@@ -287,9 +287,9 @@ To grant rules to an existing token (e.g. one the agent already has):
 guard session grant <token> --allow '<glob>' --deny '<glob>' [--ttl N] [--prompt TEXT]
 ```
 
-Matching deny patterns win over allow patterns, and everything that does not match a session rule falls through to the normal evaluator. Grants live in server memory and clear on daemon restart. `guard session revoke <token>` is daemon-UID-only; `guard session list` is visible over the Unix socket to exec-allowed local users, but it redacts the bearer token, rule bodies, and prompt text unless the caller is the daemon UID.
+Matching deny patterns win over allow patterns, and everything that does not match a session rule falls through to the normal evaluator. Session grants are persisted in the daemon state database and survive daemon restarts by default. The default path is the XDG state dir (`$XDG_STATE_HOME/guard/state.db` or `~/.local/state/guard/state.db`); override it with `--state-db` or `SSH_GUARD_STATE_DB`. `guard session revoke <token>` is daemon-UID-only; `guard session list` is visible over the Unix socket to exec-allowed local users, but it redacts the bearer token, rule bodies, and prompt text unless the caller is the daemon UID.
 
-For operator forensics, `guard session show <token>` is daemon-UID-only and prints the full prompt, aggregate allow/deny and exec outcome counts, source breakdown (`llm`, `static_policy`, `session_allow`, `session_deny`, `validation`), a risk histogram for LLM-evaluated calls, and a bounded recent interaction log.
+For operator forensics, `guard session show <token>` is daemon-UID-only and prints the full prompt, aggregate allow/deny and exec outcome counts, source breakdown (`llm`, `static_policy`, `session_allow`, `session_deny`, `validation`), a risk histogram for LLM-evaluated calls, and a bounded recent interaction log. Those summaries are loaded from the state database, so they remain available after a service restart within the configured retention window.
 
 ## Per-run secret injection
 
@@ -344,6 +344,8 @@ Session admin RPCs (`session new` / `grant` / `revoke`, plus the privileged subs
 The non-privileged `guard status` (run as your normal user or any other exec-allowed UID) returns only client + server version, uptime, evaluation mode, and dry-run state. It is a liveness probe — enough to confirm the connection works and what mode the evaluator is in, but nothing that would help fingerprint the deployment or escalate privilege.
 
 The `--prompt` / `--prompt-file` flags attach a free-form context fragment that is appended to the LLM system prompt under a `Session context:` heading for evaluator calls made under that token. Use them for guidance the static glob patterns cannot express. The decision cache is bypassed when a session prompt is in play, because cached verdicts were made under the base prompt and may not hold under the extended context.
+
+Because grants are now durable, broad sessions deserve the same care as any other persistent authorization state. Prefer explicit TTLs for elevated sessions, and treat `allow=["*"]` as an operator override that must be revoked intentionally rather than something a daemon restart will clear for you.
 
 ## Execution identity
 
@@ -468,7 +470,7 @@ LLM token usage is logged per evaluation:
 [LLM_USAGE] model=openai/gpt-5.4-nano attempt=1 prompt_tokens=3594 completion_tokens=47 total_tokens=3641 status=ok
 ```
 
-Session interaction summaries shown by `guard session show` are in-memory convenience telemetry, not a durable audit store. For durable audit trails, ship the structured daemon logs off-host via journald or your existing log pipeline.
+For this local deployment model, the audit source of truth is the daemon's structured `tracing` output, typically collected by journald. The SQLite state database is for session state and queryable session history, not for replacing your log pipeline. `guard session show` is an operator view over that persisted session history; it should complement journald, not replace it.
 
 ## Limitations
 
