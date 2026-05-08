@@ -111,7 +111,7 @@ jobs:
 
       - name: Dependency Review
         if: steps.dependency_graph.outputs.enabled == 'true'
-        uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48  # v4
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294  # v4
 
       - name: Skip dependency review
         if: steps.dependency_graph.outputs.enabled != 'true'
