@@ -1862,7 +1862,7 @@ fn apply_exec_identity(
     cmd.uid(context.uid);
     unsafe {
         cmd.pre_exec(move || {
-            if libc::initgroups(username.as_ptr(), gid) != 0 {
+            if libc::initgroups(username.as_ptr(), gid as _) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
