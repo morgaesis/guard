@@ -57,7 +57,10 @@ jobs:
           gh pr merge --auto --squash "$PR_URL"
 
       - name: Prepare major bump review context
-        if: steps.meta.outputs.update-type == 'version-update:semver-major'
+        if: >-
+          steps.meta.outputs.update-type == 'version-update:semver-major' &&
+          steps.meta.outputs.alert-state != 'open' &&
+          steps.meta.outputs.package-ecosystem != 'github_actions'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_URL: ${{ github.event.pull_request.html_url }}
@@ -89,7 +92,10 @@ jobs:
 
       - name: Require AI review secret for major bumps
         id: require_ai_key
-        if: steps.meta.outputs.update-type == 'version-update:semver-major'
+        if: >-
+          steps.meta.outputs.update-type == 'version-update:semver-major' &&
+          steps.meta.outputs.alert-state != 'open' &&
+          steps.meta.outputs.package-ecosystem != 'github_actions'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_URL: ${{ github.event.pull_request.html_url }}
@@ -100,6 +106,7 @@ jobs:
           fi
 
           gh label create "needs-manual-review" \
+            --repo "$GITHUB_REPOSITORY" \
             --color "B60205" \
             --description "Dependabot update requires manual review" \
             --force
@@ -110,7 +117,10 @@ jobs:
 
       - name: Run opencode major bump review
         id: opencode
-        if: steps.meta.outputs.update-type == 'version-update:semver-major'
+        if: >-
+          steps.meta.outputs.update-type == 'version-update:semver-major' &&
+          steps.meta.outputs.alert-state != 'open' &&
+          steps.meta.outputs.package-ecosystem != 'github_actions'
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           DEPENDABOT_AI_MODEL: ${{ vars.DEPENDABOT_AI_MODEL || 'openrouter/moonshotai/kimi-k2' }}
@@ -133,7 +143,10 @@ jobs:
 
       - name: Evaluate opencode decision
         id: ai
-        if: steps.meta.outputs.update-type == 'version-update:semver-major'
+        if: >-
+          steps.meta.outputs.update-type == 'version-update:semver-major' &&
+          steps.meta.outputs.alert-state != 'open' &&
+          steps.meta.outputs.package-ecosystem != 'github_actions'
         run: |
           node <<'NODE'
           const fs = require("fs");
@@ -163,12 +176,19 @@ jobs:
           NODE
 
       - name: Escalate major bump when AI review fails
-        if: failure() && steps.meta.outputs.update-type == 'version-update:semver-major' && steps.require_ai_key.outcome == 'success' && steps.ai.outputs.manual == ''
+        if: >-
+          failure() &&
+          steps.meta.outputs.update-type == 'version-update:semver-major' &&
+          steps.meta.outputs.alert-state != 'open' &&
+          steps.meta.outputs.package-ecosystem != 'github_actions' &&
+          steps.require_ai_key.outcome == 'success' &&
+          steps.ai.outputs.manual == ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_URL: ${{ github.event.pull_request.html_url }}
         run: |
           gh label create "needs-manual-review" \
+            --repo "$GITHUB_REPOSITORY" \
             --color "B60205" \
             --description "Dependabot update requires manual review" \
             --force
@@ -178,13 +198,18 @@ jobs:
           exit 1
 
       - name: Escalate major bump when AI requests review
-        if: steps.meta.outputs.update-type == 'version-update:semver-major' && steps.ai.outputs.manual == 'true'
+        if: >-
+          steps.meta.outputs.update-type == 'version-update:semver-major' &&
+          steps.meta.outputs.alert-state != 'open' &&
+          steps.meta.outputs.package-ecosystem != 'github_actions' &&
+          steps.ai.outputs.manual == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_URL: ${{ github.event.pull_request.html_url }}
           SUMMARY: ${{ steps.ai.outputs.summary }}
         run: |
           gh label create "needs-manual-review" \
+            --repo "$GITHUB_REPOSITORY" \
             --color "B60205" \
             --description "Dependabot update requires manual review" \
             --force
@@ -195,7 +220,11 @@ jobs:
           exit 1
 
       - name: Approve and enable auto-merge for AI-cleared major bump
-        if: steps.meta.outputs.update-type == 'version-update:semver-major' && steps.ai.outputs.manual == 'false'
+        if: >-
+          steps.meta.outputs.update-type == 'version-update:semver-major' &&
+          steps.meta.outputs.alert-state != 'open' &&
+          steps.meta.outputs.package-ecosystem != 'github_actions' &&
+          steps.ai.outputs.manual == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_URL: ${{ github.event.pull_request.html_url }}
