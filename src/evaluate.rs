@@ -56,20 +56,22 @@ struct CacheEntry {
 
 #[derive(Clone)]
 enum CachedResult {
-    Allow(String),
-    Deny(String),
+    Allow { reason: String, risk: Option<i32> },
+    Deny { reason: String, risk: Option<i32> },
 }
 
 impl CachedResult {
     fn into_eval(self) -> EvalResult {
         match self {
-            CachedResult::Allow(reason) => EvalResult::Allow {
+            CachedResult::Allow { reason, risk } => EvalResult::Allow {
                 reason,
                 source: EvalSource::Llm,
+                risk,
             },
-            CachedResult::Deny(reason) => EvalResult::Deny {
+            CachedResult::Deny { reason, risk } => EvalResult::Deny {
                 reason,
                 source: EvalSource::Llm,
+                risk,
             },
         }
     }
@@ -301,8 +303,16 @@ pub struct LlmResponse {
 
 #[derive(Debug, Clone)]
 pub enum EvalResult {
-    Allow { reason: String, source: EvalSource },
-    Deny { reason: String, source: EvalSource },
+    Allow {
+        reason: String,
+        source: EvalSource,
+        risk: Option<i32>,
+    },
+    Deny {
+        reason: String,
+        source: EvalSource,
+        risk: Option<i32>,
+    },
     Error(String),
 }
 
@@ -315,10 +325,10 @@ pub enum EvalSource {
 impl std::fmt::Display for EvalResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            EvalResult::Allow { reason, source } => {
+            EvalResult::Allow { reason, source, .. } => {
                 write!(f, "Allow ({:?}): {}", source, reason)
             }
-            EvalResult::Deny { reason, source } => {
+            EvalResult::Deny { reason, source, .. } => {
                 write!(f, "Deny ({:?}): {}", source, reason)
             }
             EvalResult::Error(e) => {
@@ -346,6 +356,13 @@ impl EvalResult {
             EvalResult::Allow { reason, .. } => reason.clone(),
             EvalResult::Deny { reason, .. } => reason.clone(),
             EvalResult::Error(e) => format!("LLM unavailable: {}", e),
+        }
+    }
+
+    pub fn risk(&self) -> Option<i32> {
+        match self {
+            EvalResult::Allow { risk, .. } | EvalResult::Deny { risk, .. } => *risk,
+            EvalResult::Error(_) => None,
         }
     }
 }
@@ -629,6 +646,7 @@ impl Evaluator {
                     return EvalResult::Deny {
                         reason: static_result.reason,
                         source: EvalSource::StaticPolicy,
+                        risk: None,
                     };
                 }
             }
@@ -665,11 +683,23 @@ impl Evaluator {
                     match &result {
                         EvalResult::Allow { reason, .. } => {
                             let mut guard = cache.write().await;
-                            guard.insert(command.to_string(), CachedResult::Allow(reason.clone()));
+                            guard.insert(
+                                command.to_string(),
+                                CachedResult::Allow {
+                                    reason: reason.clone(),
+                                    risk: result.risk(),
+                                },
+                            );
                         }
                         EvalResult::Deny { reason, .. } => {
                             let mut guard = cache.write().await;
-                            guard.insert(command.to_string(), CachedResult::Deny(reason.clone()));
+                            guard.insert(
+                                command.to_string(),
+                                CachedResult::Deny {
+                                    reason: reason.clone(),
+                                    risk: result.risk(),
+                                },
+                            );
                         }
                         EvalResult::Error(_) => {
                             // Don't cache transient errors.
@@ -687,6 +717,7 @@ impl Evaluator {
                 return EvalResult::Allow {
                     reason: static_result.reason,
                     source: EvalSource::StaticPolicy,
+                    risk: None,
                 };
             }
         }
@@ -694,6 +725,7 @@ impl Evaluator {
         EvalResult::Deny {
             reason: "no policy and LLM disabled: default-deny".to_string(),
             source: EvalSource::StaticPolicy,
+            risk: None,
         }
     }
 
@@ -741,11 +773,13 @@ impl Evaluator {
                         return EvalResult::Allow {
                             reason: decision.reason,
                             source: EvalSource::Llm,
+                            risk: Some(decision.risk),
                         };
                     } else {
                         return EvalResult::Deny {
                             reason: decision.reason,
                             source: EvalSource::Llm,
+                            risk: Some(decision.risk),
                         };
                     }
                 }
@@ -1319,7 +1353,10 @@ mod tests {
         let mut cache = EvalCache::new(4, Duration::from_secs(60));
         cache.insert(
             "ls -la".to_string(),
-            CachedResult::Allow("inspection".to_string()),
+            CachedResult::Allow {
+                reason: "inspection".to_string(),
+                risk: Some(1),
+            },
         );
         match cache.get("ls -la") {
             Some(EvalResult::Allow { reason, .. }) => assert_eq!(reason, "inspection"),
@@ -1336,7 +1373,13 @@ mod tests {
     #[test]
     fn cache_ttl_expires_entry() {
         let mut cache = EvalCache::new(4, Duration::from_millis(10));
-        cache.insert("ls".to_string(), CachedResult::Allow("ok".to_string()));
+        cache.insert(
+            "ls".to_string(),
+            CachedResult::Allow {
+                reason: "ok".to_string(),
+                risk: Some(1),
+            },
+        );
         std::thread::sleep(Duration::from_millis(20));
         assert!(cache.get("ls").is_none(), "entry should have expired");
     }
@@ -1344,11 +1387,29 @@ mod tests {
     #[test]
     fn cache_evicts_oldest_when_full() {
         let mut cache = EvalCache::new(2, Duration::from_secs(60));
-        cache.insert("a".into(), CachedResult::Allow("a".into()));
+        cache.insert(
+            "a".into(),
+            CachedResult::Allow {
+                reason: "a".into(),
+                risk: Some(1),
+            },
+        );
         std::thread::sleep(Duration::from_millis(2));
-        cache.insert("b".into(), CachedResult::Allow("b".into()));
+        cache.insert(
+            "b".into(),
+            CachedResult::Allow {
+                reason: "b".into(),
+                risk: Some(1),
+            },
+        );
         std::thread::sleep(Duration::from_millis(2));
-        cache.insert("c".into(), CachedResult::Allow("c".into()));
+        cache.insert(
+            "c".into(),
+            CachedResult::Allow {
+                reason: "c".into(),
+                risk: Some(1),
+            },
+        );
 
         assert!(cache.get("a").is_none(), "oldest should have been evicted");
         assert!(cache.get("b").is_some());
@@ -1359,8 +1420,20 @@ mod tests {
     #[test]
     fn cache_caches_both_allow_and_deny() {
         let mut cache = EvalCache::new(4, Duration::from_secs(60));
-        cache.insert("ok".into(), CachedResult::Allow("ok".into()));
-        cache.insert("bad".into(), CachedResult::Deny("bad".into()));
+        cache.insert(
+            "ok".into(),
+            CachedResult::Allow {
+                reason: "ok".into(),
+                risk: Some(1),
+            },
+        );
+        cache.insert(
+            "bad".into(),
+            CachedResult::Deny {
+                reason: "bad".into(),
+                risk: Some(9),
+            },
+        );
         assert!(matches!(cache.get("ok"), Some(EvalResult::Allow { .. })));
         assert!(matches!(cache.get("bad"), Some(EvalResult::Deny { .. })));
     }
@@ -1389,6 +1462,7 @@ mod tests {
         let allow = EvalResult::Allow {
             reason: "test".to_string(),
             source: EvalSource::Llm,
+            risk: Some(1),
         };
         assert!(allow.to_string().contains("Allow"));
         assert!(allow.to_string().contains("Llm"));
@@ -1396,6 +1470,7 @@ mod tests {
         let deny = EvalResult::Deny {
             reason: "test".to_string(),
             source: EvalSource::StaticPolicy,
+            risk: None,
         };
         assert!(deny.to_string().contains("Deny"));
         assert!(deny.to_string().contains("StaticPolicy"));
@@ -1410,6 +1485,7 @@ mod tests {
         let allow = EvalResult::Allow {
             reason: "test".to_string(),
             source: EvalSource::Llm,
+            risk: Some(1),
         };
         assert!(allow.is_allow());
         assert!(!allow.is_deny());
@@ -1418,6 +1494,7 @@ mod tests {
         let deny = EvalResult::Deny {
             reason: "test".to_string(),
             source: EvalSource::StaticPolicy,
+            risk: None,
         };
         assert!(!deny.is_allow());
         assert!(deny.is_deny());

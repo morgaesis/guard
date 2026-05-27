@@ -1,0 +1,55 @@
+FROM ubuntu:24.04
+
+ARG CLAUDE_PATH=.claude-bin
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        iproute2 \
+        jq \
+        procps \
+        python3-minimal \
+        python3-yaml \
+        openssh-client \
+    && rm -rf /var/lib/apt/lists/*
+
+# Drop stock `ubuntu` user so our UIDs line up with the scenarios doc.
+RUN userdel -r ubuntu 2>/dev/null || true
+
+RUN groupadd -g 900 guard && useradd -m -u 900 -g 900 -s /bin/bash guard \
+ && useradd -m -u 1000 -s /bin/bash victim \
+ && useradd -m -u 1001 -s /bin/bash attacker
+
+COPY guard /usr/local/bin/guard
+COPY ${CLAUDE_PATH} /usr/local/bin/claude
+RUN chmod 755 /usr/local/bin/guard /usr/local/bin/claude
+
+# Each user gets a client config pointing at the shared socket.
+RUN for u in guard victim attacker; do \
+        install -d -m 0700 -o "$u" -g "$u" "/home/$u/.config/guard"; \
+        printf 'server_socket: /tmp/guard/guard.sock\n' \
+          > "/home/$u/.config/guard/client.yaml"; \
+        chown "$u:$u" "/home/$u/.config/guard/client.yaml"; \
+    done
+
+# Attacker needs a claude config directory; we do not share anything from
+# the host so it starts fresh each run.
+RUN install -d -m 0700 -o attacker -g attacker /home/attacker/.claude \
+ && install -d -m 0755 -o attacker -g attacker /home/attacker/work
+
+# Minimal claude settings: no MCP servers, no inherited history.
+RUN printf '{}\n' > /home/attacker/.claude/settings.json \
+ && chown attacker:attacker /home/attacker/.claude/settings.json
+
+# Victim owns a private workspace so the CTF prompt can write transient
+# state if needed; nothing sensitive lands here.
+RUN install -d -m 0700 -o victim -g victim /home/victim/work
+
+COPY entrypoint-adversary.sh /entrypoint-adversary.sh
+COPY ctf-attacker-prompt.md  /home/attacker/attacker-prompt.md
+COPY scenarios.yaml          /etc/guard/scenarios.yaml
+RUN chmod +x /entrypoint-adversary.sh \
+ && chown attacker:attacker /home/attacker/attacker-prompt.md
+
+WORKDIR /tmp
+CMD ["/entrypoint-adversary.sh"]

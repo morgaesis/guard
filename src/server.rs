@@ -10,13 +10,16 @@
 //! - Socket: 0666 so local clients can connect before UID validation
 
 use crate::evaluate::Evaluator;
+use crate::injection::is_valid_env_name;
 use crate::redact::{
     redact_exact_secrets, redact_output_text, redact_output_with_state, RedactionState,
 };
-use crate::secrets::SecretManager;
+use crate::secrets::{SecretManager, LEGACY_UID_SENTINEL};
 use crate::session::{
-    HistoricalGrant, SessionDecision, SessionGrant, SessionGrantSummary, SessionRegistry,
+    HistoricalGrant, SessionDecision, SessionDecisionSource, SessionExecStatus, SessionGrant,
+    SessionGrantSummary, SessionInteraction, SessionRegistry, SessionReport,
 };
+use crate::session_store::SessionStore;
 
 // Re-export so main.rs can pattern-match on history status without a
 // direct dependency on the `session` module path.
@@ -25,7 +28,9 @@ use crate::tool_config::ToolRegistry;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -33,6 +38,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::process::Command;
 use tokio::sync::{mpsc, RwLock};
+use uzers::os::unix::UserExt;
 
 const DEFAULT_SOCKET_PATH: &str = "/var/run/guard/guard.sock";
 const DEFAULT_TCP_PORT: u16 = 8123;
@@ -124,6 +130,11 @@ pub enum AdminRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         since_unix: Option<u64>,
     },
+    SessionShow {
+        token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+    },
     SecretSet {
         key: String,
         value: String,
@@ -131,7 +142,11 @@ pub enum AdminRequest {
     SecretDelete {
         key: String,
     },
+    SecretExists {
+        key: String,
+    },
     SecretList,
+    SecretListDetailed,
     /// Privileged status snapshot. Caller must be the daemon UID.
     Status,
     /// No-auth liveness probe. Returns version, uptime, and a small
@@ -143,10 +158,20 @@ pub enum AdminRequest {
 }
 
 impl AdminRequest {
-    /// Ping is the only admin RPC that does not require daemon-UID
-    /// caller; it is intentionally a public liveness probe.
+    /// Admin RPCs that require the caller to be the daemon UID.
+    /// Ping is a public liveness probe. Secret RPCs and session
+    /// listing are open to any connected user; they self-scope or
+    /// redact sensitive fields so a caller cannot elevate from them.
     fn requires_daemon_uid(&self) -> bool {
-        !matches!(self, Self::Ping)
+        !matches!(
+            self,
+            Self::Ping
+                | Self::SessionList { .. }
+                | Self::SecretSet { .. }
+                | Self::SecretDelete { .. }
+                | Self::SecretExists { .. }
+                | Self::SecretList
+        )
     }
 }
 
@@ -157,13 +182,22 @@ pub enum AdminResponse {
     Error {
         message: String,
     },
+    SecretExists {
+        exists: bool,
+    },
     SessionList {
         grants: Vec<SessionGrantSummary>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         history: Vec<HistoricalGrant>,
     },
+    SessionShow {
+        report: SessionReport,
+    },
     SecretList {
         keys: Vec<String>,
+    },
+    SecretListDetailed {
+        items: Vec<SecretDetail>,
     },
     Status {
         status: ServerStatus,
@@ -180,6 +214,15 @@ pub enum AdminResponse {
         /// will actually run.
         dry_run: bool,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretDetail {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
+    #[serde(default)]
+    pub legacy: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,6 +243,10 @@ pub struct ServerStatus {
     pub cache_size: usize,
     pub session_count: usize,
     pub daemon_uid: u32,
+    pub exec_identity: String,
+    pub state_db_path: Option<String>,
+    #[serde(default)]
+    pub secret_backend: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -259,12 +306,17 @@ pub struct ServerConfig {
     /// Session grant registry. Grants here extend or narrow the policy
     /// decision for a specific session token.
     pub sessions: Arc<RwLock<SessionRegistry>>,
+    pub session_store: Option<SessionStore>,
+    /// When true, approved Unix-socket requests execute as the connecting
+    /// user instead of the daemon UID.
+    pub exec_as_caller: bool,
     /// Wall-clock unix seconds when the daemon started. Surfaced via the
     /// Status admin RPC so callers can compute uptime.
     pub started_at_unix: u64,
     /// Effective UID of the daemon process. Admin RPCs require the
     /// caller to be this UID; there is no token-based elevation.
     pub daemon_uid: u32,
+    pub state_db_path: Option<PathBuf>,
 }
 
 impl ServerConfig {
@@ -283,6 +335,10 @@ impl ServerConfig {
         tool_registry: ToolRegistry,
         redact_secrets: Vec<String>,
         preflight: bool,
+        sessions: SessionRegistry,
+        session_store: Option<SessionStore>,
+        exec_as_caller: bool,
+        state_db_path: Option<PathBuf>,
     ) -> Self {
         Self {
             socket_path,
@@ -298,12 +354,15 @@ impl ServerConfig {
             tool_registry: Arc::new(RwLock::new(tool_registry)),
             redact_secrets,
             preflight,
+            session_store,
+            exec_as_caller,
             daemon_uid: current_uid(),
-            sessions: Arc::new(RwLock::new(SessionRegistry::new())),
+            sessions: Arc::new(RwLock::new(sessions)),
             started_at_unix: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
+            state_db_path,
         }
     }
 
@@ -420,6 +479,10 @@ impl Server {
         tool_registry: ToolRegistry,
         redact_secrets: Vec<String>,
         preflight: bool,
+        sessions: SessionRegistry,
+        session_store: Option<SessionStore>,
+        exec_as_caller: bool,
+        state_db_path: Option<PathBuf>,
     ) -> Self {
         let config = ServerConfig::new(
             socket_path,
@@ -435,6 +498,10 @@ impl Server {
             tool_registry,
             redact_secrets,
             preflight,
+            sessions,
+            session_store,
+            exec_as_caller,
+            state_db_path,
         );
         Self { config }
     }
@@ -743,9 +810,19 @@ async fn handle_admin_request(
                 prompt_append,
                 granted_at: 0, // SessionRegistry::grant fills the current time
             };
-            let mut reg = config.sessions.write().await;
-            reg.purge_expired();
-            reg.grant(token.clone(), grant);
+            let (before, after) = {
+                let mut reg = config.sessions.write().await;
+                reg.purge_expired();
+                let before = reg.clone();
+                reg.grant(token.clone(), grant);
+                (before, reg.clone())
+            };
+            if let Err(err) = persist_session_snapshot(config.session_store.clone(), after).await {
+                *config.sessions.write().await = before;
+                return AdminResponse::Error {
+                    message: format!("failed to persist session grant: {}", err),
+                };
+            }
             tracing::info!(
                 "[AUDIT] SESSION_GRANT caller={} token={} ttl={:?}",
                 caller,
@@ -755,8 +832,18 @@ async fn handle_admin_request(
             AdminResponse::Ok
         }
         AdminRequest::SessionRevoke { token } => {
-            let mut reg = config.sessions.write().await;
-            let removed = reg.revoke(&token);
+            let (removed, before, after) = {
+                let mut reg = config.sessions.write().await;
+                let before = reg.clone();
+                let removed = reg.revoke(&token);
+                (removed, before, reg.clone())
+            };
+            if let Err(err) = persist_session_snapshot(config.session_store.clone(), after).await {
+                *config.sessions.write().await = before;
+                return AdminResponse::Error {
+                    message: format!("failed to persist session revoke: {}", err),
+                };
+            }
             tracing::info!(
                 "[AUDIT] SESSION_REVOKE caller={} token={} existed={}",
                 caller,
@@ -775,14 +862,62 @@ async fn handle_admin_request(
                 let mut reg = config.sessions.write().await;
                 reg.purge_expired();
             }
+            if let Err(err) = persist_current_sessions(config).await {
+                tracing::warn!("failed to persist purged session state: {}", err);
+            }
             let reg = config.sessions.read().await;
-            let grants = reg.list();
+            let show_prompt =
+                matches!(caller, CallerIdentity::Unix { uid } if *uid == config.daemon_uid);
+            let grants = reg
+                .list()
+                .into_iter()
+                .map(|mut grant| {
+                    if !show_prompt {
+                        grant.token = "(hidden)".to_string();
+                        grant.allow.clear();
+                        grant.deny.clear();
+                        if grant.prompt_append.is_some() {
+                            grant.prompt_append = Some("(hidden)".to_string());
+                        }
+                    }
+                    grant
+                })
+                .collect();
             let history = if include_history {
                 reg.list_history(since_unix)
+                    .into_iter()
+                    .map(|mut grant| {
+                        if !show_prompt {
+                            grant.token = "(hidden)".to_string();
+                            grant.allow.clear();
+                            grant.deny.clear();
+                            if grant.prompt_append.is_some() {
+                                grant.prompt_append = Some("(hidden)".to_string());
+                            }
+                        }
+                        grant
+                    })
+                    .collect()
             } else {
                 Vec::new()
             };
             AdminResponse::SessionList { grants, history }
+        }
+        AdminRequest::SessionShow { token, limit } => {
+            {
+                let mut reg = config.sessions.write().await;
+                reg.purge_expired();
+            }
+            if let Err(err) = persist_current_sessions(config).await {
+                tracing::warn!("failed to persist purged session state: {}", err);
+            }
+            let reg = config.sessions.read().await;
+            match reg.show(&token, limit.unwrap_or(20)) {
+                Some(report) => AdminResponse::SessionShow { report },
+                None => AdminResponse::Error {
+                    message: format!("unknown session token: '{}'", token),
+                },
+            }
         }
         AdminRequest::SecretSet { key, value } => {
             if !is_valid_secret_key(&key) {
@@ -790,9 +925,22 @@ async fn handle_admin_request(
                     message: format!("invalid secret key: '{}'", key),
                 };
             }
-            match config.secrets.set(&key, &value).await {
+            let caller_uid = match caller {
+                CallerIdentity::Unix { uid } => *uid,
+                _ => {
+                    return AdminResponse::Error {
+                        message: "secret operations require a unix socket caller".to_string(),
+                    };
+                }
+            };
+            match config.secrets.set(caller_uid, &key, &value).await {
                 Ok(()) => {
-                    tracing::info!("[AUDIT] SECRET_SET caller={} key={}", caller, key);
+                    tracing::info!(
+                        "[AUDIT] SECRET_SET caller={} uid={} key={}",
+                        caller,
+                        caller_uid,
+                        key
+                    );
                     AdminResponse::Ok
                 }
                 Err(e) => AdminResponse::Error {
@@ -806,9 +954,22 @@ async fn handle_admin_request(
                     message: format!("invalid secret key: '{}'", key),
                 };
             }
-            match config.secrets.delete(&key).await {
+            let caller_uid = match caller {
+                CallerIdentity::Unix { uid } => *uid,
+                _ => {
+                    return AdminResponse::Error {
+                        message: "secret operations require a unix socket caller".to_string(),
+                    };
+                }
+            };
+            match config.secrets.delete(caller_uid, &key).await {
                 Ok(()) => {
-                    tracing::info!("[AUDIT] SECRET_DELETE caller={} key={}", caller, key);
+                    tracing::info!(
+                        "[AUDIT] SECRET_DELETE caller={} uid={} key={}",
+                        caller,
+                        caller_uid,
+                        key
+                    );
                     AdminResponse::Ok
                 }
                 Err(e) => AdminResponse::Error {
@@ -816,8 +977,80 @@ async fn handle_admin_request(
                 },
             }
         }
-        AdminRequest::SecretList => match config.secrets.list().await {
-            Ok(keys) => AdminResponse::SecretList { keys },
+        AdminRequest::SecretExists { key } => {
+            if !is_valid_secret_key(&key) {
+                return AdminResponse::Error {
+                    message: format!("invalid secret key: '{}'", key),
+                };
+            }
+            let caller_uid = match caller {
+                CallerIdentity::Unix { uid } => *uid,
+                _ => {
+                    return AdminResponse::Error {
+                        message: "secret operations require a unix socket caller".to_string(),
+                    };
+                }
+            };
+            match config.secrets.get(caller_uid, &key).await {
+                Ok(value) => AdminResponse::SecretExists {
+                    exists: value.is_some(),
+                },
+                Err(e) => AdminResponse::Error {
+                    message: format!("failed to inspect secret '{}': {}", key, e),
+                },
+            }
+        }
+        AdminRequest::SecretList => {
+            let caller_uid = match caller {
+                CallerIdentity::Unix { uid } => *uid,
+                _ => {
+                    return AdminResponse::Error {
+                        message: "secret operations require a unix socket caller".to_string(),
+                    };
+                }
+            };
+            if caller_uid == config.daemon_uid {
+                match config.secrets.list_all().await {
+                    Ok(pairs) => {
+                        let mut keys: Vec<String> = pairs.into_iter().map(|(_, key)| key).collect();
+                        keys.sort();
+                        AdminResponse::SecretList { keys }
+                    }
+                    Err(e) => AdminResponse::Error {
+                        message: format!("failed to list secrets: {}", e),
+                    },
+                }
+            } else {
+                match config.secrets.list(caller_uid).await {
+                    Ok(keys) => AdminResponse::SecretList { keys },
+                    Err(e) => AdminResponse::Error {
+                        message: format!("failed to list secrets: {}", e),
+                    },
+                }
+            }
+        }
+        AdminRequest::SecretListDetailed => match config.secrets.list_all().await {
+            Ok(pairs) => {
+                let mut items: Vec<SecretDetail> = pairs
+                    .into_iter()
+                    .map(|(uid, key)| SecretDetail {
+                        key,
+                        uid: if uid == LEGACY_UID_SENTINEL {
+                            None
+                        } else {
+                            Some(uid)
+                        },
+                        legacy: uid == LEGACY_UID_SENTINEL,
+                    })
+                    .collect();
+                items.sort_by(|a, b| {
+                    a.legacy
+                        .cmp(&b.legacy)
+                        .then_with(|| a.uid.cmp(&b.uid))
+                        .then_with(|| a.key.cmp(&b.key))
+                });
+                AdminResponse::SecretListDetailed { items }
+            }
             Err(e) => AdminResponse::Error {
                 message: format!("failed to list secrets: {}", e),
             },
@@ -870,6 +1103,16 @@ async fn handle_admin_request(
                     cache_size,
                     session_count,
                     daemon_uid: config.daemon_uid,
+                    exec_identity: if config.exec_as_caller {
+                        "caller".to_string()
+                    } else {
+                        "daemon".to_string()
+                    },
+                    state_db_path: config
+                        .state_db_path
+                        .as_ref()
+                        .map(|path| path.display().to_string()),
+                    secret_backend: config.secrets.backend_name().to_string(),
                 },
             }
         }
@@ -907,8 +1150,18 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
             IncomingMessage::Admin { admin } => {
                 // Admin over TCP can never satisfy the daemon-UID rule
                 // (no peer-credentials over loopback that we can trust),
-                // so we surface a generic Tcp identity and let
-                // validate_admin reject everything except Ping.
+                // so only Ping is exposed here. Everything else is
+                // Unix-socket-only.
+                if !matches!(admin, AdminRequest::Ping) {
+                    let resp = AdminResponse::Error {
+                        message: "admin RPCs require a unix socket caller".to_string(),
+                    };
+                    writer
+                        .write_all(serde_json::to_string(&resp)?.as_bytes())
+                        .await?;
+                    writer.write_all(b"\n").await?;
+                    continue;
+                }
                 let caller = CallerIdentity::Tcp {
                     token: "<tcp>".to_string(),
                 };
@@ -1127,6 +1380,15 @@ impl ExecuteResult {
             },
         }
     }
+
+    fn session_exec_status(&self) -> SessionExecStatus {
+        match self.exec {
+            ExecOutcome::Completed { .. } => SessionExecStatus::Completed,
+            ExecOutcome::Failed { .. } => SessionExecStatus::Failed,
+            ExecOutcome::DryRun => SessionExecStatus::DryRun,
+            ExecOutcome::NotAttempted => SessionExecStatus::NotAttempted,
+        }
+    }
 }
 
 async fn write_stream_message<W: AsyncWrite + Unpin>(
@@ -1185,6 +1447,8 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
     stream_output: bool,
     stream_writer: &mut W,
 ) -> ExecuteResult {
+    let session_token = request.session_token.clone();
+
     // Check recursion depth
     let depth: u32 = std::env::var("GUARD_DEPTH")
         .ok()
@@ -1194,6 +1458,20 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         let reason = format!("guard recursion depth exceeded (max {})", MAX_GUARD_DEPTH);
         config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
         let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
+        record_live_session_interaction(
+            config,
+            session_token.as_deref(),
+            SessionInteraction {
+                at_unix: 0,
+                command: request.binary.clone(),
+                allowed: false,
+                source: SessionDecisionSource::Validation,
+                reason: reason.clone(),
+                risk: None,
+                exec_status: SessionExecStatus::NotAttempted,
+            },
+        )
+        .await;
         return ExecuteResult::denied(reason);
     }
 
@@ -1203,9 +1481,33 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         || request.binary.contains('\0')
         || request.binary.is_empty()
     {
-        let reason = format!("invalid binary name: '{}'", request.binary);
+        let looks_like_shell_string = request.binary.contains(char::is_whitespace)
+            || request.binary.contains('"')
+            || request.binary.contains('\'');
+        let reason = if looks_like_shell_string {
+            format!(
+                "invalid binary name: '{}'. guard run expects `<binary> [args...]`, not a shell string. Pass the command as separate arguments; e.g. `guard run ssh host 'remote cmd'` instead of `guard run 'ssh host \"remote cmd\"'`.",
+                request.binary
+            )
+        } else {
+            format!("invalid binary name: '{}'", request.binary)
+        };
         config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
         let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
+        record_live_session_interaction(
+            config,
+            session_token.as_deref(),
+            SessionInteraction {
+                at_unix: 0,
+                command: request.binary.clone(),
+                allowed: false,
+                source: SessionDecisionSource::Validation,
+                reason: reason.clone(),
+                risk: None,
+                exec_status: SessionExecStatus::NotAttempted,
+            },
+        )
+        .await;
         return ExecuteResult::denied(reason);
     }
 
@@ -1217,9 +1519,24 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         format!("{} {}", request.binary, request.args.join(" "))
     };
 
-    if let Err(reason) = validate_request_injections(&request, config, &command_line).await {
+    if let Err(reason) = validate_request_injections(&request, config, caller, &command_line).await
+    {
         config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
         let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
+        record_live_session_interaction(
+            config,
+            session_token.as_deref(),
+            SessionInteraction {
+                at_unix: 0,
+                command: command_line.clone(),
+                allowed: false,
+                source: SessionDecisionSource::Validation,
+                reason: reason.clone(),
+                risk: None,
+                exec_status: SessionExecStatus::NotAttempted,
+            },
+        )
+        .await;
         return ExecuteResult::denied(reason);
     }
 
@@ -1251,6 +1568,20 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
                     config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
                     let _ =
                         write_policy_decision(stream_output, stream_writer, false, &reason).await;
+                    record_live_session_interaction(
+                        config,
+                        session_token.as_deref(),
+                        SessionInteraction {
+                            at_unix: 0,
+                            command: command_line.clone(),
+                            allowed: false,
+                            source: SessionDecisionSource::SessionDeny,
+                            reason: reason.clone(),
+                            risk: None,
+                            exec_status: SessionExecStatus::NotAttempted,
+                        },
+                    )
+                    .await;
                     return ExecuteResult::denied(reason);
                 }
                 SessionDecision::Allow => {
@@ -1263,16 +1594,31 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
                             format!("client stream error: {}", e),
                         );
                     }
-                    return exec_after_approval(
+                    let result = exec_after_approval(
                         request,
                         config,
                         caller,
-                        reason,
+                        reason.clone(),
                         depth,
                         stream_output,
                         stream_writer,
                     )
                     .await;
+                    record_live_session_interaction(
+                        config,
+                        session_token.as_deref(),
+                        SessionInteraction {
+                            at_unix: 0,
+                            command: command_line.clone(),
+                            allowed: true,
+                            source: SessionDecisionSource::SessionAllow,
+                            reason,
+                            risk: None,
+                            exec_status: result.session_exec_status(),
+                        },
+                    )
+                    .await;
+                    return result;
                 }
             }
         }
@@ -1285,6 +1631,20 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         );
         config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
         let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
+        record_live_session_interaction(
+            config,
+            session_token.as_deref(),
+            SessionInteraction {
+                at_unix: 0,
+                command: command_line.clone(),
+                allowed: false,
+                source: SessionDecisionSource::Validation,
+                reason: reason.clone(),
+                risk: None,
+                exec_status: SessionExecStatus::NotAttempted,
+            },
+        )
+        .await;
         return ExecuteResult::denied(reason);
     }
 
@@ -1292,6 +1652,20 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         if let Some(reason) = deterministic_credential_deny_reason(&request.binary, &request.args) {
             config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
             let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
+            record_live_session_interaction(
+                config,
+                session_token.as_deref(),
+                SessionInteraction {
+                    at_unix: 0,
+                    command: command_line.clone(),
+                    allowed: false,
+                    source: SessionDecisionSource::Validation,
+                    reason: reason.clone(),
+                    risk: None,
+                    exec_status: SessionExecStatus::NotAttempted,
+                },
+            )
+            .await;
             return ExecuteResult::denied(reason);
         }
     }
@@ -1311,40 +1685,191 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         .evaluate_with_context(&command_line, session_prompt.as_deref())
         .await;
 
-    let allow_reason = match eval_result {
-        crate::evaluate::EvalResult::Deny { reason, .. } => {
+    match eval_result {
+        crate::evaluate::EvalResult::Deny {
+            reason,
+            source,
+            risk,
+        } => {
             config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
             let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
-            return ExecuteResult::denied(reason);
+            record_live_session_interaction(
+                config,
+                session_token.as_deref(),
+                SessionInteraction {
+                    at_unix: 0,
+                    command: command_line.clone(),
+                    allowed: false,
+                    source: session_source_from_eval(source),
+                    reason: reason.clone(),
+                    risk,
+                    exec_status: SessionExecStatus::NotAttempted,
+                },
+            )
+            .await;
+            ExecuteResult::denied(reason)
         }
         crate::evaluate::EvalResult::Error(e) => {
             tracing::error!("evaluation error: {}", e);
             let reason = format!("evaluation error: {}", e);
             config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
             let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
-            return ExecuteResult::denied(reason);
+            record_live_session_interaction(
+                config,
+                session_token.as_deref(),
+                SessionInteraction {
+                    at_unix: 0,
+                    command: command_line.clone(),
+                    allowed: false,
+                    source: SessionDecisionSource::EvaluatorError,
+                    reason: reason.clone(),
+                    risk: None,
+                    exec_status: SessionExecStatus::NotAttempted,
+                },
+            )
+            .await;
+            ExecuteResult::denied(reason)
         }
-        crate::evaluate::EvalResult::Allow { reason, .. } => {
+        crate::evaluate::EvalResult::Allow {
+            reason,
+            source,
+            risk,
+        } => {
             tracing::debug!("command allowed: {}", reason);
             config.log_audit_policy(caller, &request.binary, &request.args, true, &reason);
             if let Err(e) = write_policy_decision(stream_output, stream_writer, true, &reason).await
             {
                 return ExecuteResult::exec_failed(reason, format!("client stream error: {}", e));
             }
-            reason
+            let result = exec_after_approval(
+                request,
+                config,
+                caller,
+                reason.clone(),
+                depth,
+                stream_output,
+                stream_writer,
+            )
+            .await;
+            record_live_session_interaction(
+                config,
+                session_token.as_deref(),
+                SessionInteraction {
+                    at_unix: 0,
+                    command: command_line,
+                    allowed: true,
+                    source: session_source_from_eval(source),
+                    reason,
+                    risk,
+                    exec_status: result.session_exec_status(),
+                },
+            )
+            .await;
+            result
+        }
+    }
+}
+
+fn session_source_from_eval(source: crate::evaluate::EvalSource) -> SessionDecisionSource {
+    match source {
+        crate::evaluate::EvalSource::Llm => SessionDecisionSource::Llm,
+        crate::evaluate::EvalSource::StaticPolicy => SessionDecisionSource::StaticPolicy,
+    }
+}
+
+async fn persist_session_snapshot(
+    session_store: Option<SessionStore>,
+    snapshot: SessionRegistry,
+) -> Result<()> {
+    if let Some(store) = session_store {
+        store.persist_registry(&snapshot).await?;
+    }
+    Ok(())
+}
+
+async fn persist_current_sessions(config: &ServerConfig) -> Result<()> {
+    let snapshot = { config.sessions.read().await.clone() };
+    persist_session_snapshot(config.session_store.clone(), snapshot).await
+}
+
+async fn record_live_session_interaction(
+    config: &ServerConfig,
+    token: Option<&str>,
+    interaction: SessionInteraction,
+) {
+    let Some(token) = token else {
+        return;
+    };
+    let snapshot = {
+        let mut reg = config.sessions.write().await;
+        if reg.has(token) {
+            reg.record_interaction(token, interaction);
+            Some(reg.clone())
+        } else {
+            None
         }
     };
+    if let Some(snapshot) = snapshot {
+        if let Err(err) = persist_session_snapshot(config.session_store.clone(), snapshot).await {
+            tracing::warn!("failed to persist session interaction: {}", err);
+        }
+    }
+}
 
-    exec_after_approval(
-        request,
-        config,
-        caller,
-        allow_reason,
-        depth,
-        stream_output,
-        stream_writer,
-    )
-    .await
+#[derive(Debug, Clone)]
+struct ExecCallerContext {
+    uid: u32,
+    gid: u32,
+    username: String,
+    home_dir: PathBuf,
+}
+
+fn resolve_exec_caller_context(uid: u32) -> Result<ExecCallerContext> {
+    let user = uzers::get_user_by_uid(uid)
+        .ok_or_else(|| anyhow::anyhow!("caller uid {} does not exist in passwd", uid))?;
+    let username = user
+        .name()
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("caller uid {} has a non-utf8 username", uid))?
+        .to_string();
+    Ok(ExecCallerContext {
+        uid,
+        gid: user.primary_group_id(),
+        username,
+        home_dir: user.home_dir().to_path_buf(),
+    })
+}
+
+fn apply_exec_identity(
+    cmd: &mut Command,
+    config: &ServerConfig,
+    caller: &CallerIdentity,
+) -> Result<Option<ExecCallerContext>> {
+    if !config.exec_as_caller {
+        return Ok(None);
+    }
+
+    let caller_uid = match caller {
+        CallerIdentity::Unix { uid } => *uid,
+        _ => bail!("exec-as-caller requires a unix socket caller"),
+    };
+    let context = resolve_exec_caller_context(caller_uid)?;
+    let username = CString::new(context.username.clone())
+        .context("caller username contains an interior NUL byte")?;
+    let gid = context.gid;
+
+    cmd.gid(gid);
+    cmd.uid(context.uid);
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::initgroups(username.as_ptr(), gid as _) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    Ok(Some(context))
 }
 
 /// Execute a command the policy layer has already approved.
@@ -1373,11 +1898,20 @@ async fn exec_after_approval<W: AsyncWrite + Unpin>(
     }
 
     let user_key = caller.user_key();
+    let tool_env_uid = match caller {
+        CallerIdentity::Unix { uid } => Some(*uid),
+        _ => None,
+    };
     let tool_env = {
         let mut reg = config.tool_registry.write().await;
         let _ = reg.reload_if_stale();
-        reg.resolve_env(&request.binary, &config.secrets, user_key.as_deref())
-            .await
+        reg.resolve_env(
+            &request.binary,
+            &config.secrets,
+            tool_env_uid,
+            user_key.as_deref(),
+        )
+        .await
     };
     let tool_env = match tool_env {
         Ok(env) => env,
@@ -1400,8 +1934,17 @@ async fn exec_after_approval<W: AsyncWrite + Unpin>(
         tool_env.insert(key.clone(), value.clone());
     }
 
+    let caller_uid = match caller {
+        CallerIdentity::Unix { uid } => *uid,
+        _ => {
+            return ExecuteResult::exec_failed(
+                allow_reason,
+                "secret injection requires a unix socket caller".to_string(),
+            );
+        }
+    };
     for (env_var, secret_key) in &request.secrets {
-        let value = match config.secrets.get(secret_key).await {
+        let value = match config.secrets.get(caller_uid, secret_key).await {
             Ok(Some(value)) => value,
             Ok(None) => {
                 return ExecuteResult::exec_failed(
@@ -1458,8 +2001,27 @@ async fn exec_after_approval<W: AsyncWrite + Unpin>(
         }
     }
 
+    let exec_caller = match apply_exec_identity(&mut cmd, config, caller) {
+        Ok(context) => context,
+        Err(e) => {
+            return ExecuteResult::exec_failed(allow_reason, format!("exec identity error: {}", e));
+        }
+    };
+
     for (key, value) in &tool_env {
         cmd.env(key, value);
+    }
+
+    if let Some(context) = &exec_caller {
+        cmd.env("HOME", &context.home_dir);
+        cmd.env("USER", &context.username);
+        cmd.env("LOGNAME", &context.username);
+        cmd.env_remove("SSH_AUTH_SOCK");
+        cmd.env_remove("XDG_RUNTIME_DIR");
+        let runtime_dir = PathBuf::from(format!("/run/user/{}", context.uid));
+        if runtime_dir.exists() {
+            cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+        }
     }
 
     cmd.env("GUARD_DEPTH", (depth + 1).to_string());
@@ -1637,15 +2199,6 @@ fn command_tokens(command: &str) -> Vec<String> {
         .collect()
 }
 
-fn is_valid_env_name(value: &str) -> bool {
-    let mut chars = value.chars();
-    match chars.next() {
-        Some(c) if c == '_' || c.is_ascii_alphabetic() => {}
-        _ => return false,
-    }
-    chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
-}
-
 fn is_valid_secret_key(value: &str) -> bool {
     if value.is_empty()
         || value.contains('\0')
@@ -1690,6 +2243,7 @@ fn invalid_shell_secret_reference(
 async fn validate_request_injections(
     request: &ExecuteRequest,
     config: &ServerConfig,
+    caller: &CallerIdentity,
     command_line: &str,
 ) -> std::result::Result<(), String> {
     for key in request.env.keys().chain(request.secrets.keys()) {
@@ -1701,6 +2255,25 @@ async fn validate_request_injections(
         }
     }
 
+    for env_var in request.secrets.keys() {
+        if request.env.contains_key(env_var) {
+            return Err(format!(
+                "conflicting injection for '{}': choose either --env or --secret, not both",
+                env_var
+            ));
+        }
+    }
+
+    let caller_uid = match caller {
+        CallerIdentity::Unix { uid } => *uid,
+        _ => {
+            if !request.secrets.is_empty() {
+                return Err("secret injection requires a unix socket caller".to_string());
+            }
+            return Ok(());
+        }
+    };
+
     for (env_var, secret_key) in &request.secrets {
         if !is_valid_secret_key(secret_key) {
             return Err(format!("invalid secret key: '{}'", secret_key));
@@ -1708,7 +2281,7 @@ async fn validate_request_injections(
         if let Some(reason) = invalid_shell_secret_reference(command_line, env_var, secret_key) {
             return Err(reason);
         }
-        match config.secrets.get(secret_key).await {
+        match config.secrets.get(caller_uid, secret_key).await {
             Ok(Some(_)) => {}
             Ok(None) => {
                 return Err(format!(
@@ -1937,9 +2510,12 @@ impl Client {
             AdminRequest::SessionGrant { .. } => "session_grant",
             AdminRequest::SessionRevoke { .. } => "session_revoke",
             AdminRequest::SessionList { .. } => "session_list",
+            AdminRequest::SessionShow { .. } => "session_show",
             AdminRequest::SecretSet { .. } => "secret_set",
             AdminRequest::SecretDelete { .. } => "secret_delete",
+            AdminRequest::SecretExists { .. } => "secret_exists",
             AdminRequest::SecretList => "secret_list",
+            AdminRequest::SecretListDetailed => "secret_list_detailed",
             AdminRequest::Status => "status",
             AdminRequest::Ping => "ping",
         };
@@ -2264,6 +2840,16 @@ fn parse_admin_response_line(response_line: &str, request_name: &str) -> Result<
     match serde_json::from_str::<AdminResponse>(response_line) {
         Ok(resp) => Ok(resp),
         Err(admin_err) => {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(response_line) {
+                if let Some(result_name) = value.get("result").and_then(|v| v.as_str()) {
+                    return Ok(AdminResponse::Error {
+                        message: format!(
+                            "guard daemon returned malformed admin response for '{}': result '{}' did not match the current schema ({admin_err}). Restart the daemon onto the current binary.",
+                            request_name, result_name
+                        ),
+                    });
+                }
+            }
             if let Ok(exec_resp) = serde_json::from_str::<ExecuteResponse>(response_line) {
                 let message = if exec_resp.reason.contains("invalid request")
                     && exec_resp.reason.contains("IncomingMessage")
@@ -2463,6 +3049,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_admin_response_line_surfaces_malformed_admin_payloads_as_restart_errors() {
+        let line = r#"{"result":"secret_list","items":[{"key":"alpha"}]}"#;
+        match parse_admin_response_line(line, "secret_list").unwrap() {
+            AdminResponse::Error { message } => {
+                assert!(message.contains("secret_list"));
+                assert!(message.contains("malformed admin response"));
+                assert!(message.contains("Restart the daemon"));
+            }
+            other => panic!("expected admin error, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn secret_key_validation_allows_namespaced_keys() {
         assert!(is_valid_secret_key("opnsense-apikey-secret"));
         assert!(is_valid_secret_key("atlas/opnsense-apikey"));
@@ -2481,6 +3080,31 @@ mod tests {
         )
         .expect("dashed shell-style reference should be rejected");
         assert!(reason.contains("$OPNSENSE_APIKEY_SECRET"));
+    }
+
+    #[tokio::test]
+    async fn env_and_secret_injections_cannot_target_same_env_var() {
+        let (cfg, _) = make_test_config();
+        let request = ExecuteRequest {
+            binary: "echo".to_string(),
+            args: vec!["ok".to_string()],
+            auth_token: None,
+            env: HashMap::from([("API_TOKEN".to_string(), "plain".to_string())]),
+            secrets: HashMap::from([("API_TOKEN".to_string(), "api/token".to_string())]),
+            stream: false,
+            session_token: None,
+        };
+
+        let err = validate_request_injections(
+            &request,
+            &cfg,
+            &CallerIdentity::Unix { uid: 1000 },
+            "echo ok",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.contains("conflicting injection for 'API_TOKEN'"));
     }
 
     #[tokio::test]
@@ -2508,7 +3132,7 @@ mod tests {
     async fn invalid_secret_shell_reference_denies_before_policy_evaluation() {
         let (cfg, _) = make_test_config();
         cfg.secrets
-            .set("opnsense-apikey-secret", "dummy_api_key_12345")
+            .set(1000, "opnsense-apikey-secret", "dummy_api_key_12345")
             .await
             .unwrap();
         let request = ExecuteRequest {
@@ -2614,6 +3238,10 @@ mod tests {
             ToolRegistry::empty(),
             Vec::new(),
             false,
+            SessionRegistry::new(),
+            None,
+            false,
+            None,
         );
         let buf = SharedBuf(Arc::new(Mutex::new(Vec::new())));
         (cfg, buf)
@@ -2701,5 +3329,257 @@ mod tests {
 
         assert!(output.contains("[AUDIT] ALLOWED"));
         assert!(!output.contains("EXEC_FAILED"));
+    }
+
+    /// Regression: each user has an independent namespace. Two users
+    /// can store the same key name without collision; neither can see
+    /// the other's keys through the user-scoped list, but the daemon
+    /// UID sees both via the admin list_all path.
+    #[tokio::test]
+    async fn secret_list_is_per_user_namespaced() {
+        let (mut cfg, _) = make_test_config();
+        cfg.daemon_uid = 777;
+
+        // Unique key so parallel tests sharing the EnvBackend don't
+        // collide.
+        let key = format!("NAMESPACED_{}", std::process::id());
+
+        let user_a = CallerIdentity::Unix { uid: 20_000 };
+        let user_b = CallerIdentity::Unix { uid: 20_001 };
+        let daemon = CallerIdentity::Unix { uid: 777 };
+
+        // Both users store the SAME key name with different values.
+        let set_a = handle_admin_request(
+            &cfg,
+            &user_a,
+            AdminRequest::SecretSet {
+                key: key.clone(),
+                value: "alice".into(),
+            },
+        )
+        .await;
+        assert!(matches!(set_a, AdminResponse::Ok));
+
+        let set_b = handle_admin_request(
+            &cfg,
+            &user_b,
+            AdminRequest::SecretSet {
+                key: key.clone(),
+                value: "bob".into(),
+            },
+        )
+        .await;
+        assert!(matches!(set_b, AdminResponse::Ok));
+
+        // Each user sees only their own namespace.
+        let list_a = handle_admin_request(&cfg, &user_a, AdminRequest::SecretList).await;
+        match list_a {
+            AdminResponse::SecretList { keys } => {
+                let ours: Vec<_> = keys.iter().filter(|k| *k == &key).collect();
+                assert_eq!(ours.len(), 1);
+            }
+            other => panic!("unexpected {:?}", other),
+        }
+
+        // Daemon aggregate view includes both entries, annotated with uid.
+        let list_daemon = handle_admin_request(&cfg, &daemon, AdminRequest::SecretList).await;
+        match list_daemon {
+            AdminResponse::SecretList { keys } => {
+                let ours: Vec<_> = keys.iter().filter(|k| *k == &key).collect();
+                assert_eq!(ours.len(), 2, "daemon sees both namespaced copies");
+            }
+            other => panic!("unexpected {:?}", other),
+        }
+
+        // user B's delete touches only their own namespace.
+        let del_b = handle_admin_request(
+            &cfg,
+            &user_b,
+            AdminRequest::SecretDelete { key: key.clone() },
+        )
+        .await;
+        assert!(matches!(del_b, AdminResponse::Ok));
+
+        // A's secret still there, value "alice" intact.
+        assert_eq!(
+            cfg.secrets.get(20_000, &key).await.unwrap().as_deref(),
+            Some("alice")
+        );
+        // B's is gone.
+        assert_eq!(cfg.secrets.get(20_001, &key).await.unwrap(), None);
+
+        // Cleanup.
+        let _ = handle_admin_request(
+            &cfg,
+            &user_a,
+            AdminRequest::SecretDelete { key: key.clone() },
+        )
+        .await;
+    }
+
+    /// Regression: exec-time secret injection reads from the caller's
+    /// namespace. Another user cannot `--secret X` their way to our X.
+    #[tokio::test]
+    async fn exec_secret_injection_is_isolated_per_uid() {
+        let (mut cfg, _) = make_test_config();
+        cfg.daemon_uid = 777;
+        let key = format!("EXEC_ISO_{}", std::process::id());
+
+        // user_a stores THE secret.
+        cfg.secrets.set(30_000, &key, "alice-value").await.unwrap();
+
+        // user_b asks to inject $key into their exec call.
+        let mut secrets_map = HashMap::new();
+        secrets_map.insert("INJECTED".to_string(), key.clone());
+        let req = ExecuteRequest {
+            binary: "echo".to_string(),
+            args: vec!["hi".to_string()],
+            auth_token: None,
+            env: HashMap::new(),
+            secrets: secrets_map,
+            stream: false,
+            session_token: None,
+        };
+
+        let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 30_001 }).await;
+        // user_b has no such key in their namespace -> secret not found.
+        assert!(!result.policy_allowed());
+        assert!(
+            result.policy_reason().contains("secret not found"),
+            "reason: {}",
+            result.policy_reason()
+        );
+
+        // Cleanup.
+        let _ = cfg.secrets.delete(30_000, &key).await;
+    }
+
+    #[tokio::test]
+    async fn session_list_is_user_visible_but_prompt_is_hidden() {
+        let (mut cfg, _) = make_test_config();
+        cfg.daemon_uid = 777;
+
+        let daemon = CallerIdentity::Unix { uid: 777 };
+        let user = CallerIdentity::Unix { uid: 20_002 };
+        let token = format!("session-{}", std::process::id());
+
+        let grant = handle_admin_request(
+            &cfg,
+            &daemon,
+            AdminRequest::SessionGrant {
+                token: token.clone(),
+                allow: vec!["mkdir /tmp/work/*".into()],
+                deny: Vec::new(),
+                ttl_secs: None,
+                prompt_append: Some("operator-only prompt".into()),
+            },
+        )
+        .await;
+        assert!(matches!(grant, AdminResponse::Ok));
+
+        let listed = handle_admin_request(
+            &cfg,
+            &user,
+            AdminRequest::SessionList {
+                include_history: false,
+                since_unix: None,
+            },
+        )
+        .await;
+        match listed {
+            AdminResponse::SessionList { grants, .. } => {
+                let grant = grants.iter().find(|grant| grant.token == token).is_none();
+                assert!(grant, "non-daemon callers must not receive bearer tokens");
+                let hidden = grants
+                    .iter()
+                    .find(|grant| grant.token == "(hidden)")
+                    .expect("redacted session grant visible to user");
+                assert!(hidden.allow.is_empty());
+                assert!(hidden.deny.is_empty());
+                assert_eq!(hidden.prompt_append.as_deref(), Some("(hidden)"));
+            }
+            other => panic!("unexpected {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_show_reports_recent_stats() {
+        let (mut cfg, _) = make_test_config();
+        cfg.daemon_uid = 777;
+
+        let daemon = CallerIdentity::Unix { uid: 777 };
+        let token = format!("session-show-{}", std::process::id());
+
+        let grant = handle_admin_request(
+            &cfg,
+            &daemon,
+            AdminRequest::SessionGrant {
+                token: token.clone(),
+                allow: vec!["echo*".into()],
+                deny: vec!["rm*".into()],
+                ttl_secs: None,
+                prompt_append: Some("operator context".into()),
+            },
+        )
+        .await;
+        assert!(matches!(grant, AdminResponse::Ok));
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+
+        {
+            let mut reg = cfg.sessions.write().await;
+            reg.record_interaction(
+                &token,
+                SessionInteraction {
+                    at_unix: now.saturating_sub(1),
+                    command: "echo hi".into(),
+                    allowed: true,
+                    source: SessionDecisionSource::Llm,
+                    reason: "safe".into(),
+                    risk: Some(1),
+                    exec_status: SessionExecStatus::Completed,
+                },
+            );
+            reg.record_interaction(
+                &token,
+                SessionInteraction {
+                    at_unix: now,
+                    command: "rm -rf /tmp/x".into(),
+                    allowed: false,
+                    source: SessionDecisionSource::SessionDeny,
+                    reason: "session deny pattern: rm*".into(),
+                    risk: None,
+                    exec_status: SessionExecStatus::NotAttempted,
+                },
+            );
+        }
+
+        let show = handle_admin_request(
+            &cfg,
+            &daemon,
+            AdminRequest::SessionShow {
+                token: token.clone(),
+                limit: Some(1),
+            },
+        )
+        .await;
+        match show {
+            AdminResponse::SessionShow { report } => {
+                assert_eq!(report.stats.total, 2);
+                assert_eq!(report.stats.allowed, 1);
+                assert_eq!(report.stats.denied, 1);
+                assert_eq!(report.stats.risk_histogram[1], 1);
+                assert_eq!(report.recent.len(), 1);
+                assert_eq!(report.recent[0].command, "rm -rf /tmp/x");
+                assert_eq!(
+                    report.active.and_then(|grant| grant.prompt_append),
+                    Some("operator context".into())
+                );
+            }
+            other => panic!("unexpected {:?}", other),
+        }
     }
 }

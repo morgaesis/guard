@@ -1,4 +1,4 @@
-//! In-memory session grant registry.
+//! Session grant registry and reporting model.
 //!
 //! A session is an opaque token the caller includes in `ExecuteRequest`.
 //! Grants attach extra allow/deny glob patterns to that token. Session
@@ -8,18 +8,19 @@
 //! /tmp/work/*", "rm /tmp/work/scratch.txt") without relaxing the
 //! global mode.
 //!
-//! Grants are in-memory only. They clear on daemon restart, matching
-//! the "short-lived extra trust" semantics of sudo timestamps.
+//! The daemon keeps a live in-memory registry for fast decision checks,
+//! while `session_store.rs` persists grants and bounded interaction
+//! history across daemon restarts.
 
 use guard::policy::{Decision, PolicyRule};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Default daemon-side history retention. Anything older than this is
 /// dropped on the next opportunistic purge. 24h matches the "I want
 /// to debug what an agent did yesterday" use case without growing the
-/// in-memory log unboundedly.
+/// persisted interaction history unboundedly.
 pub const DEFAULT_HISTORY_RETENTION_SECS: u64 = 24 * 60 * 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,10 +87,102 @@ pub struct SessionGrantSummary {
     pub prompt_append: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionDecisionSource {
+    SessionAllow,
+    SessionDeny,
+    Llm,
+    StaticPolicy,
+    Validation,
+    EvaluatorError,
+}
+
+impl SessionDecisionSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionAllow => "session_allow",
+            Self::SessionDeny => "session_deny",
+            Self::Llm => "llm",
+            Self::StaticPolicy => "static_policy",
+            Self::Validation => "validation",
+            Self::EvaluatorError => "evaluator_error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionExecStatus {
+    NotAttempted,
+    Completed,
+    Failed,
+    DryRun,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionInteraction {
+    pub at_unix: u64,
+    pub command: String,
+    pub allowed: bool,
+    pub source: SessionDecisionSource,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<i32>,
+    pub exec_status: SessionExecStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionStats {
+    pub total: u64,
+    pub allowed: u64,
+    pub denied: u64,
+    pub completed: u64,
+    pub exec_failed: u64,
+    pub dry_run: u64,
+    pub not_attempted: u64,
+    pub source_counts: BTreeMap<String, u64>,
+    pub risk_histogram: Vec<u64>,
+}
+
+impl Default for SessionStats {
+    fn default() -> Self {
+        Self {
+            total: 0,
+            allowed: 0,
+            denied: 0,
+            completed: 0,
+            exec_failed: 0,
+            dry_run: 0,
+            not_attempted: 0,
+            source_counts: BTreeMap::new(),
+            risk_histogram: vec![0; 11],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<SessionGrantSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<HistoricalGrant>,
+    pub stats: SessionStats,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent: Vec<SessionInteraction>,
+}
+
+#[derive(Debug, Clone)]
+struct StoredSessionInteraction {
+    token: String,
+    interaction: SessionInteraction,
+}
+
+#[derive(Debug, Clone)]
 pub struct SessionRegistry {
     grants: HashMap<String, SessionGrant>,
     history: Vec<HistoricalGrant>,
+    interactions: Vec<StoredSessionInteraction>,
     history_retention_secs: u64,
 }
 
@@ -98,6 +191,7 @@ impl Default for SessionRegistry {
         Self {
             grants: HashMap::new(),
             history: Vec::new(),
+            interactions: Vec::new(),
             history_retention_secs: DEFAULT_HISTORY_RETENTION_SECS,
         }
     }
@@ -111,6 +205,38 @@ impl SessionRegistry {
     pub fn with_history_retention(mut self, secs: u64) -> Self {
         self.history_retention_secs = secs;
         self
+    }
+
+    pub fn from_parts(
+        grants: HashMap<String, SessionGrant>,
+        history: Vec<HistoricalGrant>,
+        interactions: Vec<(String, SessionInteraction)>,
+        history_retention_secs: u64,
+    ) -> Self {
+        Self {
+            grants,
+            history,
+            interactions: interactions
+                .into_iter()
+                .map(|(token, interaction)| StoredSessionInteraction { token, interaction })
+                .collect(),
+            history_retention_secs,
+        }
+    }
+
+    pub fn grants_snapshot(&self) -> HashMap<String, SessionGrant> {
+        self.grants.clone()
+    }
+
+    pub fn history_snapshot(&self) -> Vec<HistoricalGrant> {
+        self.history.clone()
+    }
+
+    pub fn interactions_snapshot(&self) -> Vec<(String, SessionInteraction)> {
+        self.interactions
+            .iter()
+            .map(|entry| (entry.token.clone(), entry.interaction.clone()))
+            .collect()
     }
 
     pub fn grant(&mut self, token: String, mut grant: SessionGrant) {
@@ -180,6 +306,87 @@ impl SessionRegistry {
             .collect()
     }
 
+    pub fn record_interaction(&mut self, token: &str, mut interaction: SessionInteraction) {
+        if interaction.at_unix == 0 {
+            interaction.at_unix = current_unix_secs();
+        }
+        self.interactions.push(StoredSessionInteraction {
+            token: token.to_string(),
+            interaction,
+        });
+    }
+
+    pub fn show(&self, token: &str, limit: usize) -> Option<SessionReport> {
+        let active = self.grants.get(token).and_then(|grant| {
+            if grant.is_expired(current_unix_secs()) {
+                None
+            } else {
+                Some(SessionGrantSummary {
+                    token: token.to_string(),
+                    allow: grant.allow.clone(),
+                    deny: grant.deny.clone(),
+                    expires_at: grant.expires_at,
+                    granted_at: grant.granted_at,
+                    prompt_append: grant.prompt_append.clone(),
+                })
+            }
+        });
+
+        let history: Vec<HistoricalGrant> = self
+            .history
+            .iter()
+            .filter(|entry| entry.token == token)
+            .cloned()
+            .collect();
+
+        let matching: Vec<SessionInteraction> = self
+            .interactions
+            .iter()
+            .filter(|entry| entry.token == token)
+            .map(|entry| entry.interaction.clone())
+            .collect();
+
+        if active.is_none() && history.is_empty() && matching.is_empty() {
+            return None;
+        }
+
+        let mut stats = SessionStats::default();
+        for interaction in &matching {
+            stats.total += 1;
+            if interaction.allowed {
+                stats.allowed += 1;
+            } else {
+                stats.denied += 1;
+            }
+            match interaction.exec_status {
+                SessionExecStatus::Completed => stats.completed += 1,
+                SessionExecStatus::Failed => stats.exec_failed += 1,
+                SessionExecStatus::DryRun => stats.dry_run += 1,
+                SessionExecStatus::NotAttempted => stats.not_attempted += 1,
+            }
+            *stats
+                .source_counts
+                .entry(interaction.source.as_str().to_string())
+                .or_insert(0) += 1;
+            if let Some(risk) = interaction.risk {
+                let bucket = risk.clamp(0, 10) as usize;
+                stats.risk_histogram[bucket] += 1;
+            }
+        }
+
+        let mut recent = matching;
+        if recent.len() > limit {
+            recent = recent.split_off(recent.len() - limit);
+        }
+
+        Some(SessionReport {
+            active,
+            history,
+            stats,
+            recent,
+        })
+    }
+
     /// Return the additive prompt for this session, if the grant exists,
     /// has not expired, and has a prompt attached.
     pub fn prompt_append_for(&self, token: &str) -> Option<String> {
@@ -210,6 +417,8 @@ impl SessionRegistry {
         }
 
         self.history.retain(|h| h.ended_at >= retention_cutoff);
+        self.interactions
+            .retain(|entry| entry.interaction.at_unix >= retention_cutoff);
     }
 
     /// Check whether the session's grants short-circuit the decision.
@@ -508,5 +717,60 @@ mod tests {
         let before = current_unix_secs().saturating_sub(60);
         assert_eq!(reg.list_history(Some(after)).len(), 0);
         assert_eq!(reg.list_history(Some(before)).len(), 1);
+    }
+
+    #[test]
+    fn show_aggregates_recent_interactions_and_risk_histogram() {
+        let mut reg = reg_with("tok", &["cat*"], &["rm*"]);
+        reg.record_interaction(
+            "tok",
+            SessionInteraction {
+                at_unix: 10,
+                command: "cat /tmp/a".into(),
+                allowed: true,
+                source: SessionDecisionSource::Llm,
+                reason: "safe".into(),
+                risk: Some(2),
+                exec_status: SessionExecStatus::Completed,
+            },
+        );
+        reg.record_interaction(
+            "tok",
+            SessionInteraction {
+                at_unix: 11,
+                command: "rm -rf /tmp/a".into(),
+                allowed: false,
+                source: SessionDecisionSource::SessionDeny,
+                reason: "session deny pattern: rm*".into(),
+                risk: None,
+                exec_status: SessionExecStatus::NotAttempted,
+            },
+        );
+        reg.record_interaction(
+            "tok",
+            SessionInteraction {
+                at_unix: 12,
+                command: "echo hi".into(),
+                allowed: true,
+                source: SessionDecisionSource::Llm,
+                reason: "ok".into(),
+                risk: Some(1),
+                exec_status: SessionExecStatus::Failed,
+            },
+        );
+
+        let report = reg.show("tok", 2).expect("session report");
+        assert!(report.active.is_some());
+        assert_eq!(report.stats.total, 3);
+        assert_eq!(report.stats.allowed, 2);
+        assert_eq!(report.stats.denied, 1);
+        assert_eq!(report.stats.completed, 1);
+        assert_eq!(report.stats.exec_failed, 1);
+        assert_eq!(report.stats.not_attempted, 1);
+        assert_eq!(report.stats.risk_histogram[1], 1);
+        assert_eq!(report.stats.risk_histogram[2], 1);
+        assert_eq!(report.recent.len(), 2);
+        assert_eq!(report.recent[0].command, "rm -rf /tmp/a");
+        assert_eq!(report.recent[1].command, "echo hi");
     }
 }

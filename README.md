@@ -122,8 +122,8 @@ Guard walks up from your current directory to `/` looking for `.env` files (clos
 | `SSH_GUARD_MODE` | `readonly` | `readonly`, `safe`, or `paranoid` |
 | `SSH_GUARD_DRY_RUN` | `false` | Evaluate policy but do not execute approved commands. Useful for prompt and policy testing. |
 | `SSH_GUARD_PROMPT_APPEND` | (none) | Path to additive prompt file (appended to base prompt) |
-| `SSH_GUARD_GPG_ID` | (none) | GPG key ID for secret encryption |
-| `SSH_GUARD_BACKEND` | (auto) | Secret backend (`file`, `gpg`) |
+| `SSH_GUARD_GPG_RECIPIENT` | (none) | GPG recipient for the `local` secret backend |
+| `SSH_GUARD_BACKEND` | (auto) | Secret backend (`pass`, `env`, `local`). Auto prefers `pass`; otherwise it falls back to non-persistent `env` and logs a warning. |
 
 The primary model is `openai/gpt-5.4-nano` via OpenRouter by default. Set it
 per-invocation with `--llm-model <slug>`. To configure a true fallback chain
@@ -287,13 +287,25 @@ To grant rules to an existing token (e.g. one the agent already has):
 guard session grant <token> --allow '<glob>' --deny '<glob>' [--ttl N] [--prompt TEXT]
 ```
 
-Matching deny patterns win over allow patterns, and everything that does not match a session rule falls through to the normal evaluator. Grants live in server memory and clear on daemon restart. `guard session list` and `guard session revoke <token>` manage active grants.
+Matching deny patterns win over allow patterns, and everything that does not match a session rule falls through to the normal evaluator. Session grants are persisted in the daemon state database and survive daemon restarts by default. The default path is the XDG state dir (`$XDG_STATE_HOME/guard/state.db` or `~/.local/state/guard/state.db`); override it with `--state-db` or `SSH_GUARD_STATE_DB`. `guard session revoke <token>` is daemon-UID-only; `guard session list` is visible over the Unix socket to exec-allowed local users, but it redacts the bearer token, rule bodies, and prompt text unless the caller is the daemon UID.
+
+For operator forensics, `guard session show <token>` is daemon-UID-only and prints the full prompt, aggregate allow/deny and exec outcome counts, source breakdown (`llm`, `static_policy`, `session_allow`, `session_deny`, `validation`), a risk histogram for LLM-evaluated calls, and a bounded recent interaction log. Those summaries are loaded from the state database, so they remain available after a service restart within the configured retention window.
 
 ## Per-run secret injection
 
 `guard run` can request stored secrets for one approved command without requiring a shim or persistent tool config. The daemon resolves the secret values immediately before exec, injects them into the child environment, and includes those values in exact-match output redaction.
 
-`guard secrets add/list/remove` are daemon admin operations. The client sends the request to the configured guard server; only the daemon reads or writes the configured secret backend.
+`guard secrets add/list/remove` are Unix-socket-only, per-user operations. Any exec-allowed local user can manage their own secret namespace; TCP clients cannot use secret storage or `--secret`, because the namespace is keyed from Unix peer credentials. When the daemon UID runs `guard secrets list`, it gets an aggregate names-only view across every UID namespace; duplicate key names can appear more than once and are intentionally not annotated with ownership in the default list output.
+
+For daemon-side migration and cleanup, use `guard secrets list --detailed` as the daemon UID. That view includes `uid=` for namespaced entries and `origin=legacy` for pre-namespace flat secrets that still need operator migration.
+
+Upgrade note: pre-namespace flat secrets are no longer served through normal per-user `guard secrets list` / `guard run --secret` paths. Migrate them before rollout:
+
+- `pass`: move `guard/<key>` to `guard/u<uid>/<key>`
+- `env`: rename `GUARD_SECRET_<KEY>` to `GUARD_SECRET_U<uid>_<KEY>`
+- `local`: rewrite the flat YAML `{ KEY: value }` into `{ <uid>: { KEY: value } }`
+
+After migration, verify with `guard secrets list` as the target user and `guard run --secret KEY ...`.
 
 For a stored secret with a shell-safe name, `--secret NAME` injects `$NAME`:
 
@@ -327,11 +339,17 @@ guard run --env OPNSENSE_HOST=opnsense-host --secret OPNSENSE_API_KEY \
 
 ## Admin authorization
 
-Session admin RPCs (`session new` / `grant` / `revoke` / `list`, plus the privileged subset of `status`) are restricted to **the daemon's own UID**. There is no client-side admin token, by design — without that separation, any exec-allowed UID could mint a session whose `--prompt` tells the model to approve everything, a trivial bypass.
+Session admin RPCs (`session new` / `grant` / `revoke`, plus the privileged subset of `status`) are restricted to **the daemon's own UID**. `session list` is the exception: exec-allowed local Unix-socket callers may see that grants exist, when they were granted, and when they expire, but the daemon redacts the session token, allow/deny patterns, and prompt text unless the caller is the daemon UID. There is no client-side admin token, by design — without that separation, any exec-allowed UID could mint a session whose `--prompt` tells the model to approve everything, a trivial bypass.
 
 The non-privileged `guard status` (run as your normal user or any other exec-allowed UID) returns only client + server version, uptime, evaluation mode, and dry-run state. It is a liveness probe — enough to confirm the connection works and what mode the evaluator is in, but nothing that would help fingerprint the deployment or escalate privilege.
 
 The `--prompt` / `--prompt-file` flags attach a free-form context fragment that is appended to the LLM system prompt under a `Session context:` heading for evaluator calls made under that token. Use them for guidance the static glob patterns cannot express. The decision cache is bypassed when a session prompt is in play, because cached verdicts were made under the base prompt and may not hold under the extended context.
+
+Because grants are now durable, broad sessions deserve the same care as any other persistent authorization state. Prefer explicit TTLs for elevated sessions, and treat `allow=["*"]` as an operator override that must be revoked intentionally rather than something a daemon restart will clear for you.
+
+## Execution identity
+
+By default the daemon executes approved commands as its own service identity. If you want guard to act as a local secret broker and redactor for per-user files such as `~/.aws/config` or `~/.cmk/config`, start a root-owned daemon with `--exec-as-caller` and only a Unix socket listener. In that mode guard authenticates the caller by Unix peer credentials and drops the child process to that UID before exec, so the command runs with the caller's filesystem access instead of the daemon's or root's. TCP listeners are intentionally incompatible with this mode because a token is not a trustworthy local UID.
 
 ## Agent integration
 
@@ -355,6 +373,22 @@ The server exposes a `guard_run` tool:
 }
 ```
 
+Optional per-call environment and secret references mirror `guard run`:
+
+```json
+{
+  "binary": "sh",
+  "args": ["-lc", "[ -n \"$OPNSENSE_APIKEY_SECRET\" ] && echo set"],
+  "secrets": ["opnsense-apikey-secret"],
+  "secretEnv": {
+    "OPNSENSE_API_KEY": "atlas/opnsense-apikey"
+  },
+  "env": {
+    "TARGET_HOST": "opnsense-prod"
+  }
+}
+```
+
 Response:
 
 ```json
@@ -367,7 +401,7 @@ Response:
 }
 ```
 
-Denied commands return `isError: true` with the denial reason, so the agent can revise the command.
+Denied commands return a normal MCP tool result with `allowed: false` and the denial reason. Transport or daemon failures still use `isError: true`.
 
 <details>
 <summary><b>Claude Code (CLAUDE.md)</b></summary>
@@ -435,6 +469,8 @@ LLM token usage is logged per evaluation:
 ```
 [LLM_USAGE] model=openai/gpt-5.4-nano attempt=1 prompt_tokens=3594 completion_tokens=47 total_tokens=3641 status=ok
 ```
+
+For this local deployment model, the audit source of truth is the daemon's structured `tracing` output, typically collected by journald. The SQLite state database is for session state and queryable session history, not for replacing your log pipeline. `guard session show` is an operator view over that persisted session history; it should complement journald, not replace it.
 
 ## Limitations
 
