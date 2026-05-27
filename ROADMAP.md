@@ -10,6 +10,7 @@
 - Additive prompt support (`--system-prompt-append`) for environment-specific customization.
 - MCP stdio server (`guard mcp serve`) for agent tool integration.
 - MCP end-to-end integration test (`tests/mcp_integration.rs`) covering the stdio server against a live guard daemon.
+- MCP response UX: approved tool calls omit policy chatter, denied commands come back as normal tool results (`allowed: false`) instead of MCP transport errors, and named secret references can be passed through MCP without exposing secret values to the client.
 - Token usage tracking and audit logging via `tracing`, with POLICY and EXEC_FAILED events split so `[AUDIT] DENIED` no longer masks exec-time `ENOENT` failures.
 - Function-calling primary path with `openai/gpt-5.4-nano` as the default model (100% accuracy on the 45-case benchmark, ~2.6x cheaper and ~39% faster than the previous Gemini 3 Flash baseline).
 - Configurable retries per model via `--llm-retries` / `SSH_GUARD_LLM_RETRIES` (1-2, default 2).
@@ -29,11 +30,22 @@
 - Pre-LLM executable validation rejects unknown binaries, preventing natural-language command text from being approved as harmless prose (opt-in via `--preflight`).
 - Compiled credential preflight denies known credential-disclosure paths and tool side-channels before execution (opt-in via `--preflight`; default off because heuristics over-match on benign `kubectl set env` / `jsonpath=...env...` workflows).
 - Per-run env and secret injection for `guard run` / `guard server connect`: callers can pass `--secret ENV_VAR` or `--secret ENV_VAR=secret-name`; the daemon resolves secret values just before exec and redacts them from streamed output.
+- Pre-LLM injection validation now rejects invalid env names, missing secrets, misleading dashed shell references like `$opnsense-apikey-secret`, and same-env collisions between `--env` and `--secret` before evaluator approval.
 - Session grants: `guard session grant <token> --allow <glob> --deny <glob> [--ttl N] [--prompt TEXT|--prompt-file PATH]` attaches per-session allow/deny overlays that short-circuit the evaluator for matching commands, plus an optional additive prompt fragment that the evaluator appends to the system prompt for that session's calls. Agents opt in by setting `GUARD_SESSION` before `guard run`. Cache is bypassed when a session prompt is in play.
+- Session persistence and observability: the daemon now persists session grants, historical grant transitions, and bounded session interaction history in a local SQLite state database (`--state-db` / `SSH_GUARD_STATE_DB`, defaulting to the XDG state dir). `guard session show <token>` reports allow/deny and exec outcome counts, source breakdown, and an LLM risk histogram across that persisted history.
+- Caller execution identity: root-owned Unix-socket daemons can opt into `--exec-as-caller` so approved commands run as the connecting UID instead of the daemon identity.
 
 - LLM decision cache: in-memory TTL-bounded cache keyed on the exact command line. A command approved or denied once returns from cache on subsequent requests without another LLM call, within `--cache-ttl` seconds and `--cache-capacity` entries. Cache is bound to the Evaluator lifetime, so prompt changes force a fresh cache. Disable with `--no-cache` / `SSH_GUARD_CACHE=false`.
 
 ## Next
+
+- Pluggable secret backends via the existing `SecretBackend` trait in `src/secrets.rs`. Two new variants:
+  - `BackendType::Infisical` — fetch via the Infisical CLI (`infisical secrets get/list`) using a Universal Auth machine identity, or via the HTTP API directly. Selected via `SSH_GUARD_BACKEND=infisical`.
+  - `BackendType::Vault` — fetch via the HashiCorp Vault HTTP API using `VAULT_ADDR` + AppRole or token auth, with KV v2 as the default mount. Selected via `SSH_GUARD_BACKEND=vault`.
+
+  Same `get` / `list` / `set` / `delete` semantics as `pass`, `env`, `local`. Per-user namespacing (`u<uid>/<key>`) maps to a path prefix in the backend.
+
+- Unify the daemon's own startup secret (currently `SSH_GUARD_LLM_API_KEY` read from process env) onto the same `SecretBackend` trait. The server reads its own LLM key as if it were a secret owned by a sentinel daemon UID (e.g. uid 0 or a configurable `SSH_GUARD_SERVER_UID`), so it reuses the existing fetch / cache / redaction plumbing instead of bespoke env-var loading. Removes the need for external `infisical run` / `vault agent` wrappers around `guard server start`.
 
 - Interactive approval chat per session: conversational context with the operator that lets guard make context-aware decisions beyond per-command stateless evaluation.
 - Pre-LLM validation for secret injection requests: invalid env names, missing secrets, and misleading shell references to invalid env names should fail before evaluator approval.

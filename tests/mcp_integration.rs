@@ -29,6 +29,7 @@ policy:
       - "whoami"
       - "hostname"
       - "echo*"
+      - "sh*"
     deny:
       - "rm*"
       - "cat /etc/shadow*"
@@ -59,6 +60,7 @@ async fn start_daemon(tmp: &TempDir) -> (DaemonGuard, std::path::PathBuf) {
     let socket_path = tmp.path().join("guard.sock");
     let policy_path = tmp.path().join("policy.yaml");
     std::fs::write(&policy_path, POLICY_YAML).expect("write policy yaml");
+    let test_secret_env = format!("GUARD_SECRET_U{}_mcp-test-secret", current_uid());
 
     let child = Command::new(GUARD_BIN)
         .args(["server", "start", "--no-llm", "--policy"])
@@ -67,6 +69,8 @@ async fn start_daemon(tmp: &TempDir) -> (DaemonGuard, std::path::PathBuf) {
         .arg(&socket_path)
         .env("HOME", tmp.path())
         .env("XDG_CONFIG_HOME", tmp.path())
+        .env("SSH_GUARD_BACKEND", "env")
+        .env(&test_secret_env, "test-value")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -76,6 +80,20 @@ async fn start_daemon(tmp: &TempDir) -> (DaemonGuard, std::path::PathBuf) {
 
     wait_for_socket(&socket_path).await;
     (DaemonGuard { child }, socket_path)
+}
+
+fn current_uid() -> u32 {
+    let status = std::fs::read_to_string("/proc/self/status").expect("read /proc/self/status");
+    let uid_line = status
+        .lines()
+        .find(|line| line.starts_with("Uid:"))
+        .expect("Uid line present");
+    uid_line
+        .split_whitespace()
+        .nth(1)
+        .expect("real uid field present")
+        .parse()
+        .expect("uid parses")
 }
 
 struct McpClient {
@@ -208,7 +226,7 @@ async fn mcp_end_to_end_initialize_list_call() {
             }),
         )
         .await;
-    assert_eq!(denied["result"]["isError"], true);
+    assert_eq!(denied["result"]["isError"], false);
     let denied_structured = &denied["result"]["structuredContent"];
     assert_eq!(denied_structured["allowed"], false);
     let reason = denied_structured["reason"].as_str().unwrap_or("");
@@ -217,10 +235,30 @@ async fn mcp_end_to_end_initialize_list_call() {
         "denied response should include a non-empty reason"
     );
 
-    // 5. tools/call against an unknown tool name
-    let unknown = mcp
+    // 5. tools/call with server-side secret injection
+    let injected = mcp
         .rpc(
             5,
+            "tools/call",
+            json!({
+                "name": "guard_run",
+                "arguments": {
+                    "binary": "sh",
+                    "args": ["-lc", "[ -n \"$MCP_TEST_SECRET\" ] && echo set"],
+                    "secrets": ["mcp-test-secret"]
+                }
+            }),
+        )
+        .await;
+    assert_eq!(injected["result"]["isError"], false);
+    let injected_structured = &injected["result"]["structuredContent"];
+    assert_eq!(injected_structured["allowed"], true);
+    assert_eq!(injected_structured["stdout"], "set\n");
+
+    // 6. tools/call against an unknown tool name
+    let unknown = mcp
+        .rpc(
+            6,
             "tools/call",
             json!({
                 "name": "not_a_tool",

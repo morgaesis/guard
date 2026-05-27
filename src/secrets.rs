@@ -1,10 +1,16 @@
 //! Secret broker for managing sensitive credentials across multiple backends.
 //!
-//! This module provides a unified interface for storing and retrieving secrets
-//! from various backends (pass, environment variables, encrypted local files).
+//! Secrets are stored per-UID: each caller has its own private namespace
+//! keyed by key name. Two users can reuse the same key name (e.g.
+//! `OPNSENSE_API_KEY`) without collision, and one user cannot read, list,
+//! overwrite, or delete another user's secrets. The daemon UID has a
+//! separate admin-only `list_all` entry point that returns the full
+//! (uid, key) set for observability; it still cannot read another user's
+//! values through the normal `get` path (which requires the owning UID).
 
 use anyhow::{bail, Result};
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::ffi::OsStr;
@@ -17,14 +23,24 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command as AsyncCommand;
 use tokio::sync::RwLock;
 
-/// Directory within pass where secrets are stored.
+/// Directory within pass where secrets are stored. Entries live at
+/// `guard/u<uid>/<key>` so one user's secrets cannot collide with
+/// another's.
 const PASS_PREFIX: &str = "guard/";
 
-/// Prefix for environment variable secrets.
+/// Prefix for environment variable secrets. Full form is
+/// `GUARD_SECRET_U<uid>_<KEY>`.
 const ENV_PREFIX: &str = "GUARD_SECRET_";
 
 /// Filename for the local encrypted secrets file.
 const SECRETS_FILE: &str = "secrets.yaml";
+pub const LEGACY_UID_SENTINEL: u32 = u32::MAX;
+type NamespacedSecretKey = (u32, String);
+type PassStoreEntries = (Vec<NamespacedSecretKey>, Vec<String>);
+
+fn uid_segment(uid: u32) -> String {
+    format!("u{}", uid)
+}
 
 /// Trait for secret storage backends.
 ///
@@ -34,17 +50,23 @@ pub trait SecretBackend: Send + Sync {
     /// Returns the backend name for logging/debugging.
     fn name(&self) -> &str;
 
-    /// Retrieve a secret by key.
-    async fn get(&self, key: &str) -> Result<Option<String>>;
+    /// Retrieve a secret by (uid, key).
+    async fn get(&self, uid: u32, key: &str) -> Result<Option<String>>;
 
-    /// List all secret keys.
-    async fn list(&self) -> Result<Vec<String>>;
+    /// List secret keys owned by `uid`.
+    async fn list(&self, uid: u32) -> Result<Vec<String>>;
 
-    /// Store a secret.
-    async fn set(&self, key: &str, value: &str) -> Result<()>;
+    /// Admin view: list every (uid, key) pair in the store. The daemon
+    /// uses this for its aggregate `secrets list`. Backends that cannot
+    /// enumerate by UID (env backend) should still return everything
+    /// they can recover.
+    async fn list_all(&self) -> Result<Vec<(u32, String)>>;
 
-    /// Delete a secret.
-    async fn delete(&self, key: &str) -> Result<()>;
+    /// Store a secret under `uid`.
+    async fn set(&self, uid: u32, key: &str, value: &str) -> Result<()>;
+
+    /// Delete a secret owned by `uid`.
+    async fn delete(&self, uid: u32, key: &str) -> Result<()>;
 }
 
 // ---------------------------------------------------------------------------
@@ -54,19 +76,49 @@ pub trait SecretBackend: Send + Sync {
 /// Secret backend backed by the unix `pass` password manager.
 #[derive(Debug, Clone)]
 pub struct PassBackend {
-    gpg_id: Option<String>,
+    store_dir: Option<PathBuf>,
 }
 
 impl PassBackend {
     /// Create a new PassBackend.
     ///
-    /// If `gpg_id` is provided, it will be passed to `pass insert --multifile`.
-    pub fn new(gpg_id: Option<String>) -> Self {
-        Self { gpg_id }
+    pub fn new() -> Self {
+        Self {
+            store_dir: password_store_dir(),
+        }
     }
 
-    fn pass_path(&self, key: &str) -> String {
+    fn pass_path(&self, uid: u32, key: &str) -> String {
+        format!("{}{}/{}", PASS_PREFIX, uid_segment(uid), key)
+    }
+
+    fn legacy_pass_path(&self, key: &str) -> String {
         format!("{}{}", PASS_PREFIX, key)
+    }
+
+    fn store_dir(&self) -> Option<&Path> {
+        self.store_dir.as_deref()
+    }
+
+    async fn get_entry(&self, path: &str) -> Result<Option<String>> {
+        let mut cmd = AsyncCommand::new("pass");
+        cmd.arg("show").arg(path);
+        if let Some(store_dir) = self.store_dir() {
+            cmd.env("PASSWORD_STORE_DIR", store_dir);
+        }
+        let output = cmd.output().await?;
+
+        if !output.status.success() {
+            if output.status.code() == Some(1) {
+                return Ok(None);
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("pass show {} failed: {}", path, stderr.trim());
+        }
+
+        Ok(Some(
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        ))
     }
 
     async fn run_pass<I, S>(&self, args: I) -> Result<()>
@@ -76,6 +128,9 @@ impl PassBackend {
     {
         let mut cmd = AsyncCommand::new("pass");
         cmd.args(args);
+        if let Some(store_dir) = self.store_dir() {
+            cmd.env("PASSWORD_STORE_DIR", store_dir);
+        }
 
         let output = cmd.output().await?;
 
@@ -88,60 +143,86 @@ impl PassBackend {
     }
 }
 
-fn parse_flat_pass_list(stdout: &str) -> Vec<String> {
-    let mut keys = Vec::new();
-    for line in stdout.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let key = line
-            .strip_prefix(PASS_PREFIX)
-            .unwrap_or(line)
-            .trim_end_matches('/');
-        if !key.is_empty() {
-            keys.push(key.to_string());
-        }
-    }
-    keys.sort();
-    keys.dedup();
-    keys
+fn password_store_dir() -> Option<PathBuf> {
+    env::var_os("PASSWORD_STORE_DIR")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".password-store")))
 }
 
-fn parse_tree_pass_list(stdout: &str) -> Vec<String> {
-    let mut keys = Vec::new();
-    for line in stdout.lines() {
-        let line = line.trim();
-        if line.is_empty()
-            || line.starts_with("Password Store")
-            || line.starts_with("Passwords")
-            || line == PASS_PREFIX.trim_end_matches('/')
-        {
+fn pass_store_initialized() -> bool {
+    password_store_dir()
+        .map(|dir| dir.join(".gpg-id").is_file())
+        .unwrap_or(false)
+}
+
+fn collect_pass_entries(
+    namespace_root: &Path,
+    dir: &Path,
+    namespaced: &mut Vec<NamespacedSecretKey>,
+    legacy: &mut Vec<String>,
+) -> Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_pass_entries(namespace_root, &path, namespaced, legacy)?;
+            continue;
+        }
+        if !file_type.is_file() || path.extension() != Some(OsStr::new("gpg")) {
             continue;
         }
 
-        let cleaned = line
-            .trim_start_matches(|c: char| {
-                c.is_whitespace() || matches!(c, '├' | '└' | '│' | '─' | '┬' | '┼' | ' ' | '\t')
-            })
-            .trim();
-        if cleaned.is_empty() || cleaned == PASS_PREFIX.trim_end_matches('/') {
+        let rel = match path.strip_prefix(namespace_root) {
+            Ok(rel) => rel,
+            Err(_) => continue,
+        };
+        let components: Vec<String> = rel
+            .iter()
+            .map(|part| part.to_string_lossy().to_string())
+            .collect();
+        let mut key_parts = components.clone();
+        let Some(last) = key_parts.last_mut() else {
             continue;
+        };
+        if let Some(stem) = last.strip_suffix(".gpg") {
+            *last = stem.to_string();
         }
-
-        let key = cleaned
-            .split_whitespace()
-            .next()
-            .unwrap_or(cleaned)
-            .trim_end_matches('/');
-        let key = key.strip_prefix(PASS_PREFIX).unwrap_or(key);
+        if let Some(uid_str) = components[0].strip_prefix('u') {
+            if let Ok(uid) = uid_str.parse::<u32>() {
+                let key = key_parts[1..].join("/");
+                if !key.is_empty() {
+                    namespaced.push((uid, key));
+                }
+                continue;
+            }
+        }
+        let key = key_parts.join("/");
         if !key.is_empty() {
-            keys.push(key.to_string());
+            legacy.push(key);
         }
     }
-    keys.sort();
-    keys.dedup();
-    keys
+    Ok(())
+}
+
+fn list_pass_store_entries(store_dir: &Path) -> Result<PassStoreEntries> {
+    let namespace_root = store_dir.join(PASS_PREFIX.trim_end_matches('/'));
+    if !namespace_root.exists() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let mut namespaced = Vec::new();
+    let mut legacy = Vec::new();
+    collect_pass_entries(
+        &namespace_root,
+        &namespace_root,
+        &mut namespaced,
+        &mut legacy,
+    )?;
+    namespaced.sort();
+    namespaced.dedup();
+    legacy.sort();
+    legacy.dedup();
+    Ok((namespaced, legacy))
 }
 
 #[async_trait]
@@ -150,68 +231,42 @@ impl SecretBackend for PassBackend {
         "pass"
     }
 
-    async fn get(&self, key: &str) -> Result<Option<String>> {
-        let path = self.pass_path(key);
-
-        let output = AsyncCommand::new("pass")
-            .arg("show")
-            .arg(&path)
-            .output()
-            .await?;
-
-        if !output.status.success() {
-            // pass returns exit code 1 when the entry doesn't exist
-            if output.status.code() == Some(1) {
-                return Ok(None);
-            }
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("pass show {} failed: {}", path, stderr.trim());
-        }
-
-        // pass outputs the secret followed by a newline; trim it
-        let secret = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        Ok(Some(secret))
+    async fn get(&self, uid: u32, key: &str) -> Result<Option<String>> {
+        self.get_entry(&self.pass_path(uid, key)).await
     }
 
-    async fn list(&self) -> Result<Vec<String>> {
-        let flat_output = AsyncCommand::new("pass")
-            .args(["ls", "--flat", PASS_PREFIX])
-            .output()
-            .await?;
-        if flat_output.status.success() {
-            return Ok(parse_flat_pass_list(&String::from_utf8_lossy(
-                &flat_output.stdout,
-            )));
-        }
-
-        let output = AsyncCommand::new("pass")
-            .args(["ls", PASS_PREFIX])
-            .output()
-            .await?;
-
-        if !output.status.success() {
-            // Empty directory returns exit code 1
-            if output.status.code() == Some(1) {
-                return Ok(Vec::new());
-            }
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("pass ls {} failed: {}", PASS_PREFIX, stderr.trim());
-        }
-
-        Ok(parse_tree_pass_list(&String::from_utf8_lossy(
-            &output.stdout,
-        )))
+    async fn list(&self, uid: u32) -> Result<Vec<String>> {
+        let Some(store_dir) = self.store_dir() else {
+            return Ok(Vec::new());
+        };
+        let (namespaced, _) = list_pass_store_entries(store_dir)?;
+        let mut keys: Vec<String> = namespaced
+            .into_iter()
+            .filter_map(|(entry_uid, key)| if entry_uid == uid { Some(key) } else { None })
+            .collect();
+        keys.sort();
+        keys.dedup();
+        Ok(keys)
     }
 
-    async fn set(&self, key: &str, value: &str) -> Result<()> {
-        let path = self.pass_path(key);
+    async fn list_all(&self) -> Result<Vec<(u32, String)>> {
+        let Some(store_dir) = self.store_dir() else {
+            return Ok(Vec::new());
+        };
+        let (mut namespaced, legacy) = list_pass_store_entries(store_dir)?;
+        namespaced.extend(legacy.into_iter().map(|key| (LEGACY_UID_SENTINEL, key)));
+        namespaced.sort();
+        namespaced.dedup();
+        Ok(namespaced)
+    }
 
-        // Pipe the secret value via stdin to avoid shell injection
+    async fn set(&self, uid: u32, key: &str, value: &str) -> Result<()> {
+        let path = self.pass_path(uid, key);
+
         let mut cmd = AsyncCommand::new("pass");
         cmd.args(["insert", "--force", "--multiline", &path]);
-
-        if let Some(ref gpg_id) = self.gpg_id {
-            cmd.args(["--gpg-id", gpg_id]);
+        if let Some(store_dir) = self.store_dir() {
+            cmd.env("PASSWORD_STORE_DIR", store_dir);
         }
 
         cmd.stdin(std::process::Stdio::piped())
@@ -220,9 +275,7 @@ impl SecretBackend for PassBackend {
 
         let mut child = cmd.spawn()?;
         if let Some(mut stdin) = child.stdin.take() {
-            use tokio::io::AsyncWriteExt;
             stdin.write_all(value.as_bytes()).await?;
-            // close stdin so pass knows the input is done
         }
 
         let output = child.wait_with_output().await?;
@@ -235,23 +288,20 @@ impl SecretBackend for PassBackend {
         Ok(())
     }
 
-    async fn delete(&self, key: &str) -> Result<()> {
-        let path = self.pass_path(key);
-
+    async fn delete(&self, uid: u32, key: &str) -> Result<()> {
+        let path = self.pass_path(uid, key);
         let mut cmd = AsyncCommand::new("pass");
         cmd.args(["rm", "-f", &path]);
+        if let Some(store_dir) = self.store_dir() {
+            cmd.env("PASSWORD_STORE_DIR", store_dir);
+        }
 
         let output = cmd.output().await?;
 
-        if !output.status.success() {
-            // pass rm returns exit code 1 if the entry doesn't exist
-            if output.status.code() == Some(1) {
-                return Ok(());
-            }
+        if !output.status.success() && output.status.code() != Some(1) {
             let stderr = String::from_utf8_lossy(&output.stderr);
             bail!("pass rm {} failed: {}", path, stderr.trim());
         }
-
         Ok(())
     }
 }
@@ -260,10 +310,8 @@ impl SecretBackend for PassBackend {
 // EnvBackend
 // ---------------------------------------------------------------------------
 
-/// Secret backend backed by environment variables.
-///
-/// Secrets are stored with `GUARD_SECRET_` prefix.
-/// For example, `GUARD_SECRET_API_KEY` exposes the key `API_KEY`.
+/// Secret backend backed by environment variables. Layout is
+/// `GUARD_SECRET_U<uid>_<KEY>`.
 #[derive(Debug, Clone)]
 pub struct EnvBackend {
     _priv: (),
@@ -274,8 +322,16 @@ impl EnvBackend {
         Self { _priv: () }
     }
 
-    fn env_key(secret_key: &str) -> String {
+    fn env_key(uid: u32, secret_key: &str) -> String {
+        format!("{}U{}_{}", ENV_PREFIX, uid, secret_key)
+    }
+
+    fn legacy_env_key(secret_key: &str) -> String {
         format!("{}{}", ENV_PREFIX, secret_key)
+    }
+
+    fn user_prefix(uid: u32) -> String {
+        format!("{}U{}_", ENV_PREFIX, uid)
     }
 }
 
@@ -291,33 +347,52 @@ impl SecretBackend for EnvBackend {
         "env"
     }
 
-    async fn get(&self, key: &str) -> Result<Option<String>> {
-        let env_key = Self::env_key(key);
-        Ok(env::var(&env_key).ok())
+    async fn get(&self, uid: u32, key: &str) -> Result<Option<String>> {
+        Ok(env::var(Self::env_key(uid, key)).ok())
     }
 
-    async fn list(&self) -> Result<Vec<String>> {
+    async fn list(&self, uid: u32) -> Result<Vec<String>> {
+        let prefix = Self::user_prefix(uid);
         let mut keys = Vec::new();
-
         for (env_key, _) in env::vars() {
-            if let Some(key) = env_key.strip_prefix(ENV_PREFIX) {
+            if let Some(key) = env_key.strip_prefix(&prefix) {
                 keys.push(key.to_string());
             }
         }
-
         keys.sort();
+        keys.dedup();
         Ok(keys)
     }
 
-    async fn set(&self, key: &str, value: &str) -> Result<()> {
-        let env_key = Self::env_key(key);
-        env::set_var(&env_key, value);
+    async fn list_all(&self) -> Result<Vec<(u32, String)>> {
+        let mut out = Vec::new();
+        for (env_key, _) in env::vars() {
+            if let Some(rest) = env_key.strip_prefix(ENV_PREFIX) {
+                if let Some(after_u) = rest.strip_prefix('U') {
+                    if let Some((uid_str, key)) = after_u.split_once('_') {
+                        if let Ok(uid) = uid_str.parse::<u32>() {
+                            if !key.is_empty() {
+                                out.push((uid, key.to_string()));
+                            }
+                        }
+                    }
+                } else if !rest.is_empty() {
+                    out.push((LEGACY_UID_SENTINEL, rest.to_string()));
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
+    async fn set(&self, uid: u32, key: &str, value: &str) -> Result<()> {
+        env::set_var(Self::env_key(uid, key), value);
         Ok(())
     }
 
-    async fn delete(&self, key: &str) -> Result<()> {
-        let env_key = Self::env_key(key);
-        env::remove_var(&env_key);
+    async fn delete(&self, uid: u32, key: &str) -> Result<()> {
+        env::remove_var(Self::env_key(uid, key));
         Ok(())
     }
 }
@@ -327,19 +402,22 @@ impl SecretBackend for EnvBackend {
 // ---------------------------------------------------------------------------
 
 /// Secret backend backed by an encrypted YAML file.
-///
-/// The file is encrypted using GPG or a passphrase from stdin.
-/// Falls back to prompting for a passphrase if no GPG key is configured.
+/// The on-disk shape is `{ <uid>: { <key>: <value> } }`.
 #[derive(Debug, Clone)]
 pub struct LocalBackend {
     path: PathBuf,
     gpg_recipient: Option<String>,
 }
 
+type LocalStore = HashMap<u32, HashMap<String, String>>;
+type LegacyLocalStore = HashMap<String, String>;
+
+enum LocalStoreVariant {
+    Namespaced(LocalStore),
+    Legacy(LegacyLocalStore),
+}
+
 impl LocalBackend {
-    /// Create a new LocalBackend.
-    ///
-    /// The secrets file is stored at `~/.config/guard/secrets.yaml.gpg`.
     pub fn new() -> Result<Self> {
         let config_dir = dirs::config_dir()
             .ok_or_else(|| anyhow::anyhow!("could not determine config directory"))?;
@@ -351,7 +429,6 @@ impl LocalBackend {
         })
     }
 
-    /// Create a LocalBackend with an explicit path.
     pub fn with_path(path: PathBuf) -> Self {
         Self {
             path,
@@ -359,7 +436,6 @@ impl LocalBackend {
         }
     }
 
-    /// Set the GPG recipient for encryption.
     pub fn with_gpg_recipient(mut self, recipient: String) -> Self {
         self.gpg_recipient = Some(recipient);
         self
@@ -369,14 +445,13 @@ impl LocalBackend {
         PathBuf::from(format!("{}.gpg", self.path.display()))
     }
 
-    async fn load_secrets(&self) -> Result<HashMap<String, String>> {
+    async fn load_store_variant(&self) -> Result<LocalStoreVariant> {
         let encrypted = self.encrypted_path();
 
         if !encrypted.exists() {
-            return Ok(HashMap::new());
+            return Ok(LocalStoreVariant::Namespaced(HashMap::new()));
         }
 
-        // Decrypt with gpg
         let output = if let Some(ref recipient) = self.gpg_recipient {
             AsyncCommand::new("gpg")
                 .args(["--decrypt", "--recipient", recipient, "--quiet"])
@@ -392,27 +467,32 @@ impl LocalBackend {
         };
 
         if !output.status.success() {
-            // Likely a bad passphrase or no GPG setup; return empty
             tracing::debug!("could not decrypt secrets file: {:?}", output.status);
-            return Ok(HashMap::new());
+            return Ok(LocalStoreVariant::Namespaced(HashMap::new()));
         }
 
         let content = String::from_utf8_lossy(&output.stdout);
-        let secrets: HashMap<String, String> = serde_yaml::from_str(&content).unwrap_or_default();
-
-        Ok(secrets)
+        if let Ok(store) = serde_yaml::from_str::<LocalStore>(&content) {
+            return Ok(LocalStoreVariant::Namespaced(store));
+        }
+        if let Ok(store) = serde_yaml::from_str::<LegacyLocalStore>(&content) {
+            return Ok(LocalStoreVariant::Legacy(store));
+        }
+        bail!("failed to parse secrets file {}", encrypted.display())
     }
 
-    async fn save_secrets(&self, secrets: &HashMap<String, String>) -> Result<()> {
+    async fn save_store_variant(&self, secrets: &LocalStoreVariant) -> Result<()> {
         let parent = self.path.parent();
         if let Some(parent) = parent {
             fs::create_dir_all(parent)?;
         }
 
-        let content = serde_yaml::to_string(secrets)?;
+        let content = match secrets {
+            LocalStoreVariant::Namespaced(store) => serde_yaml::to_string(store)?,
+            LocalStoreVariant::Legacy(store) => serde_yaml::to_string(store)?,
+        };
 
         if let Some(ref recipient) = self.gpg_recipient {
-            // Encrypt with recipient using symmetric stdin pipe
             let mut child = AsyncCommand::new("gpg")
                 .args(["--encrypt", "--recipient", recipient, "--quiet", "-o"])
                 .arg(self.encrypted_path())
@@ -429,7 +509,6 @@ impl LocalBackend {
                 bail!("gpg encryption failed");
             }
         } else {
-            // Use symmetric encryption with passphrase from stdin
             let mut child = AsyncCommand::new("gpg")
                 .args(["--symmetric", "--cipher-algo", "AES256", "--quiet", "-o"])
                 .arg(self.encrypted_path())
@@ -463,28 +542,77 @@ impl SecretBackend for LocalBackend {
         "local"
     }
 
-    async fn get(&self, key: &str) -> Result<Option<String>> {
-        let secrets = self.load_secrets().await?;
-        Ok(secrets.get(key).cloned())
+    async fn get(&self, uid: u32, key: &str) -> Result<Option<String>> {
+        match self.load_store_variant().await? {
+            LocalStoreVariant::Namespaced(store) => {
+                Ok(store.get(&uid).and_then(|m| m.get(key)).cloned())
+            }
+            LocalStoreVariant::Legacy(_) => Ok(None),
+        }
     }
 
-    async fn list(&self) -> Result<Vec<String>> {
-        let secrets = self.load_secrets().await?;
-        let mut keys: Vec<_> = secrets.keys().cloned().collect();
+    async fn list(&self, uid: u32) -> Result<Vec<String>> {
+        let mut keys: Vec<String> = match self.load_store_variant().await? {
+            LocalStoreVariant::Namespaced(store) => store
+                .get(&uid)
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default(),
+            LocalStoreVariant::Legacy(_) => Vec::new(),
+        };
         keys.sort();
+        keys.dedup();
         Ok(keys)
     }
 
-    async fn set(&self, key: &str, value: &str) -> Result<()> {
-        let mut secrets = self.load_secrets().await?;
-        secrets.insert(key.to_string(), value.to_string());
-        self.save_secrets(&secrets).await
+    async fn list_all(&self) -> Result<Vec<(u32, String)>> {
+        let mut out: Vec<(u32, String)> = match self.load_store_variant().await? {
+            LocalStoreVariant::Namespaced(store) => store
+                .iter()
+                .flat_map(|(uid, m)| m.keys().map(move |k| (*uid, k.clone())))
+                .collect(),
+            LocalStoreVariant::Legacy(store) => store
+                .keys()
+                .cloned()
+                .map(|k| (LEGACY_UID_SENTINEL, k))
+                .collect(),
+        };
+        out.sort();
+        out.dedup();
+        Ok(out)
     }
 
-    async fn delete(&self, key: &str) -> Result<()> {
-        let mut secrets = self.load_secrets().await?;
-        secrets.remove(key);
-        self.save_secrets(&secrets).await
+    async fn set(&self, uid: u32, key: &str, value: &str) -> Result<()> {
+        match self.load_store_variant().await? {
+            LocalStoreVariant::Namespaced(mut store) => {
+                store
+                    .entry(uid)
+                    .or_default()
+                    .insert(key.to_string(), value.to_string());
+                self.save_store_variant(&LocalStoreVariant::Namespaced(store))
+                    .await
+            }
+            LocalStoreVariant::Legacy(_) => bail!(
+                "legacy flat local secret store detected; daemon migration is required before user-scoped writes"
+            ),
+        }
+    }
+
+    async fn delete(&self, uid: u32, key: &str) -> Result<()> {
+        match self.load_store_variant().await? {
+            LocalStoreVariant::Namespaced(mut store) => {
+                if let Some(m) = store.get_mut(&uid) {
+                    m.remove(key);
+                    if m.is_empty() {
+                        store.remove(&uid);
+                    }
+                }
+                self.save_store_variant(&LocalStoreVariant::Namespaced(store))
+                    .await
+            }
+            LocalStoreVariant::Legacy(_) => bail!(
+                "legacy flat local secret store detected; daemon migration is required before user-scoped deletes"
+            ),
+        }
     }
 }
 
@@ -492,21 +620,15 @@ impl SecretBackend for LocalBackend {
 // SecretFd
 // ---------------------------------------------------------------------------
 
-/// A file descriptor wrapper for secret injection.
-///
-/// The secret is written to a temporary file with restricted permissions (0600).
-/// The file is automatically cleaned up when this struct is dropped.
+/// File-descriptor wrapper for secret injection. The secret is written to
+/// a temporary file with 0600 permissions and cleaned up on drop.
 #[derive(Debug)]
 pub struct SecretFd {
-    /// Path to the temporary file containing the secret.
     pub path: PathBuf,
     temp_dir: tempfile::TempDir,
 }
 
 impl SecretFd {
-    /// Write a secret to a temporary file and return a wrapper with auto-cleanup.
-    ///
-    /// The file permissions are set to 0600 (owner read/write only).
     fn new(secret: &str) -> Result<Self> {
         let temp_dir = tempfile::TempDir::new_in("/tmp")?;
         let path = temp_dir.path().join("secret");
@@ -517,7 +639,6 @@ impl SecretFd {
         Ok(Self { path, temp_dir })
     }
 
-    /// Get the path to the secret file.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -525,7 +646,6 @@ impl SecretFd {
 
 impl Drop for SecretFd {
     fn drop(&mut self) {
-        // TempDir will automatically clean up on drop, but be explicit
         if self.path.exists() {
             let _ = fs::remove_file(&self.path);
         }
@@ -536,13 +656,17 @@ impl Drop for SecretFd {
 // SecretManager
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+struct CacheKey {
+    uid: u32,
+    key: String,
+}
+
 /// Manager for secret operations with a configurable backend.
-///
-/// Wraps a secret backend and provides FD-based injection for safe secret handling.
 #[derive(Clone)]
 pub struct SecretManager {
     backend: Arc<dyn SecretBackend>,
-    cache: Arc<RwLock<HashMap<String, String>>>,
+    cache: Arc<RwLock<HashMap<CacheKey, String>>>,
 }
 
 impl std::fmt::Debug for SecretManager {
@@ -554,7 +678,6 @@ impl std::fmt::Debug for SecretManager {
 }
 
 impl SecretManager {
-    /// Create a new SecretManager with the given backend.
     pub fn new(backend: Arc<dyn SecretBackend>) -> Self {
         Self {
             backend,
@@ -562,65 +685,69 @@ impl SecretManager {
         }
     }
 
-    /// Create a SecretManager with a specific backend type.
     pub fn with_backend<B: SecretBackend + 'static>(backend: B) -> Self {
         Self::new(Arc::new(backend))
     }
 
-    /// Get a secret by key, with caching.
-    pub async fn get(&self, key: &str) -> Result<Option<String>> {
-        // Check cache first
+    pub fn backend_name(&self) -> &str {
+        self.backend.name()
+    }
+
+    pub async fn get(&self, uid: u32, key: &str) -> Result<Option<String>> {
+        let ck = CacheKey {
+            uid,
+            key: key.to_string(),
+        };
         {
             let cache = self.cache.read().await;
-            if let Some(value) = cache.get(key) {
+            if let Some(value) = cache.get(&ck) {
                 return Ok(Some(value.clone()));
             }
         }
 
-        let value = self.backend.get(key).await?;
+        let value = self.backend.get(uid, key).await?;
 
-        // Cache the result if found
         if let Some(ref v) = value {
             let mut cache = self.cache.write().await;
-            cache.insert(key.to_string(), v.clone());
+            cache.insert(ck, v.clone());
         }
 
         Ok(value)
     }
 
-    /// List all secret keys.
-    pub async fn list(&self) -> Result<Vec<String>> {
-        self.backend.list().await
+    pub async fn list(&self, uid: u32) -> Result<Vec<String>> {
+        self.backend.list(uid).await
     }
 
-    /// Set a secret.
-    pub async fn set(&self, key: &str, value: &str) -> Result<()> {
-        self.backend.set(key, value).await?;
+    pub async fn list_all(&self) -> Result<Vec<(u32, String)>> {
+        self.backend.list_all().await
+    }
 
-        // Update cache
+    pub async fn set(&self, uid: u32, key: &str, value: &str) -> Result<()> {
+        self.backend.set(uid, key, value).await?;
         let mut cache = self.cache.write().await;
-        cache.insert(key.to_string(), value.to_string());
-
+        cache.insert(
+            CacheKey {
+                uid,
+                key: key.to_string(),
+            },
+            value.to_string(),
+        );
         Ok(())
     }
 
-    /// Delete a secret.
-    pub async fn delete(&self, key: &str) -> Result<()> {
-        self.backend.delete(key).await?;
-
-        // Remove from cache
+    pub async fn delete(&self, uid: u32, key: &str) -> Result<()> {
+        self.backend.delete(uid, key).await?;
         let mut cache = self.cache.write().await;
-        cache.remove(key);
-
+        cache.remove(&CacheKey {
+            uid,
+            key: key.to_string(),
+        });
         Ok(())
     }
 
-    /// Inject a secret as a file descriptor.
-    ///
-    /// Writes the secret to a temporary file with 0600 permissions.
-    /// The file is cleaned up when the returned SecretFd is dropped.
-    pub async fn inject_fd(&self, key: &str) -> Result<SecretFd> {
-        let secret = match self.get(key).await? {
+    pub async fn inject_fd(&self, uid: u32, key: &str) -> Result<SecretFd> {
+        let secret = match self.get(uid, key).await? {
             Some(s) => s,
             None => anyhow::bail!("secret not found: {}", key),
         };
@@ -628,7 +755,6 @@ impl SecretManager {
         SecretFd::new(&secret)
     }
 
-    /// Clear the in-memory cache.
     pub async fn clear_cache(&self) {
         let mut cache = self.cache.write().await;
         cache.clear();
@@ -639,25 +765,25 @@ impl SecretManager {
 // Backend selection
 // ---------------------------------------------------------------------------
 
-/// Supported secret backend types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendType {
-    /// Use the unix `pass` password manager.
     Pass,
-    /// Use environment variables (for development/testing).
     Env,
-    /// Use encrypted local file.
     Local,
 }
 
 impl BackendType {
-    /// Create a backend instance from this type.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BackendType::Pass => "pass",
+            BackendType::Env => "env",
+            BackendType::Local => "local",
+        }
+    }
+
     pub fn build(&self) -> Result<Arc<dyn SecretBackend>> {
         match self {
-            BackendType::Pass => {
-                let gpg_id = env::var("SSH_GUARD_GPG_ID").ok();
-                Ok(Arc::new(PassBackend::new(gpg_id)))
-            }
+            BackendType::Pass => Ok(Arc::new(PassBackend::new())),
             BackendType::Env => Ok(Arc::new(EnvBackend::new())),
             BackendType::Local => {
                 let mut backend = LocalBackend::new()?;
@@ -686,27 +812,24 @@ impl std::str::FromStr for BackendType {
     }
 }
 
-/// Detect the best available backend based on environment.
 pub fn detect_backend() -> BackendType {
-    // Check for explicit configuration
     if let Ok(backend_str) = env::var("SSH_GUARD_BACKEND") {
         if let Ok(backend) = backend_str.parse::<BackendType>() {
             return backend;
         }
     }
 
-    // Check for pass availability
-    if std::process::Command::new("pass")
-        .arg("init")
-        .arg("--check")
-        .output()
-        .is_ok()
-    {
+    if pass_store_initialized() {
         return BackendType::Pass;
     }
 
-    // Fall back to environment backend
     BackendType::Env
+}
+
+/// Resolve a UID to a user name via nsswitch; returns None when the UID
+/// has no entry. Used only for display (audit lines, `secrets list`).
+pub fn uid_to_name(uid: u32) -> Option<String> {
+    uzers::get_user_by_uid(uid).and_then(|u| u.name().to_str().map(|s| s.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -719,10 +842,9 @@ mod tests {
     use std::env;
     use std::sync::Mutex;
 
-    // A mock backend for testing.
     #[derive(Debug, Default)]
     struct MockBackend {
-        store: Mutex<HashMap<String, String>>,
+        store: Mutex<HashMap<(u32, String), String>>,
     }
 
     impl MockBackend {
@@ -739,112 +861,158 @@ mod tests {
             "mock"
         }
 
-        async fn get(&self, key: &str) -> Result<Option<String>> {
+        async fn get(&self, uid: u32, key: &str) -> Result<Option<String>> {
             let store = self.store.lock().unwrap();
-            Ok(store.get(key).cloned())
+            Ok(store.get(&(uid, key.to_string())).cloned())
         }
 
-        async fn list(&self) -> Result<Vec<String>> {
+        async fn list(&self, uid: u32) -> Result<Vec<String>> {
+            let store = self.store.lock().unwrap();
+            Ok(store
+                .keys()
+                .filter(|(u, _)| *u == uid)
+                .map(|(_, k)| k.clone())
+                .collect())
+        }
+
+        async fn list_all(&self) -> Result<Vec<(u32, String)>> {
             let store = self.store.lock().unwrap();
             Ok(store.keys().cloned().collect())
         }
 
-        async fn set(&self, key: &str, value: &str) -> Result<()> {
+        async fn set(&self, uid: u32, key: &str, value: &str) -> Result<()> {
             let mut store = self.store.lock().unwrap();
-            store.insert(key.to_string(), value.to_string());
+            store.insert((uid, key.to_string()), value.to_string());
             Ok(())
         }
 
-        async fn delete(&self, key: &str) -> Result<()> {
+        async fn delete(&self, uid: u32, key: &str) -> Result<()> {
             let mut store = self.store.lock().unwrap();
-            store.remove(key);
+            store.remove(&(uid, key.to_string()));
             Ok(())
         }
     }
 
     #[tokio::test]
-    async fn test_secret_manager_basic_operations() {
-        let backend = Arc::new(MockBackend::new());
-        let manager = SecretManager::new(backend.clone());
-
-        // Set a secret
-        manager.set("api_key", "secret123").await.unwrap();
-
-        // Get it back
-        let value = manager.get("api_key").await.unwrap();
-        assert_eq!(value, Some("secret123".to_string()));
-
-        // List keys
-        let keys = manager.list().await.unwrap();
-        assert!(keys.contains(&"api_key".to_string()));
-
-        // Delete
-        manager.delete("api_key").await.unwrap();
-        let value = manager.get("api_key").await.unwrap();
-        assert_eq!(value, None);
-    }
-
-    #[tokio::test]
-    async fn test_secret_manager_caching() {
+    async fn secret_manager_per_user_basic() {
         let backend = Arc::new(MockBackend::new());
         let manager = SecretManager::new(backend);
 
-        // Set a secret
-        manager.set("cached_key", "cached_value").await.unwrap();
+        manager.set(1000, "api_key", "alice-key").await.unwrap();
+        manager.set(1001, "api_key", "bob-key").await.unwrap();
 
-        // First get should cache it
-        let first = manager.get("cached_key").await.unwrap();
-        assert_eq!(first, Some("cached_value".to_string()));
+        assert_eq!(
+            manager.get(1000, "api_key").await.unwrap(),
+            Some("alice-key".to_string())
+        );
+        assert_eq!(
+            manager.get(1001, "api_key").await.unwrap(),
+            Some("bob-key".to_string())
+        );
+        assert_eq!(manager.get(1002, "api_key").await.unwrap(), None);
 
-        // Cache should be populated
-        let cache = manager.cache.read().await;
-        assert!(cache.contains_key("cached_key"));
+        let alice_keys = manager.list(1000).await.unwrap();
+        assert_eq!(alice_keys, vec!["api_key".to_string()]);
+
+        let all = manager.list_all().await.unwrap();
+        assert_eq!(all.len(), 2);
+
+        manager.delete(1000, "api_key").await.unwrap();
+        assert_eq!(manager.get(1000, "api_key").await.unwrap(), None);
+        // Bob's still there.
+        assert_eq!(
+            manager.get(1001, "api_key").await.unwrap(),
+            Some("bob-key".to_string())
+        );
     }
 
     #[tokio::test]
-    async fn test_secret_fd_creation() {
+    async fn secret_manager_cache_is_uid_keyed() {
+        let backend = Arc::new(MockBackend::new());
+        let manager = SecretManager::new(backend);
+
+        manager.set(1000, "k", "alice").await.unwrap();
+        manager.set(1001, "k", "bob").await.unwrap();
+
+        // Populate cache
+        let _ = manager.get(1000, "k").await;
+        let _ = manager.get(1001, "k").await;
+
+        let cache = manager.cache.read().await;
+        let alice_ck = CacheKey {
+            uid: 1000,
+            key: "k".into(),
+        };
+        let bob_ck = CacheKey {
+            uid: 1001,
+            key: "k".into(),
+        };
+        assert_eq!(cache.get(&alice_ck).map(String::as_str), Some("alice"));
+        assert_eq!(cache.get(&bob_ck).map(String::as_str), Some("bob"));
+    }
+
+    #[tokio::test]
+    async fn secret_fd_creation() {
         let secret = "test_secret_content";
         let fd = SecretFd::new(secret).unwrap();
 
-        // Verify the file exists and has correct content
         assert!(fd.path.exists());
         let content = fs::read_to_string(fd.path()).unwrap();
         assert_eq!(content, secret);
 
-        // Verify permissions (only on Unix)
-        #[cfg(unix)]
-        {
-            let metadata = fs::metadata(fd.path()).unwrap();
-            let mode = metadata.permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600);
-        }
-
-        // Drop the fd
-        drop(fd);
-
-        // File should be cleaned up
-        // Note: temp_dir cleanup is async, so we just verify no panic
+        let metadata = fs::metadata(fd.path()).unwrap();
+        let mode = metadata.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[tokio::test]
-    async fn test_env_backend() {
+    async fn env_backend_namespaces_by_uid() {
         let backend = EnvBackend::new();
+        env::set_var("GUARD_SECRET_U2000_EB_KEY", "v2000");
+        env::set_var("GUARD_SECRET_U2001_EB_KEY", "v2001");
 
-        // Set via env var
-        env::set_var("GUARD_SECRET_TEST_KEY", "test_value");
+        assert_eq!(
+            backend.get(2000, "EB_KEY").await.unwrap(),
+            Some("v2000".to_string())
+        );
+        assert_eq!(
+            backend.get(2001, "EB_KEY").await.unwrap(),
+            Some("v2001".to_string())
+        );
 
-        let value = backend.get("TEST_KEY").await.unwrap();
-        assert_eq!(value, Some("test_value".to_string()));
+        let keys = backend.list(2000).await.unwrap();
+        assert!(keys.contains(&"EB_KEY".to_string()));
 
-        let keys = backend.list().await.unwrap();
-        assert!(keys.contains(&"TEST_KEY".to_string()));
+        let all = backend.list_all().await.unwrap();
+        assert!(all.contains(&(2000u32, "EB_KEY".to_string())));
+        assert!(all.contains(&(2001u32, "EB_KEY".to_string())));
 
-        // Clean up
-        env::remove_var("GUARD_SECRET_TEST_KEY");
+        env::remove_var("GUARD_SECRET_U2000_EB_KEY");
+        env::remove_var("GUARD_SECRET_U2001_EB_KEY");
     }
 
     #[tokio::test]
-    async fn test_backend_type_parsing() {
+    async fn env_backend_surfaces_legacy_flat_keys_only_via_admin_view() {
+        let backend = EnvBackend::new();
+        env::set_var("GUARD_SECRET_LEGACY_KEY", "legacy");
+
+        assert_eq!(backend.get(2000, "LEGACY_KEY").await.unwrap(), None);
+        assert!(!backend
+            .list(2000)
+            .await
+            .unwrap()
+            .contains(&"LEGACY_KEY".to_string()));
+        assert!(backend
+            .list_all()
+            .await
+            .unwrap()
+            .contains(&(LEGACY_UID_SENTINEL, "LEGACY_KEY".to_string())));
+
+        env::remove_var("GUARD_SECRET_LEGACY_KEY");
+    }
+
+    #[tokio::test]
+    async fn backend_type_parsing() {
         assert_eq!("pass".parse::<BackendType>().unwrap(), BackendType::Pass);
         assert_eq!("env".parse::<BackendType>().unwrap(), BackendType::Env);
         assert_eq!("local".parse::<BackendType>().unwrap(), BackendType::Local);
@@ -853,100 +1021,28 @@ mod tests {
     }
 
     #[test]
-    fn parse_pass_flat_list_strips_guard_prefix() {
-        let keys = parse_flat_pass_list("guard/opnsense-apikey-secret\nguard/API_KEY\n");
-        assert_eq!(
-            keys,
-            vec!["API_KEY".to_string(), "opnsense-apikey-secret".to_string()]
-        );
-    }
+    fn pass_store_listing_walks_uid_namespaces() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(".cache")
+            .join(format!("pass-store-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("guard/u1000")).unwrap();
+        fs::create_dir_all(root.join("guard/u1001/nested")).unwrap();
+        fs::write(root.join("guard/u1000/OPNSENSE_API_KEY.gpg"), b"x").unwrap();
+        fs::write(root.join("guard/u1001/nested/token.gpg"), b"y").unwrap();
+        fs::write(root.join("guard/LEGACY.gpg"), b"z").unwrap();
+        fs::write(root.join("guard/.gpg-id"), b"test").unwrap();
 
-    #[test]
-    fn parse_pass_tree_list_strips_tree_glyphs() {
-        let keys = parse_tree_pass_list(
-            "Password Store\n└── guard\n    ├── OPNSENSE_API_KEY\n    └── opnsense-apikey-secret\n",
-        );
+        let (all, legacy) = list_pass_store_entries(&root).unwrap();
         assert_eq!(
-            keys,
+            all,
             vec![
-                "OPNSENSE_API_KEY".to_string(),
-                "opnsense-apikey-secret".to_string()
+                (1000u32, "OPNSENSE_API_KEY".to_string()),
+                (1001u32, "nested/token".to_string())
             ]
         );
-    }
+        assert_eq!(legacy, vec!["LEGACY".to_string()]);
 
-    #[tokio::test]
-    async fn test_pass_backend_integration() {
-        // This test requires `pass` to be installed and configured.
-        // Skip if not available.
-        let pass_available = std::process::Command::new("pass")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-
-        if !pass_available {
-            eprintln!("skipping pass integration test (pass not available)");
-            return;
-        }
-
-        // Skip if pass version doesn't support --multifile
-        let multifile_supported = std::process::Command::new("pass")
-            .arg("insert")
-            .arg("--help")
-            .output()
-            .map(|o| {
-                o.status.success() && String::from_utf8_lossy(&o.stdout).contains("--multifile")
-            })
-            .unwrap_or(false);
-
-        if !multifile_supported {
-            eprintln!("skipping pass integration test (pass --multifile not supported)");
-            return;
-        }
-
-        let backend = PassBackend::new(None);
-        let test_key = format!("guard_test_{}", std::process::id());
-        let test_value = "integration_test_value";
-
-        // Clean up any existing test entry
-        let _ = backend.delete(&test_key).await;
-
-        // Set and get
-        backend.set(&test_key, test_value).await.unwrap();
-        let value = backend.get(&test_key).await.unwrap();
-        assert_eq!(value, Some(test_value.to_string()));
-
-        // List
-        let keys = backend.list().await.unwrap();
-        assert!(keys
-            .iter()
-            .any(|k| k == &test_key || k.ends_with(&test_key)));
-
-        // Delete
-        backend.delete(&test_key).await.unwrap();
-        let value = backend.get(&test_key).await.unwrap();
-        assert_eq!(value, None);
-    }
-
-    #[tokio::test]
-    async fn test_secret_manager_inject_fd() {
-        let backend = Arc::new(MockBackend::new());
-        let manager = SecretManager::new(backend);
-
-        manager.set("fd_test", "fd_secret_value").await.unwrap();
-
-        let fd = manager.inject_fd("fd_test").await.unwrap();
-        let content = fs::read_to_string(fd.path()).unwrap();
-        assert_eq!(content, "fd_secret_value");
-    }
-
-    #[tokio::test]
-    async fn test_secret_manager_inject_fd_not_found() {
-        let backend = Arc::new(MockBackend::new());
-        let manager = SecretManager::new(backend);
-
-        let result = manager.inject_fd("nonexistent").await;
-        assert!(result.is_err());
+        let _ = fs::remove_dir_all(&root);
     }
 }

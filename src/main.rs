@@ -3,11 +3,13 @@
 #![allow(unused)]
 
 mod client_config;
+mod injection;
 mod mcp;
 mod redact;
 mod secrets;
 mod server;
 mod session;
+mod session_store;
 mod shim;
 mod ssh;
 mod tool_config;
@@ -17,6 +19,7 @@ use guard::evaluate;
 use anyhow::{Context, Result};
 use clap::{ArgAction, CommandFactory, Parser, Subcommand};
 use guard::policy::PolicyMode;
+use injection::{collect_unique_pairs, derive_env_name, is_valid_env_name};
 use std::collections::HashMap;
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -40,7 +43,8 @@ enum MainArgs {
         #[arg(long = "env", value_name = "KEY=VALUE", value_parser = parse_env_assignment)]
         env_vars: Vec<(String, String)>,
         /// Inject a stored secret. Bare SECRET derives an env var; ENV_VAR=SECRET sets one.
-        #[arg(long = "secret", value_name = "SECRET|ENV_VAR=SECRET", value_parser = parse_secret_mapping)]
+        /// Repeat the flag or pass a comma-separated list for multiple secrets.
+        #[arg(long = "secret", value_name = "SECRET[,SECRET]", value_parser = parse_secret_mapping, value_delimiter = ',')]
         secret_vars: Vec<(String, String)>,
         /// Binary to execute
         binary: String,
@@ -52,7 +56,7 @@ enum MainArgs {
     #[clap(subcommand)]
     Server(ServerCommands),
     /// Manage secrets
-    #[clap(subcommand)]
+    #[clap(subcommand, alias = "secret")]
     Secrets(SecretCommands),
     /// Install shim scripts for command interposition
     Shim {
@@ -71,8 +75,8 @@ enum MainArgs {
         /// Inject an environment variable (KEY=VALUE, repeatable)
         #[arg(long = "env", value_name = "KEY=VALUE", value_parser = parse_env_assignment)]
         env_vars: Vec<(String, String)>,
-        /// Inject a secret as an env var (ENV_VAR=secret-name, repeatable)
-        #[arg(long = "secret", value_name = "ENV_VAR=SECRET", value_parser = parse_env_assignment)]
+        /// Inject a secret as an env var (ENV_VAR=secret-name). Repeat or comma-separate.
+        #[arg(long = "secret", value_name = "ENV_VAR=SECRET[,ENV_VAR=SECRET]", value_parser = parse_env_assignment, value_delimiter = ',')]
         secret_vars: Vec<(String, String)>,
         /// Apply env/secret config to a specific user (UID or token name)
         #[arg(long)]
@@ -156,6 +160,17 @@ enum SessionCommands {
         #[arg(long, value_name = "PATH")]
         socket: Option<String>,
     },
+    /// Show one session in detail, including prompt, aggregate stats, and recent interactions.
+    Show {
+        /// Session token to inspect.
+        token: String,
+        /// Number of recent interactions to print.
+        #[arg(long, value_name = "N", default_value_t = 20)]
+        limit: usize,
+        /// Server socket path (defaults to configured)
+        #[arg(long, value_name = "PATH")]
+        socket: Option<String>,
+    },
     /// List active session grants
     List {
         /// Include past (revoked/expired) grants. Daemon retains
@@ -167,7 +182,8 @@ enum SessionCommands {
         /// `30m`, `2h`, `1d`. Implies --history when set.
         #[arg(long, value_name = "DURATION")]
         since: Option<String>,
-        /// Print untruncated session prompts.
+        /// Print untruncated session prompts (daemon UID only; other users
+        /// still see "(hidden)").
         #[arg(long = "full", action = ArgAction::SetTrue)]
         full: bool,
         /// Server socket path (defaults to configured)
@@ -181,63 +197,6 @@ fn parse_key_value(s: &str) -> Result<(String, String), String> {
         .find('=')
         .ok_or_else(|| format!("expected KEY=VALUE, got '{s}'"))?;
     Ok((s[..pos].to_string(), s[pos + 1..].to_string()))
-}
-
-fn is_valid_env_name(value: &str) -> bool {
-    let mut chars = value.chars();
-    match chars.next() {
-        Some(c) if c == '_' || c.is_ascii_alphabetic() => {}
-        _ => return false,
-    }
-    chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
-}
-
-fn derive_env_name(secret_name: &str) -> Result<String, String> {
-    let mut out = String::new();
-    let mut last_was_underscore = false;
-
-    for c in secret_name.chars() {
-        let next = if c.is_ascii_alphanumeric() {
-            Some(c.to_ascii_uppercase())
-        } else if c == '_' || c == '-' || c == '.' || c == '/' {
-            Some('_')
-        } else {
-            None
-        };
-
-        if let Some(c) = next {
-            if c == '_' {
-                if !out.is_empty() && !last_was_underscore {
-                    out.push(c);
-                }
-                last_was_underscore = true;
-            } else {
-                out.push(c);
-                last_was_underscore = false;
-            }
-        }
-    }
-
-    while out.ends_with('_') {
-        out.pop();
-    }
-
-    if out.is_empty() {
-        return Err(format!(
-            "could not derive an environment variable name from secret '{secret_name}'"
-        ));
-    }
-
-    if out
-        .chars()
-        .next()
-        .map(|c| c.is_ascii_digit())
-        .unwrap_or(false)
-    {
-        out.insert(0, '_');
-    }
-
-    Ok(out)
 }
 
 fn parse_env_assignment(s: &str) -> Result<(String, String), String> {
@@ -262,8 +221,12 @@ fn parse_secret_mapping(s: &str) -> Result<(String, String), String> {
     Ok((env_name, secret_name))
 }
 
-fn pairs_to_map(pairs: Vec<(String, String)>) -> HashMap<String, String> {
-    pairs.into_iter().collect()
+fn env_pairs_to_map(pairs: Vec<(String, String)>) -> Result<HashMap<String, String>, String> {
+    collect_unique_pairs(pairs, "environment variable injection", "value")
+}
+
+fn secret_pairs_to_map(pairs: Vec<(String, String)>) -> Result<HashMap<String, String>, String> {
+    collect_unique_pairs(pairs, "secret injection", "secret")
 }
 
 fn resolve_bool_flag(value: Option<bool>, negated: bool, default: bool) -> bool {
@@ -384,6 +347,16 @@ enum ServerCommands {
         #[arg(long = "dry-run", action = ArgAction::SetTrue)]
         dry_run: bool,
 
+        /// SQLite state database path for persistent sessions and session history.
+        /// Env: SSH_GUARD_STATE_DB.
+        #[arg(long, value_name = "PATH")]
+        state_db: Option<PathBuf>,
+
+        /// Execute approved Unix-socket requests as the connecting UID instead of the daemon UID.
+        /// Requires a root daemon and no TCP listener.
+        #[arg(long = "exec-as-caller", action = ArgAction::SetTrue)]
+        exec_as_caller: bool,
+
         /// Path to custom system prompt file for the LLM evaluator
         #[arg(long, value_name = "PATH")]
         system_prompt: Option<PathBuf>,
@@ -411,7 +384,8 @@ enum ServerCommands {
         env_vars: Vec<(String, String)>,
 
         /// Inject a stored secret. Bare SECRET derives an env var; ENV_VAR=SECRET sets one.
-        #[arg(long = "secret", value_name = "SECRET|ENV_VAR=SECRET", value_parser = parse_secret_mapping)]
+        /// Repeat the flag or pass a comma-separated list for multiple secrets.
+        #[arg(long = "secret", value_name = "SECRET[,SECRET]", value_parser = parse_secret_mapping, value_delimiter = ',')]
         secret_vars: Vec<(String, String)>,
 
         /// Binary to execute
@@ -488,7 +462,11 @@ enum SecretCommands {
         value: Option<String>,
     },
     /// List stored secret keys.
-    List,
+    List {
+        /// Include daemon-only ownership/origin detail for migration work.
+        #[arg(long, action = ArgAction::SetTrue)]
+        detailed: bool,
+    },
     /// Remove a stored secret.
     Remove {
         /// Secret key to remove.
@@ -537,13 +515,9 @@ async fn main() -> Result<()> {
             binary,
             args,
         }) => {
-            run_exec(
-                binary,
-                args,
-                pairs_to_map(env_vars),
-                pairs_to_map(secret_vars),
-            )
-            .await
+            let env_vars = env_pairs_to_map(env_vars).map_err(anyhow::Error::msg)?;
+            let secret_vars = secret_pairs_to_map(secret_vars).map_err(anyhow::Error::msg)?;
+            run_exec(binary, args, env_vars, secret_vars).await
         }
         Ok(MainArgs::Server(cmd)) => run_server(cmd).await,
         Ok(MainArgs::Secrets(subcommand)) => handle_secrets(subcommand).await,
@@ -567,12 +541,6 @@ async fn main() -> Result<()> {
         {
             // Let clap render help/version to stdout and exit 0.
             e.exit();
-        }
-        Err(ref e) if should_fallback_to_run(&args, e.kind()) => {
-            // Fallback: treat unknown subcommands as `run <binary> <args...>`
-            let binary = args[0].clone();
-            let cmd_args = args[1..].to_vec();
-            run_exec(binary, cmd_args, HashMap::new(), HashMap::new()).await
         }
         Err(e) => {
             eprintln!("{}", e);
@@ -609,29 +577,24 @@ fn print_run_help() -> Result<()> {
     Ok(())
 }
 
-fn should_fallback_to_run(args: &[String], kind: clap::error::ErrorKind) -> bool {
-    matches!(
-        kind,
-        clap::error::ErrorKind::InvalidSubcommand | clap::error::ErrorKind::UnknownArgument
-    ) && args.len() >= 2
-        && !args[0].starts_with('-')
-        && !is_guard_cli_keyword(&args[0])
+fn current_uid() -> u32 {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return 0;
+    };
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("Uid:") {
+            if let Some(uid_str) = rest.split_whitespace().next() {
+                if let Ok(uid) = uid_str.parse::<u32>() {
+                    return uid;
+                }
+            }
+        }
+    }
+    0
 }
 
-fn is_guard_cli_keyword(value: &str) -> bool {
-    matches!(
-        value,
-        "run"
-            | "exec"
-            | "server"
-            | "secrets"
-            | "shim"
-            | "config"
-            | "mcp"
-            | "session"
-            | "status"
-            | "help"
-    )
+fn default_state_db_path() -> Option<PathBuf> {
+    dirs::state_dir().map(|dir| dir.join("guard").join("state.db"))
 }
 
 async fn run_server(cmd: ServerCommands) -> Result<()> {
@@ -658,6 +621,8 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             cache_capacity,
             cache_ttl,
             dry_run,
+            state_db,
+            exec_as_caller,
             system_prompt,
             system_prompt_append,
         } => {
@@ -693,6 +658,35 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                     .unwrap_or(false);
             if dry_run {
                 tracing::warn!("Dry-run mode enabled: approved commands will not be executed");
+            }
+
+            let state_db_path = state_db
+                .or_else(|| {
+                    guard_env("STATE_DB")
+                        .filter(|value| !value.is_empty())
+                        .map(PathBuf::from)
+                })
+                .or_else(default_state_db_path);
+            if let Some(ref path) = state_db_path {
+                tracing::info!("State DB: {}", path.display());
+            }
+
+            let exec_as_caller = exec_as_caller
+                || guard_env("EXEC_AS_CALLER")
+                    .as_deref()
+                    .map(parse_env_bool)
+                    .unwrap_or(false);
+            if exec_as_caller {
+                let daemon_uid = current_uid();
+                if daemon_uid != 0 {
+                    anyhow::bail!("--exec-as-caller requires the daemon to start as root");
+                }
+                if tcp_port.is_some() {
+                    anyhow::bail!(
+                        "--exec-as-caller requires a unix socket only; TCP callers do not carry a trusted local UID"
+                    );
+                }
+                tracing::info!("Approved commands will execute as the connecting unix uid");
             }
 
             let llm_enabled = resolve_bool_flag(llm, no_llm, true);
@@ -833,7 +827,20 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             tracing::info!("Evaluator created successfully");
 
             tracing::info!("Initializing secret backend...");
-            let backend = secrets::detect_backend()
+            let backend_type = match guard_env("BACKEND") {
+                Some(value) => value
+                    .parse::<secrets::BackendType>()
+                    .map_err(anyhow::Error::msg)
+                    .context("invalid secret backend")?,
+                None => secrets::detect_backend(),
+            };
+            tracing::info!("Using {} secret backend", backend_type.as_str());
+            if guard_env("BACKEND").is_none() && backend_type == secrets::BackendType::Env {
+                tracing::warn!(
+                    "auto-selected env secret backend; secrets are process-local and will disappear on daemon restart"
+                );
+            }
+            let backend = backend_type
                 .build()
                 .context("Failed to create secret backend")?;
             let secrets = secrets::SecretManager::new(backend);
@@ -870,6 +877,22 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 }
             }
 
+            let (sessions, session_store) = if let Some(ref path) = state_db_path {
+                let store = session_store::SessionStore::open(
+                    path.clone(),
+                    session::DEFAULT_HISTORY_RETENTION_SECS,
+                )
+                .await
+                .with_context(|| format!("failed to open state db {}", path.display()))?;
+                let sessions = store
+                    .load_registry()
+                    .await
+                    .with_context(|| format!("failed to load state db {}", path.display()))?;
+                (sessions, Some(store))
+            } else {
+                (session::SessionRegistry::new(), None)
+            };
+
             tracing::info!("Creating server instance...");
             let srv = server::Server::new(
                 socket_path,
@@ -885,6 +908,10 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 tool_registry,
                 redact_secrets,
                 preflight,
+                sessions,
+                session_store,
+                exec_as_caller,
+                state_db_path,
             );
             srv.run().await
         }
@@ -897,6 +924,8 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             binary,
             args,
         } => {
+            let env_vars = env_pairs_to_map(env_vars).map_err(anyhow::Error::msg)?;
+            let secret_vars = secret_pairs_to_map(secret_vars).map_err(anyhow::Error::msg)?;
             let socket_path = socket.map(PathBuf::from);
             let mut client = server::Client::new(socket_path, tcp_port);
             if let Some(token) = token {
@@ -918,8 +947,8 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 .execute_streaming_with_injections(
                     &binary,
                     &args,
-                    pairs_to_map(env_vars),
-                    pairs_to_map(secret_vars),
+                    env_vars,
+                    secret_vars,
                     |stream, data| {
                         streamed_output = true;
                         match stream {
@@ -1145,12 +1174,19 @@ async fn handle_status(socket: Option<String>) -> Result<()> {
             println!("  static_policy  {}", status.static_policy);
             println!("  preflight      {}", status.preflight);
             println!("  redact         {}", status.redact);
+            if !status.secret_backend.is_empty() {
+                println!("  secret_backend {}", status.secret_backend);
+            }
             println!(
                 "  cache          enabled={} size={}",
                 status.cache_enabled, status.cache_size
             );
             println!("  sessions       {}", status.session_count);
             println!("  daemon_uid     {}", status.daemon_uid);
+            println!("  exec_identity  {}", status.exec_identity);
+            if let Some(ref path) = status.state_db_path {
+                println!("  state_db       {}", path);
+            }
             Ok(())
         }
         Ok(server::AdminResponse::Error { .. }) => {
@@ -1327,6 +1363,17 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
         SessionCommands::Revoke { token, socket } => {
             (socket, server::AdminRequest::SessionRevoke { token })
         }
+        SessionCommands::Show {
+            token,
+            limit,
+            socket,
+        } => (
+            socket,
+            server::AdminRequest::SessionShow {
+                token,
+                limit: Some(limit),
+            },
+        ),
         SessionCommands::List {
             history,
             since,
@@ -1397,9 +1444,115 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                 }
             }
         }
+        server::AdminResponse::SessionShow { report } => {
+            if let Some(active) = report.active {
+                println!(
+                    "token={} status=active granted_at={} expires_at={} allow={:?} deny={:?}",
+                    active.token,
+                    active.granted_at,
+                    active
+                        .expires_at
+                        .map(|t| t.to_string())
+                        .unwrap_or_else(|| "(never)".to_string()),
+                    active.allow,
+                    active.deny,
+                );
+                println!(
+                    "prompt={}",
+                    format_prompt(active.prompt_append.as_deref(), true)
+                );
+            } else {
+                println!("status=inactive");
+            }
+
+            for entry in &report.history {
+                let label = match entry.status {
+                    server::HistoricalStatus::Revoked => "revoked",
+                    server::HistoricalStatus::Expired => "expired",
+                };
+                println!(
+                    "history status={} granted_at={} ended_at={} expires_at={} allow={:?} deny={:?} prompt={}",
+                    label,
+                    entry.granted_at,
+                    entry.ended_at,
+                    entry
+                        .expires_at
+                        .map(|t| t.to_string())
+                        .unwrap_or_else(|| "(never)".to_string()),
+                    entry.allow,
+                    entry.deny,
+                    format_prompt(entry.prompt_append.as_deref(), true),
+                );
+            }
+
+            println!(
+                "stats total={} allowed={} denied={} completed={} exec_failed={} dry_run={} not_attempted={}",
+                report.stats.total,
+                report.stats.allowed,
+                report.stats.denied,
+                report.stats.completed,
+                report.stats.exec_failed,
+                report.stats.dry_run,
+                report.stats.not_attempted,
+            );
+            if !report.stats.source_counts.is_empty() {
+                let sources = report
+                    .stats
+                    .source_counts
+                    .iter()
+                    .map(|(source, count)| format!("{source}={count}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                println!("sources {}", sources);
+            }
+            let histogram = report
+                .stats
+                .risk_histogram
+                .iter()
+                .enumerate()
+                .filter(|(_, count)| **count > 0)
+                .map(|(risk, count)| format!("{risk}={count}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!(
+                "risk_histogram {}",
+                if histogram.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    histogram
+                }
+            );
+            if report.recent.is_empty() {
+                println!("recent (none)");
+            } else {
+                for interaction in &report.recent {
+                    let exec = match interaction.exec_status {
+                        session::SessionExecStatus::NotAttempted => "not_attempted",
+                        session::SessionExecStatus::Completed => "completed",
+                        session::SessionExecStatus::Failed => "failed",
+                        session::SessionExecStatus::DryRun => "dry_run",
+                    };
+                    println!(
+                        "recent at={} allowed={} source={:?} risk={} exec={} cmd={:?} reason={:?}",
+                        interaction.at_unix,
+                        interaction.allowed,
+                        interaction.source,
+                        interaction
+                            .risk
+                            .map(|risk| risk.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
+                        exec,
+                        interaction.command,
+                        interaction.reason,
+                    );
+                }
+            }
+        }
         server::AdminResponse::Status { .. }
         | server::AdminResponse::Ping { .. }
-        | server::AdminResponse::SecretList { .. } => {
+        | server::AdminResponse::SecretExists { .. }
+        | server::AdminResponse::SecretList { .. }
+        | server::AdminResponse::SecretListDetailed { .. } => {
             // session subcommands never request these response variants.
             eprintln!("unexpected response from session admin call");
             std::process::exit(1);
@@ -1481,6 +1634,22 @@ async fn handle_secrets(subcommand: SecretCommands) -> Result<()> {
 
     match subcommand {
         SecretCommands::Add { key, value } => {
+            let existed = match client
+                .send_admin(server::AdminRequest::SecretExists { key: key.clone() })
+                .await
+            {
+                Ok(server::AdminResponse::SecretExists { exists }) => exists,
+                Ok(server::AdminResponse::Error { .. }) | Err(_) => {
+                    match client.send_admin(server::AdminRequest::SecretList).await? {
+                        server::AdminResponse::SecretList { keys } => {
+                            keys.iter().any(|k| k == &key)
+                        }
+                        server::AdminResponse::Error { message } => anyhow::bail!("{}", message),
+                        other => anyhow::bail!("unexpected admin response: {:?}", other),
+                    }
+                }
+                Ok(other) => anyhow::bail!("unexpected admin response: {:?}", other),
+            };
             let secret_value = if let Some(v) = value {
                 v
             } else if !std::io::stdin().is_terminal() {
@@ -1506,6 +1675,12 @@ async fn handle_secrets(subcommand: SecretCommands) -> Result<()> {
                 .await?
             {
                 server::AdminResponse::Ok => {
+                    if existed {
+                        eprintln!(
+                            "warning: secret '{}' already existed and was overwritten",
+                            key
+                        );
+                    }
                     println!("Secret '{}' stored", key);
                     Ok(())
                 }
@@ -1515,22 +1690,45 @@ async fn handle_secrets(subcommand: SecretCommands) -> Result<()> {
                 other => anyhow::bail!("unexpected admin response: {:?}", other),
             }
         }
-        SecretCommands::List => match client.send_admin(server::AdminRequest::SecretList).await? {
-            server::AdminResponse::SecretList { keys } => {
-                if keys.is_empty() {
-                    println!("No secrets stored");
-                } else {
-                    for key in keys {
-                        println!("  - {}", key);
+        SecretCommands::List { detailed } => {
+            let request = if detailed {
+                server::AdminRequest::SecretListDetailed
+            } else {
+                server::AdminRequest::SecretList
+            };
+            match client.send_admin(request).await? {
+                server::AdminResponse::SecretList { keys } => {
+                    if keys.is_empty() {
+                        println!("No secrets stored");
+                    } else {
+                        for key in keys {
+                            println!("  - {}", key);
+                        }
                     }
+                    Ok(())
                 }
-                Ok(())
+                server::AdminResponse::SecretListDetailed { items } => {
+                    if items.is_empty() {
+                        println!("No secrets stored");
+                    } else {
+                        for item in items {
+                            if item.legacy {
+                                println!("  - {}  origin=legacy", item.key);
+                            } else if let Some(uid) = item.uid {
+                                println!("  - {}  uid={}", item.key, uid);
+                            } else {
+                                println!("  - {}", item.key);
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                server::AdminResponse::Error { message } => {
+                    anyhow::bail!("{}", message);
+                }
+                other => anyhow::bail!("unexpected admin response: {:?}", other),
             }
-            server::AdminResponse::Error { message } => {
-                anyhow::bail!("{}", message);
-            }
-            other => anyhow::bail!("unexpected admin response: {:?}", other),
-        },
+        }
         SecretCommands::Remove { key } => {
             match client
                 .send_admin(server::AdminRequest::SecretDelete { key: key.clone() })
@@ -1542,6 +1740,9 @@ async fn handle_secrets(subcommand: SecretCommands) -> Result<()> {
                 }
                 server::AdminResponse::Error { message } => {
                     anyhow::bail!("{}", message);
+                }
+                server::AdminResponse::SecretExists { .. } => {
+                    anyhow::bail!("unexpected admin response: secret_exists")
                 }
                 other => anyhow::bail!("unexpected admin response: {:?}", other),
             }
@@ -1558,6 +1759,8 @@ async fn handle_shim(
     secret_vars: Vec<(String, String)>,
     user: Option<String>,
 ) -> Result<()> {
+    let env_vars = env_pairs_to_map(env_vars).map_err(anyhow::Error::msg)?;
+    let secret_vars = env_pairs_to_map(secret_vars).map_err(anyhow::Error::msg)?;
     let shim_dir = path.unwrap_or_else(|| {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -1700,6 +1903,8 @@ mod tests {
                 cache_capacity,
                 cache_ttl,
                 dry_run,
+                state_db,
+                exec_as_caller,
                 system_prompt,
                 system_prompt_append,
             }) => ServerCommands::Start {
@@ -1724,6 +1929,8 @@ mod tests {
                 cache_capacity,
                 cache_ttl,
                 dry_run,
+                state_db,
+                exec_as_caller,
                 system_prompt,
                 system_prompt_append,
             },
@@ -1768,6 +1975,30 @@ mod tests {
             panic!("expected start");
         };
         assert_eq!(llm_retries, Some(1));
+    }
+
+    #[test]
+    fn test_server_start_exec_as_caller_flag() {
+        let ServerCommands::Start { exec_as_caller, .. } =
+            parse_start(&["guard", "server", "start", "--exec-as-caller"])
+        else {
+            panic!("expected start");
+        };
+        assert!(exec_as_caller);
+    }
+
+    #[test]
+    fn test_server_start_state_db_flag() {
+        let ServerCommands::Start { state_db, .. } = parse_start(&[
+            "guard",
+            "server",
+            "start",
+            "--state-db",
+            "/var/lib/guard/state.db",
+        ]) else {
+            panic!("expected start");
+        };
+        assert_eq!(state_db, Some(PathBuf::from("/var/lib/guard/state.db")));
     }
 
     /// Shared guard for tests that mutate `SSH_GUARD_LLM_MODEL*` environment
@@ -2021,6 +2252,31 @@ mod tests {
     }
 
     #[test]
+    fn run_accepts_comma_separated_bare_secret_names() {
+        match MainArgs::try_parse_from(["guard", "run", "--secret", "foo,bar", "sh", "-c", "true"])
+        {
+            Ok(MainArgs::Run {
+                secret_vars,
+                binary,
+                args,
+                ..
+            }) => {
+                assert_eq!(binary, "sh");
+                assert_eq!(args, vec!["-c".to_string(), "true".to_string()]);
+                assert_eq!(
+                    secret_vars,
+                    vec![
+                        ("FOO".to_string(), "foo".to_string()),
+                        ("BAR".to_string(), "bar".to_string())
+                    ]
+                );
+            }
+            Ok(_) => panic!("expected Run variant"),
+            Err(e) => panic!("parser rejected comma-separated bare secrets: {}", e),
+        }
+    }
+
+    #[test]
     fn bare_secret_name_derives_shell_safe_env_name() {
         let parsed = parse_secret_mapping("opnsense-apikey-secret").unwrap();
         assert_eq!(
@@ -2137,26 +2393,39 @@ mod tests {
     }
 
     #[test]
-    fn unknown_top_level_command_with_args_falls_back_to_run() {
-        assert!(should_fallback_to_run(
-            &["ssh".to_string(), "host".to_string(), "id".to_string()],
-            clap::error::ErrorKind::InvalidSubcommand
+    fn env_pairs_to_map_rejects_conflicting_duplicate_values() {
+        let err = env_pairs_to_map(vec![
+            ("FOO".to_string(), "one".to_string()),
+            ("FOO".to_string(), "two".to_string()),
+        ])
+        .unwrap_err();
+        assert!(err.contains("conflicting duplicate environment variable injection"));
+    }
+
+    #[test]
+    fn secret_pairs_to_map_allows_idempotent_repeats() {
+        let map = secret_pairs_to_map(vec![
+            ("AWS_TOKEN".to_string(), "aws/token".to_string()),
+            ("AWS_TOKEN".to_string(), "aws/token".to_string()),
+        ])
+        .unwrap();
+        assert_eq!(map.get("AWS_TOKEN").map(String::as_str), Some("aws/token"));
+    }
+
+    #[test]
+    fn singular_secret_alias_parses_as_secrets_subcommand() {
+        let args = MainArgs::try_parse_from(["guard", "secret", "list"]).unwrap();
+        assert!(matches!(
+            args,
+            MainArgs::Secrets(SecretCommands::List { detailed: false })
         ));
     }
 
     #[test]
-    fn known_cli_subcommand_error_does_not_fallback_to_run() {
-        assert!(!should_fallback_to_run(
-            &["server".to_string(), "hlep".to_string()],
-            clap::error::ErrorKind::InvalidSubcommand
-        ));
-        assert!(!should_fallback_to_run(
-            &[
-                "server".to_string(),
-                "start".to_string(),
-                "--bogus".to_string()
-            ],
-            clap::error::ErrorKind::UnknownArgument
-        ));
+    fn unknown_top_level_command_does_not_execute_implicitly() {
+        let err = MainArgs::try_parse_from(["guard", "ssh", "host"])
+            .err()
+            .unwrap();
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
     }
 }

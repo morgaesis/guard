@@ -132,23 +132,30 @@ impl ToolRegistry {
     /// Resolve all environment variables for a tool: base env + secrets, then per-user overrides.
     /// Returns an empty map if the tool is not registered.
     /// Fails if a referenced secret key is not found in the store.
+    ///
+    /// `caller_uid` is the identity whose secret namespace the resolver
+    /// reads from. `user_key` (typically the same UID as a string, or a
+    /// TCP token label) picks per-user overrides out of the tool config
+    /// file.
     pub async fn resolve_env(
         &self,
         tool: &str,
         secrets: &SecretManager,
+        caller_uid: Option<u32>,
         user_key: Option<&str>,
     ) -> Result<HashMap<String, String>> {
         let Some(tool_config) = self.get(tool) else {
             return Ok(HashMap::new());
         };
 
-        // Start with base tool env
         let mut env = tool_config.env.clone();
 
-        // Resolve base secrets
         for (env_var, secret_key) in &tool_config.secrets {
+            let caller_uid = caller_uid.ok_or_else(|| {
+                anyhow::anyhow!("tool config secret injection requires a unix socket caller")
+            })?;
             let value = secrets
-                .get(secret_key)
+                .get(caller_uid, secret_key)
                 .await
                 .with_context(|| format!("failed to read secret '{secret_key}'"))?
                 .ok_or_else(|| {
@@ -161,15 +168,19 @@ impl ToolRegistry {
             env.insert(env_var.clone(), value);
         }
 
-        // Overlay per-user overrides if caller matches
         if let Some(user_key) = user_key {
             if let Some(user_override) = tool_config.users.get(user_key) {
                 for (k, v) in &user_override.env {
                     env.insert(k.clone(), v.clone());
                 }
                 for (env_var, secret_key) in &user_override.secrets {
+                    let caller_uid = caller_uid.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "tool config secret injection requires a unix socket caller"
+                        )
+                    })?;
                     let value = secrets
-                        .get(secret_key)
+                        .get(caller_uid, secret_key)
                         .await
                         .with_context(|| format!("failed to read secret '{secret_key}'"))?
                         .ok_or_else(|| {

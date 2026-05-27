@@ -5,7 +5,8 @@ Source of truth hierarchy:
 1. `src/server.rs` -- privileged guard daemon: request protocol, policy evaluation, command execution, environment isolation, and output redaction.
 2. `src/evaluate.rs` -- LLM evaluator: prompt selection, OpenAI-compatible API calls, response parsing, token usage tracking.
 3. `src/main.rs` -- operator-facing CLI: server start, client commands, shim management, MCP server, secret management.
-4. `src/mcp.rs` -- stdio MCP facade: exposes `guard_run` tool for agent clients, backed by the daemon protocol.
+4. `src/session.rs` and `src/session_store.rs` -- session grant model, retention rules, and SQLite-backed persistence for grants and session interaction history.
+5. `src/mcp.rs` -- stdio MCP facade: exposes `guard_run` tool for agent clients, backed by the daemon protocol.
 
 ## Execution flow
 
@@ -39,27 +40,31 @@ Agent -> guard run <cmd> -> Client -> Server -> Evaluator -> LLM API
 
 5. **Decision cache**: An in-memory LRU-style cache of evaluator decisions, keyed on the exact command line. Cache hits return the stored `Allow`/`Deny` without another LLM call. The cache is owned by a single `Evaluator` instance, so restarting the daemon or changing the prompt gives a fresh cache. Both approve and deny decisions are cached; transient evaluator errors are not. Size and TTL are configurable (`--cache-capacity`, `--cache-ttl`, `SSH_GUARD_CACHE_*`); disable with `--no-cache` / `SSH_GUARD_CACHE=false`.
 
-6. **Session grants** (optional, opt-in per request): The caller may include a `session_token` in `ExecuteRequest`. Operators grant sessions extra allow/deny glob patterns via the admin protocol (`guard session grant`). Matching session deny patterns short-circuit to DENY before the evaluator. Matching session allow patterns short-circuit to ALLOW and skip the evaluator. A grant may also carry an additive prompt (`--prompt` / `--prompt-file`) that the evaluator appends to the system prompt for that session's calls, giving the LLM context the static glob patterns cannot express; the decision cache is bypassed for these calls so cached base-prompt verdicts do not leak across the extended context. Non-matching sessions fall through to the evaluator so the usual rules still apply. Grants live in server memory only; they clear on daemon restart, matching the "short-lived extra trust" semantics of sudo timestamps.
+6. **Session grants** (optional, opt-in per request): The caller may include a `session_token` in `ExecuteRequest`. Operators grant sessions extra allow/deny glob patterns via the admin protocol (`guard session grant`). Matching session deny patterns short-circuit to DENY before the evaluator. Matching session allow patterns short-circuit to ALLOW and skip the evaluator. A grant may also carry an additive prompt (`--prompt` / `--prompt-file`) that the evaluator appends to the system prompt for that session's calls, giving the LLM context the static glob patterns cannot express; the decision cache is bypassed for these calls so cached base-prompt verdicts do not leak across the extended context. Non-matching sessions fall through to the evaluator so the usual rules still apply. Grants, historical grant transitions, and bounded interaction history are persisted in the state database, so `session list` and `session show` survive daemon restart. Session history retention remains bounded; older interactions and expired history are purged opportunistically on write and read paths.
 
 7. **Static policy** (optional, opt-in): Glob-pattern allow and deny lists for fast decisions on deterministically safe or unsafe commands. Allow matches skip the LLM; deny matches reject without an LLM call. Everything else falls through to the LLM evaluator. Disabled by default. Documented limitation: static patterns cannot parse shell operators, quoting, or semantics. See `examples/` for reference policies.
 
 ## Admin authorization
 
-Admin RPCs (session grant/revoke/list and the full `status` snapshot) are gated separately from exec. Without this separation, an exec-allowed UID could mint a session whose `--prompt` overrides the LLM policy. The model is intentionally simple:
+Admin RPCs (session grant/revoke/show/list and the full `status` snapshot) are gated separately from exec. Without this separation, an exec-allowed UID could mint a session whose `--prompt` overrides the LLM policy. The model is intentionally simple:
 
 - **Admin = the daemon's own UID.** That process can already control the daemon by signals, /proc, or restarting the service. The socket boundary adds nothing against it.
 - **There is no client-side admin token.** A token-based path would have to live somewhere — env var, config file — and any agent process running as the same user could read it. The admin/agent split is enforced by UID separation only.
 
-The non-privileged `Ping` admin RPC is always permitted to UIDs that can already exec, and returns version, uptime, mode, and dry-run state. That is enough for a `guard status` liveness check without fingerprinting the deployment (no LLM model identity, no redaction posture, no session counts).
+The non-privileged `Ping` admin RPC is always permitted to UIDs that can already exec, and returns version, uptime, mode, and dry-run state. That is enough for a `guard status` liveness check without fingerprinting the deployment (no LLM model identity, no redaction posture, no session counts). The privileged `Status` RPC additionally reveals the resolved state database path so the daemon owner can inspect where durable session state is stored.
 
 ## Execution authority
 
-The server executes approved commands as the daemon process identity. It
-authenticates local clients by peer UID (`--users`) but does not currently
-impersonate that UID before exec. An unprivileged, hardened service is a policy
-gate and secret broker for commands that service identity can already run. A
-root service is a privileged command broker: approved local commands run with
-root authority, similar to a sudo policy boundary.
+The server executes approved commands as the daemon process identity by
+default. It authenticates local clients by peer UID (`--users`) but only
+impersonates that UID when explicitly started with `--exec-as-caller`. That
+mode requires a root daemon and a Unix-socket-only deployment; the server uses
+peer credentials to identify the caller, resolves the caller's passwd entry,
+initializes supplementary groups, and drops the child process to that UID/GID
+before exec. An unprivileged, hardened service is a policy gate and secret
+broker for commands that service identity can already run. A root service
+without `--exec-as-caller` is a privileged command broker: approved local
+commands run with root authority, similar to a sudo policy boundary.
 
 Systemd hardening changes what approved commands can do. In particular,
 `NoNewPrivileges=true` prevents setuid helpers such as `sudo` from elevating,
@@ -110,6 +115,7 @@ sees the relative path text supplied in the command.
 ## Design constraints
 
 - Policy evaluation and command execution exist in one place (the server). New agent integrations wrap the daemon rather than reimplementing approval logic.
+- Audit truth lives in the daemon's structured `tracing` output. The SQLite state database exists for persistent session state and queryable session history, not as a replacement for journald or remote log shipping.
 - MCP transport is stdio only. Network MCP transport adds a second auth surface and should be introduced only with a clear deployment requirement.
 - Tool responses preserve both raw command output and structured fields so clients can use either text-only or schema-aware handling.
 - The guard binary name is `guard`. Environment variables retain the `SSH_GUARD_*` prefix for backwards compatibility.

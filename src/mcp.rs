@@ -1,8 +1,10 @@
+use crate::injection::{collect_unique_pairs, derive_env_name};
 use crate::server;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
@@ -48,6 +50,12 @@ impl Default for McpConfig {
 struct GuardToolArgs {
     binary: String,
     args: Vec<String>,
+    #[serde(default)]
+    env: HashMap<String, String>,
+    #[serde(default)]
+    secrets: Vec<String>,
+    #[serde(default, rename = "secretEnv")]
+    secret_env: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +94,9 @@ struct ClientExecutor {
 #[async_trait]
 impl GuardExecutor for ClientExecutor {
     async fn execute(&self, args: GuardToolArgs) -> Result<GuardToolResponse> {
+        let env = collect_unique_pairs(args.env, "environment variable injection", "value")
+            .map_err(anyhow::Error::msg)?;
+        let secrets = guard_tool_secret_map(&args.secrets, args.secret_env)?;
         let client = if let Some(token) = &self.auth_token {
             server::Client::new(self.socket_path.clone(), self.tcp_port).with_auth(token.clone())
         } else {
@@ -93,12 +104,25 @@ impl GuardExecutor for ClientExecutor {
         };
 
         let response = client
-            .execute(&args.binary, &args.args)
+            .execute_with_injections(&args.binary, &args.args, env, secrets)
             .await
             .context("failed to execute command through guard server")?;
 
         Ok(response.into())
     }
+}
+
+fn guard_tool_secret_map(
+    bare_secrets: &[String],
+    explicit_secret_env: HashMap<String, String>,
+) -> Result<HashMap<String, String>> {
+    let mut pairs = Vec::with_capacity(bare_secrets.len() + explicit_secret_env.len());
+    for secret_name in bare_secrets {
+        let env_name = derive_env_name(secret_name).map_err(anyhow::Error::msg)?;
+        pairs.push((env_name, secret_name.clone()));
+    }
+    pairs.extend(explicit_secret_env);
+    collect_unique_pairs(pairs, "secret injection", "secret").map_err(anyhow::Error::msg)
 }
 
 #[derive(Serialize)]
@@ -277,7 +301,7 @@ impl<E: GuardExecutor> McpServer<E> {
                 "description": "Policy-gated command execution through MCP tools."
             },
             "instructions": format!(
-                "Use the {} tool to execute commands through the guard daemon. Commands are evaluated against security policy before execution. Denied commands are returned as tool errors so the model can revise them. Environment variables (SSH_AUTH_SOCK, PATH, HOME, etc.) are managed server-side and cannot be set by the client.",
+                "Use the {} tool to execute commands through the guard daemon. Commands are evaluated against security policy before execution. Denials come back as normal tool results with allowed=false so the model can revise the request without treating the tool itself as broken. Secret references name stored guard secrets; the daemon resolves the values server-side and never exposes them to the client.",
                 self.tool_name
             )
         })
@@ -289,7 +313,7 @@ impl<E: GuardExecutor> McpServer<E> {
                 {
                     "name": self.tool_name,
                     "title": "Run Command Through Guard",
-                    "description": "Execute a command through the guard daemon. The command is evaluated against security policy before execution. Do not attempt to set environment variables; the execution environment is fully controlled by the server.",
+                    "description": "Execute a command through the guard daemon. The command is evaluated against security policy before execution. Plain environment overrides and named secret references are optional; secret values are resolved by the daemon and never exposed to the client.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -301,6 +325,21 @@ impl<E: GuardExecutor> McpServer<E> {
                                 "type": "array",
                                 "items": { "type": "string" },
                                 "description": "Arguments to pass to the binary."
+                            },
+                            "env": {
+                                "type": "object",
+                                "additionalProperties": { "type": "string" },
+                                "description": "Optional plain environment variables to inject for this command."
+                            },
+                            "secrets": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Optional stored secret names to inject using their derived environment-variable names."
+                            },
+                            "secretEnv": {
+                                "type": "object",
+                                "additionalProperties": { "type": "string" },
+                                "description": "Optional explicit environment-variable to stored-secret mappings."
                             }
                         },
                         "required": ["binary", "args"]
@@ -394,7 +433,6 @@ fn jsonrpc_error_response(id: Value, code: i64, message: String, data: Option<Va
 }
 
 fn tool_result(result: GuardToolResponse) -> Value {
-    let is_error = !result.allowed;
     let structured = json!({
         "allowed": result.allowed,
         "reason": result.reason,
@@ -411,7 +449,7 @@ fn tool_result(result: GuardToolResponse) -> Value {
             }
         ],
         "structuredContent": structured,
-        "isError": is_error
+        "isError": false
     })
 }
 
@@ -628,6 +666,61 @@ mod tests {
             response["result"]["structuredContent"]["reason"],
             "backend unavailable"
         );
+    }
+
+    #[test]
+    fn guard_tool_secret_map_derives_and_dedupes_secret_env_names() {
+        let secrets = guard_tool_secret_map(
+            &[
+                "opnsense-apikey-secret".to_string(),
+                "opnsense-apikey-secret".to_string(),
+            ],
+            HashMap::from([(
+                "AWS_SESSION_TOKEN".to_string(),
+                "aws/session-token".to_string(),
+            )]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            secrets.get("OPNSENSE_APIKEY_SECRET").map(String::as_str),
+            Some("opnsense-apikey-secret")
+        );
+        assert_eq!(
+            secrets.get("AWS_SESSION_TOKEN").map(String::as_str),
+            Some("aws/session-token")
+        );
+    }
+
+    #[test]
+    fn guard_tool_secret_map_rejects_conflicting_secret_mappings() {
+        let err = guard_tool_secret_map(
+            &["opnsense-apikey-secret".to_string()],
+            HashMap::from([(
+                "OPNSENSE_APIKEY_SECRET".to_string(),
+                "other-secret".to_string(),
+            )]),
+        )
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("conflicting duplicate secret injection"));
+    }
+
+    #[test]
+    fn denied_tool_results_are_not_transport_errors() {
+        let value = tool_result(GuardToolResponse {
+            allowed: false,
+            reason: "policy denied".to_string(),
+            exit_code: None,
+            stdout: None,
+            stderr: None,
+        });
+
+        assert_eq!(value["isError"], false);
+        assert_eq!(value["structuredContent"]["allowed"], false);
+        assert_eq!(value["content"][0]["text"], "DENIED: policy denied");
     }
 
     #[tokio::test]
