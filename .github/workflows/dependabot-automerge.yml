@@ -216,9 +216,11 @@ jobs:
 
           opencode run \
             --model "$DEPENDABOT_AI_MODEL" \
-            --file .cache/dependabot-review/prompt.md \
-            --file .cache/dependabot-review/context.md \
-            "Review this Dependabot major update and return only the requested JSON." \
+            "$(cat .cache/dependabot-review/prompt.md)
+
+          $(cat .cache/dependabot-review/context.md)
+
+          Review this Dependabot major update and return only the requested JSON." \
             > .cache/dependabot-review/result.txt
 
       - name: Evaluate opencode decision
