@@ -1,21 +1,16 @@
-name: Dependabot auto-merge
+name: Dependabot review gate
 
-# Auto-approve and auto-merge Dependabot PRs that pass CI, restricted to
-# the bump types we are willing to take without human review:
+# Gate Dependabot PRs that need human review while staying quiet for updates
+# that normal CI can cover:
 #
 #   - security updates (any semver level)
 #   - patch and minor cargo updates
 #   - all GitHub Actions updates (we already SHA-pin them, so the bump
 #     is functionally a vetted-tag → vetted-tag move)
 #
-# Major version bumps are evaluated by an AI review gate before manual
-# review is requested. If the AI gate is unavailable or recommends human
-# review, the PR is labeled and @morgaesis is tagged.
-#
-# Required repo settings (configure once in the GitHub UI):
-#   Settings → General → Pull Requests → "Allow auto-merge" enabled
-#   Settings → Branches → branch protection on main with the CI checks
-#   marked as required (otherwise --auto would merge without waiting).
+# Major version bumps are evaluated by an AI review gate. The workflow fails
+# and tags @morgaesis only when the gate is unavailable or requests review.
+# Otherwise it succeeds without PR comments, review approvals, or merge actions.
 
 on:
   pull_request_target:
@@ -34,13 +29,13 @@ permissions:
   contents: read
 
 jobs:
-  automerge:
+  review-gate:
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.user.login == 'dependabot[bot]'
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
       issues: write
-      pull-requests: write
+      pull-requests: read
     steps:
       - name: Resolve pull request
         id: pr
@@ -122,19 +117,14 @@ jobs:
             echo "package-ecosystem=${package_ecosystem}"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Approve and enable auto-merge for safe bumps
+      - name: Succeed silently for safe bumps
         if: >-
           steps.meta.outputs.update-type == 'version-update:semver-patch' ||
           steps.meta.outputs.update-type == 'version-update:semver-minor' ||
           steps.meta.outputs.alert-state == 'open' ||
           steps.meta.outputs.package-ecosystem == 'github_actions'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_URL: ${{ steps.pr.outputs.url }}
         run: |
-          gh pr review --approve "$PR_URL" || \
-            echo "::warning::Could not approve PR with GITHUB_TOKEN; enabling auto-merge anyway."
-          gh pr merge --auto --squash "$PR_URL"
+          echo "No manual review required."
 
       - name: Prepare major bump review context
         if: >-
@@ -153,7 +143,7 @@ jobs:
           cat > .cache/dependabot-review/prompt.md <<'PROMPT'
           You are reviewing a Dependabot semver-major update for ssh-guard.
 
-          Decide whether a human maintainer must review this PR before auto-merge.
+          Decide whether a human maintainer must review this PR before the gate passes.
           Base the decision only on the attached diff and changed-file metadata.
 
           Return only JSON with this schema:
@@ -185,12 +175,6 @@ jobs:
             exit 0
           fi
 
-          gh label create "needs-manual-review" \
-            --repo "$GITHUB_REPOSITORY" \
-            --color "B60205" \
-            --description "Dependabot update requires manual review" \
-            --force
-          gh pr edit "$PR_URL" --add-label "needs-manual-review"
           gh pr comment "$PR_URL" --body \
             "@morgaesis Major version bump detected, but OPENROUTER_API_KEY is not configured for the AI review gate. Configure it as a Dependabot-accessible secret, then re-run this workflow or review manually."
           exit 1
@@ -269,12 +253,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_URL: ${{ steps.pr.outputs.url }}
         run: |
-          gh label create "needs-manual-review" \
-            --repo "$GITHUB_REPOSITORY" \
-            --color "B60205" \
-            --description "Dependabot update requires manual review" \
-            --force
-          gh pr edit "$PR_URL" --add-label "needs-manual-review"
           gh pr comment "$PR_URL" --body \
             "@morgaesis AI review could not produce a usable decision for this major Dependabot update. Review manually or re-run after fixing the AI review gate."
           exit 1
@@ -290,32 +268,16 @@ jobs:
           PR_URL: ${{ steps.pr.outputs.url }}
           SUMMARY: ${{ steps.ai.outputs.summary }}
         run: |
-          gh label create "needs-manual-review" \
-            --repo "$GITHUB_REPOSITORY" \
-            --color "B60205" \
-            --description "Dependabot update requires manual review" \
-            --force
-          gh pr edit "$PR_URL" --add-label "needs-manual-review"
           gh pr comment "$PR_URL" --body "@morgaesis AI review recommends human review before merging.
 
           ${SUMMARY}"
           exit 1
 
-      - name: Approve and enable auto-merge for AI-cleared major bump
+      - name: Succeed silently for AI-cleared major bump
         if: >-
           steps.meta.outputs.update-type == 'version-update:semver-major' &&
           steps.meta.outputs.alert-state != 'open' &&
           steps.meta.outputs.package-ecosystem != 'github_actions' &&
           steps.ai.outputs.manual == 'false'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_URL: ${{ steps.pr.outputs.url }}
-          SUMMARY: ${{ steps.ai.outputs.summary }}
         run: |
-          gh pr comment "$PR_URL" --body "AI review did not require human review.
-
-          ${SUMMARY}"
-          gh pr edit "$PR_URL" --remove-label "needs-manual-review" || true
-          gh pr review --approve "$PR_URL" || \
-            echo "::warning::Could not approve PR with GITHUB_TOKEN; enabling auto-merge anyway."
-          gh pr merge --auto --squash "$PR_URL"
+          echo "AI review did not require manual review."
