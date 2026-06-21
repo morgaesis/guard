@@ -15,6 +15,7 @@ mod ssh;
 mod tool_config;
 
 use guard::evaluate;
+use guard::learned_rules::{AutoShimMode, LearnedRuleStore, LearningConfig};
 
 use anyhow::{Context, Result};
 use clap::{ArgAction, CommandFactory, Parser, Subcommand};
@@ -23,6 +24,8 @@ use injection::{collect_unique_pairs, derive_env_name, is_valid_env_name};
 use std::collections::HashMap;
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 use tracing_subscriber::{fmt, EnvFilter};
 
 #[derive(Parser)]
@@ -258,6 +261,7 @@ enum ServerCommands {
         tcp_port: Option<u16>,
 
         /// Shared token required for TCP clients.
+        /// Env: SSH_GUARD_AUTH_TOKEN.
         #[arg(long, value_name = "TOKEN")]
         auth_token: Option<String>,
 
@@ -341,6 +345,31 @@ enum ServerCommands {
         /// Cache entry TTL in seconds. Env: SSH_GUARD_CACHE_TTL.
         #[arg(long, value_name = "SECONDS")]
         cache_ttl: Option<u64>,
+
+        /// Learn static allow rules from repeated low-risk LLM approvals.
+        /// Env: SSH_GUARD_LEARN_RULES.
+        #[arg(long = "learn-rules", action = ArgAction::SetTrue)]
+        learn_rules: bool,
+
+        /// Path to learned static rules YAML.
+        /// Env: SSH_GUARD_LEARNED_RULES.
+        #[arg(long, value_name = "PATH")]
+        learned_rules: Option<PathBuf>,
+
+        /// LLM approvals required before a learned allow rule is promoted.
+        /// Env: SSH_GUARD_LEARN_MIN_APPROVALS.
+        #[arg(long, value_name = "N")]
+        learn_min_approvals: Option<u32>,
+
+        /// Maximum risk score eligible for learned static allow promotion.
+        /// Env: SSH_GUARD_LEARN_MAX_RISK.
+        #[arg(long, value_name = "0-10")]
+        learn_max_risk: Option<i32>,
+
+        /// Service-shim behavior for learned rules: off, suggest, or create.
+        /// Env: SSH_GUARD_LEARN_SHIMS.
+        #[arg(long, value_name = "MODE")]
+        learn_shims: Option<String>,
 
         /// Evaluate policy but do not execute approved commands.
         /// Env: SSH_GUARD_DRY_RUN.
@@ -483,6 +512,8 @@ fn guard_env(suffix: &str) -> Option<String> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = dotenvy::dotenv();
+
     // Log level: RUST_LOG > GUARD_LOG_LEVEL > SSH_GUARD_LOG_LEVEL > "info"
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         let level = guard_env("LOG_LEVEL").unwrap_or_else(|| "warn".to_string());
@@ -578,23 +609,32 @@ fn print_run_help() -> Result<()> {
 }
 
 fn current_uid() -> u32 {
-    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
-        return 0;
-    };
-    for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("Uid:") {
-            if let Some(uid_str) = rest.split_whitespace().next() {
-                if let Ok(uid) = uid_str.parse::<u32>() {
-                    return uid;
-                }
-            }
-        }
+    #[cfg(unix)]
+    {
+        unsafe { libc::geteuid() as u32 }
     }
-    0
+    #[cfg(not(unix))]
+    {
+        0
+    }
 }
 
 fn default_state_db_path() -> Option<PathBuf> {
-    dirs::state_dir().map(|dir| dir.join("guard").join("state.db"))
+    default_guard_state_dir().map(|dir| dir.join("state.db"))
+}
+
+fn default_learned_rules_path() -> Option<PathBuf> {
+    default_guard_state_dir().map(|dir| dir.join("learned-rules.yaml"))
+}
+
+fn default_guard_state_dir() -> Option<PathBuf> {
+    if let Some(dir) = dirs::state_dir() {
+        return Some(dir.join("guard"));
+    }
+    if let Some(dir) = dirs::data_local_dir() {
+        return Some(dir.join("guard"));
+    }
+    dirs::home_dir().map(|dir| dir.join(".guard"))
 }
 
 async fn run_server(cmd: ServerCommands) -> Result<()> {
@@ -620,6 +660,11 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             no_cache,
             cache_capacity,
             cache_ttl,
+            learn_rules,
+            learned_rules,
+            learn_min_approvals,
+            learn_max_risk,
+            learn_shims,
             dry_run,
             state_db,
             exec_as_caller,
@@ -628,16 +673,47 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
         } => {
             tracing::info!("Starting guard server...");
 
-            let socket_path = socket
-                .map(PathBuf::from)
-                .or_else(|| {
-                    let config = client_config::ClientConfig::load().ok()?;
-                    config.server_socket.map(PathBuf::from)
-                })
+            #[cfg(not(unix))]
+            if socket.is_some() {
+                anyhow::bail!("--socket is not supported on this platform; use --tcp-port");
+            }
+
+            let configured_socket = socket.map(PathBuf::from).or_else(|| {
+                let config = client_config::ClientConfig::load().ok()?;
+                config.server_socket.map(PathBuf::from)
+            });
+            #[cfg(unix)]
+            let socket_path = configured_socket
                 .or_else(|| dirs::home_dir().map(|h| h.join(".guard").join("guard.sock")));
+            #[cfg(not(unix))]
+            let socket_path: Option<PathBuf> = None;
+
+            let tcp_port = tcp_port
+                .or_else(|| guard_env("TCP_PORT").and_then(|v| v.parse::<u16>().ok()))
+                .or_else(|| {
+                    #[cfg(windows)]
+                    {
+                        Some(8123)
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        None
+                    }
+                });
 
             if let Some(ref path) = socket_path {
                 tracing::info!("Socket: {}", path.display());
+            }
+            if let Some(port) = tcp_port {
+                tracing::info!("TCP: 127.0.0.1:{}", port);
+            }
+            let auth_token = auth_token
+                .filter(|token| !token.is_empty())
+                .or_else(|| guard_env("AUTH_TOKEN").filter(|token| !token.is_empty()));
+            if tcp_port.is_some() && auth_token.is_none() {
+                anyhow::bail!(
+                    "TCP server requires --auth-token or SSH_GUARD_AUTH_TOKEN; configure clients with `guard config set-token`"
+                );
             }
 
             let shim_dir =
@@ -703,15 +779,23 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 tracing::warn!("No LLM API key provided (set GUARD_LLM_API_KEY, OPENROUTER_API_KEY, or --llm-api-key)");
             }
 
+            let resolved_timeout = llm_timeout
+                .or_else(|| guard_env("LLM_TIMEOUT").and_then(|v| v.parse::<u64>().ok()))
+                .or_else(|| guard_env("TIMEOUT").and_then(|v| v.parse::<u64>().ok()))
+                .unwrap_or(30);
             let mut eval_config = evaluate::EvalConfig::default()
                 .llm_enabled(llm_enabled)
-                .llm_timeout_secs(llm_timeout.unwrap_or(30));
+                .llm_timeout_secs(resolved_timeout);
 
             if let Some(api_key) = api_key.filter(|value| !value.is_empty()) {
                 eval_config = eval_config.llm_api_key(api_key);
             }
 
-            if let Some(api_url) = llm_api_url.filter(|value| !value.is_empty()) {
+            let resolved_api_url = llm_api_url
+                .filter(|value| !value.is_empty())
+                .or_else(|| guard_env("LLM_API_URL").filter(|value| !value.is_empty()))
+                .or_else(|| guard_env("API_URL").filter(|value| !value.is_empty()));
+            if let Some(api_url) = resolved_api_url {
                 eval_config = eval_config.llm_api_url(api_url);
             }
 
@@ -800,6 +884,52 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 tracing::info!("LLM decision cache disabled");
             }
 
+            let learning_enabled = learn_rules
+                || guard_env("LEARN_RULES")
+                    .as_deref()
+                    .map(parse_env_bool)
+                    .unwrap_or(false);
+            if learning_enabled {
+                let learned_rules_path = learned_rules
+                    .or_else(|| {
+                        guard_env("LEARNED_RULES")
+                            .filter(|value| !value.is_empty())
+                            .map(PathBuf::from)
+                    })
+                    .or_else(default_learned_rules_path)
+                    .ok_or_else(|| anyhow::anyhow!("could not determine learned rules path"))?;
+                let mut learning_config = LearningConfig::new(learned_rules_path.clone());
+                learning_config.min_approvals = learn_min_approvals
+                    .or_else(|| {
+                        guard_env("LEARN_MIN_APPROVALS").and_then(|v| v.parse::<u32>().ok())
+                    })
+                    .unwrap_or(learning_config.min_approvals)
+                    .max(1);
+                learning_config.max_risk = learn_max_risk
+                    .or_else(|| guard_env("LEARN_MAX_RISK").and_then(|v| v.parse::<i32>().ok()))
+                    .unwrap_or(learning_config.max_risk)
+                    .clamp(0, 10);
+                let shim_mode = learn_shims
+                    .or_else(|| guard_env("LEARN_SHIMS"))
+                    .and_then(|value| AutoShimMode::parse(&value))
+                    .unwrap_or(learning_config.auto_shim);
+                learning_config.auto_shim = shim_mode;
+                let store = LearnedRuleStore::load(learning_config).with_context(|| {
+                    format!(
+                        "failed to load learned rules from {}",
+                        learned_rules_path.display()
+                    )
+                })?;
+                tracing::info!(
+                    "Learned static rules enabled: path={} min_approvals={} max_risk={} shims={}",
+                    store.path().display(),
+                    store.min_approvals(),
+                    store.max_risk(),
+                    store.auto_shim().as_str()
+                );
+                eval_config = eval_config.learned_rules(Arc::new(RwLock::new(store)));
+            }
+
             // Additive prompt: append to base prompt without replacing it.
             // Priority: --system-prompt-append flag > SSH_GUARD_PROMPT_APPEND env var
             let append_path = system_prompt_append.or_else(|| {
@@ -872,9 +1002,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 tracing::info!("Loaded {} tool config(s)", tool_count);
             }
             if let Some(ref token) = auth_token {
-                if !token.is_empty() {
-                    redact_secrets.push(token.clone());
-                }
+                redact_secrets.push(token.clone());
             }
 
             let (sessions, session_store) = if let Some(ref path) = state_db_path {
@@ -1067,13 +1195,16 @@ async fn run_mcp(subcommand: McpCommands) -> Result<()> {
             tool_name,
         } => {
             let config = client_config::ClientConfig::load().ok().unwrap_or_default();
-            let socket_path = socket.or(config.server_socket).map(PathBuf::from);
-            let tcp_port = tcp_port.or(config.server_tcp_port);
+            let (mut socket_path, mut resolved_tcp_port) = resolve_client_endpoint(socket, &config);
+            if let Some(port) = tcp_port {
+                socket_path = None;
+                resolved_tcp_port = Some(port);
+            }
             let auth_token = token.or(config.auth_token);
 
             let mcp_config = mcp::McpConfig {
                 socket_path,
-                tcp_port,
+                tcp_port: resolved_tcp_port,
                 auth_token,
                 tool_name,
             };
@@ -1086,7 +1217,9 @@ async fn run_mcp(subcommand: McpCommands) -> Result<()> {
 /// Well-known default socket path. Used when nothing more specific is
 /// configured (no --socket flag, no GUARD_SOCKET env, no client.yaml).
 /// Matches the systemd RuntimeDirectory layout in deployment/systemd/.
+#[cfg(unix)]
 const DEFAULT_CLIENT_SOCKET: &str = "/run/guard/guard.sock";
+const DEFAULT_CLIENT_TCP_PORT: u16 = 8123;
 
 /// Resolve the client endpoint from explicit override > env var > client
 /// config > well-known default. Returns (socket, tcp_port). At most one
@@ -1098,22 +1231,49 @@ fn resolve_client_endpoint(
     if let Some(s) = socket_override {
         return (Some(PathBuf::from(s)), None);
     }
+    if let Ok(port) =
+        std::env::var("GUARD_TCP_PORT").or_else(|_| std::env::var("SSH_GUARD_TCP_PORT"))
+    {
+        if let Ok(port) = port.parse::<u16>() {
+            return (None, Some(port));
+        }
+    }
     if let Ok(s) = std::env::var("GUARD_SOCKET") {
         if !s.is_empty() {
+            #[cfg(not(unix))]
+            {
+                return (
+                    None,
+                    Some(config.server_tcp_port.unwrap_or(DEFAULT_CLIENT_TCP_PORT)),
+                );
+            }
+            #[cfg(unix)]
             return (Some(PathBuf::from(s)), None);
         }
     }
+    if let Some(port) = config.server_tcp_port {
+        return (None, Some(port));
+    }
+    #[cfg(unix)]
     if let Some(ref s) = config.server_socket {
         return (Some(PathBuf::from(s)), None);
     }
-    if let Some(port) = config.server_tcp_port {
-        return (None, Some(port));
+    #[cfg(windows)]
+    {
+        return (None, Some(DEFAULT_CLIENT_TCP_PORT));
     }
     // Fall back to the well-known default. If it doesn't exist the
     // connect will fail with a clear "failed to connect" error, which
     // is more useful than the previous "No server configured" since
     // most local installs use the default anyway.
-    (Some(PathBuf::from(DEFAULT_CLIENT_SOCKET)), None)
+    #[cfg(unix)]
+    {
+        (Some(PathBuf::from(DEFAULT_CLIENT_SOCKET)), None)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        (None, Some(DEFAULT_CLIENT_TCP_PORT))
+    }
 }
 
 async fn handle_status(socket: Option<String>) -> Result<()> {
@@ -1180,6 +1340,10 @@ async fn handle_status(socket: Option<String>) -> Result<()> {
             println!(
                 "  cache          enabled={} size={}",
                 status.cache_enabled, status.cache_size
+            );
+            println!(
+                "  learning       enabled={} rules={}",
+                status.learning_enabled, status.learned_rule_count
             );
             println!("  sessions       {}", status.session_count);
             println!("  daemon_uid     {}", status.daemon_uid);
@@ -1902,6 +2066,11 @@ mod tests {
                 no_cache,
                 cache_capacity,
                 cache_ttl,
+                learn_rules,
+                learned_rules,
+                learn_min_approvals,
+                learn_max_risk,
+                learn_shims,
                 dry_run,
                 state_db,
                 exec_as_caller,
@@ -1928,6 +2097,11 @@ mod tests {
                 no_cache,
                 cache_capacity,
                 cache_ttl,
+                learn_rules,
+                learned_rules,
+                learn_min_approvals,
+                learn_max_risk,
+                learn_shims,
                 dry_run,
                 state_db,
                 exec_as_caller,

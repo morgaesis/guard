@@ -15,7 +15,6 @@ use std::collections::HashMap;
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -630,10 +629,11 @@ pub struct SecretFd {
 
 impl SecretFd {
     fn new(secret: &str) -> Result<Self> {
-        let temp_dir = tempfile::TempDir::new_in("/tmp")?;
+        let temp_dir = tempfile::TempDir::new()?;
         let path = temp_dir.path().join("secret");
 
         fs::write(&path, secret)?;
+        #[cfg(unix)]
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
 
         Ok(Self { path, temp_dir })
@@ -828,8 +828,14 @@ pub fn detect_backend() -> BackendType {
 
 /// Resolve a UID to a user name via nsswitch; returns None when the UID
 /// has no entry. Used only for display (audit lines, `secrets list`).
+#[cfg(unix)]
 pub fn uid_to_name(uid: u32) -> Option<String> {
     uzers::get_user_by_uid(uid).and_then(|u| u.name().to_str().map(|s| s.to_string()))
+}
+
+#[cfg(not(unix))]
+pub fn uid_to_name(_uid: u32) -> Option<String> {
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -960,9 +966,13 @@ mod tests {
         let content = fs::read_to_string(fd.path()).unwrap();
         assert_eq!(content, secret);
 
-        let metadata = fs::metadata(fd.path()).unwrap();
-        let mode = metadata.permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = fs::metadata(fd.path()).unwrap();
+            let mode = metadata.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 
     #[tokio::test]

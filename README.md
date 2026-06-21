@@ -104,6 +104,10 @@ Two opt-in features exist for deployments with specific constraints:
 - **Fallback model chain** via `SSH_GUARD_LLM_MODELS`. Fails over to
   alternate providers after the primary exhausts its retries. See
   [`examples/fallback-models.env`](examples/fallback-models.env).
+- **Learned static rules** via `--learn-rules`. Repeated low-risk LLM
+  approvals can promote conservative exact static allow rules so repeated
+  calls return immediately. Misses and risky commands still fall through to
+  the LLM.
 
 Enable either only when a concrete latency or uptime constraint forces it.
 
@@ -116,11 +120,17 @@ Guard walks up from your current directory to `/` looking for `.env` files (clos
 | Variable | Default | Description |
 |---|---|---|
 | `SSH_GUARD_LLM_API_KEY` / `OPENROUTER_API_KEY` | (none) | LLM API key (required). `OPENROUTER_API_KEY` is the conventional name and is accepted for compatibility. |
-| `SSH_GUARD_API_URL` | `https://openrouter.ai/api/v1/chat/completions` | Any OpenAI-compatible endpoint |
+| `SSH_GUARD_LLM_API_URL` / `SSH_GUARD_API_URL` | `https://openrouter.ai/api/v1/chat/completions` | Any OpenAI-compatible endpoint |
 | `SSH_GUARD_LLM_MODELS` | (unset) | Optional comma-separated fallback chain (e.g. `openai/gpt-5.4-nano,meta-llama/llama-4-maverick`). When set, overrides `--llm-model` and is tried in order, each with its own retry budget. Primary model when unset: `openai/gpt-5.4-nano`. |
 | `SSH_GUARD_LLM_RETRIES` | `2` | Retries per model on transient failures (429, timeouts, parse errors). 1-2. |
+| `SSH_GUARD_LLM_TIMEOUT` / `SSH_GUARD_TIMEOUT` | `30` | LLM call timeout in seconds. |
+| `SSH_GUARD_AUTH_TOKEN` | (none) | Shared token for TCP clients. Use this for loopback TCP daemons instead of passing `--auth-token` on the command line. |
 | `SSH_GUARD_MODE` | `readonly` | `readonly`, `safe`, or `paranoid` |
 | `SSH_GUARD_DRY_RUN` | `false` | Evaluate policy but do not execute approved commands. Useful for prompt and policy testing. |
+| `SSH_GUARD_LEARN_RULES` | `false` | Learn static allows from repeated low-risk LLM approvals. |
+| `SSH_GUARD_LEARN_MIN_APPROVALS` | `2` | Approvals required before promotion. |
+| `SSH_GUARD_LEARN_MAX_RISK` | `2` | Highest LLM risk score eligible for promotion. |
+| `SSH_GUARD_LEARN_SHIMS` | `suggest` | `off`, `suggest`, or `create` service shims for learned SSH/API wrappers. |
 | `SSH_GUARD_PROMPT_APPEND` | (none) | Path to additive prompt file (appended to base prompt) |
 | `SSH_GUARD_GPG_RECIPIENT` | (none) | GPG recipient for the `local` secret backend |
 | `SSH_GUARD_BACKEND` | (auto) | Secret backend (`pass`, `env`, `local`). Auto prefers `pass`; otherwise it falls back to non-persistent `env` and logs a warning. |
@@ -224,6 +234,28 @@ guard server start --policy examples/deny-policy.yaml --socket .cache/guard.sock
 Static patterns are checked first. If a command matches a deny pattern, it is rejected immediately without an LLM call. Commands that pass static policy are then evaluated by the LLM.
 
 See [`examples/deny-policy.yaml`](examples/deny-policy.yaml) for a reference policy with documented limitations of static glob matching.
+
+### Learned static rules
+
+For services with repetitive low-risk calls, enable learned rules:
+
+```bash
+guard server start \
+  --learn-rules \
+  --learn-min-approvals 2 \
+  --learn-max-risk 2 \
+  --learn-shims suggest \
+  --socket .cache/guard.sock &
+```
+
+When the LLM repeatedly approves the same low-risk command shape, guard writes
+a learned allow rule to the state directory and future identical calls bypass
+the LLM. Learned rules never deny or wildcard over service verbs; misses,
+session-prompted calls, and commands with destructive shell-control tokens fall
+back to normal evaluation. For SSH API wrappers, guard may also mention a
+shorter service shim such as `opnsense-api`; with `--learn-shims create`,
+promoted rules create that wrapper in the configured shim directory, and the
+same approved operation is covered through the shim name.
 
 ### Custom system prompt
 
@@ -421,7 +453,7 @@ Never use interactive sessions.
 ```bash
 export SSH_GUARD_LLM_API_KEY="..."
 export SSH_GUARD_MODE=readonly
-alias ssh=guard
+alias ssh='guard run ssh'
 ```
 
 </details>

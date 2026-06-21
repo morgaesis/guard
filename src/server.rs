@@ -20,24 +20,32 @@ use crate::session::{
     SessionGrantSummary, SessionInteraction, SessionRegistry, SessionReport,
 };
 use crate::session_store::SessionStore;
+use crate::shim::ShimGenerator;
 
 // Re-export so main.rs can pattern-match on history status without a
 // direct dependency on the `session` module path.
 pub use crate::session::HistoricalStatus;
 use crate::tool_config::ToolRegistry;
 use anyhow::{bail, Context, Result};
+use guard::learned_rules::{AutoShimMode, LearningOutcome};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::ffi::CString;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, UnixListener, UnixStream};
+use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command;
 use tokio::sync::{mpsc, RwLock};
+#[cfg(unix)]
 use uzers::os::unix::UserExt;
 
 const DEFAULT_SOCKET_PATH: &str = "/var/run/guard/guard.sock";
@@ -241,6 +249,10 @@ pub struct ServerStatus {
     pub dry_run: bool,
     pub cache_enabled: bool,
     pub cache_size: usize,
+    #[serde(default)]
+    pub learning_enabled: bool,
+    #[serde(default)]
+    pub learned_rule_count: usize,
     pub session_count: usize,
     pub daemon_uid: u32,
     pub exec_identity: String,
@@ -512,12 +524,21 @@ impl Server {
         let mut futures = Vec::new();
 
         if let Some(ref socket_path) = self.config.socket_path {
-            tracing::info!("Starting UNIX socket listener on {}", socket_path.display());
-            let path = socket_path.clone();
-            let config = self.config.clone();
-            futures.push(tokio::spawn(async move {
-                Self::run_unix_static(&path, &config).await
-            }));
+            #[cfg(not(unix))]
+            {
+                anyhow::bail!(
+                    "Unix sockets are not supported on this platform; start guard with --tcp-port"
+                );
+            }
+            #[cfg(unix)]
+            {
+                tracing::info!("Starting UNIX socket listener on {}", socket_path.display());
+                let path = socket_path.clone();
+                let config = self.config.clone();
+                futures.push(tokio::spawn(async move {
+                    Self::run_unix_static(&path, &config).await
+                }));
+            }
         }
 
         if let Some(port) = self.config.tcp_port {
@@ -537,6 +558,7 @@ impl Server {
         Ok(())
     }
 
+    #[cfg(unix)]
     async fn run_unix_static(socket_path: &PathBuf, config: &ServerConfig) -> Result<()> {
         if let Some(parent) = socket_path.parent() {
             tokio::fs::create_dir_all(parent)
@@ -604,6 +626,7 @@ impl Server {
         }
     }
 
+    #[cfg(unix)]
     async fn chown_to_group(path: &PathBuf, group: &str) -> Result<()> {
         let output = Command::new("chgrp").arg(group).arg(path).output().await?;
 
@@ -618,6 +641,7 @@ impl Server {
         Ok(())
     }
 
+    #[cfg(unix)]
     async fn chmod_path(path: &std::path::Path, mode: u32) -> Result<()> {
         let permissions = std::fs::Permissions::from_mode(mode);
         std::fs::set_permissions(path, permissions)
@@ -626,6 +650,7 @@ impl Server {
     }
 }
 
+#[cfg(unix)]
 async fn handle_client_unix(stream: UnixStream, config: &ServerConfig) -> Result<()> {
     tracing::info!("handle_client_unix: new connection");
     let uid = stream
@@ -1079,6 +1104,7 @@ async fn handle_admin_request(
                 .unwrap_or(0);
             let session_count = config.sessions.read().await.list().len();
             let cache_size = config.evaluator.cache_size().await;
+            let learned_rule_count = config.evaluator.learned_rule_count().await;
             let mode = config
                 .evaluator
                 .mode()
@@ -1101,6 +1127,8 @@ async fn handle_admin_request(
                     dry_run: config.dry_run,
                     cache_enabled: config.evaluator.cache_enabled(),
                     cache_size,
+                    learning_enabled: config.evaluator.learning_enabled(),
+                    learned_rule_count,
                     session_count,
                     daemon_uid: config.daemon_uid,
                     exec_identity: if config.exec_as_caller {
@@ -1735,6 +1763,35 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
             source,
             risk,
         } => {
+            let mut reason = reason;
+            if matches!(source, crate::evaluate::EvalSource::Llm)
+                && session_prompt
+                    .as_deref()
+                    .map(|prompt| prompt.trim().is_empty())
+                    .unwrap_or(true)
+            {
+                match config
+                    .evaluator
+                    .record_learned_approval(
+                        &request.binary,
+                        &request.args,
+                        &command_line,
+                        risk,
+                        &reason,
+                    )
+                    .await
+                {
+                    Ok(Some(outcome)) => {
+                        if let Some(notice) = learning_notice(config, &outcome).await {
+                            reason = format!("{reason} {notice}");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        tracing::warn!("failed to record learned rule candidate: {}", err);
+                    }
+                }
+            }
             tracing::debug!("command allowed: {}", reason);
             config.log_audit_policy(caller, &request.binary, &request.args, true, &reason);
             if let Err(e) = write_policy_decision(stream_output, stream_writer, true, &reason).await
@@ -1773,8 +1830,87 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
 fn session_source_from_eval(source: crate::evaluate::EvalSource) -> SessionDecisionSource {
     match source {
         crate::evaluate::EvalSource::Llm => SessionDecisionSource::Llm,
+        crate::evaluate::EvalSource::LearnedRule => SessionDecisionSource::StaticPolicy,
         crate::evaluate::EvalSource::StaticPolicy => SessionDecisionSource::StaticPolicy,
     }
+}
+
+async fn learning_notice(config: &ServerConfig, outcome: &LearningOutcome) -> Option<String> {
+    let mut notice = if outcome.promoted {
+        format!(
+            "Promoted learned static rule `{}` for `{}` after {} approvals.",
+            outcome.pattern, outcome.service, outcome.approvals
+        )
+    } else if let Some(reason) = &outcome.skipped_reason {
+        format!("Learned-rule skip: {reason}.")
+    } else {
+        format!(
+            "Learned-rule candidate `{}` for `{}` ({}/{} approvals).",
+            outcome.pattern, outcome.service, outcome.approvals, outcome.required_approvals
+        )
+    };
+
+    let Some(shim) = &outcome.shim else {
+        return Some(notice);
+    };
+    let mode = config
+        .evaluator
+        .learned_auto_shim_mode()
+        .await
+        .unwrap_or(AutoShimMode::Off);
+
+    match mode {
+        AutoShimMode::Off => {}
+        AutoShimMode::Suggest => {
+            notice.push_str(&format!(
+                " Shim hint: `{}` wraps `{}`.",
+                shim.name,
+                shim.render_command()
+            ));
+        }
+        AutoShimMode::Create if outcome.promoted => {
+            let Some(ref shim_dir) = config.shim_dir else {
+                notice.push_str(&format!(
+                    " Shim `{}` could be created after configuring a shim directory.",
+                    shim.name
+                ));
+                return Some(notice);
+            };
+            match std::env::current_exe()
+                .map_err(anyhow::Error::from)
+                .and_then(|guard_bin| {
+                    ShimGenerator::new(guard_bin, shim_dir.clone()).generate_alias(
+                        &shim.name,
+                        &shim.target_binary,
+                        &shim.target_args,
+                    )
+                }) {
+                Ok(path) => {
+                    notice.push_str(&format!(
+                        " Created shim `{}` at {}.",
+                        shim.name,
+                        path.display()
+                    ));
+                }
+                Err(err) => {
+                    tracing::warn!("failed to create learned shim {}: {}", shim.name, err);
+                    notice.push_str(&format!(
+                        " Shim hint: `{}` wraps `{}`.",
+                        shim.name,
+                        shim.render_command()
+                    ));
+                }
+            }
+        }
+        AutoShimMode::Create => {
+            notice.push_str(&format!(
+                " Shim `{}` will be created when the rule is promoted.",
+                shim.name
+            ));
+        }
+    }
+
+    Some(notice)
 }
 
 async fn persist_session_snapshot(
@@ -1818,12 +1954,15 @@ async fn record_live_session_interaction(
 
 #[derive(Debug, Clone)]
 struct ExecCallerContext {
+    #[cfg(unix)]
     uid: u32,
+    #[cfg(unix)]
     gid: u32,
     username: String,
     home_dir: PathBuf,
 }
 
+#[cfg(unix)]
 fn resolve_exec_caller_context(uid: u32) -> Result<ExecCallerContext> {
     let user = uzers::get_user_by_uid(uid)
         .ok_or_else(|| anyhow::anyhow!("caller uid {} does not exist in passwd", uid))?;
@@ -1840,6 +1979,7 @@ fn resolve_exec_caller_context(uid: u32) -> Result<ExecCallerContext> {
     })
 }
 
+#[cfg(unix)]
 fn apply_exec_identity(
     cmd: &mut Command,
     config: &ServerConfig,
@@ -1870,6 +2010,18 @@ fn apply_exec_identity(
     }
 
     Ok(Some(context))
+}
+
+#[cfg(not(unix))]
+fn apply_exec_identity(
+    _cmd: &mut Command,
+    config: &ServerConfig,
+    _caller: &CallerIdentity,
+) -> Result<Option<ExecCallerContext>> {
+    if config.exec_as_caller {
+        bail!("--exec-as-caller is not supported on this platform");
+    }
+    Ok(None)
 }
 
 /// Execute a command the policy layer has already approved.
@@ -1935,15 +2087,17 @@ async fn exec_after_approval<W: AsyncWrite + Unpin>(
     }
 
     let caller_uid = match caller {
-        CallerIdentity::Unix { uid } => *uid,
-        _ => {
-            return ExecuteResult::exec_failed(
-                allow_reason,
-                "secret injection requires a unix socket caller".to_string(),
-            );
-        }
+        CallerIdentity::Unix { uid } => Some(*uid),
+        _ => None,
     };
+    if !request.secrets.is_empty() && caller_uid.is_none() {
+        return ExecuteResult::exec_failed(
+            allow_reason,
+            "secret injection requires a unix socket caller".to_string(),
+        );
+    }
     for (env_var, secret_key) in &request.secrets {
+        let caller_uid = caller_uid.expect("checked non-unix secret injection above");
         let value = match config.secrets.get(caller_uid, secret_key).await {
             Ok(Some(value)) => value,
             Ok(None) => {
@@ -1981,21 +2135,7 @@ async fn exec_after_approval<W: AsyncWrite + Unpin>(
     // auth tokens) via env, printenv, /proc/self/environ, or $VAR expansion.
     cmd.env_clear();
 
-    for var in &[
-        "PATH",
-        "HOME",
-        "USER",
-        "LANG",
-        "LANGUAGE",
-        "LC_ALL",
-        "LC_CTYPE",
-        "TERM",
-        "TZ",
-        "SHELL",
-        "LOGNAME",
-        "XDG_RUNTIME_DIR",
-        "SSH_AUTH_SOCK",
-    ] {
+    for var in child_env_allowlist() {
         if let Ok(val) = std::env::var(var) {
             cmd.env(var, val);
         }
@@ -2018,17 +2158,21 @@ async fn exec_after_approval<W: AsyncWrite + Unpin>(
         cmd.env("LOGNAME", &context.username);
         cmd.env_remove("SSH_AUTH_SOCK");
         cmd.env_remove("XDG_RUNTIME_DIR");
-        let runtime_dir = PathBuf::from(format!("/run/user/{}", context.uid));
-        if runtime_dir.exists() {
-            cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+        #[cfg(unix)]
+        {
+            let runtime_dir = PathBuf::from(format!("/run/user/{}", context.uid));
+            if runtime_dir.exists() {
+                cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+            }
         }
     }
 
     cmd.env("GUARD_DEPTH", (depth + 1).to_string());
 
     if let Some(ref shim_dir) = config.shim_dir {
-        let base_path = std::env::var("PATH").unwrap_or_default();
-        cmd.env("PATH", format!("{}:{}", shim_dir.display(), base_path));
+        if let Some(path) = path_with_shim_dir(shim_dir) {
+            cmd.env("PATH", path);
+        }
     }
 
     if stream_output {
@@ -2072,24 +2216,70 @@ async fn exec_after_approval<W: AsyncWrite + Unpin>(
     ExecuteResult::completed(allow_reason, output.status.code(), stdout, stderr)
 }
 
-/// Read the daemon's effective UID without pulling in libc as a direct
-/// dep. /proc/self/status is the kernel-blessed source on Linux. Falls
-/// back to 0 only if procfs is missing — in that case admin only works
-/// when the daemon happens to be uid 0, which is the conservative default.
+/// Read the daemon's effective UID on Unix. Windows has no Unix UID; TCP
+/// callers are represented separately and cannot satisfy daemon-UID admin
+/// checks.
+#[cfg(unix)]
 fn current_uid() -> u32 {
-    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
-        return 0;
-    };
-    for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("Uid:") {
-            if let Some(uid_str) = rest.split_whitespace().next() {
-                if let Ok(uid) = uid_str.parse::<u32>() {
-                    return uid;
-                }
-            }
-        }
-    }
+    unsafe { libc::geteuid() as u32 }
+}
+
+#[cfg(not(unix))]
+fn current_uid() -> u32 {
     0
+}
+
+#[cfg(unix)]
+fn child_env_allowlist() -> &'static [&'static str] {
+    &[
+        "PATH",
+        "HOME",
+        "USER",
+        "LANG",
+        "LANGUAGE",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TERM",
+        "TZ",
+        "SHELL",
+        "LOGNAME",
+        "XDG_RUNTIME_DIR",
+        "SSH_AUTH_SOCK",
+    ]
+}
+
+#[cfg(windows)]
+fn child_env_allowlist() -> &'static [&'static str] {
+    &[
+        "PATH",
+        "SystemRoot",
+        "ComSpec",
+        "PATHEXT",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "PROGRAMDATA",
+        "PROGRAMFILES",
+        "PROGRAMFILES(X86)",
+        "WINDIR",
+        "USERNAME",
+    ]
+}
+
+#[cfg(not(any(unix, windows)))]
+fn child_env_allowlist() -> &'static [&'static str] {
+    &["PATH"]
+}
+
+fn path_with_shim_dir(shim_dir: &std::path::Path) -> Option<std::ffi::OsString> {
+    let mut paths = Vec::new();
+    paths.push(shim_dir.to_path_buf());
+    if let Some(base_path) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&base_path));
+    }
+    std::env::join_paths(paths).ok()
 }
 
 fn binary_exists_on_path(binary: &str) -> bool {
@@ -2098,12 +2288,49 @@ fn binary_exists_on_path(binary: &str) -> bool {
     };
 
     std::env::split_paths(&path).any(|dir| {
-        let candidate = dir.join(binary);
-        let Ok(metadata) = std::fs::metadata(candidate) else {
-            return false;
-        };
-        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+        binary_path_candidates(&dir, binary)
+            .into_iter()
+            .any(|candidate| is_executable_path(&candidate))
     })
+}
+
+fn is_executable_path(path: &std::path::Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.is_file()
+    }
+}
+
+fn binary_path_candidates(dir: &std::path::Path, binary: &str) -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        let binary_path = std::path::Path::new(binary);
+        let mut candidates = vec![dir.join(binary_path)];
+        if binary_path.extension().is_none() {
+            let pathext =
+                std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+            for ext in pathext.split(';').filter(|ext| !ext.is_empty()) {
+                let ext = if ext.starts_with('.') {
+                    ext.to_string()
+                } else {
+                    format!(".{ext}")
+                };
+                candidates.push(dir.join(format!("{binary}{ext}")));
+            }
+        }
+        candidates
+    }
+    #[cfg(not(windows))]
+    {
+        vec![dir.join(binary)]
+    }
 }
 
 fn deterministic_credential_deny_reason(binary: &str, args: &[String]) -> Option<String> {
@@ -2523,22 +2750,30 @@ impl Client {
         let line = serde_json::to_string(&envelope)?;
 
         if let Some(ref socket_path) = self.socket_path {
-            let stream = UnixStream::connect(socket_path)
-                .await
-                .context("failed to connect to guard server")?;
-            let (reader, writer) = stream.into_split();
-            let mut writer = tokio::io::BufWriter::new(writer);
-            writer.write_all(line.as_bytes()).await?;
-            writer.write_all(b"\n").await?;
-            writer.flush().await?;
+            #[cfg(not(unix))]
+            {
+                let _ = socket_path;
+                bail!("Unix sockets are not supported on this platform; configure a TCP port");
+            }
+            #[cfg(unix)]
+            {
+                let stream = UnixStream::connect(socket_path)
+                    .await
+                    .context("failed to connect to guard server")?;
+                let (reader, writer) = stream.into_split();
+                let mut writer = tokio::io::BufWriter::new(writer);
+                writer.write_all(line.as_bytes()).await?;
+                writer.write_all(b"\n").await?;
+                writer.flush().await?;
 
-            let mut lines = BufReader::new(reader).lines();
-            let response_line = lines
-                .next_line()
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("server closed connection without response"))?;
-            let resp = parse_admin_response_line(&response_line, request_name)?;
-            Ok(resp)
+                let mut lines = BufReader::new(reader).lines();
+                let response_line = lines
+                    .next_line()
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("server closed connection without response"))?;
+                let resp = parse_admin_response_line(&response_line, request_name)?;
+                Ok(resp)
+            }
         } else if let Some(port) = self.tcp_port {
             let addr = format!("127.0.0.1:{}", port);
             let stream = tokio::net::TcpStream::connect(&addr)
@@ -2594,7 +2829,15 @@ impl Client {
         );
 
         if let Some(ref socket_path) = self.socket_path {
-            self.send_unix(socket_path, &request).await
+            #[cfg(not(unix))]
+            {
+                let _ = socket_path;
+                bail!("Unix sockets are not supported on this platform; configure a TCP port");
+            }
+            #[cfg(unix)]
+            {
+                self.send_unix(socket_path, &request).await
+            }
         } else if let Some(port) = self.tcp_port {
             self.send_tcp(port, &request).await
         } else {
@@ -2642,8 +2885,16 @@ impl Client {
         );
 
         if let Some(ref socket_path) = self.socket_path {
-            self.send_unix_streaming(socket_path, &request, &mut on_output)
-                .await
+            #[cfg(not(unix))]
+            {
+                let _ = socket_path;
+                bail!("Unix sockets are not supported on this platform; configure a TCP port");
+            }
+            #[cfg(unix)]
+            {
+                self.send_unix_streaming(socket_path, &request, &mut on_output)
+                    .await
+            }
         } else if let Some(port) = self.tcp_port {
             self.send_tcp_streaming(port, &request, &mut on_output)
                 .await
@@ -2671,6 +2922,7 @@ impl Client {
         }
     }
 
+    #[cfg(unix)]
     async fn send_unix(
         &self,
         socket_path: &PathBuf,
@@ -2721,6 +2973,7 @@ impl Client {
         Ok(response)
     }
 
+    #[cfg(unix)]
     async fn send_unix_streaming<F>(
         &self,
         socket_path: &PathBuf,
@@ -2997,6 +3250,18 @@ mod tests {
         assert!(!binary_exists_on_path(
             "Give-this-should-not-exist-as-a-real-command"
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn binary_path_candidates_include_windows_pathext() {
+        let candidates = binary_path_candidates(std::path::Path::new("C:\\Tools"), "ssh");
+        assert!(candidates.iter().any(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.eq_ignore_ascii_case("ssh.exe"))
+                .unwrap_or(false)
+        }));
     }
 
     #[test]
