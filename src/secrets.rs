@@ -15,6 +15,8 @@ use std::collections::HashMap;
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
