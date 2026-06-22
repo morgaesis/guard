@@ -17,8 +17,8 @@ use crate::redact::{
 };
 use crate::secrets::{SecretManager, LEGACY_UID_SENTINEL};
 use crate::session::{
-    HistoricalGrant, SessionDecision, SessionDecisionSource, SessionExecStatus, SessionGrant,
-    SessionGrantSummary, SessionInteraction, SessionRegistry, SessionReport,
+    HistoricalGrant, SessionAmendment, SessionDecision, SessionDecisionSource, SessionExecStatus,
+    SessionGrant, SessionGrantSummary, SessionInteraction, SessionRegistry, SessionReport,
 };
 use crate::session_store::SessionStore;
 use crate::shim::ShimGenerator;
@@ -54,6 +54,10 @@ const DEFAULT_TCP_PORT: u16 = 8123;
 const MAX_GUARD_DEPTH: u32 = 5;
 const MAX_REQUEST_BYTES: usize = 1_048_576; // 1MB
 const MAX_OUTPUT_BYTES: usize = 10_485_760; // 10MB
+const SESSION_AUTO_AMEND_MAX_ALLOW_RISK: i32 = 2;
+const SESSION_AUTO_AMEND_MIN_DENY_RISK: i32 = 5;
+const SESSION_EXACT_RULE_MAX_ARGS: usize = 128;
+const SESSION_EXACT_RULE_MAX_ARG_LEN: usize = 1024;
 
 /// Identifies the caller for per-user secret injection.
 #[derive(Debug, Clone)]
@@ -140,6 +144,14 @@ pub enum AdminRequest {
         prose: Option<String>,
         #[serde(default)]
         static_only: bool,
+        #[serde(default)]
+        auto_amend: bool,
+    },
+    SessionAppeal {
+        token: String,
+        binary: String,
+        #[serde(default)]
+        args: Vec<String>,
     },
     SessionRevoke {
         token: String,
@@ -215,6 +227,15 @@ pub enum AdminResponse {
     },
     SessionShow {
         report: SessionReport,
+    },
+    SessionAppeal {
+        allowed: bool,
+        amended: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pattern: Option<String>,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        risk: Option<i32>,
     },
     SecretList {
         keys: Vec<String>,
@@ -873,6 +894,236 @@ fn combine_session_prompt(
     Some(sections.join("\n\n"))
 }
 
+async fn handle_session_appeal(
+    config: &ServerConfig,
+    caller: &CallerIdentity,
+    token: String,
+    binary: String,
+    args: Vec<String>,
+) -> AdminResponse {
+    if token.is_empty() {
+        return AdminResponse::Error {
+            message: "session token must not be empty".to_string(),
+        };
+    }
+    let command_line = command_line(&binary, &args);
+    if let Err(reason) = validate_session_exact_rule_candidate(&binary, &args) {
+        return AdminResponse::SessionAppeal {
+            allowed: false,
+            amended: false,
+            pattern: None,
+            reason,
+            risk: None,
+        };
+    }
+
+    let (exists, decision, session_prompt) = {
+        let reg = config.sessions.read().await;
+        (
+            reg.has(&token),
+            reg.check(&token, &binary, &args),
+            reg.prompt_append_for(&token),
+        )
+    };
+    if !exists {
+        return AdminResponse::Error {
+            message: format!(
+                "unknown session token: '{}' is revoked, expired, or never existed",
+                token
+            ),
+        };
+    }
+    if let Some((decision, reason)) = decision {
+        return match decision {
+            SessionDecision::Allow => AdminResponse::SessionAppeal {
+                allowed: true,
+                amended: false,
+                pattern: Some(command_line),
+                reason: format!("already allowed by session rule: {reason}"),
+                risk: None,
+            },
+            SessionDecision::Deny => AdminResponse::SessionAppeal {
+                allowed: false,
+                amended: false,
+                pattern: Some(command_line),
+                reason: format!("already denied by session rule: {reason}"),
+                risk: None,
+            },
+        };
+    }
+
+    let eval_result = config
+        .evaluator
+        .evaluate_with_context(&command_line, session_prompt.as_deref())
+        .await;
+
+    match eval_result {
+        crate::evaluate::EvalResult::Allow {
+            reason,
+            source,
+            risk,
+        } => {
+            if !matches!(source, crate::evaluate::EvalSource::Llm) {
+                return AdminResponse::SessionAppeal {
+                    allowed: false,
+                    amended: false,
+                    pattern: Some(command_line),
+                    reason: format!(
+                        "appeal not amended: evaluator source was {source:?}, not fresh LLM"
+                    ),
+                    risk,
+                };
+            }
+            if let Err(skip) = allow_session_auto_amend_candidate(&binary, &args, risk) {
+                record_live_session_interaction(
+                    config,
+                    Some(&token),
+                    SessionInteraction {
+                        at_unix: 0,
+                        command: command_line.clone(),
+                        allowed: false,
+                        source: SessionDecisionSource::Llm,
+                        reason: format!(
+                            "appeal denied for static amendment: {skip}; LLM reason: {reason}"
+                        ),
+                        risk,
+                        exec_status: SessionExecStatus::NotAttempted,
+                    },
+                )
+                .await;
+                return AdminResponse::SessionAppeal {
+                    allowed: false,
+                    amended: false,
+                    pattern: Some(command_line),
+                    reason: format!(
+                        "appeal denied for static amendment: {skip}; LLM reason: {reason}"
+                    ),
+                    risk,
+                };
+            }
+
+            let amended = match amend_session_exact_rule(
+                config,
+                &token,
+                SessionAmendment::Allow,
+                binary.clone(),
+                args.clone(),
+            )
+            .await
+            {
+                Ok(amended) => amended,
+                Err(err) => {
+                    return AdminResponse::Error {
+                        message: format!("failed to persist appeal allow amendment: {err}"),
+                    };
+                }
+            };
+            let final_reason = if amended {
+                format!("appeal approved; amended exact session allow. LLM reason: {reason}")
+            } else {
+                format!(
+                    "appeal approved; exact session allow already existed. LLM reason: {reason}"
+                )
+            };
+            record_live_session_interaction(
+                config,
+                Some(&token),
+                SessionInteraction {
+                    at_unix: 0,
+                    command: command_line.clone(),
+                    allowed: true,
+                    source: SessionDecisionSource::Llm,
+                    reason: final_reason.clone(),
+                    risk,
+                    exec_status: SessionExecStatus::NotAttempted,
+                },
+            )
+            .await;
+            tracing::info!(
+                "[AUDIT] SESSION_APPEAL caller={} token={} allowed=true amended={} cmd={}",
+                caller,
+                token,
+                amended,
+                command_line
+            );
+            AdminResponse::SessionAppeal {
+                allowed: true,
+                amended,
+                pattern: Some(command_line),
+                reason: final_reason,
+                risk,
+            }
+        }
+        crate::evaluate::EvalResult::Deny {
+            reason,
+            source,
+            risk,
+        } => {
+            let mut amended = false;
+            if matches!(source, crate::evaluate::EvalSource::Llm)
+                && deny_session_auto_amend_candidate(&binary, &args, risk).is_ok()
+            {
+                match amend_session_exact_rule(
+                    config,
+                    &token,
+                    SessionAmendment::Deny,
+                    binary.clone(),
+                    args.clone(),
+                )
+                .await
+                {
+                    Ok(value) => amended = value,
+                    Err(err) => {
+                        return AdminResponse::Error {
+                            message: format!("failed to persist appeal deny amendment: {err}"),
+                        };
+                    }
+                }
+            }
+            let final_reason = if amended {
+                format!("appeal denied; amended exact session deny. LLM reason: {reason}")
+            } else {
+                format!("appeal denied. LLM reason: {reason}")
+            };
+            record_live_session_interaction(
+                config,
+                Some(&token),
+                SessionInteraction {
+                    at_unix: 0,
+                    command: command_line.clone(),
+                    allowed: false,
+                    source: session_source_from_eval(source),
+                    reason: final_reason.clone(),
+                    risk,
+                    exec_status: SessionExecStatus::NotAttempted,
+                },
+            )
+            .await;
+            tracing::info!(
+                "[AUDIT] SESSION_APPEAL caller={} token={} allowed=false amended={} cmd={}",
+                caller,
+                token,
+                amended,
+                command_line
+            );
+            AdminResponse::SessionAppeal {
+                allowed: false,
+                amended,
+                pattern: Some(command_line),
+                reason: final_reason,
+                risk,
+            }
+        }
+        crate::evaluate::EvalResult::Error(err) => AdminResponse::SessionAppeal {
+            allowed: false,
+            amended: false,
+            pattern: Some(command_line),
+            reason: format!("appeal evaluation error: {err}"),
+            risk: None,
+        },
+    }
+}
+
 async fn handle_admin_request(
     config: &ServerConfig,
     caller: &CallerIdentity,
@@ -896,6 +1147,7 @@ async fn handle_admin_request(
             prompt_append,
             prose,
             static_only,
+            auto_amend,
         } => {
             if token.is_empty() {
                 return AdminResponse::Error {
@@ -909,6 +1161,7 @@ async fn handle_admin_request(
             merge_unique(&mut allow, compiled.allow.clone());
             merge_unique(&mut deny, compiled.deny.clone());
             let prompt_append = combine_session_prompt(prompt_append, prose.as_deref(), &compiled);
+            let auto_amend = auto_amend && !static_only;
             let expires_at = ttl_secs.map(|secs| {
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -919,9 +1172,12 @@ async fn handle_admin_request(
             let grant = SessionGrant {
                 allow,
                 deny,
+                allow_exact: Vec::new(),
+                deny_exact: Vec::new(),
                 expires_at,
                 prompt_append,
                 static_only,
+                auto_amend,
                 granted_at: 0, // SessionRegistry::grant fills the current time
             };
             let (before, after) = {
@@ -938,16 +1194,22 @@ async fn handle_admin_request(
                 };
             }
             tracing::info!(
-                "[AUDIT] SESSION_GRANT caller={} token={} ttl={:?} static_only={} generated_allow={} generated_deny={}",
+                "[AUDIT] SESSION_GRANT caller={} token={} ttl={:?} static_only={} auto_amend={} generated_allow={} generated_deny={}",
                 caller,
                 token,
                 ttl_secs,
                 static_only,
+                auto_amend,
                 compiled.allow.len(),
                 compiled.deny.len()
             );
             AdminResponse::Ok
         }
+        AdminRequest::SessionAppeal {
+            token,
+            binary,
+            args,
+        } => handle_session_appeal(config, caller, token, binary, args).await,
         AdminRequest::SessionRevoke { token } => {
             let (removed, before, after) = {
                 let mut reg = config.sessions.write().await;
@@ -993,6 +1255,8 @@ async fn handle_admin_request(
                         grant.token = "(hidden)".to_string();
                         grant.allow.clear();
                         grant.deny.clear();
+                        grant.allow_exact.clear();
+                        grant.deny_exact.clear();
                         if grant.prompt_append.is_some() {
                             grant.prompt_append = Some("(hidden)".to_string());
                         }
@@ -1008,6 +1272,8 @@ async fn handle_admin_request(
                             grant.token = "(hidden)".to_string();
                             grant.allow.clear();
                             grant.deny.clear();
+                            grant.allow_exact.clear();
+                            grant.deny_exact.clear();
                             if grant.prompt_append.is_some() {
                                 grant.prompt_append = Some("(hidden)".to_string());
                             }
@@ -1634,11 +1900,7 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
 
     // Reconstruct full command line early so session short-circuit and
     // evaluator share the same command text.
-    let command_line = if request.args.is_empty() {
-        request.binary.clone()
-    } else {
-        format!("{} {}", request.binary, request.args.join(" "))
-    };
+    let command_line = command_line(&request.binary, &request.args);
 
     if let Err(reason) = validate_request_injections(&request, config, caller, &command_line).await
     {
@@ -1832,6 +2094,21 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
             source,
             risk,
         } => {
+            let mut reason = reason;
+            if matches!(source, crate::evaluate::EvalSource::Llm) {
+                if let Some(notice) = maybe_auto_amend_session_after_llm(
+                    config,
+                    session_token.as_deref(),
+                    SessionAmendment::Deny,
+                    &request.binary,
+                    &request.args,
+                    risk,
+                )
+                .await
+                {
+                    reason = format!("{reason} {notice}");
+                }
+            }
             config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
             let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
             record_live_session_interaction(
@@ -1882,6 +2159,7 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
                     .as_deref()
                     .map(|prompt| prompt.trim().is_empty())
                     .unwrap_or(true)
+                && session_token.is_none()
             {
                 match config
                     .evaluator
@@ -1903,6 +2181,20 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
                     Err(err) => {
                         tracing::warn!("failed to record learned rule candidate: {}", err);
                     }
+                }
+            }
+            if matches!(source, crate::evaluate::EvalSource::Llm) {
+                if let Some(notice) = maybe_auto_amend_session_after_llm(
+                    config,
+                    session_token.as_deref(),
+                    SessionAmendment::Allow,
+                    &request.binary,
+                    &request.args,
+                    risk,
+                )
+                .await
+                {
+                    reason = format!("{reason} {notice}");
                 }
             }
             tracing::debug!("command allowed: {}", reason);
@@ -1943,8 +2235,156 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
 fn session_source_from_eval(source: crate::evaluate::EvalSource) -> SessionDecisionSource {
     match source {
         crate::evaluate::EvalSource::Llm => SessionDecisionSource::Llm,
+        crate::evaluate::EvalSource::Cache => SessionDecisionSource::Cache,
         crate::evaluate::EvalSource::LearnedRule => SessionDecisionSource::StaticPolicy,
         crate::evaluate::EvalSource::StaticPolicy => SessionDecisionSource::StaticPolicy,
+    }
+}
+
+fn command_line(binary: &str, args: &[String]) -> String {
+    if args.is_empty() {
+        binary.to_string()
+    } else {
+        format!("{} {}", binary, args.join(" "))
+    }
+}
+
+fn validate_session_exact_rule_candidate(
+    binary: &str,
+    args: &[String],
+) -> std::result::Result<(), String> {
+    if binary.is_empty()
+        || binary.contains('\0')
+        || binary.contains(char::is_whitespace)
+        || binary.contains('"')
+        || binary.contains('\'')
+    {
+        return Err("appeal command has an invalid binary name".to_string());
+    }
+    if args.len() > SESSION_EXACT_RULE_MAX_ARGS {
+        return Err(format!(
+            "appeal command has too many arguments for a durable exact rule (max {})",
+            SESSION_EXACT_RULE_MAX_ARGS
+        ));
+    }
+    for arg in args {
+        if arg.len() > SESSION_EXACT_RULE_MAX_ARG_LEN {
+            return Err(format!(
+                "appeal argument is too long for a durable exact rule (max {} bytes)",
+                SESSION_EXACT_RULE_MAX_ARG_LEN
+            ));
+        }
+        if arg.contains('\0') || arg.contains('\n') || arg.contains('\r') {
+            return Err("appeal command contains control characters".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn allow_session_auto_amend_candidate(
+    binary: &str,
+    args: &[String],
+    risk: Option<i32>,
+) -> std::result::Result<(), String> {
+    validate_session_exact_rule_candidate(binary, args)?;
+    let risk = risk.unwrap_or(5);
+    if risk > SESSION_AUTO_AMEND_MAX_ALLOW_RISK {
+        return Err(format!(
+            "risk {risk} exceeds auto-amend allow threshold {}",
+            SESSION_AUTO_AMEND_MAX_ALLOW_RISK
+        ));
+    }
+    if let Some(reason) = deterministic_credential_deny_reason(binary, args) {
+        return Err(reason);
+    }
+    let command = command_line(binary, args);
+    if crate::grant_rules::looks_dangerous_static_command(&command) {
+        return Err("command contains shell control or sensitive material".to_string());
+    }
+    Ok(())
+}
+
+fn deny_session_auto_amend_candidate(
+    binary: &str,
+    args: &[String],
+    risk: Option<i32>,
+) -> std::result::Result<(), String> {
+    validate_session_exact_rule_candidate(binary, args)?;
+    let risk = risk.unwrap_or(5);
+    if risk < SESSION_AUTO_AMEND_MIN_DENY_RISK {
+        return Err(format!(
+            "risk {risk} is below auto-amend deny threshold {}",
+            SESSION_AUTO_AMEND_MIN_DENY_RISK
+        ));
+    }
+    if deterministic_credential_deny_reason(binary, args).is_some() {
+        return Err("command may contain or expose credential material".to_string());
+    }
+    Ok(())
+}
+
+async fn amend_session_exact_rule(
+    config: &ServerConfig,
+    token: &str,
+    decision: SessionAmendment,
+    binary: String,
+    args: Vec<String>,
+) -> Result<bool> {
+    let (amended, before, after) = {
+        let mut reg = config.sessions.write().await;
+        let before = reg.clone();
+        let amended = reg
+            .amend_exact(token, decision, binary, args)
+            .ok_or_else(|| anyhow::anyhow!("session token is revoked, expired, or unknown"))?;
+        (amended, before, reg.clone())
+    };
+    if let Err(err) = persist_session_snapshot(config.session_store.clone(), after).await {
+        *config.sessions.write().await = before;
+        return Err(err);
+    }
+    Ok(amended)
+}
+
+async fn maybe_auto_amend_session_after_llm(
+    config: &ServerConfig,
+    token: Option<&str>,
+    decision: SessionAmendment,
+    binary: &str,
+    args: &[String],
+    risk: Option<i32>,
+) -> Option<String> {
+    let token = token?;
+    let enabled = {
+        let reg = config.sessions.read().await;
+        reg.auto_amend_for(token)
+    };
+    if !enabled {
+        return None;
+    }
+
+    let candidate = match decision {
+        SessionAmendment::Allow => allow_session_auto_amend_candidate(binary, args, risk),
+        SessionAmendment::Deny => deny_session_auto_amend_candidate(binary, args, risk),
+    };
+    if let Err(reason) = candidate {
+        return Some(format!("Session auto-amend skipped: {reason}."));
+    }
+
+    match amend_session_exact_rule(config, token, decision, binary.to_string(), args.to_vec()).await
+    {
+        Ok(true) => {
+            let rule = command_line(binary, args);
+            match decision {
+                SessionAmendment::Allow => {
+                    Some(format!("Session auto-amended exact allow `{rule}`."))
+                }
+                SessionAmendment::Deny => {
+                    Some(format!("Session auto-amended exact deny `{rule}`."))
+                }
+            }
+        }
+        Ok(false) => None,
+        Err(err) => Some(format!("Session auto-amend failed: {err}.")),
     }
 }
 
@@ -2855,6 +3295,7 @@ impl Client {
     pub async fn send_admin(&self, request: AdminRequest) -> Result<AdminResponse> {
         let request_name = match &request {
             AdminRequest::SessionGrant { .. } => "session_grant",
+            AdminRequest::SessionAppeal { .. } => "session_appeal",
             AdminRequest::SessionRevoke { .. } => "session_revoke",
             AdminRequest::SessionList { .. } => "session_list",
             AdminRequest::SessionShow { .. } => "session_show",
@@ -3854,9 +4295,12 @@ mod tests {
                 SessionGrant {
                     allow: vec!["kubectl -n nextcloud get pods*".into()],
                     deny: Vec::new(),
+                    allow_exact: Vec::new(),
+                    deny_exact: Vec::new(),
                     expires_at: None,
                     prompt_append: None,
                     static_only: true,
+                    auto_amend: false,
                     granted_at: 0,
                 },
             );
@@ -3875,6 +4319,53 @@ mod tests {
         let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
         assert!(!result.policy_allowed());
         assert!(result.policy_reason().contains("static-only"));
+    }
+
+    #[test]
+    fn session_auto_amend_allow_candidates_are_low_risk_and_simple() {
+        assert!(allow_session_auto_amend_candidate("echo", &["ok".into()], Some(2)).is_ok());
+        assert!(allow_session_auto_amend_candidate("echo", &["ok".into()], Some(3)).is_err());
+        assert!(allow_session_auto_amend_candidate(
+            "sh",
+            &["-c".into(), "id; whoami".into()],
+            Some(1)
+        )
+        .is_err());
+        assert!(
+            allow_session_auto_amend_candidate("cat", &["/etc/shadow".into()], Some(1)).is_err()
+        );
+    }
+
+    #[test]
+    fn session_auto_amend_deny_candidates_are_high_risk_exact_rules() {
+        assert!(deny_session_auto_amend_candidate(
+            "kubectl",
+            &["delete".into(), "pod/x".into()],
+            Some(5)
+        )
+        .is_ok());
+        assert!(deny_session_auto_amend_candidate(
+            "kubectl",
+            &["delete".into(), "pod/x".into()],
+            Some(4)
+        )
+        .is_err());
+        assert!(
+            deny_session_auto_amend_candidate("kubectl", &["delete\npod/x".into()], Some(9))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn session_source_reports_cache_separately_from_static_policy() {
+        assert_eq!(
+            session_source_from_eval(crate::evaluate::EvalSource::Cache),
+            SessionDecisionSource::Cache
+        );
+        assert_eq!(
+            session_source_from_eval(crate::evaluate::EvalSource::StaticPolicy),
+            SessionDecisionSource::StaticPolicy
+        );
     }
 
     #[test]
@@ -3918,6 +4409,7 @@ mod tests {
                 prompt_append: Some("operator-only prompt".into()),
                 prose: None,
                 static_only: false,
+                auto_amend: false,
             },
         )
         .await;
@@ -3942,6 +4434,8 @@ mod tests {
                     .expect("redacted session grant visible to user");
                 assert!(hidden.allow.is_empty());
                 assert!(hidden.deny.is_empty());
+                assert!(hidden.allow_exact.is_empty());
+                assert!(hidden.deny_exact.is_empty());
                 assert_eq!(hidden.prompt_append.as_deref(), Some("(hidden)"));
             }
             other => panic!("unexpected {:?}", other),
@@ -3967,6 +4461,7 @@ mod tests {
                 prompt_append: Some("operator context".into()),
                 prose: None,
                 static_only: false,
+                auto_amend: false,
             },
         )
         .await;

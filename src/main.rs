@@ -123,9 +123,33 @@ enum MainArgs {
         /// Deny session-rule misses instead of falling through to the LLM.
         #[arg(long = "static-only", alias = "no-llm-fallback", action = ArgAction::SetTrue)]
         static_only: bool,
+        /// Let fresh low-risk LLM fallback decisions add exact session rules.
+        #[arg(long = "auto-amend", action = ArgAction::SetTrue)]
+        auto_amend: bool,
+        /// Disable automatic exact-rule amendment for this grant.
+        #[arg(long = "no-auto-amend", action = ArgAction::SetTrue)]
+        no_auto_amend: bool,
         /// Server socket path (defaults to configured)
         #[arg(long, value_name = "PATH")]
         socket: Option<String>,
+    },
+    /// Ask the evaluator to amend or deny a session grant without executing the command
+    #[clap(
+        disable_help_flag = true,
+        after_help = "Use `guard appeal --session <token> <binary> --help` to pass --help to the appealed command."
+    )]
+    Appeal {
+        /// Session token. Defaults to GUARD_SESSION.
+        #[arg(long, value_name = "TOKEN")]
+        session: Option<String>,
+        /// Server socket path (defaults to configured)
+        #[arg(long, value_name = "PATH")]
+        socket: Option<String>,
+        /// Binary to evaluate for session amendment
+        binary: String,
+        /// Arguments to pass to the binary
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
     /// Show daemon status. Always prints client + server version,
     /// uptime, evaluation mode, and dry-run state. The full config
@@ -166,6 +190,12 @@ enum SessionCommands {
         /// Deny session-rule misses instead of falling through to the LLM.
         #[arg(long = "static-only", alias = "no-llm-fallback", action = ArgAction::SetTrue)]
         static_only: bool,
+        /// Let fresh low-risk LLM fallback decisions add exact session rules.
+        #[arg(long = "auto-amend", action = ArgAction::SetTrue)]
+        auto_amend: bool,
+        /// Disable automatic exact-rule amendment for this grant.
+        #[arg(long = "no-auto-amend", action = ArgAction::SetTrue)]
+        no_auto_amend: bool,
         /// Server socket path (defaults to configured)
         #[arg(long, value_name = "PATH")]
         socket: Option<String>,
@@ -200,9 +230,32 @@ enum SessionCommands {
         /// Deny session-rule misses instead of falling through to the LLM.
         #[arg(long = "static-only", alias = "no-llm-fallback", action = ArgAction::SetTrue)]
         static_only: bool,
+        /// Let fresh low-risk LLM fallback decisions add exact session rules.
+        #[arg(long = "auto-amend", action = ArgAction::SetTrue)]
+        auto_amend: bool,
+        /// Disable automatic exact-rule amendment for this grant.
+        #[arg(long = "no-auto-amend", action = ArgAction::SetTrue)]
+        no_auto_amend: bool,
         /// Server socket path (defaults to configured)
         #[arg(long, value_name = "PATH")]
         socket: Option<String>,
+    },
+    /// Ask the evaluator to amend or deny a session grant without executing the command.
+    #[clap(
+        disable_help_flag = true,
+        after_help = "Use `guard session appeal <token> <binary> --help` to pass --help to the appealed command."
+    )]
+    Appeal {
+        /// Session token to appeal against.
+        token: String,
+        /// Server socket path (defaults to configured)
+        #[arg(long, value_name = "PATH")]
+        socket: Option<String>,
+        /// Binary to evaluate for session amendment.
+        binary: String,
+        /// Arguments to pass to the binary.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
     /// Revoke a session grant
     Revoke {
@@ -632,6 +685,8 @@ async fn main() -> Result<()> {
             prompt,
             prompt_file,
             static_only,
+            auto_amend,
+            no_auto_amend,
             socket,
         }) => {
             handle_session(top_level_grant_to_session_command(
@@ -643,8 +698,30 @@ async fn main() -> Result<()> {
                 prompt,
                 prompt_file,
                 static_only,
+                auto_amend,
+                no_auto_amend,
                 socket,
             ))
+            .await
+        }
+        Ok(MainArgs::Appeal {
+            session,
+            socket,
+            binary,
+            args,
+        }) => {
+            let token = session
+                .or_else(|| std::env::var("GUARD_SESSION").ok())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("guard appeal requires --session or GUARD_SESSION")
+                })?;
+            handle_session(SessionCommands::Appeal {
+                token,
+                socket,
+                binary,
+                args,
+            })
             .await
         }
         Ok(MainArgs::Status { socket }) => handle_status(socket).await,
@@ -1554,6 +1631,8 @@ fn top_level_grant_to_session_command(
     prompt: Option<String>,
     prompt_file: Option<PathBuf>,
     static_only: bool,
+    auto_amend: bool,
+    no_auto_amend: bool,
     socket: Option<String>,
 ) -> SessionCommands {
     let single_positional_prose = prose.is_none()
@@ -1571,6 +1650,8 @@ fn top_level_grant_to_session_command(
             prompt,
             prompt_file,
             static_only,
+            auto_amend,
+            no_auto_amend,
             socket,
         }
     } else {
@@ -1583,8 +1664,23 @@ fn top_level_grant_to_session_command(
             prompt,
             prompt_file,
             static_only,
+            auto_amend,
+            no_auto_amend,
             socket,
         }
+    }
+}
+
+fn resolve_session_auto_amend(
+    prose: Option<&str>,
+    auto_amend: bool,
+    no_auto_amend: bool,
+    static_only: bool,
+) -> bool {
+    if static_only || no_auto_amend {
+        false
+    } else {
+        auto_amend || prose.map(|value| !value.trim().is_empty()).unwrap_or(false)
     }
 }
 
@@ -1606,6 +1702,8 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
         prompt,
         prompt_file,
         static_only,
+        auto_amend,
+        no_auto_amend,
         socket,
     } = &subcommand
     {
@@ -1620,6 +1718,12 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
 
         if has_grant {
             let prompt_append = read_grant_prompt(prompt.clone(), prompt_file.as_ref())?;
+            let auto_amend = resolve_session_auto_amend(
+                prose.as_deref(),
+                *auto_amend,
+                *no_auto_amend,
+                *static_only,
+            );
 
             let (socket_path, tcp_port) = resolve_client_endpoint(socket.clone(), &config);
             let client = admin_client(socket_path, tcp_port, &config);
@@ -1631,6 +1735,7 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                 prompt_append,
                 prose: prose.clone(),
                 static_only: *static_only,
+                auto_amend,
             };
             match client.send_admin(request).await? {
                 server::AdminResponse::Ok => {}
@@ -1672,9 +1777,17 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
             prompt,
             prompt_file,
             static_only,
+            auto_amend,
+            no_auto_amend,
             socket,
         } => {
             let prompt_append = read_grant_prompt(prompt, prompt_file.as_ref())?;
+            let auto_amend = resolve_session_auto_amend(
+                prose.as_deref(),
+                auto_amend,
+                no_auto_amend,
+                static_only,
+            );
             (
                 socket,
                 server::AdminRequest::SessionGrant {
@@ -1685,9 +1798,23 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                     prompt_append,
                     prose,
                     static_only,
+                    auto_amend,
                 },
             )
         }
+        SessionCommands::Appeal {
+            token,
+            socket,
+            binary,
+            args,
+        } => (
+            socket,
+            server::AdminRequest::SessionAppeal {
+                token,
+                binary,
+                args,
+            },
+        ),
         SessionCommands::Revoke { token, socket } => {
             (socket, server::AdminRequest::SessionRevoke { token })
         }
@@ -1743,11 +1870,14 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
             } else {
                 for g in &grants {
                     println!(
-                        "[active]  token={} allow={:?} deny={:?} static_only={} granted_at={} expires_at={} prompt={}",
+                        "[active]  token={} allow={:?} deny={:?} allow_exact={:?} deny_exact={:?} static_only={} auto_amend={} granted_at={} expires_at={} prompt={}",
                         g.token,
                         g.allow,
                         g.deny,
+                        g.allow_exact,
+                        g.deny_exact,
                         g.static_only,
+                        g.auto_amend,
                         g.granted_at,
                         g.expires_at
                             .map(|t| t.to_string())
@@ -1761,12 +1891,15 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                         server::HistoricalStatus::Expired => "[expired]",
                     };
                     println!(
-                        "{} token={} allow={:?} deny={:?} static_only={} granted_at={} ended_at={} prompt={}",
+                        "{} token={} allow={:?} deny={:?} allow_exact={:?} deny_exact={:?} static_only={} auto_amend={} granted_at={} ended_at={} prompt={}",
                         label,
                         h.token,
                         h.allow,
                         h.deny,
+                        h.allow_exact,
+                        h.deny_exact,
                         h.static_only,
+                        h.auto_amend,
                         h.granted_at,
                         h.ended_at,
                         format_prompt(h.prompt_append.as_deref(), print_full_prompt),
@@ -1777,9 +1910,10 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
         server::AdminResponse::SessionShow { report } => {
             if let Some(active) = report.active {
                 println!(
-                    "token={} status=active static_only={} granted_at={} expires_at={} allow={:?} deny={:?}",
+                    "token={} status=active static_only={} auto_amend={} granted_at={} expires_at={} allow={:?} deny={:?} allow_exact={:?} deny_exact={:?}",
                     active.token,
                     active.static_only,
+                    active.auto_amend,
                     active.granted_at,
                     active
                         .expires_at
@@ -1787,6 +1921,8 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                         .unwrap_or_else(|| "(never)".to_string()),
                     active.allow,
                     active.deny,
+                    active.allow_exact,
+                    active.deny_exact,
                 );
                 println!(
                     "prompt={}",
@@ -1802,9 +1938,10 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                     server::HistoricalStatus::Expired => "expired",
                 };
                 println!(
-                    "history status={} static_only={} granted_at={} ended_at={} expires_at={} allow={:?} deny={:?} prompt={}",
+                    "history status={} static_only={} auto_amend={} granted_at={} ended_at={} expires_at={} allow={:?} deny={:?} allow_exact={:?} deny_exact={:?} prompt={}",
                     label,
                     entry.static_only,
+                    entry.auto_amend,
                     entry.granted_at,
                     entry.ended_at,
                     entry
@@ -1813,6 +1950,8 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                         .unwrap_or_else(|| "(never)".to_string()),
                     entry.allow,
                     entry.deny,
+                    entry.allow_exact,
+                    entry.deny_exact,
                     format_prompt(entry.prompt_append.as_deref(), true),
                 );
             }
@@ -1878,6 +2017,26 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                         interaction.reason,
                     );
                 }
+            }
+        }
+        server::AdminResponse::SessionAppeal {
+            allowed,
+            amended,
+            pattern,
+            reason,
+            risk,
+        } => {
+            println!(
+                "allowed={} amended={} risk={} pattern={} reason={}",
+                allowed,
+                amended,
+                risk.map(|value| value.to_string())
+                    .unwrap_or_else(|| "(none)".to_string()),
+                pattern.unwrap_or_else(|| "(none)".to_string()),
+                reason
+            );
+            if !allowed {
+                std::process::exit(1);
             }
         }
         server::AdminResponse::Status { .. }
@@ -2405,6 +2564,8 @@ mod tests {
             None,
             None,
             true,
+            false,
+            false,
             None,
         );
 
@@ -2433,6 +2594,8 @@ mod tests {
             None,
             None,
             None,
+            false,
+            false,
             false,
             None,
         );
@@ -2468,6 +2631,78 @@ mod tests {
             }
             Ok(_) => panic!("expected session grant"),
             Err(err) => panic!("expected session grant parse, got {err}"),
+        }
+    }
+
+    #[test]
+    fn session_grant_parses_auto_amend_flags() {
+        match MainArgs::try_parse_from([
+            "guard",
+            "session",
+            "grant",
+            "tok",
+            "--auto-amend",
+            "--no-auto-amend",
+            "readonly nextcloud kube access",
+        ]) {
+            Ok(MainArgs::Session(SessionCommands::Grant {
+                auto_amend,
+                no_auto_amend,
+                ..
+            })) => {
+                assert!(auto_amend);
+                assert!(no_auto_amend);
+            }
+            Ok(_) => panic!("expected session grant"),
+            Err(err) => panic!("expected session grant parse, got {err}"),
+        }
+    }
+
+    #[test]
+    fn session_appeal_forwards_hyphen_args() {
+        match MainArgs::try_parse_from([
+            "guard", "session", "appeal", "tok", "df", "-h", "--output",
+        ]) {
+            Ok(MainArgs::Session(SessionCommands::Appeal {
+                token,
+                binary,
+                args,
+                ..
+            })) => {
+                assert_eq!(token, "tok");
+                assert_eq!(binary, "df");
+                assert_eq!(args, vec!["-h", "--output"]);
+            }
+            Ok(_) => panic!("expected session appeal"),
+            Err(err) => panic!("expected session appeal parse, got {err}"),
+        }
+    }
+
+    #[test]
+    fn top_level_appeal_parses_session_and_command() {
+        match MainArgs::try_parse_from([
+            "guard",
+            "appeal",
+            "--session",
+            "tok",
+            "kubectl",
+            "get",
+            "pods",
+            "-n",
+            "nextcloud",
+        ]) {
+            Ok(MainArgs::Appeal {
+                session,
+                binary,
+                args,
+                ..
+            }) => {
+                assert_eq!(session.as_deref(), Some("tok"));
+                assert_eq!(binary, "kubectl");
+                assert_eq!(args, vec!["get", "pods", "-n", "nextcloud"]);
+            }
+            Ok(_) => panic!("expected top-level appeal"),
+            Err(err) => panic!("expected top-level appeal parse, got {err}"),
         }
     }
 

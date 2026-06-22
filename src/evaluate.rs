@@ -66,12 +66,12 @@ impl CachedResult {
         match self {
             CachedResult::Allow { reason, risk } => EvalResult::Allow {
                 reason,
-                source: EvalSource::Llm,
+                source: EvalSource::Cache,
                 risk,
             },
             CachedResult::Deny { reason, risk } => EvalResult::Deny {
                 reason,
-                source: EvalSource::Llm,
+                source: EvalSource::Cache,
                 risk,
             },
         }
@@ -329,6 +329,7 @@ pub enum EvalResult {
 pub enum EvalSource {
     StaticPolicy,
     LearnedRule,
+    Cache,
     Llm,
 }
 

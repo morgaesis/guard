@@ -166,6 +166,16 @@ fn add_kubernetes_secret_and_escape_denies(deny: &mut Vec<String>) {
         "kubectl create token*",
         "kubectl * config view --raw*",
         "kubectl config view --raw*",
+        "kubectl * config set*",
+        "kubectl config set*",
+        "kubectl * config unset*",
+        "kubectl config unset*",
+        "kubectl * config delete*",
+        "kubectl config delete*",
+        "kubectl * config rename*",
+        "kubectl config rename*",
+        "kubectl * config use-context*",
+        "kubectl config use-context*",
         "kubectl * exec *",
         "kubectl exec *",
         "kubectl * cp *",
@@ -174,8 +184,115 @@ fn add_kubernetes_secret_and_escape_denies(deny: &mut Vec<String>) {
         "kubectl port-forward *",
         "kubectl * delete *",
         "kubectl delete *",
+        "kubectl * apply *",
+        "kubectl apply *",
+        "kubectl * replace *",
+        "kubectl replace *",
+        "kubectl * create *",
+        "kubectl create *",
+        "kubectl * rollout restart *",
+        "kubectl rollout restart *",
+        "kubectl * rollout undo *",
+        "kubectl rollout undo *",
+        "kubectl * rollout pause *",
+        "kubectl rollout pause *",
+        "kubectl * rollout resume *",
+        "kubectl rollout resume *",
+        "kubectl * autoscale *",
+        "kubectl autoscale *",
+        "kubectl * set *",
+        "kubectl set *",
+        "kubectl * cordon *",
+        "kubectl cordon *",
+        "kubectl * uncordon *",
+        "kubectl uncordon *",
+        "kubectl * drain *",
+        "kubectl drain *",
+        "kubectl * taint *",
+        "kubectl taint *",
+        "kubectl * auth *",
+        "kubectl auth *",
+        "kubectl * certificate *",
+        "kubectl certificate *",
+        "kubectl * proxy *",
+        "kubectl proxy *",
+        "kubectl * debug *",
+        "kubectl debug *",
+        "kubectl * attach *",
+        "kubectl attach *",
+        "kubectl * run *",
+        "kubectl run *",
+        "kubectl * expose *",
+        "kubectl expose *",
     ] {
         push_unique(deny, pattern.to_string());
+    }
+
+    let mutation_verbs = ["edit", "patch", "annotate", "label"];
+    let mutation_resources = [
+        "pod",
+        "pods",
+        "service",
+        "services",
+        "svc",
+        "deployment",
+        "deployments",
+        "deploy",
+        "statefulset",
+        "statefulsets",
+        "sts",
+        "daemonset",
+        "daemonsets",
+        "ds",
+        "replicaset",
+        "replicasets",
+        "rs",
+        "configmap",
+        "configmaps",
+        "cm",
+        "endpoint",
+        "endpoints",
+        "endpointslice",
+        "endpointslices",
+        "serviceaccount",
+        "serviceaccounts",
+        "sa",
+        "role",
+        "roles",
+        "rolebinding",
+        "rolebindings",
+        "clusterrole",
+        "clusterroles",
+        "clusterrolebinding",
+        "clusterrolebindings",
+        "networkpolicy",
+        "networkpolicies",
+        "namespace",
+        "namespaces",
+        "ns",
+        "node",
+        "nodes",
+        "persistentvolumeclaim",
+        "persistentvolumeclaims",
+        "pvc",
+        "persistentvolume",
+        "persistentvolumes",
+        "pv",
+        "storageclass",
+        "storageclasses",
+        "customresourcedefinition",
+        "customresourcedefinitions",
+        "crd",
+        "mutatingwebhookconfiguration",
+        "mutatingwebhookconfigurations",
+        "validatingwebhookconfiguration",
+        "validatingwebhookconfigurations",
+    ];
+    for verb in mutation_verbs {
+        for resource in mutation_resources {
+            push_unique(deny, format!("kubectl {verb} {resource}*"));
+            push_unique(deny, format!("kubectl * {verb} {resource}*"));
+        }
     }
 }
 
@@ -184,6 +301,10 @@ fn add_cluster_read_allows(prefixes: &[String], allow: &mut Vec<String>) {
         for pattern in [
             format!("{prefix} config current-context"),
             format!("{prefix} config get-contexts"),
+            format!("{prefix} api-resources*"),
+            format!("{prefix} api-versions*"),
+            format!("{prefix} version*"),
+            format!("{prefix} explain *"),
             format!("{prefix} get namespace*"),
             format!("{prefix} get ns*"),
         ] {
@@ -234,8 +355,28 @@ fn add_namespaced_kubernetes_read_allows(
             add_namespaced_patterns(prefix, namespace, "get", resource, allow);
             add_namespaced_patterns(prefix, namespace, "describe", resource, allow);
         }
+        add_broad_namespaced_read_patterns(prefix, namespace, allow);
         push_unique(allow, format!("{prefix} logs * -n {namespace}"));
         push_unique(allow, format!("{prefix} logs * --namespace {namespace}"));
+        push_unique(allow, format!("{prefix} rollout status * -n {namespace}"));
+        push_unique(
+            allow,
+            format!("{prefix} rollout status * --namespace {namespace}"),
+        );
+        push_unique(allow, format!("{prefix} top pod * -n {namespace}"));
+        push_unique(allow, format!("{prefix} top pod * --namespace {namespace}"));
+        push_unique(allow, format!("{prefix} top pods * -n {namespace}"));
+        push_unique(
+            allow,
+            format!("{prefix} top pods * --namespace {namespace}"),
+        );
+    }
+}
+
+fn add_broad_namespaced_read_patterns(prefix: &str, namespace: &str, allow: &mut Vec<String>) {
+    for verb in ["get", "describe"] {
+        push_unique(allow, format!("{prefix} {verb} * -n {namespace}"));
+        push_unique(allow, format!("{prefix} {verb} * --namespace {namespace}"));
     }
 }
 
@@ -353,7 +494,7 @@ fn looks_like_command(value: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | '\\'))
 }
 
-fn looks_dangerous_static_command(command: &str) -> bool {
+pub(crate) fn looks_dangerous_static_command(command: &str) -> bool {
     let lower = command.to_ascii_lowercase();
     lower.contains(';')
         || lower.contains('|')
@@ -424,13 +565,29 @@ mod tests {
             .iter()
             .any(|pattern| pattern == "kubectl * secret*"));
         assert!(compiled
+            .deny
+            .iter()
+            .any(|pattern| pattern == "kubectl apply *"));
+        assert!(compiled
+            .deny
+            .iter()
+            .any(|pattern| pattern == "kubectl patch service*"));
+        assert!(compiled
             .allow
             .iter()
             .any(|pattern| pattern == "kubectl -n nextcloud get pods"));
         assert!(compiled
             .allow
             .iter()
+            .any(|pattern| pattern == "kubectl get * -n nextcloud"));
+        assert!(compiled
+            .allow
+            .iter()
             .any(|pattern| pattern == "kubectl --context morgaesis-dev -n nextcloud get pods"));
+        assert!(compiled
+            .allow
+            .iter()
+            .any(|pattern| pattern == "kubectl --context morgaesis-dev get * -n nextcloud"));
         assert!(compiled
             .allow
             .iter()
@@ -439,6 +596,10 @@ mod tests {
             .allow
             .iter()
             .any(|pattern| pattern == "kubectl -n nextcloud edit ingress"));
+        assert!(compiled
+            .allow
+            .iter()
+            .any(|pattern| pattern == "kubectl patch ingress * -n nextcloud"));
         assert!(!compiled
             .allow
             .iter()
