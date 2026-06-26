@@ -6,12 +6,17 @@ Long-running `guard` server deployment as a system service.
 
 Use this when `guard` should listen on a local UNIX socket and serve local clients (AI agents, shims) through a system service.
 
-On Windows, guard runs with the TCP loopback transport instead of Unix sockets.
-Start it with `--tcp-port` (or use the Windows default `127.0.0.1:8123`) and
-configure clients with `guard config set-port 8123`. TCP callers do not carry a
-trusted Unix UID, so UID-scoped secret injection, `--exec-as-caller`, and
-daemon-UID admin are unavailable. TCP admin RPCs such as `guard grant` require a
-separate `SSH_GUARD_ADMIN_TOKEN`; the ordinary TCP exec token is not sufficient.
+On Windows, guard's native local transport is a named pipe with SID-based peer
+authentication, selected with `--socket <name>` (the same flag that selects a
+UNIX domain socket on Unix; the name maps to `\\.\pipe\<name>`). Point clients at
+it with `guard config set-server <name>`. Connect access is governed by the pipe
+ACL — Administrators/SYSTEM/Authenticated Users by default; tighten it to a
+specific agent SID on a multi-user host. A TCP loopback transport is also
+available with `--tcp-port` (default `127.0.0.1:8123`) and a shared
+`SSH_GUARD_AUTH_TOKEN`. Either way, Windows callers are not Unix peers, so
+UID-scoped secret injection, `--exec-as-caller`, consequence gating, and
+daemon-UID admin are unavailable; TCP admin RPCs such as `guard grant` require a
+separate `SSH_GUARD_ADMIN_TOKEN`.
 
 The helper script [`deployment/windows/guard-launch.ps1`](deployment/windows/guard-launch.ps1)
 starts the Windows daemon with loopback TCP, optional learned rules, and logs

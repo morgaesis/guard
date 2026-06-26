@@ -56,7 +56,16 @@ guard server start &
 guard run uptime
 ```
 
-On Windows, use the loopback TCP transport:
+On Windows, guard's native local transport is a named pipe with SID-based peer
+authentication, selected with `--socket` (the name maps to `\\.\pipe\<name>`):
+
+```powershell
+guard server start --socket guard
+guard config set-server guard
+guard run whoami
+```
+
+A TCP loopback transport is also available:
 
 ```powershell
 guard server start --tcp-port 8123

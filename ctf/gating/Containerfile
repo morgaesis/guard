@@ -1,5 +1,5 @@
 # Self-contained adversarial harness for consequence gating.
-# Builds guard for Linux, sets up a root daemon + unprivileged agent (uid 1001),
+# Builds guard for Linux, sets up an unprivileged daemon (uid 1000) and agent (uid 1001),
 # and runs the attack script. No podman, no claude OAuth, no external egress
 # (trusted verbs make classification deterministic and offline).
 #

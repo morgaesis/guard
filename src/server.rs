@@ -41,7 +41,7 @@ use std::ffi::CString;
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -1002,14 +1002,22 @@ impl Server {
             anyhow::bail!("no socket path or TCP port specified");
         }
 
-        let _ = futures::future::join_all(futures).await;
+        // A listener loop only returns on a fatal error; surface it rather than
+        // exiting silently (a swallowed error looks like a clean shutdown).
+        for result in futures::future::join_all(futures).await {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::error!("listener exited with error: {:#}", e),
+                Err(e) => tracing::error!("listener task panicked: {}", e),
+            }
+        }
 
         Ok(())
     }
 
     /// Platform dispatch for the local listener: UNIX domain socket on Unix,
     /// named pipe on Windows.
-    async fn run_local_static(socket_path: &PathBuf, config: &ServerConfig) -> Result<()> {
+    async fn run_local_static(socket_path: &Path, config: &ServerConfig) -> Result<()> {
         #[cfg(unix)]
         {
             Self::run_unix_static(socket_path, config).await
@@ -1021,7 +1029,7 @@ impl Server {
     }
 
     #[cfg(windows)]
-    async fn run_pipe_static(socket_path: &PathBuf, config: &ServerConfig) -> Result<()> {
+    async fn run_pipe_static(socket_path: &Path, config: &ServerConfig) -> Result<()> {
         let pipe_name = winplat::pipe_name(socket_path);
         tracing::info!("guard server listening on named pipe {}", pipe_name);
 
@@ -1047,7 +1055,7 @@ impl Server {
     }
 
     #[cfg(unix)]
-    async fn run_unix_static(socket_path: &PathBuf, config: &ServerConfig) -> Result<()> {
+    async fn run_unix_static(socket_path: &Path, config: &ServerConfig) -> Result<()> {
         if let Some(parent) = socket_path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -1115,7 +1123,7 @@ impl Server {
     }
 
     #[cfg(unix)]
-    async fn chown_to_group(path: &PathBuf, group: &str) -> Result<()> {
+    async fn chown_to_group(path: &Path, group: &str) -> Result<()> {
         let output = Command::new("chgrp").arg(group).arg(path).output().await?;
 
         if !output.status.success() {
@@ -1155,7 +1163,9 @@ mod winplat {
         TOKEN_QUERY, TOKEN_USER,
     };
     use windows_sys::Win32::System::Pipes::{CreateNamedPipeW, ImpersonateNamedPipeClient};
-    use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken,
+    };
 
     // Named pipe creation flags (avoid extra feature imports for the constants).
     const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
@@ -1176,14 +1186,21 @@ mod winplat {
     /// Administrators/SYSTEM/Authenticated Users) for a multi-user host.
     pub fn create_pipe_server(pipe_name: &str, first: bool) -> Result<NamedPipeServer> {
         let wide: Vec<u16> = pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
-        // Administrators/SYSTEM get full control; Authenticated Users get only
-        // FILE_GENERIC_READ|FILE_GENERIC_WRITE (0x0012019b) so they can CONNECT
-        // but NOT create rogue additional instances of the pipe
-        // (FILE_CREATE_PIPE_INSTANCE is excluded). Tighten AU to a specific agent
-        // SID for a multi-user host.
-        let sddl: Vec<u16> = "D:(A;;GA;;;BA)(A;;GA;;;SY)(A;;0x0012019b;;;AU)\0"
-            .encode_utf16()
-            .collect();
+        // The daemon's own account gets full control so it can create the
+        // additional pipe instances each accepted client needs
+        // (FILE_CREATE_PIPE_INSTANCE). A non-elevated daemon runs as a plain
+        // Authenticated User, so without this it can create the first instance
+        // but is denied the second (the AU ACE below excludes create-instance).
+        // Administrators/SYSTEM also get full control. Authenticated Users get
+        // only FILE_GENERIC_READ|FILE_GENERIC_WRITE (0x0012019b) so they can
+        // CONNECT but NOT stand up rogue instances. Tighten AU to a specific
+        // agent SID for a multi-user host.
+        let owner_sid =
+            unsafe { process_user_sid() }.context("resolve daemon SID for pipe DACL")?;
+        let sddl: Vec<u16> =
+            format!("D:(A;;GA;;;{owner_sid})(A;;GA;;;BA)(A;;GA;;;SY)(A;;0x0012019b;;;AU)\0")
+                .encode_utf16()
+                .collect();
         unsafe {
             let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
             if ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -1239,6 +1256,21 @@ mod winplat {
             let base = path.file_name().and_then(|f| f.to_str()).unwrap_or("guard");
             format!(r"\\.\pipe\{}", base)
         }
+    }
+
+    /// SID string of the daemon's own process token. Used to grant the daemon
+    /// full control of the pipe DACL so it can create additional instances.
+    unsafe fn process_user_sid() -> Result<String> {
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            bail!(
+                "OpenProcessToken failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let result = sid_string_from_token(token);
+        CloseHandle(token);
+        result
     }
 
     /// Resolve the SID string of the connected pipe client by briefly
@@ -1357,15 +1389,15 @@ async fn handle_client_pipe(stream: NamedPipeServer, config: &ServerConfig) -> R
             CallerIdentity::Windows { sid }
         }
         Err(e) => {
-            // Fail soft: the policy gate does not depend on identity, but log
-            // loudly so an operator notices identity resolution is degraded.
+            // Fail closed: a local pipe peer whose SID we cannot resolve is not
+            // trustworthy for per-identity state (secret namespaces, pending-op
+            // caps). Drop the connection rather than admit a shared synthetic
+            // identity that multiple degraded callers would collapse onto.
             tracing::warn!(
-                "could not resolve pipe client SID ({}); treating as unknown",
+                "could not resolve pipe client SID ({}); rejecting connection",
                 e
             );
-            CallerIdentity::Windows {
-                sid: "S-unknown".to_string(),
-            }
+            return Err(e);
         }
     };
     serve_connection(stream, caller, config).await
@@ -5375,15 +5407,7 @@ impl Client {
         );
 
         if let Some(ref socket_path) = self.socket_path {
-            #[cfg(not(unix))]
-            {
-                let _ = socket_path;
-                bail!("Unix sockets are not supported on this platform; configure a TCP port");
-            }
-            #[cfg(unix)]
-            {
-                self.send_unix(socket_path, &request).await
-            }
+            self.send_local(socket_path, &request).await
         } else if let Some(port) = self.tcp_port {
             self.send_tcp(port, &request).await
         } else {
@@ -5431,16 +5455,8 @@ impl Client {
         );
 
         if let Some(ref socket_path) = self.socket_path {
-            #[cfg(not(unix))]
-            {
-                let _ = socket_path;
-                bail!("Unix sockets are not supported on this platform; configure a TCP port");
-            }
-            #[cfg(unix)]
-            {
-                self.send_unix_streaming(socket_path, &request, &mut on_output)
-                    .await
-            }
+            self.send_local_streaming(socket_path, &request, &mut on_output)
+                .await
         } else if let Some(port) = self.tcp_port {
             self.send_tcp_streaming(port, &request, &mut on_output)
                 .await
@@ -5477,10 +5493,9 @@ impl Client {
         }
     }
 
-    #[cfg(unix)]
-    async fn send_unix(
+    async fn send_local(
         &self,
-        socket_path: &PathBuf,
+        socket_path: &Path,
         request: &ExecuteRequest,
     ) -> Result<ExecuteResponse> {
         tracing::debug!(
@@ -5526,10 +5541,9 @@ impl Client {
         Ok(response)
     }
 
-    #[cfg(unix)]
-    async fn send_unix_streaming<F>(
+    async fn send_local_streaming<F>(
         &self,
-        socket_path: &PathBuf,
+        socket_path: &Path,
         request: &ExecuteRequest,
         on_output: &mut F,
     ) -> Result<ExecuteResponse>
