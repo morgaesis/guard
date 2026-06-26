@@ -887,14 +887,7 @@ fn print_run_help() -> Result<()> {
 
 #[cfg(unix)]
 fn current_uid() -> u32 {
-    #[cfg(unix)]
-    {
-        unsafe { libc::geteuid() as u32 }
-    }
-    #[cfg(not(unix))]
-    {
-        0
-    }
+    unsafe { libc::geteuid() as u32 }
 }
 
 fn default_state_db_path() -> Option<PathBuf> {
@@ -982,27 +975,42 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 }
             }
 
-            #[cfg(not(unix))]
-            if socket.is_some() {
-                anyhow::bail!("--socket is not supported on this platform; use --tcp-port");
+            // --users is a Unix-uid allow-list enforced via SO_PEERCRED. The
+            // Windows named-pipe transport authenticates peers by SID, so the
+            // flag has no effect there; fail fast rather than silently ignore a
+            // security control.
+            #[cfg(windows)]
+            if users.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+                anyhow::bail!(
+                    "--users is not supported on Windows (the named-pipe transport authenticates peers by SID, not Unix uid); restrict access via the pipe ACL instead"
+                );
             }
 
             let configured_socket = socket.map(PathBuf::from).or_else(|| {
                 let config = client_config::ClientConfig::load().ok()?;
                 config.server_socket.map(PathBuf::from)
             });
+            // Local transport: a Unix-domain socket on Unix, a named pipe on
+            // Windows (winplat::pipe_name maps `--socket <name>` to
+            // \\.\pipe\<name>). On Unix it also falls back to a home-dir default.
             #[cfg(unix)]
             let socket_path = configured_socket
                 .or_else(|| dirs::home_dir().map(|h| h.join(".guard").join("guard.sock")));
-            #[cfg(not(unix))]
-            let socket_path: Option<PathBuf> = None;
+            #[cfg(windows)]
+            let socket_path = configured_socket;
 
+            // TCP loopback is the Windows no-flag default, but only when no named
+            // pipe was selected; an explicit --socket chooses the pipe instead.
             let tcp_port = tcp_port
                 .or_else(|| guard_env("TCP_PORT").and_then(|v| v.parse::<u16>().ok()))
                 .or({
                     #[cfg(windows)]
                     {
-                        Some(8123)
+                        if socket_path.is_none() {
+                            Some(8123)
+                        } else {
+                            None
+                        }
                     }
                     #[cfg(not(windows))]
                     {
@@ -1962,21 +1970,15 @@ fn resolve_client_endpoint(
     }
     if let Ok(s) = std::env::var("GUARD_SOCKET") {
         if !s.is_empty() {
-            #[cfg(not(unix))]
-            {
-                return (
-                    None,
-                    Some(config.server_tcp_port.unwrap_or(DEFAULT_CLIENT_TCP_PORT)),
-                );
-            }
-            #[cfg(unix)]
+            // A named pipe on Windows, a UNIX domain socket on Unix.
             return (Some(PathBuf::from(s)), None);
         }
     }
     if let Some(port) = config.server_tcp_port {
         return (None, Some(port));
     }
-    #[cfg(unix)]
+    // A configured socket is a named pipe on Windows, a UNIX domain socket on
+    // Unix; either way it takes precedence over the platform default below.
     if let Some(ref s) = config.server_socket {
         return (Some(PathBuf::from(s)), None);
     }
@@ -2192,9 +2194,11 @@ fn top_level_grant_to_session_command(
             .as_deref()
             .is_some_and(looks_like_quoted_grant_prose);
 
-    if token_or_prose.is_none() || single_positional_prose {
-        let prose = prose.or(token_or_prose);
-        SessionCommands::New {
+    // A positional that is not quoted-grant prose is a session token (Grant);
+    // otherwise (absent, or prose-shaped) it starts a New session.
+    match token_or_prose {
+        Some(token) if !single_positional_prose => SessionCommands::Grant {
+            token,
             prose,
             allow,
             deny,
@@ -2205,20 +2209,21 @@ fn top_level_grant_to_session_command(
             auto_amend,
             no_auto_amend,
             socket,
-        }
-    } else {
-        SessionCommands::Grant {
-            token: token_or_prose.expect("checked Some above"),
-            prose,
-            allow,
-            deny,
-            ttl,
-            prompt,
-            prompt_file,
-            static_only,
-            auto_amend,
-            no_auto_amend,
-            socket,
+        },
+        other => {
+            let prose = prose.or(other);
+            SessionCommands::New {
+                prose,
+                allow,
+                deny,
+                ttl,
+                prompt,
+                prompt_file,
+                static_only,
+                auto_amend,
+                no_auto_amend,
+                socket,
+            }
         }
     }
 }

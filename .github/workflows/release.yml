@@ -41,6 +41,10 @@ jobs:
             artifact_name: guard
             asset_name: guard-${{ github.ref_name }}-aarch64-unknown-linux-gnu.tar.gz
             use_cross: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact_name: guard.exe
+            asset_name: guard-${{ github.ref_name }}-x86_64-pc-windows-msvc.tar.gz
           # - target: x86_64-apple-darwin
           #   os: macos-latest
           #   artifact_name: guard
@@ -76,9 +80,11 @@ jobs:
         run: cross build --release --target ${{ matrix.target }}
 
       - name: Strip binary
+        shell: bash
         run: strip "target/${{ matrix.target }}/release/${{ matrix.artifact_name }}" || true
 
       - name: Create archive
+        shell: bash
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} dist/
