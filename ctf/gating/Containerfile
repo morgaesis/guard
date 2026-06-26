@@ -1,0 +1,28 @@
+# Self-contained adversarial harness for consequence gating.
+# Builds guard for Linux, sets up a root daemon + unprivileged agent (uid 1001),
+# and runs the attack script. No podman, no claude OAuth, no external egress
+# (trusted verbs make classification deterministic and offline).
+#
+# Build context is the repo root:
+#   docker build -t guard-gating -f ctf/gating/Containerfile .
+FROM rust:1-bookworm
+
+WORKDIR /src
+# Copy only what the build needs (keeps the Windows target/ out of the image).
+COPY Cargo.toml Cargo.lock build.rs deny.toml ./
+COPY src ./src
+COPY config ./config
+
+RUN cargo build --release --quiet && install -m 0755 target/release/guard /usr/local/bin/guard
+
+# Two distinct identities: the daemon/operator (uid 1000) and the agent (uid
+# 1001). The gate's bypass-resistance holds precisely because they differ.
+RUN useradd -m -u 1000 guarddaemon && useradd -m -u 1001 agent
+
+COPY ctf/gating/verbs.yaml /etc/guard/verbs.yaml
+COPY ctf/gating/attack.sh /attack.sh
+RUN chmod 0755 /attack.sh
+
+# Default: run the adversarial attack. Override the command to run the full test
+# suite instead:  docker run --rm guard-gating bash -lc 'cd /src && cargo test'
+ENTRYPOINT ["/attack.sh"]

@@ -20,6 +20,10 @@ use crate::session::{
     SessionGrantSummary, SessionInteraction, SessionRegistry, SessionReport,
 };
 use crate::session_store::SessionStore;
+use guard::gating::approval::{Approval, ApprovalRegistry, ApprovalSnapshot, ApprovalStatus};
+use guard::gating::provisional::{Provisional, ProvisionalRegistry, ProvisionalStatus};
+use guard::gating::verb::VerbCatalog;
+use guard::gating::{decide_gate, Coverage, GateMode, GateOutcome, Reversibility};
 
 // Re-export so main.rs can pattern-match on history status without a
 // direct dependency on the `session` module path.
@@ -38,11 +42,11 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::NamedPipeServer;
 use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
-#[cfg(windows)]
-use tokio::net::windows::named_pipe::NamedPipeServer;
 use tokio::process::Command;
 use tokio::sync::{mpsc, RwLock};
 #[cfg(unix)]
@@ -54,15 +58,49 @@ const MAX_GUARD_DEPTH: u32 = 5;
 const MAX_REQUEST_BYTES: usize = 1_048_576; // 1MB
 const MAX_OUTPUT_BYTES: usize = 10_485_760; // 10MB
 
+// --- Consequence-gating tuning (operator-overridable where noted) ---
+/// How often the sweeper checks for due auto-reverts and expired holds.
+const SWEEPER_TICK_SECS: u64 = 1;
+/// Delay after daemon start before the sweeper begins. Startup recovery (which
+/// moves past-deadline provisionals to needs_operator_decision) runs
+/// synchronously *before* the sweeper is spawned, so this grace is belt-and-
+/// suspenders against any clock settle and guarantees no revert fires at boot.
+const SWEEPER_GRACE_SECS: u64 = 30;
+/// Default auto-revert window for a containment envelope when `--confirm-within`
+/// is omitted.
+const DEFAULT_CONFIRM_WITHIN_SECS: u64 = 300;
+/// Upper bound on the auto-revert window. The window is set by the (untrusted)
+/// caller, so it is capped: any unconfirmed contained change auto-reverts within
+/// this horizon no matter what the caller requests.
+const MAX_CONFIRM_WITHIN_SECS: u64 = 24 * 60 * 60;
+/// Wall-clock timeout for a sweeper/operator-driven revert. A hung revert must
+/// not wedge the sweeper (which also drives fail-closed hold expiry).
+const REVERT_EXEC_TIMEOUT_SECS: u64 = 120;
+/// Default time a held command waits for operator approval before failing closed
+/// (denied-expired). Mirrors the decision-cache TTL default.
+const APPROVAL_TTL_SECS: u64 = 3600;
+/// Per-caller cap on outstanding holds + provisionals (local-DoS guard).
+const MAX_PENDING_PER_CALLER: usize = 32;
+/// Global cap on outstanding holds + provisionals.
+const MAX_PENDING_GLOBAL: usize = 256;
+/// How long decided/terminal gating rows are retained before pruning.
+const GATING_RETENTION_SECS: u64 = 24 * 60 * 60;
+
 /// Identifies the caller for per-user secret injection.
 #[derive(Debug, Clone)]
 pub enum CallerIdentity {
-    Unix { uid: u32 },
+    Unix {
+        uid: u32,
+    },
     /// Local caller over a Windows named pipe, identified by the kernel-verified
     /// SID of the connecting process (the Windows analog of a peer UID).
     #[cfg(windows)]
-    Windows { sid: String },
-    Tcp { token: String },
+    Windows {
+        sid: String,
+    },
+    Tcp {
+        token: String,
+    },
     Unknown,
 }
 
@@ -117,6 +155,54 @@ pub struct ExecuteRequest {
     /// allow/deny patterns short-circuit the decision before the evaluator.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_token: Option<String>,
+    /// Structured rollback command for a recoverable (containment) action. Used
+    /// only when consequence gating routes this command to a containment
+    /// envelope. Evaluated at arm time; never run as a shell string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revert: Option<RevertSpec>,
+    /// Auto-revert window in seconds for the containment envelope. Defaults to
+    /// `DEFAULT_CONFIRM_WITHIN_SECS` when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm_within_secs: Option<u64>,
+    /// Force the command onto the operator-approval (hold) path regardless of
+    /// the evaluator's reversibility class.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_approval: Option<bool>,
+    /// When set, a held command blocks up to this many seconds for an operator
+    /// decision and returns the real result inline instead of a bare hold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_approval_secs: Option<u64>,
+    /// Invoke an operator-defined verb instead of a raw binary. When present,
+    /// the daemon renders the verb's typed template into binary+args and uses
+    /// the verb's declared consequence class for gating.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verb: Option<VerbInvocation>,
+}
+
+/// A structured rollback command (no shell). Each arg is a single argv element.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RevertSpec {
+    pub binary: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+/// A request to run a catalog verb by name with validated parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VerbInvocation {
+    pub name: String,
+    #[serde(default)]
+    pub params: std::collections::BTreeMap<String, String>,
+}
+
+/// Resolved verb context threaded into gate routing.
+#[derive(Debug, Clone)]
+struct VerbContext {
+    name: String,
+    class: Reversibility,
+    trusted: bool,
+    params: std::collections::BTreeMap<String, String>,
+    catalog_version: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,6 +257,35 @@ pub enum AdminRequest {
     /// operating under, without revealing model identity, redaction
     /// state, session counts, or other fingerprintable internals.
     Ping,
+    // --- Consequence gating ---
+    /// Operator confirms a provisional (keep the change, cancel auto-revert).
+    Confirm {
+        handle: String,
+    },
+    /// Operator reverts a provisional now (manual rollback).
+    Revert {
+        handle: String,
+    },
+    /// List provisional (containment) executions. Daemon UID sees all; other
+    /// callers see only their own.
+    Provisionals,
+    /// Operator approves a held command (executes it from its bound snapshot).
+    Approve {
+        handle: String,
+    },
+    /// Operator denies a held command.
+    Deny {
+        handle: String,
+    },
+    /// List held/decided approvals. Daemon UID sees all; others see their own.
+    ApprovalList,
+    /// Fetch one approval's status and result (for the agent to poll its own
+    /// held command). Scoped by handle ownership.
+    ApprovalShow {
+        handle: String,
+    },
+    /// List the operator-defined verb catalog (the agent's menu).
+    VerbList,
 }
 
 impl AdminRequest {
@@ -179,6 +294,11 @@ impl AdminRequest {
     /// listing are open to any connected user; they self-scope or
     /// redact sensitive fields so a caller cannot elevate from them.
     fn requires_daemon_uid(&self) -> bool {
+        // Gate-control writes (confirm/revert/approve/deny) are daemon-UID-only:
+        // a corrupted agent must never be able to confirm or approve its own
+        // action. Reads (provisionals/approval list/show) self-scope inside the
+        // handler by the caller's uid or by unguessable handle ownership, so they
+        // do not require the daemon UID.
         !matches!(
             self,
             Self::Ping
@@ -187,6 +307,10 @@ impl AdminRequest {
                 | Self::SecretDelete { .. }
                 | Self::SecretExists { .. }
                 | Self::SecretList
+                | Self::Provisionals
+                | Self::ApprovalList
+                | Self::ApprovalShow { .. }
+                | Self::VerbList
         )
     }
 }
@@ -230,6 +354,130 @@ pub enum AdminResponse {
         /// will actually run.
         dry_run: bool,
     },
+    // --- Consequence gating ---
+    /// A gate action ran (confirm/revert/approve/deny). Carries a human message
+    /// and, for approve/revert, the resulting exit/output.
+    GateAction {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stdout: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stderr: Option<String>,
+    },
+    Provisionals {
+        items: Vec<ProvisionalSummary>,
+    },
+    Approvals {
+        items: Vec<ApprovalSummary>,
+    },
+    ApprovalShow {
+        item: ApprovalSummary,
+    },
+    Verbs {
+        items: Vec<VerbSummary>,
+    },
+}
+
+/// Agent-facing view of a catalog verb (its menu entry).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerbSummary {
+    pub name: String,
+    pub description: String,
+    pub binary: String,
+    pub consequence: String,
+    pub trusted: bool,
+    pub has_revert: bool,
+    /// Parameter name -> validation pattern.
+    pub params: std::collections::BTreeMap<String, String>,
+}
+
+/// Operator-facing view of a provisional execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProvisionalSummary {
+    pub handle: String,
+    pub status: String,
+    pub command: String,
+    pub revert_command: String,
+    pub reason: String,
+    pub created_unix: u64,
+    pub deadline_unix: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_uid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revert_exit: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revert_detail: Option<String>,
+}
+
+/// Operator-facing view of a held/decided approval.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalSummary {
+    pub handle: String,
+    pub status: String,
+    pub command: String,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reversibility: Option<String>,
+    pub fingerprint: String,
+    pub created_unix: u64,
+    pub deadline_unix: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_uid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_reason: Option<String>,
+}
+
+impl ProvisionalSummary {
+    fn from_row(p: &Provisional) -> Self {
+        let command = if p.args.is_empty() {
+            p.binary.clone()
+        } else {
+            format!("{} {}", p.binary, p.args.join(" "))
+        };
+        Self {
+            handle: p.handle.clone(),
+            status: p.status.as_str().to_string(),
+            command,
+            revert_command: p.revert_command_line(),
+            reason: p.reason.clone(),
+            created_unix: p.created_unix,
+            deadline_unix: p.deadline_unix,
+            caller_uid: p.caller_uid,
+            revert_exit: p.revert_exit,
+            revert_detail: p.revert_detail.clone(),
+        }
+    }
+}
+
+impl ApprovalSummary {
+    fn from_row(a: &Approval) -> Self {
+        Self {
+            handle: a.handle.clone(),
+            status: a.status.as_str().to_string(),
+            command: a.snapshot.command_line(),
+            reason: a.reason.clone(),
+            risk: a.risk,
+            reversibility: a.reversibility.map(|r| r.as_str().to_string()),
+            fingerprint: a.snapshot.fingerprint(),
+            created_unix: a.created_unix,
+            deadline_unix: a.deadline_unix(),
+            caller_uid: a.snapshot.caller_uid,
+            exit_code: a.result_exit,
+            stdout: a.result_stdout.clone(),
+            stderr: a.result_stderr.clone(),
+            decided_reason: a.decided_reason.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -263,13 +511,22 @@ pub struct ServerStatus {
     pub state_db_path: Option<String>,
     #[serde(default)]
     pub secret_backend: String,
+    /// Consequence-gating mode (`off` / `consequence`).
+    #[serde(default)]
+    pub gate: String,
+    /// Outstanding provisional (containment) executions.
+    #[serde(default)]
+    pub pending_provisionals: usize,
+    /// Outstanding held approvals.
+    #[serde(default)]
+    pub pending_approvals: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 enum IncomingMessage {
     Admin { admin: AdminRequest },
-    Execute(ExecuteRequest),
+    Execute(Box<ExecuteRequest>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -282,6 +539,35 @@ pub struct ExecuteResponse {
     pub stdout: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stderr: Option<String>,
+    /// Consequence-gate outcome. Absent on a legacy (gating-off) response, which
+    /// old clients parse as a normal allow/deny. `Held`/`Provisional` mean the
+    /// command was approved but routed to the operator gate / containment
+    /// envelope, not denied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<GateStatus>,
+    /// Handle for a held or provisional command, used by `guard approve` /
+    /// `guard confirm` / `guard approvals show`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
+    /// Honest statement of what the gate checked and did not check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<Coverage>,
+}
+
+/// Wire-level consequence-gate outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateStatus {
+    /// Executed immediately (reversible, or gating off).
+    Executed,
+    /// Executed inside a containment envelope; auto-reverts unless confirmed.
+    Provisional,
+    /// Approved but held for operator approval; not executed.
+    Held,
+    /// A revert ran (response from `guard revert`/auto-revert reporting).
+    Reverted,
+    /// Policy evaluated, not executed (dry-run).
+    DryRun,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -333,6 +619,15 @@ pub struct ServerConfig {
     /// caller to be this UID; there is no token-based elevation.
     pub daemon_uid: u32,
     pub state_db_path: Option<PathBuf>,
+    /// Consequence-gating mode. `Off` preserves legacy behavior; `Consequence`
+    /// routes LLM-approved commands by reversibility.
+    pub gate: GateMode,
+    /// Containment-envelope state (recoverable provisionals).
+    pub provisional: Arc<RwLock<ProvisionalRegistry>>,
+    /// Operator-approval state (held irreversible commands).
+    pub approvals: Arc<RwLock<ApprovalRegistry>>,
+    /// Operator-authored verb catalog (the typed, least-expressive interface).
+    pub verbs: Arc<RwLock<VerbCatalog>>,
 }
 
 impl ServerConfig {
@@ -379,6 +674,12 @@ impl ServerConfig {
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
             state_db_path,
+            // Gating defaults to off; the daemon entrypoint enables it and
+            // populates the registries from persisted state before serving.
+            gate: GateMode::Off,
+            provisional: Arc::new(RwLock::new(ProvisionalRegistry::new())),
+            approvals: Arc::new(RwLock::new(ApprovalRegistry::new())),
+            verbs: Arc::new(RwLock::new(VerbCatalog::empty())),
         }
     }
 
@@ -522,8 +823,88 @@ impl Server {
         Self { config }
     }
 
+    /// Enable consequence gating. Must be called before `run`.
+    pub fn set_gate(&mut self, gate: GateMode) {
+        self.config.gate = gate;
+    }
+
+    /// Install the operator-defined verb catalog. Must be called before `run`.
+    pub fn set_verbs(&mut self, catalog: VerbCatalog) {
+        self.config.verbs = Arc::new(RwLock::new(catalog));
+    }
+
+    /// Load persisted provisional/approval state and apply startup recovery:
+    /// no revert ever runs unattended at boot. Past-deadline or interrupted
+    /// provisionals become `needs_operator_decision`; interrupted approvals
+    /// become `exec_failed`. Both are surfaced via a high-severity audit line.
+    async fn startup_gating(&self) {
+        let Some(store) = &self.config.session_store else {
+            tracing::info!(
+                "Consequence gating enabled (no state-db: provisional/approval state is process-local and not recovered across restart)"
+            );
+            return;
+        };
+
+        match store.load_provisionals().await {
+            Ok(rows) => {
+                let (reg, moved) = ProvisionalRegistry::from_rows(rows);
+                if !moved.is_empty() {
+                    tracing::warn!(
+                        "[AUDIT] STARTUP_RECOVERY provisionals_needing_decision={} handles={:?} (no revert runs unattended at boot)",
+                        moved.len(),
+                        moved
+                    );
+                    for h in &moved {
+                        if let Some(p) = reg.get(h) {
+                            if let Err(e) = store.save_provisional(p.clone()).await {
+                                tracing::warn!(
+                                    "failed to persist recovered provisional {}: {}",
+                                    h,
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
+                *self.config.provisional.write().await = reg;
+            }
+            Err(e) => tracing::error!("failed to load provisional state: {}", e),
+        }
+
+        match store.load_approvals().await {
+            Ok(rows) => {
+                let (reg, recovered) = ApprovalRegistry::from_rows(rows, now_unix());
+                if !recovered.is_empty() {
+                    tracing::warn!(
+                        "[AUDIT] STARTUP_RECOVERY approvals_exec_failed={} handles={:?} (exec interrupted by restart)",
+                        recovered.len(),
+                        recovered
+                    );
+                    for h in &recovered {
+                        if let Some(a) = reg.get(h) {
+                            if let Err(e) = store.save_approval(a.clone()).await {
+                                tracing::warn!("failed to persist recovered approval {}: {}", h, e);
+                            }
+                        }
+                    }
+                }
+                *self.config.approvals.write().await = reg;
+            }
+            Err(e) => tracing::error!("failed to load approval state: {}", e),
+        }
+    }
+
     pub async fn run(&self) -> Result<()> {
         tracing::info!("Server::run() called");
+
+        // Consequence gating: load persisted state (with boot-safe recovery) and
+        // start the single sweeper that fires due auto-reverts and expires holds.
+        if self.config.gate.is_on() {
+            tracing::info!("Consequence gating: {}", self.config.gate);
+            self.startup_gating().await;
+            let config = self.config.clone();
+            tokio::spawn(async move { gating_sweeper(config).await });
+        }
 
         let mut futures = Vec::new();
 
@@ -765,7 +1146,10 @@ mod winplat {
             );
             LocalFree(psd as _);
             if handle == INVALID_HANDLE_VALUE || handle.is_null() {
-                bail!("CreateNamedPipeW failed: {}", std::io::Error::last_os_error());
+                bail!(
+                    "CreateNamedPipeW failed: {}",
+                    std::io::Error::last_os_error()
+                );
             }
             NamedPipeServer::from_raw_handle(handle as _)
                 .context("NamedPipeServer::from_raw_handle failed")
@@ -779,10 +1163,7 @@ mod winplat {
         if s.starts_with(r"\\.\pipe\") || s.starts_with(r"\\?\pipe\") {
             s
         } else {
-            let base = path
-                .file_name()
-                .and_then(|f| f.to_str())
-                .unwrap_or("guard");
+            let base = path.file_name().and_then(|f| f.to_str()).unwrap_or("guard");
             format!(r"\\.\pipe\{}", base)
         }
     }
@@ -818,7 +1199,10 @@ mod winplat {
     unsafe fn sid_from_current_thread() -> Result<String> {
         let mut token: HANDLE = std::ptr::null_mut();
         if OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) == 0 {
-            bail!("OpenThreadToken failed: {}", std::io::Error::last_os_error());
+            bail!(
+                "OpenThreadToken failed: {}",
+                std::io::Error::last_os_error()
+            );
         }
         let result = sid_string_from_token(token);
         CloseHandle(token);
@@ -841,7 +1225,10 @@ mod winplat {
             &mut len,
         ) == 0
         {
-            bail!("GetTokenInformation failed: {}", std::io::Error::last_os_error());
+            bail!(
+                "GetTokenInformation failed: {}",
+                std::io::Error::last_os_error()
+            );
         }
         // buf is a Vec<u8> (alignment 1); forming a &TOKEN_USER to it would be UB
         // because TOKEN_USER's embedded PSID forces 8-byte alignment. Read the SID
@@ -899,7 +1286,10 @@ async fn handle_client_pipe(stream: NamedPipeServer, config: &ServerConfig) -> R
         Err(e) => {
             // Fail soft: the policy gate does not depend on identity, but log
             // loudly so an operator notices identity resolution is degraded.
-            tracing::warn!("could not resolve pipe client SID ({}); treating as unknown", e);
+            tracing::warn!(
+                "could not resolve pipe client SID ({}); treating as unknown",
+                e
+            );
             CallerIdentity::Windows {
                 sid: "S-unknown".to_string(),
             }
@@ -910,11 +1300,7 @@ async fn handle_client_pipe(stream: NamedPipeServer, config: &ServerConfig) -> R
 
 /// Drive the request/response protocol for one connected client, independent of
 /// the underlying transport (UNIX socket or Windows named pipe).
-async fn serve_connection<S>(
-    stream: S,
-    caller: CallerIdentity,
-    config: &ServerConfig,
-) -> Result<()>
+async fn serve_connection<S>(stream: S, caller: CallerIdentity, config: &ServerConfig) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -937,6 +1323,9 @@ where
                     exit_code: None,
                     stdout: None,
                     stderr: None,
+                    status: None,
+                    handle: None,
+                    coverage: None,
                 };
                 writer
                     .write_all(serde_json::to_string(&resp)?.as_bytes())
@@ -955,7 +1344,7 @@ where
                 writer.write_all(b"\n").await?;
                 continue;
             }
-            IncomingMessage::Execute(req) => req,
+            IncomingMessage::Execute(req) => *req,
         };
 
         if let Err(_e) = config.validate_token(request.auth_token.as_deref()) {
@@ -972,6 +1361,9 @@ where
                 exit_code: None,
                 stdout: None,
                 stderr: None,
+                status: None,
+                handle: None,
+                coverage: None,
             };
             writer
                 .write_all(serde_json::to_string(&resp)?.as_bytes())
@@ -1409,9 +1801,369 @@ async fn handle_admin_request(
                         .as_ref()
                         .map(|path| path.display().to_string()),
                     secret_backend: config.secrets.backend_name().to_string(),
+                    gate: config.gate.as_str().to_string(),
+                    pending_provisionals: config.provisional.read().await.outstanding(),
+                    pending_approvals: config.approvals.read().await.outstanding(),
                 },
             }
         }
+        AdminRequest::Confirm { handle } => handle_confirm(config, caller, &handle).await,
+        AdminRequest::Revert { handle } => handle_manual_revert(config, caller, &handle).await,
+        AdminRequest::Approve { handle } => handle_approve(config, caller, &handle).await,
+        AdminRequest::Deny { handle } => handle_deny(config, caller, &handle).await,
+        AdminRequest::Provisionals => {
+            let (is_daemon, caller_uid) = caller_scope(config, caller);
+            let items = config
+                .provisional
+                .read()
+                .await
+                .list()
+                .iter()
+                .filter(|p| is_daemon || p.caller_uid == caller_uid)
+                .map(ProvisionalSummary::from_row)
+                .collect();
+            AdminResponse::Provisionals { items }
+        }
+        AdminRequest::ApprovalList => {
+            let (is_daemon, caller_uid) = caller_scope(config, caller);
+            let items = config
+                .approvals
+                .read()
+                .await
+                .list()
+                .iter()
+                .filter(|a| is_daemon || a.snapshot.caller_uid == caller_uid)
+                .map(ApprovalSummary::from_row)
+                .collect();
+            AdminResponse::Approvals { items }
+        }
+        AdminRequest::ApprovalShow { handle } => {
+            let (is_daemon, caller_uid) = caller_scope(config, caller);
+            let found = config.approvals.read().await.get(&handle).cloned();
+            match found {
+                // Handle is an unguessable bearer secret; the owner (or daemon)
+                // may read its status and result. Others get NotFound, not a
+                // leak of existence.
+                Some(a) if is_daemon || a.snapshot.caller_uid == caller_uid => {
+                    AdminResponse::ApprovalShow {
+                        item: ApprovalSummary::from_row(&a),
+                    }
+                }
+                _ => AdminResponse::Error {
+                    message: format!("no approval with handle '{}'", handle),
+                },
+            }
+        }
+        AdminRequest::VerbList => {
+            let items = {
+                let mut cat = config.verbs.write().await;
+                if let Err(e) = cat.reload_if_stale() {
+                    tracing::warn!("verb catalog reload failed: {}", e);
+                }
+                cat.list()
+                    .iter()
+                    .map(|v| VerbSummary {
+                        name: v.name.clone(),
+                        description: v.description.clone(),
+                        binary: v.binary.clone(),
+                        consequence: v.consequence.as_str().to_string(),
+                        trusted: v.trusted,
+                        has_revert: v.revert.is_some(),
+                        params: v
+                            .params
+                            .iter()
+                            .map(|(k, spec)| (k.clone(), spec.pattern.clone()))
+                            .collect(),
+                    })
+                    .collect()
+            };
+            AdminResponse::Verbs { items }
+        }
+    }
+}
+
+/// Returns `(is_daemon_uid, caller_uid)` for read-scoping.
+fn caller_scope(config: &ServerConfig, caller: &CallerIdentity) -> (bool, Option<u32>) {
+    match caller {
+        CallerIdentity::Unix { uid } => (*uid == config.daemon_uid, Some(*uid)),
+        _ => (false, None),
+    }
+}
+
+async fn handle_confirm(
+    config: &ServerConfig,
+    caller: &CallerIdentity,
+    handle: &str,
+) -> AdminResponse {
+    let updated = {
+        let mut reg = config.provisional.write().await;
+        reg.confirm(handle)
+    };
+    match updated {
+        Ok(p) => {
+            persist_provisional(config, &p).await;
+            tracing::info!("[AUDIT] CONFIRM handle={} caller={}", handle, caller);
+            AdminResponse::GateAction {
+                message: format!("provisional {} confirmed; change kept", handle),
+                exit_code: None,
+                stdout: None,
+                stderr: None,
+            }
+        }
+        Err(e) => AdminResponse::Error {
+            message: e.to_string(),
+        },
+    }
+}
+
+async fn handle_manual_revert(
+    config: &ServerConfig,
+    caller: &CallerIdentity,
+    handle: &str,
+) -> AdminResponse {
+    let claimed = {
+        let mut reg = config.provisional.write().await;
+        reg.begin_revert(handle)
+    };
+    let p = match claimed {
+        Ok(p) => p,
+        Err(e) => {
+            return AdminResponse::Error {
+                message: e.to_string(),
+            }
+        }
+    };
+    persist_provisional(config, &p).await;
+    let outcome = finish_revert(config, &p, caller, "manual").await;
+    AdminResponse::GateAction {
+        message: outcome.0,
+        exit_code: outcome.1,
+        stdout: None,
+        stderr: None,
+    }
+}
+
+/// Run a claimed (`Reverting`) provisional's revert and record the outcome.
+/// Returns `(message, exit_code)`.
+async fn finish_revert(
+    config: &ServerConfig,
+    p: &Provisional,
+    caller: &CallerIdentity,
+    kind: &str,
+) -> (String, Option<i32>) {
+    // Bound the revert so a hung rollback cannot pin the sweeper (which also
+    // drives fail-closed hold expiry). A timeout is recorded as RevertFailed.
+    let (status_ok, exit, detail) = match tokio::time::timeout(
+        std::time::Duration::from_secs(REVERT_EXEC_TIMEOUT_SECS),
+        run_provisional_revert(config, p),
+    )
+    .await
+    {
+        Ok(result) => match &result.exec {
+            ExecOutcome::Completed { exit_code, .. } => {
+                let ok = exit_code.unwrap_or(-1) == 0;
+                (ok, *exit_code, None)
+            }
+            ExecOutcome::Failed { reason } => (false, None, Some(reason.clone())),
+            _ => (false, None, Some("unexpected revert outcome".to_string())),
+        },
+        Err(_) => (
+            false,
+            None,
+            Some(format!(
+                "revert timed out after {}s",
+                REVERT_EXEC_TIMEOUT_SECS
+            )),
+        ),
+    };
+    let updated = {
+        let mut reg = config.provisional.write().await;
+        if status_ok {
+            reg.set_reverted(&p.handle, exit);
+        } else {
+            reg.set_revert_failed(
+                &p.handle,
+                exit,
+                detail
+                    .clone()
+                    .unwrap_or_else(|| format!("revert exited with code {:?}", exit)),
+            );
+        }
+        reg.get(&p.handle).cloned()
+    };
+    if let Some(u) = &updated {
+        persist_provisional(config, u).await;
+    }
+    if status_ok {
+        tracing::info!(
+            "[AUDIT] REVERT handle={} caller={} kind={} exit={:?}",
+            p.handle,
+            caller,
+            kind,
+            exit
+        );
+        (
+            format!("provisional {} reverted (exit {:?})", p.handle, exit),
+            exit,
+        )
+    } else {
+        tracing::error!(
+            "[AUDIT] REVERT_FAILED handle={} caller={} kind={} exit={:?} detail={:?}",
+            p.handle,
+            caller,
+            kind,
+            exit,
+            detail
+        );
+        (
+            format!(
+                "REVERT FAILED for provisional {} (exit {:?}); the change may still be in place: {}",
+                p.handle,
+                exit,
+                detail.unwrap_or_default()
+            ),
+            exit,
+        )
+    }
+}
+
+async fn handle_approve(
+    config: &ServerConfig,
+    caller: &CallerIdentity,
+    handle: &str,
+) -> AdminResponse {
+    let snapshot = {
+        let mut reg = config.approvals.write().await;
+        reg.begin_approve(handle)
+    };
+    let snapshot = match snapshot {
+        Ok(s) => s,
+        Err(e) => {
+            return AdminResponse::Error {
+                message: e.to_string(),
+            }
+        }
+    };
+    // Gate-on-prediction: if this hold came from a verb and the catalog changed
+    // since it was held, the approved artifact may no longer mean what the
+    // operator reviewed. Void the approval rather than execute a stale rendering.
+    if let Some(vname) = &snapshot.verb_name {
+        let current = config.verbs.read().await.version();
+        if snapshot.catalog_version != Some(current) {
+            let now = now_unix();
+            let detail = format!(
+                "verb catalog changed since '{}' was held; approval voided (re-issue the command)",
+                vname
+            );
+            {
+                let mut reg = config.approvals.write().await;
+                reg.set_exec_failed(handle, now, detail.clone());
+            }
+            if let Some(a) = config.approvals.read().await.get(handle).cloned() {
+                persist_approval(config, &a).await;
+            }
+            tracing::warn!(
+                "[AUDIT] APPROVE_VOIDED handle={} caller={} {}",
+                handle,
+                caller,
+                detail
+            );
+            return AdminResponse::Error { message: detail };
+        }
+    }
+    // Persist the Approving transition before exec so an interrupted exec is
+    // recoverable (startup recovery routes Approving -> ExecFailed).
+    if let Some(a) = config.approvals.read().await.get(handle).cloned() {
+        persist_approval(config, &a).await;
+    }
+    let reason = format!("operator-approved held command {}", handle);
+    let result = execute_snapshot(config, &snapshot, &reason).await;
+    let now = now_unix();
+    let (message, exit, stdout, stderr) = match result.exec {
+        ExecOutcome::Completed {
+            exit_code,
+            stdout,
+            stderr,
+        } => {
+            {
+                let mut reg = config.approvals.write().await;
+                reg.set_result(handle, now, exit_code, stdout.clone(), stderr.clone());
+            }
+            tracing::info!(
+                "[AUDIT] APPROVED handle={} caller={} exit={:?}",
+                handle,
+                caller,
+                exit_code
+            );
+            (
+                format!("approved and executed {} (exit {:?})", handle, exit_code),
+                exit_code,
+                stdout,
+                stderr,
+            )
+        }
+        ExecOutcome::Failed { reason: detail } => {
+            {
+                let mut reg = config.approvals.write().await;
+                reg.set_exec_failed(handle, now, detail.clone());
+            }
+            tracing::error!(
+                "[AUDIT] APPROVE_EXEC_FAILED handle={} caller={} detail={}",
+                handle,
+                caller,
+                detail
+            );
+            (
+                format!("approved {} but execution failed: {}", handle, detail),
+                None,
+                None,
+                None,
+            )
+        }
+        _ => (
+            format!("approved {} (unexpected outcome)", handle),
+            None,
+            None,
+            None,
+        ),
+    };
+    if let Some(a) = config.approvals.read().await.get(handle).cloned() {
+        persist_approval(config, &a).await;
+    }
+    AdminResponse::GateAction {
+        message,
+        exit_code: exit,
+        stdout,
+        stderr,
+    }
+}
+
+async fn handle_deny(
+    config: &ServerConfig,
+    caller: &CallerIdentity,
+    handle: &str,
+) -> AdminResponse {
+    let now = now_unix();
+    let result = {
+        let mut reg = config.approvals.write().await;
+        reg.deny(handle, now, "operator denied".to_string())
+    };
+    match result {
+        Ok(()) => {
+            if let Some(a) = config.approvals.read().await.get(handle).cloned() {
+                persist_approval(config, &a).await;
+            }
+            tracing::info!("[AUDIT] DENIED_HOLD handle={} caller={}", handle, caller);
+            AdminResponse::GateAction {
+                message: format!("held command {} denied", handle),
+                exit_code: None,
+                stdout: None,
+                stderr: None,
+            }
+        }
+        Err(e) => AdminResponse::Error {
+            message: e.to_string(),
+        },
     }
 }
 
@@ -1433,6 +2185,9 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
                     exit_code: None,
                     stdout: None,
                     stderr: None,
+                    status: None,
+                    handle: None,
+                    coverage: None,
                 };
                 writer
                     .write_all(serde_json::to_string(&resp)?.as_bytes())
@@ -1468,7 +2223,7 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
                 writer.write_all(b"\n").await?;
                 continue;
             }
-            IncomingMessage::Execute(req) => req,
+            IncomingMessage::Execute(req) => *req,
         };
 
         if let Err(_e) = config.validate_token(request.auth_token.as_deref()) {
@@ -1486,6 +2241,9 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
                 exit_code: None,
                 stdout: None,
                 stderr: None,
+                status: None,
+                handle: None,
+                coverage: None,
             };
             writer
                 .write_all(serde_json::to_string(&resp)?.as_bytes())
@@ -1552,7 +2310,18 @@ enum ExecOutcome {
     /// describes the OS-level error (e.g. ENOENT on the binary).
     Failed { reason: String },
     /// Policy approved, but the server intentionally did not spawn the child.
-    DryRun,
+    /// Carries gate coverage when the dry-run was routed by the consequence gate.
+    DryRun { coverage: Option<Coverage> },
+    /// Approved and routed to the operator gate; not executed. Awaits approval.
+    Held { handle: String, coverage: Coverage },
+    /// Approved and executed inside a containment envelope; auto-revert armed.
+    Provisional {
+        handle: String,
+        coverage: Coverage,
+        exit_code: Option<i32>,
+        stdout: Option<String>,
+        stderr: Option<String>,
+    },
 }
 
 struct ExecuteResult {
@@ -1606,7 +2375,54 @@ impl ExecuteResult {
             policy: PolicyOutcome::Allowed {
                 reason: reason.into(),
             },
-            exec: ExecOutcome::DryRun,
+            exec: ExecOutcome::DryRun { coverage: None },
+        }
+    }
+
+    /// A consequence-gated dry-run: reports the gate decision and its coverage
+    /// (what would be checked and what would not) without executing.
+    fn dry_run_gated(reason: impl Into<String>, coverage: Coverage) -> Self {
+        Self {
+            policy: PolicyOutcome::Allowed {
+                reason: reason.into(),
+            },
+            exec: ExecOutcome::DryRun {
+                coverage: Some(coverage),
+            },
+        }
+    }
+
+    /// Approved but held for operator approval (irreversible / uncertain /
+    /// high-risk). Not executed.
+    fn held(reason: impl Into<String>, handle: String, coverage: Coverage) -> Self {
+        Self {
+            policy: PolicyOutcome::Allowed {
+                reason: reason.into(),
+            },
+            exec: ExecOutcome::Held { handle, coverage },
+        }
+    }
+
+    /// Approved and executed inside a containment envelope.
+    fn provisional(
+        reason: impl Into<String>,
+        handle: String,
+        coverage: Coverage,
+        exit_code: Option<i32>,
+        stdout: Option<String>,
+        stderr: Option<String>,
+    ) -> Self {
+        Self {
+            policy: PolicyOutcome::Allowed {
+                reason: reason.into(),
+            },
+            exec: ExecOutcome::Provisional {
+                handle,
+                coverage,
+                exit_code,
+                stdout,
+                stderr,
+            },
         }
     }
 
@@ -1627,20 +2443,25 @@ impl ExecuteResult {
     /// audit events first should do so before consuming the result.
     fn into_response(self) -> ExecuteResponse {
         let allowed = self.policy_allowed();
+        let policy_reason = match self.policy {
+            PolicyOutcome::Allowed { reason } | PolicyOutcome::Denied { reason } => reason,
+        };
         match self.exec {
+            // Legacy arms keep status/handle/coverage = None so a gating-off
+            // response is byte-identical to today's wire format.
             ExecOutcome::Completed {
                 exit_code,
                 stdout,
                 stderr,
             } => ExecuteResponse {
                 allowed: true,
-                reason: match self.policy {
-                    PolicyOutcome::Allowed { reason } => reason,
-                    PolicyOutcome::Denied { reason } => reason,
-                },
+                reason: policy_reason,
                 exit_code,
                 stdout,
                 stderr,
+                status: None,
+                handle: None,
+                coverage: None,
             },
             ExecOutcome::Failed { reason: exec_msg } => ExecuteResponse {
                 // Even though the policy allowed it, the command could not
@@ -1653,26 +2474,58 @@ impl ExecuteResult {
                 exit_code: None,
                 stdout: None,
                 stderr: None,
+                status: None,
+                handle: None,
+                coverage: None,
             },
-            ExecOutcome::DryRun => ExecuteResponse {
+            ExecOutcome::DryRun { coverage } => ExecuteResponse {
                 allowed: true,
-                reason: match self.policy {
-                    PolicyOutcome::Allowed { reason } => reason,
-                    PolicyOutcome::Denied { reason } => reason,
-                },
+                reason: policy_reason,
                 exit_code: Some(0),
                 stdout: Some("[DRY-RUN] policy allowed; command was not executed\n".to_string()),
                 stderr: None,
+                // A gated dry-run carries its coverage and a DryRun status; a
+                // plain dry-run stays byte-identical to the pre-gating wire.
+                status: coverage.as_ref().map(|_| GateStatus::DryRun),
+                handle: None,
+                coverage,
             },
             ExecOutcome::NotAttempted => ExecuteResponse {
                 allowed,
-                reason: match self.policy {
-                    PolicyOutcome::Allowed { reason } => reason,
-                    PolicyOutcome::Denied { reason } => reason,
-                },
+                reason: policy_reason,
                 exit_code: None,
                 stdout: None,
                 stderr: None,
+                status: None,
+                handle: None,
+                coverage: None,
+            },
+            ExecOutcome::Held { handle, coverage } => ExecuteResponse {
+                // Approved but held: allowed=true (not a denial), no exit code.
+                allowed: true,
+                reason: policy_reason,
+                exit_code: None,
+                stdout: None,
+                stderr: None,
+                status: Some(GateStatus::Held),
+                handle: Some(handle),
+                coverage: Some(coverage),
+            },
+            ExecOutcome::Provisional {
+                handle,
+                coverage,
+                exit_code,
+                stdout,
+                stderr,
+            } => ExecuteResponse {
+                allowed: true,
+                reason: policy_reason,
+                exit_code,
+                stdout,
+                stderr,
+                status: Some(GateStatus::Provisional),
+                handle: Some(handle),
+                coverage: Some(coverage),
             },
         }
     }
@@ -1681,8 +2534,10 @@ impl ExecuteResult {
         match self.exec {
             ExecOutcome::Completed { .. } => SessionExecStatus::Completed,
             ExecOutcome::Failed { .. } => SessionExecStatus::Failed,
-            ExecOutcome::DryRun => SessionExecStatus::DryRun,
+            ExecOutcome::DryRun { .. } => SessionExecStatus::DryRun,
             ExecOutcome::NotAttempted => SessionExecStatus::NotAttempted,
+            ExecOutcome::Held { .. } => SessionExecStatus::Held,
+            ExecOutcome::Provisional { .. } => SessionExecStatus::Provisional,
         }
     }
 }
@@ -1737,13 +2592,56 @@ async fn execute_command_streaming<W: AsyncWrite + Unpin>(
 }
 
 async fn execute_command_inner<W: AsyncWrite + Unpin>(
-    request: ExecuteRequest,
+    mut request: ExecuteRequest,
     config: &ServerConfig,
     caller: &CallerIdentity,
     stream_output: bool,
     stream_writer: &mut W,
 ) -> ExecuteResult {
     let session_token = request.session_token.clone();
+
+    // Resolve a verb invocation into a concrete command BEFORE any validation or
+    // evaluation. The rendered binary/args then pass through the same checks as a
+    // raw command; the verb's declared consequence class and rollback drive the
+    // gate. Verbs are operator-authored, so the catalog is hot-reloaded by mtime.
+    let mut verb_ctx: Option<VerbContext> = None;
+    if let Some(invocation) = request.verb.clone() {
+        if !config.gate.is_on() {
+            let reason =
+                "verbs require consequence gating (start the daemon with --gate consequence)"
+                    .to_string();
+            let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
+            return ExecuteResult::denied(reason);
+        }
+        let rendered = {
+            let mut cat = config.verbs.write().await;
+            if let Err(e) = cat.reload_if_stale() {
+                tracing::warn!("verb catalog reload failed, using previous: {}", e);
+            }
+            cat.render(&invocation.name, &invocation.params)
+                .map(|r| (r, cat.version()))
+        };
+        match rendered {
+            Ok((r, version)) => {
+                request.binary = r.binary;
+                request.args = r.args;
+                request.revert = r.revert.map(|(binary, args)| RevertSpec { binary, args });
+                verb_ctx = Some(VerbContext {
+                    name: r.name,
+                    class: r.consequence,
+                    trusted: r.trusted,
+                    params: r.params,
+                    catalog_version: version,
+                });
+            }
+            Err(e) => {
+                let reason = format!("verb error: {}", e);
+                config.log_audit_policy(caller, &invocation.name, &[], false, &reason);
+                let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
+                return ExecuteResult::denied(reason);
+            }
+        }
+    }
 
     // Check recursion depth
     let depth: u32 = std::env::var("GUARD_DEPTH")
@@ -1980,6 +2878,53 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         None
     };
 
+    // Trusted verb: an operator-reviewed shape skips the LLM evaluator (a
+    // deterministic allow path, like a static-policy allow). The verb's declared
+    // reversibility class drives the gate and its revert is pre-authorized.
+    if let Some(vc) = verb_ctx.clone() {
+        if vc.trusted {
+            let reason = format!("trusted verb '{}'", vc.name);
+            config.log_audit_policy(caller, &request.binary, &request.args, true, &reason);
+            if let Err(e) = write_policy_decision(stream_output, stream_writer, true, &reason).await
+            {
+                return ExecuteResult::exec_failed(reason, format!("client stream error: {}", e));
+            }
+            let inputs = GateInputs {
+                reason: reason.clone(),
+                risk: Some(0),
+                reversibility: Some(vc.class),
+                revert_preauthorized: true,
+                verb: Some(vc),
+                bypass: false,
+            };
+            let result = route_gated_allow(
+                request,
+                config,
+                caller,
+                inputs,
+                depth,
+                stream_output,
+                stream_writer,
+            )
+            .await;
+            record_live_session_interaction(
+                config,
+                session_token.as_deref(),
+                SessionInteraction {
+                    at_unix: 0,
+                    command: command_line.clone(),
+                    allowed: true,
+                    source: SessionDecisionSource::StaticPolicy,
+                    reason,
+                    risk: Some(0),
+                    exec_status: result.session_exec_status(),
+                },
+            )
+            .await;
+            return result;
+        }
+    }
+
     let eval_result = config
         .evaluator
         .evaluate_with_context(&command_line, session_prompt.as_deref())
@@ -2034,6 +2979,7 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
             reason,
             source,
             risk,
+            reversibility,
         } => {
             tracing::debug!("command allowed: {}", reason);
             config.log_audit_policy(caller, &request.binary, &request.args, true, &reason);
@@ -2041,11 +2987,31 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
             {
                 return ExecuteResult::exec_failed(reason, format!("client stream error: {}", e));
             }
-            let result = exec_after_approval(
+            // Consequence gate: when enabled, route this LLM-approved command by
+            // reversibility (execute / contain / hold). When off, this is a
+            // straight exec, byte-identical to before. Operator-authored allows
+            // (session-allow above, static-policy) deliberately bypass the gate.
+            // A verb's declared class overrides the model's, and a verb's revert
+            // is pre-authorized (operator-reviewed); a free-form --revert is not.
+            let effective_class = verb_ctx.as_ref().map(|v| v.class).or(reversibility);
+            // A static-policy allow (operator-authored, deterministic) bypasses
+            // the gate. A verb invocation never bypasses — its declared class
+            // routes it. The LLM path is gated.
+            let bypass =
+                matches!(source, crate::evaluate::EvalSource::StaticPolicy) && verb_ctx.is_none();
+            let inputs = GateInputs {
+                reason: reason.clone(),
+                risk,
+                reversibility: effective_class,
+                revert_preauthorized: verb_ctx.is_some(),
+                verb: verb_ctx.clone(),
+                bypass,
+            };
+            let result = route_gated_allow(
                 request,
                 config,
                 caller,
-                reason.clone(),
+                inputs,
                 depth,
                 stream_output,
                 stream_writer,
@@ -2211,7 +3177,13 @@ async fn exec_after_approval<W: AsyncWrite + Unpin>(
             request.args,
             caller
         );
-        return ExecuteResult::dry_run(allow_reason);
+        // Under gating, even the execute-now (reversible) path reports honest
+        // coverage; off-gate keeps the legacy byte-identical dry-run.
+        return if config.gate.is_on() {
+            ExecuteResult::dry_run_gated(allow_reason, Coverage::dry_run())
+        } else {
+            ExecuteResult::dry_run(allow_reason)
+        };
     }
 
     let user_key = caller.user_key();
@@ -2443,6 +3415,665 @@ async fn exec_after_approval<W: AsyncWrite + Unpin>(
     };
 
     ExecuteResult::completed(allow_reason, output.status.code(), stdout, stderr)
+}
+
+// ===========================================================================
+// Consequence gating: routing of LLM-approved commands by reversibility.
+// ===========================================================================
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Mint an unguessable handle for a provisional/approval, using the same
+/// entropy source as session tokens (128 bits hex).
+fn new_handle() -> String {
+    use rand::Rng;
+    let mut bytes = [0u8; 16];
+    rand::rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Rebuild a caller identity from a stored uid so deferred execution (sweeper
+/// revert, operator approve) runs under the original caller's identity rather
+/// than silently as the daemon. A `None` uid means the daemon executes as its
+/// own identity (non-exec-as-caller deployments).
+fn reconstruct_caller(caller_uid: Option<u32>, fallback: &CallerIdentity) -> CallerIdentity {
+    match caller_uid {
+        Some(uid) => CallerIdentity::Unix { uid },
+        None => fallback.clone(),
+    }
+}
+
+/// Reject a binary name that is a path, traversal, or contains shell-metachar
+/// noise — the same invariants `execute_command_inner` enforces for the primary
+/// binary, applied to a revert command before it is armed.
+fn invalid_binary_reason(binary: &str) -> Option<String> {
+    if binary.contains('/')
+        || binary.contains('\\')
+        || binary.contains(':')
+        || binary.contains("..")
+        || binary.contains('\0')
+        || binary.is_empty()
+        || binary.contains(char::is_whitespace)
+    {
+        Some(format!("invalid revert binary name: '{}'", binary))
+    } else {
+        None
+    }
+}
+
+/// True when a new hold/provisional would exceed the per-caller or global cap.
+/// Counts outstanding rows across both registries (a local-DoS guard).
+async fn gate_capacity_reason(config: &ServerConfig, caller_uid: Option<u32>) -> Option<String> {
+    let (prov_global, prov_caller) = {
+        let reg = config.provisional.read().await;
+        (reg.outstanding(), reg.outstanding_for(caller_uid))
+    };
+    let (appr_global, appr_caller) = {
+        let reg = config.approvals.read().await;
+        (reg.outstanding(), reg.outstanding_for(caller_uid))
+    };
+    let global = prov_global + appr_global;
+    let per_caller = prov_caller + appr_caller;
+    if per_caller >= MAX_PENDING_PER_CALLER {
+        return Some(format!(
+            "too many outstanding gated actions for this caller ({}); confirm, approve, or let some expire first",
+            per_caller
+        ));
+    }
+    if global >= MAX_PENDING_GLOBAL {
+        return Some(format!(
+            "too many outstanding gated actions on this daemon ({}); the operator must clear the queue",
+            global
+        ));
+    }
+    None
+}
+
+async fn persist_provisional(config: &ServerConfig, p: &Provisional) {
+    if let Some(store) = &config.session_store {
+        if let Err(e) = store.save_provisional(p.clone()).await {
+            tracing::warn!("failed to persist provisional {}: {}", p.handle, e);
+        }
+    }
+}
+
+async fn delete_provisional_row(config: &ServerConfig, handle: &str) {
+    if let Some(store) = &config.session_store {
+        if let Err(e) = store.delete_provisional(handle.to_string()).await {
+            tracing::warn!("failed to delete provisional {}: {}", handle, e);
+        }
+    }
+}
+
+async fn persist_approval(config: &ServerConfig, a: &Approval) {
+    if let Some(store) = &config.session_store {
+        if let Err(e) = store.save_approval(a.clone()).await {
+            tracing::warn!("failed to persist approval {}: {}", a.handle, e);
+        }
+    }
+}
+
+/// Evaluate a free-form `--revert` command at arm time. It must pass binary-name
+/// validation and be APPROVED by the evaluator; otherwise the whole containment
+/// request is denied (a revert is a consequential action and is gated as one).
+async fn evaluate_revert(config: &ServerConfig, revert: &RevertSpec) -> Result<(), String> {
+    if let Some(reason) = invalid_binary_reason(&revert.binary) {
+        return Err(reason);
+    }
+    let command_line = if revert.args.is_empty() {
+        revert.binary.clone()
+    } else {
+        format!("{} {}", revert.binary, revert.args.join(" "))
+    };
+    match config.evaluator.evaluate(&command_line).await {
+        crate::evaluate::EvalResult::Allow { .. } => Ok(()),
+        crate::evaluate::EvalResult::Deny { reason, .. } => Err(format!(
+            "rollback command '{}' was denied by policy: {}",
+            command_line, reason
+        )),
+        crate::evaluate::EvalResult::Error(e) => Err(format!(
+            "could not evaluate rollback command '{}': {}",
+            command_line, e
+        )),
+    }
+}
+
+/// Bundled inputs for consequence-gate routing.
+struct GateInputs {
+    reason: String,
+    risk: Option<i32>,
+    reversibility: Option<Reversibility>,
+    /// True when the revert is operator-authored (a verb's `revert`), so it is
+    /// not re-evaluated at arm time. A free-form `--revert` is always evaluated.
+    revert_preauthorized: bool,
+    /// Verb context when this command came from the catalog (pins the approval
+    /// snapshot to the verb name + params + catalog version).
+    verb: Option<VerbContext>,
+    /// When true the command bypasses the gate and executes immediately. Set for
+    /// operator-authored deterministic allows (static policy), already vetted and
+    /// carrying no reversibility class.
+    bypass: bool,
+}
+
+/// Route an approved command through the consequence gate.
+async fn route_gated_allow<W: AsyncWrite + Unpin>(
+    request: ExecuteRequest,
+    config: &ServerConfig,
+    caller: &CallerIdentity,
+    inputs: GateInputs,
+    depth: u32,
+    stream_output: bool,
+    stream_writer: &mut W,
+) -> ExecuteResult {
+    // Gating off, or an operator-authored static-policy allow: execute directly.
+    if !config.gate.is_on() || inputs.bypass {
+        return exec_after_approval(
+            request,
+            config,
+            caller,
+            inputs.reason,
+            depth,
+            stream_output,
+            stream_writer,
+        )
+        .await;
+    }
+
+    let caller_uid = match caller {
+        CallerIdentity::Unix { uid } => Some(*uid),
+        _ => None,
+    };
+    let force_hold = request.require_approval.unwrap_or(false);
+    let revert_available = request.revert.is_some();
+    let outcome = decide_gate(
+        inputs.reversibility,
+        inputs.risk,
+        revert_available,
+        force_hold,
+    );
+
+    match outcome {
+        GateOutcome::ExecuteNow => {
+            exec_after_approval(
+                request,
+                config,
+                caller,
+                inputs.reason,
+                depth,
+                stream_output,
+                stream_writer,
+            )
+            .await
+        }
+        GateOutcome::Contain => {
+            arm_containment(
+                request,
+                config,
+                caller,
+                caller_uid,
+                inputs.reason,
+                inputs.revert_preauthorized,
+                depth,
+                stream_output,
+                stream_writer,
+            )
+            .await
+        }
+        GateOutcome::Hold => {
+            hold_for_approval(
+                request,
+                config,
+                caller,
+                caller_uid,
+                inputs.reason,
+                inputs.risk,
+                inputs.reversibility,
+                inputs.verb,
+                stream_output,
+                stream_writer,
+            )
+            .await
+        }
+    }
+}
+
+/// Arm a containment envelope: persist the provisional, run the forward command,
+/// then mark it armed with an auto-revert deadline.
+#[allow(clippy::too_many_arguments)]
+async fn arm_containment<W: AsyncWrite + Unpin>(
+    request: ExecuteRequest,
+    config: &ServerConfig,
+    caller: &CallerIdentity,
+    caller_uid: Option<u32>,
+    reason: String,
+    revert_preauthorized: bool,
+    depth: u32,
+    stream_output: bool,
+    stream_writer: &mut W,
+) -> ExecuteResult {
+    // decide_gate only returns Contain when a revert is present.
+    let revert = match request.revert.clone() {
+        Some(r) => r,
+        None => return ExecuteResult::held(reason, new_handle(), Coverage::hold()),
+    };
+
+    if config.dry_run {
+        return ExecuteResult::dry_run_gated(
+            format!(
+                "{} [GATE] would execute inside a containment envelope (auto-revert: {} {})",
+                reason,
+                revert.binary,
+                revert.args.join(" ")
+            ),
+            Coverage::contain(),
+        );
+    }
+
+    // The rollback is itself a consequential action. A free-form `--revert` is
+    // evaluated here and the request is denied if it would be denied. An
+    // operator-authored verb revert is already reviewed (the slow clock), so it
+    // is pre-authorized.
+    if !revert_preauthorized {
+        if let Err(why) = evaluate_revert(config, &revert).await {
+            return ExecuteResult::denied(why);
+        }
+    }
+    if let Some(why) = gate_capacity_reason(config, caller_uid).await {
+        return ExecuteResult::denied(why);
+    }
+
+    let handle = new_handle();
+    let now = now_unix();
+    // The window is caller-supplied, so cap it: a contained change always
+    // auto-reverts within MAX_CONFIRM_WITHIN_SECS even if the caller asks for
+    // longer. The caller can still shorten it.
+    let window = request
+        .confirm_within_secs
+        .unwrap_or(DEFAULT_CONFIRM_WITHIN_SECS)
+        .clamp(1, MAX_CONFIRM_WITHIN_SECS);
+    let provisional = Provisional {
+        handle: handle.clone(),
+        caller_uid,
+        binary: request.binary.clone(),
+        args: request.args.clone(),
+        revert_binary: revert.binary.clone(),
+        revert_args: revert.args.clone(),
+        reason: reason.clone(),
+        created_unix: now,
+        deadline_unix: now.saturating_add(window),
+        forward_done: false,
+        status: ProvisionalStatus::Armed,
+        revert_exit: None,
+        revert_detail: None,
+    };
+
+    // Commit BEFORE exec so a crash between exec and arm still leaves a
+    // recoverable revert (startup recovery routes it to needs_operator_decision).
+    persist_provisional(config, &provisional).await;
+    config.provisional.write().await.insert(provisional.clone());
+
+    let result = exec_after_approval(
+        request,
+        config,
+        caller,
+        reason.clone(),
+        depth,
+        stream_output,
+        stream_writer,
+    )
+    .await;
+
+    match result.exec {
+        ExecOutcome::Completed {
+            exit_code,
+            stdout,
+            stderr,
+        } => {
+            let updated = {
+                let mut reg = config.provisional.write().await;
+                reg.mark_forward_done(&handle, exit_code);
+                reg.get(&handle).cloned()
+            };
+            if let Some(u) = updated {
+                persist_provisional(config, &u).await;
+            }
+            tracing::info!(
+                "[AUDIT] PROVISIONAL handle={} caller={} deadline={} window={}s revert=\"{} {}\"",
+                handle,
+                caller,
+                now.saturating_add(window),
+                window,
+                revert.binary,
+                revert.args.join(" ")
+            );
+            ExecuteResult::provisional(
+                reason,
+                handle,
+                Coverage::contain(),
+                exit_code,
+                stdout,
+                stderr,
+            )
+        }
+        _ => {
+            // Forward command failed: there is nothing to revert. Drop the
+            // provisional and return the failure as-is.
+            config.provisional.write().await.remove(&handle);
+            delete_provisional_row(config, &handle).await;
+            result
+        }
+    }
+}
+
+/// Hold an irreversible/uncertain/high-risk command for operator approval.
+#[allow(clippy::too_many_arguments)]
+async fn hold_for_approval<W: AsyncWrite + Unpin>(
+    request: ExecuteRequest,
+    config: &ServerConfig,
+    caller: &CallerIdentity,
+    caller_uid: Option<u32>,
+    reason: String,
+    risk: Option<i32>,
+    reversibility: Option<Reversibility>,
+    verb: Option<VerbContext>,
+    stream_output: bool,
+    stream_writer: &mut W,
+) -> ExecuteResult {
+    if config.dry_run {
+        return ExecuteResult::dry_run_gated(
+            format!(
+                "{} [GATE] would be held for operator approval (irreversible/uncertain)",
+                reason
+            ),
+            Coverage::hold(),
+        );
+    }
+    if let Some(why) = gate_capacity_reason(config, caller_uid).await {
+        return ExecuteResult::denied(why);
+    }
+
+    let handle = new_handle();
+    let now = now_unix();
+    let snapshot = ApprovalSnapshot {
+        binary: request.binary.clone(),
+        args: request.args.clone(),
+        env: request
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        secret_keys: request
+            .secrets
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        verb_name: verb.as_ref().map(|v| v.name.clone()),
+        verb_params: verb.as_ref().map(|v| v.params.clone()).unwrap_or_default(),
+        catalog_version: verb.as_ref().map(|v| v.catalog_version),
+        caller_uid,
+    };
+    let approval = Approval {
+        handle: handle.clone(),
+        snapshot,
+        reason: reason.clone(),
+        risk,
+        reversibility,
+        created_unix: now,
+        ttl_secs: APPROVAL_TTL_SECS,
+        status: ApprovalStatus::Pending,
+        decided_unix: None,
+        decided_reason: None,
+        result_exit: None,
+        result_stdout: None,
+        result_stderr: None,
+    };
+
+    let notify = config.approvals.write().await.enqueue(approval.clone());
+    persist_approval(config, &approval).await;
+    tracing::info!(
+        "[AUDIT] HELD handle={} caller={} risk={:?} class={:?} cmd=\"{} {}\" ttl={}s",
+        handle,
+        caller,
+        risk,
+        reversibility.map(|r| r.as_str()),
+        request.binary,
+        request.args.join(" "),
+        APPROVAL_TTL_SECS
+    );
+
+    match request.wait_approval_secs {
+        Some(wait) => {
+            wait_for_decision(config, &handle, notify, wait, stream_output, stream_writer).await
+        }
+        None => ExecuteResult::held(reason, handle, Coverage::hold()),
+    }
+}
+
+/// Block (up to `wait_secs`) for an operator decision on a held command,
+/// emitting keepalives on the streaming path so the connection stays open, then
+/// return the real outcome. On timeout the command stays held.
+async fn wait_for_decision<W: AsyncWrite + Unpin>(
+    config: &ServerConfig,
+    handle: &str,
+    notify: std::sync::Arc<tokio::sync::Notify>,
+    wait_secs: u64,
+    stream_output: bool,
+    stream_writer: &mut W,
+) -> ExecuteResult {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
+    let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(1));
+    loop {
+        // Check current status first so a decision that landed before we parked
+        // is not missed.
+        if let Some(a) = config.approvals.read().await.get(handle).cloned() {
+            if a.status.is_decided() {
+                return approval_to_result(&a);
+            }
+        } else {
+            return ExecuteResult::denied("held command disappeared from the queue");
+        }
+
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            // Still pending at timeout: stays held.
+            return ExecuteResult::held(
+                "still awaiting operator approval".to_string(),
+                handle.to_string(),
+                Coverage::hold(),
+            );
+        }
+
+        tokio::select! {
+            _ = notify.notified() => { /* re-check status at loop top */ }
+            _ = tokio::time::sleep(remaining) => { /* timeout: re-check, then held */ }
+            _ = keepalive.tick(), if stream_output => {
+                let _ = write_stream_message(stream_writer, &ExecuteStreamMessage::Keepalive).await;
+            }
+        }
+    }
+}
+
+/// Build the client-facing result from a decided approval record.
+fn approval_to_result(a: &Approval) -> ExecuteResult {
+    match a.status {
+        ApprovalStatus::Approved => ExecuteResult::completed(
+            a.reason.clone(),
+            a.result_exit,
+            a.result_stdout.clone(),
+            a.result_stderr.clone(),
+        ),
+        ApprovalStatus::Denied => ExecuteResult::denied(
+            a.decided_reason
+                .clone()
+                .unwrap_or_else(|| "operator denied this command".to_string()),
+        ),
+        ApprovalStatus::Expired => {
+            ExecuteResult::denied("expired without operator approval (fail-closed)")
+        }
+        ApprovalStatus::ExecFailed => ExecuteResult::exec_failed(
+            a.reason.clone(),
+            a.decided_reason
+                .clone()
+                .unwrap_or_else(|| "approved command failed to execute".to_string()),
+        ),
+        ApprovalStatus::Pending | ApprovalStatus::Approving => {
+            ExecuteResult::held(a.reason.clone(), a.handle.clone(), Coverage::hold())
+        }
+    }
+}
+
+/// Execute an approved snapshot verbatim under the original caller's identity,
+/// with no client stream. Used by `guard approve`.
+async fn execute_snapshot(
+    config: &ServerConfig,
+    snapshot: &ApprovalSnapshot,
+    reason: &str,
+) -> ExecuteResult {
+    let caller = reconstruct_caller(snapshot.caller_uid, &CallerIdentity::Unknown);
+    let request = ExecuteRequest {
+        binary: snapshot.binary.clone(),
+        args: snapshot.args.clone(),
+        auth_token: None,
+        env: snapshot
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        secrets: snapshot
+            .secret_keys
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        stream: false,
+        session_token: None,
+        revert: None,
+        confirm_within_secs: None,
+        require_approval: None,
+        wait_approval_secs: None,
+        verb: None,
+    };
+    let mut sink = tokio::io::sink();
+    exec_after_approval(
+        request,
+        config,
+        &caller,
+        reason.to_string(),
+        0,
+        false,
+        &mut sink,
+    )
+    .await
+}
+
+/// The single background task that drives time-based gate transitions: fires due
+/// auto-reverts (after a startup grace so it can never race startup recovery) and
+/// expires unattended holds (fail-closed). Runs only when gating is enabled.
+async fn gating_sweeper(config: ServerConfig) {
+    // Startup recovery has already run synchronously; this grace is belt-and-
+    // suspenders so no revert can fire in the first window after boot. The
+    // default is operator-overridable (and test harnesses shorten it) but is
+    // floored so it can never race startup recovery.
+    let grace = std::env::var("GUARD_SWEEPER_GRACE_SECS")
+        .or_else(|_| std::env::var("SSH_GUARD_SWEEPER_GRACE_SECS"))
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|v| v.max(1))
+        .unwrap_or(SWEEPER_GRACE_SECS);
+    tokio::time::sleep(std::time::Duration::from_secs(grace)).await;
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(SWEEPER_TICK_SECS));
+    loop {
+        tick.tick().await;
+        let now = now_unix();
+
+        // Expire unattended holds FIRST (fail-closed deny on a timer). Doing this
+        // before the reverts guarantees the fail-closed promise is met every tick
+        // even if a revert is slow.
+        let expired = { config.approvals.write().await.expire_due(now) };
+        for h in &expired {
+            let row = config.approvals.read().await.get(h).cloned();
+            if let Some(a) = row {
+                persist_approval(&config, &a).await;
+                tracing::warn!("[AUDIT] APPROVAL_EXPIRED handle={} (fail-closed deny)", h);
+            }
+        }
+
+        // Due auto-reverts. take_due transitions each to Reverting; persist that
+        // before running so a crash mid-revert recovers to needs_operator_decision.
+        // Each revert is bounded by a wall-clock timeout (a timeout is recorded as
+        // RevertFailed and stays queryable), and reverts are dispatched as
+        // independent tasks so a burst of slow rollbacks cannot serialize and push
+        // out the next tick's fail-closed expiry sweep.
+        let due = { config.provisional.write().await.take_due(now) };
+        for p in due {
+            persist_provisional(&config, &p).await;
+            let cfg = config.clone();
+            tokio::spawn(async move {
+                let _ = finish_revert(&cfg, &p, &CallerIdentity::Unknown, "auto").await;
+            });
+        }
+
+        // Bound the tables: drop terminal rows past the retention window.
+        let pruned_p = {
+            config
+                .provisional
+                .write()
+                .await
+                .prune_terminal(now, GATING_RETENTION_SECS)
+        };
+        for h in pruned_p {
+            delete_provisional_row(&config, &h).await;
+        }
+        let pruned_a = {
+            config
+                .approvals
+                .write()
+                .await
+                .prune_decided(now, GATING_RETENTION_SECS)
+        };
+        for h in pruned_a {
+            if let Some(store) = &config.session_store {
+                if let Err(e) = store.delete_approval(h.clone()).await {
+                    tracing::warn!("failed to delete pruned approval {}: {}", h, e);
+                }
+            }
+        }
+    }
+}
+
+/// Run the revert for a provisional under the original caller's identity, with no
+/// client stream. Used by the sweeper and `guard revert`.
+async fn run_provisional_revert(config: &ServerConfig, p: &Provisional) -> ExecuteResult {
+    let caller = reconstruct_caller(p.caller_uid, &CallerIdentity::Unknown);
+    let request = ExecuteRequest {
+        binary: p.revert_binary.clone(),
+        args: p.revert_args.clone(),
+        auth_token: None,
+        env: HashMap::new(),
+        secrets: HashMap::new(),
+        stream: false,
+        session_token: None,
+        revert: None,
+        confirm_within_secs: None,
+        require_approval: None,
+        wait_approval_secs: None,
+        verb: None,
+    };
+    let mut sink = tokio::io::sink();
+    exec_after_approval(
+        request,
+        config,
+        &caller,
+        format!("auto-revert of provisional {}", p.handle),
+        0,
+        false,
+        &mut sink,
+    )
+    .await
 }
 
 /// Read the daemon's effective UID without pulling in libc as a direct
@@ -2903,6 +4534,12 @@ pub struct Client {
     tcp_port: Option<u16>,
     auth_token: Option<String>,
     session_token: Option<String>,
+    /// Consequence-gating options carried onto each `guard run` request.
+    revert: Option<RevertSpec>,
+    confirm_within_secs: Option<u64>,
+    require_approval: bool,
+    wait_approval_secs: Option<u64>,
+    verb: Option<VerbInvocation>,
 }
 
 impl Client {
@@ -2912,7 +4549,18 @@ impl Client {
             tcp_port,
             auth_token: None,
             session_token: None,
+            revert: None,
+            confirm_within_secs: None,
+            require_approval: false,
+            wait_approval_secs: None,
+            verb: None,
         }
+    }
+
+    /// Invoke a catalog verb instead of a raw binary.
+    pub fn with_verb(mut self, verb: VerbInvocation) -> Self {
+        self.verb = Some(verb);
+        self
     }
 
     pub fn with_auth(mut self, token: String) -> Self {
@@ -2922,6 +4570,22 @@ impl Client {
 
     pub fn with_session(mut self, session_token: String) -> Self {
         self.session_token = Some(session_token);
+        self
+    }
+
+    /// Attach consequence-gating options for `guard run` (rollback command,
+    /// auto-revert window, force-approval, and a blocking wait-for-approval).
+    pub fn with_gating(
+        mut self,
+        revert: Option<RevertSpec>,
+        confirm_within_secs: Option<u64>,
+        require_approval: bool,
+        wait_approval_secs: Option<u64>,
+    ) -> Self {
+        self.revert = revert;
+        self.confirm_within_secs = confirm_within_secs;
+        self.require_approval = require_approval;
+        self.wait_approval_secs = wait_approval_secs;
         self
     }
 
@@ -2938,6 +4602,14 @@ impl Client {
             AdminRequest::SecretListDetailed => "secret_list_detailed",
             AdminRequest::Status => "status",
             AdminRequest::Ping => "ping",
+            AdminRequest::Confirm { .. } => "confirm",
+            AdminRequest::Revert { .. } => "revert",
+            AdminRequest::Provisionals => "provisionals",
+            AdminRequest::Approve { .. } => "approve",
+            AdminRequest::Deny { .. } => "deny",
+            AdminRequest::ApprovalList => "approval_list",
+            AdminRequest::ApprovalShow { .. } => "approval_show",
+            AdminRequest::VerbList => "verb_list",
         };
         let envelope = IncomingMessage::Admin { admin: request };
         let line = serde_json::to_string(&envelope)?;
@@ -3086,6 +4758,15 @@ impl Client {
             secrets,
             stream,
             session_token: self.session_token.clone(),
+            revert: self.revert.clone(),
+            confirm_within_secs: self.confirm_within_secs,
+            require_approval: if self.require_approval {
+                Some(true)
+            } else {
+                None
+            },
+            wait_approval_secs: self.wait_approval_secs,
+            verb: self.verb.clone(),
         }
     }
 
@@ -3507,6 +5188,11 @@ mod tests {
             secrets: HashMap::from([("API_TOKEN".to_string(), "api/token".to_string())]),
             stream: false,
             session_token: None,
+            revert: None,
+            confirm_within_secs: None,
+            require_approval: None,
+            wait_approval_secs: None,
+            verb: None,
         };
 
         let err = validate_request_injections(
@@ -3535,6 +5221,11 @@ mod tests {
             )]),
             stream: false,
             session_token: None,
+            revert: None,
+            confirm_within_secs: None,
+            require_approval: None,
+            wait_approval_secs: None,
+            verb: None,
         };
 
         let result = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
@@ -3560,6 +5251,11 @@ mod tests {
             )]),
             stream: false,
             session_token: None,
+            revert: None,
+            confirm_within_secs: None,
+            require_approval: None,
+            wait_approval_secs: None,
+            verb: None,
         };
 
         let result = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
@@ -3853,6 +5549,11 @@ mod tests {
             secrets: secrets_map,
             stream: false,
             session_token: None,
+            revert: None,
+            confirm_within_secs: None,
+            require_approval: None,
+            wait_approval_secs: None,
+            verb: None,
         };
 
         let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 30_001 }).await;
