@@ -1,4 +1,5 @@
 use crate::gating::{GateMode, Reversibility};
+use crate::learned_rules::{AutoShimMode, LearnedRuleStore, LearningOutcome};
 use crate::policy::{PolicyEngine, PolicyMode};
 use anyhow::{bail, Context, Result};
 use regex::Regex;
@@ -6,7 +7,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
@@ -83,13 +84,13 @@ impl CachedResult {
                 reversibility,
             } => EvalResult::Allow {
                 reason,
-                source: EvalSource::Llm,
+                source: EvalSource::Cache,
                 risk,
                 reversibility,
             },
             CachedResult::Deny { reason, risk } => EvalResult::Deny {
                 reason,
-                source: EvalSource::Llm,
+                source: EvalSource::Cache,
                 risk,
             },
         }
@@ -229,6 +230,8 @@ pub struct EvalConfig {
     /// reversibility class on every approval. Fixed for the evaluator's
     /// lifetime (the daemon recreates the evaluator if the prompt changes).
     pub gate_mode: GateMode,
+    /// Optional learned static allow overlay. Misses fall through to LLM.
+    pub learned_rules: Option<Arc<RwLock<LearnedRuleStore>>>,
 }
 
 impl Default for EvalConfig {
@@ -243,6 +246,7 @@ impl Default for EvalConfig {
             cache_capacity: DEFAULT_CACHE_CAPACITY,
             cache_ttl: Duration::from_secs(DEFAULT_CACHE_TTL_SECS),
             gate_mode: GateMode::Off,
+            learned_rules: None,
         }
     }
 }
@@ -322,6 +326,11 @@ impl EvalConfig {
         self.gate_mode = mode;
         self
     }
+
+    pub fn learned_rules(mut self, store: Arc<RwLock<LearnedRuleStore>>) -> Self {
+        self.learned_rules = Some(store);
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -358,6 +367,8 @@ pub enum EvalResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvalSource {
     StaticPolicy,
+    LearnedRule,
+    Cache,
     Llm,
 }
 
@@ -481,6 +492,7 @@ pub struct Evaluator {
     cache: Option<RwLock<EvalCache>>,
     mode: Option<PolicyMode>,
     gate_mode: GateMode,
+    learned_rules: Option<Arc<RwLock<LearnedRuleStore>>>,
 }
 
 impl Evaluator {
@@ -584,6 +596,7 @@ impl Evaluator {
             cache,
             mode: config.mode,
             gate_mode: config.gate_mode,
+            learned_rules: config.learned_rules,
         })
     }
 
@@ -612,6 +625,39 @@ impl Evaluator {
             Some(c) => c.read().await.len(),
             None => 0,
         }
+    }
+
+    pub fn learning_enabled(&self) -> bool {
+        self.learned_rules.is_some()
+    }
+
+    pub async fn learned_rule_count(&self) -> usize {
+        match &self.learned_rules {
+            Some(store) => store.read().await.rule_count(),
+            None => 0,
+        }
+    }
+
+    pub async fn learned_auto_shim_mode(&self) -> Option<AutoShimMode> {
+        match &self.learned_rules {
+            Some(store) => Some(store.read().await.auto_shim()),
+            None => None,
+        }
+    }
+
+    pub async fn record_learned_approval(
+        &self,
+        binary: &str,
+        args: &[String],
+        command: &str,
+        risk: Option<i32>,
+        reason: &str,
+    ) -> Result<Option<LearningOutcome>> {
+        let Some(store) = &self.learned_rules else {
+            return Ok(None);
+        };
+        let mut guard = store.write().await;
+        guard.record_approval(binary, args, command, risk, reason)
     }
 
     pub fn has_static_policy(&self) -> bool {
@@ -702,6 +748,8 @@ impl Evaluator {
         command: &str,
         prompt_append: Option<&str>,
     ) -> EvalResult {
+        let session_prompt_active = prompt_append.map(|s| !s.trim().is_empty()).unwrap_or(false);
+
         // Only apply static policy if the engine has explicit rules.
         // Empty engines (from modes without a policy file) should not block anything
         // since they'd just default-deny everything before the LLM gets a chance.
@@ -719,10 +767,34 @@ impl Evaluator {
             }
         }
 
-        if self.llm_config.enabled {
-            let session_prompt_active =
-                prompt_append.map(|s| !s.trim().is_empty()).unwrap_or(false);
+        if !session_prompt_active {
+            if let Some(ref learned_rules) = self.learned_rules {
+                let hit = {
+                    let guard = learned_rules.read().await;
+                    guard.check(command)
+                };
+                if let Some(hit) = hit {
+                    let mut reason = format!(
+                        "learned static rule: matched `{}` for service `{}`",
+                        hit.matched_pattern, hit.service
+                    );
+                    if let Some(shim) = hit.shim {
+                        reason.push_str(&format!(
+                            "; prefer shim `{}` for shorter future calls",
+                            shim.name
+                        ));
+                    }
+                    return EvalResult::Allow {
+                        reason,
+                        source: EvalSource::LearnedRule,
+                        risk: None,
+                        reversibility: None,
+                    };
+                }
+            }
+        }
 
+        if self.llm_config.enabled {
             // Cache lookup happens on the LLM path only, and only when no
             // session-specific prompt is in play. Session prompts change
             // the decision surface, so they bypass the cache to avoid
@@ -1573,6 +1645,40 @@ mod tests {
             cache.read().await.is_empty(),
             "session-prompted call must not seed the cache"
         );
+    }
+
+    #[tokio::test]
+    async fn learned_rule_allow_bypasses_missing_llm_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = LearnedRuleStore::load(crate::learned_rules::LearningConfig {
+            path: temp.path().join("learned.yaml"),
+            min_approvals: 1,
+            max_risk: 2,
+            auto_shim: AutoShimMode::Suggest,
+        })
+        .unwrap();
+        store
+            .record_approval(
+                "opnsense-api",
+                &["status".to_string()],
+                "opnsense-api status",
+                Some(1),
+                "safe status lookup",
+            )
+            .unwrap();
+
+        let evaluator =
+            Evaluator::new(EvalConfig::default().learned_rules(Arc::new(RwLock::new(store))))
+                .unwrap();
+
+        let result = evaluator.evaluate("opnsense-api status").await;
+        match result {
+            EvalResult::Allow { source, reason, .. } => {
+                assert_eq!(source, EvalSource::LearnedRule);
+                assert!(reason.contains("learned static rule"));
+            }
+            other => panic!("expected learned allow, got {other:?}"),
+        }
     }
 
     #[test]

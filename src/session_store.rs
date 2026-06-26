@@ -1,6 +1,6 @@
 use crate::session::{
-    HistoricalGrant, HistoricalStatus, SessionDecisionSource, SessionExecStatus, SessionGrant,
-    SessionInteraction, SessionRegistry,
+    HistoricalGrant, HistoricalStatus, SessionDecisionSource, SessionExactRule, SessionExecStatus,
+    SessionGrant, SessionInteraction, SessionRegistry,
 };
 use anyhow::{Context, Result};
 use guard::gating::approval::Approval;
@@ -65,21 +65,27 @@ impl SessionStore {
         let mut grants = HashMap::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT token, allow_json, deny_json, expires_at, prompt_append, granted_at
+                "SELECT token, allow_json, deny_json, allow_exact_json, deny_exact_json, expires_at, prompt_append, granted_at, static_only, auto_amend
                  FROM session_grants",
             )?;
             let rows = stmt.query_map([], |row| {
                 let token: String = row.get(0)?;
                 let allow_json: String = row.get(1)?;
                 let deny_json: String = row.get(2)?;
+                let allow_exact_json: String = row.get(3)?;
+                let deny_exact_json: String = row.get(4)?;
                 Ok((
                     token,
                     SessionGrant {
                         allow: decode_vec(&allow_json)?,
                         deny: decode_vec(&deny_json)?,
-                        expires_at: decode_optional_u64(row.get(3)?)?,
-                        prompt_append: row.get(4)?,
-                        granted_at: decode_u64(row.get(5)?)?,
+                        allow_exact: decode_exact_vec(&allow_exact_json)?,
+                        deny_exact: decode_exact_vec(&deny_exact_json)?,
+                        expires_at: decode_optional_u64(row.get(5)?)?,
+                        prompt_append: row.get(6)?,
+                        granted_at: decode_u64(row.get(7)?)?,
+                        static_only: decode_bool(row.get(8)?)?,
+                        auto_amend: decode_bool(row.get(9)?)?,
                     },
                 ))
             })?;
@@ -92,23 +98,29 @@ impl SessionStore {
         let mut history = Vec::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT token, allow_json, deny_json, granted_at, expires_at, ended_at, status, prompt_append
+                "SELECT token, allow_json, deny_json, allow_exact_json, deny_exact_json, granted_at, expires_at, ended_at, status, prompt_append, static_only, auto_amend
                  FROM session_history
                  ORDER BY ended_at ASC, id ASC",
             )?;
             let rows = stmt.query_map([], |row| {
                 let allow_json: String = row.get(1)?;
                 let deny_json: String = row.get(2)?;
-                let status: String = row.get(6)?;
+                let allow_exact_json: String = row.get(3)?;
+                let deny_exact_json: String = row.get(4)?;
+                let status: String = row.get(8)?;
                 Ok(HistoricalGrant {
                     token: row.get(0)?,
                     allow: decode_vec(&allow_json)?,
                     deny: decode_vec(&deny_json)?,
-                    granted_at: decode_u64(row.get(3)?)?,
-                    expires_at: decode_optional_u64(row.get(4)?)?,
-                    ended_at: decode_u64(row.get(5)?)?,
+                    allow_exact: decode_exact_vec(&allow_exact_json)?,
+                    deny_exact: decode_exact_vec(&deny_exact_json)?,
+                    granted_at: decode_u64(row.get(5)?)?,
+                    expires_at: decode_optional_u64(row.get(6)?)?,
+                    ended_at: decode_u64(row.get(7)?)?,
                     status: decode_historical_status(&status)?,
-                    prompt_append: row.get(7)?,
+                    prompt_append: row.get(9)?,
+                    static_only: decode_bool(row.get(10)?)?,
+                    auto_amend: decode_bool(row.get(11)?)?,
                 })
             })?;
             for row in rows {
@@ -171,15 +183,19 @@ impl SessionStore {
         for (token, grant) in snapshot.grants_snapshot() {
             tx.execute(
                 "INSERT INTO session_grants
-                 (token, allow_json, deny_json, expires_at, prompt_append, granted_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 (token, allow_json, deny_json, allow_exact_json, deny_exact_json, expires_at, prompt_append, granted_at, static_only, auto_amend)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     token,
                     encode_vec(&grant.allow)?,
                     encode_vec(&grant.deny)?,
+                    encode_exact_vec(&grant.allow_exact)?,
+                    encode_exact_vec(&grant.deny_exact)?,
                     encode_optional_u64(grant.expires_at)?,
                     grant.prompt_append,
-                    encode_u64(grant.granted_at)?
+                    encode_u64(grant.granted_at)?,
+                    encode_bool(grant.static_only),
+                    encode_bool(grant.auto_amend)
                 ],
             )?;
         }
@@ -187,17 +203,21 @@ impl SessionStore {
         for grant in snapshot.history_snapshot() {
             tx.execute(
                 "INSERT INTO session_history
-                 (token, allow_json, deny_json, granted_at, expires_at, ended_at, status, prompt_append)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 (token, allow_json, deny_json, allow_exact_json, deny_exact_json, granted_at, expires_at, ended_at, status, prompt_append, static_only, auto_amend)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     grant.token,
                     encode_vec(&grant.allow)?,
                     encode_vec(&grant.deny)?,
+                    encode_exact_vec(&grant.allow_exact)?,
+                    encode_exact_vec(&grant.deny_exact)?,
                     encode_u64(grant.granted_at)?,
                     encode_optional_u64(grant.expires_at)?,
                     encode_u64(grant.ended_at)?,
                     encode_historical_status(grant.status),
-                    grant.prompt_append
+                    grant.prompt_append,
+                    encode_bool(grant.static_only),
+                    encode_bool(grant.auto_amend)
                 ],
             )?;
         }
@@ -241,20 +261,28 @@ impl SessionStore {
                 token TEXT PRIMARY KEY,
                 allow_json TEXT NOT NULL,
                 deny_json TEXT NOT NULL,
+                allow_exact_json TEXT NOT NULL DEFAULT '[]',
+                deny_exact_json TEXT NOT NULL DEFAULT '[]',
                 expires_at INTEGER,
                 prompt_append TEXT,
-                granted_at INTEGER NOT NULL
+                granted_at INTEGER NOT NULL,
+                static_only INTEGER NOT NULL DEFAULT 0,
+                auto_amend INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS session_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 token TEXT NOT NULL,
                 allow_json TEXT NOT NULL,
                 deny_json TEXT NOT NULL,
+                allow_exact_json TEXT NOT NULL DEFAULT '[]',
+                deny_exact_json TEXT NOT NULL DEFAULT '[]',
                 granted_at INTEGER NOT NULL,
                 expires_at INTEGER,
                 ended_at INTEGER NOT NULL,
                 status TEXT NOT NULL,
-                prompt_append TEXT
+                prompt_append TEXT,
+                static_only INTEGER NOT NULL DEFAULT 0,
+                auto_amend INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_session_history_token ON session_history(token);
             CREATE INDEX IF NOT EXISTS idx_session_history_ended_at ON session_history(ended_at);
@@ -283,6 +311,54 @@ impl SessionStore {
                 status TEXT NOT NULL,
                 created_unix INTEGER NOT NULL
             );",
+        )?;
+        ensure_column(
+            conn,
+            "session_grants",
+            "static_only",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            conn,
+            "session_grants",
+            "auto_amend",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            conn,
+            "session_grants",
+            "allow_exact_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
+        ensure_column(
+            conn,
+            "session_grants",
+            "deny_exact_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
+        ensure_column(
+            conn,
+            "session_history",
+            "static_only",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            conn,
+            "session_history",
+            "auto_amend",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            conn,
+            "session_history",
+            "allow_exact_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
+        ensure_column(
+            conn,
+            "session_history",
+            "deny_exact_json",
+            "TEXT NOT NULL DEFAULT '[]'",
         )?;
         Ok(())
     }
@@ -432,6 +508,18 @@ fn decode_optional_u64(value: Option<i64>) -> rusqlite::Result<Option<u64>> {
     value.map(decode_u64).transpose()
 }
 
+fn encode_bool(value: bool) -> i64 {
+    if value {
+        1
+    } else {
+        0
+    }
+}
+
+fn decode_bool(value: i64) -> rusqlite::Result<bool> {
+    Ok(value != 0)
+}
+
 fn decode_vec(value: &str) -> rusqlite::Result<Vec<String>> {
     serde_json::from_str(value).map_err(|err| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -440,6 +528,36 @@ fn decode_vec(value: &str) -> rusqlite::Result<Vec<String>> {
             Box::new(err),
         )
     })
+}
+
+fn encode_exact_vec(values: &[SessionExactRule]) -> rusqlite::Result<String> {
+    serde_json::to_string(values).map_err(|err| {
+        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("encode exact rules: {err}"),
+        )))
+    })
+}
+
+fn decode_exact_vec(value: &str) -> rusqlite::Result<Vec<SessionExactRule>> {
+    serde_json::from_str(value).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+    })
+}
+
+fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column {
+            return Ok(());
+        }
+    }
+    conn.execute(
+        &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+        [],
+    )?;
+    Ok(())
 }
 
 fn encode_historical_status(status: HistoricalStatus) -> &'static str {
@@ -465,7 +583,9 @@ fn encode_decision_source(source: SessionDecisionSource) -> &'static str {
     match source {
         SessionDecisionSource::SessionAllow => "session_allow",
         SessionDecisionSource::SessionDeny => "session_deny",
+        SessionDecisionSource::SessionStaticOnly => "session_static_only",
         SessionDecisionSource::Llm => "llm",
+        SessionDecisionSource::Cache => "cache",
         SessionDecisionSource::StaticPolicy => "static_policy",
         SessionDecisionSource::Validation => "validation",
         SessionDecisionSource::EvaluatorError => "evaluator_error",
@@ -476,7 +596,9 @@ fn decode_decision_source(value: &str) -> rusqlite::Result<SessionDecisionSource
     match value {
         "session_allow" => Ok(SessionDecisionSource::SessionAllow),
         "session_deny" => Ok(SessionDecisionSource::SessionDeny),
+        "session_static_only" => Ok(SessionDecisionSource::SessionStaticOnly),
         "llm" => Ok(SessionDecisionSource::Llm),
+        "cache" => Ok(SessionDecisionSource::Cache),
         "static_policy" => Ok(SessionDecisionSource::StaticPolicy),
         "validation" => Ok(SessionDecisionSource::Validation),
         "evaluator_error" => Ok(SessionDecisionSource::EvaluatorError),
@@ -536,9 +658,19 @@ mod tests {
             SessionGrant {
                 allow: vec!["echo*".into()],
                 deny: vec!["rm*".into()],
+                allow_exact: vec![SessionExactRule::new(
+                    "kubectl",
+                    vec!["get".into(), "pods".into()],
+                )],
+                deny_exact: vec![SessionExactRule::new(
+                    "kubectl",
+                    vec!["get".into(), "secrets".into()],
+                )],
                 expires_at: None,
                 prompt_append: Some("persistent".into()),
                 granted_at: now.saturating_sub(2),
+                static_only: true,
+                auto_amend: true,
             },
         );
         let registry = SessionRegistry::from_parts(
@@ -547,11 +679,15 @@ mod tests {
                 token: "old".into(),
                 allow: vec!["ls*".into()],
                 deny: Vec::new(),
+                allow_exact: Vec::new(),
+                deny_exact: Vec::new(),
                 granted_at: now.saturating_sub(10),
                 expires_at: None,
                 ended_at: now.saturating_sub(5),
                 status: HistoricalStatus::Revoked,
                 prompt_append: None,
+                static_only: false,
+                auto_amend: false,
             }],
             vec![(
                 "tok".into(),
@@ -582,6 +718,17 @@ mod tests {
             report.active.and_then(|grant| grant.prompt_append),
             Some("persistent".into())
         );
+        assert!(loaded.static_only_for("tok"));
+        assert!(loaded.auto_amend_for("tok"));
+        assert!(loaded
+            .check("tok", "kubectl", &["get".into(), "pods".into()])
+            .is_some());
+        assert!(matches!(
+            loaded
+                .check("tok", "kubectl", &["get".into(), "secrets".into()])
+                .map(|hit| hit.0),
+            Some(crate::session::SessionDecision::Deny)
+        ));
         assert_eq!(loaded.list_history(None).len(), 1);
     }
 }

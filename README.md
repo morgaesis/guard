@@ -186,6 +186,10 @@ Two opt-in features exist for deployments with specific constraints:
 - **Fallback model chain** via `SSH_GUARD_LLM_MODELS`. Fails over to
   alternate providers after the primary exhausts its retries. See
   [`examples/fallback-models.env`](examples/fallback-models.env).
+- **Learned static rules** via `--learn-rules`. Repeated low-risk LLM
+  approvals can promote conservative exact static allow rules so repeated
+  calls return immediately. Misses and risky commands still fall through to
+  the LLM.
 
 Enable either only when a concrete latency or uptime constraint forces it.
 
@@ -198,11 +202,18 @@ Guard walks up from your current directory to `/` looking for `.env` files (clos
 | Variable | Default | Description |
 |---|---|---|
 | `SSH_GUARD_LLM_API_KEY` / `OPENROUTER_API_KEY` | (none) | LLM API key (required). `OPENROUTER_API_KEY` is the conventional name and is accepted for compatibility. |
-| `SSH_GUARD_API_URL` | `https://openrouter.ai/api/v1/chat/completions` | Any OpenAI-compatible endpoint |
+| `SSH_GUARD_LLM_API_URL` / `SSH_GUARD_API_URL` | `https://openrouter.ai/api/v1/chat/completions` | Any OpenAI-compatible endpoint |
 | `SSH_GUARD_LLM_MODELS` | (unset) | Optional comma-separated fallback chain (e.g. `openai/gpt-5.4-nano,meta-llama/llama-4-maverick`). When set, overrides `--llm-model` and is tried in order, each with its own retry budget. Primary model when unset: `openai/gpt-5.4-nano`. |
 | `SSH_GUARD_LLM_RETRIES` | `2` | Retries per model on transient failures (429, timeouts, parse errors). 1-2. |
+| `SSH_GUARD_LLM_TIMEOUT` / `SSH_GUARD_TIMEOUT` | `30` | LLM call timeout in seconds. |
+| `SSH_GUARD_AUTH_TOKEN` | (none) | Shared token for TCP clients. Use this for loopback TCP daemons instead of passing `--auth-token` on the command line. |
+| `SSH_GUARD_ADMIN_TOKEN` | (none) | Separate token for TCP admin RPCs such as `guard grant`, `guard session show`, and the full `guard status`. The Windows launcher generates and stores one automatically. |
 | `SSH_GUARD_MODE` | `readonly` | `readonly`, `safe`, or `paranoid` |
 | `SSH_GUARD_DRY_RUN` | `false` | Evaluate policy but do not execute approved commands. Useful for prompt and policy testing. |
+| `SSH_GUARD_LEARN_RULES` | `false` | Learn static allows from repeated low-risk LLM approvals. |
+| `SSH_GUARD_LEARN_MIN_APPROVALS` | `2` | Approvals required before promotion. |
+| `SSH_GUARD_LEARN_MAX_RISK` | `2` | Highest LLM risk score eligible for promotion. |
+| `SSH_GUARD_LEARN_SHIMS` | `suggest` | `off`, `suggest`, or `create` service shims for learned SSH/API wrappers. |
 | `SSH_GUARD_PROMPT_APPEND` | (none) | Path to additive prompt file (appended to base prompt) |
 | `SSH_GUARD_GPG_RECIPIENT` | (none) | GPG recipient for the `local` secret backend |
 | `SSH_GUARD_BACKEND` | (auto) | Secret backend (`pass`, `env`, `local`). Auto prefers `pass`; otherwise it falls back to non-persistent `env` and logs a warning. |
@@ -309,6 +320,28 @@ Static patterns are checked first. If a command matches a deny pattern, it is re
 
 See [`examples/deny-policy.yaml`](examples/deny-policy.yaml) for a reference policy with documented limitations of static glob matching.
 
+### Learned static rules
+
+For services with repetitive low-risk calls, enable learned rules:
+
+```bash
+guard server start \
+  --learn-rules \
+  --learn-min-approvals 2 \
+  --learn-max-risk 2 \
+  --learn-shims suggest \
+  --socket .cache/guard.sock &
+```
+
+When the LLM repeatedly approves the same low-risk command shape, guard writes
+a learned allow rule to the state directory and future identical calls bypass
+the LLM. Learned rules never deny or wildcard over service verbs; misses,
+session-prompted calls, and commands with destructive shell-control tokens fall
+back to normal evaluation. For SSH API wrappers, guard may also mention a
+shorter service shim such as `opnsense-api`; with `--learn-shims create`,
+promoted rules create that wrapper in the configured shim directory, and the
+same approved operation is covered through the shim name.
+
 ### Custom system prompt
 
 Replace the built-in prompt entirely for a specific deployment:
@@ -345,7 +378,7 @@ The additive prompt is appended to whichever base prompt is active (readonly, sa
 
 ## Session grants
 
-Session grants hand a specific agent narrow extra permissions for a specific run, without relaxing the global mode. The agent identifies its session by the `GUARD_SESSION` env var; every `guard run` (and `guard server connect`) reads that env var and forwards it as the session token in the request. Operators attach allow/deny patterns and prompt context to that token.
+Session grants hand a specific agent narrow extra permissions for a specific run, without relaxing the global mode. The agent identifies its session by the `GUARD_SESSION` env var; every `guard run` (and `guard server connect`) reads that env var and forwards it as the session token in the request. Operators attach allow/deny patterns, prose intent, and prompt context to that token.
 
 The simplest flow is `guard session new`, which mints a token and (optionally) grants it in one round trip, printing an eval-friendly export line:
 
@@ -368,12 +401,43 @@ Inside the agent's process tree, every `guard run` call automatically picks up `
 To grant rules to an existing token (e.g. one the agent already has):
 
 ```bash
-guard session grant <token> --allow '<glob>' --deny '<glob>' [--ttl N] [--prompt TEXT]
+guard session grant <token> --allow '<glob>' --deny '<glob>' [--ttl N] [--prompt TEXT] [--auto-amend]
 ```
 
-Matching deny patterns win over allow patterns, and everything that does not match a session rule falls through to the normal evaluator. Session grants are persisted in the daemon state database and survive daemon restarts by default. The default path is the XDG state dir (`$XDG_STATE_HOME/guard/state.db` or `~/.local/state/guard/state.db`); override it with `--state-db` or `SSH_GUARD_STATE_DB`. `guard session revoke <token>` is daemon-UID-only; `guard session list` is visible over the Unix socket to exec-allowed local users, but it redacts the bearer token, rule bodies, and prompt text unless the caller is the daemon UID.
+There is also a top-level shorthand. With a quoted prose description it mints and
+grants a fresh session, again printing an eval-friendly export line:
 
-For operator forensics, `guard session show <token>` is daemon-UID-only and prints the full prompt, aggregate allow/deny and exec outcome counts, source breakdown (`llm`, `static_policy`, `session_allow`, `session_deny`, `validation`), a risk histogram for LLM-evaluated calls, and a bounded recent interaction log. Those summaries are loaded from the state database, so they remain available after a service restart within the configured retention window.
+```bash
+eval "$(guard grant --ttl 3600 --static-only 'readonly access to nextcloud resources in the morgaesis-dev kube cluster, not secrets, with write access for scaling replicas and editing ingresses')"
+```
+
+For an existing token, pass the token first:
+
+```bash
+guard grant <token> "readonly access to nextcloud resources in the morgaesis-dev kube cluster, not secrets, with write access for scaling replicas and editing ingresses"
+```
+
+Prose grants are compiled at grant time into conservative static rules when guard recognizes the domain. The first compiler handles Kubernetes: it infers namespaces such as `nextcloud`, optional contexts such as `morgaesis-dev`, adds hard denies for shell-control, secret access, token creation, raw kubeconfig reads, `exec`, `cp`, `port-forward`, and deletes, then adds namespace-scoped read, scale, and ingress/reverse-proxy rules implied by the prose. Safe command examples in backticks are added as exact static allows. Unrecognized prose is still stored as session LLM context, but does not create broad static globs.
+
+Session allow/deny patterns use guard's shell-style glob matcher, not regex. `*`, `?`, and bracket classes are supported, but the match is against the flat reconstructed command line; it does not understand shell quoting, Kubernetes resource schemas, or argument semantics. Generated rules therefore use broad globs sparingly: for example, Kubernetes prose grants may add namespace-bounded `get * -n nextcloud` and `describe * -n nextcloud` read globs, backed by explicit secret and mutating-resource denies. Automatic amendments do not add globs at all; they add exact `binary + argv` rules, so literal `*` or `[` characters in an appealed command do not become wildcards.
+
+Matching deny patterns win over allow patterns, and by default everything that does not match a session rule falls through to the normal evaluator with the session prose/prompt appended. Prose grants enable `auto_amend` by default so fresh low-risk LLM fallback approvals can add exact session allows, and fresh high-risk LLM denials can add exact session denies. Use `--no-auto-amend` to keep fallback non-mutating, or `--auto-amend` to opt a manual `--allow`/`--deny` grant into the same behavior. Cache hits, static policy hits, and learned-rule hits never amend a session; session fallback also does not promote global learned rules. Add `--static-only` (alias `--no-llm-fallback`) to `guard grant`, `guard session grant`, or `guard session new` to deny any session-rule miss instead of falling through to the LLM; static-only grants disable auto-amend.
+
+To ask for a one-off amendment without executing the command, appeal it:
+
+```bash
+guard appeal --session <token> kubectl get httproute -n nextcloud
+# or, when GUARD_SESSION is already set:
+guard appeal kubectl get httproute -n nextcloud
+# equivalent explicit session subcommand:
+guard session appeal <token> kubectl get httproute -n nextcloud
+```
+
+An appeal runs the evaluator with the session context and then either amends an exact allow, amends an exact deny for a high-risk denial, or refuses to amend. It exits nonzero when the appealed command remains denied. Appeals are admin RPCs, like grant/revoke/show, because they can change durable authorization state.
+
+Session grants are persisted in the daemon state database and survive daemon restarts by default. The default path is the XDG state dir (`$XDG_STATE_HOME/guard/state.db` or `~/.local/state/guard/state.db`); override it with `--state-db` or `SSH_GUARD_STATE_DB`. `guard session revoke <token>` is daemon-UID-only; `guard session list` is visible over the Unix socket to exec-allowed local users, but it redacts the bearer token, rule bodies, and prompt text unless the caller is the daemon UID.
+
+For operator forensics, `guard session show <token>` is daemon-UID-only and prints the full prompt, aggregate allow/deny and exec outcome counts, source breakdown (`llm`, `cache`, `static_policy`, `session_allow`, `session_deny`, `session_static_only`, `validation`), a risk histogram for LLM-evaluated calls, and a bounded recent interaction log. Those summaries are loaded from the state database, so they remain available after a service restart within the configured retention window.
 
 ## Per-run secret injection
 
@@ -423,13 +487,13 @@ guard run --env OPNSENSE_HOST=opnsense-host --secret OPNSENSE_API_KEY \
 
 ## Admin authorization
 
-Session admin RPCs (`session new` / `grant` / `revoke`, plus the privileged subset of `status`) are restricted to **the daemon's own UID**. `session list` is the exception: exec-allowed local Unix-socket callers may see that grants exist, when they were granted, and when they expire, but the daemon redacts the session token, allow/deny patterns, and prompt text unless the caller is the daemon UID. There is no client-side admin token, by design — without that separation, any exec-allowed UID could mint a session whose `--prompt` tells the model to approve everything, a trivial bypass.
+Session admin RPCs (`session new` / `grant` / `revoke`, plus the privileged subset of `status`) are restricted to **the daemon's own UID** on Unix sockets. `session list` is the Unix-socket exception: exec-allowed local callers may see that grants exist, when they were granted, and when they expire, but the daemon redacts the session token, allow/deny patterns, and prompt text unless the caller is the daemon UID. On TCP transports, non-Ping admin RPCs require the separate `SSH_GUARD_ADMIN_TOKEN`; the ordinary TCP exec `SSH_GUARD_AUTH_TOKEN` is not enough to mint grants.
 
-The non-privileged `guard status` (run as your normal user or any other exec-allowed UID) returns only client + server version, uptime, evaluation mode, and dry-run state. It is a liveness probe — enough to confirm the connection works and what mode the evaluator is in, but nothing that would help fingerprint the deployment or escalate privilege.
+The non-privileged `guard status` (run as your normal user or any other exec-allowed UID, or over TCP without the admin token) returns only client + server version, uptime, evaluation mode, and dry-run state. It is a liveness probe — enough to confirm the connection works and what mode the evaluator is in, but nothing that would help fingerprint the deployment or escalate privilege.
 
-The `--prompt` / `--prompt-file` flags attach a free-form context fragment that is appended to the LLM system prompt under a `Session context:` heading for evaluator calls made under that token. Use them for guidance the static glob patterns cannot express. The decision cache is bypassed when a session prompt is in play, because cached verdicts were made under the base prompt and may not hold under the extended context.
+The `--prompt` / `--prompt-file` flags attach a free-form context fragment that is appended to the LLM system prompt under a `Session context:` heading for evaluator calls made under that token. Prose grants use the same context path after static rule synthesis. Use prompt/prose for guidance the static glob patterns cannot express. The decision cache is bypassed when a session prompt is in play, because cached verdicts were made under the base prompt and may not hold under the extended context.
 
-Because grants are now durable, broad sessions deserve the same care as any other persistent authorization state. Prefer explicit TTLs for elevated sessions, and treat `allow=["*"]` as an operator override that must be revoked intentionally rather than something a daemon restart will clear for you.
+Because grants are now durable, broad sessions deserve the same care as any other persistent authorization state. Prefer explicit TTLs for elevated sessions, and treat `allow=["*"]` as an operator override that must be revoked intentionally rather than something a daemon restart will clear for you. Generated prose rules intentionally stay narrow; if guard cannot infer a safe static rule, it relies on LLM fallback or denies under `--static-only`.
 
 ## Execution identity
 
@@ -505,7 +569,7 @@ Never use interactive sessions.
 ```bash
 export SSH_GUARD_LLM_API_KEY="..."
 export SSH_GUARD_MODE=readonly
-alias ssh=guard
+alias ssh='guard run ssh'
 ```
 
 </details>

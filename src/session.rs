@@ -27,6 +27,10 @@ pub const DEFAULT_HISTORY_RETENTION_SECS: u64 = 24 * 60 * 60;
 pub struct SessionGrant {
     pub allow: Vec<String>,
     pub deny: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_exact: Vec<SessionExactRule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny_exact: Vec<SessionExactRule>,
     /// Unix seconds after which this grant is treated as absent.
     pub expires_at: Option<u64>,
     /// Free-form text appended to the LLM system prompt for evaluator
@@ -36,6 +40,14 @@ pub struct SessionGrant {
     /// related psql copy commands as expected".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_append: Option<String>,
+    /// If true, commands that miss the grant's static allow/deny rules are
+    /// denied instead of falling through to the normal evaluator.
+    #[serde(default)]
+    pub static_only: bool,
+    /// If true, fresh low-risk LLM fallback decisions may amend this grant
+    /// with exact allow/deny rules for future calls.
+    #[serde(default)]
+    pub auto_amend: bool,
     /// Unix seconds when the grant was installed. Used by `session
     /// list` to show grant age.
     #[serde(default)]
@@ -45,6 +57,30 @@ pub struct SessionGrant {
 impl SessionGrant {
     pub fn is_expired(&self, now: u64) -> bool {
         matches!(self.expires_at, Some(exp) if now >= exp)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionExactRule {
+    pub binary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+}
+
+impl SessionExactRule {
+    pub fn new(binary: impl Into<String>, args: Vec<String>) -> Self {
+        Self {
+            binary: binary.into(),
+            args,
+        }
+    }
+
+    pub fn command_line(&self) -> String {
+        command_line(&self.binary, &self.args)
+    }
+
+    fn matches(&self, cmd: &str, args: &[String]) -> bool {
+        self.binary == cmd && self.args == args
     }
 }
 
@@ -60,6 +96,10 @@ pub struct HistoricalGrant {
     pub token: String,
     pub allow: Vec<String>,
     pub deny: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_exact: Vec<SessionExactRule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny_exact: Vec<SessionExactRule>,
     pub granted_at: u64,
     pub expires_at: Option<u64>,
     /// Unix seconds when the grant left the active set.
@@ -67,10 +107,20 @@ pub struct HistoricalGrant {
     pub status: HistoricalStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_append: Option<String>,
+    #[serde(default)]
+    pub static_only: bool,
+    #[serde(default)]
+    pub auto_amend: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionDecision {
+    Allow,
+    Deny,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionAmendment {
     Allow,
     Deny,
 }
@@ -80,11 +130,19 @@ pub struct SessionGrantSummary {
     pub token: String,
     pub allow: Vec<String>,
     pub deny: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_exact: Vec<SessionExactRule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny_exact: Vec<SessionExactRule>,
     pub expires_at: Option<u64>,
     #[serde(default)]
     pub granted_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_append: Option<String>,
+    #[serde(default)]
+    pub static_only: bool,
+    #[serde(default)]
+    pub auto_amend: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,7 +150,9 @@ pub struct SessionGrantSummary {
 pub enum SessionDecisionSource {
     SessionAllow,
     SessionDeny,
+    SessionStaticOnly,
     Llm,
+    Cache,
     StaticPolicy,
     Validation,
     EvaluatorError,
@@ -103,7 +163,9 @@ impl SessionDecisionSource {
         match self {
             Self::SessionAllow => "session_allow",
             Self::SessionDeny => "session_deny",
+            Self::SessionStaticOnly => "session_static_only",
             Self::Llm => "llm",
+            Self::Cache => "cache",
             Self::StaticPolicy => "static_policy",
             Self::Validation => "validation",
             Self::EvaluatorError => "evaluator_error",
@@ -290,9 +352,13 @@ impl SessionRegistry {
                 token: token.clone(),
                 allow: g.allow.clone(),
                 deny: g.deny.clone(),
+                allow_exact: g.allow_exact.clone(),
+                deny_exact: g.deny_exact.clone(),
                 expires_at: g.expires_at,
                 granted_at: g.granted_at,
                 prompt_append: g.prompt_append.clone(),
+                static_only: g.static_only,
+                auto_amend: g.auto_amend,
             })
             .collect()
     }
@@ -329,9 +395,13 @@ impl SessionRegistry {
                     token: token.to_string(),
                     allow: grant.allow.clone(),
                     deny: grant.deny.clone(),
+                    allow_exact: grant.allow_exact.clone(),
+                    deny_exact: grant.deny_exact.clone(),
                     expires_at: grant.expires_at,
                     granted_at: grant.granted_at,
                     prompt_append: grant.prompt_append.clone(),
+                    static_only: grant.static_only,
+                    auto_amend: grant.auto_amend,
                 })
             }
         });
@@ -408,6 +478,55 @@ impl SessionRegistry {
         grant.prompt_append.clone()
     }
 
+    pub fn static_only_for(&self, token: &str) -> bool {
+        let Some(grant) = self.grants.get(token) else {
+            return false;
+        };
+        !grant.is_expired(current_unix_secs()) && grant.static_only
+    }
+
+    pub fn auto_amend_for(&self, token: &str) -> bool {
+        let Some(grant) = self.grants.get(token) else {
+            return false;
+        };
+        !grant.is_expired(current_unix_secs()) && grant.auto_amend
+    }
+
+    pub fn amend_exact(
+        &mut self,
+        token: &str,
+        decision: SessionAmendment,
+        binary: String,
+        args: Vec<String>,
+    ) -> Option<bool> {
+        let grant = self.grants.get_mut(token)?;
+        if grant.is_expired(current_unix_secs()) {
+            return None;
+        }
+
+        let rule = SessionExactRule::new(binary, args);
+        match decision {
+            SessionAmendment::Allow => {
+                grant.deny_exact.retain(|existing| existing != &rule);
+                if grant.allow_exact.iter().any(|existing| existing == &rule) {
+                    Some(false)
+                } else {
+                    grant.allow_exact.push(rule);
+                    Some(true)
+                }
+            }
+            SessionAmendment::Deny => {
+                grant.allow_exact.retain(|existing| existing != &rule);
+                if grant.deny_exact.iter().any(|existing| existing == &rule) {
+                    Some(false)
+                } else {
+                    grant.deny_exact.push(rule);
+                    Some(true)
+                }
+            }
+        }
+    }
+
     /// Remove expired entries (move them to history) and trim history
     /// older than the retention window. Called opportunistically.
     pub fn purge_expired(&mut self) {
@@ -450,11 +569,14 @@ impl SessionRegistry {
             return None;
         }
 
-        let full_cmd = if args.is_empty() {
-            cmd.to_string()
-        } else {
-            format!("{} {}", cmd, args.join(" "))
-        };
+        let full_cmd = command_line(cmd, args);
+
+        if let Some(rule) = grant.deny_exact.iter().find(|rule| rule.matches(cmd, args)) {
+            return Some((
+                SessionDecision::Deny,
+                format!("session exact deny: {}", rule.command_line()),
+            ));
+        }
 
         let deny_rule = PolicyRule {
             patterns: grant.deny.clone(),
@@ -478,6 +600,17 @@ impl SessionRegistry {
             return Some((
                 SessionDecision::Deny,
                 format!("session deny pattern: {}", which),
+            ));
+        }
+
+        if let Some(rule) = grant
+            .allow_exact
+            .iter()
+            .find(|rule| rule.matches(cmd, args))
+        {
+            return Some((
+                SessionDecision::Allow,
+                format!("session exact allow: {}", rule.command_line()),
             ));
         }
 
@@ -520,11 +653,23 @@ fn historical(
         token: token.to_string(),
         allow: grant.allow,
         deny: grant.deny,
+        allow_exact: grant.allow_exact,
+        deny_exact: grant.deny_exact,
         granted_at: grant.granted_at,
         expires_at: grant.expires_at,
         ended_at,
         status,
         prompt_append: grant.prompt_append,
+        static_only: grant.static_only,
+        auto_amend: grant.auto_amend,
+    }
+}
+
+fn command_line(cmd: &str, args: &[String]) -> String {
+    if args.is_empty() {
+        cmd.to_string()
+    } else {
+        format!("{} {}", cmd, args.join(" "))
     }
 }
 
@@ -546,9 +691,13 @@ mod tests {
             SessionGrant {
                 allow: allow.iter().map(|s| s.to_string()).collect(),
                 deny: deny.iter().map(|s| s.to_string()).collect(),
+                allow_exact: Vec::new(),
+                deny_exact: Vec::new(),
                 expires_at: None,
                 granted_at: 0,
                 prompt_append: None,
+                static_only: false,
+                auto_amend: false,
             },
         );
         reg
@@ -585,6 +734,63 @@ mod tests {
     }
 
     #[test]
+    fn exact_rules_do_not_treat_glob_characters_as_wildcards() {
+        let mut reg = reg_with("tok", &[], &[]);
+        assert_eq!(
+            reg.amend_exact(
+                "tok",
+                SessionAmendment::Allow,
+                "echo".into(),
+                vec!["literal*".into()]
+            ),
+            Some(true)
+        );
+
+        assert!(reg
+            .check("tok", "echo", &["literal*".into()])
+            .is_some_and(|hit| hit.0 == SessionDecision::Allow));
+        assert!(reg.check("tok", "echo", &["literal123".into()]).is_none());
+    }
+
+    #[test]
+    fn exact_deny_wins_and_amend_dedupes_without_history() {
+        let mut reg = reg_with("tok", &[], &[]);
+        assert_eq!(
+            reg.amend_exact(
+                "tok",
+                SessionAmendment::Allow,
+                "kubectl".into(),
+                vec!["get".into(), "pods".into()]
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            reg.amend_exact(
+                "tok",
+                SessionAmendment::Deny,
+                "kubectl".into(),
+                vec!["get".into(), "pods".into()]
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            reg.amend_exact(
+                "tok",
+                SessionAmendment::Deny,
+                "kubectl".into(),
+                vec!["get".into(), "pods".into()]
+            ),
+            Some(false)
+        );
+
+        let hit = reg
+            .check("tok", "kubectl", &["get".into(), "pods".into()])
+            .expect("exact deny should match");
+        assert_eq!(hit.0, SessionDecision::Deny);
+        assert!(reg.list_history(None).is_empty());
+    }
+
+    #[test]
     fn expired_grant_is_ignored() {
         let mut reg = SessionRegistry::new();
         reg.grant(
@@ -592,9 +798,13 @@ mod tests {
             SessionGrant {
                 allow: vec!["mkdir*".to_string()],
                 deny: vec![],
+                allow_exact: Vec::new(),
+                deny_exact: Vec::new(),
                 expires_at: Some(1),
                 granted_at: 0, // 1970-01-01 +1s
                 prompt_append: None,
+                static_only: false,
+                auto_amend: false,
             },
         );
         assert!(reg.check("tok", "mkdir", &["/tmp".into()]).is_none());
@@ -616,9 +826,13 @@ mod tests {
             SessionGrant {
                 allow: vec![],
                 deny: vec![],
+                allow_exact: Vec::new(),
+                deny_exact: Vec::new(),
                 expires_at: None,
                 granted_at: 0,
                 prompt_append: Some("session is restoring a backup".to_string()),
+                static_only: false,
+                auto_amend: false,
             },
         );
         assert_eq!(
@@ -636,9 +850,13 @@ mod tests {
             SessionGrant {
                 allow: vec![],
                 deny: vec![],
+                allow_exact: Vec::new(),
+                deny_exact: Vec::new(),
                 expires_at: Some(1),
                 granted_at: 0,
                 prompt_append: Some("ignored".to_string()),
+                static_only: false,
+                auto_amend: false,
             },
         );
         assert!(reg.prompt_append_for("tok").is_none());
@@ -652,9 +870,13 @@ mod tests {
             SessionGrant {
                 allow: vec!["*".into()],
                 deny: vec![],
+                allow_exact: Vec::new(),
+                deny_exact: Vec::new(),
                 expires_at: None,
                 granted_at: 0,
                 prompt_append: None,
+                static_only: false,
+                auto_amend: false,
             },
         );
         reg.grant(
@@ -662,9 +884,13 @@ mod tests {
             SessionGrant {
                 allow: vec!["*".into()],
                 deny: vec![],
+                allow_exact: Vec::new(),
+                deny_exact: Vec::new(),
                 expires_at: Some(1),
                 granted_at: 0,
                 prompt_append: None,
+                static_only: false,
+                auto_amend: false,
             },
         );
         let listed = reg.list();
@@ -677,6 +903,29 @@ mod tests {
         let reg = reg_with("live", &[], &[]);
         assert!(reg.has("live"));
         assert!(!reg.has("ghost"));
+    }
+
+    #[test]
+    fn static_only_is_reported_for_live_grant() {
+        let mut reg = SessionRegistry::new();
+        reg.grant(
+            "tok".to_string(),
+            SessionGrant {
+                allow: vec![],
+                deny: vec![],
+                allow_exact: Vec::new(),
+                deny_exact: Vec::new(),
+                expires_at: None,
+                granted_at: 0,
+                prompt_append: None,
+                static_only: true,
+                auto_amend: true,
+            },
+        );
+        assert!(reg.static_only_for("tok"));
+        assert!(reg.auto_amend_for("tok"));
+        assert!(!reg.static_only_for("missing"));
+        assert!(!reg.auto_amend_for("missing"));
     }
 
     #[test]
@@ -698,9 +947,13 @@ mod tests {
             SessionGrant {
                 allow: vec!["*".into()],
                 deny: vec![],
+                allow_exact: Vec::new(),
+                deny_exact: Vec::new(),
                 expires_at: Some(1),
                 granted_at: 0,
                 prompt_append: None,
+                static_only: false,
+                auto_amend: false,
             },
         );
         reg.purge_expired();
@@ -718,9 +971,13 @@ mod tests {
             SessionGrant {
                 allow: vec![],
                 deny: vec![],
+                allow_exact: Vec::new(),
+                deny_exact: Vec::new(),
                 expires_at: None,
                 granted_at: 0,
                 prompt_append: None,
+                static_only: false,
+                auto_amend: false,
             },
         );
         reg.revoke("a");

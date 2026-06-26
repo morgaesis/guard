@@ -1,6 +1,6 @@
 [package]
 name = "guard"
-version = "0.1.1"
+version = "0.1.4"
 edition = "2021"
 description = "LLM-evaluated command gate for AI agents"
 authors = ["Mörgæsis <morgaesis+git@morgaes.is>"]

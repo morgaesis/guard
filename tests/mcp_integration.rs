@@ -1,4 +1,5 @@
 //! End-to-end MCP integration test.
+#![cfg(unix)]
 //!
 //! Spins up a real guard daemon with a static (no-LLM) policy on a temp socket,
 //! spawns `guard mcp serve` as a child with piped stdio, and exercises the full

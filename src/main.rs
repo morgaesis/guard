@@ -3,6 +3,7 @@
 #![allow(unused)]
 
 mod client_config;
+mod grant_rules;
 mod injection;
 mod mcp;
 mod redact;
@@ -15,6 +16,7 @@ mod ssh;
 mod tool_config;
 
 use guard::evaluate;
+use guard::learned_rules::{AutoShimMode, LearnedRuleStore, LearningConfig};
 
 use anyhow::{Context, Result};
 use clap::{ArgAction, CommandFactory, Parser, Subcommand};
@@ -23,6 +25,8 @@ use injection::{collect_unique_pairs, derive_env_name, is_valid_env_name};
 use std::collections::HashMap;
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 use tracing_subscriber::{fmt, EnvFilter};
 
 #[derive(Parser)]
@@ -106,6 +110,62 @@ enum MainArgs {
     /// Manage session grants (extra allow/deny for a specific session token)
     #[clap(subcommand)]
     Session(SessionCommands),
+    /// Shorthand for `guard session new <prose>` or `guard session grant <token> ...`
+    Grant {
+        /// Opaque session token to update, or quoted prose to create a fresh session.
+        token: Option<String>,
+        /// Prose describing the intended access. Known domains are compiled to
+        /// static session rules; misses fall through to the LLM unless
+        /// --static-only is set.
+        #[arg(value_name = "PROSE")]
+        prose: Option<String>,
+        /// Glob pattern to allow in this session (repeatable)
+        #[arg(long = "allow", value_name = "GLOB")]
+        allow: Vec<String>,
+        /// Glob pattern to deny in this session (repeatable, beats allow)
+        #[arg(long = "deny", value_name = "GLOB")]
+        deny: Vec<String>,
+        /// Time-to-live in seconds; omit for no expiry
+        #[arg(long, value_name = "SECONDS")]
+        ttl: Option<u64>,
+        /// Free-form context appended to the LLM system prompt for evaluator
+        /// calls made under this session token.
+        #[arg(long, value_name = "TEXT")]
+        prompt: Option<String>,
+        /// Read prompt from a file (alternative to --prompt).
+        #[arg(long, value_name = "PATH")]
+        prompt_file: Option<PathBuf>,
+        /// Deny session-rule misses instead of falling through to the LLM.
+        #[arg(long = "static-only", alias = "no-llm-fallback", action = ArgAction::SetTrue)]
+        static_only: bool,
+        /// Let fresh low-risk LLM fallback decisions add exact session rules.
+        #[arg(long = "auto-amend", action = ArgAction::SetTrue)]
+        auto_amend: bool,
+        /// Disable automatic exact-rule amendment for this grant.
+        #[arg(long = "no-auto-amend", action = ArgAction::SetTrue)]
+        no_auto_amend: bool,
+        /// Server socket path (defaults to configured)
+        #[arg(long, value_name = "PATH")]
+        socket: Option<String>,
+    },
+    /// Ask the evaluator to amend or deny a session grant without executing the command
+    #[clap(
+        disable_help_flag = true,
+        after_help = "Use `guard appeal --session <token> <binary> --help` to pass --help to the appealed command."
+    )]
+    Appeal {
+        /// Session token. Defaults to GUARD_SESSION.
+        #[arg(long, value_name = "TOKEN")]
+        session: Option<String>,
+        /// Server socket path (defaults to configured)
+        #[arg(long, value_name = "PATH")]
+        socket: Option<String>,
+        /// Binary to evaluate for session amendment
+        binary: String,
+        /// Arguments to pass to the binary
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Show daemon status. Always prints client + server version,
     /// uptime, evaluation mode, and dry-run state. The full config
     /// snapshot is restricted to the daemon UID.
@@ -187,6 +247,11 @@ enum SessionCommands {
     /// trip. Prints `export GUARD_SESSION=<token>` on stdout so you can
     /// `eval $(guard session new ...)` to set it for the current shell.
     New {
+        /// Prose describing the intended access. Known domains are compiled to
+        /// static session rules; misses fall through to the LLM unless
+        /// --static-only is set.
+        #[arg(value_name = "PROSE")]
+        prose: Option<String>,
         /// Glob pattern to allow in this session (repeatable)
         #[arg(long = "allow", value_name = "GLOB")]
         allow: Vec<String>,
@@ -202,6 +267,15 @@ enum SessionCommands {
         /// Read session context from a file.
         #[arg(long, value_name = "PATH")]
         prompt_file: Option<PathBuf>,
+        /// Deny session-rule misses instead of falling through to the LLM.
+        #[arg(long = "static-only", alias = "no-llm-fallback", action = ArgAction::SetTrue)]
+        static_only: bool,
+        /// Let fresh low-risk LLM fallback decisions add exact session rules.
+        #[arg(long = "auto-amend", action = ArgAction::SetTrue)]
+        auto_amend: bool,
+        /// Disable automatic exact-rule amendment for this grant.
+        #[arg(long = "no-auto-amend", action = ArgAction::SetTrue)]
+        no_auto_amend: bool,
         /// Server socket path (defaults to configured)
         #[arg(long, value_name = "PATH")]
         socket: Option<String>,
@@ -210,6 +284,11 @@ enum SessionCommands {
     Grant {
         /// Opaque session token; the agent passes this as GUARD_SESSION or --session
         token: String,
+        /// Prose describing the intended access. Known domains are compiled to
+        /// static session rules; misses fall through to the LLM unless
+        /// --static-only is set.
+        #[arg(value_name = "PROSE")]
+        prose: Option<String>,
         /// Glob pattern to allow in this session (repeatable)
         #[arg(long = "allow", value_name = "GLOB")]
         allow: Vec<String>,
@@ -228,9 +307,35 @@ enum SessionCommands {
         /// exclusive with --prompt; --prompt-file wins if both are given.
         #[arg(long, value_name = "PATH")]
         prompt_file: Option<PathBuf>,
+        /// Deny session-rule misses instead of falling through to the LLM.
+        #[arg(long = "static-only", alias = "no-llm-fallback", action = ArgAction::SetTrue)]
+        static_only: bool,
+        /// Let fresh low-risk LLM fallback decisions add exact session rules.
+        #[arg(long = "auto-amend", action = ArgAction::SetTrue)]
+        auto_amend: bool,
+        /// Disable automatic exact-rule amendment for this grant.
+        #[arg(long = "no-auto-amend", action = ArgAction::SetTrue)]
+        no_auto_amend: bool,
         /// Server socket path (defaults to configured)
         #[arg(long, value_name = "PATH")]
         socket: Option<String>,
+    },
+    /// Ask the evaluator to amend or deny a session grant without executing the command.
+    #[clap(
+        disable_help_flag = true,
+        after_help = "Use `guard session appeal <token> <binary> --help` to pass --help to the appealed command."
+    )]
+    Appeal {
+        /// Session token to appeal against.
+        token: String,
+        /// Server socket path (defaults to configured)
+        #[arg(long, value_name = "PATH")]
+        socket: Option<String>,
+        /// Binary to evaluate for session amendment.
+        binary: String,
+        /// Arguments to pass to the binary.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
     /// Revoke a session grant
     Revoke {
@@ -338,8 +443,14 @@ enum ServerCommands {
         tcp_port: Option<u16>,
 
         /// Shared token required for TCP clients.
+        /// Env: SSH_GUARD_AUTH_TOKEN.
         #[arg(long, value_name = "TOKEN")]
         auth_token: Option<String>,
+
+        /// Separate token required for non-Ping TCP admin RPCs.
+        /// Env: SSH_GUARD_ADMIN_TOKEN.
+        #[arg(long, value_name = "TOKEN")]
+        admin_token: Option<String>,
 
         /// Group owning the UNIX socket.
         #[arg(long, value_name = "GROUP")]
@@ -421,6 +532,31 @@ enum ServerCommands {
         /// Cache entry TTL in seconds. Env: SSH_GUARD_CACHE_TTL.
         #[arg(long, value_name = "SECONDS")]
         cache_ttl: Option<u64>,
+
+        /// Learn static allow rules from repeated low-risk LLM approvals.
+        /// Env: SSH_GUARD_LEARN_RULES.
+        #[arg(long = "learn-rules", action = ArgAction::SetTrue)]
+        learn_rules: bool,
+
+        /// Path to learned static rules YAML.
+        /// Env: SSH_GUARD_LEARNED_RULES.
+        #[arg(long, value_name = "PATH")]
+        learned_rules: Option<PathBuf>,
+
+        /// LLM approvals required before a learned allow rule is promoted.
+        /// Env: SSH_GUARD_LEARN_MIN_APPROVALS.
+        #[arg(long, value_name = "N")]
+        learn_min_approvals: Option<u32>,
+
+        /// Maximum risk score eligible for learned static allow promotion.
+        /// Env: SSH_GUARD_LEARN_MAX_RISK.
+        #[arg(long, value_name = "0-10")]
+        learn_max_risk: Option<i32>,
+
+        /// Service-shim behavior for learned rules: off, suggest, or create.
+        /// Env: SSH_GUARD_LEARN_SHIMS.
+        #[arg(long, value_name = "MODE")]
+        learn_shims: Option<String>,
 
         /// Evaluate policy but do not execute approved commands.
         /// Env: SSH_GUARD_DRY_RUN.
@@ -515,6 +651,11 @@ enum ConfigCommands {
         /// Shared token for TCP connections.
         token: String,
     },
+    /// Set admin token
+    SetAdminToken {
+        /// Separate token for TCP admin RPCs.
+        token: String,
+    },
     /// Set default user
     SetUser {
         /// Default user label for client configuration.
@@ -577,6 +718,8 @@ fn guard_env(suffix: &str) -> Option<String> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = dotenvy::dotenv();
+
     // Log level: RUST_LOG > GUARD_LOG_LEVEL > SSH_GUARD_LOG_LEVEL > "info"
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         let level = guard_env("LOG_LEVEL").unwrap_or_else(|| "warn".to_string());
@@ -650,6 +793,54 @@ async fn main() -> Result<()> {
         Ok(MainArgs::Config(subcommand)) => handle_config(subcommand).await,
         Ok(MainArgs::Mcp(subcommand)) => run_mcp(subcommand).await,
         Ok(MainArgs::Session(subcommand)) => handle_session(subcommand).await,
+        Ok(MainArgs::Grant {
+            token,
+            prose,
+            allow,
+            deny,
+            ttl,
+            prompt,
+            prompt_file,
+            static_only,
+            auto_amend,
+            no_auto_amend,
+            socket,
+        }) => {
+            handle_session(top_level_grant_to_session_command(
+                token,
+                prose,
+                allow,
+                deny,
+                ttl,
+                prompt,
+                prompt_file,
+                static_only,
+                auto_amend,
+                no_auto_amend,
+                socket,
+            ))
+            .await
+        }
+        Ok(MainArgs::Appeal {
+            session,
+            socket,
+            binary,
+            args,
+        }) => {
+            let token = session
+                .or_else(|| std::env::var("GUARD_SESSION").ok())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("guard appeal requires --session or GUARD_SESSION")
+                })?;
+            handle_session(SessionCommands::Appeal {
+                token,
+                socket,
+                binary,
+                args,
+            })
+            .await
+        }
         Ok(MainArgs::Status { socket }) => handle_status(socket).await,
         Err(ref e)
             if e.kind() == clap::error::ErrorKind::DisplayHelp
@@ -696,23 +887,32 @@ fn print_run_help() -> Result<()> {
 
 #[cfg(unix)]
 fn current_uid() -> u32 {
-    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
-        return 0;
-    };
-    for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("Uid:") {
-            if let Some(uid_str) = rest.split_whitespace().next() {
-                if let Ok(uid) = uid_str.parse::<u32>() {
-                    return uid;
-                }
-            }
-        }
+    #[cfg(unix)]
+    {
+        unsafe { libc::geteuid() as u32 }
     }
-    0
+    #[cfg(not(unix))]
+    {
+        0
+    }
 }
 
 fn default_state_db_path() -> Option<PathBuf> {
-    dirs::state_dir().map(|dir| dir.join("guard").join("state.db"))
+    default_guard_state_dir().map(|dir| dir.join("state.db"))
+}
+
+fn default_learned_rules_path() -> Option<PathBuf> {
+    default_guard_state_dir().map(|dir| dir.join("learned-rules.yaml"))
+}
+
+fn default_guard_state_dir() -> Option<PathBuf> {
+    if let Some(dir) = dirs::state_dir() {
+        return Some(dir.join("guard"));
+    }
+    if let Some(dir) = dirs::data_local_dir() {
+        return Some(dir.join("guard"));
+    }
+    dirs::home_dir().map(|dir| dir.join(".guard"))
 }
 
 async fn run_server(cmd: ServerCommands) -> Result<()> {
@@ -721,6 +921,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             socket,
             tcp_port,
             auth_token,
+            admin_token,
             socket_group,
             users,
             policy,
@@ -738,6 +939,11 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             no_cache,
             cache_capacity,
             cache_ttl,
+            learn_rules,
+            learned_rules,
+            learn_min_approvals,
+            learn_max_risk,
+            learn_shims,
             dry_run,
             state_db,
             exec_as_caller,
@@ -776,16 +982,55 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 }
             }
 
-            let socket_path = socket
-                .map(PathBuf::from)
-                .or_else(|| {
-                    let config = client_config::ClientConfig::load().ok()?;
-                    config.server_socket.map(PathBuf::from)
-                })
+            #[cfg(not(unix))]
+            if socket.is_some() {
+                anyhow::bail!("--socket is not supported on this platform; use --tcp-port");
+            }
+
+            let configured_socket = socket.map(PathBuf::from).or_else(|| {
+                let config = client_config::ClientConfig::load().ok()?;
+                config.server_socket.map(PathBuf::from)
+            });
+            #[cfg(unix)]
+            let socket_path = configured_socket
                 .or_else(|| dirs::home_dir().map(|h| h.join(".guard").join("guard.sock")));
+            #[cfg(not(unix))]
+            let socket_path: Option<PathBuf> = None;
+
+            let tcp_port = tcp_port
+                .or_else(|| guard_env("TCP_PORT").and_then(|v| v.parse::<u16>().ok()))
+                .or_else(|| {
+                    #[cfg(windows)]
+                    {
+                        Some(8123)
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        None
+                    }
+                });
 
             if let Some(ref path) = socket_path {
                 tracing::info!("Socket: {}", path.display());
+            }
+            if let Some(port) = tcp_port {
+                tracing::info!("TCP: 127.0.0.1:{}", port);
+            }
+            let auth_token = auth_token
+                .filter(|token| !token.is_empty())
+                .or_else(|| guard_env("AUTH_TOKEN").filter(|token| !token.is_empty()));
+            if tcp_port.is_some() && auth_token.is_none() {
+                anyhow::bail!(
+                    "TCP server requires --auth-token or SSH_GUARD_AUTH_TOKEN; configure clients with `guard config set-token`"
+                );
+            }
+            let admin_token = admin_token
+                .filter(|token| !token.is_empty())
+                .or_else(|| guard_env("ADMIN_TOKEN").filter(|token| !token.is_empty()));
+            if tcp_port.is_some() && admin_token.is_none() {
+                tracing::warn!(
+                    "TCP admin RPCs other than ping are disabled; set --admin-token or SSH_GUARD_ADMIN_TOKEN to use guard grant/status over TCP"
+                );
             }
 
             let shim_dir =
@@ -858,16 +1103,24 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 tracing::warn!("No LLM API key provided (set GUARD_LLM_API_KEY, OPENROUTER_API_KEY, or --llm-api-key)");
             }
 
+            let resolved_timeout = llm_timeout
+                .or_else(|| guard_env("LLM_TIMEOUT").and_then(|v| v.parse::<u64>().ok()))
+                .or_else(|| guard_env("TIMEOUT").and_then(|v| v.parse::<u64>().ok()))
+                .unwrap_or(30);
             let mut eval_config = evaluate::EvalConfig::default()
                 .llm_enabled(llm_enabled)
                 .gate_mode(gate_mode)
-                .llm_timeout_secs(llm_timeout.unwrap_or(30));
+                .llm_timeout_secs(resolved_timeout);
 
             if let Some(api_key) = api_key.filter(|value| !value.is_empty()) {
                 eval_config = eval_config.llm_api_key(api_key);
             }
 
-            if let Some(api_url) = llm_api_url.filter(|value| !value.is_empty()) {
+            let resolved_api_url = llm_api_url
+                .filter(|value| !value.is_empty())
+                .or_else(|| guard_env("LLM_API_URL").filter(|value| !value.is_empty()))
+                .or_else(|| guard_env("API_URL").filter(|value| !value.is_empty()));
+            if let Some(api_url) = resolved_api_url {
                 eval_config = eval_config.llm_api_url(api_url);
             }
 
@@ -956,6 +1209,52 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 tracing::info!("LLM decision cache disabled");
             }
 
+            let learning_enabled = learn_rules
+                || guard_env("LEARN_RULES")
+                    .as_deref()
+                    .map(parse_env_bool)
+                    .unwrap_or(false);
+            if learning_enabled {
+                let learned_rules_path = learned_rules
+                    .or_else(|| {
+                        guard_env("LEARNED_RULES")
+                            .filter(|value| !value.is_empty())
+                            .map(PathBuf::from)
+                    })
+                    .or_else(default_learned_rules_path)
+                    .ok_or_else(|| anyhow::anyhow!("could not determine learned rules path"))?;
+                let mut learning_config = LearningConfig::new(learned_rules_path.clone());
+                learning_config.min_approvals = learn_min_approvals
+                    .or_else(|| {
+                        guard_env("LEARN_MIN_APPROVALS").and_then(|v| v.parse::<u32>().ok())
+                    })
+                    .unwrap_or(learning_config.min_approvals)
+                    .max(1);
+                learning_config.max_risk = learn_max_risk
+                    .or_else(|| guard_env("LEARN_MAX_RISK").and_then(|v| v.parse::<i32>().ok()))
+                    .unwrap_or(learning_config.max_risk)
+                    .clamp(0, 10);
+                let shim_mode = learn_shims
+                    .or_else(|| guard_env("LEARN_SHIMS"))
+                    .and_then(|value| AutoShimMode::parse(&value))
+                    .unwrap_or(learning_config.auto_shim);
+                learning_config.auto_shim = shim_mode;
+                let store = LearnedRuleStore::load(learning_config).with_context(|| {
+                    format!(
+                        "failed to load learned rules from {}",
+                        learned_rules_path.display()
+                    )
+                })?;
+                tracing::info!(
+                    "Learned static rules enabled: path={} min_approvals={} max_risk={} shims={}",
+                    store.path().display(),
+                    store.min_approvals(),
+                    store.max_risk(),
+                    store.auto_shim().as_str()
+                );
+                eval_config = eval_config.learned_rules(Arc::new(RwLock::new(store)));
+            }
+
             // Additive prompt: append to base prompt without replacing it.
             // Priority: --system-prompt-append flag > SSH_GUARD_PROMPT_APPEND env var
             let append_path = system_prompt_append.or_else(|| {
@@ -1028,9 +1327,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 tracing::info!("Loaded {} tool config(s)", tool_count);
             }
             if let Some(ref token) = auth_token {
-                if !token.is_empty() {
-                    redact_secrets.push(token.clone());
-                }
+                redact_secrets.push(token.clone());
             }
 
             let (sessions, session_store) = if let Some(ref path) = state_db_path {
@@ -1057,6 +1354,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 secrets,
                 redact,
                 auth_token,
+                admin_token,
                 socket_group,
                 allowed_uids,
                 shim_dir,
@@ -1619,13 +1917,16 @@ async fn run_mcp(subcommand: McpCommands) -> Result<()> {
             tool_name,
         } => {
             let config = client_config::ClientConfig::load().ok().unwrap_or_default();
-            let socket_path = socket.or(config.server_socket).map(PathBuf::from);
-            let tcp_port = tcp_port.or(config.server_tcp_port);
+            let (mut socket_path, mut resolved_tcp_port) = resolve_client_endpoint(socket, &config);
+            if let Some(port) = tcp_port {
+                socket_path = None;
+                resolved_tcp_port = Some(port);
+            }
             let auth_token = token.or(config.auth_token);
 
             let mcp_config = mcp::McpConfig {
                 socket_path,
-                tcp_port,
+                tcp_port: resolved_tcp_port,
                 auth_token,
                 tool_name,
             };
@@ -1638,7 +1939,9 @@ async fn run_mcp(subcommand: McpCommands) -> Result<()> {
 /// Well-known default socket path. Used when nothing more specific is
 /// configured (no --socket flag, no GUARD_SOCKET env, no client.yaml).
 /// Matches the systemd RuntimeDirectory layout in deployment/systemd/.
+#[cfg(unix)]
 const DEFAULT_CLIENT_SOCKET: &str = "/run/guard/guard.sock";
+const DEFAULT_CLIENT_TCP_PORT: u16 = 8123;
 
 /// Resolve the client endpoint from explicit override > env var > client
 /// config > well-known default. Returns (socket, tcp_port). At most one
@@ -1650,28 +1953,68 @@ fn resolve_client_endpoint(
     if let Some(s) = socket_override {
         return (Some(PathBuf::from(s)), None);
     }
+    if let Ok(port) =
+        std::env::var("GUARD_TCP_PORT").or_else(|_| std::env::var("SSH_GUARD_TCP_PORT"))
+    {
+        if let Ok(port) = port.parse::<u16>() {
+            return (None, Some(port));
+        }
+    }
     if let Ok(s) = std::env::var("GUARD_SOCKET") {
         if !s.is_empty() {
+            #[cfg(not(unix))]
+            {
+                return (
+                    None,
+                    Some(config.server_tcp_port.unwrap_or(DEFAULT_CLIENT_TCP_PORT)),
+                );
+            }
+            #[cfg(unix)]
             return (Some(PathBuf::from(s)), None);
         }
     }
+    if let Some(port) = config.server_tcp_port {
+        return (None, Some(port));
+    }
+    #[cfg(unix)]
     if let Some(ref s) = config.server_socket {
         return (Some(PathBuf::from(s)), None);
     }
-    if let Some(port) = config.server_tcp_port {
-        return (None, Some(port));
+    #[cfg(windows)]
+    {
+        return (None, Some(DEFAULT_CLIENT_TCP_PORT));
     }
     // Fall back to the well-known default. If it doesn't exist the
     // connect will fail with a clear "failed to connect" error, which
     // is more useful than the previous "No server configured" since
     // most local installs use the default anyway.
-    (Some(PathBuf::from(DEFAULT_CLIENT_SOCKET)), None)
+    #[cfg(unix)]
+    {
+        (Some(PathBuf::from(DEFAULT_CLIENT_SOCKET)), None)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        (None, Some(DEFAULT_CLIENT_TCP_PORT))
+    }
+}
+
+fn admin_client(
+    socket_path: Option<PathBuf>,
+    tcp_port: Option<u16>,
+    config: &client_config::ClientConfig,
+) -> server::Client {
+    let client = server::Client::new(socket_path, tcp_port);
+    if let Some(token) = config.admin_token.clone() {
+        client.with_admin_token(token)
+    } else {
+        client
+    }
 }
 
 async fn handle_status(socket: Option<String>) -> Result<()> {
     let config = client_config::ClientConfig::load().ok().unwrap_or_default();
     let (socket_path, tcp_port) = resolve_client_endpoint(socket, &config);
-    let client = server::Client::new(socket_path.clone(), tcp_port);
+    let client = admin_client(socket_path.clone(), tcp_port, &config);
 
     // Client info first — useful even when the daemon is unreachable.
     println!("Client:");
@@ -1709,8 +2052,8 @@ async fn handle_status(socket: Option<String>) -> Result<()> {
     println!("  mode           {}", mode);
     println!("  dry_run        {}", dry_run);
 
-    // Try the full Status RPC. Succeeds when the caller is the daemon
-    // UID; refused otherwise. There is no client-side admin token.
+    // Try the full Status RPC. Succeeds for daemon-UID Unix callers or
+    // TCP callers with the configured admin token.
     match client.send_admin(server::AdminRequest::Status).await {
         Ok(server::AdminResponse::Status { status }) => {
             if let Some(ref s) = status.socket_path {
@@ -1732,6 +2075,10 @@ async fn handle_status(socket: Option<String>) -> Result<()> {
             println!(
                 "  cache          enabled={} size={}",
                 status.cache_enabled, status.cache_size
+            );
+            println!(
+                "  learning       enabled={} rules={}",
+                status.learning_enabled, status.learned_rule_count
             );
             println!("  sessions       {}", status.session_count);
             println!("  daemon_uid     {}", status.daemon_uid);
@@ -1776,6 +2123,18 @@ fn format_prompt(prompt: Option<&str>, full: bool) -> String {
     }
 }
 
+fn read_grant_prompt(
+    prompt: Option<String>,
+    prompt_file: Option<&PathBuf>,
+) -> Result<Option<String>> {
+    match prompt_file {
+        Some(path) => Ok(Some(std::fs::read_to_string(path).with_context(|| {
+            format!("failed to read --prompt-file {}", path.display())
+        })?)),
+        None => Ok(prompt),
+    }
+}
+
 /// Parse a `--since` value into an absolute unix-seconds threshold.
 /// Accepts plain integer seconds or simple suffixes: `s`, `m`, `h`, `d`.
 fn parse_since_to_unix(value: &str) -> Result<u64> {
@@ -1814,6 +2173,73 @@ fn generate_session_token() -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+#[allow(clippy::too_many_arguments)]
+fn top_level_grant_to_session_command(
+    token_or_prose: Option<String>,
+    prose: Option<String>,
+    allow: Vec<String>,
+    deny: Vec<String>,
+    ttl: Option<u64>,
+    prompt: Option<String>,
+    prompt_file: Option<PathBuf>,
+    static_only: bool,
+    auto_amend: bool,
+    no_auto_amend: bool,
+    socket: Option<String>,
+) -> SessionCommands {
+    let single_positional_prose = prose.is_none()
+        && token_or_prose
+            .as_deref()
+            .is_some_and(looks_like_quoted_grant_prose);
+
+    if token_or_prose.is_none() || single_positional_prose {
+        let prose = prose.or(token_or_prose);
+        SessionCommands::New {
+            prose,
+            allow,
+            deny,
+            ttl,
+            prompt,
+            prompt_file,
+            static_only,
+            auto_amend,
+            no_auto_amend,
+            socket,
+        }
+    } else {
+        SessionCommands::Grant {
+            token: token_or_prose.expect("checked Some above"),
+            prose,
+            allow,
+            deny,
+            ttl,
+            prompt,
+            prompt_file,
+            static_only,
+            auto_amend,
+            no_auto_amend,
+            socket,
+        }
+    }
+}
+
+fn resolve_session_auto_amend(
+    prose: Option<&str>,
+    auto_amend: bool,
+    no_auto_amend: bool,
+    static_only: bool,
+) -> bool {
+    if static_only || no_auto_amend {
+        false
+    } else {
+        auto_amend || prose.map(|value| !value.trim().is_empty()).unwrap_or(false)
+    }
+}
+
+fn looks_like_quoted_grant_prose(value: &str) -> bool {
+    value.split_whitespace().nth(1).is_some()
+}
+
 async fn handle_session(subcommand: SessionCommands) -> Result<()> {
     let config = client_config::ClientConfig::load().ok().unwrap_or_default();
 
@@ -1821,38 +2247,47 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
     // send. If no grant flags are present we just print and exit; otherwise
     // we send a SessionGrant for the freshly-minted token.
     if let SessionCommands::New {
+        prose,
         allow,
         deny,
         ttl,
         prompt,
         prompt_file,
+        static_only,
+        auto_amend,
+        no_auto_amend,
         socket,
     } = &subcommand
     {
         let token = generate_session_token();
-        let has_grant = !allow.is_empty()
+        let has_grant = prose.is_some()
+            || !allow.is_empty()
             || !deny.is_empty()
             || ttl.is_some()
             || prompt.is_some()
-            || prompt_file.is_some();
+            || prompt_file.is_some()
+            || *static_only;
 
         if has_grant {
-            let prompt_append =
-                match prompt_file {
-                    Some(path) => Some(std::fs::read_to_string(path).with_context(|| {
-                        format!("failed to read --prompt-file {}", path.display())
-                    })?),
-                    None => prompt.clone(),
-                };
+            let prompt_append = read_grant_prompt(prompt.clone(), prompt_file.as_ref())?;
+            let auto_amend = resolve_session_auto_amend(
+                prose.as_deref(),
+                *auto_amend,
+                *no_auto_amend,
+                *static_only,
+            );
 
             let (socket_path, tcp_port) = resolve_client_endpoint(socket.clone(), &config);
-            let client = server::Client::new(socket_path, tcp_port);
+            let client = admin_client(socket_path, tcp_port, &config);
             let request = server::AdminRequest::SessionGrant {
                 token: token.clone(),
                 allow: allow.clone(),
                 deny: deny.clone(),
                 ttl_secs: *ttl,
                 prompt_append,
+                prose: prose.clone(),
+                static_only: *static_only,
+                auto_amend,
             };
             match client.send_admin(request).await? {
                 server::AdminResponse::Ok => {}
@@ -1887,20 +2322,24 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
         SessionCommands::New { .. } => unreachable!("handled above"),
         SessionCommands::Grant {
             token,
+            prose,
             allow,
             deny,
             ttl,
             prompt,
             prompt_file,
+            static_only,
+            auto_amend,
+            no_auto_amend,
             socket,
         } => {
-            let prompt_append =
-                match prompt_file {
-                    Some(path) => Some(std::fs::read_to_string(&path).with_context(|| {
-                        format!("failed to read --prompt-file {}", path.display())
-                    })?),
-                    None => prompt,
-                };
+            let prompt_append = read_grant_prompt(prompt, prompt_file.as_ref())?;
+            let auto_amend = resolve_session_auto_amend(
+                prose.as_deref(),
+                auto_amend,
+                no_auto_amend,
+                static_only,
+            );
             (
                 socket,
                 server::AdminRequest::SessionGrant {
@@ -1909,9 +2348,25 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                     deny,
                     ttl_secs: ttl,
                     prompt_append,
+                    prose,
+                    static_only,
+                    auto_amend,
                 },
             )
         }
+        SessionCommands::Appeal {
+            token,
+            socket,
+            binary,
+            args,
+        } => (
+            socket,
+            server::AdminRequest::SessionAppeal {
+                token,
+                binary,
+                args,
+            },
+        ),
         SessionCommands::Revoke { token, socket } => {
             (socket, server::AdminRequest::SessionRevoke { token })
         }
@@ -1951,7 +2406,7 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
     };
 
     let (socket_path, tcp_port) = resolve_client_endpoint(socket_override, &config);
-    let client = server::Client::new(socket_path, tcp_port);
+    let client = admin_client(socket_path, tcp_port, &config);
 
     match client.send_admin(request).await? {
         server::AdminResponse::Ok => {
@@ -1967,10 +2422,14 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
             } else {
                 for g in &grants {
                     println!(
-                        "[active]  token={} allow={:?} deny={:?} granted_at={} expires_at={} prompt={}",
+                        "[active]  token={} allow={:?} deny={:?} allow_exact={:?} deny_exact={:?} static_only={} auto_amend={} granted_at={} expires_at={} prompt={}",
                         g.token,
                         g.allow,
                         g.deny,
+                        g.allow_exact,
+                        g.deny_exact,
+                        g.static_only,
+                        g.auto_amend,
                         g.granted_at,
                         g.expires_at
                             .map(|t| t.to_string())
@@ -1984,11 +2443,15 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                         server::HistoricalStatus::Expired => "[expired]",
                     };
                     println!(
-                        "{} token={} allow={:?} deny={:?} granted_at={} ended_at={} prompt={}",
+                        "{} token={} allow={:?} deny={:?} allow_exact={:?} deny_exact={:?} static_only={} auto_amend={} granted_at={} ended_at={} prompt={}",
                         label,
                         h.token,
                         h.allow,
                         h.deny,
+                        h.allow_exact,
+                        h.deny_exact,
+                        h.static_only,
+                        h.auto_amend,
                         h.granted_at,
                         h.ended_at,
                         format_prompt(h.prompt_append.as_deref(), print_full_prompt),
@@ -1999,8 +2462,10 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
         server::AdminResponse::SessionShow { report } => {
             if let Some(active) = report.active {
                 println!(
-                    "token={} status=active granted_at={} expires_at={} allow={:?} deny={:?}",
+                    "token={} status=active static_only={} auto_amend={} granted_at={} expires_at={} allow={:?} deny={:?} allow_exact={:?} deny_exact={:?}",
                     active.token,
+                    active.static_only,
+                    active.auto_amend,
                     active.granted_at,
                     active
                         .expires_at
@@ -2008,6 +2473,8 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                         .unwrap_or_else(|| "(never)".to_string()),
                     active.allow,
                     active.deny,
+                    active.allow_exact,
+                    active.deny_exact,
                 );
                 println!(
                     "prompt={}",
@@ -2023,8 +2490,10 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                     server::HistoricalStatus::Expired => "expired",
                 };
                 println!(
-                    "history status={} granted_at={} ended_at={} expires_at={} allow={:?} deny={:?} prompt={}",
+                    "history status={} static_only={} auto_amend={} granted_at={} ended_at={} expires_at={} allow={:?} deny={:?} allow_exact={:?} deny_exact={:?} prompt={}",
                     label,
+                    entry.static_only,
+                    entry.auto_amend,
                     entry.granted_at,
                     entry.ended_at,
                     entry
@@ -2033,6 +2502,8 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                         .unwrap_or_else(|| "(never)".to_string()),
                     entry.allow,
                     entry.deny,
+                    entry.allow_exact,
+                    entry.deny_exact,
                     format_prompt(entry.prompt_append.as_deref(), true),
                 );
             }
@@ -2102,6 +2573,26 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                 }
             }
         }
+        server::AdminResponse::SessionAppeal {
+            allowed,
+            amended,
+            pattern,
+            reason,
+            risk,
+        } => {
+            println!(
+                "allowed={} amended={} risk={} pattern={} reason={}",
+                allowed,
+                amended,
+                risk.map(|value| value.to_string())
+                    .unwrap_or_else(|| "(none)".to_string()),
+                pattern.unwrap_or_else(|| "(none)".to_string()),
+                reason
+            );
+            if !allowed {
+                std::process::exit(1);
+            }
+        }
         server::AdminResponse::Status { .. }
         | server::AdminResponse::Ping { .. }
         | server::AdminResponse::SecretExists { .. }
@@ -2146,6 +2637,14 @@ async fn handle_config(subcommand: ConfigCommands) -> Result<()> {
                     "(none)"
                 }
             );
+            println!(
+                "admin_token: {}",
+                if config.admin_token.is_some() {
+                    "***"
+                } else {
+                    "(none)"
+                }
+            );
         }
         ConfigCommands::SetServer { socket } => {
             let mut config =
@@ -2170,6 +2669,13 @@ async fn handle_config(subcommand: ConfigCommands) -> Result<()> {
             config.save()?;
             println!("Token set");
         }
+        ConfigCommands::SetAdminToken { token } => {
+            let mut config =
+                client_config::ClientConfig::load().context("failed to load client config")?;
+            config.admin_token = Some(token);
+            config.save()?;
+            println!("Admin token set");
+        }
         ConfigCommands::SetUser { user } => {
             let mut config =
                 client_config::ClientConfig::load().context("failed to load client config")?;
@@ -2189,7 +2695,7 @@ async fn handle_config(subcommand: ConfigCommands) -> Result<()> {
 async fn handle_secrets(subcommand: SecretCommands) -> Result<()> {
     let config = client_config::ClientConfig::load().ok().unwrap_or_default();
     let (socket_path, tcp_port) = resolve_client_endpoint(None, &config);
-    let client = server::Client::new(socket_path, tcp_port);
+    let client = admin_client(socket_path, tcp_port, &config);
 
     match subcommand {
         SecretCommands::Add { key, value } => {
@@ -2444,6 +2950,7 @@ mod tests {
                 socket,
                 tcp_port,
                 auth_token,
+                admin_token,
                 socket_group,
                 users,
                 policy,
@@ -2461,6 +2968,11 @@ mod tests {
                 no_cache,
                 cache_capacity,
                 cache_ttl,
+                learn_rules,
+                learned_rules,
+                learn_min_approvals,
+                learn_max_risk,
+                learn_shims,
                 dry_run,
                 state_db,
                 exec_as_caller,
@@ -2472,6 +2984,7 @@ mod tests {
                 socket,
                 tcp_port,
                 auth_token,
+                admin_token,
                 socket_group,
                 users,
                 policy,
@@ -2489,6 +3002,11 @@ mod tests {
                 no_cache,
                 cache_capacity,
                 cache_ttl,
+                learn_rules,
+                learned_rules,
+                learn_min_approvals,
+                learn_max_risk,
+                learn_shims,
                 dry_run,
                 state_db,
                 exec_as_caller,
@@ -2562,6 +3080,193 @@ mod tests {
             panic!("expected start");
         };
         assert_eq!(state_db, Some(PathBuf::from("/var/lib/guard/state.db")));
+    }
+
+    #[test]
+    fn test_server_start_admin_token_flag() {
+        let ServerCommands::Start { admin_token, .. } =
+            parse_start(&["guard", "server", "start", "--admin-token", "adm"])
+        else {
+            panic!("expected start");
+        };
+        assert_eq!(admin_token.as_deref(), Some("adm"));
+    }
+
+    #[test]
+    fn top_level_grant_parses_prose_and_static_only() {
+        match MainArgs::try_parse_from([
+            "guard",
+            "grant",
+            "tok",
+            "--static-only",
+            "readonly nextcloud kube access",
+        ]) {
+            Ok(MainArgs::Grant {
+                token,
+                prose,
+                static_only,
+                ..
+            }) => {
+                assert_eq!(token.as_deref(), Some("tok"));
+                assert_eq!(prose.as_deref(), Some("readonly nextcloud kube access"));
+                assert!(static_only);
+            }
+            Ok(_) => panic!("expected top-level grant"),
+            Err(err) => panic!("expected grant parse, got {err}"),
+        }
+    }
+
+    #[test]
+    fn top_level_grant_bare_prose_mints_session() {
+        let command = top_level_grant_to_session_command(
+            Some("readonly nextcloud kube access".to_string()),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Some(120),
+            None,
+            None,
+            true,
+            false,
+            false,
+            None,
+        );
+
+        match command {
+            SessionCommands::New {
+                prose,
+                ttl,
+                static_only,
+                ..
+            } => {
+                assert_eq!(prose.as_deref(), Some("readonly nextcloud kube access"));
+                assert_eq!(ttl, Some(120));
+                assert!(static_only);
+            }
+            _ => panic!("expected top-level prose grant to mint a session"),
+        }
+    }
+
+    #[test]
+    fn top_level_grant_single_word_keeps_token_path() {
+        let command = top_level_grant_to_session_command(
+            Some("tok".to_string()),
+            None,
+            vec!["whoami".to_string()],
+            Vec::new(),
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+        );
+
+        match command {
+            SessionCommands::Grant { token, allow, .. } => {
+                assert_eq!(token, "tok");
+                assert_eq!(allow, vec!["whoami"]);
+            }
+            _ => panic!("expected single-word top-level grant to update a session"),
+        }
+    }
+
+    #[test]
+    fn session_grant_parses_prose_and_static_only_alias() {
+        match MainArgs::try_parse_from([
+            "guard",
+            "session",
+            "grant",
+            "tok",
+            "--no-llm-fallback",
+            "readonly nextcloud kube access",
+        ]) {
+            Ok(MainArgs::Session(SessionCommands::Grant {
+                token,
+                prose,
+                static_only,
+                ..
+            })) => {
+                assert_eq!(token, "tok");
+                assert_eq!(prose.as_deref(), Some("readonly nextcloud kube access"));
+                assert!(static_only);
+            }
+            Ok(_) => panic!("expected session grant"),
+            Err(err) => panic!("expected session grant parse, got {err}"),
+        }
+    }
+
+    #[test]
+    fn session_grant_parses_auto_amend_flags() {
+        match MainArgs::try_parse_from([
+            "guard",
+            "session",
+            "grant",
+            "tok",
+            "--auto-amend",
+            "--no-auto-amend",
+            "readonly nextcloud kube access",
+        ]) {
+            Ok(MainArgs::Session(SessionCommands::Grant {
+                auto_amend,
+                no_auto_amend,
+                ..
+            })) => {
+                assert!(auto_amend);
+                assert!(no_auto_amend);
+            }
+            Ok(_) => panic!("expected session grant"),
+            Err(err) => panic!("expected session grant parse, got {err}"),
+        }
+    }
+
+    #[test]
+    fn session_appeal_forwards_hyphen_args() {
+        match MainArgs::try_parse_from([
+            "guard", "session", "appeal", "tok", "df", "-h", "--output",
+        ]) {
+            Ok(MainArgs::Session(SessionCommands::Appeal {
+                token,
+                binary,
+                args,
+                ..
+            })) => {
+                assert_eq!(token, "tok");
+                assert_eq!(binary, "df");
+                assert_eq!(args, vec!["-h", "--output"]);
+            }
+            Ok(_) => panic!("expected session appeal"),
+            Err(err) => panic!("expected session appeal parse, got {err}"),
+        }
+    }
+
+    #[test]
+    fn top_level_appeal_parses_session_and_command() {
+        match MainArgs::try_parse_from([
+            "guard",
+            "appeal",
+            "--session",
+            "tok",
+            "kubectl",
+            "get",
+            "pods",
+            "-n",
+            "nextcloud",
+        ]) {
+            Ok(MainArgs::Appeal {
+                session,
+                binary,
+                args,
+                ..
+            }) => {
+                assert_eq!(session.as_deref(), Some("tok"));
+                assert_eq!(binary, "kubectl");
+                assert_eq!(args, vec!["get", "pods", "-n", "nextcloud"]);
+            }
+            Ok(_) => panic!("expected top-level appeal"),
+            Err(err) => panic!("expected top-level appeal parse, got {err}"),
+        }
     }
 
     /// Shared guard for tests that mutate `SSH_GUARD_LLM_MODEL*` environment

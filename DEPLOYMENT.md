@@ -6,6 +6,24 @@ Long-running `guard` server deployment as a system service.
 
 Use this when `guard` should listen on a local UNIX socket and serve local clients (AI agents, shims) through a system service.
 
+On Windows, guard runs with the TCP loopback transport instead of Unix sockets.
+Start it with `--tcp-port` (or use the Windows default `127.0.0.1:8123`) and
+configure clients with `guard config set-port 8123`. TCP callers do not carry a
+trusted Unix UID, so UID-scoped secret injection, `--exec-as-caller`, and
+daemon-UID admin are unavailable. TCP admin RPCs such as `guard grant` require a
+separate `SSH_GUARD_ADMIN_TOKEN`; the ordinary TCP exec token is not sufficient.
+
+The helper script [`deployment/windows/guard-launch.ps1`](deployment/windows/guard-launch.ps1)
+starts the Windows daemon with loopback TCP, optional learned rules, and logs
+under `%LOCALAPPDATA%\guard`. Pass `-EnvFile` when credentials live outside the
+repository, for example in a WSL home directory. If Windows does not have a
+kubeconfig, the launcher attempts a one-time copy from Ubuntu WSL's
+`$KUBECONFIG` or `~/.kube/config` into `%USERPROFILE%\.kube\config` before
+starting the native Windows daemon; pass `-NoCopyKubeconfig` to disable that
+bootstrap. The launcher also generates and stores separate TCP exec/admin tokens
+with `guard config set-token` and `guard config set-admin-token` when they are
+missing.
+
 ## Recommended deployment
 
 Choose the deployment model based on what authority the daemon should have.
@@ -106,11 +124,18 @@ ls -l /run/guard/guard.sock
 ## Notes
 
 - The service runs in server mode over a UNIX socket.
+- On Windows, run `guard server start --tcp-port 8123 --learn-rules` from a
+  service manager or scheduled task and set `SSH_GUARD_LLM_API_KEY` /
+  `OPENROUTER_API_KEY` in that service environment. Use `guard config set-port
+  8123` for clients on the same host.
 - The socket can be world-connectable at the filesystem layer because authorization is enforced by peer UID in the server.
 - Omit `--users` to allow any local UNIX-socket caller. Add `--users` only when the daemon should reject all callers outside a specific UID list.
 - The packaged unit stores persistent session state at `/var/lib/guard/state.db`, which remains writable under the default systemd sandbox profile.
 - For LLM-backed evaluation, provide credentials through the environment file rather than command-line arguments.
 - For static-policy-only deployments, use `--no-llm` and provide a `--policy` file.
+- For latency-sensitive service APIs, enable learned static allows with
+  `--learn-rules`; use `--learn-shims suggest` or `--learn-shims create` to
+  surface shorter wrappers for repeated SSH/API prefixes.
 - Pre-LLM executable validation and credential-pattern deny are off by default. Enable with `--preflight` or `SSH_GUARD_PREFLIGHT=true`. These checks are coarse and over-match (they deny any command containing the `env` token); prefer them only on hosts where LLM cost or latency dominates over false positives.
 - For prompt and policy testing, run a separate `--dry-run` server on its own
   socket so approved commands are evaluated but not executed.

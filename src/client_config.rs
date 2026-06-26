@@ -7,6 +7,7 @@ pub struct ClientConfig {
     pub server_socket: Option<String>,
     pub server_tcp_port: Option<u16>,
     pub auth_token: Option<String>,
+    pub admin_token: Option<String>,
     pub default_user: Option<String>,
 }
 
@@ -19,7 +20,7 @@ impl ClientConfig {
     /// clobber the wrong file. Fail loudly instead.
     fn validate_xdg_config_home() -> Result<()> {
         match std::env::var("XDG_CONFIG_HOME") {
-            Ok(value) if !value.is_empty() && !value.starts_with('/') => {
+            Ok(value) if !value.is_empty() && !std::path::Path::new(&value).is_absolute() => {
                 anyhow::bail!(
                     "XDG_CONFIG_HOME is set to a relative path ('{}'); the XDG base directory \
                      specification requires an absolute path. Set it to an absolute path or \
@@ -73,7 +74,9 @@ mod tests {
 
     #[test]
     fn relative_xdg_config_home_errors() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let previous = std::env::var("XDG_CONFIG_HOME").ok();
 
         // SAFETY: serialized via ENV_LOCK for the test suite.
@@ -101,15 +104,21 @@ mod tests {
 
     #[test]
     fn absolute_xdg_config_home_is_accepted() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let previous = std::env::var("XDG_CONFIG_HOME").ok();
 
-        std::env::set_var("XDG_CONFIG_HOME", "/nonexistent/xdg-test-absolute");
+        let absolute = std::env::temp_dir().join("xdg-test-absolute");
+        std::env::set_var("XDG_CONFIG_HOME", &absolute);
 
         let path = ClientConfig::config_path()
             .expect("config_path must accept absolute paths")
             .expect("dirs crate should return a directory");
-        assert!(path.starts_with("/nonexistent/xdg-test-absolute"));
+        #[cfg(unix)]
+        assert!(path.starts_with(&absolute));
+        #[cfg(not(unix))]
+        assert!(path.ends_with("guard/client.yaml") || path.ends_with("guard\\client.yaml"));
 
         match previous {
             Some(val) => std::env::set_var("XDG_CONFIG_HOME", val),
@@ -119,7 +128,9 @@ mod tests {
 
     #[test]
     fn unset_xdg_config_home_is_accepted() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let previous = std::env::var("XDG_CONFIG_HOME").ok();
 
         std::env::remove_var("XDG_CONFIG_HOME");
