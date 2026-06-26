@@ -28,16 +28,24 @@ use crate::tool_config::ToolRegistry;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::ffi::CString;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, UnixListener, UnixStream};
+use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::NamedPipeServer;
 use tokio::process::Command;
 use tokio::sync::{mpsc, RwLock};
+#[cfg(unix)]
 use uzers::os::unix::UserExt;
 
 const DEFAULT_SOCKET_PATH: &str = "/var/run/guard/guard.sock";
@@ -50,6 +58,10 @@ const MAX_OUTPUT_BYTES: usize = 10_485_760; // 10MB
 #[derive(Debug, Clone)]
 pub enum CallerIdentity {
     Unix { uid: u32 },
+    /// Local caller over a Windows named pipe, identified by the kernel-verified
+    /// SID of the connecting process (the Windows analog of a peer UID).
+    #[cfg(windows)]
+    Windows { sid: String },
     Tcp { token: String },
     Unknown,
 }
@@ -59,6 +71,8 @@ impl CallerIdentity {
     pub fn user_key(&self) -> Option<String> {
         match self {
             Self::Unix { uid } => Some(uid.to_string()),
+            #[cfg(windows)]
+            Self::Windows { sid } => Some(sid.clone()),
             Self::Tcp { token } => Some(token.clone()),
             Self::Unknown => None,
         }
@@ -69,6 +83,8 @@ impl std::fmt::Display for CallerIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unix { uid } => write!(f, "uid={}", uid),
+            #[cfg(windows)]
+            Self::Windows { sid } => write!(f, "sid={}", sid),
             Self::Tcp { token } => {
                 let redacted = if token.len() > 8 {
                     format!("{}...{}", &token[..4], &token[token.len() - 4..])
@@ -512,11 +528,11 @@ impl Server {
         let mut futures = Vec::new();
 
         if let Some(ref socket_path) = self.config.socket_path {
-            tracing::info!("Starting UNIX socket listener on {}", socket_path.display());
+            tracing::info!("Starting local listener on {}", socket_path.display());
             let path = socket_path.clone();
             let config = self.config.clone();
             futures.push(tokio::spawn(async move {
-                Self::run_unix_static(&path, &config).await
+                Self::run_local_static(&path, &config).await
             }));
         }
 
@@ -537,6 +553,46 @@ impl Server {
         Ok(())
     }
 
+    /// Platform dispatch for the local listener: UNIX domain socket on Unix,
+    /// named pipe on Windows.
+    async fn run_local_static(socket_path: &PathBuf, config: &ServerConfig) -> Result<()> {
+        #[cfg(unix)]
+        {
+            Self::run_unix_static(socket_path, config).await
+        }
+        #[cfg(windows)]
+        {
+            Self::run_pipe_static(socket_path, config).await
+        }
+    }
+
+    #[cfg(windows)]
+    async fn run_pipe_static(socket_path: &PathBuf, config: &ServerConfig) -> Result<()> {
+        let pipe_name = winplat::pipe_name(socket_path);
+        tracing::info!("guard server listening on named pipe {}", pipe_name);
+
+        let mut server = winplat::create_pipe_server(&pipe_name, true)?;
+
+        loop {
+            // Wait for a client to connect to the current instance, then hand it
+            // off and immediately stand up the next instance for the next client.
+            server
+                .connect()
+                .await
+                .context("named pipe connect failed")?;
+            let connected = server;
+            server = winplat::create_pipe_server(&pipe_name, false)?;
+
+            let config = config.clone();
+            tokio::spawn(async move {
+                if let Err(e) = handle_client_pipe(connected, &config).await {
+                    tracing::error!("client handler error: {}", e);
+                }
+            });
+        }
+    }
+
+    #[cfg(unix)]
     async fn run_unix_static(socket_path: &PathBuf, config: &ServerConfig) -> Result<()> {
         if let Some(parent) = socket_path.parent() {
             tokio::fs::create_dir_all(parent)
@@ -604,6 +660,7 @@ impl Server {
         }
     }
 
+    #[cfg(unix)]
     async fn chown_to_group(path: &PathBuf, group: &str) -> Result<()> {
         let output = Command::new("chgrp").arg(group).arg(path).output().await?;
 
@@ -618,6 +675,7 @@ impl Server {
         Ok(())
     }
 
+    #[cfg(unix)]
     async fn chmod_path(path: &std::path::Path, mode: u32) -> Result<()> {
         let permissions = std::fs::Permissions::from_mode(mode);
         std::fs::set_permissions(path, permissions)
@@ -626,8 +684,197 @@ impl Server {
     }
 }
 
+/// Windows-only helpers: named-pipe name normalization and peer-SID resolution.
+/// The SID is the Windows analog of a Unix peer UID — the kernel-verified
+/// identity of the process on the other end of the local pipe.
+#[cfg(windows)]
+mod winplat {
+    use anyhow::{bail, Context, Result};
+    use std::os::windows::io::AsRawHandle;
+    use tokio::net::windows::named_pipe::NamedPipeServer;
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    };
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, RevertToSelf, TokenUser, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+        TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::System::Pipes::{CreateNamedPipeW, ImpersonateNamedPipeClient};
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+
+    // Named pipe creation flags (avoid extra feature imports for the constants).
+    const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
+    const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+    const FILE_FLAG_FIRST_PIPE_INSTANCE: u32 = 0x0008_0000;
+    const PIPE_REJECT_REMOTE_CLIENTS: u32 = 0x0000_0008; // byte type/readmode/wait = 0
+    const PIPE_UNLIMITED_INSTANCES: u32 = 255;
+    const PIPE_BUF: u32 = 65536;
+
+    /// Create a named-pipe server instance with an explicit security descriptor
+    /// so local authenticated users can connect to the gate. A pipe's security
+    /// must be set at creation time (the server handle has no WRITE_DAC), so we
+    /// call CreateNamedPipeW directly and wrap the handle into tokio.
+    ///
+    /// Connect access is NOT the trust boundary: the gate enforces policy on
+    /// every request and never exposes the brokered credentials. The boundary is
+    /// the daemon's account isolation. Tighten the trustee set (currently
+    /// Administrators/SYSTEM/Authenticated Users) for a multi-user host.
+    pub fn create_pipe_server(pipe_name: &str, first: bool) -> Result<NamedPipeServer> {
+        let wide: Vec<u16> = pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
+        // Administrators/SYSTEM get full control; Authenticated Users get only
+        // FILE_GENERIC_READ|FILE_GENERIC_WRITE (0x0012019b) so they can CONNECT
+        // but NOT create rogue additional instances of the pipe
+        // (FILE_CREATE_PIPE_INSTANCE is excluded). Tighten AU to a specific agent
+        // SID for a multi-user host.
+        let sddl: Vec<u16> = "D:(A;;GA;;;BA)(A;;GA;;;SY)(A;;0x0012019b;;;AU)\0"
+            .encode_utf16()
+            .collect();
+        unsafe {
+            let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+            if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                1,
+                &mut psd,
+                std::ptr::null_mut(),
+            ) == 0
+            {
+                bail!(
+                    "ConvertStringSecurityDescriptorToSecurityDescriptorW failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            let sa = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: psd,
+                bInheritHandle: 0,
+            };
+            let mut open_mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
+            if first {
+                open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
+            }
+            let handle = CreateNamedPipeW(
+                wide.as_ptr(),
+                open_mode,
+                PIPE_REJECT_REMOTE_CLIENTS,
+                PIPE_UNLIMITED_INSTANCES,
+                PIPE_BUF,
+                PIPE_BUF,
+                0,
+                &sa,
+            );
+            LocalFree(psd as _);
+            if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+                bail!("CreateNamedPipeW failed: {}", std::io::Error::last_os_error());
+            }
+            NamedPipeServer::from_raw_handle(handle as _)
+                .context("NamedPipeServer::from_raw_handle failed")
+        }
+    }
+
+    /// Normalize a configured path/name into a `\\.\pipe\<name>` pipe name so the
+    /// same `--socket` flag works on Windows.
+    pub fn pipe_name(path: &std::path::Path) -> String {
+        let s = path.to_string_lossy().to_string();
+        if s.starts_with(r"\\.\pipe\") || s.starts_with(r"\\?\pipe\") {
+            s
+        } else {
+            let base = path
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("guard");
+            format!(r"\\.\pipe\{}", base)
+        }
+    }
+
+    /// Resolve the SID string of the connected pipe client by briefly
+    /// impersonating it and reading the impersonation token's user.
+    pub fn client_sid(server: &NamedPipeServer) -> Result<String> {
+        let pipe = server.as_raw_handle() as HANDLE;
+        unsafe {
+            if ImpersonateNamedPipeClient(pipe) == 0 {
+                bail!(
+                    "ImpersonateNamedPipeClient failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            let outcome = sid_from_current_thread();
+            // Always drop impersonation. A failed revert would leave this pooled
+            // tokio worker thread impersonating the lower-privilege client for
+            // subsequent tasks (policy eval, credential reads), so a failure here
+            // is unrecoverable for the process: abort rather than risk running
+            // privileged work under the client's token.
+            if RevertToSelf() == 0 {
+                tracing::error!(
+                    "RevertToSelf failed after named-pipe impersonation ({}); aborting",
+                    std::io::Error::last_os_error()
+                );
+                std::process::abort();
+            }
+            outcome
+        }
+    }
+
+    unsafe fn sid_from_current_thread() -> Result<String> {
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) == 0 {
+            bail!("OpenThreadToken failed: {}", std::io::Error::last_os_error());
+        }
+        let result = sid_string_from_token(token);
+        CloseHandle(token);
+        result
+    }
+
+    unsafe fn sid_string_from_token(token: HANDLE) -> Result<String> {
+        let mut len: u32 = 0;
+        // First call sizes the buffer (it is expected to "fail" with the length).
+        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut len);
+        if len == 0 {
+            bail!("GetTokenInformation returned a zero length");
+        }
+        let mut buf = vec![0u8; len as usize];
+        if GetTokenInformation(
+            token,
+            TokenUser,
+            buf.as_mut_ptr() as *mut core::ffi::c_void,
+            len,
+            &mut len,
+        ) == 0
+        {
+            bail!("GetTokenInformation failed: {}", std::io::Error::last_os_error());
+        }
+        // buf is a Vec<u8> (alignment 1); forming a &TOKEN_USER to it would be UB
+        // because TOKEN_USER's embedded PSID forces 8-byte alignment. Read the SID
+        // pointer out with an unaligned read instead of taking a reference.
+        let sid = core::ptr::read_unaligned(core::ptr::addr_of!(
+            (*(buf.as_ptr() as *const TOKEN_USER)).User.Sid
+        ));
+        let mut wide: *mut u16 = std::ptr::null_mut();
+        if ConvertSidToStringSidW(sid, &mut wide) == 0 {
+            bail!(
+                "ConvertSidToStringSidW failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let s = widestring_to_string(wide);
+        LocalFree(wide as _);
+        Ok(s)
+    }
+
+    unsafe fn widestring_to_string(ptr: *const u16) -> String {
+        if ptr.is_null() {
+            return String::new();
+        }
+        let mut len = 0usize;
+        while *ptr.add(len) != 0 {
+            len += 1;
+        }
+        String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
+    }
+}
+
+#[cfg(unix)]
 async fn handle_client_unix(stream: UnixStream, config: &ServerConfig) -> Result<()> {
-    tracing::info!("handle_client_unix: new connection");
     let uid = stream
         .peer_cred()
         .context("failed to read peer credentials")?
@@ -639,17 +886,48 @@ async fn handle_client_unix(stream: UnixStream, config: &ServerConfig) -> Result
         return Err(e);
     }
 
-    tracing::info!("handle_client_unix: uid validated");
-    let (reader, mut writer) = stream.into_split();
+    serve_connection(stream, CallerIdentity::Unix { uid }, config).await
+}
+
+#[cfg(windows)]
+async fn handle_client_pipe(stream: NamedPipeServer, config: &ServerConfig) -> Result<()> {
+    let caller = match winplat::client_sid(&stream) {
+        Ok(sid) => {
+            tracing::info!("named pipe client sid = {}", sid);
+            CallerIdentity::Windows { sid }
+        }
+        Err(e) => {
+            // Fail soft: the policy gate does not depend on identity, but log
+            // loudly so an operator notices identity resolution is degraded.
+            tracing::warn!("could not resolve pipe client SID ({}); treating as unknown", e);
+            CallerIdentity::Windows {
+                sid: "S-unknown".to_string(),
+            }
+        }
+    };
+    serve_connection(stream, caller, config).await
+}
+
+/// Drive the request/response protocol for one connected client, independent of
+/// the underlying transport (UNIX socket or Windows named pipe).
+async fn serve_connection<S>(
+    stream: S,
+    caller: CallerIdentity,
+    config: &ServerConfig,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (reader, mut writer) = tokio::io::split(stream);
     let mut lines = BufReader::new(reader).lines();
 
-    tracing::info!("handle_client_unix: waiting for request...");
+    tracing::info!("serve_connection: waiting for request...");
     while let Ok(Some(line)) = lines.next_line().await {
         if line.len() > MAX_REQUEST_BYTES {
             tracing::warn!("request too large ({} bytes), dropping", line.len());
             continue;
         }
-        tracing::debug!("handle_client_unix: received request (raw)");
+        tracing::debug!("serve_connection: received request (raw)");
         let incoming: IncomingMessage = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
@@ -667,8 +945,6 @@ async fn handle_client_unix(stream: UnixStream, config: &ServerConfig) -> Result
                 continue;
             }
         };
-
-        let caller = CallerIdentity::Unix { uid };
 
         let request = match incoming {
             IncomingMessage::Admin { admin } => {
@@ -767,6 +1043,26 @@ fn emit_exec_audit_events(
     if let ExecOutcome::Failed { reason } = &result.exec {
         config.log_audit_exec_failed(caller, binary, args, reason);
     }
+}
+
+/// Connect to the local guard daemon: UNIX domain socket on Unix, named pipe on
+/// Windows. Returns a stream that implements `AsyncRead + AsyncWrite`.
+#[cfg(unix)]
+async fn connect_local(path: &std::path::Path) -> Result<UnixStream> {
+    UnixStream::connect(path)
+        .await
+        .context("failed to connect to guard server")
+}
+
+#[cfg(windows)]
+async fn connect_local(
+    path: &std::path::Path,
+) -> Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    use tokio::net::windows::named_pipe::ClientOptions;
+    let name = winplat::pipe_name(path);
+    ClientOptions::new()
+        .open(&name)
+        .context("failed to connect to guard server")
 }
 
 async fn handle_admin_request(
@@ -1475,8 +1771,12 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         return ExecuteResult::denied(reason);
     }
 
-    // Validate binary name: reject paths, traversal, and shell metacharacters
+    // Validate binary name: reject paths, traversal, and shell metacharacters.
+    // Windows path forms (backslash, drive-letter `:`, UNC) are rejected too so a
+    // caller cannot smuggle an absolute/relative trojan path as the "binary".
     if request.binary.contains('/')
+        || request.binary.contains('\\')
+        || request.binary.contains(':')
         || request.binary.contains("..")
         || request.binary.contains('\0')
         || request.binary.is_empty()
@@ -1824,6 +2124,7 @@ struct ExecCallerContext {
     home_dir: PathBuf,
 }
 
+#[cfg(unix)]
 fn resolve_exec_caller_context(uid: u32) -> Result<ExecCallerContext> {
     let user = uzers::get_user_by_uid(uid)
         .ok_or_else(|| anyhow::anyhow!("caller uid {} does not exist in passwd", uid))?;
@@ -1840,6 +2141,22 @@ fn resolve_exec_caller_context(uid: u32) -> Result<ExecCallerContext> {
     })
 }
 
+/// On Windows there is no setuid-equivalent here; the daemon executes approved
+/// commands as its own service identity. `--exec-as-caller` is therefore
+/// rejected at startup, so this should only ever be reached with it disabled.
+#[cfg(windows)]
+fn apply_exec_identity(
+    _cmd: &mut Command,
+    config: &ServerConfig,
+    _caller: &CallerIdentity,
+) -> Result<Option<ExecCallerContext>> {
+    if config.exec_as_caller {
+        bail!("--exec-as-caller is not supported on Windows");
+    }
+    Ok(None)
+}
+
+#[cfg(unix)]
 fn apply_exec_identity(
     cmd: &mut Command,
     config: &ServerConfig,
@@ -1930,39 +2247,56 @@ async fn exec_after_approval<W: AsyncWrite + Unpin>(
         }
     }
 
+    // Per-run --env injection, like --secret, is only honored for callers with a
+    // trusted local UID namespace. A non-Unix (Windows named-pipe) caller cannot
+    // set child environment variables, so it cannot redirect a tool's config or
+    // endpoint lookup (e.g. cmk's %HOME%/%USERPROFILE%) via --env.
+    if !request.env.is_empty() && !matches!(caller, CallerIdentity::Unix { .. }) {
+        return ExecuteResult::exec_failed(
+            allow_reason,
+            "per-run --env injection requires a caller with a trusted local UID namespace"
+                .to_string(),
+        );
+    }
     for (key, value) in &request.env {
         tool_env.insert(key.clone(), value.clone());
     }
 
-    let caller_uid = match caller {
-        CallerIdentity::Unix { uid } => *uid,
-        _ => {
-            return ExecuteResult::exec_failed(
-                allow_reason,
-                "secret injection requires a unix socket caller".to_string(),
-            );
-        }
-    };
-    for (env_var, secret_key) in &request.secrets {
-        let value = match config.secrets.get(caller_uid, secret_key).await {
-            Ok(Some(value)) => value,
-            Ok(None) => {
+    // Per-run --secret injection is only available to callers with a trusted
+    // local UID namespace (Unix peer credentials). It is required only when the
+    // request actually asks for secrets; a request with none proceeds on any
+    // transport (e.g. a Windows named-pipe caller).
+    if !request.secrets.is_empty() {
+        let caller_uid = match caller {
+            CallerIdentity::Unix { uid } => *uid,
+            _ => {
                 return ExecuteResult::exec_failed(
                     allow_reason,
-                    format!(
-                        "secret not found: '{}' (required by --secret {})",
-                        secret_key, env_var
-                    ),
-                );
-            }
-            Err(e) => {
-                return ExecuteResult::exec_failed(
-                    allow_reason,
-                    format!("failed to read secret '{}': {}", secret_key, e),
+                    "secret injection requires a caller with a trusted local UID namespace (unix peer credentials)".to_string(),
                 );
             }
         };
-        tool_env.insert(env_var.clone(), value);
+        for (env_var, secret_key) in &request.secrets {
+            let value = match config.secrets.get(caller_uid, secret_key).await {
+                Ok(Some(value)) => value,
+                Ok(None) => {
+                    return ExecuteResult::exec_failed(
+                        allow_reason,
+                        format!(
+                            "secret not found: '{}' (required by --secret {})",
+                            secret_key, env_var
+                        ),
+                    );
+                }
+                Err(e) => {
+                    return ExecuteResult::exec_failed(
+                        allow_reason,
+                        format!("failed to read secret '{}': {}", secret_key, e),
+                    );
+                }
+            };
+            tool_env.insert(env_var.clone(), value);
+        }
     }
 
     tracing::info!(
@@ -1981,7 +2315,8 @@ async fn exec_after_approval<W: AsyncWrite + Unpin>(
     // auth tokens) via env, printenv, /proc/self/environ, or $VAR expansion.
     cmd.env_clear();
 
-    for var in &[
+    #[cfg(unix)]
+    let allow_vars: &[&str] = &[
         "PATH",
         "HOME",
         "USER",
@@ -1995,7 +2330,32 @@ async fn exec_after_approval<W: AsyncWrite + Unpin>(
         "LOGNAME",
         "XDG_RUNTIME_DIR",
         "SSH_AUTH_SOCK",
-    ] {
+    ];
+    // On Windows there is no HOME/USER convention; tools resolve the profile via
+    // USERPROFILE / HOMEDRIVE+HOMEPATH, so those must pass through for the child
+    // (e.g. cmk reads %USERPROFILE%\.cmk\config).
+    #[cfg(windows)]
+    let allow_vars: &[&str] = &[
+        "PATH",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "HOME",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "TEMP",
+        "TMP",
+        "SystemRoot",
+        "SystemDrive",
+        "ComSpec",
+        "PATHEXT",
+        "windir",
+        "USERNAME",
+        "USERDOMAIN",
+        "NUMBER_OF_PROCESSORS",
+        "PROCESSOR_ARCHITECTURE",
+    ];
+    for var in allow_vars {
         if let Ok(val) = std::env::var(var) {
             cmd.env(var, val);
         }
@@ -2026,9 +2386,22 @@ async fn exec_after_approval<W: AsyncWrite + Unpin>(
 
     cmd.env("GUARD_DEPTH", (depth + 1).to_string());
 
+    // Nested-eval shims are a Unix construct; on Windows, prepending a shim dir
+    // only widens CreateProcess's bare-name search path with no benefit, so it is
+    // skipped there.
+    #[cfg(unix)]
     if let Some(ref shim_dir) = config.shim_dir {
         let base_path = std::env::var("PATH").unwrap_or_default();
         cmd.env("PATH", format!("{}:{}", shim_dir.display(), base_path));
+    }
+
+    // On Windows, pin the child working directory to a fixed system directory so
+    // the inherited (daemon) CWD is not part of CreateProcess's bare-name search
+    // order, removing a path by which a planted executable could shadow the
+    // intended binary.
+    #[cfg(windows)]
+    if let Some(sysroot) = std::env::var_os("SystemRoot") {
+        cmd.current_dir(sysroot);
     }
 
     if stream_output {
@@ -2076,6 +2449,7 @@ async fn exec_after_approval<W: AsyncWrite + Unpin>(
 /// dep. /proc/self/status is the kernel-blessed source on Linux. Falls
 /// back to 0 only if procfs is missing — in that case admin only works
 /// when the daemon happens to be uid 0, which is the conservative default.
+#[cfg(unix)]
 fn current_uid() -> u32 {
     let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
         return 0;
@@ -2092,6 +2466,13 @@ fn current_uid() -> u32 {
     0
 }
 
+/// Windows has no numeric daemon UID; admin authorization there is keyed on the
+/// caller SID, not this value, so a stable sentinel is sufficient.
+#[cfg(windows)]
+fn current_uid() -> u32 {
+    0
+}
+
 fn binary_exists_on_path(binary: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;
@@ -2099,11 +2480,50 @@ fn binary_exists_on_path(binary: &str) -> bool {
 
     std::env::split_paths(&path).any(|dir| {
         let candidate = dir.join(binary);
-        let Ok(metadata) = std::fs::metadata(candidate) else {
-            return false;
-        };
-        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+        #[cfg(unix)]
+        {
+            match std::fs::metadata(&candidate) {
+                Ok(metadata) => metadata.is_file() && metadata.permissions().mode() & 0o111 != 0,
+                Err(_) => false,
+            }
+        }
+        #[cfg(windows)]
+        {
+            windows_executable_exists(&candidate)
+        }
     })
+}
+
+/// Windows executability is by extension, not a mode bit: accept the candidate
+/// as-is or with any PATHEXT extension appended (so a bare `cmk` matches
+/// `cmk.exe`).
+#[cfg(windows)]
+fn windows_executable_exists(candidate: &std::path::Path) -> bool {
+    if std::fs::metadata(candidate)
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    let file = match candidate.file_name().and_then(|f| f.to_str()) {
+        Some(f) => f,
+        None => return false,
+    };
+    for ext in exts.split(';') {
+        let ext = ext.trim();
+        if ext.is_empty() {
+            continue;
+        }
+        let with_ext = candidate.with_file_name(format!("{}{}", file, ext));
+        if std::fs::metadata(&with_ext)
+            .map(|m| m.is_file())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn deterministic_credential_deny_reason(binary: &str, args: &[String]) -> Option<String> {
@@ -2268,7 +2688,7 @@ async fn validate_request_injections(
         CallerIdentity::Unix { uid } => *uid,
         _ => {
             if !request.secrets.is_empty() {
-                return Err("secret injection requires a unix socket caller".to_string());
+                return Err("secret injection requires a caller with a trusted local UID namespace (unix peer credentials)".to_string());
             }
             return Ok(());
         }
@@ -2523,10 +2943,8 @@ impl Client {
         let line = serde_json::to_string(&envelope)?;
 
         if let Some(ref socket_path) = self.socket_path {
-            let stream = UnixStream::connect(socket_path)
-                .await
-                .context("failed to connect to guard server")?;
-            let (reader, writer) = stream.into_split();
+            let stream = connect_local(socket_path).await?;
+            let (reader, writer) = tokio::io::split(stream);
             let mut writer = tokio::io::BufWriter::new(writer);
             writer.write_all(line.as_bytes()).await?;
             writer.write_all(b"\n").await?;
@@ -2680,15 +3098,13 @@ impl Client {
             socket = %socket_path.display(),
             "connecting to guard server"
         );
-        let stream = UnixStream::connect(socket_path)
-            .await
-            .context("failed to connect to guard server")?;
+        let stream = connect_local(socket_path).await?;
         tracing::debug!(
             socket = %socket_path.display(),
             "connected to guard server"
         );
 
-        let (reader, writer) = stream.into_split();
+        let (reader, writer) = tokio::io::split(stream);
 
         let mut writer = tokio::io::BufWriter::new(writer);
         tracing::debug!(
@@ -2734,15 +3150,13 @@ impl Client {
             socket = %socket_path.display(),
             "connecting to guard server"
         );
-        let stream = UnixStream::connect(socket_path)
-            .await
-            .context("failed to connect to guard server")?;
+        let stream = connect_local(socket_path).await?;
         tracing::debug!(
             socket = %socket_path.display(),
             "connected to guard server"
         );
 
-        let (reader, writer) = stream.into_split();
+        let (reader, writer) = tokio::io::split(stream);
         let mut writer = tokio::io::BufWriter::new(writer);
         tracing::debug!(
             binary = %request.binary,

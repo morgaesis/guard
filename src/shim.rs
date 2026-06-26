@@ -22,6 +22,7 @@
 use anyhow::{bail, Context, Result};
 use std::fs::{self, File};
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -158,14 +159,18 @@ impl ShimGenerator {
         file.write_all(shim_content.as_bytes())
             .context(format!("failed to write shim: {}", shim_path.display()))?;
 
-        // Make executable
-        let metadata = fs::metadata(&shim_path)?;
-        let mut permissions = metadata.permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&shim_path, permissions).context(format!(
-            "failed to set permissions on: {}",
-            shim_path.display()
-        ))?;
+        // Make executable (Unix mode bit; on Windows executability is by
+        // extension and the shim is not chmod'd).
+        #[cfg(unix)]
+        {
+            let metadata = fs::metadata(&shim_path)?;
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&shim_path, permissions).context(format!(
+                "failed to set permissions on: {}",
+                shim_path.display()
+            ))?;
+        }
 
         tracing::debug!("generated shim: {}", shim_path.display());
         Ok(shim_path)
@@ -481,10 +486,14 @@ mod tests {
         assert!(content.contains("guard"));
         assert!(content.contains("ssh"));
 
-        // Verify it's executable
-        let metadata = fs::metadata(&path)?;
-        let mode = metadata.permissions().mode() & 0o777;
-        assert_eq!(mode, 0o755);
+        // Verify it's executable (Unix mode bit only; no equivalent on Windows).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = fs::metadata(&path)?;
+            let mode = metadata.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o755);
+        }
 
         Ok(())
     }

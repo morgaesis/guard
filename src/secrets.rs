@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -630,10 +631,16 @@ pub struct SecretFd {
 
 impl SecretFd {
     fn new(secret: &str) -> Result<Self> {
+        #[cfg(unix)]
         let temp_dir = tempfile::TempDir::new_in("/tmp")?;
+        #[cfg(windows)]
+        let temp_dir = tempfile::TempDir::new()?;
         let path = temp_dir.path().join("secret");
 
         fs::write(&path, secret)?;
+        // On Windows the temp dir is already owner-scoped by its default ACL;
+        // the 0600 mode applies only on Unix.
+        #[cfg(unix)]
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
 
         Ok(Self { path, temp_dir })
@@ -828,8 +835,16 @@ pub fn detect_backend() -> BackendType {
 
 /// Resolve a UID to a user name via nsswitch; returns None when the UID
 /// has no entry. Used only for display (audit lines, `secrets list`).
+#[cfg(unix)]
 pub fn uid_to_name(uid: u32) -> Option<String> {
     uzers::get_user_by_uid(uid).and_then(|u| u.name().to_str().map(|s| s.to_string()))
+}
+
+/// No passwd database on Windows; secret namespaces are keyed by SID string and
+/// this display-only helper has no numeric-UID source.
+#[cfg(windows)]
+pub fn uid_to_name(_uid: u32) -> Option<String> {
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -960,9 +975,15 @@ mod tests {
         let content = fs::read_to_string(fd.path()).unwrap();
         assert_eq!(content, secret);
 
-        let metadata = fs::metadata(fd.path()).unwrap();
-        let mode = metadata.permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+        // 0600 is a Unix permission semantic; on Windows the temp dir's default
+        // ACL provides owner-only access and there is no mode bit to assert.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = fs::metadata(fd.path()).unwrap();
+            let mode = metadata.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 
     #[tokio::test]

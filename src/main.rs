@@ -577,6 +577,7 @@ fn print_run_help() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn current_uid() -> u32 {
     let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
         return 0;
@@ -677,16 +678,23 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                     .map(parse_env_bool)
                     .unwrap_or(false);
             if exec_as_caller {
-                let daemon_uid = current_uid();
-                if daemon_uid != 0 {
-                    anyhow::bail!("--exec-as-caller requires the daemon to start as root");
+                #[cfg(windows)]
+                anyhow::bail!(
+                    "--exec-as-caller is not supported on Windows; the daemon executes approved commands as its own service account"
+                );
+                #[cfg(unix)]
+                {
+                    let daemon_uid = current_uid();
+                    if daemon_uid != 0 {
+                        anyhow::bail!("--exec-as-caller requires the daemon to start as root");
+                    }
+                    if tcp_port.is_some() {
+                        anyhow::bail!(
+                            "--exec-as-caller requires a unix socket only; TCP callers do not carry a trusted local UID"
+                        );
+                    }
+                    tracing::info!("Approved commands will execute as the connecting unix uid");
                 }
-                if tcp_port.is_some() {
-                    anyhow::bail!(
-                        "--exec-as-caller requires a unix socket only; TCP callers do not carry a trusted local UID"
-                    );
-                }
-                tracing::info!("Approved commands will execute as the connecting unix uid");
             }
 
             let llm_enabled = resolve_bool_flag(llm, no_llm, true);
