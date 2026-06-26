@@ -3,6 +3,8 @@ use crate::session::{
     SessionInteraction, SessionRegistry,
 };
 use anyhow::{Context, Result};
+use guard::gating::approval::Approval;
+use guard::gating::provisional::Provisional;
 use rusqlite::{params, Connection};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -268,9 +270,143 @@ impl SessionStore {
                 exec_status TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_session_interactions_token ON session_interactions(token);
-            CREATE INDEX IF NOT EXISTS idx_session_interactions_at ON session_interactions(at_unix);",
+            CREATE INDEX IF NOT EXISTS idx_session_interactions_at ON session_interactions(at_unix);
+            CREATE TABLE IF NOT EXISTS gating_provisional (
+                handle TEXT PRIMARY KEY,
+                json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_unix INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS gating_approval (
+                handle TEXT PRIMARY KEY,
+                json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_unix INTEGER NOT NULL
+            );",
         )?;
         Ok(())
+    }
+
+    // --- Consequence-gating runtime state (provisional executions and operator
+    // approvals). These are high-churn, handle-keyed rows, so unlike the session
+    // registry they persist incrementally (per-row upsert/delete) rather than by
+    // full-table snapshot, and a provisional is committed before its forward
+    // command runs so a crash still leaves a recoverable revert.
+
+    pub async fn save_provisional(&self, p: Provisional) -> Result<()> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = Self::open_connection(&path)?;
+            Self::init_schema(&conn)?;
+            let json = serde_json::to_string(&p).context("encode provisional")?;
+            conn.execute(
+                "INSERT OR REPLACE INTO gating_provisional (handle, json, status, created_unix)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    p.handle,
+                    json,
+                    p.status.as_str(),
+                    encode_u64(p.created_unix)?
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("save_provisional task failed")?
+    }
+
+    pub async fn delete_provisional(&self, handle: String) -> Result<()> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = Self::open_connection(&path)?;
+            Self::init_schema(&conn)?;
+            conn.execute(
+                "DELETE FROM gating_provisional WHERE handle = ?1",
+                params![handle],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("delete_provisional task failed")?
+    }
+
+    pub async fn load_provisionals(&self) -> Result<Vec<Provisional>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = Self::open_connection(&path)?;
+            Self::init_schema(&conn)?;
+            let mut stmt = conn.prepare("SELECT json FROM gating_provisional")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for row in rows {
+                let json = row?;
+                match serde_json::from_str::<Provisional>(&json) {
+                    Ok(p) => out.push(p),
+                    Err(e) => tracing::warn!("skipping unreadable provisional row: {}", e),
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .context("load_provisionals task failed")?
+    }
+
+    pub async fn save_approval(&self, a: Approval) -> Result<()> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = Self::open_connection(&path)?;
+            Self::init_schema(&conn)?;
+            let json = serde_json::to_string(&a).context("encode approval")?;
+            conn.execute(
+                "INSERT OR REPLACE INTO gating_approval (handle, json, status, created_unix)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    a.handle,
+                    json,
+                    a.status.as_str(),
+                    encode_u64(a.created_unix)?
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("save_approval task failed")?
+    }
+
+    pub async fn delete_approval(&self, handle: String) -> Result<()> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = Self::open_connection(&path)?;
+            Self::init_schema(&conn)?;
+            conn.execute(
+                "DELETE FROM gating_approval WHERE handle = ?1",
+                params![handle],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("delete_approval task failed")?
+    }
+
+    pub async fn load_approvals(&self) -> Result<Vec<Approval>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = Self::open_connection(&path)?;
+            Self::init_schema(&conn)?;
+            let mut stmt = conn.prepare("SELECT json FROM gating_approval")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for row in rows {
+                let json = row?;
+                match serde_json::from_str::<Approval>(&json) {
+                    Ok(a) => out.push(a),
+                    Err(e) => tracing::warn!("skipping unreadable approval row: {}", e),
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .context("load_approvals task failed")?
     }
 }
 
@@ -358,6 +494,8 @@ fn encode_exec_status(status: SessionExecStatus) -> &'static str {
         SessionExecStatus::Completed => "completed",
         SessionExecStatus::Failed => "failed",
         SessionExecStatus::DryRun => "dry_run",
+        SessionExecStatus::Held => "held",
+        SessionExecStatus::Provisional => "provisional",
     }
 }
 
@@ -367,6 +505,8 @@ fn decode_exec_status(value: &str) -> rusqlite::Result<SessionExecStatus> {
         "completed" => Ok(SessionExecStatus::Completed),
         "failed" => Ok(SessionExecStatus::Failed),
         "dry_run" => Ok(SessionExecStatus::DryRun),
+        "held" => Ok(SessionExecStatus::Held),
+        "provisional" => Ok(SessionExecStatus::Provisional),
         other => Err(rusqlite::Error::FromSqlConversionFailure(
             other.len(),
             rusqlite::types::Type::Text,

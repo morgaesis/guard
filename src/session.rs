@@ -118,6 +118,10 @@ pub enum SessionExecStatus {
     Completed,
     Failed,
     DryRun,
+    /// Approved but held for operator approval (consequence gating); not run.
+    Held,
+    /// Executed inside a containment envelope (consequence gating).
+    Provisional,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -359,10 +363,17 @@ impl SessionRegistry {
                 stats.denied += 1;
             }
             match interaction.exec_status {
-                SessionExecStatus::Completed => stats.completed += 1,
+                // Provisional commands did execute (inside a containment
+                // envelope); held commands did not run. The fine-grained gating
+                // states are surfaced by `guard provisionals` / `guard approvals`.
+                SessionExecStatus::Completed | SessionExecStatus::Provisional => {
+                    stats.completed += 1
+                }
                 SessionExecStatus::Failed => stats.exec_failed += 1,
                 SessionExecStatus::DryRun => stats.dry_run += 1,
-                SessionExecStatus::NotAttempted => stats.not_attempted += 1,
+                SessionExecStatus::NotAttempted | SessionExecStatus::Held => {
+                    stats.not_attempted += 1
+                }
             }
             *stats
                 .source_counts

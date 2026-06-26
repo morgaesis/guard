@@ -46,6 +46,21 @@ enum MainArgs {
         /// Repeat the flag or pass a comma-separated list for multiple secrets.
         #[arg(long = "secret", value_name = "SECRET[,SECRET]", value_parser = parse_secret_mapping, value_delimiter = ',')]
         secret_vars: Vec<(String, String)>,
+        /// Rollback command for a recoverable action under consequence gating,
+        /// as a single string (e.g. --revert "systemctl stop nginx"). It is
+        /// itself policy-evaluated; if denied, the whole request is denied.
+        #[arg(long = "revert", value_name = "COMMAND")]
+        revert: Option<String>,
+        /// Auto-revert window in seconds for the containment envelope.
+        #[arg(long = "confirm-within", value_name = "SECONDS")]
+        confirm_within: Option<u64>,
+        /// Force the command onto the operator-approval (hold) path.
+        #[arg(long = "require-approval", action = ArgAction::SetTrue)]
+        require_approval: bool,
+        /// Block up to SECONDS for an operator decision on a held command and
+        /// return the real result inline. Bare flag waits the full approval TTL.
+        #[arg(long = "wait-approval", value_name = "SECONDS", num_args = 0..=1, default_missing_value = "3600")]
+        wait_approval: Option<u64>,
         /// Binary to execute
         binary: String,
         /// Arguments to pass to the binary
@@ -95,6 +110,71 @@ enum MainArgs {
     /// uptime, evaluation mode, and dry-run state. The full config
     /// snapshot is restricted to the daemon UID.
     Status {
+        #[arg(long)]
+        socket: Option<String>,
+    },
+    /// List provisional (containment-envelope) executions awaiting confirmation.
+    Provisionals {
+        #[arg(long)]
+        socket: Option<String>,
+    },
+    /// Confirm a provisional: keep the change and cancel its auto-revert.
+    /// Daemon-UID only.
+    Confirm {
+        handle: String,
+        #[arg(long)]
+        socket: Option<String>,
+    },
+    /// Revert a provisional now (manual rollback). Daemon-UID only.
+    Revert {
+        handle: String,
+        #[arg(long)]
+        socket: Option<String>,
+    },
+    /// List held / decided operator approvals, or show one with a handle.
+    Approvals {
+        /// Optional handle to show a single approval's status and result.
+        handle: Option<String>,
+        #[arg(long)]
+        socket: Option<String>,
+    },
+    /// Approve a held command: execute it from its bound snapshot. Daemon-UID only.
+    Approve {
+        handle: String,
+        #[arg(long)]
+        socket: Option<String>,
+    },
+    /// Deny a held command. Daemon-UID only.
+    Deny {
+        handle: String,
+        #[arg(long)]
+        socket: Option<String>,
+    },
+    /// Run or list operator-defined verbs (the typed, least-expressive interface).
+    #[clap(subcommand)]
+    Verb(VerbCommands),
+}
+
+#[derive(Subcommand)]
+enum VerbCommands {
+    /// List available verbs with their parameters and consequence class.
+    List {
+        #[arg(long)]
+        socket: Option<String>,
+    },
+    /// Run a verb with validated parameters: --param key=value (repeatable).
+    Run {
+        /// Verb name from the catalog.
+        name: String,
+        /// Parameter assignments (key=value), repeatable.
+        #[arg(long = "param", value_name = "KEY=VALUE", value_parser = parse_env_assignment)]
+        params: Vec<(String, String)>,
+        /// Auto-revert window in seconds for a recoverable verb.
+        #[arg(long = "confirm-within", value_name = "SECONDS")]
+        confirm_within: Option<u64>,
+        /// Block up to SECONDS for an operator decision if the verb is held.
+        #[arg(long = "wait-approval", value_name = "SECONDS", num_args = 0..=1, default_missing_value = "3600")]
+        wait_approval: Option<u64>,
         #[arg(long)]
         socket: Option<String>,
     },
@@ -364,6 +444,20 @@ enum ServerCommands {
         /// Path to additive prompt file (appended to base prompt)
         #[arg(long, value_name = "PATH")]
         system_prompt_append: Option<PathBuf>,
+
+        /// Consequence gating: `off` (default) or `consequence`. When enabled,
+        /// LLM-approved commands are routed by reversibility — reversible runs
+        /// immediately, recoverable runs behind an auto-revert envelope, and
+        /// irreversible is held for operator approval. Requires a Unix-socket
+        /// listener (incompatible with --tcp-port). Env: SSH_GUARD_GATE.
+        #[arg(long, value_name = "MODE")]
+        gate: Option<String>,
+
+        /// Path to the verb catalog YAML (the operator-defined, typed interface
+        /// agents call via `guard verb`). Hot-reloaded on change.
+        /// Env: SSH_GUARD_VERBS.
+        #[arg(long, value_name = "PATH")]
+        verbs: Option<PathBuf>,
     },
     /// Connect to guard server and execute a command
     Connect {
@@ -512,14 +606,37 @@ async fn main() -> Result<()> {
         Ok(MainArgs::Run {
             env_vars,
             secret_vars,
+            revert,
+            confirm_within,
+            require_approval,
+            wait_approval,
             binary,
             args,
         }) => {
             let env_vars = env_pairs_to_map(env_vars).map_err(anyhow::Error::msg)?;
             let secret_vars = secret_pairs_to_map(secret_vars).map_err(anyhow::Error::msg)?;
-            run_exec(binary, args, env_vars, secret_vars).await
+            let gating = GatingOptions {
+                revert,
+                confirm_within,
+                require_approval,
+                wait_approval,
+            };
+            run_exec(binary, args, env_vars, secret_vars, gating).await
         }
         Ok(MainArgs::Server(cmd)) => run_server(cmd).await,
+        Ok(MainArgs::Provisionals { socket }) => handle_provisionals(socket).await,
+        Ok(MainArgs::Confirm { handle, socket }) => {
+            handle_gate_action(socket, "confirm", handle).await
+        }
+        Ok(MainArgs::Revert { handle, socket }) => {
+            handle_gate_action(socket, "revert", handle).await
+        }
+        Ok(MainArgs::Approve { handle, socket }) => {
+            handle_gate_action(socket, "approve", handle).await
+        }
+        Ok(MainArgs::Deny { handle, socket }) => handle_gate_action(socket, "deny", handle).await,
+        Ok(MainArgs::Approvals { handle, socket }) => handle_approvals(socket, handle).await,
+        Ok(MainArgs::Verb(subcommand)) => handle_verb(subcommand).await,
         Ok(MainArgs::Secrets(subcommand)) => handle_secrets(subcommand).await,
         Ok(MainArgs::Shim {
             tools,
@@ -626,8 +743,38 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             exec_as_caller,
             system_prompt,
             system_prompt_append,
+            gate,
+            verbs,
         } => {
             tracing::info!("Starting guard server...");
+
+            // Resolve consequence-gating mode: flag > SSH_GUARD_GATE env > off.
+            let gate_mode: guard::gating::GateMode = gate
+                .or_else(|| guard_env("GATE").filter(|v| !v.is_empty()))
+                .map(|v| v.parse())
+                .transpose()
+                .map_err(anyhow::Error::msg)
+                .context("invalid --gate value (expected 'off' or 'consequence')")?
+                .unwrap_or_default();
+            if gate_mode.is_on() {
+                // The operator gate (confirm/approve) is daemon-UID-only and only
+                // a Unix-socket peer can ever be the daemon UID. Over TCP, or on a
+                // Windows named pipe, no caller could approve a held command, so
+                // refuse those listeners rather than ship a dead-end.
+                #[cfg(windows)]
+                anyhow::bail!(
+                    "--gate consequence is not supported on Windows: the operator-approval gate requires Unix peer-credential authorization. Run guard in WSL/Linux for consequence gating."
+                );
+                #[cfg(unix)]
+                {
+                    if tcp_port.is_some() {
+                        anyhow::bail!(
+                            "--gate consequence requires a Unix-socket listener; it is incompatible with --tcp-port (the operator approval gate is daemon-UID-only and unreachable over TCP)"
+                        );
+                    }
+                    tracing::info!("Consequence gating enabled (mode: {})", gate_mode);
+                }
+            }
 
             let socket_path = socket
                 .map(PathBuf::from)
@@ -713,6 +860,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
 
             let mut eval_config = evaluate::EvalConfig::default()
                 .llm_enabled(llm_enabled)
+                .gate_mode(gate_mode)
                 .llm_timeout_secs(llm_timeout.unwrap_or(30));
 
             if let Some(api_key) = api_key.filter(|value| !value.is_empty()) {
@@ -902,7 +1050,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             };
 
             tracing::info!("Creating server instance...");
-            let srv = server::Server::new(
+            let mut srv = server::Server::new(
                 socket_path,
                 tcp_port,
                 evaluator,
@@ -921,6 +1069,25 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 exec_as_caller,
                 state_db_path,
             );
+            srv.set_gate(gate_mode);
+
+            let verbs_path = verbs.or_else(|| {
+                guard_env("VERBS")
+                    .filter(|v| !v.is_empty())
+                    .map(PathBuf::from)
+            });
+            if let Some(path) = verbs_path {
+                let catalog = guard::gating::verb::VerbCatalog::load(&path)
+                    .with_context(|| format!("failed to load verb catalog {}", path.display()))?;
+                tracing::info!(
+                    "Loaded verb catalog from {} ({} verb(s), version {})",
+                    path.display(),
+                    catalog.names().len(),
+                    catalog.version()
+                );
+                srv.set_verbs(catalog);
+            }
+
             srv.run().await
         }
         ServerCommands::Connect {
@@ -995,17 +1162,62 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
     }
 }
 
+/// Consequence-gating options parsed from `guard run` flags.
+struct GatingOptions {
+    revert: Option<String>,
+    confirm_within: Option<u64>,
+    require_approval: bool,
+    wait_approval: Option<u64>,
+}
+
+/// Parse a `--revert "binary arg1 arg2"` string into a structured RevertSpec
+/// (no shell is ever run; this only splits the operator's command into argv).
+fn parse_revert(spec: &str) -> Result<server::RevertSpec> {
+    let parts =
+        shell_words::split(spec).map_err(|e| anyhow::anyhow!("invalid --revert command: {}", e))?;
+    let mut it = parts.into_iter();
+    let binary = it
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("--revert command is empty"))?;
+    Ok(server::RevertSpec {
+        binary,
+        args: it.collect(),
+    })
+}
+
+fn print_coverage(coverage: &Option<guard::gating::Coverage>) {
+    if let Some(c) = coverage {
+        for line in &c.checked {
+            eprintln!("  checked:     {}", line);
+        }
+        for line in &c.not_checked {
+            eprintln!("  NOT checked: {}", line);
+        }
+    }
+}
+
 async fn run_exec(
     binary: String,
     args: Vec<String>,
     env_vars: HashMap<String, String>,
     secret_vars: HashMap<String, String>,
+    gating: GatingOptions,
 ) -> Result<()> {
     let config = client_config::ClientConfig::load().ok().unwrap_or_default();
 
     let (socket_path, tcp_port) = resolve_client_endpoint(None, &config);
 
-    let mut client = server::Client::new(socket_path, tcp_port);
+    let revert = match gating.revert.as_deref() {
+        Some(spec) => Some(parse_revert(spec)?),
+        None => None,
+    };
+
+    let mut client = server::Client::new(socket_path, tcp_port).with_gating(
+        revert,
+        gating.confirm_within,
+        gating.require_approval,
+        gating.wait_approval,
+    );
     if let Some(token) = config.auth_token {
         client = client.with_auth(token);
     }
@@ -1037,6 +1249,46 @@ async fn run_exec(
         })
         .await?;
 
+    // Consequence-gate outcomes: a held command did not run; a provisional ran
+    // behind an auto-revert timer.
+    match resp.status {
+        Some(server::GateStatus::Held) => {
+            let handle = resp.handle.clone().unwrap_or_default();
+            eprintln!("HELD for operator approval: {}", resp.reason);
+            eprintln!("  handle:  {}", handle);
+            eprintln!("  approve: guard approve {}", handle);
+            eprintln!("  poll:    guard approvals {}", handle);
+            print_coverage(&resp.coverage);
+            // Not executed; exit non-zero so callers do not treat it as success.
+            std::process::exit(75); // EX_TEMPFAIL: try again after approval
+        }
+        Some(server::GateStatus::Provisional) => {
+            if !streamed_output {
+                if let Some(stdout) = &resp.stdout {
+                    print!("{}", stdout);
+                }
+                if let Some(stderr) = &resp.stderr {
+                    eprint!("{}", stderr);
+                }
+            }
+            let handle = resp.handle.clone().unwrap_or_default();
+            eprintln!("PROVISIONAL (containment envelope): {}", resp.reason);
+            eprintln!("  handle:  {}", handle);
+            eprintln!("  confirm: guard confirm {}  (else auto-reverts)", handle);
+            print_coverage(&resp.coverage);
+            if let Some(code) = resp.exit_code {
+                std::process::exit(code);
+            }
+            return Ok(());
+        }
+        Some(server::GateStatus::DryRun) => {
+            println!("[DRY-RUN] {}", resp.reason);
+            print_coverage(&resp.coverage);
+            return Ok(());
+        }
+        _ => {}
+    }
+
     if resp.allowed {
         tracing::info!(
             binary = %binary,
@@ -1063,6 +1315,298 @@ async fn run_exec(
         );
         eprintln!("DENIED: {}", resp.reason);
         std::process::exit(1);
+    }
+}
+
+/// Resolve the admin endpoint and build a client for a gate-control RPC.
+fn gate_client(socket_override: Option<String>) -> server::Client {
+    let config = client_config::ClientConfig::load().ok().unwrap_or_default();
+    let (socket_path, tcp_port) = resolve_client_endpoint(socket_override, &config);
+    let mut client = server::Client::new(socket_path, tcp_port);
+    if let Some(token) = config.auth_token {
+        client = client.with_auth(token);
+    }
+    client
+}
+
+async fn handle_provisionals(socket: Option<String>) -> Result<()> {
+    let client = gate_client(socket);
+    match client
+        .send_admin(server::AdminRequest::Provisionals)
+        .await?
+    {
+        server::AdminResponse::Provisionals { items } => {
+            if items.is_empty() {
+                println!("(no provisional executions)");
+            }
+            for p in &items {
+                println!(
+                    "[{}] handle={} cmd={:?} revert={:?} deadline={} reason={:?}{}",
+                    p.status,
+                    p.handle,
+                    p.command,
+                    p.revert_command,
+                    p.deadline_unix,
+                    p.reason,
+                    p.revert_detail
+                        .as_ref()
+                        .map(|d| format!(" revert_detail={:?}", d))
+                        .unwrap_or_default(),
+                );
+            }
+            Ok(())
+        }
+        server::AdminResponse::Error { message } => {
+            eprintln!("error: {}", message);
+            std::process::exit(1);
+        }
+        _ => {
+            eprintln!("unexpected response");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn handle_approvals(socket: Option<String>, handle: Option<String>) -> Result<()> {
+    let client = gate_client(socket);
+    let request = match handle {
+        Some(h) => server::AdminRequest::ApprovalShow { handle: h },
+        None => server::AdminRequest::ApprovalList,
+    };
+    match client.send_admin(request).await? {
+        server::AdminResponse::Approvals { items } => {
+            if items.is_empty() {
+                println!("(no approvals)");
+            }
+            for a in &items {
+                println!(
+                    "[{}] handle={} risk={:?} class={:?} cmd={:?} fp={} reason={:?}",
+                    a.status, a.handle, a.risk, a.reversibility, a.command, a.fingerprint, a.reason
+                );
+            }
+            Ok(())
+        }
+        server::AdminResponse::ApprovalShow { item } => {
+            println!(
+                "[{}] handle={} risk={:?} class={:?} cmd={:?} fp={}",
+                item.status,
+                item.handle,
+                item.risk,
+                item.reversibility,
+                item.command,
+                item.fingerprint
+            );
+            if let Some(code) = item.exit_code {
+                println!("exit_code={}", code);
+            }
+            if let Some(out) = &item.stdout {
+                print!("{}", out);
+            }
+            if let Some(err) = &item.stderr {
+                eprint!("{}", err);
+            }
+            if let Some(reason) = &item.decided_reason {
+                println!("decision: {}", reason);
+            }
+            Ok(())
+        }
+        server::AdminResponse::Error { message } => {
+            eprintln!("error: {}", message);
+            std::process::exit(1);
+        }
+        _ => {
+            eprintln!("unexpected response");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
+    match subcommand {
+        VerbCommands::List { socket } => {
+            let client = gate_client(socket);
+            match client.send_admin(server::AdminRequest::VerbList).await? {
+                server::AdminResponse::Verbs { items } => {
+                    if items.is_empty() {
+                        println!("(no verbs; start the daemon with --verbs <catalog.yaml>)");
+                    }
+                    for v in &items {
+                        println!(
+                            "{} [{}]{}{} — {}",
+                            v.name,
+                            v.consequence,
+                            if v.trusted { " trusted" } else { "" },
+                            if v.has_revert { " revertable" } else { "" },
+                            v.description
+                        );
+                        for (p, pattern) in &v.params {
+                            println!("    --param {}=<{}>", p, pattern);
+                        }
+                    }
+                    Ok(())
+                }
+                server::AdminResponse::Error { message } => {
+                    eprintln!("error: {}", message);
+                    std::process::exit(1);
+                }
+                _ => {
+                    eprintln!("unexpected response");
+                    std::process::exit(1);
+                }
+            }
+        }
+        VerbCommands::Run {
+            name,
+            params,
+            confirm_within,
+            wait_approval,
+            socket,
+        } => {
+            let config = client_config::ClientConfig::load().ok().unwrap_or_default();
+            let (socket_path, tcp_port) = resolve_client_endpoint(socket, &config);
+            let param_map: std::collections::BTreeMap<String, String> =
+                params.into_iter().collect();
+            let invocation = server::VerbInvocation {
+                name: name.clone(),
+                params: param_map,
+            };
+            let mut client = server::Client::new(socket_path, tcp_port)
+                .with_verb(invocation)
+                .with_gating(None, confirm_within, false, wait_approval);
+            if let Some(token) = config.auth_token {
+                client = client.with_auth(token);
+            }
+            if let Ok(session) = std::env::var("GUARD_SESSION") {
+                if !session.is_empty() {
+                    client = client.with_session(session);
+                }
+            }
+            // Verb binary/args are rendered server-side; the client sends empty.
+            let mut streamed = false;
+            let resp = client
+                .execute_streaming_with_injections(
+                    "",
+                    &[],
+                    HashMap::new(),
+                    HashMap::new(),
+                    |stream, data| {
+                        streamed = true;
+                        match stream {
+                            server::OutputStream::Stdout => {
+                                print!("{}", data);
+                                let _ = std::io::stdout().flush();
+                            }
+                            server::OutputStream::Stderr => {
+                                eprint!("{}", data);
+                                let _ = std::io::stderr().flush();
+                            }
+                        }
+                    },
+                )
+                .await?;
+            render_gated_response(&resp, streamed, &name)
+        }
+    }
+}
+
+/// Print a gated response (shared by `guard run` and `guard verb run`).
+fn render_gated_response(
+    resp: &server::ExecuteResponse,
+    streamed: bool,
+    label: &str,
+) -> Result<()> {
+    match resp.status {
+        Some(server::GateStatus::Held) => {
+            let handle = resp.handle.clone().unwrap_or_default();
+            eprintln!("HELD for operator approval: {}", resp.reason);
+            eprintln!("  handle:  {}", handle);
+            eprintln!("  approve: guard approve {}", handle);
+            eprintln!("  poll:    guard approvals {}", handle);
+            print_coverage(&resp.coverage);
+            std::process::exit(75);
+        }
+        Some(server::GateStatus::Provisional) => {
+            if !streamed {
+                if let Some(out) = &resp.stdout {
+                    print!("{}", out);
+                }
+                if let Some(err) = &resp.stderr {
+                    eprint!("{}", err);
+                }
+            }
+            let handle = resp.handle.clone().unwrap_or_default();
+            eprintln!("PROVISIONAL (containment envelope): {}", resp.reason);
+            eprintln!("  handle:  {}", handle);
+            eprintln!("  confirm: guard confirm {}  (else auto-reverts)", handle);
+            print_coverage(&resp.coverage);
+            if let Some(code) = resp.exit_code {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        Some(server::GateStatus::DryRun) => {
+            println!("[DRY-RUN] {}", resp.reason);
+            print_coverage(&resp.coverage);
+            Ok(())
+        }
+        _ => {
+            if resp.allowed {
+                if !streamed {
+                    if let Some(out) = &resp.stdout {
+                        print!("{}", out);
+                    }
+                    if let Some(err) = &resp.stderr {
+                        eprint!("{}", err);
+                    }
+                }
+                if let Some(code) = resp.exit_code {
+                    std::process::exit(code);
+                }
+                Ok(())
+            } else {
+                eprintln!("DENIED ({}): {}", label, resp.reason);
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+async fn handle_gate_action(socket: Option<String>, action: &str, handle: String) -> Result<()> {
+    let client = gate_client(socket);
+    let request = match action {
+        "confirm" => server::AdminRequest::Confirm { handle },
+        "revert" => server::AdminRequest::Revert { handle },
+        "approve" => server::AdminRequest::Approve { handle },
+        "deny" => server::AdminRequest::Deny { handle },
+        _ => unreachable!("unknown gate action"),
+    };
+    match client.send_admin(request).await? {
+        server::AdminResponse::GateAction {
+            message,
+            exit_code,
+            stdout,
+            stderr,
+        } => {
+            println!("{}", message);
+            if let Some(out) = &stdout {
+                print!("{}", out);
+            }
+            if let Some(err) = &stderr {
+                eprint!("{}", err);
+            }
+            if let Some(code) = exit_code {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        server::AdminResponse::Error { message } => {
+            eprintln!("error: {}", message);
+            std::process::exit(1);
+        }
+        _ => {
+            eprintln!("unexpected response");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -1539,6 +2083,8 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                         session::SessionExecStatus::Completed => "completed",
                         session::SessionExecStatus::Failed => "failed",
                         session::SessionExecStatus::DryRun => "dry_run",
+                        session::SessionExecStatus::Held => "held",
+                        session::SessionExecStatus::Provisional => "provisional",
                     };
                     println!(
                         "recent at={} allowed={} source={:?} risk={} exec={} cmd={:?} reason={:?}",
@@ -1560,7 +2106,12 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
         | server::AdminResponse::Ping { .. }
         | server::AdminResponse::SecretExists { .. }
         | server::AdminResponse::SecretList { .. }
-        | server::AdminResponse::SecretListDetailed { .. } => {
+        | server::AdminResponse::SecretListDetailed { .. }
+        | server::AdminResponse::GateAction { .. }
+        | server::AdminResponse::Provisionals { .. }
+        | server::AdminResponse::Approvals { .. }
+        | server::AdminResponse::ApprovalShow { .. }
+        | server::AdminResponse::Verbs { .. } => {
             // session subcommands never request these response variants.
             eprintln!("unexpected response from session admin call");
             std::process::exit(1);
@@ -1915,6 +2466,8 @@ mod tests {
                 exec_as_caller,
                 system_prompt,
                 system_prompt_append,
+                gate,
+                verbs,
             }) => ServerCommands::Start {
                 socket,
                 tcp_port,
@@ -1941,6 +2494,8 @@ mod tests {
                 exec_as_caller,
                 system_prompt,
                 system_prompt_append,
+                gate,
+                verbs,
             },
             _ => panic!("expected server start args"),
         }

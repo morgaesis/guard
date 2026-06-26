@@ -1,3 +1,4 @@
+use crate::gating::{GateMode, Reversibility};
 use crate::policy::{PolicyEngine, PolicyMode};
 use anyhow::{bail, Context, Result};
 use regex::Regex;
@@ -19,6 +20,12 @@ const SYSTEM_PROMPT_SAFE: &str = include_str!("../config/system-prompt-safe.md")
 
 /// PARANOID mode prompt: block everything except basic read-only inspection.
 const SYSTEM_PROMPT_PARANOID: &str = include_str!("../config/system-prompt-paranoid.md");
+
+/// Consequence-classification appendix. Appended to whichever base prompt is
+/// active only when `GateMode::Consequence` is enabled. It is purely additive:
+/// it asks the model to classify the reversibility of commands it already
+/// approves and never changes the approve/deny boundary the base prompt encodes.
+const SYSTEM_PROMPT_GATING: &str = include_str!("../config/system-prompt-gating.md");
 
 /// Default model used when no `--llm-model` or `--llm-models` is supplied.
 ///
@@ -56,17 +63,29 @@ struct CacheEntry {
 
 #[derive(Clone)]
 enum CachedResult {
-    Allow { reason: String, risk: Option<i32> },
-    Deny { reason: String, risk: Option<i32> },
+    Allow {
+        reason: String,
+        risk: Option<i32>,
+        reversibility: Option<Reversibility>,
+    },
+    Deny {
+        reason: String,
+        risk: Option<i32>,
+    },
 }
 
 impl CachedResult {
     fn into_eval(self) -> EvalResult {
         match self {
-            CachedResult::Allow { reason, risk } => EvalResult::Allow {
+            CachedResult::Allow {
+                reason,
+                risk,
+                reversibility,
+            } => EvalResult::Allow {
                 reason,
                 source: EvalSource::Llm,
                 risk,
+                reversibility,
             },
             CachedResult::Deny { reason, risk } => EvalResult::Deny {
                 reason,
@@ -205,6 +224,11 @@ pub struct EvalConfig {
     pub cache_enabled: bool,
     pub cache_capacity: usize,
     pub cache_ttl: Duration,
+    /// Consequence-gating mode. When `Consequence`, the evaluator appends the
+    /// classification appendix to the system prompt and asks the model for a
+    /// reversibility class on every approval. Fixed for the evaluator's
+    /// lifetime (the daemon recreates the evaluator if the prompt changes).
+    pub gate_mode: GateMode,
 }
 
 impl Default for EvalConfig {
@@ -218,6 +242,7 @@ impl Default for EvalConfig {
             cache_enabled: true,
             cache_capacity: DEFAULT_CACHE_CAPACITY,
             cache_ttl: Duration::from_secs(DEFAULT_CACHE_TTL_SECS),
+            gate_mode: GateMode::Off,
         }
     }
 }
@@ -292,6 +317,11 @@ impl EvalConfig {
         self.cache_ttl = ttl;
         self
     }
+
+    pub fn gate_mode(mut self, mode: GateMode) -> Self {
+        self.gate_mode = mode;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -299,6 +329,11 @@ pub struct LlmResponse {
     pub decision: String,
     pub reason: String,
     pub risk: i32,
+    /// Reversibility class for an APPROVE decision when gating is enabled.
+    /// `None` when gating is off or the model omitted/garbled the field; the
+    /// routing layer treats `None` as "uncertain" and fails safe to a hold.
+    #[serde(default)]
+    pub reversibility: Option<Reversibility>,
 }
 
 #[derive(Debug, Clone)]
@@ -307,6 +342,10 @@ pub enum EvalResult {
         reason: String,
         source: EvalSource,
         risk: Option<i32>,
+        /// Reversibility class from the LLM when gating is enabled. `None` for
+        /// static-policy allows and when gating is off; the consequence gate
+        /// treats `None` as uncertain and holds.
+        reversibility: Option<Reversibility>,
     },
     Deny {
         reason: String,
@@ -356,6 +395,16 @@ impl EvalResult {
             EvalResult::Allow { reason, .. } => reason.clone(),
             EvalResult::Deny { reason, .. } => reason.clone(),
             EvalResult::Error(e) => format!("LLM unavailable: {}", e),
+        }
+    }
+
+    /// Reversibility class for an allow decision, if the evaluator produced one
+    /// (LLM allows under gating). `None` for denials, errors, static-policy
+    /// allows, and allows made with gating off.
+    pub fn reversibility(&self) -> Option<Reversibility> {
+        match self {
+            EvalResult::Allow { reversibility, .. } => *reversibility,
+            _ => None,
         }
     }
 
@@ -431,6 +480,7 @@ pub struct Evaluator {
     system_prompt: String,
     cache: Option<RwLock<EvalCache>>,
     mode: Option<PolicyMode>,
+    gate_mode: GateMode,
 }
 
 impl Evaluator {
@@ -495,6 +545,18 @@ impl Evaluator {
             system_prompt
         };
 
+        // When consequence-gating is enabled, append the classification appendix.
+        // It is additive: it asks the model to classify the reversibility of
+        // commands it already approves and never alters the approve/deny boundary
+        // the base prompt encodes. With gating off, the prompt is byte-identical
+        // to the pre-gating build.
+        let system_prompt = if config.gate_mode.is_on() {
+            tracing::info!("Consequence gating enabled: appending classification appendix");
+            format!("{}\n\n{}", system_prompt, SYSTEM_PROMPT_GATING)
+        } else {
+            system_prompt
+        };
+
         let http_client = Client::builder()
             .timeout(config.llm.timeout())
             .build()
@@ -521,11 +583,16 @@ impl Evaluator {
             system_prompt,
             cache,
             mode: config.mode,
+            gate_mode: config.gate_mode,
         })
     }
 
     pub fn mode(&self) -> Option<PolicyMode> {
         self.mode
+    }
+
+    pub fn gate_mode(&self) -> GateMode {
+        self.gate_mode
     }
 
     pub fn llm_enabled(&self) -> bool {
@@ -688,6 +755,7 @@ impl Evaluator {
                                 CachedResult::Allow {
                                     reason: reason.clone(),
                                     risk: result.risk(),
+                                    reversibility: result.reversibility(),
                                 },
                             );
                         }
@@ -718,6 +786,7 @@ impl Evaluator {
                     reason: static_result.reason,
                     source: EvalSource::StaticPolicy,
                     risk: None,
+                    reversibility: None,
                 };
             }
         }
@@ -774,6 +843,13 @@ impl Evaluator {
                             reason: decision.reason,
                             source: EvalSource::Llm,
                             risk: Some(decision.risk),
+                            // Carry the model's class through only when gating is
+                            // on; off-mode allows stay unclassified.
+                            reversibility: if self.gate_mode.is_on() {
+                                decision.reversibility
+                            } else {
+                                None
+                            },
                         };
                     } else {
                         return EvalResult::Deny {
@@ -902,10 +978,11 @@ impl Evaluator {
         system_prompt: &str,
         use_function_calling: bool,
     ) -> Result<(LlmResponse, TokenUsage), AttemptError> {
+        let gating = self.gate_mode.is_on();
         let body = if use_function_calling {
-            build_function_call_body(model, system_prompt, command)
+            build_function_call_body(model, system_prompt, command, gating)
         } else {
-            build_json_response_body(model, system_prompt, command)
+            build_json_response_body(model, system_prompt, command, gating)
         };
 
         tracing::debug!("LLM POST {}: model={}", api_url, model);
@@ -1026,8 +1103,39 @@ fn truncate(s: &str, max: usize) -> String {
 /// Build the OpenAI-compatible body for a function-calling request. The evaluator
 /// defines exactly one tool, `decide`, with a strict schema, and forces the model
 /// to call it via `tool_choice`.
-fn build_function_call_body(model: &str, system_prompt: &str, command: &str) -> serde_json::Value {
+fn build_function_call_body(
+    model: &str,
+    system_prompt: &str,
+    command: &str,
+    gating: bool,
+) -> serde_json::Value {
     let user_message = format!("Command: {}", command);
+    let mut properties = serde_json::json!({
+        "decision": {
+            "type": "string",
+            "enum": ["APPROVE", "DENY"],
+            "description": "APPROVE if the command is allowed under the active mode policy, DENY if the active mode policy blocks it"
+        },
+        "reason": {
+            "type": "string",
+            "description": "Brief explanation of the decision (one sentence)"
+        },
+        "risk": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10,
+            "description": "Risk score from 0 (completely safe) to 10 (catastrophic)"
+        }
+    });
+    let mut required = vec!["decision", "reason", "risk"];
+    if gating {
+        properties["reversibility"] = serde_json::json!({
+            "type": "string",
+            "enum": ["reversible", "recoverable", "irreversible"],
+            "description": "For an APPROVE decision, how reversible the command's effect is. Does not change the decision; classify only commands you approve. When unsure pick the more destructive class."
+        });
+        required.push("reversibility");
+    }
     serde_json::json!({
         "model": model,
         "max_tokens": 512,
@@ -1042,24 +1150,8 @@ fn build_function_call_body(model: &str, system_prompt: &str, command: &str) -> 
                 "description": "Record the authorization decision for the command",
                 "parameters": {
                     "type": "object",
-                    "properties": {
-                        "decision": {
-                            "type": "string",
-                            "enum": ["APPROVE", "DENY"],
-                            "description": "APPROVE if the command is allowed under the active mode policy, DENY if the active mode policy blocks it"
-                        },
-                        "reason": {
-                            "type": "string",
-                            "description": "Brief explanation of the decision (one sentence)"
-                        },
-                        "risk": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "maximum": 10,
-                            "description": "Risk score from 0 (completely safe) to 10 (catastrophic)"
-                        }
-                    },
-                    "required": ["decision", "reason", "risk"],
+                    "properties": properties,
+                    "required": required,
                     "additionalProperties": false
                 }
             }
@@ -1071,10 +1163,20 @@ fn build_function_call_body(model: &str, system_prompt: &str, command: &str) -> 
 /// Build the request body for the fallback path: tell the model to emit a bare
 /// JSON object and parse it tolerantly. Used after a parse-error retry or when
 /// the provider does not support function calling.
-fn build_json_response_body(model: &str, system_prompt: &str, command: &str) -> serde_json::Value {
+fn build_json_response_body(
+    model: &str,
+    system_prompt: &str,
+    command: &str,
+    gating: bool,
+) -> serde_json::Value {
+    let schema_hint = if gating {
+        "{\"decision\": \"APPROVE\" or \"DENY\", \"reason\": \"brief\", \"risk\": 0-10, \"reversibility\": \"reversible\" or \"recoverable\" or \"irreversible\"}"
+    } else {
+        "{\"decision\": \"APPROVE\" or \"DENY\", \"reason\": \"brief\", \"risk\": 0-10}"
+    };
     let user_message = format!(
-        "Command: {}\n\nRespond with ONLY a JSON object matching this schema (no prose, no markdown):\n{{\"decision\": \"APPROVE\" or \"DENY\", \"reason\": \"brief\", \"risk\": 0-10}}",
-        command
+        "Command: {}\n\nRespond with ONLY a JSON object matching this schema (no prose, no markdown):\n{}",
+        command, schema_hint
     );
     serde_json::json!({
         "model": model,
@@ -1167,10 +1269,20 @@ fn decision_from_value(value: &serde_json::Value) -> Result<LlmResponse> {
 
     let risk = value.get("risk").and_then(|v| v.as_i64()).unwrap_or(5) as i32;
 
+    // Reversibility is optional: present only when gating asked for it, and a
+    // garbled value is tolerated as `None` so a small model's bad label fails
+    // safe at the routing layer (None -> hold) rather than erroring the whole
+    // evaluation.
+    let reversibility = value
+        .get("reversibility")
+        .and_then(|v| v.as_str())
+        .and_then(Reversibility::parse_lenient);
+
     Ok(LlmResponse {
         decision,
         reason,
         risk,
+        reversibility,
     })
 }
 
@@ -1356,6 +1468,7 @@ mod tests {
             CachedResult::Allow {
                 reason: "inspection".to_string(),
                 risk: Some(1),
+                reversibility: None,
             },
         );
         match cache.get("ls -la") {
@@ -1378,6 +1491,7 @@ mod tests {
             CachedResult::Allow {
                 reason: "ok".to_string(),
                 risk: Some(1),
+                reversibility: None,
             },
         );
         std::thread::sleep(Duration::from_millis(20));
@@ -1392,6 +1506,7 @@ mod tests {
             CachedResult::Allow {
                 reason: "a".into(),
                 risk: Some(1),
+                reversibility: None,
             },
         );
         std::thread::sleep(Duration::from_millis(2));
@@ -1400,6 +1515,7 @@ mod tests {
             CachedResult::Allow {
                 reason: "b".into(),
                 risk: Some(1),
+                reversibility: None,
             },
         );
         std::thread::sleep(Duration::from_millis(2));
@@ -1408,6 +1524,7 @@ mod tests {
             CachedResult::Allow {
                 reason: "c".into(),
                 risk: Some(1),
+                reversibility: None,
             },
         );
 
@@ -1425,6 +1542,7 @@ mod tests {
             CachedResult::Allow {
                 reason: "ok".into(),
                 risk: Some(1),
+                reversibility: None,
             },
         );
         cache.insert(
@@ -1463,6 +1581,7 @@ mod tests {
             reason: "test".to_string(),
             source: EvalSource::Llm,
             risk: Some(1),
+            reversibility: None,
         };
         assert!(allow.to_string().contains("Allow"));
         assert!(allow.to_string().contains("Llm"));
@@ -1486,6 +1605,7 @@ mod tests {
             reason: "test".to_string(),
             source: EvalSource::Llm,
             risk: Some(1),
+            reversibility: None,
         };
         assert!(allow.is_allow());
         assert!(!allow.is_deny());
@@ -1504,6 +1624,70 @@ mod tests {
         assert!(!err.is_allow());
         assert!(!err.is_deny());
         assert!(err.is_error());
+    }
+
+    // --- Consequence gating: classification plumbing ---
+
+    const GATING_MARKER: &str = "Consequence classification (additional task)";
+
+    #[test]
+    fn gating_off_prompt_excludes_appendix() {
+        let ev = Evaluator::new(EvalConfig::default().llm_enabled(false)).expect("build");
+        assert_eq!(ev.gate_mode(), GateMode::Off);
+        assert!(
+            !ev.system_prompt.contains(GATING_MARKER),
+            "gating-off prompt must be byte-identical to today's (no appendix)"
+        );
+    }
+
+    #[test]
+    fn gating_on_prompt_includes_appendix() {
+        let ev = Evaluator::new(
+            EvalConfig::default()
+                .llm_enabled(false)
+                .gate_mode(GateMode::Consequence),
+        )
+        .expect("build");
+        assert_eq!(ev.gate_mode(), GateMode::Consequence);
+        assert!(
+            ev.system_prompt.contains(GATING_MARKER),
+            "gating-on prompt must carry the classification appendix"
+        );
+    }
+
+    #[test]
+    fn schema_requires_reversibility_only_when_gating() {
+        let off = build_function_call_body("m", "sys", "ls", false);
+        let req_off = &off["tools"][0]["function"]["parameters"]["required"];
+        assert!(!req_off.to_string().contains("reversibility"));
+
+        let on = build_function_call_body("m", "sys", "ls", true);
+        let req_on = &on["tools"][0]["function"]["parameters"]["required"];
+        assert!(req_on.to_string().contains("reversibility"));
+        assert!(
+            on["tools"][0]["function"]["parameters"]["properties"]["reversibility"].is_object()
+        );
+    }
+
+    #[test]
+    fn decision_parses_reversibility_when_present() {
+        let v = serde_json::json!({
+            "decision": "APPROVE", "reason": "ok", "risk": 3, "reversibility": "recoverable"
+        });
+        let resp = decision_from_value(&v).unwrap();
+        assert_eq!(resp.reversibility, Some(Reversibility::Recoverable));
+
+        // Absent field -> None (gating off, or model omitted it).
+        let v2 = serde_json::json!({"decision": "APPROVE", "reason": "ok", "risk": 1});
+        assert_eq!(decision_from_value(&v2).unwrap().reversibility, None);
+
+        // Garbled class -> None (fails safe at routing), decision still parses.
+        let v3 = serde_json::json!({
+            "decision": "APPROVE", "reason": "ok", "risk": 1, "reversibility": "?!"
+        });
+        let r3 = decision_from_value(&v3).unwrap();
+        assert_eq!(r3.decision, "APPROVE");
+        assert_eq!(r3.reversibility, None);
     }
 
     #[test]

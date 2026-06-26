@@ -86,6 +86,88 @@ guard run sudo rm -rf /etc/nginx/    # readonly: denied  (destructive)
 guard run sudo systemctl restart app # safe: allowed     (targeted restart)
 ```
 
+## Consequence-gated execution
+
+By default an approved command runs immediately. That is one gate for every
+action, regardless of whether the action is a read, a reversible change, or an
+irreversible destruction. Consequence gating (opt-in, `--gate consequence`) makes
+the gate depend on the *consequence* of the command, turning the binary
+allow/deny into a graduated trust ladder:
+
+| class | when | gate |
+|---|---|---|
+| `reversible` | read-only / idempotent / trivially undone, low risk | runs immediately |
+| `recoverable` | a mutation with a known inverse | runs behind an **auto-revert envelope**: applied, then reverted unless an operator confirms in time |
+| `irreversible` | destruction or no clean inverse (or high risk, or uncertain) | **held for operator approval**; not executed until approved |
+
+With gating on, the LLM keeps deciding APPROVE/DENY exactly as before (the deny
+rules are unchanged) and additionally classifies the reversibility of commands it
+approves. The daemon routes on that class. Classification is **fail-safe**:
+reversibility can only *raise* the gate, never lower it, and a missing or
+uncertain class is held, never run. Operator-authored allows (static policy,
+trusted verbs) and the LLM-uncertain path are separated: the open-ended LLM path
+is gated; the operator-vetted surface is not.
+
+Gating is meaningful only where the daemon UID differs from the agent's (so the
+agent cannot approve its own held command). It requires a Unix-socket listener
+and is refused with `--tcp-port`; on Windows it is unavailable (run guard in
+WSL/Linux). Approval, denial, confirmation, and manual revert are **daemon-UID
+only** — the operator decides the irreversible steps, never the agent.
+
+```bash
+guard server start --gate consequence --exec-as-caller \
+  --socket /run/guard/guard.sock --verbs /etc/guard/verbs.yaml
+
+# Reversible: runs now.
+guard run ls -la /etc/nginx/
+
+# Recoverable: applied behind an auto-revert envelope.
+guard run --revert "systemctl stop app" --confirm-within 900 \
+  systemctl restart app
+# PROVISIONAL (containment envelope): ... handle: 3f9c...
+#   confirm: guard confirm 3f9c...   (else auto-reverts)
+guard confirm 3f9c...     # operator: keep it
+
+# Irreversible: held for operator approval, not executed.
+guard run rm -rf /var/data
+# HELD for operator approval: ... handle: a1b2...
+#   approve: guard approve a1b2...
+guard approvals                 # operator: review the queue
+guard approve a1b2...           # operator: execute the exact held command
+guard deny a1b2...              # operator: reject it
+```
+
+A free-form `--revert` is itself policy-evaluated at arm time, so an agent cannot
+smuggle an arbitrary command into the rollback slot. A recoverable command with
+no usable revert is held, not run unconfined. Held commands fail closed: an
+unattended queue denies on a TTL rather than stalling. Held and provisional state
+survives a daemon restart, and a revert never runs unattended at boot — a
+past-deadline provisional becomes `needs_operator_decision` for explicit
+handling. Inspect state with `guard provisionals` and `guard approvals`.
+
+### Verbs: the typed interface
+
+`guard run <anything>` is a single, all-powerful entry point. For high-value
+operations, expose **verbs** instead: named, typed operations the operator
+defines in a catalog (`--verbs <yaml>`), each with a fixed binary, an argument
+template with pattern-validated parameters, a declared consequence class, and a
+rollback. The agent calls the verb; it never composes raw shell.
+
+```bash
+guard verb list
+# restart-service [recoverable] trusted revertable — Restart a systemd unit
+#     --param unit=<^[a-zA-Z0-9@._-]+$>
+
+guard verb run restart-service --param unit=nginx
+```
+
+Each `{param}` renders as exactly one argument (no shell, no word-splitting), and
+a value may not begin with `-` unless the parameter opts in, so parameter and
+flag injection are structurally impossible. The catalog is operator-only and
+hot-reloaded on change; agents cannot add or alter verbs. A `trusted` verb skips
+the LLM (a deterministic allow path); its declared class still drives the gate.
+See [`examples/verbs.yaml`](examples/verbs.yaml).
+
 ## Configuration
 
 ### Defaults vs. opt-ins
@@ -124,6 +206,8 @@ Guard walks up from your current directory to `/` looking for `.env` files (clos
 | `SSH_GUARD_PROMPT_APPEND` | (none) | Path to additive prompt file (appended to base prompt) |
 | `SSH_GUARD_GPG_RECIPIENT` | (none) | GPG recipient for the `local` secret backend |
 | `SSH_GUARD_BACKEND` | (auto) | Secret backend (`pass`, `env`, `local`). Auto prefers `pass`; otherwise it falls back to non-persistent `env` and logs a warning. |
+| `SSH_GUARD_GATE` | `off` | Consequence gating: `off` or `consequence`. Requires a Unix-socket listener. |
+| `SSH_GUARD_VERBS` | (none) | Path to the verb catalog YAML. Hot-reloaded on change. |
 
 The primary model is `openai/gpt-5.4-nano` via OpenRouter by default. Set it
 per-invocation with `--llm-model <slug>`. To configure a true fallback chain

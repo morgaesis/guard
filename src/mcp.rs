@@ -46,9 +46,18 @@ impl Default for McpConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+struct GuardVerbArgs {
+    name: String,
+    #[serde(default)]
+    params: std::collections::BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 struct GuardToolArgs {
+    #[serde(default)]
     binary: String,
+    #[serde(default)]
     args: Vec<String>,
     #[serde(default)]
     env: HashMap<String, String>,
@@ -56,6 +65,19 @@ struct GuardToolArgs {
     secrets: Vec<String>,
     #[serde(default, rename = "secretEnv")]
     secret_env: HashMap<String, String>,
+    // --- Consequence gating (optional) ---
+    /// Rollback command for a recoverable action, as a single string.
+    #[serde(default)]
+    revert: Option<String>,
+    #[serde(default, rename = "confirmWithin")]
+    confirm_within: Option<u64>,
+    #[serde(default, rename = "requireApproval")]
+    require_approval: bool,
+    #[serde(default, rename = "waitApproval")]
+    wait_approval: Option<u64>,
+    /// Invoke a catalog verb instead of a raw binary.
+    #[serde(default)]
+    verb: Option<GuardVerbArgs>,
 }
 
 #[derive(Debug, Clone)]
@@ -65,6 +87,12 @@ struct GuardToolResponse {
     exit_code: Option<i32>,
     stdout: Option<String>,
     stderr: Option<String>,
+    /// Consequence-gate outcome: "executed", "held", "provisional", etc.
+    status: Option<String>,
+    /// Handle for a held/provisional command (use with guard approve/confirm).
+    handle: Option<String>,
+    /// Honest statement of what the gate checked and did not check.
+    coverage: Option<guard::gating::Coverage>,
 }
 
 impl From<server::ExecuteResponse> for GuardToolResponse {
@@ -75,6 +103,18 @@ impl From<server::ExecuteResponse> for GuardToolResponse {
             exit_code: response.exit_code,
             stdout: response.stdout,
             stderr: response.stderr,
+            coverage: response.coverage.clone(),
+            status: response.status.map(|s| {
+                match s {
+                    server::GateStatus::Executed => "executed",
+                    server::GateStatus::Provisional => "provisional",
+                    server::GateStatus::Held => "held",
+                    server::GateStatus::Reverted => "reverted",
+                    server::GateStatus::DryRun => "dry_run",
+                }
+                .to_string()
+            }),
+            handle: response.handle,
         }
     }
 }
@@ -97,11 +137,38 @@ impl GuardExecutor for ClientExecutor {
         let env = collect_unique_pairs(args.env, "environment variable injection", "value")
             .map_err(anyhow::Error::msg)?;
         let secrets = guard_tool_secret_map(&args.secrets, args.secret_env)?;
-        let client = if let Some(token) = &self.auth_token {
-            server::Client::new(self.socket_path.clone(), self.tcp_port).with_auth(token.clone())
-        } else {
-            server::Client::new(self.socket_path.clone(), self.tcp_port)
+
+        let revert = match args.revert.as_deref() {
+            Some(spec) => {
+                let parts = shell_words::split(spec)
+                    .map_err(|e| anyhow::anyhow!("invalid revert command: {}", e))?;
+                let mut it = parts.into_iter();
+                let binary = it
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("revert command is empty"))?;
+                Some(server::RevertSpec {
+                    binary,
+                    args: it.collect(),
+                })
+            }
+            None => None,
         };
+
+        let mut client = server::Client::new(self.socket_path.clone(), self.tcp_port).with_gating(
+            revert,
+            args.confirm_within,
+            args.require_approval,
+            args.wait_approval,
+        );
+        if let Some(token) = &self.auth_token {
+            client = client.with_auth(token.clone());
+        }
+        if let Some(verb) = args.verb {
+            client = client.with_verb(server::VerbInvocation {
+                name: verb.name,
+                params: verb.params,
+            });
+        }
 
         let response = client
             .execute_with_injections(&args.binary, &args.args, env, secrets)
@@ -340,6 +407,31 @@ impl<E: GuardExecutor> McpServer<E> {
                                 "type": "object",
                                 "additionalProperties": { "type": "string" },
                                 "description": "Optional explicit environment-variable to stored-secret mappings."
+                            },
+                            "verb": {
+                                "type": "object",
+                                "description": "Optional: invoke an operator-defined verb instead of a raw binary. Provide name and params; the daemon renders the typed template.",
+                                "properties": {
+                                    "name": { "type": "string" },
+                                    "params": { "type": "object", "additionalProperties": { "type": "string" } }
+                                },
+                                "required": ["name"]
+                            },
+                            "revert": {
+                                "type": "string",
+                                "description": "Optional rollback command (single string) for a recoverable action under consequence gating. It is policy-evaluated before the action is armed."
+                            },
+                            "confirmWithin": {
+                                "type": "integer",
+                                "description": "Optional auto-revert window in seconds for the containment envelope."
+                            },
+                            "requireApproval": {
+                                "type": "boolean",
+                                "description": "Optional: force this command onto the operator-approval (hold) path."
+                            },
+                            "waitApproval": {
+                                "type": "integer",
+                                "description": "Optional: block up to N seconds for an operator decision on a held command and return the real result inline."
                             }
                         },
                         "required": ["binary", "args"]
@@ -351,7 +443,10 @@ impl<E: GuardExecutor> McpServer<E> {
                             "reason": { "type": "string" },
                             "exit_code": { "type": ["integer", "null"] },
                             "stdout": { "type": ["string", "null"] },
-                            "stderr": { "type": ["string", "null"] }
+                            "stderr": { "type": ["string", "null"] },
+                            "status": { "type": ["string", "null"], "description": "Consequence-gate outcome: executed, provisional, held, reverted, dry_run." },
+                            "handle": { "type": ["string", "null"], "description": "Handle for a held/provisional command (use with guard approve/confirm)." },
+                            "coverage": { "type": ["object", "null"], "description": "What the gate checked and deliberately did NOT check (checked / not_checked arrays). Surfaced for held/provisional/dry-run outcomes." }
                         },
                         "required": ["allowed", "reason", "exit_code", "stdout", "stderr"]
                     },
@@ -438,7 +533,10 @@ fn tool_result(result: GuardToolResponse) -> Value {
         "reason": result.reason,
         "exit_code": result.exit_code,
         "stdout": result.stdout,
-        "stderr": result.stderr
+        "stderr": result.stderr,
+        "status": result.status,
+        "handle": result.handle,
+        "coverage": result.coverage
     });
 
     json!({
@@ -474,6 +572,33 @@ fn tool_error_result(message: String) -> Value {
     })
 }
 
+/// Render the gate coverage (what was checked / not checked) as appended text so
+/// the agent reads the honesty surface inline, not just in structuredContent.
+fn coverage_text(result: &Value) -> String {
+    let Some(cov) = result.get("coverage") else {
+        return String::new();
+    };
+    if cov.is_null() {
+        return String::new();
+    }
+    let mut out = String::new();
+    if let Some(checked) = cov.get("checked").and_then(Value::as_array) {
+        for c in checked {
+            if let Some(s) = c.as_str() {
+                out.push_str(&format!("\n  checked: {s}"));
+            }
+        }
+    }
+    if let Some(not_checked) = cov.get("not_checked").and_then(Value::as_array) {
+        for c in not_checked {
+            if let Some(s) = c.as_str() {
+                out.push_str(&format!("\n  NOT checked: {s}"));
+            }
+        }
+    }
+    out
+}
+
 fn render_tool_text(result: &Value) -> String {
     let allowed = result
         .get("allowed")
@@ -486,6 +611,35 @@ fn render_tool_text(result: &Value) -> String {
     let exit_code = result.get("exit_code").and_then(Value::as_i64);
     let stdout = result.get("stdout").and_then(Value::as_str).unwrap_or("");
     let stderr = result.get("stderr").and_then(Value::as_str).unwrap_or("");
+    let status = result.get("status").and_then(Value::as_str);
+    let handle = result.get("handle").and_then(Value::as_str).unwrap_or("");
+
+    // Consequence-gate outcomes are not denials: surface the handle, the next
+    // step, and the honest coverage so the model knows what was NOT verified.
+    match status {
+        Some("held") => {
+            return format!(
+                "HELD for operator approval (handle {handle}): {reason}\nThe operator must run `guard approve {handle}` for this to execute. Do not retry; wait or proceed with other work.{}",
+                coverage_text(result)
+            );
+        }
+        Some("provisional") => {
+            let mut out = String::new();
+            if !stdout.is_empty() {
+                out.push_str(stdout);
+                out.push('\n');
+            }
+            out.push_str(&format!(
+                "PROVISIONAL (handle {handle}): applied behind an auto-revert envelope; it reverts unless the operator runs `guard confirm {handle}`.{}",
+                coverage_text(result)
+            ));
+            return out;
+        }
+        Some("dry_run") => {
+            return format!("[DRY-RUN] {reason}{}", coverage_text(result));
+        }
+        _ => {}
+    }
 
     if !allowed {
         return format!("DENIED: {reason}");
@@ -548,6 +702,9 @@ mod tests {
                 exit_code: Some(0),
                 stdout: Some("ok\n".to_string()),
                 stderr: None,
+                status: None,
+                handle: None,
+                coverage: None,
             }),
         });
         let mut server = McpServer::new(executor, DEFAULT_TOOL_NAME.to_string());
@@ -579,6 +736,9 @@ mod tests {
                 exit_code: Some(0),
                 stdout: Some("ok\n".to_string()),
                 stderr: None,
+                status: None,
+                handle: None,
+                coverage: None,
             }),
         });
         let mut server = McpServer::new(executor, DEFAULT_TOOL_NAME.to_string());
@@ -609,6 +769,9 @@ mod tests {
                 exit_code: Some(0),
                 stdout: Some("uptime output\n".to_string()),
                 stderr: None,
+                status: None,
+                handle: None,
+                coverage: None,
             }),
         });
         let mut server = McpServer::new(executor, DEFAULT_TOOL_NAME.to_string());
@@ -716,6 +879,9 @@ mod tests {
             exit_code: None,
             stdout: None,
             stderr: None,
+            status: None,
+            handle: None,
+            coverage: None,
         });
 
         assert_eq!(value["isError"], false);
@@ -732,6 +898,9 @@ mod tests {
                 exit_code: Some(0),
                 stdout: Some("ok\n".to_string()),
                 stderr: None,
+                status: None,
+                handle: None,
+                coverage: None,
             }),
         });
         let mut server = McpServer::new(executor, DEFAULT_TOOL_NAME.to_string());

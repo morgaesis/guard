@@ -37,6 +37,10 @@
 
 - LLM decision cache: in-memory TTL-bounded cache keyed on the exact command line. A command approved or denied once returns from cache on subsequent requests without another LLM call, within `--cache-ttl` seconds and `--cache-capacity` entries. Cache is bound to the Evaluator lifetime, so prompt changes force a fresh cache. Disable with `--no-cache` / `SSH_GUARD_CACHE=false`.
 
+- Consequence gating (`--gate consequence`): the evaluator classifies the reversibility of commands it approves, and the daemon routes by class — `reversible` executes immediately, `recoverable` runs behind an auto-revert containment envelope (`--revert` / `--confirm-within`, `guard confirm` / `guard revert`), and `irreversible` (or high-risk, or unclassified) is held for daemon-UID operator approval (`guard approve` / `guard deny` / `guard approvals`, with `--wait-approval` for blocking callers). Routing is fail-safe; reversibility only raises the gate. Held commands bind to an immutable execution snapshot; an unattended queue fails closed on a TTL; a free-form `--revert` is policy-evaluated at arm time. Provisional and approval state persist and recover across restart without firing a revert unattended at boot.
+
+- Verb catalog (`--verbs`): an operator-authored, hot-reloaded catalog of typed operations with anchored pattern-validated parameters, declared consequence class, and structured rollback. `guard verb list` / `guard verb run` render templates into argv with no shell, making parameter and flag injection structurally impossible. `trusted` verbs are a deterministic allow path; agents cannot add or alter verbs.
+
 ## Next
 
 - Pluggable secret backends via the existing `SecretBackend` trait in `src/secrets.rs`. Two new variants:
@@ -47,7 +51,8 @@
 
 - Unify the daemon's own startup secret (currently `SSH_GUARD_LLM_API_KEY` read from process env) onto the same `SecretBackend` trait. The server reads its own LLM key as if it were a secret owned by a sentinel daemon UID (e.g. uid 0 or a configurable `SSH_GUARD_SERVER_UID`), so it reuses the existing fetch / cache / redaction plumbing instead of bespoke env-var loading. Removes the need for external `infisical run` / `vault agent` wrappers around `guard server start`.
 
-- Interactive approval chat per session: conversational context with the operator that lets guard make context-aware decisions beyond per-command stateless evaluation.
+- Interactive approval chat per session: the consequence-gate operator hold delivers human-in-the-loop approval at points of no return; a richer conversational approval flow (multi-turn context with the operator) would extend it beyond the current accept/deny/confirm decisions.
+- Secret-value binding for held commands: the approval snapshot pins the secret-key *mapping*; optionally hash the resolved values at hold time and reject on mismatch at approve time, so a same-uid caller cannot alter its own mapped secret values before approval.
 - Pre-LLM validation for secret injection requests: invalid env names, missing secrets, and misleading shell references to invalid env names should fail before evaluator approval.
 - Live integration test for 429 / `Retry-After` mocking (the unit test suite already covers the retry rules; an HTTP-mock integration test would catch wire-format regressions).
 - Binary allowlist for the server (restrict which binaries can be executed, not just what arguments are passed).
