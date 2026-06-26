@@ -474,7 +474,7 @@ fn add_namespaced_patterns(
 fn sanitize_kube_name(value: &str) -> String {
     value
         .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_')
-        .trim_end_matches(|ch: char| matches!(ch, '.' | ',' | ';' | ':' | ')' | ']'))
+        .trim_end_matches(['.', ',', ';', ':', ')', ']'])
         .to_ascii_lowercase()
 }
 

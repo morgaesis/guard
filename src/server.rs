@@ -1796,7 +1796,6 @@ async fn handle_session_appeal(
     }
 }
 
-
 async fn handle_admin_request(
     config: &ServerConfig,
     caller: &CallerIdentity,

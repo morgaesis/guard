@@ -219,16 +219,12 @@ impl LearnedRuleStore {
             let matched_pattern = std::iter::once(&rule.pattern)
                 .chain(rule.equivalent_patterns.iter())
                 .find(|pattern| glob_match(pattern, command));
-            if let Some(matched_pattern) = matched_pattern {
-                Some(LearnedRuleHit {
-                    service: rule.service.clone(),
-                    pattern: rule.pattern.clone(),
-                    matched_pattern: matched_pattern.clone(),
-                    shim: rule.shim.clone(),
-                })
-            } else {
-                None
-            }
+            matched_pattern.map(|matched_pattern| LearnedRuleHit {
+                service: rule.service.clone(),
+                pattern: rule.pattern.clone(),
+                matched_pattern: matched_pattern.clone(),
+                shim: rule.shim.clone(),
+            })
         })
     }
 
@@ -500,7 +496,7 @@ fn infer_ssh_service(host: &str, remote_args: &[String]) -> String {
 
     let base = host
         .split('@')
-        .last()
+        .next_back()
         .unwrap_or(host)
         .split('.')
         .next()

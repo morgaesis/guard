@@ -999,7 +999,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
 
             let tcp_port = tcp_port
                 .or_else(|| guard_env("TCP_PORT").and_then(|v| v.parse::<u16>().ok()))
-                .or_else(|| {
+                .or({
                     #[cfg(windows)]
                     {
                         Some(8123)
@@ -1982,7 +1982,7 @@ fn resolve_client_endpoint(
     }
     #[cfg(windows)]
     {
-        return (None, Some(DEFAULT_CLIENT_TCP_PORT));
+        (None, Some(DEFAULT_CLIENT_TCP_PORT))
     }
     // Fall back to the well-known default. If it doesn't exist the
     // connect will fail with a clear "failed to connect" error, which
