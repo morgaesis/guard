@@ -9,9 +9,15 @@ FROM rust:1-bookworm
 
 WORKDIR /src
 # Copy only what the build needs (keeps the Windows target/ out of the image).
+# `tests/` is required so `run.sh test` actually compiles and runs the
+# integration test binaries (e.g. mcp_integration) — without it the suite
+# silently covers only the lib/bin unit tests. `examples/` is required because
+# policy_tests embeds example policy files via include_str!("../examples/...").
 COPY Cargo.toml Cargo.lock build.rs deny.toml ./
 COPY src ./src
 COPY config ./config
+COPY tests ./tests
+COPY examples ./examples
 
 RUN cargo build --release --quiet && install -m 0755 target/release/guard /usr/local/bin/guard
 
