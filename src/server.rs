@@ -1565,7 +1565,7 @@ fn emit_audit_events(
     // If the policy allowed but exec failed, emit a second event so the
     // audit stream can distinguish "LLM denied" from "LLM approved but
     // exec failed". Ignored by legacy grep patterns.
-    if let ExecOutcome::Failed { reason } = &result.exec {
+    if let ExecOutcome::Failed { reason, .. } = &result.exec {
         config.log_audit_exec_failed(caller, binary, args, reason);
     }
 }
@@ -1577,7 +1577,7 @@ fn emit_exec_audit_events(
     args: &[String],
     result: &ExecuteResult,
 ) {
-    if let ExecOutcome::Failed { reason } = &result.exec {
+    if let ExecOutcome::Failed { reason, .. } = &result.exec {
         config.log_audit_exec_failed(caller, binary, args, reason);
     }
 }
@@ -2421,7 +2421,7 @@ async fn finish_revert(
                 let ok = exit_code.unwrap_or(-1) == 0;
                 (ok, *exit_code, None)
             }
-            ExecOutcome::Failed { reason } => (false, None, Some(reason.clone())),
+            ExecOutcome::Failed { reason, .. } => (false, None, Some(reason.clone())),
             _ => (false, None, Some("unexpected revert outcome".to_string())),
         },
         Err(_) => (
@@ -2559,7 +2559,7 @@ async fn handle_approve(
                 stderr,
             )
         }
-        ExecOutcome::Failed { reason: detail } => {
+        ExecOutcome::Failed { reason: detail, .. } => {
             {
                 let mut reg = config.approvals.write().await;
                 reg.set_exec_failed(handle, now, detail.clone());
@@ -2764,9 +2764,13 @@ enum ExecOutcome {
         stdout: Option<String>,
         stderr: Option<String>,
     },
-    /// Policy approved, but spawning/running the child failed. `reason`
-    /// describes the OS-level error (e.g. ENOENT on the binary).
-    Failed { reason: String },
+    /// Policy approved, but the child failed. `started` distinguishes a
+    /// spawn/setup failure where the child never ran (e.g. ENOENT on the binary)
+    /// from a failure after it was launched (e.g. the client stream dropped
+    /// mid-run). A contained forward command that fails with `started: true` may
+    /// already have applied its mutation, so the containment envelope keeps the
+    /// auto-revert armed rather than dropping it.
+    Failed { reason: String, started: bool },
     /// Policy approved, but the server intentionally did not spawn the child.
     /// Carries gate coverage when the dry-run was routed by the consequence gate.
     DryRun { coverage: Option<Coverage> },
@@ -2816,7 +2820,8 @@ impl ExecuteResult {
         }
     }
 
-    /// Convenience constructor for "policy approved but exec failed".
+    /// Convenience constructor for "policy approved but the child never ran"
+    /// (a spawn/setup failure such as ENOENT on the binary).
     fn exec_failed(policy_reason: impl Into<String>, exec_reason: impl Into<String>) -> Self {
         Self {
             policy: PolicyOutcome::Allowed {
@@ -2824,6 +2829,25 @@ impl ExecuteResult {
             },
             exec: ExecOutcome::Failed {
                 reason: exec_reason.into(),
+                started: false,
+            },
+        }
+    }
+
+    /// Constructor for "policy approved, the child WAS launched, then execution
+    /// failed" (e.g. the client stream dropped mid-run). The child may have had
+    /// observable effects, which the containment envelope must account for.
+    fn exec_failed_after_start(
+        policy_reason: impl Into<String>,
+        exec_reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            policy: PolicyOutcome::Allowed {
+                reason: policy_reason.into(),
+            },
+            exec: ExecOutcome::Failed {
+                reason: exec_reason.into(),
+                started: true,
             },
         }
     }
@@ -2921,7 +2945,9 @@ impl ExecuteResult {
                 handle: None,
                 coverage: None,
             },
-            ExecOutcome::Failed { reason: exec_msg } => ExecuteResponse {
+            ExecOutcome::Failed {
+                reason: exec_msg, ..
+            } => ExecuteResponse {
                 // Even though the policy allowed it, the command could not
                 // actually run. Surface this to the client as `allowed=false`
                 // with the exec error as the reason, because from the
@@ -3361,7 +3387,10 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
             config.log_audit_policy(caller, &request.binary, &request.args, true, &reason);
             if let Err(e) = write_policy_decision(stream_output, stream_writer, true, &reason).await
             {
-                return ExecuteResult::exec_failed(reason, format!("client stream error: {}", e));
+                return ExecuteResult::exec_failed_after_start(
+                    reason,
+                    format!("client stream error: {}", e),
+                );
             }
             let inputs = GateInputs {
                 reason: reason.clone(),
@@ -3518,7 +3547,10 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
             config.log_audit_policy(caller, &request.binary, &request.args, true, &reason);
             if let Err(e) = write_policy_decision(stream_output, stream_writer, true, &reason).await
             {
-                return ExecuteResult::exec_failed(reason, format!("client stream error: {}", e));
+                return ExecuteResult::exec_failed_after_start(
+                    reason,
+                    format!("client stream error: {}", e),
+                );
             }
             // Consequence gate: when enabled, route this LLM-approved command by
             // reversibility (execute / contain / hold). When off, this is a
@@ -4503,9 +4535,31 @@ async fn arm_containment<W: AsyncWrite + Unpin>(
                 stderr,
             )
         }
+        // The child was launched and then failed (e.g. the client stream dropped
+        // mid-run). It may already have applied its mutation, so keep the
+        // provisional armed: the auto-revert timer fires at the deadline and
+        // rolls the unconfirmed change back rather than leaking it. Mark the
+        // forward done so the deadline is honored, and surface the failure.
+        ExecOutcome::Failed { started: true, .. } => {
+            let updated = {
+                let mut reg = config.provisional.write().await;
+                reg.mark_forward_done(&handle, None);
+                reg.get(&handle).cloned()
+            };
+            if let Some(u) = updated {
+                persist_provisional(config, &u).await;
+            }
+            tracing::warn!(
+                "[AUDIT] PROVISIONAL_INTERRUPTED handle={} caller={} deadline={} (forward launched then failed; auto-revert armed)",
+                handle,
+                caller,
+                now.saturating_add(window)
+            );
+            result
+        }
         _ => {
-            // Forward command failed: there is nothing to revert. Drop the
-            // provisional and return the failure as-is.
+            // The child never ran (spawn/setup failure) — nothing to revert.
+            // Drop the provisional and return the failure as-is.
             config.provisional.write().await.remove(&handle);
             delete_provisional_row(config, &handle).await;
             result
@@ -5226,7 +5280,10 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
 
                     if let Err(e) = write_stream_message(writer, &message).await {
                         let _ = child.kill().await;
-                        return ExecuteResult::exec_failed(allow_reason, format!("client stream error: {}", e));
+                        return ExecuteResult::exec_failed_after_start(
+                            allow_reason,
+                            format!("client stream error: {}", e),
+                        );
                     }
                     }
                     None => break,
@@ -5235,7 +5292,10 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
             _ = keepalive.tick() => {
                 if let Err(e) = write_stream_message(writer, &ExecuteStreamMessage::Keepalive).await {
                     let _ = child.kill().await;
-                    return ExecuteResult::exec_failed(allow_reason, format!("client stream error: {}", e));
+                    return ExecuteResult::exec_failed_after_start(
+                        allow_reason,
+                        format!("client stream error: {}", e),
+                    );
                 }
             }
         }
@@ -5878,7 +5938,7 @@ mod tests {
         );
         assert_eq!(r.policy_reason(), "looks fine");
         match &r.exec {
-            ExecOutcome::Failed { reason } => {
+            ExecOutcome::Failed { reason, .. } => {
                 assert!(reason.contains("no such file"));
             }
             other => panic!("expected Failed, got {:?}", other),
@@ -6052,6 +6112,24 @@ mod tests {
             sid: "S-1-5-18".into()
         }
         .is_local_peer());
+    }
+
+    #[test]
+    fn exec_failed_constructors_set_started_flag() {
+        // Spawn/setup failure: the child never ran -> the containment envelope
+        // drops the provisional (nothing to revert).
+        let pre = ExecuteResult::exec_failed("allowed", "ENOENT");
+        assert!(matches!(
+            pre.exec,
+            ExecOutcome::Failed { started: false, .. }
+        ));
+        // Failure after the child was launched (e.g. client stream dropped):
+        // the mutation may have applied -> keep the auto-revert armed.
+        let post = ExecuteResult::exec_failed_after_start("allowed", "client stream error");
+        assert!(matches!(
+            post.exec,
+            ExecOutcome::Failed { started: true, .. }
+        ));
     }
 
     #[cfg(windows)]
