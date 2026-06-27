@@ -216,6 +216,17 @@ enum MainArgs {
         #[arg(long)]
         socket: Option<String>,
     },
+    /// Post a note to a held command's approval thread, then show the thread.
+    /// The operator may note any hold; the requester may note its own.
+    #[clap(name = "approval-note")]
+    ApprovalNote {
+        /// Held-command handle.
+        handle: String,
+        /// Note text.
+        text: String,
+        #[arg(long)]
+        socket: Option<String>,
+    },
     /// Run or list operator-defined verbs (the typed, least-expressive interface).
     #[clap(subcommand)]
     Verb(VerbCommands),
@@ -840,6 +851,11 @@ async fn main() -> Result<()> {
         }
         Ok(MainArgs::Deny { handle, socket }) => handle_gate_action(socket, "deny", handle).await,
         Ok(MainArgs::Approvals { handle, socket }) => handle_approvals(socket, handle).await,
+        Ok(MainArgs::ApprovalNote {
+            handle,
+            text,
+            socket,
+        }) => handle_approval_note_cmd(socket, handle, text).await,
         Ok(MainArgs::Verb(subcommand)) => handle_verb(subcommand).await,
         Ok(MainArgs::Secrets(subcommand)) => handle_secrets(subcommand).await,
         Ok(MainArgs::Shim {
@@ -1831,6 +1847,37 @@ async fn handle_provisionals(socket: Option<String>) -> Result<()> {
     }
 }
 
+async fn handle_approval_note_cmd(
+    socket: Option<String>,
+    handle: String,
+    text: String,
+) -> Result<()> {
+    let client = gate_client(socket);
+    match client
+        .send_admin(server::AdminRequest::ApprovalNote { handle, text })
+        .await?
+    {
+        server::AdminResponse::ApprovalShow { item } => {
+            println!(
+                "[{}] handle={} cmd={:?}",
+                item.status, item.handle, item.command
+            );
+            for n in &item.notes {
+                println!("  note [{}] {}: {}", n.at_unix, n.author, n.text);
+            }
+            Ok(())
+        }
+        server::AdminResponse::Error { message } => {
+            eprintln!("error: {}", message);
+            std::process::exit(1);
+        }
+        other => {
+            eprintln!("unexpected response: {:?}", other);
+            std::process::exit(1);
+        }
+    }
+}
+
 async fn handle_approvals(socket: Option<String>, handle: Option<String>) -> Result<()> {
     let client = gate_client(socket);
     let request = match handle {
@@ -1871,6 +1918,9 @@ async fn handle_approvals(socket: Option<String>, handle: Option<String>) -> Res
             }
             if let Some(reason) = &item.decided_reason {
                 println!("decision: {}", reason);
+            }
+            for n in &item.notes {
+                println!("  note [{}] {}: {}", n.at_unix, n.author, n.text);
             }
             Ok(())
         }

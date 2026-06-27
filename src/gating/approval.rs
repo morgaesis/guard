@@ -137,6 +137,17 @@ impl ApprovalStatus {
     }
 }
 
+/// One turn in a held command's approval discussion. Either side of the gate
+/// (the operator, or the hold's original requester) can post context before the
+/// operator decides, turning the accept/deny gate into a short conversation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalNote {
+    pub at_unix: u64,
+    /// Which side posted: `operator` or `requester`.
+    pub author: String,
+    pub text: String,
+}
+
 /// One held command awaiting operator approval.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Approval {
@@ -155,6 +166,10 @@ pub struct Approval {
     pub result_exit: Option<i32>,
     pub result_stdout: Option<String>,
     pub result_stderr: Option<String>,
+    /// Discussion thread on this hold (operator <-> requester) before a
+    /// decision. Defaults empty for rows written before notes existed.
+    #[serde(default)]
+    pub notes: Vec<ApprovalNote>,
 }
 
 impl Approval {
@@ -296,6 +311,34 @@ impl ApprovalRegistry {
         self.wake(handle);
     }
 
+    /// Append a note to a pending hold's discussion thread. Allowed only while
+    /// the hold is undecided; a decided hold's thread is frozen. The caller
+    /// (server) authorizes who may post (operator or the hold's requester).
+    pub fn add_note(
+        &mut self,
+        handle: &str,
+        author: &str,
+        text: &str,
+        now: u64,
+    ) -> Result<(), GateError> {
+        let a = self
+            .items
+            .get_mut(handle)
+            .ok_or_else(|| GateError::NotFound(handle.to_string()))?;
+        if !a.status.is_pending() {
+            return Err(GateError::WrongState {
+                handle: handle.to_string(),
+                detail: format!("already {}; its thread is closed", a.status.as_str()),
+            });
+        }
+        a.notes.push(ApprovalNote {
+            at_unix: now,
+            author: author.to_string(),
+            text: text.to_string(),
+        });
+        Ok(())
+    }
+
     /// Operator denies a pending hold and wakes any waiter.
     pub fn deny(&mut self, handle: &str, now: u64, reason: String) -> Result<(), GateError> {
         let a = self
@@ -396,6 +439,7 @@ mod tests {
             result_exit: None,
             result_stdout: None,
             result_stderr: None,
+            notes: Vec::new(),
         }
     }
 

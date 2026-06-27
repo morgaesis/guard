@@ -338,6 +338,12 @@ pub enum AdminRequest {
     ApprovalShow {
         handle: String,
     },
+    /// Append a note to a held command's discussion thread. Allowed for the
+    /// operator (any hold) or the hold's original requester (its own hold).
+    ApprovalNote {
+        handle: String,
+        text: String,
+    },
     /// List the operator-defined verb catalog (the agent's menu).
     VerbList,
 }
@@ -364,6 +370,9 @@ impl AdminRequest {
                 | Self::Provisionals
                 | Self::ApprovalList
                 | Self::ApprovalShow { .. }
+                // ApprovalNote does its own operator-or-owner authorization in
+                // the handler, so it is not gated to the daemon UID here.
+                | Self::ApprovalNote { .. }
                 | Self::VerbList
         )
     }
@@ -498,6 +507,9 @@ pub struct ApprovalSummary {
     pub stderr: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decided_reason: Option<String>,
+    /// Approval discussion thread (operator <-> requester).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<guard::gating::approval::ApprovalNote>,
 }
 
 impl ProvisionalSummary {
@@ -543,6 +555,7 @@ impl ApprovalSummary {
             stdout: a.result_stdout.clone(),
             stderr: a.result_stderr.clone(),
             decided_reason: a.decided_reason.clone(),
+            notes: a.notes.clone(),
         }
     }
 }
@@ -2322,6 +2335,9 @@ async fn handle_admin_request(
                 },
             }
         }
+        AdminRequest::ApprovalNote { handle, text } => {
+            handle_approval_note(config, caller, &handle, &text).await
+        }
         AdminRequest::VerbList => {
             let items = {
                 let mut cat = config.verbs.write().await;
@@ -2607,6 +2623,72 @@ async fn handle_approve(
         exit_code: exit,
         stdout,
         stderr,
+    }
+}
+
+/// Append a note to a held command's discussion thread, turning the gate into a
+/// short operator<->requester conversation before a decision. The operator may
+/// note any hold; the hold's original requester (a local peer whose principal
+/// matches the snapshot) may note its own; nobody else. Returns the updated hold
+/// view (including the thread) so the caller can render it.
+async fn handle_approval_note(
+    config: &ServerConfig,
+    caller: &CallerIdentity,
+    handle: &str,
+    text: &str,
+) -> AdminResponse {
+    let text = text.trim();
+    if text.is_empty() {
+        return AdminResponse::Error {
+            message: "note text must not be empty".to_string(),
+        };
+    }
+    let (is_operator, caller_key) = caller_scope(config, caller);
+    let author = {
+        let reg = config.approvals.read().await;
+        match reg.get(handle) {
+            Some(_) if is_operator => "operator",
+            Some(a) if caller.is_local_peer() && scope_eq(&a.snapshot.principal, &caller_key) => {
+                "requester"
+            }
+            // Unknown handle, or a caller who is neither operator nor owner:
+            // return NotFound, never leaking the hold's existence.
+            _ => {
+                return AdminResponse::Error {
+                    message: format!("no approval with handle '{}'", handle),
+                };
+            }
+        }
+    };
+    let now = now_unix();
+    let result = {
+        let mut reg = config.approvals.write().await;
+        reg.add_note(handle, author, text, now)
+    };
+    match result {
+        Ok(()) => {
+            let updated = config.approvals.read().await.get(handle).cloned();
+            match updated {
+                Some(a) => {
+                    persist_approval(config, &a).await;
+                    tracing::info!(
+                        "[AUDIT] APPROVAL_NOTE handle={} author={} caller={}",
+                        handle,
+                        author,
+                        caller
+                    );
+                    AdminResponse::ApprovalShow {
+                        item: ApprovalSummary::from_row(&a),
+                    }
+                }
+                None => AdminResponse::Error {
+                    message: format!("no approval with handle '{}'", handle),
+                },
+            }
+        }
+        Err(e) => AdminResponse::Error {
+            message: e.to_string(),
+        },
     }
 }
 
@@ -4731,6 +4813,7 @@ async fn hold_for_approval<W: AsyncWrite + Unpin>(
         result_exit: None,
         result_stdout: None,
         result_stderr: None,
+        notes: Vec::new(),
     };
 
     let notify = config.approvals.write().await.enqueue(approval.clone());
@@ -5661,6 +5744,7 @@ impl Client {
             AdminRequest::Deny { .. } => "deny",
             AdminRequest::ApprovalList => "approval_list",
             AdminRequest::ApprovalShow { .. } => "approval_show",
+            AdminRequest::ApprovalNote { .. } => "approval_note",
             AdminRequest::VerbList => "verb_list",
         };
         let envelope = IncomingMessage::Admin {
@@ -7707,6 +7791,96 @@ mod tests {
         let _ = cfg.secrets.delete(&p, "BIND_OK_KEY").await;
     }
 
+    /// The approval discussion thread accepts notes from the operator and from
+    /// the hold's original requester, refuses everyone else, and freezes once
+    /// the hold is decided.
+    #[tokio::test]
+    async fn approval_note_operator_and_owner_post_others_refused() {
+        let (cfg, operator, agent) = gating_config(7301, 4301);
+        let agent_principal = agent.principal();
+        let request = ExecuteRequest {
+            binary: "true".to_string(),
+            args: Vec::new(),
+            auth_token: None,
+            env: HashMap::new(),
+            secrets: HashMap::new(),
+            stream: false,
+            session_token: None,
+            revert: None,
+            confirm_within_secs: None,
+            require_approval: None,
+            wait_approval_secs: None,
+            verb: None,
+        };
+        let mut sink = tokio::io::sink();
+        let held = hold_for_approval(
+            request,
+            &cfg,
+            &agent,
+            agent_principal.clone(),
+            "review".to_string(),
+            Some(8),
+            Some(Reversibility::Irreversible),
+            None,
+            false,
+            &mut sink,
+        )
+        .await;
+        let handle = match &held.exec {
+            ExecOutcome::Held { handle, .. } => handle.clone(),
+            other => panic!("expected Held, got {:?}", other),
+        };
+
+        // The requester (hold owner) can post.
+        let r = handle_approval_note(&cfg, &agent, &handle, "why is this needed?").await;
+        assert!(
+            matches!(r, AdminResponse::ApprovalShow { .. }),
+            "owner should post: {:?}",
+            r
+        );
+
+        // The operator can post; the thread now has both turns, labeled.
+        let r = handle_approval_note(&cfg, &operator, &handle, "ok, approving").await;
+        match r {
+            AdminResponse::ApprovalShow { item } => {
+                assert_eq!(item.notes.len(), 2);
+                assert_eq!(item.notes[0].author, "requester");
+                assert_eq!(item.notes[1].author, "operator");
+            }
+            other => panic!("operator should post: {:?}", other),
+        }
+
+        // A different non-operator principal is refused (NotFound, no leak).
+        let stranger = CallerIdentity::Unix { uid: 9999 };
+        assert!(
+            matches!(
+                handle_approval_note(&cfg, &stranger, &handle, "let me in").await,
+                AdminResponse::Error { .. }
+            ),
+            "a stranger must be refused"
+        );
+
+        // Empty text is rejected.
+        assert!(matches!(
+            handle_approval_note(&cfg, &operator, &handle, "   ").await,
+            AdminResponse::Error { .. }
+        ));
+
+        // Once decided, the thread is frozen.
+        cfg.approvals
+            .write()
+            .await
+            .deny(&handle, now_unix(), "denied".to_string())
+            .unwrap();
+        assert!(
+            matches!(
+                handle_approval_note(&cfg, &operator, &handle, "too late").await,
+                AdminResponse::Error { .. }
+            ),
+            "a decided hold's thread must be frozen"
+        );
+    }
+
     /// approve after the verb catalog version changed is voided: the approved
     /// artifact may no longer mean what the operator reviewed, so the daemon
     /// fails it closed rather than executing a stale rendering. Cross-platform:
@@ -7746,6 +7920,7 @@ mod tests {
             result_exit: None,
             result_stdout: None,
             result_stderr: None,
+            notes: Vec::new(),
         };
         assert_ne!(
             approval.snapshot.catalog_version,
