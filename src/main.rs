@@ -721,7 +721,8 @@ enum ConfigCommands {
 
 #[derive(Subcommand)]
 enum McpCommands {
-    /// Start a stdio MCP server backed by the configured guard daemon
+    /// Start an MCP server backed by the configured guard daemon. Defaults to
+    /// stdio; pass --http to serve over a local HTTP endpoint instead.
     Serve {
         /// UNIX socket path to connect to.
         #[arg(long, value_name = "PATH")]
@@ -738,6 +739,17 @@ enum McpCommands {
         /// MCP tool name exposed to clients.
         #[arg(long, default_value = "guard_run")]
         tool_name: String,
+
+        /// Serve MCP over Streamable-HTTP on this address (e.g. 127.0.0.1:7333)
+        /// instead of stdio. Requires a bearer token (--http-token or
+        /// GUARD_MCP_TOKEN). Intended for localhost / trusted networks.
+        #[arg(long, value_name = "ADDR")]
+        http: Option<String>,
+
+        /// Bearer token required on every HTTP request (overrides
+        /// GUARD_MCP_TOKEN). Only used with --http; never logged.
+        #[arg(long, value_name = "TOKEN")]
+        http_token: Option<String>,
     },
 }
 
@@ -2131,6 +2143,8 @@ async fn run_mcp(subcommand: McpCommands) -> Result<()> {
             tcp_port,
             token,
             tool_name,
+            http,
+            http_token,
         } => {
             let config = client_config::ClientConfig::load().ok().unwrap_or_default();
             let (mut socket_path, mut resolved_tcp_port) = resolve_client_endpoint(socket, &config);
@@ -2140,11 +2154,27 @@ async fn run_mcp(subcommand: McpCommands) -> Result<()> {
             }
             let auth_token = token.or(config.auth_token);
 
+            let http_addr = match http {
+                Some(addr) => Some(
+                    addr.parse::<std::net::SocketAddr>()
+                        .with_context(|| format!("invalid --http address '{addr}'"))?,
+                ),
+                None => None,
+            };
+            // Bearer source: --http-token wins, else GUARD_MCP_TOKEN
+            // (guard_env tries GUARD_ then SSH_GUARD_). Only meaningful with
+            // --http; validate() rejects --http without a token.
+            let http_token = http_token
+                .filter(|t| !t.is_empty())
+                .or_else(|| guard_env("MCP_TOKEN").filter(|t| !t.is_empty()));
+
             let mcp_config = mcp::McpConfig {
                 socket_path,
                 tcp_port: resolved_tcp_port,
                 auth_token,
                 tool_name,
+                http_addr,
+                http_token,
             };
 
             mcp::serve(mcp_config).await

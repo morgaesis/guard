@@ -5,13 +5,23 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
 
 const JSONRPC_VERSION: &str = "2.0";
 const DEFAULT_TOOL_NAME: &str = "guard_run";
+const VERB_LIST_TOOL_NAME: &str = "guard_verbs";
+const APPROVAL_LIST_TOOL_NAME: &str = "guard_approvals";
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-03-26", "2024-11-05"];
+
+/// Cap the HTTP request body we will buffer. The MCP request payloads are
+/// small JSON-RPC envelopes; this bounds the memory a single connection can
+/// force us to allocate from an unauthenticated peer before the bearer check.
+const MAX_HTTP_BODY: usize = 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct McpConfig {
@@ -19,6 +29,11 @@ pub struct McpConfig {
     pub tcp_port: Option<u16>,
     pub auth_token: Option<String>,
     pub tool_name: String,
+    /// When set, serve MCP over HTTP on this address instead of stdio.
+    pub http_addr: Option<SocketAddr>,
+    /// Bearer token required on every HTTP request. Mandatory whenever
+    /// `http_addr` is set; there is no unauthenticated network transport.
+    pub http_token: Option<String>,
 }
 
 impl McpConfig {
@@ -29,6 +44,20 @@ impl McpConfig {
 
         if self.tool_name.trim().is_empty() {
             bail!("MCP tool name cannot be empty");
+        }
+
+        if self.http_addr.is_some()
+            && self
+                .http_token
+                .as_deref()
+                .map(str::trim)
+                .map(str::is_empty)
+                .unwrap_or(true)
+        {
+            bail!(
+                "--http requires a bearer token (set --http-token or GUARD_MCP_TOKEN); \
+                 refusing to start an unauthenticated network MCP server"
+            );
         }
 
         Ok(())
@@ -42,6 +71,8 @@ impl Default for McpConfig {
             tcp_port: None,
             auth_token: None,
             tool_name: DEFAULT_TOOL_NAME.to_string(),
+            http_addr: None,
+            http_token: None,
         }
     }
 }
@@ -124,11 +155,43 @@ trait GuardExecutor: Send + Sync {
     async fn execute(&self, args: GuardToolArgs) -> Result<GuardToolResponse>;
 }
 
+/// Read-only proxy for the daemon's admin RPCs that the catalog/approval MCP
+/// tools surface. These map one-to-one onto existing `AdminRequest` variants;
+/// they self-scope inside the daemon by caller uid/handle ownership and never
+/// bypass the gate (no command runs through this path).
+#[async_trait]
+trait GuardAdmin: Send + Sync {
+    async fn send_admin(&self, request: server::AdminRequest) -> Result<server::AdminResponse>;
+}
+
 #[derive(Clone)]
 struct ClientExecutor {
     socket_path: Option<PathBuf>,
     tcp_port: Option<u16>,
     auth_token: Option<String>,
+}
+
+impl ClientExecutor {
+    /// Build a bare daemon client carrying only the connection details and the
+    /// optional TCP auth token. Used for read-only admin RPCs that the catalog
+    /// and approval tools proxy.
+    fn admin_client(&self) -> server::Client {
+        let mut client = server::Client::new(self.socket_path.clone(), self.tcp_port);
+        if let Some(token) = &self.auth_token {
+            client = client.with_auth(token.clone());
+        }
+        client
+    }
+}
+
+#[async_trait]
+impl GuardAdmin for ClientExecutor {
+    async fn send_admin(&self, request: server::AdminRequest) -> Result<server::AdminResponse> {
+        self.admin_client()
+            .send_admin(request)
+            .await
+            .context("failed to query guard daemon")
+    }
 }
 
 #[async_trait]
@@ -218,8 +281,21 @@ pub async fn serve(config: McpConfig) -> Result<()> {
         tcp_port: config.tcp_port,
         auth_token: config.auth_token.clone(),
     });
-    let mut server = McpServer::new(executor, config.tool_name);
+    let server = McpServer::new(executor.clone(), executor, config.tool_name);
 
+    match config.http_addr {
+        Some(addr) => {
+            let token = config
+                .http_token
+                .clone()
+                .expect("validate() guarantees a token when http_addr is set");
+            serve_http(server, addr, token).await
+        }
+        None => serve_stdio(server).await,
+    }
+}
+
+async fn serve_stdio<E: GuardExecutor, A: GuardAdmin>(mut server: McpServer<E, A>) -> Result<()> {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
     let mut lines = BufReader::new(stdin).lines();
@@ -251,16 +327,306 @@ pub async fn serve(config: McpConfig) -> Result<()> {
     Ok(())
 }
 
-struct McpServer<E: GuardExecutor> {
+/// Minimal MCP Streamable-HTTP transport: a single POST endpoint that pipes the
+/// JSON-RPC body through the same request handler the stdio path uses. Every
+/// request must carry `Authorization: Bearer <token>`; there is no server-side
+/// SSE streaming. The handler is shared behind a Mutex because MCP keeps a
+/// little session state (the initialize handshake) and clients are expected to
+/// drive one logical session.
+async fn serve_http<E: GuardExecutor + 'static, A: GuardAdmin + 'static>(
+    server: McpServer<E, A>,
+    addr: SocketAddr,
+    token: String,
+) -> Result<()> {
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("failed to bind MCP HTTP listener on {addr}"))?;
+    let bound = listener.local_addr().unwrap_or(addr);
+
+    if !bound.ip().is_loopback() {
+        tracing::warn!(
+            address = %bound,
+            "MCP HTTP transport bound to a non-loopback address; it is intended for \
+             localhost or trusted networks only and authenticates with a single bearer token"
+        );
+    }
+    tracing::info!(address = %bound, "MCP HTTP transport listening");
+
+    let server = Arc::new(Mutex::new(server));
+    let token = Arc::new(token);
+
+    loop {
+        let (stream, _peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                tracing::warn!(error = %error, "MCP HTTP accept failed");
+                continue;
+            }
+        };
+        let server = server.clone();
+        let token = token.clone();
+        tokio::spawn(async move {
+            if let Err(error) = handle_http_connection(stream, server, &token).await {
+                tracing::debug!(error = %error, "MCP HTTP connection ended with error");
+            }
+        });
+    }
+}
+
+/// Serve a single HTTP/1.1 request on `stream` (we always close after one,
+/// `Connection: close`). Auth is enforced before the body is dispatched.
+async fn handle_http_connection<E: GuardExecutor, A: GuardAdmin>(
+    mut stream: TcpStream,
+    server: Arc<Mutex<McpServer<E, A>>>,
+    token: &str,
+) -> Result<()> {
+    let request = match read_http_request(&mut stream).await {
+        Ok(request) => request,
+        Err(HttpError::Status(code, message)) => {
+            return write_http_response(&mut stream, code, &error_body(&message)).await;
+        }
+        Err(HttpError::Io(error)) => return Err(error.into()),
+    };
+
+    if request.method != "POST" {
+        return write_http_response(
+            &mut stream,
+            405,
+            &error_body("method not allowed; POST a JSON-RPC request"),
+        )
+        .await;
+    }
+
+    if !request.path_is_mcp_endpoint() {
+        return write_http_response(&mut stream, 404, &error_body("not found")).await;
+    }
+
+    if !request.bearer_matches(token) {
+        return write_http_response(
+            &mut stream,
+            401,
+            &error_body("missing or invalid bearer token"),
+        )
+        .await;
+    }
+
+    let message: Value = match serde_json::from_slice(&request.body) {
+        Ok(message) => message,
+        Err(error) => {
+            let payload =
+                jsonrpc_error_response(Value::Null, -32700, format!("parse error: {error}"), None);
+            return write_http_response(&mut stream, 400, &payload).await;
+        }
+    };
+
+    let response = {
+        let mut guard = server.lock().await;
+        guard.handle_message(message).await
+    };
+
+    // A JSON-RPC notification (no id) produces no response value. The MCP
+    // Streamable-HTTP shape answers such a POST with 202 Accepted and no body.
+    match response {
+        Some(response) => write_http_response(&mut stream, 200, &response).await,
+        None => write_http_empty(&mut stream, 202).await,
+    }
+}
+
+enum HttpError {
+    /// A protocol-level rejection we answer with this status and message.
+    Status(u16, String),
+    Io(std::io::Error),
+}
+
+impl From<std::io::Error> for HttpError {
+    fn from(error: std::io::Error) -> Self {
+        HttpError::Io(error)
+    }
+}
+
+struct HttpRequest {
+    method: String,
+    path: String,
+    authorization: Option<String>,
+    body: Vec<u8>,
+}
+
+impl HttpRequest {
+    fn path_is_mcp_endpoint(&self) -> bool {
+        let path = self.path.split('?').next().unwrap_or(&self.path);
+        path == "/" || path == "/mcp"
+    }
+
+    /// Constant-time-ish bearer comparison: reject on length mismatch, then
+    /// compare every byte without early exit so the check does not leak the
+    /// token length or a prefix match through timing.
+    fn bearer_matches(&self, expected: &str) -> bool {
+        let Some(value) = self.authorization.as_deref() else {
+            return false;
+        };
+        let Some(presented) = value
+            .strip_prefix("Bearer ")
+            .or_else(|| value.strip_prefix("bearer "))
+        else {
+            return false;
+        };
+        constant_time_eq(presented.as_bytes(), expected.as_bytes())
+    }
+}
+
+/// Length-checked, branch-stable byte comparison. Returns false immediately on
+/// a length mismatch (the lengths are not secret), then ORs every byte diff so
+/// the loop runs to completion regardless of where the first mismatch is.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Read one HTTP/1.1 request: the request line, headers, and exactly
+/// `Content-Length` body bytes. Headers are parsed case-insensitively. We bound
+/// both the header section and the body so an unauthenticated peer cannot force
+/// unbounded buffering.
+async fn read_http_request(stream: &mut TcpStream) -> std::result::Result<HttpRequest, HttpError> {
+    let mut reader = BufReader::new(stream);
+    let mut request_line = String::new();
+    let read = reader.read_line(&mut request_line).await?;
+    if read == 0 {
+        return Err(HttpError::Status(400, "empty request".to_string()));
+    }
+
+    let mut parts = request_line.split_whitespace();
+    let method = parts
+        .next()
+        .ok_or_else(|| HttpError::Status(400, "malformed request line".to_string()))?
+        .to_string();
+    let path = parts
+        .next()
+        .ok_or_else(|| HttpError::Status(400, "malformed request line".to_string()))?
+        .to_string();
+
+    let mut content_length: Option<usize> = None;
+    let mut authorization: Option<String> = None;
+    loop {
+        let mut header = String::new();
+        let read = reader.read_line(&mut header).await?;
+        if read == 0 {
+            return Err(HttpError::Status(
+                400,
+                "unexpected end of headers".to_string(),
+            ));
+        }
+        let trimmed = header.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        let Some((name, value)) = trimmed.split_once(':') else {
+            return Err(HttpError::Status(400, "malformed header".to_string()));
+        };
+        let name = name.trim().to_ascii_lowercase();
+        let value = value.trim();
+        match name.as_str() {
+            "content-length" => {
+                let parsed: usize = value
+                    .parse()
+                    .map_err(|_| HttpError::Status(400, "invalid Content-Length".to_string()))?;
+                if parsed > MAX_HTTP_BODY {
+                    return Err(HttpError::Status(413, "request body too large".to_string()));
+                }
+                content_length = Some(parsed);
+            }
+            "authorization" => authorization = Some(value.to_string()),
+            _ => {}
+        }
+    }
+
+    let body = match content_length {
+        Some(0) | None => Vec::new(),
+        Some(len) => {
+            let mut buf = vec![0u8; len];
+            reader.read_exact(&mut buf).await?;
+            buf
+        }
+    };
+
+    Ok(HttpRequest {
+        method,
+        path,
+        authorization,
+        body,
+    })
+}
+
+fn error_body(message: &str) -> Value {
+    json!({ "error": message })
+}
+
+/// Write an HTTP/1.1 response with a JSON body, correct Content-Length, and
+/// `Connection: close`.
+async fn write_http_response(stream: &mut TcpStream, status: u16, body: &Value) -> Result<()> {
+    let payload = serde_json::to_vec(body)?;
+    let head = format!(
+        "HTTP/1.1 {status} {reason}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {len}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        status = status,
+        reason = http_reason(status),
+        len = payload.len(),
+    );
+    stream.write_all(head.as_bytes()).await?;
+    stream.write_all(&payload).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// Write an HTTP/1.1 response with no body (used for 202 Accepted on a
+/// JSON-RPC notification).
+async fn write_http_empty(stream: &mut TcpStream, status: u16) -> Result<()> {
+    let head = format!(
+        "HTTP/1.1 {status} {reason}\r\n\
+         Content-Length: 0\r\n\
+         Connection: close\r\n\
+         \r\n",
+        status = status,
+        reason = http_reason(status),
+    );
+    stream.write_all(head.as_bytes()).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+fn http_reason(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        202 => "Accepted",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        413 => "Payload Too Large",
+        _ => "Error",
+    }
+}
+
+struct McpServer<E: GuardExecutor, A: GuardAdmin> {
     executor: Arc<E>,
+    admin: Arc<A>,
     tool_name: String,
     initialize_seen: bool,
 }
 
-impl<E: GuardExecutor> McpServer<E> {
-    fn new(executor: Arc<E>, tool_name: String) -> Self {
+impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
+    fn new(executor: Arc<E>, admin: Arc<A>, tool_name: String) -> Self {
         Self {
             executor,
+            admin,
             tool_name,
             initialize_seen: false,
         }
@@ -323,16 +689,22 @@ impl<E: GuardExecutor> McpServer<E> {
                         ));
                     }
                 };
-                if tool_call.name != self.tool_name {
+                if tool_call.name == self.tool_name {
+                    let result = self.call_tool(tool_call.arguments).await;
+                    jsonrpc_result_response(id, result)
+                } else if tool_call.name == VERB_LIST_TOOL_NAME {
+                    let result = self.call_verb_list().await;
+                    jsonrpc_result_response(id, result)
+                } else if tool_call.name == APPROVAL_LIST_TOOL_NAME {
+                    let result = self.call_approval_list().await;
+                    jsonrpc_result_response(id, result)
+                } else {
                     jsonrpc_error_response(
                         id,
                         -32601,
                         format!("unknown tool '{}'", tool_call.name),
                         None,
                     )
-                } else {
-                    let result = self.call_tool(tool_call.arguments).await;
-                    jsonrpc_result_response(id, result)
                 }
             }
             _ => jsonrpc_error_response(id, -32601, format!("method not found: {method}"), None),
@@ -456,6 +828,38 @@ impl<E: GuardExecutor> McpServer<E> {
                         "idempotentHint": false,
                         "openWorldHint": true
                     }
+                },
+                {
+                    "name": VERB_LIST_TOOL_NAME,
+                    "title": "List Operator Verb Catalog",
+                    "description": "List the operator-defined verb catalog (the agent's allow-listed menu). Each verb names a binary, its consequence class, and validated parameters. Invoke a verb with the run tool's `verb` argument; this tool only reads the catalog and never executes anything.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                    },
+                    "annotations": {
+                        "readOnlyHint": true,
+                        "destructiveHint": false,
+                        "idempotentHint": true,
+                        "openWorldHint": false
+                    }
+                },
+                {
+                    "name": APPROVAL_LIST_TOOL_NAME,
+                    "title": "List Held and Provisional Approvals",
+                    "description": "List the caller's held approvals and provisional (auto-revert) executions, scoped to the caller by the daemon. Use to poll whether an operator has approved a held command or to see provisionals still inside their revert window. Read-only; it does not approve, confirm, or run anything.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                    },
+                    "annotations": {
+                        "readOnlyHint": true,
+                        "destructiveHint": false,
+                        "idempotentHint": true,
+                        "openWorldHint": false
+                    }
                 }
             ]
         })
@@ -474,6 +878,93 @@ impl<E: GuardExecutor> McpServer<E> {
             Err(error) => tool_error_result(format!("{error:#}")),
         }
     }
+
+    /// Proxy AdminRequest::VerbList: surface the operator verb catalog as a
+    /// read-only tool result. No command runs through this path.
+    async fn call_verb_list(&self) -> Value {
+        match self.admin.send_admin(server::AdminRequest::VerbList).await {
+            Ok(server::AdminResponse::Verbs { items }) => {
+                let structured = json!({ "verbs": items });
+                admin_tool_result(render_verbs_text(&items), structured)
+            }
+            Ok(server::AdminResponse::Error { message }) => tool_error_result(message),
+            Ok(_) => tool_error_result("unexpected response from guard daemon".to_string()),
+            Err(error) => tool_error_result(format!("{error:#}")),
+        }
+    }
+
+    /// Proxy AdminRequest::ApprovalList: surface the caller's held approvals.
+    /// The daemon scopes the list to the caller; this path never approves,
+    /// confirms, or executes anything.
+    async fn call_approval_list(&self) -> Value {
+        match self
+            .admin
+            .send_admin(server::AdminRequest::ApprovalList)
+            .await
+        {
+            Ok(server::AdminResponse::Approvals { items }) => {
+                let structured = json!({ "approvals": items });
+                admin_tool_result(render_approvals_text(&items), structured)
+            }
+            Ok(server::AdminResponse::Error { message }) => tool_error_result(message),
+            Ok(_) => tool_error_result("unexpected response from guard daemon".to_string()),
+            Err(error) => tool_error_result(format!("{error:#}")),
+        }
+    }
+}
+
+fn render_verbs_text(items: &[server::VerbSummary]) -> String {
+    if items.is_empty() {
+        return "(no verbs configured)".to_string();
+    }
+    let mut lines = Vec::with_capacity(items.len());
+    for v in items {
+        let mut line = format!(
+            "{} [{}]{}{} — {}",
+            v.name,
+            v.consequence,
+            if v.trusted { " trusted" } else { "" },
+            if v.has_revert { " revertable" } else { "" },
+            v.description
+        );
+        for (param, pattern) in &v.params {
+            line.push_str(&format!("\n    {param}=<{pattern}>"));
+        }
+        lines.push(line);
+    }
+    lines.join("\n")
+}
+
+fn render_approvals_text(items: &[server::ApprovalSummary]) -> String {
+    if items.is_empty() {
+        return "(no held or provisional approvals)".to_string();
+    }
+    items
+        .iter()
+        .map(|a| {
+            format!(
+                "[{}] handle={} cmd={:?} risk={:?} class={:?} reason={:?}",
+                a.status, a.handle, a.command, a.risk, a.reversibility, a.reason
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Wrap a read-only admin proxy result in the MCP tool-result envelope. These
+/// are never daemon errors (those go through `tool_error_result`), so
+/// `isError` is false.
+fn admin_tool_result(text: String, structured: Value) -> Value {
+    json!({
+        "content": [
+            {
+                "type": "text",
+                "text": text
+            }
+        ],
+        "structuredContent": structured,
+        "isError": false
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -693,6 +1184,28 @@ mod tests {
         }
     }
 
+    /// Admin proxy stub returning a fixed AdminResponse for every RPC.
+    #[derive(Clone)]
+    struct FakeAdmin {
+        response: server::AdminResponse,
+    }
+
+    #[async_trait]
+    impl GuardAdmin for FakeAdmin {
+        async fn send_admin(
+            &self,
+            _request: server::AdminRequest,
+        ) -> Result<server::AdminResponse> {
+            Ok(self.response.clone())
+        }
+    }
+
+    fn empty_admin() -> Arc<FakeAdmin> {
+        Arc::new(FakeAdmin {
+            response: server::AdminResponse::Ok,
+        })
+    }
+
     #[tokio::test]
     async fn initialize_advertises_tools_capability() {
         let executor = Arc::new(FakeExecutor {
@@ -707,7 +1220,7 @@ mod tests {
                 coverage: None,
             }),
         });
-        let mut server = McpServer::new(executor, DEFAULT_TOOL_NAME.to_string());
+        let mut server = McpServer::new(executor, empty_admin(), DEFAULT_TOOL_NAME.to_string());
 
         let response = server
             .handle_message(json!({
@@ -741,7 +1254,7 @@ mod tests {
                 coverage: None,
             }),
         });
-        let mut server = McpServer::new(executor, DEFAULT_TOOL_NAME.to_string());
+        let mut server = McpServer::new(executor, empty_admin(), DEFAULT_TOOL_NAME.to_string());
         server.initialize_seen = true;
 
         let response = server
@@ -774,7 +1287,7 @@ mod tests {
                 coverage: None,
             }),
         });
-        let mut server = McpServer::new(executor, DEFAULT_TOOL_NAME.to_string());
+        let mut server = McpServer::new(executor, empty_admin(), DEFAULT_TOOL_NAME.to_string());
         server.initialize_seen = true;
 
         let response = server
@@ -805,7 +1318,7 @@ mod tests {
         let executor = Arc::new(FakeExecutor {
             response: Err("backend unavailable".to_string()),
         });
-        let mut server = McpServer::new(executor, DEFAULT_TOOL_NAME.to_string());
+        let mut server = McpServer::new(executor, empty_admin(), DEFAULT_TOOL_NAME.to_string());
         server.initialize_seen = true;
 
         let response = server
@@ -903,7 +1416,7 @@ mod tests {
                 coverage: None,
             }),
         });
-        let mut server = McpServer::new(executor, DEFAULT_TOOL_NAME.to_string());
+        let mut server = McpServer::new(executor, empty_admin(), DEFAULT_TOOL_NAME.to_string());
 
         let response = server
             .handle_message(json!({
@@ -916,5 +1429,300 @@ mod tests {
 
         assert_eq!(response["error"]["code"], -32600);
         assert_eq!(response["id"], 5);
+    }
+
+    #[tokio::test]
+    async fn tools_list_includes_catalog_and_approval_tools() {
+        let executor = Arc::new(FakeExecutor {
+            response: Ok(GuardToolResponse {
+                allowed: true,
+                reason: "ok".to_string(),
+                exit_code: Some(0),
+                stdout: None,
+                stderr: None,
+                status: None,
+                handle: None,
+                coverage: None,
+            }),
+        });
+        let mut server = McpServer::new(executor, empty_admin(), DEFAULT_TOOL_NAME.to_string());
+        server.initialize_seen = true;
+
+        let response = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/list"
+            }))
+            .await
+            .expect("tools/list should respond");
+
+        let names: Vec<&str> = response["result"]["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+
+        assert!(names.contains(&DEFAULT_TOOL_NAME));
+        assert!(names.contains(&VERB_LIST_TOOL_NAME));
+        assert!(names.contains(&APPROVAL_LIST_TOOL_NAME));
+    }
+
+    #[tokio::test]
+    async fn verb_list_tool_proxies_daemon_catalog() {
+        let executor = Arc::new(FakeExecutor {
+            response: Ok(GuardToolResponse {
+                allowed: true,
+                reason: "ok".to_string(),
+                exit_code: Some(0),
+                stdout: None,
+                stderr: None,
+                status: None,
+                handle: None,
+                coverage: None,
+            }),
+        });
+        let admin = Arc::new(FakeAdmin {
+            response: server::AdminResponse::Verbs {
+                items: vec![server::VerbSummary {
+                    name: "drain-node".to_string(),
+                    description: "cordon and drain a node".to_string(),
+                    binary: "kubectl".to_string(),
+                    consequence: "recoverable".to_string(),
+                    trusted: true,
+                    has_revert: true,
+                    params: std::collections::BTreeMap::new(),
+                }],
+            },
+        });
+        let mut server = McpServer::new(executor, admin, DEFAULT_TOOL_NAME.to_string());
+        server.initialize_seen = true;
+
+        let response = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "tools/call",
+                "params": {
+                    "name": VERB_LIST_TOOL_NAME,
+                    "arguments": {}
+                }
+            }))
+            .await
+            .expect("tools/call should respond");
+
+        assert_eq!(response["result"]["isError"], false);
+        assert_eq!(
+            response["result"]["structuredContent"]["verbs"][0]["name"],
+            "drain-node"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_list_tool_proxies_daemon_approvals() {
+        let executor = Arc::new(FakeExecutor {
+            response: Ok(GuardToolResponse {
+                allowed: true,
+                reason: "ok".to_string(),
+                exit_code: Some(0),
+                stdout: None,
+                stderr: None,
+                status: None,
+                handle: None,
+                coverage: None,
+            }),
+        });
+        let admin = Arc::new(FakeAdmin {
+            response: server::AdminResponse::Approvals { items: vec![] },
+        });
+        let mut server = McpServer::new(executor, admin, DEFAULT_TOOL_NAME.to_string());
+        server.initialize_seen = true;
+
+        let response = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "tools/call",
+                "params": {
+                    "name": APPROVAL_LIST_TOOL_NAME,
+                    "arguments": {}
+                }
+            }))
+            .await
+            .expect("tools/call should respond");
+
+        assert_eq!(response["result"]["isError"], false);
+        assert!(response["result"]["structuredContent"]["approvals"]
+            .as_array()
+            .expect("approvals array")
+            .is_empty());
+    }
+
+    #[test]
+    fn http_config_requires_token() {
+        let mut config = McpConfig {
+            socket_path: Some(PathBuf::from("/run/guard/guard.sock")),
+            tcp_port: None,
+            auth_token: None,
+            tool_name: DEFAULT_TOOL_NAME.to_string(),
+            http_addr: Some("127.0.0.1:0".parse().unwrap()),
+            http_token: None,
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("bearer token"));
+
+        config.http_token = Some("   ".to_string());
+        assert!(config.validate().is_err(), "blank token must be rejected");
+
+        config.http_token = Some("secret-token".to_string());
+        config
+            .validate()
+            .expect("token present makes http config valid");
+    }
+
+    #[test]
+    fn constant_time_eq_matches_only_on_equal_bytes() {
+        assert!(constant_time_eq(b"token", b"token"));
+        assert!(!constant_time_eq(b"token", b"tokem"));
+        assert!(!constant_time_eq(b"token", b"token-longer"));
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    fn http_test_server() -> McpServer<FakeExecutor, FakeAdmin> {
+        let executor = Arc::new(FakeExecutor {
+            response: Ok(GuardToolResponse {
+                allowed: true,
+                reason: "ok".to_string(),
+                exit_code: Some(0),
+                stdout: None,
+                stderr: None,
+                status: None,
+                handle: None,
+                coverage: None,
+            }),
+        });
+        let mut server = McpServer::new(executor, empty_admin(), DEFAULT_TOOL_NAME.to_string());
+        // The HTTP server shares the same initialize gate; pre-seed it so a raw
+        // POST of tools/list does not need the full handshake for this test.
+        server.initialize_seen = true;
+        server
+    }
+
+    /// Drive one raw HTTP request against an ephemeral-port HTTP MCP server and
+    /// return the parsed status line + body string.
+    async fn http_roundtrip(
+        addr: SocketAddr,
+        authorization: Option<&str>,
+        json_body: &str,
+    ) -> (u16, String) {
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        let mut request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
+            json_body.len()
+        );
+        if let Some(auth) = authorization {
+            request.push_str(&format!("Authorization: {auth}\r\n"));
+        }
+        request.push_str("Connection: close\r\n\r\n");
+        request.push_str(json_body);
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write request");
+
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await.expect("read response");
+        let text = String::from_utf8_lossy(&raw).into_owned();
+        let status: u16 = text
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse().ok())
+            .expect("status code");
+        let body = text
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body.to_string())
+            .unwrap_or_default();
+        (status, body)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_transport_enforces_bearer_and_serves_tools_list() {
+        let token = "test-bearer-token".to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+
+        let token_for_task = token.clone();
+        let handle = tokio::spawn(async move {
+            // Inline a one-connection-at-a-time accept loop mirroring serve_http,
+            // so the test exercises the real connection handler and auth path.
+            let server = Arc::new(Mutex::new(http_test_server()));
+            let token = Arc::new(token_for_task);
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(accepted) => accepted,
+                    Err(_) => break,
+                };
+                let server = server.clone();
+                let token = token.clone();
+                tokio::spawn(async move {
+                    let _ = handle_http_connection(stream, server, &token).await;
+                });
+            }
+        });
+
+        let list_body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+
+        // No Authorization header -> 401, no JSON-RPC result.
+        let (status, body) = http_roundtrip(addr, None, list_body).await;
+        assert_eq!(status, 401, "missing token must be rejected");
+        assert!(
+            !body.contains("\"result\""),
+            "401 body must not leak a result"
+        );
+
+        // Wrong token -> 401.
+        let (status, _) = http_roundtrip(addr, Some("Bearer wrong-token"), list_body).await;
+        assert_eq!(status, 401, "wrong token must be rejected");
+
+        // Correct token -> 200 + a valid JSON-RPC result listing tools.
+        let auth = format!("Bearer {token}");
+        let (status, body) = http_roundtrip(addr, Some(&auth), list_body).await;
+        assert_eq!(status, 200, "valid token must be accepted");
+        let parsed: Value = serde_json::from_str(&body).expect("body is JSON");
+        assert_eq!(parsed["jsonrpc"], "2.0");
+        assert_eq!(parsed["id"], 1);
+        let names: Vec<&str> = parsed["result"]["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(names.contains(&DEFAULT_TOOL_NAME));
+        assert!(names.contains(&VERB_LIST_TOOL_NAME));
+        assert!(names.contains(&APPROVAL_LIST_TOOL_NAME));
+
+        // A non-POST method is rejected with 405.
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream
+            .write_all(
+                format!("GET /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n").as_bytes(),
+            )
+            .await
+            .expect("write GET");
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await.expect("read");
+        let text = String::from_utf8_lossy(&raw);
+        let status: u16 = text
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse().ok())
+            .expect("status");
+        assert_eq!(status, 405, "GET must be rejected");
+
+        handle.abort();
     }
 }
