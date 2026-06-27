@@ -6836,4 +6836,597 @@ mod tests {
             other => panic!("unexpected {:?}", other),
         }
     }
+
+    // ---- Consequence-gating orchestration tests -----------------------------
+    //
+    // These drive the daemon orchestration in this file (arm_containment,
+    // hold_for_approval, handle_admin_request -> confirm/approve/deny/revert,
+    // and the sweeper's expire/auto-revert steps) directly in-process, so the
+    // invariants the Docker CTF (ctf/gating) checks end-to-end are also caught
+    // by `cargo test`. Tests that must spawn a real forward/revert child use
+    // POSIX `echo`/`true`/`false` and are `#[cfg(unix)]`; the authoritative
+    // cross-platform run is the Linux container. The pure registry/handler
+    // invariants (operator gating, TTL expiry, catalog voiding) run everywhere.
+
+    // The gating types (Approval, ApprovalSnapshot, ApprovalStatus, Provisional,
+    // ProvisionalStatus, Coverage, GateMode, Reversibility) and AsyncWrite are
+    // already in scope via `use super::*;`.
+    use std::collections::BTreeMap;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// Build a containment-gating config: gate on, a distinct operator
+    /// principal, and the caller uid as the row owner. Returns
+    /// `(config, operator_caller, agent_caller)`.
+    fn gating_config(
+        operator_uid: u32,
+        agent_uid: u32,
+    ) -> (ServerConfig, CallerIdentity, CallerIdentity) {
+        let (mut cfg, _) = make_test_config();
+        cfg.gate = GateMode::Consequence;
+        cfg.daemon_uid = operator_uid;
+        cfg.daemon_principal = PrincipalKey::from_uid(operator_uid);
+        let operator = CallerIdentity::Unix { uid: operator_uid };
+        let agent = CallerIdentity::Unix { uid: agent_uid };
+        (cfg, operator, agent)
+    }
+
+    /// A request with a structured revert, used to drive `arm_containment`.
+    fn contain_request(binary: &str, args: &[&str], revert: RevertSpec) -> ExecuteRequest {
+        ExecuteRequest {
+            binary: binary.to_string(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            auth_token: None,
+            env: HashMap::new(),
+            secrets: HashMap::new(),
+            stream: false,
+            session_token: None,
+            revert: Some(revert),
+            confirm_within_secs: None,
+            require_approval: None,
+            wait_approval_secs: None,
+            verb: None,
+        }
+    }
+
+    /// A `tokio::io::AsyncWrite` whose writes succeed `ok_writes` times and then
+    /// fail with `BrokenPipe`. With `ok_writes == 0` it fails on the very first
+    /// write, simulating a client stream that drops the instant the daemon
+    /// begins forwarding the child's output. The forward child still spawns and
+    /// runs (so the mutation may have applied); only streaming its output fails.
+    struct FlakyWriter {
+        remaining_ok: usize,
+    }
+
+    impl FlakyWriter {
+        fn failing_after(ok_writes: usize) -> Self {
+            Self {
+                remaining_ok: ok_writes,
+            }
+        }
+    }
+
+    impl AsyncWrite for FlakyWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.remaining_ok == 0 {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "client stream dropped",
+                )));
+            }
+            self.remaining_ok -= 1;
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// CONTAINMENT-LEAK (regression for the just-landed disconnect fix): a
+    /// contained forward command that LAUNCHES and then fails because the client
+    /// stream drops mid-run must STAY ARMED — the provisional stays in the
+    /// registry with `forward_done` set so the auto-revert can still fire. A
+    /// leak here would let an unconfirmed mutation persist past its deadline.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn containment_stays_armed_when_client_stream_drops_after_launch() {
+        let (cfg, _operator, agent) = gating_config(7001, 1000);
+        let agent_principal = agent.principal();
+
+        // Forward `echo` produces a line, so the daemon attempts to stream it;
+        // our writer fails on that first write -> exec_failed_after_start.
+        let request = contain_request(
+            "echo",
+            &["contained-change"],
+            RevertSpec {
+                binary: "true".to_string(),
+                args: Vec::new(),
+            },
+        );
+        let mut writer = FlakyWriter::failing_after(0);
+
+        let result = arm_containment(
+            request,
+            &cfg,
+            &agent,
+            agent_principal,
+            "recoverable change".to_string(),
+            true, // revert_preauthorized: skip re-eval (default-deny evaluator)
+            0,
+            true, // stream_output: exercise the streaming failure path
+            &mut writer,
+        )
+        .await;
+
+        // The forward child launched then failed: started=true.
+        match &result.exec {
+            ExecOutcome::Failed { started, .. } => {
+                assert!(*started, "client stream drop must report started=true");
+            }
+            other => panic!("expected Failed{{started:true}}, got {:?}", other),
+        }
+
+        // Invariant: the provisional is STILL ARMED with forward_done set, so the
+        // sweeper's take_due can fire the auto-revert. It must NOT have been
+        // dropped (that would leak the unconfirmed mutation).
+        let reg = cfg.provisional.read().await;
+        let rows = reg.list();
+        assert_eq!(rows.len(), 1, "the armed provisional must be retained");
+        let p = &rows[0];
+        assert_eq!(p.status, ProvisionalStatus::Armed);
+        assert!(
+            p.forward_done,
+            "forward_done must be set so the deadline is honored"
+        );
+        assert_eq!(reg.outstanding(), 1, "the armed row still occupies a slot");
+    }
+
+    /// Counterpart to the leak test: a contained forward command that FAILS TO
+    /// SPAWN (nonexistent binary, started=false) has no observable effect, so
+    /// the provisional is DROPPED — there is nothing to revert.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn containment_dropped_when_forward_fails_to_spawn() {
+        let (cfg, _operator, agent) = gating_config(7002, 1000);
+        let agent_principal = agent.principal();
+
+        let request = contain_request(
+            "guard-nonexistent-binary-xyz",
+            &[],
+            RevertSpec {
+                binary: "true".to_string(),
+                args: Vec::new(),
+            },
+        );
+        let mut sink = tokio::io::sink();
+
+        let result = arm_containment(
+            request,
+            &cfg,
+            &agent,
+            agent_principal,
+            "recoverable change".to_string(),
+            true,
+            0,
+            false,
+            &mut sink,
+        )
+        .await;
+
+        match &result.exec {
+            ExecOutcome::Failed { started, .. } => {
+                assert!(!*started, "spawn failure must report started=false");
+            }
+            other => panic!("expected Failed{{started:false}}, got {:?}", other),
+        }
+
+        // The provisional was dropped: nothing ran, so nothing to revert.
+        let reg = cfg.provisional.read().await;
+        assert!(
+            reg.list().is_empty(),
+            "a never-launched forward must drop its provisional"
+        );
+    }
+
+    /// contain -> operator confirm keeps the change (no revert fires), and
+    /// confirm is daemon-principal-only: a non-operator caller is refused before
+    /// the registry is touched.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn contain_then_operator_confirm_keeps_change_nonoperator_refused() {
+        let (cfg, operator, agent) = gating_config(7003, 1000);
+        let agent_principal = agent.principal();
+
+        let request = contain_request(
+            "true",
+            &[],
+            RevertSpec {
+                binary: "true".to_string(),
+                args: Vec::new(),
+            },
+        );
+        let mut sink = tokio::io::sink();
+        let result = arm_containment(
+            request,
+            &cfg,
+            &agent,
+            agent_principal,
+            "recoverable change".to_string(),
+            true,
+            0,
+            false,
+            &mut sink,
+        )
+        .await;
+        let handle = match &result.exec {
+            ExecOutcome::Provisional { handle, .. } => handle.clone(),
+            other => panic!("expected Provisional, got {:?}", other),
+        };
+
+        // A non-operator (uid != daemon_principal) cannot confirm: validate_admin
+        // refuses before handle_confirm runs, so the row is untouched.
+        let refused = handle_admin_request(
+            &cfg,
+            &agent,
+            AdminRequest::Confirm {
+                handle: handle.clone(),
+            },
+        )
+        .await;
+        match refused {
+            AdminResponse::Error { message } => {
+                assert!(
+                    message.contains("not the daemon principal"),
+                    "got: {message}"
+                );
+            }
+            other => panic!("non-operator confirm must be refused, got {:?}", other),
+        }
+        assert_eq!(
+            cfg.provisional.read().await.get(&handle).unwrap().status,
+            ProvisionalStatus::Armed,
+            "a refused confirm must not change state"
+        );
+
+        // The operator confirms: the change is kept and the auto-revert is
+        // cancelled.
+        let ok = handle_admin_request(
+            &cfg,
+            &operator,
+            AdminRequest::Confirm {
+                handle: handle.clone(),
+            },
+        )
+        .await;
+        assert!(matches!(ok, AdminResponse::GateAction { .. }));
+        assert_eq!(
+            cfg.provisional.read().await.get(&handle).unwrap().status,
+            ProvisionalStatus::Confirmed
+        );
+
+        // A confirmed provisional is never due, even far past any deadline: the
+        // sweeper's take_due step yields nothing to revert.
+        let due = cfg
+            .provisional
+            .write()
+            .await
+            .take_due(now_unix() + 10_000_000);
+        assert!(due.is_empty(), "a confirmed change must never auto-revert");
+    }
+
+    /// contain -> deadline passes -> the sweeper's auto-revert path fires and
+    /// rolls the change back. Drives the sweeper's `take_due` + `finish_revert`
+    /// steps directly (the live `gating_sweeper` is an infinite loop with a
+    /// startup grace, so its time-driven body is exercised piecewise here).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn contain_then_deadline_triggers_sweeper_autorevert() {
+        let (cfg, _operator, agent) = gating_config(7004, 1000);
+        let agent_principal = agent.principal();
+
+        // A 1s window: the smallest the clamp allows.
+        let mut request = contain_request(
+            "true",
+            &[],
+            RevertSpec {
+                binary: "true".to_string(),
+                args: Vec::new(),
+            },
+        );
+        request.confirm_within_secs = Some(1);
+        let mut sink = tokio::io::sink();
+        let result = arm_containment(
+            request,
+            &cfg,
+            &agent,
+            agent_principal,
+            "recoverable change".to_string(),
+            true,
+            0,
+            false,
+            &mut sink,
+        )
+        .await;
+        let handle = match &result.exec {
+            ExecOutcome::Provisional { handle, .. } => handle.clone(),
+            other => panic!("expected Provisional, got {:?}", other),
+        };
+
+        // Sweeper step: claim every armed-and-due provisional (simulate the
+        // deadline by passing a `now` well past it), then run each revert.
+        let due = cfg
+            .provisional
+            .write()
+            .await
+            .take_due(now_unix() + 10_000_000);
+        assert_eq!(
+            due.len(),
+            1,
+            "the armed provisional is due past its deadline"
+        );
+        for p in &due {
+            finish_revert(&cfg, p, &CallerIdentity::Unknown, "auto").await;
+        }
+
+        // The `true` revert exits 0 -> Reverted.
+        assert_eq!(
+            cfg.provisional.read().await.get(&handle).unwrap().status,
+            ProvisionalStatus::Reverted,
+            "auto-revert must roll the unconfirmed change back"
+        );
+    }
+
+    /// hold -> operator approve executes from the bound snapshot; a non-operator
+    /// caller cannot approve (validate_admin refuses before any state change).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hold_then_operator_approve_executes_snapshot_nonoperator_refused() {
+        let (cfg, operator, agent) = gating_config(7005, 1000);
+        let agent_principal = agent.principal();
+
+        // Hold a command. `true` is the bound binary; approval must run exactly
+        // this snapshot.
+        let request = ExecuteRequest {
+            binary: "true".to_string(),
+            args: Vec::new(),
+            auth_token: None,
+            env: HashMap::new(),
+            secrets: HashMap::new(),
+            stream: false,
+            session_token: None,
+            revert: None,
+            confirm_within_secs: None,
+            require_approval: None,
+            wait_approval_secs: None,
+            verb: None,
+        };
+        let mut sink = tokio::io::sink();
+        let held = hold_for_approval(
+            request,
+            &cfg,
+            &agent,
+            agent_principal,
+            "needs sign-off".to_string(),
+            Some(9),
+            Some(Reversibility::Irreversible),
+            None,
+            false,
+            &mut sink,
+        )
+        .await;
+        let handle = match &held.exec {
+            ExecOutcome::Held { handle, .. } => handle.clone(),
+            other => panic!("expected Held, got {:?}", other),
+        };
+
+        // Non-operator approve is refused; the hold stays pending.
+        let refused = handle_admin_request(
+            &cfg,
+            &agent,
+            AdminRequest::Approve {
+                handle: handle.clone(),
+            },
+        )
+        .await;
+        match refused {
+            AdminResponse::Error { message } => {
+                assert!(
+                    message.contains("not the daemon principal"),
+                    "got: {message}"
+                );
+            }
+            other => panic!("non-operator approve must be refused, got {:?}", other),
+        }
+        assert_eq!(
+            cfg.approvals.read().await.get(&handle).unwrap().status,
+            ApprovalStatus::Pending,
+            "a refused approve must not change state"
+        );
+
+        // Operator approves: the snapshot executes (`true` -> exit 0) and the row
+        // becomes Approved.
+        let ok = handle_admin_request(
+            &cfg,
+            &operator,
+            AdminRequest::Approve {
+                handle: handle.clone(),
+            },
+        )
+        .await;
+        match ok {
+            AdminResponse::GateAction { exit_code, .. } => {
+                assert_eq!(exit_code, Some(0), "approved `true` exits 0");
+            }
+            other => panic!("operator approve should execute, got {:?}", other),
+        }
+        assert_eq!(
+            cfg.approvals.read().await.get(&handle).unwrap().status,
+            ApprovalStatus::Approved
+        );
+    }
+
+    /// hold -> TTL expiry -> the sweeper denies (fail-closed); the command never
+    /// executes. Cross-platform: no child is spawned on this path.
+    #[tokio::test]
+    async fn hold_then_ttl_expiry_denies_fail_closed() {
+        let (cfg, _operator, agent) = gating_config(7006, 1000);
+        let agent_principal = agent.principal();
+
+        let request = ExecuteRequest {
+            binary: "rm".to_string(),
+            args: vec!["-rf".to_string(), "/data".to_string()],
+            auth_token: None,
+            env: HashMap::new(),
+            secrets: HashMap::new(),
+            stream: false,
+            session_token: None,
+            revert: None,
+            confirm_within_secs: None,
+            require_approval: None,
+            wait_approval_secs: None,
+            verb: None,
+        };
+        let mut sink = tokio::io::sink();
+        let held = hold_for_approval(
+            request,
+            &cfg,
+            &agent,
+            agent_principal,
+            "destructive".to_string(),
+            Some(10),
+            Some(Reversibility::Irreversible),
+            None,
+            false,
+            &mut sink,
+        )
+        .await;
+        let handle = match &held.exec {
+            ExecOutcome::Held { handle, .. } => handle.clone(),
+            other => panic!("expected Held, got {:?}", other),
+        };
+
+        // Sweeper step: expire every pending hold past its TTL. Pass a `now` far
+        // beyond the TTL so the deadline has certainly passed.
+        let expired = cfg
+            .approvals
+            .write()
+            .await
+            .expire_due(now_unix() + APPROVAL_TTL_SECS + 10_000);
+        assert_eq!(expired, vec![handle.clone()]);
+
+        let row = cfg.approvals.read().await.get(&handle).cloned().unwrap();
+        assert_eq!(
+            row.status,
+            ApprovalStatus::Expired,
+            "an unattended hold must fail closed (deny), not execute"
+        );
+        // The client-facing result is a denial, never an execution.
+        let result = approval_to_result(&row);
+        assert!(!result.policy_allowed());
+        assert!(result.policy_reason().contains("expired"));
+        assert!(matches!(result.exec, ExecOutcome::NotAttempted));
+    }
+
+    /// approve after the verb catalog version changed is voided: the approved
+    /// artifact may no longer mean what the operator reviewed, so the daemon
+    /// fails it closed rather than executing a stale rendering. Cross-platform:
+    /// the void check returns before any child is spawned.
+    #[tokio::test]
+    async fn approve_voided_when_verb_catalog_version_changed() {
+        let (cfg, operator, agent) = gating_config(7007, 1000);
+
+        // Enqueue a hold that originated from a verb, stamped with a catalog
+        // version that differs from the live (empty) catalog's version. Use a
+        // binary that would clearly execute if the void check were skipped, so a
+        // false pass is detectable.
+        let handle = new_handle();
+        let snapshot = ApprovalSnapshot {
+            binary: "true".to_string(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            secret_keys: BTreeMap::new(),
+            verb_name: Some("restart-service".to_string()),
+            verb_params: BTreeMap::new(),
+            // Live catalog (VerbCatalog::empty()) has version 0; a stale stamp.
+            catalog_version: Some(424_242),
+            principal: agent.principal(),
+        };
+        let approval = Approval {
+            handle: handle.clone(),
+            snapshot,
+            reason: "verb hold".to_string(),
+            risk: Some(8),
+            reversibility: Some(Reversibility::Irreversible),
+            created_unix: now_unix(),
+            ttl_secs: APPROVAL_TTL_SECS,
+            status: ApprovalStatus::Pending,
+            decided_unix: None,
+            decided_reason: None,
+            result_exit: None,
+            result_stdout: None,
+            result_stderr: None,
+        };
+        assert_ne!(
+            approval.snapshot.catalog_version,
+            Some(cfg.verbs.read().await.version()),
+            "test precondition: the stamped version must differ from live"
+        );
+        cfg.approvals.write().await.enqueue(approval);
+
+        let voided = handle_admin_request(
+            &cfg,
+            &operator,
+            AdminRequest::Approve {
+                handle: handle.clone(),
+            },
+        )
+        .await;
+        match voided {
+            AdminResponse::Error { message } => {
+                assert!(
+                    message.contains("catalog changed") && message.contains("voided"),
+                    "got: {message}"
+                );
+            }
+            other => panic!("a stale-catalog approve must be voided, got {:?}", other),
+        }
+
+        // The hold is terminal (ExecFailed), not Approved: nothing executed.
+        assert_eq!(
+            cfg.approvals.read().await.get(&handle).unwrap().status,
+            ApprovalStatus::ExecFailed
+        );
+    }
+
+    /// Sanity: `Coverage::contain` is what a provisional carries, so the
+    /// client-facing result of a contained action advertises the residual risk
+    /// the operator owns (the gate did not verify the rollback inverts the
+    /// change). Guards against silently dropping coverage from the result.
+    #[test]
+    fn provisional_result_carries_contain_coverage() {
+        let r = ExecuteResult::provisional(
+            "recoverable".to_string(),
+            "handle123".to_string(),
+            Coverage::contain(),
+            Some(0),
+            None,
+            None,
+        );
+        match &r.exec {
+            ExecOutcome::Provisional {
+                coverage, handle, ..
+            } => {
+                assert_eq!(handle, "handle123");
+                assert!(coverage.not_checked.iter().any(|s| s.contains("invert")));
+            }
+            other => panic!("expected Provisional, got {:?}", other),
+        }
+    }
 }
