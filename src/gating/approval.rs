@@ -22,10 +22,29 @@ use tokio::sync::Notify;
 use super::{GateError, Reversibility};
 use crate::principal::{scope_eq, PrincipalKey};
 
+/// Optional binding of held secret VALUES to the artifact the operator reviewed.
+/// Captured at hold time as salted SHA-256 hashes of each resolved secret value
+/// (never the value itself), keyed by the injected env-var name. Verified at
+/// approve time: if a mapped value changed since the hold, approval fails closed.
+/// This closes the window where a same-principal caller alters its own mapped
+/// secret values between hold and approval. `None`/empty means no binding was
+/// captured (an older row, or no secret resolved at hold time) and verification
+/// is skipped for back-compat. The salt makes a stored hash not a plain value
+/// hash, so the snapshot does not leak a brute-forceable digest of the secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash, Default)]
+pub struct SecretBinding {
+    /// Per-hold random salt (hex).
+    pub salt: String,
+    /// env-var -> hex SHA-256(salt-bytes, 0x00, value-bytes).
+    pub hashes: BTreeMap<String, String>,
+}
+
 /// The immutable execution inputs an approval is bound to. Stored at enqueue and
 /// replayed verbatim at approve time. Secret *values* are never stored — only the
 /// env-var -> secret-key mapping, resolved at exec under the original caller's
-/// namespace. `BTreeMap` gives a stable order for a stable fingerprint.
+/// namespace, plus an optional salted-hash [`SecretBinding`] used to detect a
+/// value swap between hold and approval. `BTreeMap` gives a stable order for a
+/// stable fingerprint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub struct ApprovalSnapshot {
     pub binary: String,
@@ -49,6 +68,10 @@ pub struct ApprovalSnapshot {
         deserialize_with = "crate::principal::principal_from_legacy"
     )]
     pub principal: Option<PrincipalKey>,
+    /// Optional secret-value binding captured at hold time (see
+    /// [`SecretBinding`]). Absent on rows written before value binding existed.
+    #[serde(default)]
+    pub secret_binding: Option<SecretBinding>,
 }
 
 impl ApprovalSnapshot {
@@ -354,6 +377,7 @@ mod tests {
             verb_params: BTreeMap::new(),
             catalog_version: None,
             principal: Some(PrincipalKey::from_uid(1001)),
+            secret_binding: None,
         }
     }
 

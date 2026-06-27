@@ -4674,6 +4674,30 @@ async fn hold_for_approval<W: AsyncWrite + Unpin>(
 
     let handle = new_handle();
     let now = now_unix();
+
+    // Secret-value binding (best effort): hash each referenced secret value NOW
+    // so a same-principal caller cannot swap its mapped values between this hold
+    // and the operator's approval. A binding is captured only for secrets that
+    // resolve here; if none resolve (or there are no secrets), no binding is
+    // stored and approve-time verification is skipped (back-compat).
+    let secret_binding = match caller_principal.clone() {
+        Some(principal) if !request.secrets.is_empty() => {
+            let salt = hex_encode(&rand::random::<u128>().to_le_bytes());
+            let mut hashes = std::collections::BTreeMap::new();
+            for (env_var, secret_name) in &request.secrets {
+                if let Ok(Some(value)) = config.secrets.get(&principal, secret_name).await {
+                    hashes.insert(env_var.clone(), hash_secret_value(&salt, &value));
+                }
+            }
+            if hashes.is_empty() {
+                None
+            } else {
+                Some(guard::gating::approval::SecretBinding { salt, hashes })
+            }
+        }
+        _ => None,
+    };
+
     let snapshot = ApprovalSnapshot {
         binary: request.binary.clone(),
         args: request.args.clone(),
@@ -4691,6 +4715,7 @@ async fn hold_for_approval<W: AsyncWrite + Unpin>(
         verb_params: verb.as_ref().map(|v| v.params.clone()).unwrap_or_default(),
         catalog_version: verb.as_ref().map(|v| v.catalog_version),
         principal: caller_principal,
+        secret_binding,
     };
     let approval = Approval {
         handle: handle.clone(),
@@ -4802,6 +4827,29 @@ fn approval_to_result(a: &Approval) -> ExecuteResult {
     }
 }
 
+/// Lowercase hex-encode bytes without pulling in a hex crate.
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
+}
+
+/// Salted SHA-256 of a secret value, hex-encoded. The salt and a 0x00 domain
+/// separator ensure the stored digest is not a plain hash of the value, so a
+/// persisted binding does not expose a brute-forceable fingerprint of the
+/// secret. Used only to detect a value change between hold and approval.
+fn hash_secret_value(salt_hex: &str, value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(salt_hex.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(value.as_bytes());
+    hex_encode(&hasher.finalize())
+}
+
 /// Execute an approved snapshot verbatim under the original caller's identity,
 /// with no client stream. Used by `guard approve`.
 async fn execute_snapshot(
@@ -4809,6 +4857,53 @@ async fn execute_snapshot(
     snapshot: &ApprovalSnapshot,
     reason: &str,
 ) -> ExecuteResult {
+    // Verify the secret-value binding captured at hold time. A same-principal
+    // caller must not have swapped its mapped secret values since the operator
+    // reviewed the hold. Fail closed (exec_failed, command not started) on any
+    // mismatch, missing binding entry, or re-resolution failure.
+    if let Some(binding) = &snapshot.secret_binding {
+        let Some(principal) = snapshot.principal.clone() else {
+            return ExecuteResult::exec_failed(
+                reason.to_string(),
+                "approval rejected: a secret-value binding is present but the caller principal is unknown".to_string(),
+            );
+        };
+        for (env_var, secret_name) in &snapshot.secret_keys {
+            let value = match config.secrets.get(&principal, secret_name).await {
+                Ok(Some(v)) => v,
+                Ok(None) => {
+                    return ExecuteResult::exec_failed(
+                        reason.to_string(),
+                        format!(
+                            "approval rejected: bound secret '{}' no longer resolves",
+                            secret_name
+                        ),
+                    );
+                }
+                Err(e) => {
+                    return ExecuteResult::exec_failed(
+                        reason.to_string(),
+                        format!(
+                            "approval rejected: failed to re-resolve bound secret '{}': {}",
+                            secret_name, e
+                        ),
+                    );
+                }
+            };
+            let matches = binding
+                .hashes
+                .get(env_var)
+                .is_some_and(|expected| hash_secret_value(&binding.salt, &value) == *expected);
+            if !matches {
+                return ExecuteResult::exec_failed(
+                    reason.to_string(),
+                    "approval rejected: a mapped secret value changed since the command was held"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
     let caller = reconstruct_caller(snapshot.principal.clone(), &CallerIdentity::Unknown);
     let request = ExecuteRequest {
         binary: snapshot.binary.clone(),
@@ -7451,6 +7546,167 @@ mod tests {
         assert!(matches!(result.exec, ExecOutcome::NotAttempted));
     }
 
+    #[test]
+    fn hash_secret_value_is_salted_and_value_sensitive() {
+        let a = hash_secret_value("salt1", "v1");
+        // Deterministic for the same (salt, value).
+        assert_eq!(a, hash_secret_value("salt1", "v1"));
+        // Sensitive to the value.
+        assert_ne!(a, hash_secret_value("salt1", "v2"));
+        // Sensitive to the salt (so a persisted digest is not a plain value hash).
+        assert_ne!(a, hash_secret_value("salt2", "v1"));
+        // 32-byte SHA-256 -> 64 hex chars.
+        assert_eq!(a.len(), 64);
+    }
+
+    /// A held command captures a salted hash of its mapped secret VALUES. If the
+    /// same-principal caller swaps a value between hold and approval, approval
+    /// fails closed before the command runs.
+    #[tokio::test]
+    async fn approve_rejected_when_bound_secret_value_changed() {
+        let (cfg, _operator, agent) = gating_config(7201, 4201);
+        let agent_principal = agent.principal();
+        let p = agent_principal.clone().expect("agent principal");
+        cfg.secrets.set(&p, "BIND_TEST_KEY", "v1").await.unwrap();
+
+        let mut secrets = HashMap::new();
+        secrets.insert("INJECTED".to_string(), "BIND_TEST_KEY".to_string());
+        let request = ExecuteRequest {
+            binary: "true".to_string(),
+            args: Vec::new(),
+            auth_token: None,
+            env: HashMap::new(),
+            secrets,
+            stream: false,
+            session_token: None,
+            revert: None,
+            confirm_within_secs: None,
+            require_approval: None,
+            wait_approval_secs: None,
+            verb: None,
+        };
+        let mut sink = tokio::io::sink();
+        let held = hold_for_approval(
+            request,
+            &cfg,
+            &agent,
+            agent_principal.clone(),
+            "needs review".to_string(),
+            Some(8),
+            Some(Reversibility::Irreversible),
+            None,
+            false,
+            &mut sink,
+        )
+        .await;
+        let handle = match &held.exec {
+            ExecOutcome::Held { handle, .. } => handle.clone(),
+            other => panic!("expected Held, got {:?}", other),
+        };
+
+        let snapshot = cfg
+            .approvals
+            .read()
+            .await
+            .get(&handle)
+            .cloned()
+            .unwrap()
+            .snapshot;
+        assert!(
+            snapshot.secret_binding.is_some(),
+            "a secret-value binding must be captured at hold time"
+        );
+
+        // The same principal swaps the value the operator was reviewing.
+        cfg.secrets
+            .set(&p, "BIND_TEST_KEY", "v2-tampered")
+            .await
+            .unwrap();
+
+        let result = execute_snapshot(&cfg, &snapshot, "operator approved").await;
+        match &result.exec {
+            ExecOutcome::Failed { reason, started } => {
+                assert!(!started, "the command must not have started");
+                assert!(
+                    reason.contains("changed since the command was held"),
+                    "got: {}",
+                    reason
+                );
+            }
+            other => panic!("expected a fail-closed rejection, got {:?}", other),
+        }
+
+        let _ = cfg.secrets.delete(&p, "BIND_TEST_KEY").await;
+    }
+
+    /// When the bound value is unchanged, the binding check passes (it does not
+    /// reject), so the approved command proceeds to execution.
+    #[tokio::test]
+    async fn approve_passes_binding_when_secret_value_unchanged() {
+        let (cfg, _operator, agent) = gating_config(7202, 4202);
+        let agent_principal = agent.principal();
+        let p = agent_principal.clone().expect("agent principal");
+        cfg.secrets.set(&p, "BIND_OK_KEY", "stable").await.unwrap();
+
+        let mut secrets = HashMap::new();
+        secrets.insert("INJECTED".to_string(), "BIND_OK_KEY".to_string());
+        let request = ExecuteRequest {
+            binary: "true".to_string(),
+            args: Vec::new(),
+            auth_token: None,
+            env: HashMap::new(),
+            secrets,
+            stream: false,
+            session_token: None,
+            revert: None,
+            confirm_within_secs: None,
+            require_approval: None,
+            wait_approval_secs: None,
+            verb: None,
+        };
+        let mut sink = tokio::io::sink();
+        let held = hold_for_approval(
+            request,
+            &cfg,
+            &agent,
+            agent_principal.clone(),
+            "needs review".to_string(),
+            Some(8),
+            Some(Reversibility::Irreversible),
+            None,
+            false,
+            &mut sink,
+        )
+        .await;
+        let handle = match &held.exec {
+            ExecOutcome::Held { handle, .. } => handle.clone(),
+            other => panic!("expected Held, got {:?}", other),
+        };
+        let snapshot = cfg
+            .approvals
+            .read()
+            .await
+            .get(&handle)
+            .cloned()
+            .unwrap()
+            .snapshot;
+
+        // Value unchanged -> the binding check must NOT reject. The subsequent
+        // exec of `true` succeeds on Unix; on Windows there is no `true` binary,
+        // so it may fail to spawn — either way it is not the binding rejection,
+        // which is what this test asserts.
+        let result = execute_snapshot(&cfg, &snapshot, "operator approved").await;
+        if let ExecOutcome::Failed { reason, .. } = &result.exec {
+            assert!(
+                !reason.contains("changed since the command was held"),
+                "binding check must not reject an unchanged value; got: {}",
+                reason
+            );
+        }
+
+        let _ = cfg.secrets.delete(&p, "BIND_OK_KEY").await;
+    }
+
     /// approve after the verb catalog version changed is voided: the approved
     /// artifact may no longer mean what the operator reviewed, so the daemon
     /// fails it closed rather than executing a stale rendering. Cross-platform:
@@ -7474,6 +7730,7 @@ mod tests {
             // Live catalog (VerbCatalog::empty()) has version 0; a stale stamp.
             catalog_version: Some(424_242),
             principal: agent.principal(),
+            secret_binding: None,
         };
         let approval = Approval {
             handle: handle.clone(),
