@@ -472,7 +472,12 @@ function Invoke-Install {
     #    (HKLM\SYSTEM\CurrentControlSet\Services\<name>\Environment) as a
     #    REG_MULTI_SZ. It is readable by admins (trusted) but NOT by the non-admin
     #    agent, which cannot read other accounts' service config.
-    $serviceEnv = @("KUBECONFIG=$KubeConfig")
+    # KUBECONFIG points the brokered kubectl at the guard-only config; GUARD_CHILD_ENV
+    # tells the daemon to forward KUBECONFIG to the children it execs (the daemon
+    # otherwise env_clears the child), so the agent runs kubectl through guard
+    # without ever seeing the credentials. Add more names here to broker other
+    # tools' config env generically (no per-tool code in guard).
+    $serviceEnv = @("KUBECONFIG=$KubeConfig", "GUARD_CHILD_ENV=KUBECONFIG")
     foreach ($k in $llmEnv.Keys) { $serviceEnv += "$k=$($llmEnv[$k])" }
     Set-ServiceEnvironment -Name $ServiceName -Pairs $serviceEnv
     if ($haveKey) {

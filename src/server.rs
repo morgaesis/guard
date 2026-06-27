@@ -733,6 +733,13 @@ pub struct ServerConfig {
     /// hard floor independent of the LLM decision. Set by the daemon entrypoint
     /// from `--allow-bin` / `GUARD_ALLOW_BIN`.
     pub allowed_binaries: Option<Vec<String>>,
+    /// Extra environment variable names the daemon forwards from its own
+    /// environment to executed children, in addition to the built-in
+    /// platform allowlist. Operator-declared via `--child-env` /
+    /// `GUARD_CHILD_ENV`, this is how brokered credentials reach a tool
+    /// generically without per-tool code — e.g. `KUBECONFIG` so brokered
+    /// kubectl/helm read a config the agent cannot see.
+    pub extra_child_env: Vec<String>,
 }
 
 impl ServerConfig {
@@ -791,6 +798,9 @@ impl ServerConfig {
             // No binary restriction by default; the entrypoint sets this from
             // --allow-bin / GUARD_ALLOW_BIN, like the gate fields above.
             allowed_binaries: None,
+            // No extra child-env passthrough by default; the entrypoint sets
+            // this from --child-env / GUARD_CHILD_ENV.
+            extra_child_env: Vec::new(),
         }
     }
 
@@ -972,6 +982,12 @@ impl Server {
     /// default); an empty list denies everything. Must be called before `run`.
     pub fn set_allowed_binaries(&mut self, allowed: Option<Vec<String>>) {
         self.config.allowed_binaries = allowed;
+    }
+
+    /// Set the operator-declared extra child-env passthrough list (see
+    /// [`ServerConfig::extra_child_env`]). Must be called before `run`.
+    pub fn set_extra_child_env(&mut self, vars: Vec<String>) {
+        self.config.extra_child_env = vars;
     }
 
     /// Load persisted provisional/approval state and apply startup recovery:
@@ -4220,6 +4236,17 @@ async fn exec_after_approval<W: AsyncWrite + Unpin>(
         }
     }
 
+    // Operator-declared passthroughs (GUARD_CHILD_ENV): forward these daemon
+    // env vars to the child so brokered credentials reach a tool generically.
+    // The value comes from the DAEMON's environment (not the caller), so an
+    // agent cannot inject one here; e.g. KUBECONFIG points kubectl at a config
+    // only the daemon can read.
+    for var in &config.extra_child_env {
+        if let Ok(val) = std::env::var(var) {
+            cmd.env(var, val);
+        }
+    }
+
     let exec_caller = match apply_exec_identity(&mut cmd, config, caller) {
         Ok(context) => context,
         Err(e) => {
@@ -6912,6 +6939,75 @@ mod tests {
             .secrets
             .delete(&PrincipalKey::from_uid(30_000), &key)
             .await;
+    }
+
+    #[tokio::test]
+    async fn extra_child_env_forwards_named_var_to_child() {
+        let (mut cfg, _) = make_test_config();
+        // The daemon forwards GUARD_CHILD_TEST_PT to children only because it is
+        // listed in extra_child_env; the value comes from the daemon's own env.
+        std::env::set_var("GUARD_CHILD_TEST_PT", "brokered-value-xyz");
+        cfg.extra_child_env = vec!["GUARD_CHILD_TEST_PT".to_string()];
+
+        #[cfg(unix)]
+        let (bin, args) = (
+            "sh".to_string(),
+            vec![
+                "-c".to_string(),
+                "printf %s \"$GUARD_CHILD_TEST_PT\"".to_string(),
+            ],
+        );
+        #[cfg(windows)]
+        let (bin, args) = (
+            "cmd".to_string(),
+            vec!["/c".to_string(), "echo %GUARD_CHILD_TEST_PT%".to_string()],
+        );
+
+        let token = format!("child-env-{}", std::process::id());
+        {
+            let mut sessions = cfg.sessions.write().await;
+            sessions.grant(
+                token.clone(),
+                SessionGrant {
+                    allow: vec!["*".into()],
+                    deny: Vec::new(),
+                    allow_exact: Vec::new(),
+                    deny_exact: Vec::new(),
+                    expires_at: None,
+                    prompt_append: None,
+                    static_only: true,
+                    auto_amend: false,
+                    granted_at: 0,
+                },
+            );
+        }
+        let req = ExecuteRequest {
+            binary: bin,
+            args,
+            auth_token: None,
+            env: HashMap::new(),
+            secrets: HashMap::new(),
+            stream: false,
+            session_token: Some(token),
+            revert: None,
+            confirm_within_secs: None,
+            require_approval: None,
+            wait_approval_secs: None,
+            verb: None,
+        };
+        let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+        match &result.exec {
+            ExecOutcome::Completed { stdout, .. } => assert!(
+                stdout
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("brokered-value-xyz"),
+                "child did not receive the forwarded var; stdout={:?}",
+                stdout
+            ),
+            other => panic!("expected Completed, got {:?}", other),
+        }
+        std::env::remove_var("GUARD_CHILD_TEST_PT");
     }
 
     #[tokio::test]

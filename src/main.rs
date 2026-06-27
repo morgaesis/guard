@@ -641,6 +641,15 @@ enum ServerCommands {
         #[arg(long = "allow-bin", value_name = "BIN[,BIN]", value_delimiter = ',')]
         allow_bin: Option<Vec<String>>,
 
+        /// Extra environment variables the daemon forwards from its own
+        /// environment to executed children (beyond the built-in platform
+        /// allowlist). The generic way to broker a tool's credential config
+        /// without per-tool code, e.g. `--child-env KUBECONFIG` so brokered
+        /// kubectl/helm read a config the agent cannot see. Repeat or
+        /// comma-separate. Env: GUARD_CHILD_ENV (comma-separated).
+        #[arg(long = "child-env", value_name = "VAR[,VAR]", value_delimiter = ',')]
+        child_env: Option<Vec<String>>,
+
         /// Internal marker: launched under the Windows Service Control Manager.
         /// The Windows installer sets this in the service binPath so startup
         /// answers the SCM start/stop handshake instead of running in the
@@ -1053,6 +1062,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             gate,
             verbs,
             allow_bin,
+            child_env,
             // Consumed in `main` (Windows SCM dispatch); irrelevant to the
             // server run itself, which is identical in service and foreground.
             service: _,
@@ -1578,6 +1588,29 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             if let Some(ref list) = allowed_binaries {
                 tracing::info!("Binary allow-list active: {:?}", list);
                 srv.set_allowed_binaries(Some(list.clone()));
+            }
+
+            // Extra child-env passthrough: flag wins, else GUARD_CHILD_ENV
+            // (comma-separated). Forwards named daemon env vars to children.
+            let child_env_vars = child_env
+                .or_else(|| {
+                    guard_env("CHILD_ENV").map(|v| {
+                        v.split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .map(|list| {
+                    list.into_iter()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if !child_env_vars.is_empty() {
+                tracing::info!("Child-env passthrough: {:?}", child_env_vars);
+                srv.set_extra_child_env(child_env_vars);
             }
 
             srv.run().await
@@ -3223,6 +3256,7 @@ mod tests {
                 gate,
                 verbs,
                 allow_bin,
+                child_env,
                 service,
             }) => ServerCommands::Start {
                 socket,
@@ -3259,6 +3293,7 @@ mod tests {
                 gate,
                 verbs,
                 allow_bin,
+                child_env,
                 service,
             },
             _ => panic!("expected server start args"),
