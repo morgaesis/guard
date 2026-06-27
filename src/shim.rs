@@ -474,7 +474,7 @@ fn find_guard_binary() -> Result<PathBuf> {
         }
     }
 
-    bail!("could not find 'guard' binary in PATH. Set SSH_GUARD_BIN or ensure guard is in PATH.")
+    bail!("could not find 'guard' binary in PATH. Set GUARD_BIN or ensure guard is in PATH.")
 }
 
 /// Get the default shim directory path.

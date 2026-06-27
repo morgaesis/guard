@@ -18,10 +18,10 @@ ACL — Administrators/SYSTEM/Authenticated Users by default; tighten it to a
 specific agent SID on a multi-user host.
 
 A TCP loopback transport is also available with `--tcp-port` (default
-`127.0.0.1:8123`) and a shared `SSH_GUARD_AUTH_TOKEN`. A TCP caller carries only
+`127.0.0.1:8123`) and a shared `GUARD_AUTH_TOKEN`. A TCP caller carries only
 a bearer token and no local principal, so over TCP consequence gating is refused,
 secret/`--env` injection is refused, and non-Ping admin RPCs such as `guard grant`
-require the separate `SSH_GUARD_ADMIN_TOKEN`. `--exec-as-caller` (setuid-style
+require the separate `GUARD_ADMIN_TOKEN`. `--exec-as-caller` (setuid-style
 identity drop) is Unix-only; on Windows the daemon always executes approved
 commands as its own service account, and containment rests on that account
 isolation rather than an identity swap.
@@ -150,7 +150,7 @@ Install the environment file:
 
 ```bash
 install -m 0600 deployment/systemd/guard.env.example /etc/default/guard
-# Edit /etc/default/guard and set SSH_GUARD_LLM_API_KEY
+# Edit /etc/default/guard and set GUARD_LLM_API_KEY
 ```
 
 Install the unit:
@@ -185,7 +185,7 @@ ls -l /run/guard/guard.sock
   gating and credential brokering, since both authorize on the named-pipe SID.
   For a no-gating deployment, run `guard server start --tcp-port 8123
   --learn-rules` from a service manager or scheduled task, set
-  `SSH_GUARD_LLM_API_KEY` / `OPENROUTER_API_KEY` in that service environment, and
+  `GUARD_LLM_API_KEY` / `OPENROUTER_API_KEY` in that service environment, and
   use `guard config set-port 8123` for clients on the same host.
 - The socket can be world-connectable at the filesystem layer because authorization is enforced by peer UID in the server.
 - Omit `--users` to allow any local UNIX-socket caller. Add `--users` only when the daemon should reject all callers outside a specific UID list.
@@ -195,7 +195,7 @@ ls -l /run/guard/guard.sock
 - For latency-sensitive service APIs, enable learned static allows with
   `--learn-rules`; use `--learn-shims suggest` or `--learn-shims create` to
   surface shorter wrappers for repeated SSH/API prefixes.
-- Pre-LLM executable validation and credential-pattern deny are off by default. Enable with `--preflight` or `SSH_GUARD_PREFLIGHT=true`. These checks are coarse and over-match (they deny any command containing the `env` token); prefer them only on hosts where LLM cost or latency dominates over false positives.
+- Pre-LLM executable validation and credential-pattern deny are off by default. Enable with `--preflight` or `GUARD_PREFLIGHT=true`. These checks are coarse and over-match (they deny any command containing the `env` token); prefer them only on hosts where LLM cost or latency dominates over false positives.
 - For prompt and policy testing, run a separate `--dry-run` server on its own
   socket so approved commands are evaluated but not executed.
 - Audit logs are emitted via `tracing` to stderr (captured by systemd journal). Set `RUST_LOG=info` in the environment file for standard logging.

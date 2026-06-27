@@ -33,7 +33,7 @@ See [INSTALL.md](INSTALL.md) for install options and [DEPLOYMENT.md](DEPLOYMENT.
 
 ```bash
 # Set your API key (OpenRouter, or any OpenAI-compatible endpoint)
-export SSH_GUARD_LLM_API_KEY="your-key-here"
+export GUARD_LLM_API_KEY="your-key-here"
 
 # Start the server
 guard server start &
@@ -58,7 +58,7 @@ guard server connect --socket .cache/guard-dry-run.sock bash -- -c 'sudo id'
 
 ## Modes
 
-Set via `SSH_GUARD_MODE`:
+Set via `GUARD_MODE`:
 
 | Mode | Description |
 |---|---|
@@ -74,8 +74,8 @@ untrusted agents, adversarial testing, or first contact with an unfamiliar
 workspace where even broad reads and network access should be treated as risky.
 
 ```bash
-SSH_GUARD_MODE=safe guard run sudo systemctl status ssh --no-pager  # allowed
-SSH_GUARD_MODE=paranoid guard run sudo systemctl status ssh --no-pager  # denied
+GUARD_MODE=safe guard run sudo systemctl status ssh --no-pager  # allowed
+GUARD_MODE=paranoid guard run sudo systemctl status ssh --no-pager  # denied
 ```
 
 All modes evaluate `sudo` by the underlying command:
@@ -186,7 +186,7 @@ Two opt-in features exist for deployments with specific constraints:
   for deterministic safe or unsafe patterns. See
   [`examples/`](examples/README.md) for `allow-policy.yaml`,
   `deny-policy.yaml`, and `hybrid-policy.yaml`.
-- **Fallback model chain** via `SSH_GUARD_LLM_MODELS`. Fails over to
+- **Fallback model chain** via `GUARD_LLM_MODELS`. Fails over to
   alternate providers after the primary exhausts its retries. See
   [`examples/fallback-models.env`](examples/fallback-models.env).
 - **Learned static rules** via `--learn-rules`. Repeated low-risk LLM
@@ -204,28 +204,28 @@ Guard walks up from your current directory to `/` looking for `.env` files (clos
 
 | Variable | Default | Description |
 |---|---|---|
-| `SSH_GUARD_LLM_API_KEY` / `OPENROUTER_API_KEY` | (none) | LLM API key (required). `OPENROUTER_API_KEY` is the conventional name and is accepted for compatibility. |
-| `SSH_GUARD_LLM_API_URL` / `SSH_GUARD_API_URL` | `https://openrouter.ai/api/v1/chat/completions` | Any OpenAI-compatible endpoint |
-| `SSH_GUARD_LLM_MODELS` | (unset) | Optional comma-separated fallback chain (e.g. `openai/gpt-5.4-nano,meta-llama/llama-4-maverick`). When set, overrides `--llm-model` and is tried in order, each with its own retry budget. Primary model when unset: `openai/gpt-5.4-nano`. |
-| `SSH_GUARD_LLM_RETRIES` | `2` | Retries per model on transient failures (429, timeouts, parse errors). 1-2. |
-| `SSH_GUARD_LLM_TIMEOUT` / `SSH_GUARD_TIMEOUT` | `30` | LLM call timeout in seconds. |
-| `SSH_GUARD_AUTH_TOKEN` | (none) | Shared token for TCP clients. Use this for loopback TCP daemons instead of passing `--auth-token` on the command line. |
-| `SSH_GUARD_ADMIN_TOKEN` | (none) | Separate token for TCP admin RPCs such as `guard grant`, `guard session show`, and the full `guard status`. The Windows launcher generates and stores one automatically. |
-| `SSH_GUARD_MODE` | `readonly` | `readonly`, `safe`, or `paranoid` |
-| `SSH_GUARD_DRY_RUN` | `false` | Evaluate policy but do not execute approved commands. Useful for prompt and policy testing. |
-| `SSH_GUARD_LEARN_RULES` | `false` | Learn static allows from repeated low-risk LLM approvals. |
-| `SSH_GUARD_LEARN_MIN_APPROVALS` | `2` | Approvals required before promotion. |
-| `SSH_GUARD_LEARN_MAX_RISK` | `2` | Highest LLM risk score eligible for promotion. |
-| `SSH_GUARD_LEARN_SHIMS` | `suggest` | `off`, `suggest`, or `create` service shims for learned SSH/API wrappers. |
-| `SSH_GUARD_PROMPT_APPEND` | (none) | Path to additive prompt file (appended to base prompt) |
-| `SSH_GUARD_GPG_RECIPIENT` | (none) | GPG recipient for the `local` secret backend |
-| `SSH_GUARD_BACKEND` | (auto) | Secret backend (`pass`, `env`, `local`). Auto prefers `pass`; otherwise it falls back to non-persistent `env` and logs a warning. |
-| `SSH_GUARD_GATE` | `off` | Consequence gating: `off` or `consequence`. Requires a local listener (`--socket`: a Unix-domain socket on Unix, a named pipe on Windows); refused over TCP. |
-| `SSH_GUARD_VERBS` | (none) | Path to the verb catalog YAML. Hot-reloaded on change. |
+| `GUARD_LLM_API_KEY` / `OPENROUTER_API_KEY` | (none) | LLM API key (required). `OPENROUTER_API_KEY` is the conventional name and is accepted for compatibility. |
+| `GUARD_LLM_API_URL` / `GUARD_API_URL` | `https://openrouter.ai/api/v1/chat/completions` | Any OpenAI-compatible endpoint |
+| `GUARD_LLM_MODELS` | (unset) | Optional comma-separated fallback chain (e.g. `openai/gpt-5.4-nano,meta-llama/llama-4-maverick`). When set, overrides `--llm-model` and is tried in order, each with its own retry budget. Primary model when unset: `openai/gpt-5.4-nano`. |
+| `GUARD_LLM_RETRIES` | `2` | Retries per model on transient failures (429, timeouts, parse errors). 1-2. |
+| `GUARD_LLM_TIMEOUT` / `GUARD_TIMEOUT` | `30` | LLM call timeout in seconds. |
+| `GUARD_AUTH_TOKEN` | (none) | Shared token for TCP clients. Use this for loopback TCP daemons instead of passing `--auth-token` on the command line. |
+| `GUARD_ADMIN_TOKEN` | (none) | Separate token for TCP admin RPCs such as `guard grant`, `guard session show`, and the full `guard status`. The Windows launcher generates and stores one automatically. |
+| `GUARD_MODE` | `readonly` | `readonly`, `safe`, or `paranoid` |
+| `GUARD_DRY_RUN` | `false` | Evaluate policy but do not execute approved commands. Useful for prompt and policy testing. |
+| `GUARD_LEARN_RULES` | `false` | Learn static allows from repeated low-risk LLM approvals. |
+| `GUARD_LEARN_MIN_APPROVALS` | `2` | Approvals required before promotion. |
+| `GUARD_LEARN_MAX_RISK` | `2` | Highest LLM risk score eligible for promotion. |
+| `GUARD_LEARN_SHIMS` | `suggest` | `off`, `suggest`, or `create` service shims for learned SSH/API wrappers. |
+| `GUARD_PROMPT_APPEND` | (none) | Path to additive prompt file (appended to base prompt) |
+| `GUARD_GPG_RECIPIENT` | (none) | GPG recipient for the `local` secret backend |
+| `GUARD_BACKEND` | (auto) | Secret backend (`pass`, `env`, `local`). Auto prefers `pass`; otherwise it falls back to non-persistent `env` and logs a warning. |
+| `GUARD_GATE` | `off` | Consequence gating: `off` or `consequence`. Requires a local listener (`--socket`: a Unix-domain socket on Unix, a named pipe on Windows); refused over TCP. |
+| `GUARD_VERBS` | (none) | Path to the verb catalog YAML. Hot-reloaded on change. |
 
 The primary model is `openai/gpt-5.4-nano` via OpenRouter by default. Set it
 per-invocation with `--llm-model <slug>`. To configure a true fallback chain
-across providers, use `SSH_GUARD_LLM_MODELS` (comma-separated) or
+across providers, use `GUARD_LLM_MODELS` (comma-separated) or
 `--llm-models`. `--llm-timeout <seconds>` controls the per-call HTTP timeout.
 
 See [`.env.example`](.env.example) for a copyable template.
@@ -237,7 +237,7 @@ See [`.env.example`](.env.example) for a copyable template.
 Start the guard server and execute commands through it:
 
 ```bash
-export SSH_GUARD_LLM_API_KEY="sk-or-v1-..."
+export GUARD_LLM_API_KEY="sk-or-v1-..."
 
 guard server start --socket .cache/guard.sock &
 guard config set-server .cache/guard.sock
@@ -269,7 +269,7 @@ Safe mode allows visible, bounded administration while still blocking direct
 credential-material reads and obvious escalation paths:
 
 ```bash
-SSH_GUARD_MODE=safe guard server start --socket .cache/guard.sock &
+GUARD_MODE=safe guard server start --socket .cache/guard.sock &
 
 # Allowed: ordinary inspection and work files
 guard run cat /etc/hosts
@@ -292,7 +292,7 @@ guard run sudo su
 Paranoid mode locks down to basic read-only inspection:
 
 ```bash
-SSH_GUARD_MODE=paranoid guard server start --socket .cache/guard.sock &
+GUARD_MODE=paranoid guard server start --socket .cache/guard.sock &
 
 # Allowed: basic system state
 guard run id
@@ -364,7 +364,7 @@ Append environment-specific instructions to the built-in prompt without replacin
 guard server start --system-prompt-append /etc/guard/extra-rules.txt &
 
 # Or via environment variable
-SSH_GUARD_PROMPT_APPEND=/etc/guard/extra-rules.txt guard server start &
+GUARD_PROMPT_APPEND=/etc/guard/extra-rules.txt guard server start &
 ```
 
 Example additive prompt (`extra-rules.txt`):
@@ -438,7 +438,7 @@ guard session appeal <token> kubectl get httproute -n nextcloud
 
 An appeal runs the evaluator with the session context and then either amends an exact allow, amends an exact deny for a high-risk denial, or refuses to amend. It exits nonzero when the appealed command remains denied. Appeals are admin RPCs, like grant/revoke/show, because they can change durable authorization state.
 
-Session grants are persisted in the daemon state database and survive daemon restarts by default. The default path is the XDG state dir (`$XDG_STATE_HOME/guard/state.db` or `~/.local/state/guard/state.db`); override it with `--state-db` or `SSH_GUARD_STATE_DB`. `guard session revoke <token>` is restricted to the daemon principal; `guard session list` is visible over a local listener to exec-allowed callers, but it redacts the bearer token, rule bodies, and prompt text unless the caller is the daemon principal.
+Session grants are persisted in the daemon state database and survive daemon restarts by default. The default path is the XDG state dir (`$XDG_STATE_HOME/guard/state.db` or `~/.local/state/guard/state.db`); override it with `--state-db` or `GUARD_STATE_DB`. `guard session revoke <token>` is restricted to the daemon principal; `guard session list` is visible over a local listener to exec-allowed callers, but it redacts the bearer token, rule bodies, and prompt text unless the caller is the daemon principal.
 
 For operator forensics, `guard session show <token>` is restricted to the daemon principal and prints the full prompt, aggregate allow/deny and exec outcome counts, source breakdown (`llm`, `cache`, `static_policy`, `session_allow`, `session_deny`, `session_static_only`, `validation`), a risk histogram for LLM-evaluated calls, and a bounded recent interaction log. Those summaries are loaded from the state database, so they remain available after a service restart within the configured retention window.
 
@@ -490,7 +490,7 @@ guard run --env OPNSENSE_HOST=opnsense-host --secret OPNSENSE_API_KEY \
 
 ## Admin authorization
 
-Session admin RPCs (`session new` / `grant` / `revoke`, plus the privileged subset of `status`) are restricted to **the daemon's own principal** over a local listener — its uid over a Unix-domain socket, its SID over a Windows named pipe. `session list` is the local-listener exception: exec-allowed local callers may see that grants exist, when they were granted, and when they expire, but the daemon redacts the session token, allow/deny patterns, and prompt text unless the caller is the daemon principal. On TCP transports, non-Ping admin RPCs require the separate `SSH_GUARD_ADMIN_TOKEN`; the ordinary TCP exec `SSH_GUARD_AUTH_TOKEN` is not enough to mint grants.
+Session admin RPCs (`session new` / `grant` / `revoke`, plus the privileged subset of `status`) are restricted to **the daemon's own principal** over a local listener — its uid over a Unix-domain socket, its SID over a Windows named pipe. `session list` is the local-listener exception: exec-allowed local callers may see that grants exist, when they were granted, and when they expire, but the daemon redacts the session token, allow/deny patterns, and prompt text unless the caller is the daemon principal. On TCP transports, non-Ping admin RPCs require the separate `GUARD_ADMIN_TOKEN`; the ordinary TCP exec `GUARD_AUTH_TOKEN` is not enough to mint grants.
 
 The non-privileged `guard status` (run as your normal user or any other exec-allowed UID, or over TCP without the admin token) returns only client + server version, uptime, evaluation mode, and dry-run state. It is a liveness probe — enough to confirm the connection works and what mode the evaluator is in, but nothing that would help fingerprint the deployment or escalate privilege.
 
@@ -572,8 +572,8 @@ Never use interactive sessions.
 <summary><b>OpenHands / SWE-Agent</b></summary>
 
 ```bash
-export SSH_GUARD_LLM_API_KEY="..."
-export SSH_GUARD_MODE=readonly
+export GUARD_LLM_API_KEY="..."
+export GUARD_MODE=readonly
 alias ssh='guard run ssh'
 ```
 

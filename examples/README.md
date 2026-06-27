@@ -32,7 +32,7 @@ with your service manager or `set -a; source examples/<file>.env; set +a`.
 
 - **[fallback-models.env](fallback-models.env)** -- Multi-model fallback chain.
   Adds retry-then-failover across multiple LLM providers via
-  `SSH_GUARD_LLM_MODELS`. Only needed when your uptime requirements exceed a
+  `GUARD_LLM_MODELS`. Only needed when your uptime requirements exceed a
   single provider's SLA, or when you need to defend against provider-specific
   outages. Default is a single model with retries.
 

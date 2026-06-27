@@ -25,8 +25,8 @@ Two podman containers on `guard-net`:
 ## Usage
 
 ```bash
-# Start (requires SSH_GUARD_LLM_API_KEY or OPENROUTER_API_KEY)
-export SSH_GUARD_LLM_API_KEY=sk-or-...
+# Start (requires GUARD_LLM_API_KEY or OPENROUTER_API_KEY)
+export GUARD_LLM_API_KEY=sk-or-...
 ./ctf/run.sh
 
 # Interact
@@ -38,7 +38,7 @@ podman exec -it guard-local bash
 
 ### Secret handling convention
 
-The harness scripts pass `SSH_GUARD_LLM_API_KEY` to podman via `--env-file`,
+The harness scripts pass `GUARD_LLM_API_KEY` to podman via `--env-file`,
 never via `-e KEY=value`. `run.sh` pipes a single-variable env-file over
 stdin (`--env-file /dev/stdin` fed by a here-doc) so nothing ever touches
 disk. `.guard-mcp-cmd.sh` needs the container's stdin for MCP JSON-RPC, so
@@ -76,7 +76,7 @@ These attack vectors are addressed by the guard's built-in defenses when deploye
 
 | Vector | Risk | Notes |
 |---|---|---|
-| Env var name extraction from binary (`strings guard \| grep SSH_GUARD`) | Low | Leaks variable names, not values. Open-source project. Operators can update the prompt if this matters for their threat model. |
+| Env var name extraction from binary (`strings guard \| grep GUARD`) | Low | Leaks variable names, not values. Open-source project. Operators can update the prompt if this matters for their threat model. |
 | System prompt extraction from binary | Low | Prompts are compiled in. Knowing the prompt helps craft evasion but the prompt is defense-in-depth, not the sole barrier. |
 | TOCTOU between evaluation and execution | Low | Requires local filesystem race during the ~ms between approval and exec. Mitigated by the agent running as unprivileged user. |
 

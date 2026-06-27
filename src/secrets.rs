@@ -901,7 +901,7 @@ impl BackendType {
             BackendType::Env => Ok(Arc::new(EnvBackend::new())),
             BackendType::Local => {
                 let mut backend = LocalBackend::new()?;
-                if let Ok(recipient) = env::var("SSH_GUARD_GPG_RECIPIENT") {
+                if let Some(recipient) = guard::env::guard_env("GPG_RECIPIENT") {
                     backend = backend.with_gpg_recipient(recipient);
                 }
                 Ok(Arc::new(backend))
@@ -927,7 +927,7 @@ impl std::str::FromStr for BackendType {
 }
 
 pub fn detect_backend() -> BackendType {
-    if let Ok(backend_str) = env::var("SSH_GUARD_BACKEND") {
+    if let Some(backend_str) = guard::env::guard_env("BACKEND") {
         if let Ok(backend) = backend_str.parse::<BackendType>() {
             return backend;
         }

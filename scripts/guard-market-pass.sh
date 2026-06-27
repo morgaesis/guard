@@ -19,7 +19,7 @@ run_id="$(date -u +%Y%m%dT%H%M%SZ)"
 out_file="$out_dir/research-$run_id.md"
 latest_file="$out_dir/latest.md"
 
-prompt='You are an autonomous market research and strategy critic for github.com/morgaesis/ssh-guard, a Rust LLM-evaluated command/capability gate for AI agents.
+prompt='You are an autonomous market research and strategy critic for github.com/morgaesis/guard, a Rust LLM-evaluated command/capability gate for AI agents.
 
 Run one fresh monitoring-loop pass, but keep the final output concise and decision-oriented. Use web search. Do not modify files.
 

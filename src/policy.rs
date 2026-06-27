@@ -20,9 +20,7 @@ impl PolicyMode {
         match value.trim().to_ascii_lowercase().as_str() {
             "readonly" => Some(Self::Readonly),
             "default" => {
-                tracing::warn!(
-                    "SSH_GUARD_MODE=\"default\" is deprecated, use \"readonly\" instead"
-                );
+                tracing::warn!("GUARD_MODE=\"default\" is deprecated, use \"readonly\" instead");
                 Some(Self::Readonly)
             }
             "paranoid" => Some(Self::Paranoid),

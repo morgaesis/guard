@@ -39,7 +39,7 @@ Choose the release asset that matches the target platform:
 Set an API key before use:
 
 ```bash
-export SSH_GUARD_LLM_API_KEY="..."
+export GUARD_LLM_API_KEY="..."
 ```
 
 Or:
@@ -93,14 +93,14 @@ Configuration is environment-driven. See [`.env.example`](.env.example) for all 
 
 Key variables:
 
-- `SSH_GUARD_LLM_API_KEY` / `OPENROUTER_API_KEY` -- LLM API key (required)
-- `SSH_GUARD_LLM_API_URL` / `SSH_GUARD_API_URL` -- LLM endpoint (default: OpenRouter)
-- `SSH_GUARD_LLM_MODEL` -- Primary model (default: `openai/gpt-5.4-nano`). For a fallback chain, use `SSH_GUARD_LLM_MODELS` with a comma-separated list; the chain takes precedence over this single-model value when set.
-- `SSH_GUARD_MODE` -- Evaluation mode (default: `readonly`)
-- `SSH_GUARD_LLM_TIMEOUT` / `SSH_GUARD_TIMEOUT` -- LLM call timeout in seconds (default: `30`)
-- `SSH_GUARD_AUTH_TOKEN` -- Shared token for TCP clients
-- `SSH_GUARD_ADMIN_TOKEN` -- Separate token for TCP admin RPCs such as `guard grant`
-- `SSH_GUARD_LEARN_RULES` -- Learn static allows from repeated low-risk approvals
-- `SSH_GUARD_LEARN_SHIMS` -- `off`, `suggest`, or `create` shorter service shims for promoted rules
+- `GUARD_LLM_API_KEY` / `OPENROUTER_API_KEY` -- LLM API key (required)
+- `GUARD_LLM_API_URL` / `GUARD_API_URL` -- LLM endpoint (default: OpenRouter)
+- `GUARD_LLM_MODEL` -- Primary model (default: `openai/gpt-5.4-nano`). For a fallback chain, use `GUARD_LLM_MODELS` with a comma-separated list; the chain takes precedence over this single-model value when set.
+- `GUARD_MODE` -- Evaluation mode (default: `readonly`)
+- `GUARD_LLM_TIMEOUT` / `GUARD_TIMEOUT` -- LLM call timeout in seconds (default: `30`)
+- `GUARD_AUTH_TOKEN` -- Shared token for TCP clients
+- `GUARD_ADMIN_TOKEN` -- Separate token for TCP admin RPCs such as `guard grant`
+- `GUARD_LEARN_RULES` -- Learn static allows from repeated low-risk approvals
+- `GUARD_LEARN_SHIMS` -- `off`, `suggest`, or `create` shorter service shims for promoted rules
 
 For long-running service deployment, see [DEPLOYMENT.md](DEPLOYMENT.md).

@@ -65,7 +65,7 @@ podman run -it --rm \
   --name guard-demo \
   -v ./target/release/guard:/usr/local/bin/guard:ro \
   -v ./demo.tape:/demo.tape:ro \
-  -e SSH_GUARD_LLM_API_KEY="$SSH_GUARD_LLM_API_KEY" \
+  -e GUARD_LLM_API_KEY="$GUARD_LLM_API_KEY" \
   ubuntu:24.04 bash
 ```
 
@@ -121,7 +121,7 @@ The tape file should only use generic commands and hostnames. Do not include rea
 ```bash
 podman run -it --rm \
   -v ./target/release/guard:/usr/local/bin/guard:ro \
-  -e SSH_GUARD_LLM_API_KEY="$SSH_GUARD_LLM_API_KEY" \
+  -e GUARD_LLM_API_KEY="$GUARD_LLM_API_KEY" \
   ubuntu:24.04 bash -c '
     guard server start --socket /tmp/guard.sock &
     sleep 2
@@ -142,7 +142,7 @@ podman run -it --rm \
 See [ctf/DESIGN.md](ctf/DESIGN.md) for the full CTF test harness setup. Quick summary:
 
 ```bash
-export SSH_GUARD_LLM_API_KEY=sk-or-...
+export GUARD_LLM_API_KEY=sk-or-...
 ./ctf/run.sh                    # start containers
 python3 ctf/.run-all-modes.py   # run all tests across all modes
 ./ctf/teardown.sh               # clean up

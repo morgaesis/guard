@@ -3,7 +3,7 @@
 ## Reporting a vulnerability
 
 Please report security issues privately via GitHub's
-["Report a vulnerability"](https://github.com/morgaesis/ssh-guard/security/advisories/new)
+["Report a vulnerability"](https://github.com/morgaesis/guard/security/advisories/new)
 flow rather than opening a public issue.
 
 If you cannot use the GitHub flow, email the maintainer at

@@ -70,7 +70,7 @@ async fn start_daemon(tmp: &TempDir) -> (DaemonGuard, std::path::PathBuf) {
         .arg(&socket_path)
         .env("HOME", tmp.path())
         .env("XDG_CONFIG_HOME", tmp.path())
-        .env("SSH_GUARD_BACKEND", "env")
+        .env("GUARD_BACKEND", "env")
         .env(&test_secret_env, "test-value")
         .stdin(Stdio::null())
         .stdout(Stdio::null())

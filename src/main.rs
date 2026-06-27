@@ -443,12 +443,12 @@ enum ServerCommands {
         tcp_port: Option<u16>,
 
         /// Shared token required for TCP clients.
-        /// Env: SSH_GUARD_AUTH_TOKEN.
+        /// Env: GUARD_AUTH_TOKEN.
         #[arg(long, value_name = "TOKEN")]
         auth_token: Option<String>,
 
         /// Separate token required for non-Ping TCP admin RPCs.
-        /// Env: SSH_GUARD_ADMIN_TOKEN.
+        /// Env: GUARD_ADMIN_TOKEN.
         #[arg(long, value_name = "TOKEN")]
         admin_token: Option<String>,
 
@@ -485,14 +485,14 @@ enum ServerCommands {
         llm_timeout: Option<u64>,
 
         /// Retries per model on transient failures (default 2, capped at 2).
-        /// Env: SSH_GUARD_LLM_RETRIES.
+        /// Env: GUARD_LLM_RETRIES.
         #[arg(long, value_name = "N")]
         llm_retries: Option<u32>,
 
         /// Ordered fallback chain of model slugs. If more than one is supplied,
         /// the evaluator tries them in order, each with its own retry budget.
         /// Overrides --llm-model when non-empty.
-        /// Env: SSH_GUARD_LLM_MODELS (comma-separated).
+        /// Env: GUARD_LLM_MODELS (comma-separated).
         #[arg(long, value_name = "MODEL[,MODEL]", value_delimiter = ',')]
         llm_models: Option<Vec<String>>,
 
@@ -517,54 +517,54 @@ enum ServerCommands {
 
         /// Enable deterministic pre-LLM checks: executable-exists on PATH
         /// and credential-disclosure pattern deny. Default off. Env:
-        /// SSH_GUARD_PREFLIGHT.
+        /// GUARD_PREFLIGHT.
         #[arg(long = "preflight", action = ArgAction::SetTrue)]
         preflight: bool,
 
-        /// Disable in-memory caching of LLM decisions. Env: SSH_GUARD_CACHE.
+        /// Disable in-memory caching of LLM decisions. Env: GUARD_CACHE.
         #[arg(long = "no-cache", action = ArgAction::SetTrue)]
         no_cache: bool,
 
-        /// Maximum number of cached decisions. Env: SSH_GUARD_CACHE_CAPACITY.
+        /// Maximum number of cached decisions. Env: GUARD_CACHE_CAPACITY.
         #[arg(long, value_name = "N")]
         cache_capacity: Option<usize>,
 
-        /// Cache entry TTL in seconds. Env: SSH_GUARD_CACHE_TTL.
+        /// Cache entry TTL in seconds. Env: GUARD_CACHE_TTL.
         #[arg(long, value_name = "SECONDS")]
         cache_ttl: Option<u64>,
 
         /// Learn static allow rules from repeated low-risk LLM approvals.
-        /// Env: SSH_GUARD_LEARN_RULES.
+        /// Env: GUARD_LEARN_RULES.
         #[arg(long = "learn-rules", action = ArgAction::SetTrue)]
         learn_rules: bool,
 
         /// Path to learned static rules YAML.
-        /// Env: SSH_GUARD_LEARNED_RULES.
+        /// Env: GUARD_LEARNED_RULES.
         #[arg(long, value_name = "PATH")]
         learned_rules: Option<PathBuf>,
 
         /// LLM approvals required before a learned allow rule is promoted.
-        /// Env: SSH_GUARD_LEARN_MIN_APPROVALS.
+        /// Env: GUARD_LEARN_MIN_APPROVALS.
         #[arg(long, value_name = "N")]
         learn_min_approvals: Option<u32>,
 
         /// Maximum risk score eligible for learned static allow promotion.
-        /// Env: SSH_GUARD_LEARN_MAX_RISK.
+        /// Env: GUARD_LEARN_MAX_RISK.
         #[arg(long, value_name = "0-10")]
         learn_max_risk: Option<i32>,
 
         /// Service-shim behavior for learned rules: off, suggest, or create.
-        /// Env: SSH_GUARD_LEARN_SHIMS.
+        /// Env: GUARD_LEARN_SHIMS.
         #[arg(long, value_name = "MODE")]
         learn_shims: Option<String>,
 
         /// Evaluate policy but do not execute approved commands.
-        /// Env: SSH_GUARD_DRY_RUN.
+        /// Env: GUARD_DRY_RUN.
         #[arg(long = "dry-run", action = ArgAction::SetTrue)]
         dry_run: bool,
 
         /// SQLite state database path for persistent sessions and session history.
-        /// Env: SSH_GUARD_STATE_DB.
+        /// Env: GUARD_STATE_DB.
         #[arg(long, value_name = "PATH")]
         state_db: Option<PathBuf>,
 
@@ -585,13 +585,13 @@ enum ServerCommands {
         /// LLM-approved commands are routed by reversibility — reversible runs
         /// immediately, recoverable runs behind an auto-revert envelope, and
         /// irreversible is held for operator approval. Requires a Unix-socket
-        /// listener (incompatible with --tcp-port). Env: SSH_GUARD_GATE.
+        /// listener (incompatible with --tcp-port). Env: GUARD_GATE.
         #[arg(long, value_name = "MODE")]
         gate: Option<String>,
 
         /// Path to the verb catalog YAML (the operator-defined, typed interface
         /// agents call via `guard verb`). Hot-reloaded on change.
-        /// Env: SSH_GUARD_VERBS.
+        /// Env: GUARD_VERBS.
         #[arg(long, value_name = "PATH")]
         verbs: Option<PathBuf>,
     },
@@ -709,11 +709,11 @@ enum SecretCommands {
     },
 }
 
-/// Try GUARD_ prefix, then SSH_GUARD_ prefix for a given env var suffix.
+/// Try GUARD_ prefix, then the legacy SSH_GUARD_ prefix for a given env var
+/// suffix. Thin wrapper over [`guard::env::guard_env`] so the binary and the
+/// library resolve configuration identically.
 fn guard_env(suffix: &str) -> Option<String> {
-    std::env::var(format!("GUARD_{}", suffix))
-        .ok()
-        .or_else(|| std::env::var(format!("SSH_GUARD_{}", suffix)).ok())
+    guard::env::guard_env(suffix)
 }
 
 #[tokio::main]
@@ -947,7 +947,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
         } => {
             tracing::info!("Starting guard server...");
 
-            // Resolve consequence-gating mode: flag > SSH_GUARD_GATE env > off.
+            // Resolve consequence-gating mode: flag > GUARD_GATE env > off.
             let gate_mode: guard::gating::GateMode = gate
                 .or_else(|| guard_env("GATE").filter(|v| !v.is_empty()))
                 .map(|v| v.parse())
@@ -1007,12 +1007,12 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             // the operator. A TCP listener carries only a bearer token, so it
             // both cannot reach the operator gate and needlessly widens the exec
             // surface. Enforce on the FINAL resolved transport — after --tcp-port,
-            // SSH_GUARD_TCP_PORT, and the platform default — so an env-set TCP
+            // GUARD_TCP_PORT, and the platform default — so an env-set TCP
             // port cannot slip a listener in beside the gate.
             if gate_mode.is_on() {
                 if tcp_port.is_some() {
                     anyhow::bail!(
-                        "--gate consequence is incompatible with a TCP listener (--tcp-port or SSH_GUARD_TCP_PORT); the operator approval gate is principal-scoped and unreachable over TCP. Use a local socket via --socket."
+                        "--gate consequence is incompatible with a TCP listener (--tcp-port or GUARD_TCP_PORT); the operator approval gate is principal-scoped and unreachable over TCP. Use a local socket via --socket."
                     );
                 }
                 if socket_path.is_none() {
@@ -1033,7 +1033,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 .or_else(|| guard_env("AUTH_TOKEN").filter(|token| !token.is_empty()));
             if tcp_port.is_some() && auth_token.is_none() {
                 anyhow::bail!(
-                    "TCP server requires --auth-token or SSH_GUARD_AUTH_TOKEN; configure clients with `guard config set-token`"
+                    "TCP server requires --auth-token or GUARD_AUTH_TOKEN; configure clients with `guard config set-token`"
                 );
             }
             let admin_token = admin_token
@@ -1041,7 +1041,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 .or_else(|| guard_env("ADMIN_TOKEN").filter(|token| !token.is_empty()));
             if tcp_port.is_some() && admin_token.is_none() {
                 tracing::warn!(
-                    "TCP admin RPCs other than ping are disabled; set --admin-token or SSH_GUARD_ADMIN_TOKEN to use guard grant/status over TCP"
+                    "TCP admin RPCs other than ping are disabled; set --admin-token or GUARD_ADMIN_TOKEN to use guard grant/status over TCP"
                 );
             }
 
@@ -1138,10 +1138,10 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
 
             // Model resolution precedence (single primary model):
             //   1. --llm-model CLI flag
-            //   2. SSH_GUARD_LLM_MODEL env var (singular — primary model)
+            //   2. GUARD_LLM_MODEL env var (singular — primary model)
             //   3. evaluate::EvalConfig default (DEFAULT_MODEL in evaluate.rs)
             //
-            // The fallback chain (SSH_GUARD_LLM_MODELS / --llm-models) is
+            // The fallback chain (GUARD_LLM_MODELS / --llm-models) is
             // resolved separately below and, when set, takes precedence over
             // the single-model value above because a chain is an explicit
             // opt-in to multi-model evaluation.
@@ -1200,7 +1200,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 eval_config = eval_config.system_prompt_path(prompt_path.clone());
             }
 
-            // Cache: flag disable wins, else env SSH_GUARD_CACHE=false disables.
+            // Cache: flag disable wins, else env GUARD_CACHE=false disables.
             // Capacity and TTL: flag > env > default.
             let cache_env_enabled = guard_env("CACHE")
                 .as_deref()
@@ -1268,7 +1268,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             }
 
             // Additive prompt: append to base prompt without replacing it.
-            // Priority: --system-prompt-append flag > SSH_GUARD_PROMPT_APPEND env var
+            // Priority: --system-prompt-append flag > GUARD_PROMPT_APPEND env var
             let append_path = system_prompt_append.or_else(|| {
                 guard_env("PROMPT_APPEND")
                     .filter(|v| !v.is_empty())
@@ -1314,7 +1314,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             tracing::info!("Secret backend ready");
 
             // Redaction is server-side only, controlled by CLI flag.
-            // NOT readable from child env (prevents SSH_GUARD_REDACT=false bypass).
+            // NOT readable from child env (prevents GUARD_REDACT=false bypass).
             let redact = !no_redact;
 
             let preflight = preflight
@@ -3280,22 +3280,22 @@ mod tests {
         }
     }
 
-    /// Shared guard for tests that mutate `SSH_GUARD_LLM_MODEL*` environment
-    /// variables. Rust's test runner executes tests in parallel by default,
-    /// and `std::env::{set,remove}_var` mutates shared process state, so
-    /// concurrent readers/writers must be serialized with a mutex.
+    /// Shared guard for tests that mutate `GUARD_LLM_MODEL*` /
+    /// `SSH_GUARD_LLM_MODEL*` environment variables. Rust's test runner
+    /// executes tests in parallel by default, and `std::env::{set,remove}_var`
+    /// mutates shared process state, so concurrent readers/writers must be
+    /// serialized with a mutex.
     static MODEL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Mirror of the resolution logic in `run_server` so we can exercise the
-    /// precedence ladder without spinning up an actual server. Must stay in
-    /// sync with the block under the "Model resolution precedence" comment
-    /// in `run_server`.
+    /// precedence ladder without spinning up an actual server. Uses the same
+    /// `guard_env` helper as `run_server`, so it honors the canonical `GUARD_`
+    /// prefix with the legacy `SSH_GUARD_` fallback. Must stay in sync with the
+    /// block under the "Model resolution precedence" comment in `run_server`.
     fn resolve_single_model_for_test(cli_flag: Option<String>) -> Option<String> {
-        cli_flag.filter(|value| !value.is_empty()).or_else(|| {
-            std::env::var("SSH_GUARD_LLM_MODEL")
-                .ok()
-                .filter(|v| !v.is_empty())
-        })
+        cli_flag
+            .filter(|value| !value.is_empty())
+            .or_else(|| guard::env::guard_env("LLM_MODEL").filter(|v| !v.is_empty()))
     }
 
     fn resolve_chain_for_test(cli_flag: Option<Vec<String>>) -> Vec<String> {
@@ -3305,8 +3305,7 @@ mod tests {
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>();
         if models_chain.is_empty() {
-            std::env::var("SSH_GUARD_LLM_MODELS")
-                .ok()
+            guard::env::guard_env("LLM_MODELS")
                 .map(|v| {
                     v.split(',')
                         .map(|s| s.trim().to_string())
@@ -3319,16 +3318,18 @@ mod tests {
         }
     }
 
-    /// Regression guard for silent-ignore of `SSH_GUARD_LLM_MODEL`. Exercises
-    /// the full precedence ladder:
+    /// Regression guard for silent-ignore of `GUARD_LLM_MODEL`. Exercises the
+    /// full precedence ladder:
     ///
     ///   1. `--llm-model` CLI flag
-    ///   2. `SSH_GUARD_LLM_MODEL` env var (singular)
+    ///   2. `GUARD_LLM_MODEL` env var (singular), with `SSH_GUARD_LLM_MODEL`
+    ///      as the legacy fallback
     ///   3. default (`None` here; EvalConfig falls back to `DEFAULT_MODEL`)
     ///
-    /// and verifies that `SSH_GUARD_LLM_MODELS` (plural, chain) still parses
-    /// correctly alongside the singular. The test is sequential within a
-    /// single function body because splitting into multiple `#[test]`
+    /// and verifies that `GUARD_LLM_MODELS` (plural, chain) still parses
+    /// correctly alongside the singular, and that the canonical `GUARD_` prefix
+    /// takes precedence over the legacy `SSH_GUARD_` one. The test is sequential
+    /// within a single function body because splitting into multiple `#[test]`
     /// functions would allow parallel process-env races even with a mutex
     /// (one test could observe another test's cleared state).
     #[test]
@@ -3338,14 +3339,20 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        // Snapshot existing values so we restore the shell's environment on
-        // exit even if the harness inherited one of these vars.
-        let prev_single = std::env::var("SSH_GUARD_LLM_MODEL").ok();
-        let prev_chain = std::env::var("SSH_GUARD_LLM_MODELS").ok();
+        // Snapshot existing values (both prefixes) so we restore the shell's
+        // environment on exit even if the harness inherited one of these vars.
+        let prev = [
+            "GUARD_LLM_MODEL",
+            "GUARD_LLM_MODELS",
+            "SSH_GUARD_LLM_MODEL",
+            "SSH_GUARD_LLM_MODELS",
+        ]
+        .map(|k| (k, std::env::var(k).ok()));
 
         // Env mutations are serialized across tests via MODEL_ENV_LOCK above.
-        std::env::remove_var("SSH_GUARD_LLM_MODEL");
-        std::env::remove_var("SSH_GUARD_LLM_MODELS");
+        for (k, _) in &prev {
+            std::env::remove_var(k);
+        }
 
         // 1. Clean slate: no flag, no env -> None (caller falls back to
         //    evaluate::DEFAULT_MODEL which is "openai/gpt-5.4-nano").
@@ -3357,19 +3364,19 @@ mod tests {
         );
         assert_eq!(resolve_chain_for_test(None), Vec::<String>::new());
 
-        // 2. SSH_GUARD_LLM_MODEL set -> picked up as primary.
-        std::env::set_var("SSH_GUARD_LLM_MODEL", "alt/model-x");
+        // 2. GUARD_LLM_MODEL set -> picked up as primary.
+        std::env::set_var("GUARD_LLM_MODEL", "alt/model-x");
         assert_eq!(
             resolve_single_model_for_test(None),
             Some("alt/model-x".to_string()),
-            "SSH_GUARD_LLM_MODEL must be honored when no CLI flag is supplied"
+            "GUARD_LLM_MODEL must be honored when no CLI flag is supplied"
         );
 
         // 3. CLI flag wins over the singular env var.
         assert_eq!(
             resolve_single_model_for_test(Some("flag/model-y".to_string())),
             Some("flag/model-y".to_string()),
-            "--llm-model must take precedence over SSH_GUARD_LLM_MODEL"
+            "--llm-model must take precedence over GUARD_LLM_MODEL"
         );
 
         // 4. Empty CLI flag falls through to env var.
@@ -3379,13 +3386,29 @@ mod tests {
             "empty --llm-model value must fall through to the env var"
         );
 
-        // 5. Chain env var still parses independently of the singular var.
-        std::env::set_var("SSH_GUARD_LLM_MODELS", "a,b,c");
+        // 5. Legacy SSH_GUARD_LLM_MODEL is honored when the canonical var is
+        //    unset, and the canonical GUARD_ prefix wins when both are set.
+        std::env::remove_var("GUARD_LLM_MODEL");
+        std::env::set_var("SSH_GUARD_LLM_MODEL", "legacy/model-z");
+        assert_eq!(
+            resolve_single_model_for_test(None),
+            Some("legacy/model-z".to_string()),
+            "legacy SSH_GUARD_LLM_MODEL must be honored as a fallback"
+        );
+        std::env::set_var("GUARD_LLM_MODEL", "alt/model-x");
+        assert_eq!(
+            resolve_single_model_for_test(None),
+            Some("alt/model-x".to_string()),
+            "canonical GUARD_LLM_MODEL must take precedence over the legacy var"
+        );
+
+        // 6. Chain env var still parses independently of the singular var.
+        std::env::set_var("GUARD_LLM_MODELS", "a,b,c");
         let chain = resolve_chain_for_test(None);
         assert_eq!(
             chain,
             vec!["a".to_string(), "b".to_string(), "c".to_string()],
-            "SSH_GUARD_LLM_MODELS must parse into an ordered chain"
+            "GUARD_LLM_MODELS must parse into an ordered chain"
         );
         // The singular resolver is orthogonal and still returns the singular
         // value; the call site in run_server applies the precedence rule
@@ -3396,13 +3419,11 @@ mod tests {
         );
 
         // Cleanup: restore prior values so other tests see the original env.
-        match prev_single {
-            Some(v) => std::env::set_var("SSH_GUARD_LLM_MODEL", v),
-            None => std::env::remove_var("SSH_GUARD_LLM_MODEL"),
-        }
-        match prev_chain {
-            Some(v) => std::env::set_var("SSH_GUARD_LLM_MODELS", v),
-            None => std::env::remove_var("SSH_GUARD_LLM_MODELS"),
+        for (k, v) in &prev {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
         }
     }
 

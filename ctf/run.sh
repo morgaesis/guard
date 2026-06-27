@@ -13,18 +13,22 @@ fi
 CLAUDE_CREDS="${CLAUDE_CREDS:-$HOME/.claude/.credentials.json}"
 
 # Source the user's ~/.env if no key is in the environment yet. We only care
-# about OPENROUTER_API_KEY / SSH_GUARD_*_KEY here; the file may legitimately
+# about OPENROUTER_API_KEY / GUARD_*_KEY here; the file may legitimately
 # hold many other secrets, so we extract just those keys with `sed -n` rather
-# than blanket-sourcing.
-if [ -f "$HOME/.env" ] && [ -z "${SSH_GUARD_LLM_API_KEY:-${SSH_GUARD_API_KEY:-${OPENROUTER_API_KEY:-}}}" ]; then
-    eval "$(sed -n 's/^\(SSH_GUARD_LLM_API_KEY\|SSH_GUARD_API_KEY\|OPENROUTER_API_KEY\)=\(.*\)$/\1=\2; export \1/p' "$HOME/.env")"
+# than blanket-sourcing. The legacy SSH_GUARD_* names are still recognized.
+if [ -f "$HOME/.env" ] && [ -z "${GUARD_LLM_API_KEY:-${GUARD_API_KEY:-${SSH_GUARD_LLM_API_KEY:-${SSH_GUARD_API_KEY:-${OPENROUTER_API_KEY:-}}}}}" ]; then
+    eval "$(sed -n 's/^\(GUARD_LLM_API_KEY\|GUARD_API_KEY\|SSH_GUARD_LLM_API_KEY\|SSH_GUARD_API_KEY\|OPENROUTER_API_KEY\)=\(.*\)$/\1=\2; export \1/p' "$HOME/.env")"
 fi
 
-if [ -z "${SSH_GUARD_LLM_API_KEY:-${SSH_GUARD_API_KEY:-}}" ] && [ -z "${OPENROUTER_API_KEY:-}" ]; then
-    echo "Error: Set SSH_GUARD_LLM_API_KEY or OPENROUTER_API_KEY (or put it in ~/.env)"
+# Accept the legacy SSH_GUARD_* names as fallbacks for the renamed variables.
+: "${GUARD_LLM_API_KEY:=${SSH_GUARD_LLM_API_KEY:-}}"
+: "${GUARD_API_KEY:=${SSH_GUARD_API_KEY:-}}"
+
+if [ -z "${GUARD_LLM_API_KEY:-${GUARD_API_KEY:-}}" ] && [ -z "${OPENROUTER_API_KEY:-}" ]; then
+    echo "Error: Set GUARD_LLM_API_KEY or OPENROUTER_API_KEY (or put it in ~/.env)"
     exit 1
 fi
-API_KEY="${SSH_GUARD_LLM_API_KEY:-${SSH_GUARD_API_KEY:-${OPENROUTER_API_KEY:-}}}"
+API_KEY="${GUARD_LLM_API_KEY:-${GUARD_API_KEY:-${OPENROUTER_API_KEY:-}}}"
 
 if [ -z "$CLAUDE_BIN" ] || [ ! -x "$CLAUDE_BIN" ]; then
     echo "Error: claude binary not found. Set CLAUDE_BIN or install Claude Code."
@@ -136,8 +140,8 @@ podman run -d \
     -v "$KEYDIR/agent_key.pub:/home/agent/.ssh/id_ed25519.pub:ro,U" \
     -v "$STATE_DIR:/home/agent/.claude:rw,U" \
     guard-local <<EOF
-SSH_GUARD_LLM_API_KEY=$API_KEY
-SSH_GUARD_MODE=safe
+GUARD_LLM_API_KEY=$API_KEY
+GUARD_MODE=safe
 EOF
 
 sleep 3
