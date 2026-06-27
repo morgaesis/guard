@@ -170,8 +170,8 @@ fn service_log_dir() -> PathBuf {
 
 /// Initialize logging to a file under the data directory. A service has no
 /// console, so foreground stderr logging would be invisible and a failed start
-/// would be undiagnosable. Level comes from `RUST_LOG`, then `GUARD_LOG_LEVEL`
-/// (the legacy `SSH_GUARD_LOG_LEVEL` is honored by `guard_env`), else `info`.
+/// would be undiagnosable. Level comes from `RUST_LOG`, then `GUARD_LOG_LEVEL`,
+/// else `info`.
 fn init_service_logging() {
     let dir = service_log_dir();
     let _ = std::fs::create_dir_all(&dir);

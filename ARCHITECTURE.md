@@ -141,4 +141,4 @@ sees the relative path text supplied in the command.
 - Audit truth lives in the daemon's structured `tracing` output. The SQLite state database exists for persistent session state and queryable session history, not as a replacement for journald or remote log shipping.
 - MCP transport is stdio only. Network MCP transport adds a second auth surface and should be introduced only with a clear deployment requirement.
 - Tool responses preserve both raw command output and structured fields so clients can use either text-only or schema-aware handling.
-- The guard binary name is `guard`. Environment variables use the `GUARD_*` prefix; the legacy `SSH_GUARD_*` names are still honored as fallbacks for backwards compatibility.
+- The guard binary name is `guard`. Environment variables use the `GUARD_*` prefix. The former `SSH_GUARD_*` names are not recognized.

@@ -5032,7 +5032,6 @@ async fn gating_sweeper(config: ServerConfig) {
     // default is operator-overridable (and test harnesses shorten it) but is
     // floored so it can never race startup recovery.
     let grace = std::env::var("GUARD_SWEEPER_GRACE_SECS")
-        .or_else(|_| std::env::var("SSH_GUARD_SWEEPER_GRACE_SECS"))
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map(|v| v.max(1))

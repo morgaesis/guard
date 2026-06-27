@@ -452,10 +452,7 @@ impl ShimGenerator {
 /// Find the guard binary in PATH.
 fn find_guard_binary() -> Result<PathBuf> {
     // First check if there's a configured path
-    if let Some(path) = std::env::var("GUARD_BIN")
-        .ok()
-        .or_else(|| std::env::var("SSH_GUARD_BIN").ok())
-    {
+    if let Ok(path) = std::env::var("GUARD_BIN") {
         let path = PathBuf::from(&path);
         if path.exists() {
             return Ok(path);

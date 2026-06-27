@@ -43,7 +43,7 @@
 
 - Verb catalog (`--verbs`): an operator-authored, hot-reloaded catalog of typed operations with anchored pattern-validated parameters, declared consequence class, and structured rollback. `guard verb list` / `guard verb run` render templates into argv with no shell, making parameter and flag injection structurally impossible. `trusted` verbs are a deterministic allow path; agents cannot add or alter verbs.
 
-- Unified `guard` branding: configuration variables use the `GUARD_` prefix, resolved through a single `guard::env::guard_env` helper that still honors the legacy `SSH_GUARD_` names as fallbacks, so existing deployments keep working without renaming.
+- Unified `guard` branding: configuration variables use the `GUARD_` prefix, resolved through a single `guard::env::guard_env` helper. The former `SSH_GUARD_` prefix is not recognized.
 
 - Native Windows service host: `guard server start --service` answers the Service Control Manager start/stop handshake through the windows-service dispatcher, running the same daemon path as the foreground process (one configuration surface). `deployment/windows/install-guard.ps1` registers the service with that marker under `NT SERVICE\guard`; a service has no console, so the daemon logs to a file inside the ACL-locked data directory.
 

@@ -64,9 +64,8 @@ param(
     [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path,
 
     # Optional .env file supplying an LLM API key. When omitted (and no key is
-    # found), the service runs with --no-llm (static/verb policy only). The
-    # legacy SSH_GUARD_WINDOWS_ENV_FILE name is still honored as a fallback.
-    [string]$EnvFile = ($(if ($env:GUARD_WINDOWS_ENV_FILE) { $env:GUARD_WINDOWS_ENV_FILE } else { $env:SSH_GUARD_WINDOWS_ENV_FILE })),
+    # found), the service runs with --no-llm (static/verb policy only).
+    [string]$EnvFile = $env:GUARD_WINDOWS_ENV_FILE,
 
     # uninstall only: also delete the data directory (state.db + brokered creds).
     [switch]$Purge
@@ -115,22 +114,15 @@ $SidUsers = 'S-1-5-32-545'      # BUILTIN\Users
 $SidAuthUsers = 'S-1-5-11'      # NT AUTHORITY\Authenticated Users
 $SidEveryone = 'S-1-1-0'        # Everyone
 
-# Service env vars guard reads for the LLM (resolved by guard_env in main.rs:
-# GUARD_* then SSH_GUARD_*). Only the API key is sensitive; the rest are config.
-# The legacy SSH_GUARD_* names are kept here so an operator whose env file still
-# uses the old prefix continues to work.
+# Service env vars guard reads for the LLM (resolved by guard_env in main.rs).
+# Only the API key is sensitive; the rest are config.
 $LlmEnvKeys = @(
     'GUARD_LLM_API_KEY',
-    'SSH_GUARD_LLM_API_KEY',
     'OPENROUTER_API_KEY',
     'GUARD_LLM_MODEL',
-    'SSH_GUARD_LLM_MODEL',
     'GUARD_LLM_MODELS',
-    'SSH_GUARD_LLM_MODELS',
     'GUARD_LLM_API_URL',
-    'SSH_GUARD_LLM_API_URL',
-    'GUARD_LLM_TIMEOUT',
-    'SSH_GUARD_LLM_TIMEOUT'
+    'GUARD_LLM_TIMEOUT'
 )
 
 # ---------------------------------------------------------------------------
@@ -413,7 +405,6 @@ function Invoke-Install {
     #    evaluation; otherwise it runs --no-llm (static policy + verb catalog).
     $llmEnv = Import-LlmKeyFromEnvFile -Path $EnvFile
     $haveKey = $llmEnv.ContainsKey('GUARD_LLM_API_KEY') -or
-               $llmEnv.ContainsKey('SSH_GUARD_LLM_API_KEY') -or
                $llmEnv.ContainsKey('OPENROUTER_API_KEY')
 
     # 4. Build the service binPath. Only flags that exist in src/main.rs.

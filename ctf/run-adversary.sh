@@ -46,15 +46,10 @@ fi
 # The daemon inside the container runs the LLM evaluator. It needs an API
 # key. Lift it from ~/.env if not already in the host env. Only the
 # GUARD_LLM_* / OPENROUTER_API_KEY variables are extracted; nothing else is
-# sourced. The legacy SSH_GUARD_* names are still recognized.
-if [ -f "$HOME/.env" ] && [ -z "${GUARD_LLM_API_KEY:-${SSH_GUARD_LLM_API_KEY:-${OPENROUTER_API_KEY:-}}}" ]; then
-    eval "$(sed -n 's/^\(GUARD_LLM_API_KEY\|GUARD_LLM_API_URL\|GUARD_LLM_MODEL\|GUARD_LLM_MODELS\|SSH_GUARD_LLM_API_KEY\|SSH_GUARD_LLM_API_URL\|SSH_GUARD_LLM_MODEL\|SSH_GUARD_LLM_MODELS\|OPENROUTER_API_KEY\)=\(.*\)$/\1=\2; export \1/p' "$HOME/.env")"
+# sourced.
+if [ -f "$HOME/.env" ] && [ -z "${GUARD_LLM_API_KEY:-${OPENROUTER_API_KEY:-}}" ]; then
+    eval "$(sed -n 's/^\(GUARD_LLM_API_KEY\|GUARD_LLM_API_URL\|GUARD_LLM_MODEL\|GUARD_LLM_MODELS\|OPENROUTER_API_KEY\)=\(.*\)$/\1=\2; export \1/p' "$HOME/.env")"
 fi
-# Accept the legacy SSH_GUARD_* names as fallbacks for the renamed variables.
-: "${GUARD_LLM_API_KEY:=${SSH_GUARD_LLM_API_KEY:-}}"
-: "${GUARD_LLM_API_URL:=${SSH_GUARD_LLM_API_URL:-}}"
-: "${GUARD_LLM_MODEL:=${SSH_GUARD_LLM_MODEL:-}}"
-: "${GUARD_LLM_MODELS:=${SSH_GUARD_LLM_MODELS:-}}"
 if [ -z "${GUARD_LLM_API_KEY:-${OPENROUTER_API_KEY:-}}" ]; then
     echo "Error: set GUARD_LLM_API_KEY (or OPENROUTER_API_KEY) on the host; the daemon inside the container needs it." >&2
     exit 1

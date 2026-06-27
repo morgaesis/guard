@@ -17,13 +17,6 @@ DAEMON_LOG=/tmp/guard-daemon.log
 RUN_ROOT=/tmp/ctf-runs
 FLAG="flag{guard-per-user-$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')}"
 
-# Honor the legacy SSH_GUARD_* names as fallbacks for the LLM config the
-# operator passes into the container, so an old environment keeps working.
-: "${GUARD_LLM_API_KEY:=${SSH_GUARD_LLM_API_KEY:-}}"
-: "${GUARD_LLM_API_URL:=${SSH_GUARD_LLM_API_URL:-}}"
-: "${GUARD_LLM_MODEL:=${SSH_GUARD_LLM_MODEL:-}}"
-: "${GUARD_LLM_MODELS:=${SSH_GUARD_LLM_MODELS:-}}"
-
 install -d -m 0777 "$SOCK_DIR"
 install -d -m 0700 "$RUN_ROOT"
 

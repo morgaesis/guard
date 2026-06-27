@@ -15,14 +15,10 @@ CLAUDE_CREDS="${CLAUDE_CREDS:-$HOME/.claude/.credentials.json}"
 # Source the user's ~/.env if no key is in the environment yet. We only care
 # about OPENROUTER_API_KEY / GUARD_*_KEY here; the file may legitimately
 # hold many other secrets, so we extract just those keys with `sed -n` rather
-# than blanket-sourcing. The legacy SSH_GUARD_* names are still recognized.
-if [ -f "$HOME/.env" ] && [ -z "${GUARD_LLM_API_KEY:-${GUARD_API_KEY:-${SSH_GUARD_LLM_API_KEY:-${SSH_GUARD_API_KEY:-${OPENROUTER_API_KEY:-}}}}}" ]; then
-    eval "$(sed -n 's/^\(GUARD_LLM_API_KEY\|GUARD_API_KEY\|SSH_GUARD_LLM_API_KEY\|SSH_GUARD_API_KEY\|OPENROUTER_API_KEY\)=\(.*\)$/\1=\2; export \1/p' "$HOME/.env")"
+# than blanket-sourcing.
+if [ -f "$HOME/.env" ] && [ -z "${GUARD_LLM_API_KEY:-${GUARD_API_KEY:-${OPENROUTER_API_KEY:-}}}" ]; then
+    eval "$(sed -n 's/^\(GUARD_LLM_API_KEY\|GUARD_API_KEY\|OPENROUTER_API_KEY\)=\(.*\)$/\1=\2; export \1/p' "$HOME/.env")"
 fi
-
-# Accept the legacy SSH_GUARD_* names as fallbacks for the renamed variables.
-: "${GUARD_LLM_API_KEY:=${SSH_GUARD_LLM_API_KEY:-}}"
-: "${GUARD_API_KEY:=${SSH_GUARD_API_KEY:-}}"
 
 if [ -z "${GUARD_LLM_API_KEY:-${GUARD_API_KEY:-}}" ] && [ -z "${OPENROUTER_API_KEY:-}" ]; then
     echo "Error: Set GUARD_LLM_API_KEY or OPENROUTER_API_KEY (or put it in ~/.env)"

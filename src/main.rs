@@ -775,9 +775,9 @@ enum SecretCommands {
     },
 }
 
-/// Try GUARD_ prefix, then the legacy SSH_GUARD_ prefix for a given env var
-/// suffix. Thin wrapper over [`guard::env::guard_env`] so the binary and the
-/// library resolve configuration identically.
+/// Resolve a `GUARD_<suffix>` configuration variable. Thin wrapper over
+/// [`guard::env::guard_env`] so the binary and the library resolve
+/// configuration identically.
 fn guard_env(suffix: &str) -> Option<String> {
     guard::env::guard_env(suffix)
 }
@@ -803,7 +803,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Log level: RUST_LOG > GUARD_LOG_LEVEL > SSH_GUARD_LOG_LEVEL > "info"
+    // Log level: RUST_LOG > GUARD_LOG_LEVEL > "info"
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         let level = guard_env("LOG_LEVEL").unwrap_or_else(|| "warn".to_string());
         EnvFilter::new(level)
@@ -2161,9 +2161,8 @@ async fn run_mcp(subcommand: McpCommands) -> Result<()> {
                 ),
                 None => None,
             };
-            // Bearer source: --http-token wins, else GUARD_MCP_TOKEN
-            // (guard_env tries GUARD_ then SSH_GUARD_). Only meaningful with
-            // --http; validate() rejects --http without a token.
+            // Bearer source: --http-token wins, else GUARD_MCP_TOKEN. Only
+            // meaningful with --http; validate() rejects --http without a token.
             let http_token = http_token
                 .filter(|t| !t.is_empty())
                 .or_else(|| guard_env("MCP_TOKEN").filter(|t| !t.is_empty()));
@@ -2199,9 +2198,7 @@ fn resolve_client_endpoint(
     if let Some(s) = socket_override {
         return (Some(PathBuf::from(s)), None);
     }
-    if let Ok(port) =
-        std::env::var("GUARD_TCP_PORT").or_else(|_| std::env::var("SSH_GUARD_TCP_PORT"))
-    {
+    if let Ok(port) = std::env::var("GUARD_TCP_PORT") {
         if let Ok(port) = port.parse::<u16>() {
             return (None, Some(port));
         }
@@ -3518,18 +3515,17 @@ mod tests {
         }
     }
 
-    /// Shared guard for tests that mutate `GUARD_LLM_MODEL*` /
-    /// `SSH_GUARD_LLM_MODEL*` environment variables. Rust's test runner
-    /// executes tests in parallel by default, and `std::env::{set,remove}_var`
-    /// mutates shared process state, so concurrent readers/writers must be
-    /// serialized with a mutex.
+    /// Shared guard for tests that mutate `GUARD_LLM_MODEL*` environment
+    /// variables. Rust's test runner executes tests in parallel by default, and
+    /// `std::env::{set,remove}_var` mutates shared process state, so concurrent
+    /// readers/writers must be serialized with a mutex.
     static MODEL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Mirror of the resolution logic in `run_server` so we can exercise the
     /// precedence ladder without spinning up an actual server. Uses the same
     /// `guard_env` helper as `run_server`, so it honors the canonical `GUARD_`
-    /// prefix with the legacy `SSH_GUARD_` fallback. Must stay in sync with the
-    /// block under the "Model resolution precedence" comment in `run_server`.
+    /// prefix. Must stay in sync with the block under the "Model resolution
+    /// precedence" comment in `run_server`.
     fn resolve_single_model_for_test(cli_flag: Option<String>) -> Option<String> {
         cli_flag
             .filter(|value| !value.is_empty())
@@ -3560,16 +3556,14 @@ mod tests {
     /// full precedence ladder:
     ///
     ///   1. `--llm-model` CLI flag
-    ///   2. `GUARD_LLM_MODEL` env var (singular), with `SSH_GUARD_LLM_MODEL`
-    ///      as the legacy fallback
+    ///   2. `GUARD_LLM_MODEL` env var (singular)
     ///   3. default (`None` here; EvalConfig falls back to `DEFAULT_MODEL`)
     ///
     /// and verifies that `GUARD_LLM_MODELS` (plural, chain) still parses
-    /// correctly alongside the singular, and that the canonical `GUARD_` prefix
-    /// takes precedence over the legacy `SSH_GUARD_` one. The test is sequential
-    /// within a single function body because splitting into multiple `#[test]`
-    /// functions would allow parallel process-env races even with a mutex
-    /// (one test could observe another test's cleared state).
+    /// correctly alongside the singular. The test is sequential within a single
+    /// function body because splitting into multiple `#[test]` functions would
+    /// allow parallel process-env races even with a mutex (one test could
+    /// observe another test's cleared state).
     #[test]
     fn test_llm_model_env_resolution_chain() {
         // SAFETY: serialize all process-env mutations in this test suite.
@@ -3579,13 +3573,7 @@ mod tests {
 
         // Snapshot existing values (both prefixes) so we restore the shell's
         // environment on exit even if the harness inherited one of these vars.
-        let prev = [
-            "GUARD_LLM_MODEL",
-            "GUARD_LLM_MODELS",
-            "SSH_GUARD_LLM_MODEL",
-            "SSH_GUARD_LLM_MODELS",
-        ]
-        .map(|k| (k, std::env::var(k).ok()));
+        let prev = ["GUARD_LLM_MODEL", "GUARD_LLM_MODELS"].map(|k| (k, std::env::var(k).ok()));
 
         // Env mutations are serialized across tests via MODEL_ENV_LOCK above.
         for (k, _) in &prev {
@@ -3624,23 +3612,7 @@ mod tests {
             "empty --llm-model value must fall through to the env var"
         );
 
-        // 5. Legacy SSH_GUARD_LLM_MODEL is honored when the canonical var is
-        //    unset, and the canonical GUARD_ prefix wins when both are set.
-        std::env::remove_var("GUARD_LLM_MODEL");
-        std::env::set_var("SSH_GUARD_LLM_MODEL", "legacy/model-z");
-        assert_eq!(
-            resolve_single_model_for_test(None),
-            Some("legacy/model-z".to_string()),
-            "legacy SSH_GUARD_LLM_MODEL must be honored as a fallback"
-        );
-        std::env::set_var("GUARD_LLM_MODEL", "alt/model-x");
-        assert_eq!(
-            resolve_single_model_for_test(None),
-            Some("alt/model-x".to_string()),
-            "canonical GUARD_LLM_MODEL must take precedence over the legacy var"
-        );
-
-        // 6. Chain env var still parses independently of the singular var.
+        // 5. Chain env var still parses independently of the singular var.
         std::env::set_var("GUARD_LLM_MODELS", "a,b,c");
         let chain = resolve_chain_for_test(None);
         assert_eq!(
