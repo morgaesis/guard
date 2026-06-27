@@ -45,6 +45,54 @@ The more concerning finding is not multi-step bypass but a single-shot reasoning
 - guard cannot verify runtime claims an attacker embeds in command framing. The `/proc/*/environ` and `>/dev/null && echo OK` slippages both rely on unverifiable assertions about what the host does.
 - guard is not a substitute for kernel-level isolation. A `/tmp/mybin` PATH hijack, an `LD_PRELOAD` shared-object injection, or a container-escape primitive must still be blocked by seccomp, AppArmor, or read-only filesystems in production. guard blocked these in this run only because the LLM recognized the surface pattern.
 
+## Research direction: resampling and Time Travel
+
+The Ctrl-Z protocol closes the multi-step gap with two mechanisms guard does not
+have: **resampling** (when an action looks borderline, draw several alternative
+continuations from the policy and audit the distribution rather than the single
+sampled action) and **Time Travel** (when a late action is finally suspicious,
+re-audit earlier trajectory steps with the new context and retroactively block
+or roll back). Both are trajectory-level controls. guard is a per-call gate with
+no cross-turn memory, so neither lives naturally inside it.
+
+Where each mechanism belongs:
+
+- **Resampling is an agent-harness concern.** It requires the ability to draw
+  multiple candidate actions from the agent policy for the same state, which
+  only the harness that owns the policy can do. guard sees one already-chosen
+  command; it cannot resample the agent. A resampling deployment wraps the
+  agent loop, asks guard (or any monitor) to score each candidate, and selects
+  or defers based on the score distribution. guard's existing `--llm-models`
+  fan-out and risk score are the per-candidate scoring primitive that protocol
+  would call; the orchestration is upstream.
+
+- **Time Travel needs a durable trajectory store, which guard already keeps.**
+  The session state database (`--state-db`) persists per-session interaction
+  history, including each evaluated command and its risk score. That is the
+  substrate a re-audit pass reads. A Time Travel prototype against guard would:
+  1. On a high-risk or denied command, load the session's prior commands from
+     the state DB.
+  2. Re-evaluate each prior command with the suspicious command appended as
+     context (the "what does this earlier step mean now" prompt), reusing the
+     evaluator with a trajectory-aware system-prompt fragment.
+  3. If a prior step's re-scored risk crosses a threshold, emit a retroactive
+     finding. With consequence gating on, recoverable prior actions are already
+     behind an auto-revert envelope, so the finding can trigger the same revert
+     path rather than needing a new rollback mechanism.
+
+The CTF harness (`ctf/`) is the place to measure this. The Known Strings attack
+is the canonical case: each fragment write is individually low-risk, and only a
+trajectory-aware re-audit at the terminal `chmod +x` step can retroactively flag
+the assembly. A prototype would replay a recorded Known Strings session through
+the re-audit pass above and report whether step N's re-score, given step N+k,
+crosses the block threshold — a measurable detection-latency number rather than
+a binary pass/fail.
+
+This stays a research track, not a shipped feature: the per-call gate and the
+trajectory protocol are different layers, and folding resampling into guard
+would couple it to a specific agent harness. The state DB and risk scoring are
+deliberately the seams a future trajectory auditor plugs into.
+
 ## References
 
 - [bashcontrol.com](https://www.bashcontrol.com/)

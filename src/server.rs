@@ -714,6 +714,12 @@ pub struct ServerConfig {
     pub approvals: Arc<RwLock<ApprovalRegistry>>,
     /// Operator-authored verb catalog (the typed, least-expressive interface).
     pub verbs: Arc<RwLock<VerbCatalog>>,
+    /// Optional server-wide binary allow-list. `None` (the default) imposes no
+    /// restriction. When `Some`, only binaries permitted by [`binary_allowed`]
+    /// may execute, on every route (raw run, verb, and gated approval), as a
+    /// hard floor independent of the LLM decision. Set by the daemon entrypoint
+    /// from `--allow-bin` / `GUARD_ALLOW_BIN`.
+    pub allowed_binaries: Option<Vec<String>>,
 }
 
 impl ServerConfig {
@@ -769,6 +775,9 @@ impl ServerConfig {
             provisional: Arc::new(RwLock::new(ProvisionalRegistry::new())),
             approvals: Arc::new(RwLock::new(ApprovalRegistry::new())),
             verbs: Arc::new(RwLock::new(VerbCatalog::empty())),
+            // No binary restriction by default; the entrypoint sets this from
+            // --allow-bin / GUARD_ALLOW_BIN, like the gate fields above.
+            allowed_binaries: None,
         }
     }
 
@@ -944,6 +953,12 @@ impl Server {
     /// Install the operator-defined verb catalog. Must be called before `run`.
     pub fn set_verbs(&mut self, catalog: VerbCatalog) {
         self.config.verbs = Arc::new(RwLock::new(catalog));
+    }
+
+    /// Restrict which binaries may execute. `None` imposes no restriction (the
+    /// default); an empty list denies everything. Must be called before `run`.
+    pub fn set_allowed_binaries(&mut self, allowed: Option<Vec<String>>) {
+        self.config.allowed_binaries = allowed;
     }
 
     /// Load persisted provisional/approval state and apply startup recovery:
@@ -3322,6 +3337,33 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         }
     }
 
+    // Server-wide binary allow-list: a hard floor enforced before evaluation on
+    // every execution route, so a disallowed binary never reaches the LLM or an
+    // operator hold. Independent of --preflight.
+    if !binary_allowed(&config.allowed_binaries, &request.binary) {
+        let reason = format!(
+            "binary '{}' is not in the server allow-list",
+            request.binary
+        );
+        config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
+        let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
+        record_live_session_interaction(
+            config,
+            session_token.as_deref(),
+            SessionInteraction {
+                at_unix: 0,
+                command: command_line.clone(),
+                allowed: false,
+                source: SessionDecisionSource::Validation,
+                reason: reason.clone(),
+                risk: None,
+                exec_status: SessionExecStatus::NotAttempted,
+            },
+        )
+        .await;
+        return ExecuteResult::denied(reason);
+    }
+
     if config.preflight && !binary_exists_on_path(&request.binary) {
         let reason = format!(
             "unknown binary: '{}' is not available on the guard server PATH",
@@ -4224,6 +4266,42 @@ fn reconstruct_caller(
 /// Reject a binary name that is a path, traversal, or contains shell-metachar
 /// noise — the same invariants `execute_command_inner` enforces for the primary
 /// binary, applied to a revert command before it is armed.
+/// Normalize a binary reference to the match key used by the allow-list: its
+/// file name with any directory stripped, a trailing `.exe`/`.EXE` removed, and
+/// lowercased. Lowercasing keeps the operator's list case-insensitive (Windows
+/// paths are case-insensitive; tool names are conventionally lowercase).
+fn binary_match_key(binary: &str) -> String {
+    let name = std::path::Path::new(binary)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(binary);
+    let name = name
+        .strip_suffix(".exe")
+        .or_else(|| name.strip_suffix(".EXE"))
+        .unwrap_or(name);
+    name.to_ascii_lowercase()
+}
+
+/// Whether `binary` is permitted by the optional allow-list. `None` means no
+/// restriction. A bare command name (no path separator) matches an allow-list
+/// entry by match key — the common case, where the daemon's trusted PATH
+/// resolves the name. A path-qualified binary bypasses PATH resolution, so it is
+/// permitted ONLY by an exact allow-list entry; this stops a payload placed at
+/// an arbitrary path and named after an allowed tool (e.g. `/tmp/x/kubectl`)
+/// from slipping through basename matching.
+fn binary_allowed(allowed: &Option<Vec<String>>, binary: &str) -> bool {
+    let Some(list) = allowed else {
+        return true;
+    };
+    if binary.contains('/') || binary.contains('\\') {
+        return list.iter().any(|entry| entry == binary);
+    }
+    let key = binary_match_key(binary);
+    list.iter().any(|entry| {
+        !entry.contains('/') && !entry.contains('\\') && binary_match_key(entry) == key
+    })
+}
+
 fn invalid_binary_reason(binary: &str) -> Option<String> {
     if binary.contains('/')
         || binary.contains('\\')
@@ -6014,6 +6092,45 @@ mod tests {
     fn credential_preflight_allows_basic_kubectl_inspection() {
         let args = vec!["get".to_string(), "namespaces".to_string()];
         assert!(deterministic_credential_deny_reason("kubectl", &args).is_none());
+    }
+
+    #[test]
+    fn binary_allowlist_none_allows_everything() {
+        assert!(binary_allowed(&None, "kubectl"));
+        assert!(binary_allowed(&None, "/tmp/whatever"));
+    }
+
+    #[test]
+    fn binary_allowlist_matches_bare_name_case_insensitively() {
+        let allow = Some(vec!["kubectl".to_string(), "git".to_string()]);
+        assert!(binary_allowed(&allow, "kubectl"));
+        assert!(binary_allowed(&allow, "KUBECTL"));
+        assert!(binary_allowed(&allow, "kubectl.exe"));
+        assert!(binary_allowed(&allow, "git"));
+        assert!(!binary_allowed(&allow, "helm"));
+    }
+
+    #[test]
+    fn binary_allowlist_rejects_path_qualified_spoof() {
+        // A payload placed at an arbitrary path and named after an allowed tool
+        // must NOT pass via basename matching; only an exact path entry allows
+        // a path-qualified binary.
+        let allow = Some(vec!["kubectl".to_string()]);
+        assert!(!binary_allowed(&allow, "/tmp/evil/kubectl"));
+        assert!(!binary_allowed(&allow, "./kubectl"));
+        assert!(!binary_allowed(&allow, r"C:\tmp\kubectl.exe"));
+
+        let allow_path = Some(vec!["/usr/bin/kubectl".to_string()]);
+        assert!(binary_allowed(&allow_path, "/usr/bin/kubectl"));
+        assert!(!binary_allowed(&allow_path, "kubectl"));
+        assert!(!binary_allowed(&allow_path, "/tmp/kubectl"));
+    }
+
+    #[test]
+    fn binary_allowlist_empty_denies_everything() {
+        let allow = Some(vec![]);
+        assert!(!binary_allowed(&allow, "kubectl"));
+        assert!(!binary_allowed(&allow, "/usr/bin/anything"));
     }
 
     #[test]

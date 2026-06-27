@@ -597,6 +597,14 @@ enum ServerCommands {
         #[arg(long, value_name = "PATH")]
         verbs: Option<PathBuf>,
 
+        /// Restrict which binaries the server may execute, regardless of the LLM
+        /// decision. Repeat or comma-separate (e.g. `--allow-bin kubectl,git`).
+        /// Bare names match by command name via the daemon PATH; path-qualified
+        /// entries must match exactly. Empty/unset means no restriction.
+        /// Env: GUARD_ALLOW_BIN (comma-separated).
+        #[arg(long = "allow-bin", value_name = "BIN[,BIN]", value_delimiter = ',')]
+        allow_bin: Option<Vec<String>>,
+
         /// Internal marker: launched under the Windows Service Control Manager.
         /// The Windows installer sets this in the service binPath so startup
         /// answers the SCM start/stop handshake instead of running in the
@@ -971,6 +979,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             system_prompt_append,
             gate,
             verbs,
+            allow_bin,
             // Consumed in `main` (Windows SCM dispatch); irrelevant to the
             // server run itself, which is identical in service and foreground.
             service: _,
@@ -1426,6 +1435,29 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                     catalog.version()
                 );
                 srv.set_verbs(catalog);
+            }
+
+            // Binary allow-list: flag wins, else GUARD_ALLOW_BIN (comma-separated).
+            // Entries are trimmed; an all-empty value is treated as no restriction.
+            let allowed_binaries = allow_bin
+                .or_else(|| {
+                    guard_env("ALLOW_BIN").map(|v| {
+                        v.split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .map(|list| {
+                    list.into_iter()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .filter(|list| !list.is_empty());
+            if let Some(ref list) = allowed_binaries {
+                tracing::info!("Binary allow-list active: {:?}", list);
+                srv.set_allowed_binaries(Some(list.clone()));
             }
 
             srv.run().await
@@ -3021,6 +3053,7 @@ mod tests {
                 system_prompt_append,
                 gate,
                 verbs,
+                allow_bin,
                 service,
             }) => ServerCommands::Start {
                 socket,
@@ -3056,6 +3089,7 @@ mod tests {
                 system_prompt_append,
                 gate,
                 verbs,
+                allow_bin,
                 service,
             },
             _ => panic!("expected server start args"),
