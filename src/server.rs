@@ -4495,28 +4495,66 @@ async fn persist_approval(config: &ServerConfig, a: &Approval) {
     }
 }
 
-/// Evaluate a free-form `--revert` command at arm time. It must pass binary-name
-/// validation and be APPROVED by the evaluator; otherwise the whole containment
-/// request is denied (a revert is a consequential action and is gated as one).
-async fn evaluate_revert(config: &ServerConfig, revert: &RevertSpec) -> Result<(), String> {
+/// Outcome of assessing a free-form `--revert` before arming a containment
+/// envelope.
+enum RevertAssessment {
+    /// The rollback is policy-compliant and a sensible inverse of the forward
+    /// command; it is safe to arm the auto-revert envelope.
+    Sensible,
+    /// The rollback could not be affirmed (structurally invalid, denied by
+    /// policy, judged off-target, or unevaluable). The forward command is held
+    /// for operator review instead of being armed with an unverified rollback.
+    NeedsReview(String),
+}
+
+/// Assess a free-form `--revert` at arm time. The evaluator judges the rollback
+/// both for policy compliance and for whether it is a sensible inverse of the
+/// forward command (supplied as context), since the daemon may run it unattended.
+/// Only an explicit APPROVE arms the envelope; any other verdict escalates to
+/// operator review (a human decides) rather than silently denying or arming an
+/// unverified rollback. An operator-authored verb revert is the slow clock and is
+/// not routed here.
+async fn assess_revert(
+    config: &ServerConfig,
+    forward: &ExecuteRequest,
+    revert: &RevertSpec,
+) -> RevertAssessment {
     if let Some(reason) = invalid_binary_reason(&revert.binary) {
-        return Err(reason);
+        return RevertAssessment::NeedsReview(reason);
     }
-    let command_line = if revert.args.is_empty() {
+    let forward_line = if forward.args.is_empty() {
+        forward.binary.clone()
+    } else {
+        format!("{} {}", forward.binary, forward.args.join(" "))
+    };
+    let revert_line = if revert.args.is_empty() {
         revert.binary.clone()
     } else {
         format!("{} {}", revert.binary, revert.args.join(" "))
     };
-    match config.evaluator.evaluate(&command_line).await {
-        crate::evaluate::EvalResult::Allow { .. } => Ok(()),
-        crate::evaluate::EvalResult::Deny { reason, .. } => Err(format!(
-            "rollback command '{}' was denied by policy: {}",
-            command_line, reason
-        )),
-        crate::evaluate::EvalResult::Error(e) => Err(format!(
-            "could not evaluate rollback command '{}': {}",
-            command_line, e
-        )),
+    let context = format!(
+        "ROLLBACK ASSESSMENT. A recoverable command was approved to run inside an \
+         auto-revert containment envelope. If the operator does not confirm in time, \
+         the daemon runs the rollback unattended.\n\
+         Forward command: {forward_line}\n\
+         Proposed rollback: {revert_line}\n\
+         APPROVE only if the rollback is safe under policy AND is a sensible inverse \
+         that undoes the forward command without additional damage, broader scope, or \
+         unrelated side effects. DENY if it is off-target, destructive, overly broad, \
+         or unrelated to the forward command."
+    );
+    match config
+        .evaluator
+        .evaluate_with_context(&revert_line, Some(&context))
+        .await
+    {
+        crate::evaluate::EvalResult::Allow { .. } => RevertAssessment::Sensible,
+        crate::evaluate::EvalResult::Deny { reason, .. } => {
+            RevertAssessment::NeedsReview(format!("rollback not affirmed by policy: {reason}"))
+        }
+        crate::evaluate::EvalResult::Error(e) => {
+            RevertAssessment::NeedsReview(format!("rollback could not be evaluated: {e}"))
+        }
     }
 }
 
@@ -4587,13 +4625,43 @@ async fn route_gated_allow<W: AsyncWrite + Unpin>(
             .await
         }
         GateOutcome::Contain => {
+            // The rollback is itself a consequential action the daemon may run
+            // unattended. An operator-authored verb revert is pre-authorized (the
+            // slow clock). A free-form `--revert` is assessed for policy and for
+            // being a sensible inverse of the forward command; if it cannot be
+            // affirmed, the command is held for operator review rather than denied
+            // or armed with an unverified rollback.
+            if !inputs.revert_preauthorized {
+                if let Some(revert) = request.revert.clone() {
+                    if let RevertAssessment::NeedsReview(why) =
+                        assess_revert(config, &request, &revert).await
+                    {
+                        let hold_reason = format!(
+                            "{} [held for operator review: auto-revert not validated: {}]",
+                            inputs.reason, why
+                        );
+                        return hold_for_approval(
+                            request,
+                            config,
+                            caller,
+                            caller_principal,
+                            hold_reason,
+                            inputs.risk,
+                            inputs.reversibility,
+                            inputs.verb,
+                            stream_output,
+                            stream_writer,
+                        )
+                        .await;
+                    }
+                }
+            }
             arm_containment(
                 request,
                 config,
                 caller,
                 caller_principal,
                 inputs.reason,
-                inputs.revert_preauthorized,
                 depth,
                 stream_output,
                 stream_writer,
@@ -4627,7 +4695,6 @@ async fn arm_containment<W: AsyncWrite + Unpin>(
     caller: &CallerIdentity,
     caller_principal: Option<PrincipalKey>,
     reason: String,
-    revert_preauthorized: bool,
     depth: u32,
     stream_output: bool,
     stream_writer: &mut W,
@@ -4650,15 +4717,9 @@ async fn arm_containment<W: AsyncWrite + Unpin>(
         );
     }
 
-    // The rollback is itself a consequential action. A free-form `--revert` is
-    // evaluated here and the request is denied if it would be denied. An
-    // operator-authored verb revert is already reviewed (the slow clock), so it
-    // is pre-authorized.
-    if !revert_preauthorized {
-        if let Err(why) = evaluate_revert(config, &revert).await {
-            return ExecuteResult::denied(why);
-        }
-    }
+    // The rollback was assessed by the gate router before this point (free-form
+    // reverts are policy- and sensibility-checked; a verb revert is the
+    // operator-authored slow clock), so the envelope is armed here directly.
     if let Some(why) = gate_capacity_reason(config, caller_principal.as_ref()).await {
         return ExecuteResult::denied(why);
     }
@@ -7380,7 +7441,6 @@ mod tests {
             &agent,
             agent_principal,
             "recoverable change".to_string(),
-            true, // revert_preauthorized: skip re-eval (default-deny evaluator)
             0,
             true, // stream_output: exercise the streaming failure path
             &mut writer,
@@ -7435,7 +7495,6 @@ mod tests {
             &agent,
             agent_principal,
             "recoverable change".to_string(),
-            true,
             0,
             false,
             &mut sink,
@@ -7481,7 +7540,6 @@ mod tests {
             &agent,
             agent_principal,
             "recoverable change".to_string(),
-            true,
             0,
             false,
             &mut sink,
@@ -7570,7 +7628,6 @@ mod tests {
             &agent,
             agent_principal,
             "recoverable change".to_string(),
-            true,
             0,
             false,
             &mut sink,
@@ -7602,6 +7659,55 @@ mod tests {
             cfg.provisional.read().await.get(&handle).unwrap().status,
             ProvisionalStatus::Reverted,
             "auto-revert must roll the unconfirmed change back"
+        );
+    }
+
+    /// A recoverable command whose free-form `--revert` cannot be affirmed is
+    /// HELD for operator review, not armed with an unverified rollback and not
+    /// silently denied. Here the rollback binary is structurally invalid, so
+    /// `assess_revert` returns `NeedsReview` before any evaluator call, keeping
+    /// the test deterministic and cross-platform (the hold path spawns no child).
+    #[tokio::test]
+    async fn recoverable_with_unaffirmable_revert_is_held_for_review() {
+        let (cfg, _operator, agent) = gating_config(7011, 1000);
+
+        let request = contain_request(
+            "systemctl",
+            &["restart", "app"],
+            RevertSpec {
+                binary: "../evil".to_string(), // `..` rejected by invalid_binary_reason
+                args: Vec::new(),
+            },
+        );
+        let inputs = GateInputs {
+            reason: "recoverable restart".to_string(),
+            risk: Some(2),
+            reversibility: Some(Reversibility::Recoverable),
+            revert_preauthorized: false,
+            verb: None,
+            bypass: false,
+        };
+        let mut sink = tokio::io::sink();
+        let result = route_gated_allow(request, &cfg, &agent, inputs, 0, false, &mut sink).await;
+
+        let handle = match &result.exec {
+            ExecOutcome::Held { handle, .. } => handle.clone(),
+            other => panic!("expected Held, got {:?}", other),
+        };
+        assert!(
+            result.policy_reason().contains("held for operator review"),
+            "reason should explain the escalation: {}",
+            result.policy_reason()
+        );
+        assert_eq!(
+            cfg.provisional.read().await.outstanding(),
+            0,
+            "an unaffirmable rollback must never arm a containment envelope"
+        );
+        assert_eq!(
+            cfg.approvals.read().await.get(&handle).unwrap().status,
+            ApprovalStatus::Pending,
+            "the forward command must be queued for an operator decision"
         );
     }
 

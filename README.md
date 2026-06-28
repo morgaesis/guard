@@ -140,8 +140,14 @@ guard approve a1b2...           # operator: execute the exact held command
 guard deny a1b2...              # operator: reject it
 ```
 
-A free-form `--revert` is itself policy-evaluated at arm time, so an agent cannot
-smuggle an arbitrary command into the rollback slot. A recoverable command with
+A free-form `--revert` is assessed by the evaluator at arm time, with the forward
+command as context, for both policy compliance and whether it is a sensible
+inverse of the forward action — the daemon may run it unattended, so it is gated
+as the consequential action it is. Only an explicit approval arms the envelope;
+any other verdict escalates the command to operator review (it is held, not armed
+with an unverified rollback and not silently denied), so an agent cannot smuggle
+an arbitrary or off-target command into the rollback slot. An operator-authored
+verb revert is the slow clock and is not re-evaluated. A recoverable command with
 no usable revert is held, not run unconfined. Held commands fail closed: an
 unattended queue denies on a TTL rather than stalling. Held and provisional state
 survives a daemon restart, and a revert never runs unattended at boot — a
