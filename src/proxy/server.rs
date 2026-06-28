@@ -5,14 +5,17 @@
 //! operator's credentials. Secret reads are buffered, JSON-parsed, and redacted
 //! before the response reaches the client; everything else streams through.
 //!
-//! Phase 1 scope: the read path plus the containment foundation. Interactive
-//! subresources (`exec`/`attach`/`portforward`) and Secret `watch`es are denied
-//! (their streams cannot be redacted yet); writes the policy allows are forwarded
-//! without the auto-revert envelope (that lands in phase 2).
+//! A recoverable write the policy allows is wrapped in an auto-revert envelope
+//! when the daemon's consequence gate is active: the proxy snapshots the prior
+//! object (or notes the created one) and hands a synthesized revert to the
+//! [`GateSink`], so the operator's `guard confirm` keeps it and the sweeper rolls
+//! it back otherwise. Interactive subresources (`exec`/`attach`/`portforward`)
+//! and Secret `watch`es are denied: their streams cannot be redacted or gated
+//! per object.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -27,10 +30,12 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio_rustls::TlsAcceptor;
 
-use super::k8s::{self, parse_api_op, Verb};
+use super::gate::{ApiMutation, ApiRevert, GateSink};
+use super::k8s::{self, parse_api_op, ApiOp, Verb};
 use super::policy::{ApiAction, ApiPolicy};
 use super::tls::ProxyTls;
 use super::upstream::Upstream;
+use crate::gating::Reversibility;
 
 /// Cap on a forwarded request body. Manifests are small; this bounds memory and
 /// denies an oversized body from a misbehaving client.
@@ -50,6 +55,12 @@ pub struct KubeProxy {
     upstream: Upstream,
     policy: Arc<RwLock<ApiPolicy>>,
     policy_path: Option<PathBuf>,
+    /// The operator's real kubeconfig path, used by the daemon to build the
+    /// `kubectl` revert when an auto-revert envelope fires.
+    real_kubeconfig: PathBuf,
+    /// Bridge to the daemon's consequence machinery, attached before serving.
+    /// When present, recoverable writes are wrapped in an auto-revert envelope.
+    gate: OnceLock<Arc<dyn GateSink>>,
 }
 
 impl KubeProxy {
@@ -61,6 +72,7 @@ impl KubeProxy {
         upstream: Upstream,
         policy: ApiPolicy,
         policy_path: Option<PathBuf>,
+        real_kubeconfig: PathBuf,
     ) -> Self {
         let proxy_url = format!("https://127.0.0.1:{}", listen.port());
         Self {
@@ -70,7 +82,20 @@ impl KubeProxy {
             upstream,
             policy: Arc::new(RwLock::new(policy)),
             policy_path,
+            real_kubeconfig,
+            gate: OnceLock::new(),
         }
+    }
+
+    /// Attach the daemon's consequence bridge before serving. Idempotent; a
+    /// second call is ignored.
+    pub fn attach_gate(&self, sink: Arc<dyn GateSink>) {
+        let _ = self.gate.set(sink);
+    }
+
+    /// The operator's real kubeconfig path (for building reverts).
+    pub fn real_kubeconfig(&self) -> &std::path::Path {
+        &self.real_kubeconfig
     }
 
     pub fn listen(&self) -> SocketAddr {
@@ -150,7 +175,7 @@ impl KubeProxy {
             // Non-resource paths: discovery, /version, /openapi, /healthz. Clients
             // need these. Allow safe reads; block anything else.
             if method == Method::GET || method == Method::HEAD {
-                return self.forward(req, &path, &query, false).await;
+                return self.forward(req, &path, &query, false, None).await;
             }
             return status_resp(
                 StatusCode::FORBIDDEN,
@@ -206,7 +231,7 @@ impl KubeProxy {
             ApiAction::Allow => {
                 let redact = decision.redact_secrets && op.is_secrets() && op.is_read();
                 tracing::info!(target: "guard::kubeproxy", "ALLOW {}{}", label, if redact { " (redacting)" } else { "" });
-                self.forward(req, &path, &query, redact).await
+                self.forward(req, &path, &query, redact, Some(op)).await
             }
         }
     }
@@ -217,8 +242,9 @@ impl KubeProxy {
         path: &str,
         query: &str,
         redact: bool,
+        op: Option<ApiOp>,
     ) -> Response<ProxyBody> {
-        match self.forward_inner(req, path, query, redact).await {
+        match self.forward_inner(req, path, query, redact, op).await {
             Ok(resp) => resp,
             Err(e) => {
                 tracing::warn!(target: "guard::kubeproxy", "upstream error for {path}: {e:#}");
@@ -237,6 +263,7 @@ impl KubeProxy {
         path: &str,
         query: &str,
         redact: bool,
+        op: Option<ApiOp>,
     ) -> Result<Response<ProxyBody>> {
         let (parts, body) = req.into_parts();
 
@@ -245,6 +272,25 @@ impl KubeProxy {
             .await
             .map_err(|e| anyhow!("read request body (limit {MAX_REQ_BODY}): {e}"))?
             .to_bytes();
+
+        // A recoverable write we will wrap in an auto-revert envelope: snapshot
+        // the prior object first (for an update/patch), then forward, then arm.
+        let track_write = op.as_ref().is_some_and(|o| {
+            self.gate.get().is_some()
+                && !o.dry_run
+                && o.reversibility() == Some(Reversibility::Recoverable)
+                && matches!(o.verb, Verb::Create | Verb::Update | Verb::Patch)
+        });
+        let snapshot = if track_write {
+            let o = op.as_ref().unwrap();
+            if matches!(o.verb, Verb::Update | Verb::Patch) && o.name.is_some() {
+                self.snapshot_object(path).await
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         let url = if query.is_empty() {
             format!("{}{}", self.upstream.base(), path)
@@ -321,6 +367,20 @@ impl KubeProxy {
                 .expect("build redacted response"));
         }
 
+        // A tracked write: buffer the (small) object response, arm an auto-revert
+        // on success, and return the body. Writes are not streamed.
+        if track_write {
+            let bytes = upstream_resp.bytes().await.context("read write response")?;
+            if status.is_success() {
+                if let Some(o) = op.as_ref() {
+                    self.arm_write_revert(o, snapshot, &bytes).await;
+                }
+            }
+            return Ok(builder
+                .body(full_body(bytes))
+                .expect("build write response"));
+        }
+
         // Stream the response body through unchanged (lists, gets, watches).
         let stream = upstream_resp
             .bytes_stream()
@@ -328,6 +388,102 @@ impl KubeProxy {
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
         let body = StreamBody::new(stream).boxed();
         Ok(builder.body(body).expect("build streamed response"))
+    }
+
+    /// Fetch the current object at `path` to snapshot it before a mutation.
+    /// Strips `resourceVersion` so the daemon's `kubectl replace` revert is
+    /// unconditional. Returns `None` if the object cannot be fetched/parsed (the
+    /// caller then synthesizes a delete-the-created-object revert instead).
+    async fn snapshot_object(&self, path: &str) -> Option<Vec<u8>> {
+        let url = format!("{}{}", self.upstream.base(), path);
+        let mut rb = self
+            .upstream
+            .client()
+            .get(&url)
+            .header(header::ACCEPT, "application/json");
+        if let Some(token) = self.upstream.bearer() {
+            rb = rb.bearer_auth(token);
+        }
+        let resp = rb.send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let bytes = resp.bytes().await.ok()?;
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        if let Some(meta) = value.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+            meta.remove("resourceVersion");
+            meta.remove("managedFields");
+        }
+        serde_json::to_vec(&value).ok()
+    }
+
+    /// Arm an auto-revert envelope for a write the proxy just forwarded. For an
+    /// update/patch with a captured prior state, the revert restores it; for a
+    /// create, it deletes the (possibly server-named) object from the response.
+    async fn arm_write_revert(&self, op: &ApiOp, snapshot: Option<Vec<u8>>, response_body: &[u8]) {
+        let Some(gate) = self.gate.get() else {
+            return;
+        };
+        let (revert, name) = if let Some(snap) = snapshot {
+            (
+                ApiRevert::Restore { object_json: snap },
+                op.name.clone().unwrap_or_default(),
+            )
+        } else {
+            let value: serde_json::Value = match serde_json::from_slice(response_body) {
+                Ok(v) => v,
+                Err(_) => {
+                    tracing::warn!(
+                        target: "guard::kubeproxy",
+                        "allowed write but response was unparsable; no auto-revert armed"
+                    );
+                    return;
+                }
+            };
+            let Some(name) = value
+                .get("metadata")
+                .and_then(|m| m.get("name"))
+                .and_then(|n| n.as_str())
+            else {
+                tracing::warn!(
+                    target: "guard::kubeproxy",
+                    "allowed create but response carried no object name; no auto-revert armed"
+                );
+                return;
+            };
+            let namespace = value
+                .get("metadata")
+                .and_then(|m| m.get("namespace"))
+                .and_then(|n| n.as_str())
+                .map(String::from)
+                .or_else(|| op.namespace.clone());
+            (
+                ApiRevert::DeleteCreated {
+                    group: op.group.clone(),
+                    resource: op.resource.clone(),
+                    name: name.to_string(),
+                    namespace,
+                },
+                name.to_string(),
+            )
+        };
+        let ns = op.namespace.as_deref().unwrap_or("(cluster)");
+        let label = format!("{} {}/{} in {}", op.verb.as_str(), op.resource, name, ns);
+        match gate
+            .arm_revert(ApiMutation {
+                label: label.clone(),
+                revert,
+            })
+            .await
+        {
+            Some(handle) => {
+                tracing::info!(target: "guard::kubeproxy", "armed auto-revert {handle} for {label}")
+            }
+            None => tracing::warn!(
+                target: "guard::kubeproxy",
+                "could not arm auto-revert for {label} (capacity)"
+            ),
+        }
     }
 }
 

@@ -1097,6 +1097,35 @@ impl Server {
         }
 
         if let Some(ref proxy) = self.config.kube_proxy {
+            // The auto-revert envelope needs the consequence sweeper, which only
+            // runs under `--gate consequence`. Without it the proxy still gates
+            // (allow/deny/hold/redact) but forwards recoverable writes unwrapped.
+            if self.config.gate.is_on() {
+                let snapshot_dir = self
+                    .config
+                    .state_db_path
+                    .as_ref()
+                    .and_then(|p| p.parent())
+                    .map(|d| d.join("kube-proxy-reverts"))
+                    .unwrap_or_else(|| std::env::temp_dir().join("guard-kube-proxy-reverts"));
+                if let Err(e) = std::fs::create_dir_all(&snapshot_dir) {
+                    tracing::warn!(
+                        "could not create kube-proxy revert dir {}: {}",
+                        snapshot_dir.display(),
+                        e
+                    );
+                }
+                proxy.attach_gate(Arc::new(DaemonGateSink {
+                    config: self.config.clone(),
+                    kubeconfig: proxy.real_kubeconfig().to_path_buf(),
+                    snapshot_dir,
+                    window_secs: DEFAULT_CONFIRM_WITHIN_SECS,
+                }));
+            } else {
+                tracing::info!(
+                    "kube-proxy: --gate consequence not set; recoverable writes forwarded without auto-revert"
+                );
+            }
             tracing::info!("Starting kube-proxy listener on {}", proxy.listen());
             let proxy = proxy.clone();
             futures.push(tokio::spawn(async move { proxy.serve().await }));
@@ -4496,6 +4525,98 @@ async fn persist_provisional(config: &ServerConfig, p: &Provisional) {
         if let Err(e) = store.save_provisional(p.clone()).await {
             tracing::warn!("failed to persist provisional {}: {}", p.handle, e);
         }
+    }
+}
+
+/// Bridges the kube-proxy's synthesized reverts into the daemon's consequence
+/// machinery. Holds a clone of the server config (which shares the provisional
+/// registry and state store), the operator kubeconfig for the `kubectl` revert,
+/// and a directory for snapshot files. The proxy acts as the daemon principal,
+/// so the operator manages proxy-armed provisionals with the same
+/// `guard confirm` / `guard provisionals` / `guard revert` commands.
+struct DaemonGateSink {
+    config: ServerConfig,
+    kubeconfig: PathBuf,
+    snapshot_dir: PathBuf,
+    window_secs: u64,
+}
+
+#[async_trait::async_trait]
+impl guard::proxy::GateSink for DaemonGateSink {
+    async fn arm_revert(&self, mutation: guard::proxy::ApiMutation) -> Option<String> {
+        let principal = Some(self.config.daemon_principal.clone());
+        if let Some(reason) = gate_capacity_reason(&self.config, principal.as_ref()).await {
+            tracing::warn!("kube-proxy auto-revert not armed: {}", reason);
+            return None;
+        }
+        let handle = new_handle();
+        let now = now_unix();
+        let kubeconfig = self.kubeconfig.display().to_string();
+        let (revert_binary, revert_args) = match mutation.revert {
+            guard::proxy::ApiRevert::Restore { object_json } => {
+                let file = self.snapshot_dir.join(format!("revert-{handle}.json"));
+                if let Err(e) = tokio::fs::write(&file, &object_json).await {
+                    tracing::error!(
+                        "kube-proxy: failed to write revert snapshot {}: {}",
+                        file.display(),
+                        e
+                    );
+                    return None;
+                }
+                (
+                    "kubectl".to_string(),
+                    vec![
+                        "--kubeconfig".to_string(),
+                        kubeconfig,
+                        "replace".to_string(),
+                        "-f".to_string(),
+                        file.display().to_string(),
+                    ],
+                )
+            }
+            guard::proxy::ApiRevert::DeleteCreated {
+                group,
+                resource,
+                name,
+                namespace,
+            } => {
+                let target = if group.is_empty() {
+                    resource
+                } else {
+                    format!("{resource}.{group}")
+                };
+                let mut args = vec![
+                    "--kubeconfig".to_string(),
+                    kubeconfig,
+                    "delete".to_string(),
+                    target,
+                    name,
+                ];
+                if let Some(ns) = namespace {
+                    args.push("-n".to_string());
+                    args.push(ns);
+                }
+                ("kubectl".to_string(), args)
+            }
+        };
+        let provisional = Provisional {
+            handle: handle.clone(),
+            principal,
+            binary: "(kube-proxy)".to_string(),
+            args: vec![mutation.label.clone()],
+            revert_binary,
+            revert_args,
+            reason: mutation.label,
+            created_unix: now,
+            deadline_unix: now.saturating_add(self.window_secs),
+            forward_done: true,
+            status: ProvisionalStatus::Armed,
+            revert_exit: None,
+            revert_detail: None,
+        };
+        persist_provisional(&self.config, &provisional).await;
+        self.config.provisional.write().await.insert(provisional);
+        Some(handle)
     }
 }
 

@@ -17,6 +17,7 @@
 //! generation/validation ([`kubeconfig`]). The TLS-terminating server loop that
 //! wires them to a live apiserver builds on top of these.
 
+pub mod gate;
 pub mod k8s;
 pub mod kubeconfig;
 pub mod policy;
@@ -24,6 +25,7 @@ pub mod server;
 pub mod tls;
 pub mod upstream;
 
+pub use gate::{ApiMutation, ApiRevert, GateSink};
 pub use k8s::{ApiOp, Verb};
 pub use kubeconfig::{brokered_kubeconfig, validate_brokered_kubeconfig, BrokerError};
 pub use policy::{ApiAction, ApiPolicy, ApiRule};

@@ -1689,6 +1689,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                     upstream,
                     policy,
                     api_policy_path,
+                    kubeconfig_path.clone(),
                 ));
                 if let Some(out) = brokered_kubeconfig_out
                     .or_else(|| guard_env("BROKERED_KUBECONFIG_OUT").map(PathBuf::from))
