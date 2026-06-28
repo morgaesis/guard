@@ -177,6 +177,44 @@ hot-reloaded on change; agents cannot add or alter verbs. A `trusted` verb skips
 the LLM (a deterministic allow path); its declared class still drives the gate.
 See [`examples/verbs.yaml`](examples/verbs.yaml).
 
+## Kubernetes API proxy
+
+The command gate sees a command's argv, but tools that drive the Kubernetes API
+in-process never spawn a gated command: `helm upgrade` renders templates locally
+then performs many create/update/delete calls against the apiserver via client-go,
+and terraform's k8s provider, k9s, and client libraries are the same. The gate
+sees one opaque invocation.
+
+`--kube-proxy` moves the gate to the API boundary. The daemon fronts the apiserver
+with a TLS-terminating proxy, parses each request into a typed operation, matches
+it against an operator policy, and re-originates allowed requests to the real
+apiserver with the credentials only the daemon holds:
+
+```bash
+guard server start --gate consequence --socket /run/guard/guard.sock \
+    --kube-proxy 127.0.0.1:8443 \
+    --kubeconfig /etc/guard/kubeconfig \
+    --api-policy /etc/guard/api-policy.yaml \
+    --brokered-kubeconfig-out /run/guard/brokered.kubeconfig
+
+# The agent uses the brokered config, which carries no credential:
+KUBECONFIG=/run/guard/brokered.kubeconfig helm upgrade --install app ./chart
+```
+
+The daemon reads the real bearer token or client certificate from its kubeconfig
+(`exec`/`auth-provider` plugins are rejected) and emits a brokered kubeconfig that
+points only at the proxy and is validated to carry no credential, so the proxy is
+the sole path to the cluster. `--kube-proxy` refuses to start with
+`--exec-as-caller`. Policy actions are `allow`, `deny`, and `hold`; an allowed
+Secret read has its `data`/`stringData` redacted from the response (something the
+cluster's admission control cannot do, since admission fires only on writes).
+Interactive subresources (`exec`/`attach`/`portforward`) and Secret `watch`es are
+denied. Under `--gate consequence`, a recoverable write is wrapped in the
+auto-revert envelope: the proxy snapshots the prior object and synthesizes a
+`kubectl`-based revert armed in the provisional registry, so `guard confirm` keeps
+it and the sweeper rolls it back otherwise. See
+[`examples/api-policy.yaml`](examples/api-policy.yaml).
+
 ## Configuration
 
 ### Defaults vs. opt-ins
