@@ -1230,8 +1230,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
 
             let api_key = llm_api_key
                 .or_else(|| guard_env("LLM_API_KEY"))
-                .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
-                .or_else(|| guard_env("API_KEY")); // deprecated fallback
+                .or_else(|| std::env::var("OPENROUTER_API_KEY").ok());
 
             if llm_enabled && api_key.is_none() {
                 tracing::warn!("No LLM API key provided (set GUARD_LLM_API_KEY, OPENROUTER_API_KEY, or --llm-api-key)");
@@ -1239,7 +1238,6 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
 
             let resolved_timeout = llm_timeout
                 .or_else(|| guard_env("LLM_TIMEOUT").and_then(|v| v.parse::<u64>().ok()))
-                .or_else(|| guard_env("TIMEOUT").and_then(|v| v.parse::<u64>().ok()))
                 .unwrap_or(30);
             let mut eval_config = evaluate::EvalConfig::default()
                 .llm_enabled(llm_enabled)
@@ -1252,8 +1250,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
 
             let resolved_api_url = llm_api_url
                 .filter(|value| !value.is_empty())
-                .or_else(|| guard_env("LLM_API_URL").filter(|value| !value.is_empty()))
-                .or_else(|| guard_env("API_URL").filter(|value| !value.is_empty()));
+                .or_else(|| guard_env("LLM_API_URL").filter(|value| !value.is_empty()));
             if let Some(api_url) = resolved_api_url {
                 eval_config = eval_config.llm_api_url(api_url);
             }

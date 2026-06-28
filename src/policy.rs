@@ -19,10 +19,6 @@ impl PolicyMode {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "readonly" => Some(Self::Readonly),
-            "default" => {
-                tracing::warn!("GUARD_MODE=\"default\" is deprecated, use \"readonly\" instead");
-                Some(Self::Readonly)
-            }
             "paranoid" => Some(Self::Paranoid),
             "safe" => Some(Self::Safe),
             _ => None,
@@ -904,9 +900,8 @@ policy:
         assert_eq!(PolicyMode::parse("Paranoid"), Some(PolicyMode::Paranoid));
         assert_eq!(PolicyMode::parse("SAFE"), Some(PolicyMode::Safe));
         assert_eq!(PolicyMode::parse("invalid"), None);
-        // "default" is a deprecated alias for Readonly
-        assert_eq!(PolicyMode::parse("default"), Some(PolicyMode::Readonly));
-        assert_eq!(PolicyMode::parse("Default"), Some(PolicyMode::Readonly));
+        // "default" is no longer recognized (was a deprecated alias for readonly).
+        assert_eq!(PolicyMode::parse("default"), None);
     }
 
     #[test]

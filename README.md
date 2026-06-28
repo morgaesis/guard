@@ -205,10 +205,10 @@ Guard walks up from your current directory to `/` looking for `.env` files (clos
 | Variable | Default | Description |
 |---|---|---|
 | `GUARD_LLM_API_KEY` / `OPENROUTER_API_KEY` | (none) | LLM API key (required). `OPENROUTER_API_KEY` is the conventional name and is accepted for compatibility. |
-| `GUARD_LLM_API_URL` / `GUARD_API_URL` | `https://openrouter.ai/api/v1/chat/completions` | Any OpenAI-compatible endpoint |
+| `GUARD_LLM_API_URL` | `https://openrouter.ai/api/v1/chat/completions` | Any OpenAI-compatible endpoint |
 | `GUARD_LLM_MODELS` | (unset) | Optional comma-separated fallback chain (e.g. `openai/gpt-5.4-nano,meta-llama/llama-4-maverick`). When set, overrides `--llm-model` and is tried in order, each with its own retry budget. Primary model when unset: `openai/gpt-5.4-nano`. |
 | `GUARD_LLM_RETRIES` | `2` | Retries per model on transient failures (429, timeouts, parse errors). 1-2. |
-| `GUARD_LLM_TIMEOUT` / `GUARD_TIMEOUT` | `30` | LLM call timeout in seconds. |
+| `GUARD_LLM_TIMEOUT` | `30` | LLM call timeout in seconds. |
 | `GUARD_AUTH_TOKEN` | (none) | Shared token for TCP clients. Use this for loopback TCP daemons instead of passing `--auth-token` on the command line. |
 | `GUARD_ADMIN_TOKEN` | (none) | Separate token for TCP admin RPCs such as `guard grant`, `guard session show`, and the full `guard status`. The Windows launcher generates and stores one automatically. |
 | `GUARD_MODE` | `readonly` | `readonly`, `safe`, or `paranoid` |
