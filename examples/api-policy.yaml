@@ -1,0 +1,63 @@
+# Kubernetes API policy: gated cluster access for in-process API clients.
+#
+# When the daemon fronts the apiserver with `guard server start --kube-proxy`,
+# every API request from a brokered client (helm, kubectl, terraform's k8s
+# provider, k9s, client libraries) is parsed into a typed operation and matched
+# against this policy. Unlike the verb catalog, which gates whole commands, this
+# gates individual API operations -- so `helm upgrade`, which performs many
+# create/update/delete calls in-process, is gated per object.
+#
+# Only the operator (daemon principal) edits this file; it is hot-reloaded.
+# Agents cannot add or alter rules.
+#
+# Each rule matches by verb, resource, and namespace (all default to `*`). The
+# first matching rule wins; an unmatched request takes `default` (fail-safe
+# deny). Actions:
+#   allow  -> forward to the apiserver
+#   deny   -> reject at the proxy; the apiserver is never contacted
+#   hold   -> hold for operator approval before the request reaches the apiserver
+#
+# Verbs: get, list, watch (reads); create, update, patch (writes); delete,
+# deletecollection. A dry-run write is treated as a read.
+#
+# `redact_secrets: true` on an allowed read strips `data`/`stringData` from
+# Secret responses so values never reach the client. Reading Secret values is
+# always redacted on an allowed Secret read regardless of this flag -- set it to
+# document intent, or on broad read rules.
+
+default: deny
+
+rules:
+  # Read-only inspection across the cluster, with Secret values redacted.
+  - verbs: [get, list, watch]
+    resources: ["*"]
+    namespaces: ["*"]
+    action: allow
+    redact_secrets: true
+    description: "read-only inspection (secret values redacted)"
+
+  # Recoverable writes confined to non-production namespaces. Each runs behind
+  # the auto-revert envelope (the proxy snapshots the prior object and restores
+  # it if the operator does not confirm in time).
+  - verbs: [create, update, patch]
+    resources: ["*"]
+    namespaces: [dev, staging, sandbox]
+    action: allow
+    description: "writes allowed in non-production namespaces"
+
+  # Deleting a namespace removes everything in it: always hold for approval.
+  - verbs: [delete]
+    resources: [namespaces]
+    namespaces: ["*"]
+    action: hold
+    description: "namespace deletion needs operator sign-off"
+
+  # Any other delete is held for an operator decision rather than auto-run.
+  - verbs: [delete, deletecollection]
+    resources: ["*"]
+    namespaces: ["*"]
+    action: hold
+    description: "deletions need operator sign-off"
+
+  # Everything else (e.g. writes in production namespaces) falls through to the
+  # default deny above.
