@@ -165,7 +165,11 @@ users:
 
     #[test]
     fn rejects_client_cert_and_key() {
-        for field in ["client-certificate-data", "client-key-data", "auth-provider"] {
+        for field in [
+            "client-certificate-data",
+            "client-key-data",
+            "auth-provider",
+        ] {
             let yaml = format!(
                 "apiVersion: v1\nkind: Config\nusers:\n  - name: u\n    user:\n      {field}: x\n"
             );

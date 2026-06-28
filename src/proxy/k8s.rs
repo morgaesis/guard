@@ -334,7 +334,10 @@ mod tests {
         assert_eq!(op("POST", "/api/v1/namespaces/p/pods").verb, Verb::Create);
         assert_eq!(op("PUT", "/api/v1/namespaces/p/pods/x").verb, Verb::Update);
         assert_eq!(op("PATCH", "/api/v1/namespaces/p/pods/x").verb, Verb::Patch);
-        assert_eq!(op("DELETE", "/api/v1/namespaces/p/pods/x").verb, Verb::Delete);
+        assert_eq!(
+            op("DELETE", "/api/v1/namespaces/p/pods/x").verb,
+            Verb::Delete
+        );
         assert_eq!(
             op("DELETE", "/api/v1/namespaces/p/pods").verb,
             Verb::DeleteCollection
@@ -346,7 +349,12 @@ mod tests {
         let o = parse_api_op("GET", "/api/v1/namespaces/p/pods", "watch=true").unwrap();
         assert_eq!(o.verb, Verb::Watch);
         assert!(o.is_read());
-        let o2 = parse_api_op("GET", "/api/v1/namespaces/p/pods", "watch=1&timeoutSeconds=9").unwrap();
+        let o2 = parse_api_op(
+            "GET",
+            "/api/v1/namespaces/p/pods",
+            "watch=1&timeoutSeconds=9",
+        )
+        .unwrap();
         assert_eq!(o2.verb, Verb::Watch);
         let not = parse_api_op("GET", "/api/v1/namespaces/p/pods", "watch=false").unwrap();
         assert_eq!(not.verb, Verb::List);

@@ -99,21 +99,17 @@ impl ApiPolicy {
     /// forced on for any Secret read regardless of the rule flag, so an operator
     /// cannot accidentally allow reading secret values by omitting the flag.
     pub fn decide(&self, op: &ApiOp) -> ApiDecision {
-        let (action, mut redact, reason) = match self
-            .rules
-            .iter()
-            .enumerate()
-            .find(|(_, r)| r.matches(op))
-        {
-            Some((i, r)) => {
-                let label = r
-                    .description
-                    .clone()
-                    .unwrap_or_else(|| format!("api-policy rule #{i}"));
-                (r.action, r.redact_secrets, label)
-            }
-            None => (self.default, false, "api-policy default".to_string()),
-        };
+        let (action, mut redact, reason) =
+            match self.rules.iter().enumerate().find(|(_, r)| r.matches(op)) {
+                Some((i, r)) => {
+                    let label = r
+                        .description
+                        .clone()
+                        .unwrap_or_else(|| format!("api-policy rule #{i}"));
+                    (r.action, r.redact_secrets, label)
+                }
+                None => (self.default, false, "api-policy default".to_string()),
+            };
         // Reading secret values is never allowed to leak: force redaction on any
         // allowed Secret read, even if the matched rule did not set the flag.
         if matches!(action, ApiAction::Allow) && op.is_read() && op.is_secrets() {
@@ -180,7 +176,8 @@ rules:
             ApiAction::Allow
         );
         assert_eq!(
-            p.decide(&op("DELETE", "/api/v1/namespaces/d/pods/x")).action,
+            p.decide(&op("DELETE", "/api/v1/namespaces/d/pods/x"))
+                .action,
             ApiAction::Hold
         );
         assert_eq!(
@@ -263,7 +260,8 @@ rules:
             ApiAction::Hold
         );
         assert_eq!(
-            p.decide(&op("DELETE", "/api/v1/namespaces/dev/pods/x")).action,
+            p.decide(&op("DELETE", "/api/v1/namespaces/dev/pods/x"))
+                .action,
             ApiAction::Hold
         );
     }
