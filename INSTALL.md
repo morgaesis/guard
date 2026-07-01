@@ -107,5 +107,7 @@ Key variables:
 - `GUARD_LEARN_SHIMS` -- `off`, `suggest`, or `create` shorter service shims for promoted rules
 - `GUARD_LEARN_DENY` -- Auto-learn deny shapes from repeated LLM denials (default: `true`; never grants anything, so no operator promotion step is needed)
 - `GUARD_LEARN_DENY_MIN_DENIALS` -- Denials of the same shape required before synthesizing an auto-learned deny fast path (default: `3`)
+- `GUARD_LEARN_ALLOW` -- Auto-promote trusted verbs from repeated low-risk approvals (default: `true`; requires `--gate consequence`; restricted to reversible/recoverable-with-a-validated-revert shapes, never irreversible)
+- `GUARD_LEARN_ALLOW_MIN_APPROVALS` -- Approvals of the same shape required before attempting to promote a trusted verb (default: `5`)
 
 For long-running service deployment, see [DEPLOYMENT.md](DEPLOYMENT.md).

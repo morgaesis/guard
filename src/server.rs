@@ -253,6 +253,50 @@ struct VerbContext {
     catalog_version: u64,
 }
 
+/// Whether a verb's `trusted` flag still applies, given its own
+/// `auto_promoted`/`promotion_stamp` and the daemon's current stamp. A
+/// hand-authored verb (`auto_promoted == false`) has no expiry: an operator
+/// reviewed it, so it stays trusted until the operator changes it. An
+/// auto-promoted verb (`gating::allow_promotion`) is trusted only as long as
+/// the daemon's current model + prompt stamp matches the one that justified
+/// promoting it -- a model or prompt change silently downgrades it back to
+/// an untrusted, LLM-evaluated shape rather than continuing to trust a
+/// judgment made under a since-changed evaluator. The single source of truth
+/// for this check: used for the explicit-invocation and reverse-match verb
+/// paths in `execute_command_inner` (via `verb_trust_is_current`) and for
+/// what `guard verb list` reports (via `verb_effective_trust`), so the two
+/// can never disagree about whether a given verb is still trusted.
+fn trust_is_current(
+    trusted: bool,
+    auto_promoted: bool,
+    promotion_stamp: Option<&str>,
+    current_stamp: &str,
+) -> bool {
+    trusted && (!auto_promoted || promotion_stamp == Some(current_stamp))
+}
+
+fn verb_trust_is_current(r: &guard::gating::verb::RenderedVerb, current_stamp: &str) -> bool {
+    trust_is_current(
+        r.trusted,
+        r.auto_promoted,
+        r.promotion_stamp.as_deref(),
+        current_stamp,
+    )
+}
+
+/// Same check for a raw catalog `Verb` (not yet rendered against params),
+/// used by `guard verb list` so a stale auto-promoted verb is reported as
+/// untrusted rather than misleading an operator into thinking it is still
+/// fast-pathing when the daemon has actually stopped honoring it.
+fn verb_effective_trust(verb: &guard::gating::verb::Verb, current_stamp: &str) -> bool {
+    trust_is_current(
+        verb.trusted,
+        verb.auto_promoted,
+        verb.promotion_stamp.as_deref(),
+        current_stamp,
+    )
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 #[allow(clippy::enum_variant_names)]
@@ -480,10 +524,24 @@ pub struct VerbSummary {
     pub description: String,
     pub binary: String,
     pub consequence: String,
+    /// Whether this verb currently skips the LLM. For an auto-promoted verb
+    /// this already reflects the staleness check (`verb_effective_trust`):
+    /// `false` here means the daemon has stopped honoring the promotion
+    /// (e.g. after a model/prompt change), even if the catalog's underlying
+    /// `trusted` field still says `true`.
     pub trusted: bool,
     pub has_revert: bool,
     /// Parameter name -> validation pattern.
     pub params: std::collections::BTreeMap<String, String>,
+    /// True for a verb `gating::allow_promotion` appended automatically from
+    /// repeated approvals, rather than authored or reviewed by an operator.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_promoted: bool,
+    /// Rationale recorded when the verb was created or promoted (operator
+    /// prose evidence for `guard verb create`, or the derived/model evidence
+    /// for an auto-promotion).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
 }
 
 /// Operator-facing view of a provisional execution.
@@ -623,6 +681,15 @@ pub struct ServerStatus {
     /// path.
     #[serde(default)]
     pub deny_shape_count: usize,
+    /// Whether auto-verb-promotion is active (see `gating::allow_promotion`;
+    /// on by default, `--no-learn-allow` to disable).
+    #[serde(default)]
+    pub allow_promotion_enabled: bool,
+    /// Number of observation buckets auto-verb-promotion is currently
+    /// tracking (not the number of verbs promoted -- see `guard verb list`
+    /// for those).
+    #[serde(default)]
+    pub allow_promotion_observation_count: usize,
     pub session_count: usize,
     pub daemon_uid: u32,
     pub exec_identity: String,
@@ -2358,6 +2425,8 @@ async fn handle_admin_request(
             let cache_size = config.evaluator.cache_size().await;
             let learned_rule_count = config.evaluator.learned_rule_count().await;
             let deny_shape_count = config.evaluator.deny_shape_count().await;
+            let allow_promotion_observation_count =
+                config.evaluator.allow_promotion_observation_count().await;
             let mode = config
                 .evaluator
                 .mode()
@@ -2384,6 +2453,8 @@ async fn handle_admin_request(
                     learned_rule_count,
                     deny_learning_enabled: config.evaluator.deny_learning_enabled(),
                     deny_shape_count,
+                    allow_promotion_enabled: config.evaluator.allow_promotion_enabled(),
+                    allow_promotion_observation_count,
                     session_count,
                     daemon_uid: config.daemon_uid,
                     exec_identity: if config.exec_as_caller {
@@ -2458,6 +2529,7 @@ async fn handle_admin_request(
                 if let Err(e) = cat.reload_if_stale() {
                     tracing::warn!("verb catalog reload failed: {}", e);
                 }
+                let current_stamp = config.evaluator.verb_promotion_stamp();
                 cat.list()
                     .iter()
                     .map(|v| VerbSummary {
@@ -2465,13 +2537,15 @@ async fn handle_admin_request(
                         description: v.description.clone(),
                         binary: v.binary.clone(),
                         consequence: v.consequence.as_str().to_string(),
-                        trusted: v.trusted,
+                        trusted: verb_effective_trust(v, current_stamp),
                         has_revert: v.revert.is_some(),
                         params: v
                             .params
                             .iter()
                             .map(|(k, spec)| (k.clone(), spec.pattern.clone()))
                             .collect(),
+                        auto_promoted: v.auto_promoted,
+                        evidence: v.evidence.clone(),
                     })
                     .collect()
             };
@@ -3390,13 +3464,14 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         };
         match rendered {
             Ok((r, version)) => {
+                let trusted = verb_trust_is_current(&r, config.evaluator.verb_promotion_stamp());
                 request.binary = r.binary;
                 request.args = r.args;
                 request.revert = r.revert.map(|(binary, args)| RevertSpec { binary, args });
                 verb_ctx = Some(VerbContext {
                     name: r.name,
                     class: r.consequence,
-                    trusted: r.trusted,
+                    trusted,
                     params: r.params,
                     catalog_version: version,
                 });
@@ -3407,6 +3482,37 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
                 let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
                 return ExecuteResult::denied(reason);
             }
+        }
+    } else if config.gate.is_on() {
+        // No explicit `--verb` invocation, but a raw command may still match
+        // a catalog verb's template (hand-authored or auto-promoted -- see
+        // `gating::allow_promotion`). Reverse-matching lets a caller that
+        // invokes a tool directly (`kubectl get pods -n foo`) pick up the
+        // matching verb's declared consequence class and trust the same way
+        // an explicit invocation would; the catalog is the transparent,
+        // operator-inspectable/editable record either way. Gated on
+        // `config.gate.is_on()` for the same reason the explicit path is:
+        // without consequence gating there is no routing for a verb's class
+        // to drive, so this stays a no-op and raw commands behave exactly as
+        // before.
+        let matched = {
+            let mut cat = config.verbs.write().await;
+            if let Err(e) = cat.reload_if_stale() {
+                tracing::warn!("verb catalog reload failed, using previous: {}", e);
+            }
+            cat.match_command(&request.binary, &request.args)
+                .map(|r| (r, cat.version()))
+        };
+        if let Some((r, version)) = matched {
+            let trusted = verb_trust_is_current(&r, config.evaluator.verb_promotion_stamp());
+            request.revert = r.revert.map(|(binary, args)| RevertSpec { binary, args });
+            verb_ctx = Some(VerbContext {
+                name: r.name,
+                class: r.consequence,
+                trusted,
+                params: r.params,
+                catalog_version: version,
+            });
         }
     }
 
@@ -3846,6 +3952,16 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
                         tracing::warn!("failed to record learned rule candidate: {}", err);
                     }
                 }
+                maybe_promote_allow_verb(
+                    config,
+                    &request.binary,
+                    &request.args,
+                    &command_line,
+                    risk,
+                    reversibility,
+                    &reason,
+                )
+                .await;
             }
             if matches!(source, crate::evaluate::EvalSource::Llm) {
                 if let Some(notice) = maybe_auto_amend_session_after_llm(
@@ -4126,6 +4242,110 @@ async fn maybe_promote_deny_shape(
             Err(err) => {
                 tracing::warn!("deny-shape promotion failed: {}", err);
             }
+        }
+    });
+}
+
+/// Record one fresh LLM approval against the auto-verb-promotion observation
+/// store (`gating::allow_promotion`), and, once a bucket is ready, spawn a
+/// detached background task that confirms and appends a trusted verb to the
+/// catalog. Mirrors `maybe_promote_deny_shape`'s split between a fast inline
+/// bookkeeping write and a backgrounded LLM round trip, with one difference:
+/// on success this also appends to `config.verbs`, since a promoted verb (an
+/// allow) has to land somewhere the daemon actually consults, unlike a deny
+/// shape, which lives entirely inside the evaluator. There is deliberately no
+/// operator notification anywhere in this path -- see the `gating::allow_promotion`
+/// module docs for why an allow-side auto-promotion is designed to need none:
+/// the promoted-or-not state is fully recoverable from `guard verb list` at
+/// any time, so there is nothing time-sensitive for a human to be paged about.
+#[allow(clippy::too_many_arguments)]
+async fn maybe_promote_allow_verb(
+    config: &ServerConfig,
+    binary: &str,
+    args: &[String],
+    command_line: &str,
+    risk: Option<i32>,
+    reversibility: Option<Reversibility>,
+    reason: &str,
+) {
+    let outcome = match config
+        .evaluator
+        .record_learned_approval_for_promotion(
+            binary,
+            args,
+            command_line,
+            risk,
+            reversibility,
+            reason,
+        )
+        .await
+    {
+        Ok(Some(outcome)) => outcome,
+        Ok(None) => return,
+        Err(err) => {
+            tracing::warn!("failed to record allow-promotion observation: {}", err);
+            return;
+        }
+    };
+    if !outcome.ready_to_synthesize {
+        return;
+    }
+    let evaluator = config.evaluator.clone();
+    let verbs = config.verbs.clone();
+    tokio::spawn(async move {
+        // `Ok(None)` here means "not confident yet" or a transient LLM
+        // failure -- both should keep retrying as more evidence accumulates,
+        // so the bucket is left as-is. Both `Ok(Some(verb))` (whether the
+        // subsequent `append_verb` succeeds or fails) and `Err` are
+        // definitive verdicts for this evidence and mark the bucket resolved
+        // so it never retries the same doomed-to-repeat outcome (an
+        // unbounded silent retry loop, e.g. on a deterministic catalog name
+        // collision, or an unbounded stream of near-duplicate verbs from a
+        // long-lived shape that keeps re-promoting under a fresh model-chosen
+        // name every `min_approvals` multiple).
+        let verb = match evaluator.try_confirm_verb_promotion(&outcome).await {
+            Ok(Some(verb)) => verb,
+            Ok(None) => {
+                tracing::debug!(
+                    "verb promotion for {} {} declined or not confident yet",
+                    outcome.binary,
+                    outcome.subcommand
+                );
+                return;
+            }
+            Err(err) => {
+                tracing::warn!("verb-promotion confirmation failed: {}", err);
+                if let Err(mark_err) = evaluator.mark_allow_promotion_resolved(&outcome).await {
+                    tracing::warn!(
+                        "failed to mark allow-promotion bucket resolved: {}",
+                        mark_err
+                    );
+                }
+                return;
+            }
+        };
+        let mut cat = verbs.write().await;
+        match cat.append_verb(&verb) {
+            Ok(()) => {
+                tracing::info!(
+                    "[AUDIT] VERB_AUTO_PROMOTED name={} binary={} consequence={} approvals={}",
+                    verb.name,
+                    verb.binary,
+                    verb.consequence.as_str(),
+                    outcome.approvals
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "failed to append auto-promoted verb '{}' to the catalog: {}",
+                    verb.name,
+                    err
+                );
+            }
+        }
+        drop(cat);
+        if let Err(err) = evaluator.mark_allow_promotion_resolved(&outcome).await {
+            tracing::warn!("failed to mark allow-promotion bucket resolved: {}", err);
         }
     });
 }
@@ -7200,6 +7420,151 @@ mod tests {
             Some(0),
             "the verb should have actually run"
         );
+    }
+
+    /// A raw command (no explicit `--verb` invocation) that happens to match
+    /// a catalog verb's template picks up the verb's declared class and trust
+    /// the same way an explicit invocation would (`VerbCatalog::match_command`),
+    /// as long as the verb's trust is current (see the next test for the
+    /// stale case). This is what makes a catalog useful for gating a tool a
+    /// caller invokes normally, rather than only via `--verb name`.
+    #[tokio::test]
+    async fn raw_command_reverse_matches_trusted_verb_and_executes_now() {
+        let (mut cfg, _buf) = make_test_config();
+        cfg.gate = GateMode::Consequence;
+        let catalog = VerbCatalog::from_yaml(
+            "verbs:\n  - name: safe-op\n    binary: true\n    consequence: reversible\n    trusted: true\n",
+        )
+        .unwrap();
+        cfg.verbs = Arc::new(RwLock::new(catalog));
+
+        let request = ExecuteRequest {
+            binary: "true".to_string(),
+            args: Vec::new(),
+            auth_token: None,
+            env: HashMap::new(),
+            secrets: HashMap::new(),
+            stream: false,
+            session_token: None,
+            revert: None,
+            confirm_within_secs: None,
+            reevaluate: false,
+            require_approval: None,
+            wait_approval_secs: None,
+            verb: None,
+        };
+
+        let result = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+        let response = result.into_response();
+        assert!(
+            response.allowed,
+            "a raw command matching a trusted verb's template should be allowed"
+        );
+        assert_eq!(
+            response.exit_code,
+            Some(0),
+            "should have executed immediately via the reverse-matched trusted verb"
+        );
+    }
+
+    /// An auto-promoted verb (`gating::allow_promotion`) is trusted only as
+    /// long as its `promotion_stamp` matches the daemon's current model +
+    /// prompt stamp. A stale stamp must downgrade `trusted` to false rather
+    /// than continuing to trust a judgment made under a since-changed
+    /// evaluator -- with the LLM disabled and no static policy in this test
+    /// config, that downgrade is observable as a default-deny instead of an
+    /// immediate execution.
+    #[tokio::test]
+    async fn stale_auto_promoted_verb_is_not_trusted() {
+        let (mut cfg, _buf) = make_test_config();
+        cfg.gate = GateMode::Consequence;
+        let catalog = VerbCatalog::from_yaml(
+            "verbs:\n  - name: auto-op\n    binary: true\n    consequence: reversible\n    \
+             trusted: true\n    auto_promoted: true\n    promotion_stamp: definitely-stale\n",
+        )
+        .unwrap();
+        cfg.verbs = Arc::new(RwLock::new(catalog));
+        assert_ne!(
+            cfg.evaluator.verb_promotion_stamp(),
+            "definitely-stale",
+            "the fixture stamp must not accidentally collide with a real stamp"
+        );
+
+        let request = ExecuteRequest {
+            binary: "true".to_string(),
+            args: Vec::new(),
+            auth_token: None,
+            env: HashMap::new(),
+            secrets: HashMap::new(),
+            stream: false,
+            session_token: None,
+            revert: None,
+            confirm_within_secs: None,
+            reevaluate: false,
+            require_approval: None,
+            wait_approval_secs: None,
+            verb: None,
+        };
+
+        let result = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+        let response = result.into_response();
+        assert!(
+            !response.allowed,
+            "a stale auto-promoted verb must not skip the LLM (denied here since the test \
+             evaluator has the LLM disabled and no static policy): got {:?}",
+            response
+        );
+    }
+
+    /// `guard verb list` must not misrepresent a stale auto-promoted verb as
+    /// still trusted: its reported `trusted` field has to reflect the same
+    /// staleness check `execute_command_inner` applies, not the catalog's raw
+    /// `Verb.trusted` flag, or an operator reading the list would believe a
+    /// promotion is still fast-pathing when the daemon has actually stopped
+    /// honoring it. A current (non-stale, or non-auto-promoted) verb must
+    /// still report trusted, and `auto_promoted`/`evidence` must come through.
+    #[tokio::test]
+    async fn verb_list_reports_staleness_corrected_trust_and_provenance() {
+        let (mut cfg, _buf) = make_test_config();
+        let current_stamp = cfg.evaluator.verb_promotion_stamp().to_string();
+        let catalog = VerbCatalog::from_yaml(&format!(
+            "verbs:\n\
+             - name: fresh-auto\n  binary: true\n  consequence: reversible\n  trusted: true\n  \
+             auto_promoted: true\n  promotion_stamp: {current_stamp}\n  evidence: fresh\n\
+             - name: stale-auto\n  binary: true\n  consequence: reversible\n  trusted: true\n  \
+             auto_promoted: true\n  promotion_stamp: definitely-stale\n  evidence: stale\n\
+             - name: hand-authored\n  binary: true\n  consequence: reversible\n  trusted: true\n"
+        ))
+        .unwrap();
+        cfg.verbs = Arc::new(RwLock::new(catalog));
+
+        let response = handle_admin_request(
+            &cfg,
+            &CallerIdentity::Unix { uid: 1000 },
+            AdminRequest::VerbList,
+        )
+        .await;
+        let AdminResponse::Verbs { items } = response else {
+            panic!("expected Verbs response, got {response:?}");
+        };
+        let by_name = |name: &str| items.iter().find(|v| v.name == name).unwrap();
+
+        let fresh = by_name("fresh-auto");
+        assert!(fresh.trusted, "a current auto-promoted verb stays trusted");
+        assert!(fresh.auto_promoted);
+        assert_eq!(fresh.evidence.as_deref(), Some("fresh"));
+
+        let stale = by_name("stale-auto");
+        assert!(
+            !stale.trusted,
+            "a stale auto-promoted verb must be reported as untrusted, not just downgraded \
+             silently at execution time"
+        );
+        assert!(stale.auto_promoted);
+
+        let hand = by_name("hand-authored");
+        assert!(hand.trusted, "a hand-authored verb has no staleness expiry");
+        assert!(!hand.auto_promoted);
     }
 
     fn capture<F: FnOnce()>(buf: &SharedBuf, f: F) -> String {

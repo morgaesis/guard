@@ -145,6 +145,82 @@ see whether it's active and how many shapes it has learned; disable with
 disk -- delete or edit `learned-deny.yaml` for that). A caller can force a
 fresh LLM look past a specific auto-learned deny with `guard run --reevaluate`.
 
+## Auto-verb-promotion
+
+Auto-verb-promotion (`--learn-allow`, on by default, requires `--gate
+consequence`) writes a bookkeeping state file, `learned-allow.yaml`, alongside
+the other state files above, and -- once a repeated shape qualifies --
+appends an actual verb to the catalog (`--verbs`; a default `verbs.yaml` is
+created in the state directory if `--verbs` was not given). Unlike learned-rule
+candidate detection, this needs no operator step at all: most real deployments
+are unattended, so a design that depends on an operator reading a notice and
+running `guard verb create` does not fire in practice. It is deliberately far
+more conservative than an operator-driven verb, on several axes explained in
+`gating::allow_promotion`'s module docs -- in short, every parameter's allowed
+values are pinned to the exact, regex-escaped values actually observed (never
+a model-authored pattern), an irreversible shape is never eligible, and a
+recoverable shape is promoted only with a validated revert. A promoted verb is
+stamped to the model + prompts that justified it, so a model or prompt change
+silently stops trusting verbs promoted under the old judgment rather than
+carrying that trust forward.
+
+Check `guard status` for `learn_allow enabled=... observations=N` (the
+observation count, not the number of verbs promoted). `guard verb list` is the
+actual, human-readable record of what has been auto-promoted -- entries carry
+`auto_promoted: true` and the evidence that justified them, and the reported
+`trusted` state already accounts for a stale promotion (see above), so a verb
+the daemon has silently stopped honoring shows as untrusted here too. `guard
+verb list` is also the revocation mechanism: edit or delete an entry in the
+verb catalog file like any other verb. Disable with `--no-learn-allow` /
+`GUARD_LEARN_ALLOW=false` if you want to fully opt out (this stops new
+promotions; it does not retroactively remove verbs already in the catalog).
+Distributing or synchronizing a verb catalog across a multi-host deployment is
+an operator concern; each daemon promotes independently into its own
+`--verbs` file.
+
+**Upgrading an existing deployment.** `--learn-allow` is on by default, same
+as `--learn-deny`, but unlike deny-shape learning it needs `--gate consequence`
+to do anything at all (with gating off there is no reversibility
+classification to key eligibility on, so the store stays inert). If you
+already run `--gate consequence` without `--verbs`, upgrading in place will,
+for the first time, create a live verb catalog under the default state
+directory and start populating it with `trusted: true` verbs from ordinary
+traffic — a real change in what "no `--verbs` flag" means for that
+deployment. If you'd rather opt in deliberately, either add `--no-learn-allow`
+or configure `--verbs` explicitly and review `guard verb list` periodically.
+
+**Pin state paths explicitly under a hardened systemd unit.** The default
+paths for `--verbs`, `--learn-allow-state`, `--deny-shapes`, and
+`--learned-rules` all resolve through the same XDG state-dir lookup as
+`--state-db`'s default (`dirs::state_dir()`, typically `$HOME/.local/state`)
+-- but the packaged unit (`deployment/systemd/guard.service`) only pins
+`--state-db` explicitly, to `/var/lib/guard/state.db`. Left unpinned, the
+other files land under `/var/lib/guard/.local/state/guard/` -- covered by
+`ReadWritePaths=/var/lib/guard` and so not a startup failure, but a nested,
+non-obvious location an operator inspecting `/var/lib/guard/` won't find. If
+you enable `--gate consequence` on the packaged unit, also pass `--verbs
+/var/lib/guard/verbs.yaml` (after seeding it: `echo 'verbs: []' >
+/var/lib/guard/verbs.yaml`, since an explicitly-named `--verbs` path must
+already exist) to keep the catalog in the conventional location; the
+bookkeeping files (`--learn-allow-state`, `--deny-shapes`, `--learned-rules`)
+tolerate a missing path and can be pinned the same way without a seed step.
+
+**Auto-promotion rewrites your whole catalog file on every append.** Appending
+a verb (auto-promoted or via `guard verb create`) re-serializes the entire
+`--verbs` YAML document rather than appending a line, so a hand-authored
+catalog under version control will show its whole file reformatted/reordered
+-- not just one new entry -- the first time a promotion lands, and any
+inline comments are not preserved across that rewrite.
+
+**Promotion failures are log-only.** A promotion attempt that the model
+declines, or that fails validation, or that fails to append (e.g. a verb-name
+collision with an existing catalog entry) is visible only via
+`tracing::warn!`/`tracing::debug!` log lines (`grep -i "verb-promotion\|verb
+auto_promoted" ` your journal), not in `guard status` or `guard verb list`.
+A definitive failure (validation or append) permanently stops retrying that
+shape; check the logs if a shape you expected to see promoted never appears
+in `guard verb list`.
+
 ## Files
 
 Example systemd files:

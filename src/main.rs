@@ -654,6 +654,40 @@ enum ServerCommands {
         #[arg(long, value_name = "N")]
         learn_deny_min_denials: Option<u32>,
 
+        /// Auto-promote trusted verbs from repeated low-risk LLM approvals
+        /// (requires --gate consequence: promotion is keyed on the
+        /// reversibility class the gate produces). On by default. Unlike
+        /// --learn-rules, this needs no operator step: a qualifying shape is
+        /// appended straight to the verb catalog as `trusted`, restricted to
+        /// reversible/recoverable-with-a-validated-revert shapes -- an
+        /// irreversible command is never eligible, since it always holds for
+        /// operator approval regardless of `trusted`. See
+        /// `gating::allow_promotion` for the full safety rationale.
+        /// Env: GUARD_LEARN_ALLOW.
+        #[arg(
+            long,
+            action = ArgAction::Set,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            value_name = "BOOL",
+            overrides_with = "no_learn_allow"
+        )]
+        learn_allow: Option<bool>,
+
+        /// Disable auto-promotion of trusted verbs.
+        #[arg(long = "no-learn-allow", action = ArgAction::SetTrue, overrides_with = "learn_allow")]
+        no_learn_allow: bool,
+
+        /// Path to the auto-verb-promotion observation state YAML (bookkeeping
+        /// only; promoted verbs themselves land in --verbs). Env: GUARD_LEARN_ALLOW_STATE.
+        #[arg(long, value_name = "PATH")]
+        learn_allow_state: Option<PathBuf>,
+
+        /// LLM approvals of the same shape required before attempting to
+        /// promote a trusted verb. Env: GUARD_LEARN_ALLOW_MIN_APPROVALS.
+        #[arg(long, value_name = "N")]
+        learn_allow_min_approvals: Option<u32>,
+
         /// Evaluate policy but do not execute approved commands.
         /// Env: GUARD_DRY_RUN.
         #[arg(long = "dry-run", action = ArgAction::SetTrue)]
@@ -1095,6 +1129,20 @@ fn default_deny_shapes_path() -> Option<PathBuf> {
     default_guard_state_dir().map(|dir| dir.join("learned-deny.yaml"))
 }
 
+fn default_allow_promotion_state_path() -> Option<PathBuf> {
+    default_guard_state_dir().map(|dir| dir.join("learned-allow.yaml"))
+}
+
+/// Default verb catalog path used only when `--verbs` was not given but
+/// auto-promotion is enabled and needs somewhere to persist a promoted verb.
+/// Unlike `--verbs`, a missing file at this path is not an error (see the
+/// call site): auto-promotion should work out of the box on a fresh host,
+/// the same way `--learn-deny` and `--learn-rules` do not require the
+/// operator to hand-create a state file first.
+fn default_verbs_path() -> Option<PathBuf> {
+    default_guard_state_dir().map(|dir| dir.join("verbs.yaml"))
+}
+
 fn default_guard_state_dir() -> Option<PathBuf> {
     if let Some(dir) = dirs::state_dir() {
         return Some(dir.join("guard"));
@@ -1157,6 +1205,10 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             no_learn_deny,
             deny_shapes,
             learn_deny_min_denials,
+            learn_allow,
+            no_learn_allow,
+            learn_allow_state,
+            learn_allow_min_approvals,
             dry_run,
             state_db,
             exec_as_caller,
@@ -1533,6 +1585,48 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 eval_config = eval_config.deny_shapes(Arc::new(RwLock::new(store)));
             }
 
+            let allow_promotion_enabled = if no_learn_allow {
+                false
+            } else {
+                learn_allow
+                    .or_else(|| guard_env("LEARN_ALLOW").map(|v| parse_env_bool(&v)))
+                    .unwrap_or(true)
+            };
+            if allow_promotion_enabled {
+                let learn_allow_state_path = learn_allow_state
+                    .or_else(|| {
+                        guard_env("LEARN_ALLOW_STATE")
+                            .filter(|value| !value.is_empty())
+                            .map(PathBuf::from)
+                    })
+                    .or_else(default_allow_promotion_state_path)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("could not determine allow-promotion state path")
+                    })?;
+                let mut allow_config = guard::gating::allow_promotion::AllowPromotionConfig::new(
+                    learn_allow_state_path.clone(),
+                );
+                allow_config.min_approvals = learn_allow_min_approvals
+                    .or_else(|| {
+                        guard_env("LEARN_ALLOW_MIN_APPROVALS").and_then(|v| v.parse::<u32>().ok())
+                    })
+                    .unwrap_or(allow_config.min_approvals)
+                    .max(2);
+                let store = guard::gating::allow_promotion::AllowPromotionStore::load(allow_config)
+                    .with_context(|| {
+                        format!(
+                            "failed to load allow-promotion state from {}",
+                            learn_allow_state_path.display()
+                        )
+                    })?;
+                tracing::info!(
+                    "Auto-verb-promotion enabled: path={} min_approvals={}",
+                    store.path().display(),
+                    store.min_approvals()
+                );
+                eval_config = eval_config.allow_promotion(Arc::new(RwLock::new(store)));
+            }
+
             // Additive prompt: append to base prompt without replacing it.
             // Priority: --system-prompt-append flag > GUARD_PROMPT_APPEND env var
             let append_path = system_prompt_append.or_else(|| {
@@ -1694,11 +1788,66 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             );
             srv.set_gate(gate_mode);
 
-            let verbs_path = verbs.or_else(|| {
+            let explicit_verbs_path = verbs.or_else(|| {
                 guard_env("VERBS")
                     .filter(|v| !v.is_empty())
                     .map(PathBuf::from)
             });
+            // An explicitly-given --verbs/GUARD_VERBS path must already exist:
+            // an operator naming a path is trusted to have created it, and a
+            // typo should fail loudly rather than silently start with zero
+            // verbs. Auto-promotion falling back to its own default path is
+            // different -- it should work out of the box on a fresh host, the
+            // same way --learn-deny does not require a pre-created state
+            // file, so that path is created empty if missing. Gated on
+            // `gate_mode.is_on()` too (not just `allow_promotion_enabled`,
+            // which defaults to true independent of gating): promotion is
+            // inert without consequence gating (see `AllowPromotionStore::
+            // record_approval`), so there is no reason to create a live,
+            // trust-bearing catalog file a daemon running without --gate
+            // could never populate.
+            let verbs_path = match explicit_verbs_path {
+                Some(path) => Some(path),
+                None if allow_promotion_enabled && gate_mode.is_on() => {
+                    let path = default_verbs_path()
+                        .ok_or_else(|| anyhow::anyhow!("could not determine default verbs path"))?;
+                    if !path.exists() {
+                        if let Some(parent) = path.parent() {
+                            std::fs::create_dir_all(parent).with_context(|| {
+                                format!("failed to create {}", parent.display())
+                            })?;
+                        }
+                        std::fs::write(&path, "verbs: []\n")
+                            .with_context(|| format!("failed to create {}", path.display()))?;
+                        // This file grants real, permanent LLM-bypassing
+                        // trust once auto-promotion populates it -- harden
+                        // its permissions explicitly rather than relying on
+                        // process umask, since it is now created
+                        // automatically rather than only when an operator
+                        // deliberately opted in via --verbs.
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            if let Err(e) = std::fs::set_permissions(
+                                &path,
+                                std::fs::Permissions::from_mode(0o600),
+                            ) {
+                                tracing::warn!(
+                                    "failed to set restrictive permissions on {}: {}",
+                                    path.display(),
+                                    e
+                                );
+                            }
+                        }
+                        tracing::info!(
+                            "Created empty verb catalog at {} for auto-verb-promotion",
+                            path.display()
+                        );
+                    }
+                    Some(path)
+                }
+                None => None,
+            };
             if let Some(path) = verbs_path {
                 let catalog = guard::gating::verb::VerbCatalog::load(&path)
                     .with_context(|| format!("failed to load verb catalog {}", path.display()))?;
@@ -2201,15 +2350,23 @@ async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                     }
                     for v in &items {
                         println!(
-                            "{} [{}]{}{} — {}",
+                            "{} [{}]{}{}{} — {}",
                             v.name,
                             v.consequence,
                             if v.trusted { " trusted" } else { "" },
                             if v.has_revert { " revertable" } else { "" },
+                            if v.auto_promoted {
+                                " auto_promoted"
+                            } else {
+                                ""
+                            },
                             v.description
                         );
                         for (p, pattern) in &v.params {
                             println!("    --param {}=<{}>", p, pattern);
+                        }
+                        if let Some(evidence) = &v.evidence {
+                            println!("    evidence: {}", evidence);
                         }
                     }
                     Ok(())
@@ -2613,6 +2770,10 @@ async fn handle_status(socket: Option<String>) -> Result<()> {
             println!(
                 "  learn_deny     enabled={} shapes={}",
                 status.deny_learning_enabled, status.deny_shape_count
+            );
+            println!(
+                "  learn_allow    enabled={} observations={}",
+                status.allow_promotion_enabled, status.allow_promotion_observation_count
             );
             println!("  sessions       {}", status.session_count);
             println!("  daemon_uid     {}", status.daemon_uid);
@@ -3517,6 +3678,10 @@ mod tests {
                 no_learn_deny,
                 deny_shapes,
                 learn_deny_min_denials,
+                learn_allow,
+                no_learn_allow,
+                learn_allow_state,
+                learn_allow_min_approvals,
                 dry_run,
                 state_db,
                 exec_as_caller,
@@ -3563,6 +3728,10 @@ mod tests {
                 no_learn_deny,
                 deny_shapes,
                 learn_deny_min_denials,
+                learn_allow,
+                no_learn_allow,
+                learn_allow_state,
+                learn_allow_min_approvals,
                 dry_run,
                 state_db,
                 exec_as_caller,
@@ -3665,6 +3834,74 @@ mod tests {
             panic!("expected start");
         };
         assert_eq!(learn_deny_min_denials, Some(5));
+    }
+
+    fn resolved_learn_allow(args: &[&str]) -> bool {
+        let ServerCommands::Start {
+            learn_allow,
+            no_learn_allow,
+            ..
+        } = parse_start(args)
+        else {
+            panic!("expected start");
+        };
+        resolve_bool_flag(learn_allow, no_learn_allow, true)
+    }
+
+    #[test]
+    fn test_server_start_learn_allow_defaults_true() {
+        assert!(resolved_learn_allow(&["guard", "server", "start"]));
+    }
+
+    #[test]
+    fn test_server_start_learn_allow_can_be_disabled() {
+        assert!(!resolved_learn_allow(&[
+            "guard",
+            "server",
+            "start",
+            "--no-learn-allow"
+        ]));
+        assert!(!resolved_learn_allow(&[
+            "guard",
+            "server",
+            "start",
+            "--learn-allow=false"
+        ]));
+    }
+
+    #[test]
+    fn test_server_start_learn_allow_min_approvals_flag() {
+        let ServerCommands::Start {
+            learn_allow_min_approvals,
+            ..
+        } = parse_start(&[
+            "guard",
+            "server",
+            "start",
+            "--learn-allow-min-approvals",
+            "7",
+        ])
+        else {
+            panic!("expected start");
+        };
+        assert_eq!(learn_allow_min_approvals, Some(7));
+    }
+
+    #[test]
+    fn test_server_start_learn_allow_state_flag() {
+        let ServerCommands::Start {
+            learn_allow_state, ..
+        } = parse_start(&[
+            "guard",
+            "server",
+            "start",
+            "--learn-allow-state",
+            "/tmp/allow.yaml",
+        ])
+        else {
+            panic!("expected start");
+        };
+        assert_eq!(learn_allow_state, Some(PathBuf::from("/tmp/allow.yaml")));
     }
 
     #[test]
