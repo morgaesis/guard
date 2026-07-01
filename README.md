@@ -290,6 +290,9 @@ Guard walks up from your current directory to `/` looking for `.env` files (clos
 | `GUARD_LEARN_MIN_APPROVALS` | `2` | Approvals required before promotion. |
 | `GUARD_LEARN_MAX_RISK` | `2` | Highest LLM risk score eligible for promotion. |
 | `GUARD_LEARN_SHIMS` | `suggest` | `off`, `suggest`, or `create` service shims for learned SSH/API wrappers. |
+| `GUARD_LEARN_DENY` | `true` | Auto-learn deny shapes from repeated LLM denials and fast-reject matching commands without another LLM call. On by default -- unlike `GUARD_LEARN_RULES`, this never grants anything, so it needs no operator promotion step. |
+| `GUARD_DENY_SHAPES` | `<state dir>/learned-deny.yaml` | Path to the auto-learned deny-shape state YAML. |
+| `GUARD_LEARN_DENY_MIN_DENIALS` | `3` | LLM denials of the same shape required before attempting to synthesize an auto-learned deny fast path. |
 | `GUARD_PROMPT_APPEND` | (none) | Path to additive prompt file (appended to base prompt) |
 | `GUARD_GPG_RECIPIENT` | (none) | GPG recipient for the `local` secret backend |
 | `GUARD_BACKEND` | (auto) | Secret backend: `pass`, `env`, `local`, `vault`, or `infisical`. Auto prefers `pass`; otherwise it falls back to non-persistent `env` and logs a warning. `vault` uses `VAULT_ADDR` with `VAULT_TOKEN` or `VAULT_ROLE_ID`+`VAULT_SECRET_ID` (KV v2, mount `VAULT_KV_MOUNT`, default `secret`); `infisical` uses `INFISICAL_CLIENT_ID`/`INFISICAL_CLIENT_SECRET`/`INFISICAL_PROJECT_ID` (Universal Auth, env `INFISICAL_ENVIRONMENT`). |

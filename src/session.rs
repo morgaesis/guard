@@ -154,6 +154,10 @@ pub enum SessionDecisionSource {
     Llm,
     Cache,
     StaticPolicy,
+    /// A deny fast path the daemon synthesized itself from repeated LLM
+    /// denials of this shape (`gating::deny_shape`). Kept distinct from
+    /// `StaticPolicy` (operator-authored) for audit clarity.
+    LearnedDeny,
     Validation,
     EvaluatorError,
 }
@@ -167,6 +171,7 @@ impl SessionDecisionSource {
             Self::Llm => "llm",
             Self::Cache => "cache",
             Self::StaticPolicy => "static_policy",
+            Self::LearnedDeny => "learned_deny",
             Self::Validation => "validation",
             Self::EvaluatorError => "evaluator_error",
         }

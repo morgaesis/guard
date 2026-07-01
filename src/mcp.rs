@@ -109,6 +109,12 @@ struct GuardToolArgs {
     /// Invoke a catalog verb instead of a raw binary.
     #[serde(default)]
     verb: Option<GuardVerbArgs>,
+    /// Skip the daemon's auto-learned deny-shape fast path and force a fresh
+    /// LLM look at this one command. Never skips an operator-authored policy
+    /// deny rule. Use this if an auto-learned shape over-blocked something
+    /// that should be allowed.
+    #[serde(default)]
+    reevaluate: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -217,12 +223,14 @@ impl GuardExecutor for ClientExecutor {
             None => None,
         };
 
-        let mut client = server::Client::new(self.socket_path.clone(), self.tcp_port).with_gating(
-            revert,
-            args.confirm_within,
-            args.require_approval,
-            args.wait_approval,
-        );
+        let mut client = server::Client::new(self.socket_path.clone(), self.tcp_port)
+            .with_gating(
+                revert,
+                args.confirm_within,
+                args.require_approval,
+                args.wait_approval,
+            )
+            .with_reevaluate(args.reevaluate);
         if let Some(token) = &self.auth_token {
             client = client.with_auth(token.clone());
         }
@@ -823,6 +831,10 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                             "waitApproval": {
                                 "type": "integer",
                                 "description": "Optional: block up to N seconds for an operator decision on a held command and return the real result inline."
+                            },
+                            "reevaluate": {
+                                "type": "boolean",
+                                "description": "Optional: skip the daemon's auto-learned deny-shape fast path and force a fresh policy look at this one command. Never skips an operator-authored deny rule. Use this if you believe an auto-learned shape over-blocked something that should be allowed."
                             }
                         },
                         "required": ["binary", "args"]

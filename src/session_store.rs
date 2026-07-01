@@ -587,6 +587,7 @@ fn encode_decision_source(source: SessionDecisionSource) -> &'static str {
         SessionDecisionSource::Llm => "llm",
         SessionDecisionSource::Cache => "cache",
         SessionDecisionSource::StaticPolicy => "static_policy",
+        SessionDecisionSource::LearnedDeny => "learned_deny",
         SessionDecisionSource::Validation => "validation",
         SessionDecisionSource::EvaluatorError => "evaluator_error",
     }
@@ -600,6 +601,7 @@ fn decode_decision_source(value: &str) -> rusqlite::Result<SessionDecisionSource
         "llm" => Ok(SessionDecisionSource::Llm),
         "cache" => Ok(SessionDecisionSource::Cache),
         "static_policy" => Ok(SessionDecisionSource::StaticPolicy),
+        "learned_deny" => Ok(SessionDecisionSource::LearnedDeny),
         "validation" => Ok(SessionDecisionSource::Validation),
         "evaluator_error" => Ok(SessionDecisionSource::EvaluatorError),
         other => Err(rusqlite::Error::FromSqlConversionFailure(

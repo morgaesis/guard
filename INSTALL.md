@@ -105,5 +105,7 @@ Key variables:
 - `GUARD_ADMIN_TOKEN` -- Separate token for TCP admin RPCs such as `guard grant`
 - `GUARD_LEARN_RULES` -- Learn static allows from repeated low-risk approvals
 - `GUARD_LEARN_SHIMS` -- `off`, `suggest`, or `create` shorter service shims for promoted rules
+- `GUARD_LEARN_DENY` -- Auto-learn deny shapes from repeated LLM denials (default: `true`; never grants anything, so no operator promotion step is needed)
+- `GUARD_LEARN_DENY_MIN_DENIALS` -- Denials of the same shape required before synthesizing an auto-learned deny fast path (default: `3`)
 
 For long-running service deployment, see [DEPLOYMENT.md](DEPLOYMENT.md).

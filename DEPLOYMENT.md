@@ -131,6 +131,20 @@ directory, and child-command execution. Apply it alongside the systemd
 hardening directives below; it is a complementary, OS-level layer, not a
 replacement for `NoNewPrivileges`/`User=guard`/`--users`.
 
+## Auto-learned deny shapes
+
+Auto-learned deny shapes (`--learn-deny`, on by default) write a state file,
+`learned-deny.yaml`, alongside `learned-rules.yaml` and `state.db` in the
+daemon's state directory. It's a deny-only fast path the daemon populates
+itself from repeated LLM denials -- it never grants a bypass, so it needs no
+operator review step, and upgrading an existing deployment enables it
+automatically. Check `guard status` for `learn_deny enabled=... shapes=N` to
+see whether it's active and how many shapes it has learned; disable with
+`--no-learn-deny` / `GUARD_LEARN_DENY=false` if you want to fully opt out
+(this stops new learning; it does not retroactively remove shapes already on
+disk -- delete or edit `learned-deny.yaml` for that). A caller can force a
+fresh LLM look past a specific auto-learned deny with `guard run --reevaluate`.
+
 ## Files
 
 Example systemd files:

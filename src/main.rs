@@ -67,6 +67,13 @@ enum MainArgs {
         /// return the real result inline. Bare flag waits the full approval TTL.
         #[arg(long = "wait-approval", value_name = "SECONDS", num_args = 0..=1, default_missing_value = "3600")]
         wait_approval: Option<u64>,
+        /// Skip the daemon's auto-learned deny-shape fast path and force a
+        /// fresh LLM look at this command. Never skips an operator-authored
+        /// policy deny rule -- those stay absolute either way. Use this if
+        /// you believe an auto-learned shape over-blocked something that
+        /// should be allowed.
+        #[arg(long = "reevaluate", action = ArgAction::SetTrue)]
+        reevaluate: bool,
         /// Binary to execute
         binary: String,
         /// Arguments to pass to the binary
@@ -617,6 +624,36 @@ enum ServerCommands {
         #[arg(long, value_name = "MODE")]
         learn_shims: Option<String>,
 
+        /// Auto-learn deny shapes from repeated LLM denials and fast-reject
+        /// matching commands without another LLM call. On by default: unlike
+        /// learned-rule allow candidates, this never grants anything -- it can
+        /// only accelerate a "no" the LLM already gave, so it needs no
+        /// operator promotion step. A client can force a fresh LLM look past
+        /// it with `--reevaluate` on `guard run`. Env: GUARD_LEARN_DENY.
+        #[arg(
+            long,
+            action = ArgAction::Set,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            value_name = "BOOL",
+            overrides_with = "no_learn_deny"
+        )]
+        learn_deny: Option<bool>,
+
+        /// Disable auto-learned deny shapes.
+        #[arg(long = "no-learn-deny", action = ArgAction::SetTrue, overrides_with = "learn_deny")]
+        no_learn_deny: bool,
+
+        /// Path to the auto-learned deny-shape state YAML.
+        /// Env: GUARD_DENY_SHAPES.
+        #[arg(long, value_name = "PATH")]
+        deny_shapes: Option<PathBuf>,
+
+        /// LLM denials of the same shape required before attempting to
+        /// synthesize an auto-learned deny fast path. Env: GUARD_LEARN_DENY_MIN_DENIALS.
+        #[arg(long, value_name = "N")]
+        learn_deny_min_denials: Option<u32>,
+
         /// Evaluate policy but do not execute approved commands.
         /// Env: GUARD_DRY_RUN.
         #[arg(long = "dry-run", action = ArgAction::SetTrue)]
@@ -880,7 +917,11 @@ async fn main() -> Result<()> {
     // that `guard --version` stays concise and does not require parsing
     // subcommands.
     if top_level_version_requested(&args) {
-        println!("guard v{} ({})", env!("CARGO_PKG_VERSION"), env!("GUARD_GIT_COMMIT"));
+        println!(
+            "guard v{} ({})",
+            env!("CARGO_PKG_VERSION"),
+            env!("GUARD_GIT_COMMIT")
+        );
         return Ok(());
     }
     if run_help_requested(&args) {
@@ -897,6 +938,7 @@ async fn main() -> Result<()> {
             confirm_within,
             require_approval,
             wait_approval,
+            reevaluate,
             binary,
             args,
         }) => {
@@ -907,6 +949,7 @@ async fn main() -> Result<()> {
                 confirm_within,
                 require_approval,
                 wait_approval,
+                reevaluate,
             };
             run_exec(binary, args, env_vars, secret_vars, gating).await
         }
@@ -1048,6 +1091,10 @@ fn default_learned_rules_path() -> Option<PathBuf> {
     default_guard_state_dir().map(|dir| dir.join("learned-rules.yaml"))
 }
 
+fn default_deny_shapes_path() -> Option<PathBuf> {
+    default_guard_state_dir().map(|dir| dir.join("learned-deny.yaml"))
+}
+
 fn default_guard_state_dir() -> Option<PathBuf> {
     if let Some(dir) = dirs::state_dir() {
         return Some(dir.join("guard"));
@@ -1106,6 +1153,10 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             learn_min_approvals,
             learn_max_risk,
             learn_shims,
+            learn_deny,
+            no_learn_deny,
+            deny_shapes,
+            learn_deny_min_denials,
             dry_run,
             state_db,
             exec_as_caller,
@@ -1441,6 +1492,45 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                     store.auto_shim().as_str()
                 );
                 eval_config = eval_config.learned_rules(Arc::new(RwLock::new(store)));
+            }
+
+            let deny_learning_enabled = if no_learn_deny {
+                false
+            } else {
+                learn_deny
+                    .or_else(|| guard_env("LEARN_DENY").map(|v| parse_env_bool(&v)))
+                    .unwrap_or(true)
+            };
+            if deny_learning_enabled {
+                let deny_shapes_path = deny_shapes
+                    .or_else(|| {
+                        guard_env("DENY_SHAPES")
+                            .filter(|value| !value.is_empty())
+                            .map(PathBuf::from)
+                    })
+                    .or_else(default_deny_shapes_path)
+                    .ok_or_else(|| anyhow::anyhow!("could not determine deny-shapes path"))?;
+                let mut deny_config =
+                    guard::gating::deny_shape::DenyLearningConfig::new(deny_shapes_path.clone());
+                deny_config.min_denials = learn_deny_min_denials
+                    .or_else(|| {
+                        guard_env("LEARN_DENY_MIN_DENIALS").and_then(|v| v.parse::<u32>().ok())
+                    })
+                    .unwrap_or(deny_config.min_denials)
+                    .max(1);
+                let store = guard::gating::deny_shape::DenyShapeStore::load(deny_config)
+                    .with_context(|| {
+                        format!(
+                            "failed to load deny shapes from {}",
+                            deny_shapes_path.display()
+                        )
+                    })?;
+                tracing::info!(
+                    "Auto-learned deny shapes enabled: path={} min_denials={}",
+                    store.path().display(),
+                    store.min_denials()
+                );
+                eval_config = eval_config.deny_shapes(Arc::new(RwLock::new(store)));
             }
 
             // Additive prompt: append to base prompt without replacing it.
@@ -1810,6 +1900,7 @@ struct GatingOptions {
     confirm_within: Option<u64>,
     require_approval: bool,
     wait_approval: Option<u64>,
+    reevaluate: bool,
 }
 
 /// Parse a `--revert "binary arg1 arg2"` string into a structured RevertSpec
@@ -1854,12 +1945,14 @@ async fn run_exec(
         None => None,
     };
 
-    let mut client = server::Client::new(socket_path, tcp_port).with_gating(
-        revert,
-        gating.confirm_within,
-        gating.require_approval,
-        gating.wait_approval,
-    );
+    let mut client = server::Client::new(socket_path, tcp_port)
+        .with_gating(
+            revert,
+            gating.confirm_within,
+            gating.require_approval,
+            gating.wait_approval,
+        )
+        .with_reevaluate(gating.reevaluate);
     if let Some(token) = config.auth_token {
         client = client.with_auth(token);
     }
@@ -2516,6 +2609,10 @@ async fn handle_status(socket: Option<String>) -> Result<()> {
             println!(
                 "  learning       enabled={} candidates={}",
                 status.learning_enabled, status.learned_rule_count
+            );
+            println!(
+                "  learn_deny     enabled={} shapes={}",
+                status.deny_learning_enabled, status.deny_shape_count
             );
             println!("  sessions       {}", status.session_count);
             println!("  daemon_uid     {}", status.daemon_uid);
@@ -3416,6 +3513,10 @@ mod tests {
                 learn_min_approvals,
                 learn_max_risk,
                 learn_shims,
+                learn_deny,
+                no_learn_deny,
+                deny_shapes,
+                learn_deny_min_denials,
                 dry_run,
                 state_db,
                 exec_as_caller,
@@ -3458,6 +3559,10 @@ mod tests {
                 learn_min_approvals,
                 learn_max_risk,
                 learn_shims,
+                learn_deny,
+                no_learn_deny,
+                deny_shapes,
+                learn_deny_min_denials,
                 dry_run,
                 state_db,
                 exec_as_caller,
@@ -3515,6 +3620,65 @@ mod tests {
             panic!("expected start");
         };
         assert_eq!(llm_retries, Some(1));
+    }
+
+    fn resolved_learn_deny(args: &[&str]) -> bool {
+        let ServerCommands::Start {
+            learn_deny,
+            no_learn_deny,
+            ..
+        } = parse_start(args)
+        else {
+            panic!("expected start");
+        };
+        resolve_bool_flag(learn_deny, no_learn_deny, true)
+    }
+
+    #[test]
+    fn test_server_start_learn_deny_defaults_true() {
+        assert!(resolved_learn_deny(&["guard", "server", "start"]));
+    }
+
+    #[test]
+    fn test_server_start_learn_deny_can_be_disabled() {
+        assert!(!resolved_learn_deny(&[
+            "guard",
+            "server",
+            "start",
+            "--no-learn-deny"
+        ]));
+        assert!(!resolved_learn_deny(&[
+            "guard",
+            "server",
+            "start",
+            "--learn-deny=false"
+        ]));
+    }
+
+    #[test]
+    fn test_server_start_learn_deny_min_denials_flag() {
+        let ServerCommands::Start {
+            learn_deny_min_denials,
+            ..
+        } = parse_start(&["guard", "server", "start", "--learn-deny-min-denials", "5"])
+        else {
+            panic!("expected start");
+        };
+        assert_eq!(learn_deny_min_denials, Some(5));
+    }
+
+    #[test]
+    fn test_run_reevaluate_flag() {
+        match MainArgs::try_parse_from(["guard", "run", "--reevaluate", "kubectl", "get", "pods"]) {
+            Ok(MainArgs::Run { reevaluate, .. }) => assert!(reevaluate),
+            Ok(_) => panic!("expected Run variant"),
+            Err(e) => panic!("parser rejected --reevaluate: {}", e),
+        }
+        match MainArgs::try_parse_from(["guard", "run", "kubectl", "get", "pods"]) {
+            Ok(MainArgs::Run { reevaluate, .. }) => assert!(!reevaluate),
+            Ok(_) => panic!("expected Run variant"),
+            Err(e) => panic!("parser rejected plain run: {}", e),
+        }
     }
 
     #[test]

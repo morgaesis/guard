@@ -219,6 +219,12 @@ pub struct ExecuteRequest {
     /// the verb's declared consequence class for gating.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verb: Option<VerbInvocation>,
+    /// Skip the auto-learned deny-shape fast path (`gating::deny_shape`) and
+    /// force a fresh LLM call for this one request. Never skips an
+    /// operator-authored `PolicyEngine` deny rule -- those stay absolute.
+    /// Safe for any caller: its only effect is "ask the LLM again."
+    #[serde(default)]
+    pub reevaluate: bool,
 }
 
 /// A structured rollback command (no shell). Each arg is a single argv element.
@@ -609,6 +615,14 @@ pub struct ServerStatus {
     pub learning_enabled: bool,
     #[serde(default)]
     pub learned_rule_count: usize,
+    /// Whether auto-learned deny-shape detection is active (see
+    /// `gating::deny_shape`; on by default, `--no-learn-deny` to disable).
+    #[serde(default)]
+    pub deny_learning_enabled: bool,
+    /// Number of auto-learned deny shapes currently active as a pre-LLM fast
+    /// path.
+    #[serde(default)]
+    pub deny_shape_count: usize,
     pub session_count: usize,
     pub daemon_uid: u32,
     pub exec_identity: String,
@@ -1817,9 +1831,12 @@ async fn handle_session_appeal(
         };
     }
 
+    // An appeal is itself a request for a fresh look: it always bypasses the
+    // auto-learned deny-shape fast path (never the operator PolicyEngine
+    // deny rules, which `evaluate_with_reevaluate` never skips either way).
     let eval_result = config
         .evaluator
-        .evaluate_with_context(&command_line, session_prompt.as_deref())
+        .evaluate_with_reevaluate(&command_line, session_prompt.as_deref(), true)
         .await;
 
     match eval_result {
@@ -2340,6 +2357,7 @@ async fn handle_admin_request(
             let session_count = config.sessions.read().await.list().len();
             let cache_size = config.evaluator.cache_size().await;
             let learned_rule_count = config.evaluator.learned_rule_count().await;
+            let deny_shape_count = config.evaluator.deny_shape_count().await;
             let mode = config
                 .evaluator
                 .mode()
@@ -2364,6 +2382,8 @@ async fn handle_admin_request(
                     cache_size,
                     learning_enabled: config.evaluator.learning_enabled(),
                     learned_rule_count,
+                    deny_learning_enabled: config.evaluator.deny_learning_enabled(),
+                    deny_shape_count,
                     session_count,
                     daemon_uid: config.daemon_uid,
                     exec_identity: if config.exec_as_caller {
@@ -3720,7 +3740,7 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
 
     let eval_result = config
         .evaluator
-        .evaluate_with_context(&command_line, session_prompt.as_deref())
+        .evaluate_with_reevaluate(&command_line, session_prompt.as_deref(), request.reevaluate)
         .await;
 
     match eval_result {
@@ -3743,6 +3763,14 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
                 {
                     reason = format!("{reason} {notice}");
                 }
+                maybe_promote_deny_shape(
+                    config,
+                    &request.binary,
+                    &request.args,
+                    &command_line,
+                    &reason,
+                )
+                .await;
             }
             config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
             let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
@@ -3896,6 +3924,7 @@ fn session_source_from_eval(source: crate::evaluate::EvalSource) -> SessionDecis
         crate::evaluate::EvalSource::Llm => SessionDecisionSource::Llm,
         crate::evaluate::EvalSource::Cache => SessionDecisionSource::Cache,
         crate::evaluate::EvalSource::StaticPolicy => SessionDecisionSource::StaticPolicy,
+        crate::evaluate::EvalSource::LearnedDeny => SessionDecisionSource::LearnedDeny,
     }
 }
 
@@ -4044,6 +4073,61 @@ async fn maybe_auto_amend_session_after_llm(
         Ok(false) => None,
         Err(err) => Some(format!("Session auto-amend failed: {err}.")),
     }
+}
+
+/// Record one fresh LLM denial against the auto-learned deny-shape store
+/// (`gating::deny_shape`). This is the only orchestration step for deny-shape
+/// auto-learning: no operator action is needed because the store can only
+/// ever hold shapes the LLM already denied. `record_learned_denial` is a fast
+/// local bookkeeping write, awaited inline; if the bucket just crossed its
+/// synthesis threshold, the actual promotion (a real LLM round trip) is
+/// spawned as a detached background task so it never adds latency to this
+/// (already-decided) denied request's response. Failures are logged, not
+/// surfaced to the caller.
+async fn maybe_promote_deny_shape(
+    config: &ServerConfig,
+    binary: &str,
+    args: &[String],
+    command_line: &str,
+    reason: &str,
+) {
+    let outcome = match config
+        .evaluator
+        .record_learned_denial(binary, args, command_line, reason)
+        .await
+    {
+        Ok(Some(outcome)) => outcome,
+        Ok(None) => return,
+        Err(err) => {
+            tracing::warn!("failed to record deny-shape observation: {}", err);
+            return;
+        }
+    };
+    if !outcome.ready_to_synthesize {
+        return;
+    }
+    let evaluator = config.evaluator.clone();
+    tokio::spawn(async move {
+        match evaluator.try_promote_deny_shape(&outcome).await {
+            Ok(true) => {
+                tracing::info!(
+                    "[AUDIT] DENY_SHAPE_LEARNED service={} binary={} denials={}",
+                    outcome.service,
+                    outcome.binary,
+                    outcome.denials
+                );
+            }
+            Ok(false) => {
+                tracing::debug!(
+                    "deny-shape synthesis for {} declined or not confident yet",
+                    outcome.binary
+                );
+            }
+            Err(err) => {
+                tracing::warn!("deny-shape promotion failed: {}", err);
+            }
+        }
+    });
 }
 
 async fn learning_notice(config: &ServerConfig, outcome: &LearningOutcome) -> Option<String> {
@@ -5354,6 +5438,7 @@ async fn execute_snapshot(
         session_token: None,
         revert: None,
         confirm_within_secs: None,
+        reevaluate: false,
         require_approval: None,
         wait_approval_secs: None,
         verb: None,
@@ -5459,6 +5544,7 @@ async fn run_provisional_revert(config: &ServerConfig, p: &Provisional) -> Execu
         session_token: None,
         revert: None,
         confirm_within_secs: None,
+        reevaluate: false,
         require_approval: None,
         wait_approval_secs: None,
         verb: None,
@@ -6015,6 +6101,7 @@ pub struct Client {
     require_approval: bool,
     wait_approval_secs: Option<u64>,
     verb: Option<VerbInvocation>,
+    reevaluate: bool,
 }
 
 impl Client {
@@ -6030,12 +6117,21 @@ impl Client {
             require_approval: false,
             wait_approval_secs: None,
             verb: None,
+            reevaluate: false,
         }
     }
 
     /// Invoke a catalog verb instead of a raw binary.
     pub fn with_verb(mut self, verb: VerbInvocation) -> Self {
         self.verb = Some(verb);
+        self
+    }
+
+    /// Skip the auto-learned deny-shape fast path for this client's requests
+    /// and force a fresh LLM call. Never skips an operator-authored
+    /// `PolicyEngine` deny rule.
+    pub fn with_reevaluate(mut self, reevaluate: bool) -> Self {
+        self.reevaluate = reevaluate;
         self
     }
 
@@ -6254,6 +6350,7 @@ impl Client {
             },
             wait_approval_secs: self.wait_approval_secs,
             verb: self.verb.clone(),
+            reevaluate: self.reevaluate,
         }
     }
 
@@ -6728,6 +6825,7 @@ mod tests {
             session_token: None,
             revert: None,
             confirm_within_secs: None,
+            reevaluate: false,
             require_approval: None,
             wait_approval_secs: None,
             verb: None,
@@ -6807,6 +6905,7 @@ mod tests {
             session_token: None,
             revert: None,
             confirm_within_secs: None,
+            reevaluate: false,
             require_approval: None,
             wait_approval_secs: None,
             verb: None,
@@ -6864,6 +6963,7 @@ mod tests {
             session_token: None,
             revert: None,
             confirm_within_secs: None,
+            reevaluate: false,
             require_approval: None,
             wait_approval_secs: None,
             verb: None,
@@ -6898,6 +6998,7 @@ mod tests {
             session_token: None,
             revert: None,
             confirm_within_secs: None,
+            reevaluate: false,
             require_approval: None,
             wait_approval_secs: None,
             verb: None,
@@ -7001,6 +7102,104 @@ mod tests {
         );
         let buf = SharedBuf(Arc::new(Mutex::new(Vec::new())));
         (cfg, buf)
+    }
+
+    /// Trusted-verb + consequence-gate interaction: `trusted` only skips the
+    /// LLM evaluator (`bypass: false` in the `GateInputs` built for it,
+    /// see `execute_command_inner`); it must NOT also skip consequence
+    /// routing. An irreversible trusted verb must still be held for operator
+    /// approval, never executed immediately, even though it never went
+    /// through the LLM.
+    #[tokio::test]
+    async fn trusted_verb_irreversible_still_holds_for_approval() {
+        let (mut cfg, _buf) = make_test_config();
+        cfg.gate = GateMode::Consequence;
+        let catalog = VerbCatalog::from_yaml(
+            "verbs:\n  - name: danger-op\n    binary: true\n    consequence: irreversible\n    trusted: true\n",
+        )
+        .unwrap();
+        cfg.verbs = Arc::new(RwLock::new(catalog));
+
+        let request = ExecuteRequest {
+            binary: String::new(),
+            args: Vec::new(),
+            auth_token: None,
+            env: HashMap::new(),
+            secrets: HashMap::new(),
+            stream: false,
+            session_token: None,
+            revert: None,
+            confirm_within_secs: None,
+            reevaluate: false,
+            require_approval: None,
+            wait_approval_secs: None,
+            verb: Some(VerbInvocation {
+                name: "danger-op".to_string(),
+                params: std::collections::BTreeMap::new(),
+            }),
+        };
+
+        let result = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+        let response = result.into_response();
+        assert!(response.allowed, "a held command is still policy-allowed");
+        assert_eq!(
+            response.status,
+            Some(GateStatus::Held),
+            "a trusted verb declared irreversible must be held, not executed, despite skipping \
+             the LLM: got {:?}",
+            response.status
+        );
+        assert!(
+            response.exit_code.is_none(),
+            "a held command must not have run"
+        );
+    }
+
+    /// The other half of the same interaction: a trusted verb declared
+    /// reversible with a low (verb-forced) risk of 0 clears the gate at
+    /// execute-now, exactly like an LLM-approved reversible command would.
+    #[tokio::test]
+    async fn trusted_verb_reversible_executes_now() {
+        let (mut cfg, _buf) = make_test_config();
+        cfg.gate = GateMode::Consequence;
+        let catalog = VerbCatalog::from_yaml(
+            "verbs:\n  - name: safe-op\n    binary: true\n    consequence: reversible\n    trusted: true\n",
+        )
+        .unwrap();
+        cfg.verbs = Arc::new(RwLock::new(catalog));
+
+        let request = ExecuteRequest {
+            binary: String::new(),
+            args: Vec::new(),
+            auth_token: None,
+            env: HashMap::new(),
+            secrets: HashMap::new(),
+            stream: false,
+            session_token: None,
+            revert: None,
+            confirm_within_secs: None,
+            reevaluate: false,
+            require_approval: None,
+            wait_approval_secs: None,
+            verb: Some(VerbInvocation {
+                name: "safe-op".to_string(),
+                params: std::collections::BTreeMap::new(),
+            }),
+        };
+
+        let result = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+        let response = result.into_response();
+        assert!(response.allowed);
+        assert!(
+            response.status.is_none() || response.status == Some(GateStatus::Executed),
+            "a trusted reversible verb should execute immediately, got {:?}",
+            response.status
+        );
+        assert_eq!(
+            response.exit_code,
+            Some(0),
+            "the verb should have actually run"
+        );
     }
 
     fn capture<F: FnOnce()>(buf: &SharedBuf, f: F) -> String {
@@ -7211,6 +7410,7 @@ mod tests {
             session_token: None,
             revert: None,
             confirm_within_secs: None,
+            reevaluate: false,
             require_approval: None,
             wait_approval_secs: None,
             verb: None,
@@ -7282,6 +7482,7 @@ mod tests {
             session_token: Some(token),
             revert: None,
             confirm_within_secs: None,
+            reevaluate: false,
             require_approval: None,
             wait_approval_secs: None,
             verb: None,
@@ -7333,6 +7534,7 @@ mod tests {
             session_token: Some(token),
             revert: None,
             confirm_within_secs: None,
+            reevaluate: false,
             require_approval: None,
             wait_approval_secs: None,
             verb: None,
@@ -7596,6 +7798,7 @@ mod tests {
             session_token: None,
             revert: Some(revert),
             confirm_within_secs: None,
+            reevaluate: false,
             require_approval: None,
             wait_approval_secs: None,
             verb: None,
@@ -7961,6 +8164,7 @@ mod tests {
             session_token: None,
             revert: None,
             confirm_within_secs: None,
+            reevaluate: false,
             require_approval: None,
             wait_approval_secs: None,
             verb: None,
@@ -8047,6 +8251,7 @@ mod tests {
             session_token: None,
             revert: None,
             confirm_within_secs: None,
+            reevaluate: false,
             require_approval: None,
             wait_approval_secs: None,
             verb: None,
@@ -8127,6 +8332,7 @@ mod tests {
             session_token: None,
             revert: None,
             confirm_within_secs: None,
+            reevaluate: false,
             require_approval: None,
             wait_approval_secs: None,
             verb: None,
@@ -8206,6 +8412,7 @@ mod tests {
             session_token: None,
             revert: None,
             confirm_within_secs: None,
+            reevaluate: false,
             require_approval: None,
             wait_approval_secs: None,
             verb: None,
@@ -8277,6 +8484,7 @@ mod tests {
             session_token: None,
             revert: None,
             confirm_within_secs: None,
+            reevaluate: false,
             require_approval: None,
             wait_approval_secs: None,
             verb: None,
@@ -8352,6 +8560,7 @@ mod tests {
             session_token: None,
             revert: None,
             confirm_within_secs: None,
+            reevaluate: false,
             require_approval: None,
             wait_approval_secs: None,
             verb: None,

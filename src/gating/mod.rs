@@ -21,6 +21,7 @@
 //! [`verb`].
 
 pub mod approval;
+pub mod deny_shape;
 pub mod provisional;
 pub mod verb;
 

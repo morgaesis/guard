@@ -1,3 +1,4 @@
+use crate::gating::deny_shape::{split_command_line, DenyLearningOutcome, DenyShapeStore};
 use crate::gating::verb::Verb;
 use crate::gating::{GateMode, Reversibility};
 use crate::learned_rules::{AutoShimMode, LearnedRuleStore, LearningOutcome};
@@ -259,6 +260,9 @@ pub struct EvalConfig {
     pub gate_mode: GateMode,
     /// Optional learned static allow overlay. Misses fall through to LLM.
     pub learned_rules: Option<Arc<RwLock<LearnedRuleStore>>>,
+    /// Optional auto-learned deny-shape store. Unlike `learned_rules`, a hit
+    /// here IS an authoritative deny fast path -- see `gating::deny_shape`.
+    pub deny_shapes: Option<Arc<RwLock<DenyShapeStore>>>,
 }
 
 impl Default for EvalConfig {
@@ -274,6 +278,7 @@ impl Default for EvalConfig {
             cache_ttl: Duration::from_secs(DEFAULT_CACHE_TTL_SECS),
             gate_mode: GateMode::Off,
             learned_rules: None,
+            deny_shapes: None,
         }
     }
 }
@@ -358,6 +363,11 @@ impl EvalConfig {
         self.learned_rules = Some(store);
         self
     }
+
+    pub fn deny_shapes(mut self, store: Arc<RwLock<DenyShapeStore>>) -> Self {
+        self.deny_shapes = Some(store);
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -396,6 +406,10 @@ pub enum EvalSource {
     StaticPolicy,
     Cache,
     Llm,
+    /// A deny fast path the daemon synthesized itself from repeated LLM
+    /// denials of this shape (see `gating::deny_shape`). Always a deny; this
+    /// source can never appear on an `EvalResult::Allow`.
+    LearnedDeny,
 }
 
 impl std::fmt::Display for EvalResult {
@@ -519,6 +533,7 @@ pub struct Evaluator {
     mode: Option<PolicyMode>,
     gate_mode: GateMode,
     learned_rules: Option<Arc<RwLock<LearnedRuleStore>>>,
+    deny_shapes: Option<Arc<RwLock<DenyShapeStore>>>,
 }
 
 impl Evaluator {
@@ -638,6 +653,7 @@ impl Evaluator {
             mode: config.mode,
             gate_mode: config.gate_mode,
             learned_rules: config.learned_rules,
+            deny_shapes: config.deny_shapes,
         })
     }
 
@@ -699,6 +715,67 @@ impl Evaluator {
         };
         let mut guard = store.write().await;
         guard.record_approval(binary, args, command, risk, reason)
+    }
+
+    pub fn deny_learning_enabled(&self) -> bool {
+        self.deny_shapes.is_some()
+    }
+
+    pub async fn deny_shape_count(&self) -> usize {
+        match &self.deny_shapes {
+            Some(store) => store.read().await.shape_count(),
+            None => 0,
+        }
+    }
+
+    /// Bookkeeping only: record one LLM denial. Returns an outcome flagging
+    /// whether this bucket just crossed the synthesis threshold; the caller
+    /// (`server::maybe_promote_deny_shape`) decides whether to act on it via
+    /// `try_promote_deny_shape`. Never grants or matches anything itself.
+    pub async fn record_learned_denial(
+        &self,
+        binary: &str,
+        args: &[String],
+        command: &str,
+        reason: &str,
+    ) -> Result<Option<DenyLearningOutcome>> {
+        let Some(store) = &self.deny_shapes else {
+            return Ok(None);
+        };
+        let mut guard = store.write().await;
+        guard.record_denial(binary, args, command, reason)
+    }
+
+    /// Attempt to synthesize and promote a deny shape from an outcome flagged
+    /// `ready_to_synthesize`. Makes one LLM call, then validates the result
+    /// through `validate_deny_shape_safety` before persisting -- the model's
+    /// output is never trusted directly. Returns `Ok(true)` if a shape was
+    /// promoted, `Ok(false)` if the model wasn't confident or nothing changed
+    /// (not an error: the bucket keeps accumulating evidence for next time).
+    pub async fn try_promote_deny_shape(&self, outcome: &DenyLearningOutcome) -> Result<bool> {
+        let Some(store) = &self.deny_shapes else {
+            return Ok(false);
+        };
+        if outcome.evidence_args.len() < 2 {
+            // Nothing to generalize from yet; skip the LLM call entirely.
+            return Ok(false);
+        }
+        let Some((args_pattern, evidence_note)) = self
+            .synthesize_deny_shape(&outcome.binary, &outcome.evidence_args, &outcome.reason)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let mut guard = store.write().await;
+        guard.promote_shape(
+            &outcome.service,
+            &outcome.binary,
+            &args_pattern,
+            &outcome.evidence_args,
+            &evidence_note,
+            outcome.denials,
+        )?;
+        Ok(true)
     }
 
     pub fn has_static_policy(&self) -> bool {
@@ -784,10 +861,32 @@ impl Evaluator {
     /// session-specific context. The decision cache is bypassed when a
     /// session prompt is in play, because cached decisions were made under
     /// the base prompt and may not hold under the extended context.
+    ///
+    /// Equivalent to `evaluate_with_reevaluate(command, prompt_append, false)`:
+    /// the auto-learned deny-shape fast path (`gating::deny_shape`) is
+    /// consulted. Operator-authored `PolicyEngine` deny rules are always
+    /// consulted regardless; only the auto-learned store can be skipped, and
+    /// only via the `reevaluate` flag.
     pub async fn evaluate_with_context(
         &self,
         command: &str,
         prompt_append: Option<&str>,
+    ) -> EvalResult {
+        self.evaluate_with_reevaluate(command, prompt_append, false)
+            .await
+    }
+
+    /// Same as `evaluate_with_context`, with an explicit `reevaluate` flag.
+    /// `reevaluate = true` skips only the auto-learned deny-shape fast path
+    /// and forces a fresh LLM call -- it never skips operator-authored
+    /// `PolicyEngine` deny rules, which stay absolute. Safe to expose to
+    /// callers broadly: its only effect is "ask the LLM again," never a
+    /// grant, since the auto-learned store can only ever hold deny shapes.
+    pub async fn evaluate_with_reevaluate(
+        &self,
+        command: &str,
+        prompt_append: Option<&str>,
+        reevaluate: bool,
     ) -> EvalResult {
         let session_prompt_active = prompt_append.map(|s| !s.trim().is_empty()).unwrap_or(false);
 
@@ -799,6 +898,7 @@ impl Evaluator {
         // were loaded. Allow patterns never skip the LLM: `guard verb`
         // (`trusted = true`) is the supported mechanism for a deterministic,
         // LLM-skipping allow. See `PolicyEngine::check_deny_fast_path`.
+        // This check is never skipped by `reevaluate`.
         if let Some(ref engine) = self.policy_engine {
             if let Some(reason) = engine.check_deny_fast_path(command) {
                 tracing::debug!("static policy denied: {}", reason);
@@ -807,6 +907,33 @@ impl Evaluator {
                     source: EvalSource::StaticPolicy,
                     risk: None,
                 };
+            }
+        }
+
+        // Auto-learned deny fast path: shapes the daemon synthesized itself
+        // from repeated LLM denials (`gating::deny_shape`). Unlike the
+        // operator PolicyEngine check above, `reevaluate` skips this one --
+        // its only effect is forcing a fresh LLM call, never a grant, since
+        // this store can only ever hold shapes the LLM already denied.
+        if !reevaluate {
+            if let Some(ref store) = self.deny_shapes {
+                let (binary, args_joined) = split_command_line(command);
+                let hit = {
+                    let guard = store.read().await;
+                    guard
+                        .matches(binary, args_joined)
+                        .map(|shape| shape.last_reason.clone())
+                };
+                if let Some(reason) = hit {
+                    tracing::debug!("auto-learned deny shape matched: {}", reason);
+                    return EvalResult::Deny {
+                        reason: format!(
+                            "{reason} (auto-learned deny shape; re-run with --reevaluate to force a fresh check)"
+                        ),
+                        source: EvalSource::LearnedDeny,
+                        risk: None,
+                    };
+                }
             }
         }
 
@@ -1059,6 +1186,105 @@ impl Evaluator {
         let verb: Verb = serde_json::from_value(args)
             .map_err(|e| anyhow::anyhow!("model output did not match the verb schema: {e}"))?;
         Ok(verb)
+    }
+
+    /// Synthesize one deny shape from repeated denial evidence (the automatic
+    /// half of `gating::deny_shape`). Reuses the daemon's own LLM client/key.
+    /// Returns `Ok(None)` when the model isn't confident the evidence shares
+    /// one shape -- the caller keeps accumulating rather than forcing a
+    /// synthesis. The caller still re-validates the returned pattern from
+    /// scratch (`validate_deny_shape_safety`); nothing here is trusted.
+    async fn synthesize_deny_shape(
+        &self,
+        binary: &str,
+        evidence: &[String],
+        last_reason: &str,
+    ) -> Result<Option<(String, String)>> {
+        if !self.llm_config.enabled {
+            return Ok(None);
+        }
+        let Some(api_key) = self.llm_config.api_key.clone().filter(|k| !k.is_empty()) else {
+            return Ok(None);
+        };
+        let api_url = self.llm_config.api_url();
+        let model = self.llm_config.model();
+        let body = build_create_deny_shape_body(&model, binary, evidence, last_reason);
+
+        let attempts = self.llm_config.effective_retries().saturating_add(1).max(2);
+        let mut last_err = String::new();
+        for attempt in 1..=attempts {
+            match self
+                .synthesize_deny_shape_once(&api_key, &api_url, &body)
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    last_err = e.to_string();
+                    tracing::warn!(
+                        "deny-shape synthesis attempt {}/{} failed: {}",
+                        attempt,
+                        attempts,
+                        last_err
+                    );
+                    if attempt < attempts {
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                    }
+                }
+            }
+        }
+        tracing::warn!("deny-shape synthesis failed after {attempts} attempts: {last_err}");
+        Ok(None)
+    }
+
+    async fn synthesize_deny_shape_once(
+        &self,
+        api_key: &str,
+        api_url: &str,
+        body: &serde_json::Value,
+    ) -> Result<Option<(String, String)>> {
+        let response = self
+            .http_client
+            .post(api_url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("transport error: {e}"))?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .map_err(|e| anyhow::anyhow!("read error: {e}"))?;
+        if !status.is_success() {
+            bail!("LLM call failed ({}): {}", status, truncate(&text, 200));
+        }
+        let parsed: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("non-JSON response: {e}"))?;
+        let args_str = parsed
+            .pointer("/choices/0/message/tool_calls/0/function/arguments")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("model did not return a create_deny_shape tool call"))?;
+        let args: serde_json::Value = serde_json::from_str(args_str)
+            .map_err(|e| anyhow::anyhow!("tool-call arguments were not valid JSON: {e}"))?;
+        let confident = args
+            .get("confident")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !confident {
+            return Ok(None);
+        }
+        let args_pattern = args
+            .get("args_pattern")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("model output missing args_pattern"))?
+            .to_string();
+        let evidence = args
+            .get("evidence")
+            .and_then(|v| v.as_str())
+            .unwrap_or("auto-learned from repeated denials")
+            .to_string();
+        Ok(Some((args_pattern, evidence)))
     }
 
     /// Runs one model through the full retry budget. Returns Ok(decision) on the
@@ -1355,6 +1581,64 @@ fn build_create_verb_body(
             }
         }],
         "tool_choice": {"type": "function", "function": {"name": "create_verb"}}
+    })
+}
+
+/// System prompt for deny-shape synthesis: infer the minimal generalized
+/// shape from repeated denial evidence, or decline if it doesn't clearly
+/// generalize. Kept narrow on purpose -- unlike verb synthesis, there is no
+/// human review before this pattern becomes an active fast path, so the
+/// model is instructed to prefer declining (`confident: false`) over
+/// guessing.
+const SYSTEM_PROMPT_CREATE_DENY_SHAPE: &str = "You infer the minimal common shape from several \
+argument strings that were all denied for the same binary. Each example below is quoted exactly \
+as the regex must match it: no binary name, no leading or trailing space, no added punctuation. \
+Produce a single fully-anchored regular expression (must start with ^ and end with $) that matches \
+each quoted example verbatim and materially similar variants -- and nothing broader. Do not prepend \
+`^\\s` or any other whitespace to the pattern; the match starts at the first character of the \
+argument string itself. Only set confident=true if the examples clearly share one narrow shape. If \
+they look unrelated, or generalizing would require matching a wide range of unrelated arguments, \
+set confident=false and leave args_pattern empty. This pattern will become an automatic deny fast \
+path with no human review, so err toward declining rather than guessing.";
+
+fn build_create_deny_shape_body(
+    model: &str,
+    binary: &str,
+    evidence: &[String],
+    last_reason: &str,
+) -> serde_json::Value {
+    let examples: String = evidence
+        .iter()
+        .map(|e| format!("- {e:?}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let user = format!(
+        "Binary: {binary}\nMost recent denial reason: {last_reason}\n\nDenied argument strings \
+         (quoted exactly; match them without the surrounding quotes):\n{examples}"
+    );
+    serde_json::json!({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT_CREATE_DENY_SHAPE},
+            {"role": "user", "content": user},
+        ],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "create_deny_shape",
+                "description": "Infer the minimal generalized deny shape for these examples, or decline.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "args_pattern": {"type": "string", "description": "FULLY ANCHORED regex ^...$ over the space-joined argument string"},
+                        "confident": {"type": "boolean", "description": "true only if the examples clearly share one narrow shape"},
+                        "evidence": {"type": "string", "description": "one sentence justifying this shape"}
+                    },
+                    "required": ["confident", "evidence"]
+                }
+            }
+        }],
+        "tool_choice": {"type": "function", "function": {"name": "create_deny_shape"}}
     })
 }
 
@@ -1843,13 +2127,19 @@ mod tests {
         // StaticPolicy deny on bare default-deny fallthrough.
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("deny-only.yaml");
-        std::fs::write(&path, "policy:\n  commands:\n    deny:\n      - \"rm -rf /*\"\n").unwrap();
+        std::fs::write(
+            &path,
+            "policy:\n  commands:\n    deny:\n      - \"rm -rf /*\"\n",
+        )
+        .unwrap();
 
         let evaluator = Evaluator::new(EvalConfig::default().policy_path(path)).unwrap();
 
         match evaluator.evaluate("ls -la").await {
             EvalResult::Error(msg) => assert!(msg.contains("API key")),
-            other => panic!("expected fallthrough to the LLM (and an API-key error), got {other:?}"),
+            other => {
+                panic!("expected fallthrough to the LLM (and an API-key error), got {other:?}")
+            }
         }
 
         match evaluator.evaluate("rm -rf /*").await {
@@ -1880,9 +2170,9 @@ mod tests {
         }
         match evaluator.evaluate("id").await {
             EvalResult::Error(msg) => assert!(msg.contains("API key")),
-            other => panic!(
-                "allow patterns must not skip the LLM while it is enabled, got {other:?}"
-            ),
+            other => {
+                panic!("allow patterns must not skip the LLM while it is enabled, got {other:?}")
+            }
         }
     }
 
@@ -1925,6 +2215,118 @@ mod tests {
             EvalResult::Error(msg) => assert!(msg.contains("API key")),
             other => panic!("expected an LLM error (no bypass), got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn learned_deny_shape_fast_rejects_without_llm() {
+        // A promoted deny shape must fast-reject a matching command without
+        // ever reaching the LLM stage. Promote the shape directly (the
+        // synthesis LLM call itself is a separate, mocked-free unit boundary
+        // covered in gating::deny_shape) and prove the wiring in
+        // evaluate_with_context consults it before the LLM path.
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = DenyShapeStore::load(crate::gating::deny_shape::DenyLearningConfig::new(
+            temp.path().join("deny.yaml"),
+        ))
+        .unwrap();
+        store
+            .promote_shape(
+                "kubectl",
+                "kubectl",
+                r"^delete namespace \S+$",
+                &["delete namespace prod".to_string()],
+                "namespace deletion is destructive",
+                3,
+            )
+            .unwrap();
+
+        let evaluator =
+            Evaluator::new(EvalConfig::default().deny_shapes(Arc::new(RwLock::new(store))))
+                .unwrap();
+
+        match evaluator.evaluate("kubectl delete namespace prod").await {
+            EvalResult::Deny { source, reason, .. } => {
+                assert_eq!(source, EvalSource::LearnedDeny);
+                assert!(reason.contains("namespace deletion is destructive"));
+            }
+            other => panic!("expected a fast-rejected deny with no LLM call, got {other:?}"),
+        }
+
+        // A non-matching command for the same binary must not be affected.
+        match evaluator.evaluate("kubectl get pods").await {
+            EvalResult::Error(msg) => assert!(msg.contains("API key")),
+            other => {
+                panic!("expected fallthrough to the LLM for a non-matching shape, got {other:?}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reevaluate_flag_skips_only_the_learned_deny_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = DenyShapeStore::load(crate::gating::deny_shape::DenyLearningConfig::new(
+            temp.path().join("deny.yaml"),
+        ))
+        .unwrap();
+        store
+            .promote_shape(
+                "kubectl",
+                "kubectl",
+                r"^delete namespace \S+$",
+                &["delete namespace prod".to_string()],
+                "namespace deletion is destructive",
+                3,
+            )
+            .unwrap();
+
+        let evaluator = Evaluator::new(
+            EvalConfig::default()
+                .llm_enabled(false)
+                .deny_shapes(Arc::new(RwLock::new(store))),
+        )
+        .unwrap();
+
+        match evaluator
+            .evaluate_with_reevaluate("kubectl delete namespace prod", None, false)
+            .await
+        {
+            EvalResult::Deny { source, .. } => assert_eq!(source, EvalSource::LearnedDeny),
+            other => panic!("expected the learned-deny fast path, got {other:?}"),
+        }
+
+        // reevaluate=true must skip the auto-learned store; with the LLM
+        // disabled and no policy engine, the fallback is a bare default-deny
+        // (StaticPolicy), proving the learned-deny check was bypassed.
+        match evaluator
+            .evaluate_with_reevaluate("kubectl delete namespace prod", None, true)
+            .await
+        {
+            EvalResult::Deny { source, reason, .. } => {
+                assert_eq!(source, EvalSource::StaticPolicy);
+                assert!(reason.contains("default-deny"));
+            }
+            other => panic!("expected reevaluate to skip the learned-deny store, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn deny_shape_observation_without_llm_key_does_not_error() {
+        // Recording a denial and attempting promotion must be safe no-ops
+        // when the LLM (needed for synthesis) has no API key configured --
+        // mirrors record_learned_approval's graceful behavior on the allow
+        // side.
+        let evaluator = Evaluator::new(EvalConfig::default()).unwrap();
+        assert!(!evaluator.deny_learning_enabled());
+        let outcome = evaluator
+            .record_learned_denial(
+                "kubectl",
+                &["get".into(), "pods".into()],
+                "kubectl get pods",
+                "no",
+            )
+            .await
+            .unwrap();
+        assert!(outcome.is_none());
     }
 
     #[test]

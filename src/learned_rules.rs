@@ -464,7 +464,9 @@ fn infer_ssh_service(host: &str, remote_args: &[String]) -> String {
     sanitize_name(base, "service")
 }
 
-fn infer_service_from_binary(binary: &str) -> String {
+/// Also used by `gating::deny_shape` so both the allow-candidate and the
+/// auto-deny bucketing key commands to the same "service" the same way.
+pub(crate) fn infer_service_from_binary(binary: &str) -> String {
     sanitize_name(binary.trim_end_matches(".exe"), "service")
 }
 
