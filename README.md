@@ -200,6 +200,25 @@ or shell metacharacters, and its name must be kebab-case. This lets an operator 
 narrow, least-privilege verbs — including per-resource limits a tool's own RBAC
 cannot express — without writing YAML by hand.
 
+A caller does not have to name a verb to benefit from one: a raw command
+(`guard run kubectl get pods -n foo`) reverse-matches any catalog verb whose
+template it satisfies, hand-authored or auto-promoted, picking up its class
+and trust the same way `guard verb run` would.
+
+#### Auto-verb-promotion
+
+`--learn-allow` (on by default, requires `--gate consequence`) is the
+allow-side counterpart to `GUARD_LEARN_DENY`, for deployments too unattended
+for an operator to act on learned-rule notices. Repeated low-risk approvals of
+the same command shape are appended to the catalog automatically as a
+`trusted` verb — restricted to reversible shapes, or recoverable shapes with a
+validated revert; irreversible shapes are never eligible, since they hold for
+operator approval regardless of `trusted`. Every parameter's allowed values
+are pinned to the exact values actually observed, never a model-authored
+pattern. `guard verb list` shows what has been promoted (`auto_promoted: true`);
+edit or delete the catalog file to revoke. See [DEPLOYMENT.md](DEPLOYMENT.md#auto-verb-promotion)
+for the full design rationale.
+
 ## Kubernetes API proxy
 
 The command gate sees a command's argv, but tools that drive the Kubernetes API
@@ -293,6 +312,9 @@ Guard walks up from your current directory to `/` looking for `.env` files (clos
 | `GUARD_LEARN_DENY` | `true` | Auto-learn deny shapes from repeated LLM denials and fast-reject matching commands without another LLM call. On by default -- unlike `GUARD_LEARN_RULES`, this never grants anything, so it needs no operator promotion step. |
 | `GUARD_DENY_SHAPES` | `<state dir>/learned-deny.yaml` | Path to the auto-learned deny-shape state YAML. |
 | `GUARD_LEARN_DENY_MIN_DENIALS` | `3` | LLM denials of the same shape required before attempting to synthesize an auto-learned deny fast path. |
+| `GUARD_LEARN_ALLOW` | `true` | Auto-promote trusted verbs from repeated low-risk LLM approvals (requires `--gate consequence`). On by default; needs no operator step, unlike `GUARD_LEARN_RULES` -- restricted to reversible/recoverable-with-a-validated-revert shapes, never irreversible. |
+| `GUARD_LEARN_ALLOW_STATE` | `<state dir>/learned-allow.yaml` | Path to the auto-verb-promotion observation state YAML (bookkeeping only; promoted verbs land in `GUARD_VERBS`). |
+| `GUARD_LEARN_ALLOW_MIN_APPROVALS` | `5` | LLM approvals of the same shape required before attempting to promote a trusted verb. |
 | `GUARD_PROMPT_APPEND` | (none) | Path to additive prompt file (appended to base prompt) |
 | `GUARD_GPG_RECIPIENT` | (none) | GPG recipient for the `local` secret backend |
 | `GUARD_BACKEND` | (auto) | Secret backend: `pass`, `env`, `local`, `vault`, or `infisical`. Auto prefers `pass`; otherwise it falls back to non-persistent `env` and logs a warning. `vault` uses `VAULT_ADDR` with `VAULT_TOKEN` or `VAULT_ROLE_ID`+`VAULT_SECRET_ID` (KV v2, mount `VAULT_KV_MOUNT`, default `secret`); `infisical` uses `INFISICAL_CLIENT_ID`/`INFISICAL_CLIENT_SECRET`/`INFISICAL_PROJECT_ID` (Universal Auth, env `INFISICAL_ENVIRONMENT`). |

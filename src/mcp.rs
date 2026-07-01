@@ -1524,6 +1524,8 @@ mod tests {
                     trusted: true,
                     has_revert: true,
                     params: std::collections::BTreeMap::new(),
+                    auto_promoted: false,
+                    evidence: None,
                 }],
             },
         });

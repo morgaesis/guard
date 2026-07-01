@@ -515,7 +515,10 @@ fn is_valid_shim_name(name: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
 }
 
-fn looks_dangerous_for_learned_allow(command: &str) -> bool {
+/// Also used by `gating::allow_promotion`: both modules trust a repeated LLM
+/// approval only up to the same floor of "obviously not something to ever
+/// auto-trust regardless of how many times it was approved."
+pub(crate) fn looks_dangerous_for_learned_allow(command: &str) -> bool {
     let lower = command.to_ascii_lowercase();
     let first_token = lower.split_whitespace().next().unwrap_or_default();
     if matches!(first_token, "sudo" | "su" | "reboot" | "shutdown" | "halt") {

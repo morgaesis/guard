@@ -20,6 +20,7 @@
 //! [`provisional`] and [`approval`]; the operator-authored catalog is in
 //! [`verb`].
 
+pub mod allow_promotion;
 pub mod approval;
 pub mod deny_shape;
 pub mod provisional;
