@@ -381,6 +381,15 @@ function Invoke-Install {
     #     applied in step 6, so the guard SID's later FULL grant covers it). The
     #     service account runs this copy; the source under the user profile is not
     #     readable by the guard SID.
+    #     On an upgrade the running service holds a lock on the deployed exe and
+    #     the copy fails with a sharing violation, so stop it first; step 9
+    #     starts it again.
+    $running = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if ($running -and $running.Status -ne 'Stopped') {
+        Write-Host "Stopping running service '$ServiceName' before replacing its binary"
+        Stop-Service -Name $ServiceName -Force
+        $running.WaitForStatus('Stopped', (New-TimeSpan -Seconds 30))
+    }
     Copy-Item -LiteralPath $guardExe -Destination $DeployedExe -Force
     Write-Host "Deployed daemon binary -> $DeployedExe"
 
