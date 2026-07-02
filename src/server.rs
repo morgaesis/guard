@@ -6262,21 +6262,28 @@ fn ssh_o_directive_readonly_safe(value: &str) -> bool {
         return false;
     }
     let lower = value.trim_start().to_ascii_lowercase();
-    let key = lower
+    let mut parts = lower
         .split(|ch: char| ch == '=' || ch.is_whitespace())
-        .next()
-        .unwrap_or("");
-    matches!(
-        key,
+        .filter(|part| !part.is_empty());
+    let key = parts.next().unwrap_or("");
+    let directive_value = parts.next().unwrap_or("");
+    match key {
         "batchmode"
-            | "connecttimeout"
-            | "connectionattempts"
-            | "serveraliveinterval"
-            | "serveralivecountmax"
-            | "stricthostkeychecking"
-            | "updatehostkeys"
-            | "checkhostip"
-    )
+        | "connecttimeout"
+        | "connectionattempts"
+        | "serveraliveinterval"
+        | "serveralivecountmax"
+        | "updatehostkeys"
+        | "checkhostip" => true,
+        // Host-key checking is permitted only in its security-preserving
+        // forms. Disabling it (`no`/`off`) or deferring to an interactive
+        // prompt (`ask`) would let a man-in-the-middle tamper with the
+        // diagnostic's output, so those forfeit to the evaluator rather than
+        // taking the deterministic fast path. An empty value falls back to
+        // ssh's strict default, which is safe.
+        "stricthostkeychecking" => matches!(directive_value, "yes" | "accept-new" | ""),
+        _ => false,
+    }
 }
 
 /// True only for an exact, whole read-only diagnostic command (no shell
@@ -7783,6 +7790,9 @@ mod tests {
             &["-o", "Include=/tmp/evil", "host01", "id"][..],
             // Combined short flags are not decomposed; forfeit conservatively.
             &["-Cq", "host01", "id"][..],
+            // A value option with no following value is malformed; forfeit.
+            &["-p"][..],
+            &["host01", "-l"][..],
         ] {
             assert!(
                 !ssh_options_all_readonly_safe(&args(bad)),
@@ -7836,6 +7846,35 @@ mod tests {
         ])));
         // The same keyword without a newline stays on the fast path.
         assert!(ssh_o_directive_readonly_safe("ConnectTimeout=5"));
+    }
+
+    #[test]
+    fn ssh_o_stricthostkeychecking_permits_only_secure_values() {
+        // Security-preserving values keep the fast path (accept-new is what
+        // the --hostkey mode injects).
+        assert!(ssh_o_directive_readonly_safe("StrictHostKeyChecking=yes"));
+        assert!(ssh_o_directive_readonly_safe("StrictHostKeyChecking=accept-new"));
+        // Disabling or deferring host-key verification forfeits to the
+        // evaluator rather than auto-allowing over an unauthenticated channel.
+        for weak in [
+            "StrictHostKeyChecking=no",
+            "StrictHostKeyChecking=off",
+            "StrictHostKeyChecking=ask",
+            "stricthostkeychecking no",
+        ] {
+            assert!(
+                !ssh_o_directive_readonly_safe(weak),
+                "{weak} should forfeit the fast path"
+            );
+        }
+        // And the whole invocation forfeits when the caller disables it.
+        let (cfg, _buf) = make_test_config();
+        assert!(deterministic_safe_allow_reason(
+            &cfg,
+            "ssh",
+            &args(&["-o", "StrictHostKeyChecking=no", "host01", "id"])
+        )
+        .is_none());
     }
 
     #[test]
