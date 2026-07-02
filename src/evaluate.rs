@@ -39,9 +39,17 @@ const SYSTEM_PROMPT_GATING: &str = include_str!("../config/system-prompt-gating.
 /// static policy. Changing this default will change the out-of-the-box behaviour
 /// of every daemon, so update deliberately.
 const DEFAULT_MODEL: &str = "openai/gpt-5.4-mini";
-const DEFAULT_TIMEOUT: u64 = 10;
+/// Generous enough for a slow provider cold-start plus a reasoning model's
+/// hidden thinking tokens; 10s produced spurious transport timeouts in
+/// production.
+const DEFAULT_TIMEOUT: u64 = 30;
 const DEFAULT_API_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 const DEFAULT_RETRIES: u32 = 2;
+/// Completion budget sent as `max_completion_tokens`. Reasoning-capable
+/// models spend hidden reasoning tokens from this same budget, so it is far
+/// larger than the visible decision JSON needs; `max_tokens` is rejected
+/// outright by several current models.
+const DEFAULT_MAX_COMPLETION_TOKENS: u32 = 4096;
 
 /// System guidance for `guard verb create --prompt` synthesis: turn operator
 /// prose into exactly ONE least-privilege, typed verb. Conservative defaults
@@ -1721,9 +1729,9 @@ impl Evaluator {
     ) -> Result<(LlmResponse, TokenUsage), AttemptError> {
         let gating = self.gate_mode.is_on();
         let body = if use_function_calling {
-            build_function_call_body(model, system_prompt, command, gating)
+            build_function_call_body(api_url, model, system_prompt, command, gating)
         } else {
-            build_json_response_body(model, system_prompt, command, gating)
+            build_json_response_body(api_url, model, system_prompt, command, gating)
         };
 
         tracing::debug!("LLM POST {}: model={}", api_url, model);
@@ -1763,6 +1771,17 @@ impl Evaluator {
             )));
         }
         if status.is_client_error() {
+            // A router that cannot satisfy forced tool calling for this model
+            // reports it as a 4xx. Classify as ParseError, not ClientError:
+            // the retry loop downgrades to JSON mode after a ParseError, so
+            // the next attempt succeeds instead of burning the budget on an
+            // unusable mode.
+            if use_function_calling && response_text.to_ascii_lowercase().contains("tool_choice") {
+                return Err(AttemptError::ParseError(format!(
+                    "tool calling unsupported by provider: {}",
+                    truncate(&response_text, 200)
+                )));
+            }
             return Err(AttemptError::ClientError(format!(
                 "{}: {}",
                 status,
@@ -1782,12 +1801,14 @@ impl Evaluator {
 
         let usage = extract_usage(&parsed);
 
-        let decision = if use_function_calling {
-            parse_tool_call(&parsed)
-        } else {
-            parse_json_content(&parsed)
+        // Routers commonly return HTTP 200 with an embedded error object.
+        if parsed.get("error").is_some() {
+            return Err(AttemptError::ClientError(provider_error_summary(&parsed)));
         }
-        .map_err(|e| AttemptError::ParseError(e.to_string()))?;
+
+        let decision = parse_decision_response(&parsed, use_function_calling).map_err(|e| {
+            AttemptError::ParseError(format!("{}; {}", e, response_shape_summary(&parsed)))
+        })?;
 
         Ok((decision, usage))
     }
@@ -2061,8 +2082,10 @@ fn build_confirm_verb_promotion_body(
 
 /// Build the OpenAI-compatible body for a function-calling request. The evaluator
 /// defines exactly one tool, `decide`, with a strict schema, and forces the model
-/// to call it via `tool_choice`.
+/// to call it via `tool_choice`. `api_url` selects the provider-appropriate
+/// reasoning-control field (see `add_reasoning_controls`).
 fn build_function_call_body(
+    api_url: &str,
     model: &str,
     system_prompt: &str,
     command: &str,
@@ -2095,9 +2118,9 @@ fn build_function_call_body(
         });
         required.push("reversibility");
     }
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
-        "max_tokens": 512,
+        "max_completion_tokens": DEFAULT_MAX_COMPLETION_TOKENS,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message}
@@ -2116,13 +2139,19 @@ fn build_function_call_body(
             }
         }],
         "tool_choice": {"type": "function", "function": {"name": "decide"}}
-    })
+    });
+    add_reasoning_controls(api_url, &mut body);
+    body
 }
 
 /// Build the request body for the fallback path: tell the model to emit a bare
 /// JSON object and parse it tolerantly. Used after a parse-error retry or when
-/// the provider does not support function calling.
+/// the provider does not support function calling. No `response_format` is
+/// sent: several routed models reject `json_object` mode, and the tolerant
+/// parser plus the dual-shape fallback (`parse_decision_response`) already
+/// absorb prose-wrapped output.
 fn build_json_response_body(
+    api_url: &str,
     model: &str,
     system_prompt: &str,
     command: &str,
@@ -2137,15 +2166,126 @@ fn build_json_response_body(
         "Command: {}\n\nRespond with ONLY a JSON object matching this schema (no prose, no markdown):\n{}",
         command, schema_hint
     );
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
-        "max_tokens": 512,
-        "response_format": {"type": "json_object"},
+        "max_completion_tokens": DEFAULT_MAX_COMPLETION_TOKENS,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message}
         ]
-    })
+    });
+    add_reasoning_controls(api_url, &mut body);
+    body
+}
+
+/// Ask the provider to spend as little hidden reasoning as possible: the
+/// decision schema needs no chain of thought, and reasoning tokens both bill
+/// and drain `max_completion_tokens`. OpenRouter uses a structured
+/// `reasoning` object (`exclude` drops reasoning from the response);
+/// OpenAI-compatible endpoints use the flat `reasoning_effort` field.
+/// Non-reasoning models ignore the field on both paths.
+fn add_reasoning_controls(api_url: &str, body: &mut serde_json::Value) {
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
+    if api_url.contains("openrouter.ai") {
+        obj.insert(
+            "reasoning".to_string(),
+            serde_json::json!({"effort": "minimal", "exclude": true}),
+        );
+    } else {
+        obj.insert("reasoning_effort".to_string(), serde_json::json!("minimal"));
+    }
+}
+
+/// Parse a provider response in the preferred mode, then fall back to the
+/// other valid OpenAI-compatible shape. Some routers/models ignore the
+/// request mode and return a tool call for a JSON request, or plain content
+/// for a tool-call request.
+fn parse_decision_response(
+    parsed: &serde_json::Value,
+    prefer_function_calling: bool,
+) -> Result<LlmResponse> {
+    let primary = if prefer_function_calling {
+        parse_tool_call(parsed)
+    } else {
+        parse_json_content(parsed)
+    };
+    match primary {
+        Ok(decision) => Ok(decision),
+        Err(primary_err) => {
+            let secondary = if prefer_function_calling {
+                parse_json_content(parsed)
+            } else {
+                parse_tool_call(parsed)
+            };
+            secondary.with_context(|| {
+                format!(
+                    "primary response parser failed: {}; fallback parser also failed",
+                    primary_err
+                )
+            })
+        }
+    }
+}
+
+/// Structural description of a response that failed to parse: key names,
+/// counts, and kinds only — never message content, so a provider echo of the
+/// (already redacted) command cannot ride an error string into logs.
+fn response_shape_summary(parsed: &serde_json::Value) -> String {
+    let top_keys = parsed
+        .as_object()
+        .map(|obj| obj.keys().cloned().collect::<Vec<_>>().join(","))
+        .unwrap_or_else(|| "<non-object>".to_string());
+    let choice_count = parsed
+        .get("choices")
+        .and_then(|v| v.as_array())
+        .map(Vec::len)
+        .unwrap_or(0);
+    let finish_reason = parsed
+        .pointer("/choices/0/finish_reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<none>");
+    let message_keys = parsed
+        .pointer("/choices/0/message")
+        .and_then(|v| v.as_object())
+        .map(|obj| obj.keys().cloned().collect::<Vec<_>>().join(","))
+        .unwrap_or_else(|| "<none>".to_string());
+    let content_kind = match parsed.pointer("/choices/0/message/content") {
+        Some(value) if value.is_null() => "null",
+        Some(value) if value.is_string() => "string",
+        Some(value) if value.is_array() => "array",
+        Some(_) => "other",
+        None => "missing",
+    };
+    let tool_call_count = parsed
+        .pointer("/choices/0/message/tool_calls")
+        .and_then(|v| v.as_array())
+        .map(Vec::len)
+        .unwrap_or(0);
+    format!(
+        "response_shape=top_keys:[{}] choices:{} finish_reason:{} message_keys:[{}] content:{} tool_calls:{}",
+        top_keys, choice_count, finish_reason, message_keys, content_kind, tool_call_count
+    )
+}
+
+/// Compact summary of a provider-embedded `error` object (an HTTP-200 body
+/// carrying an error, common behind routers). Message text is truncated.
+fn provider_error_summary(parsed: &serde_json::Value) -> String {
+    let message = parsed
+        .pointer("/error/message")
+        .and_then(|v| v.as_str())
+        .map(|message| truncate(message, 160))
+        .unwrap_or_else(|| "provider returned an error object".to_string());
+    let code = parsed
+        .pointer("/error/code")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<none>");
+    let error_type = parsed
+        .pointer("/error/type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<none>");
+    format!("{} (code={}, type={})", message, code, error_type)
 }
 
 /// Parse a function-calling response: `choices[0].message.tool_calls[0].function.arguments`
@@ -2189,21 +2329,50 @@ fn parse_tool_call(parsed: &serde_json::Value) -> Result<LlmResponse> {
 }
 
 /// Parse a JSON-response-format message: `choices[0].message.content` should be
-/// a JSON object, but small models often wrap it in markdown fences or prose.
+/// a JSON object, but small models often wrap it in markdown fences or prose,
+/// and some providers return content as an array of typed parts.
 fn parse_json_content(parsed: &serde_json::Value) -> Result<LlmResponse> {
-    let content = parsed
+    let content_value = parsed
         .pointer("/choices/0/message/content")
-        .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("no content in response"))?;
+    let content = message_content_to_text(content_value)?;
 
     if content.trim().is_empty() {
         bail!("empty content in response");
     }
 
-    let extracted = lax_extract_json(content)?;
+    let extracted = lax_extract_json(&content)?;
     let value: serde_json::Value = serde_json::from_str(&extracted)
         .with_context(|| format!("failed to parse extracted JSON: {}", extracted))?;
     decision_from_value(&value)
+}
+
+/// Flatten a message `content` value to text: plain string, or an array of
+/// parts holding text as bare strings, `{"text": ...}`, or `{"content": ...}`.
+fn message_content_to_text(value: &serde_json::Value) -> Result<String> {
+    if let Some(s) = value.as_str() {
+        return Ok(s.to_string());
+    }
+
+    if let Some(parts) = value.as_array() {
+        let mut text = String::new();
+        for part in parts {
+            if let Some(s) = part.as_str() {
+                text.push_str(s);
+                continue;
+            }
+            if let Some(s) = part.get("text").and_then(|v| v.as_str()) {
+                text.push_str(s);
+                continue;
+            }
+            if let Some(s) = part.get("content").and_then(|v| v.as_str()) {
+                text.push_str(s);
+            }
+        }
+        return Ok(text);
+    }
+
+    bail!("content was not text")
 }
 
 /// Build an LlmResponse from a parsed JSON value, accepting decision values
@@ -2997,16 +3166,119 @@ mod tests {
 
     #[test]
     fn schema_requires_reversibility_only_when_gating() {
-        let off = build_function_call_body("m", "sys", "ls", false);
+        let off = build_function_call_body(DEFAULT_API_URL, "m", "sys", "ls", false);
         let req_off = &off["tools"][0]["function"]["parameters"]["required"];
         assert!(!req_off.to_string().contains("reversibility"));
 
-        let on = build_function_call_body("m", "sys", "ls", true);
+        let on = build_function_call_body(DEFAULT_API_URL, "m", "sys", "ls", true);
         let req_on = &on["tools"][0]["function"]["parameters"]["required"];
         assert!(req_on.to_string().contains("reversibility"));
         assert!(
             on["tools"][0]["function"]["parameters"]["properties"]["reversibility"].is_object()
         );
+    }
+
+    #[test]
+    fn test_chat_bodies_use_reasoning_compatible_token_budget() {
+        let tool_body = build_function_call_body(DEFAULT_API_URL, "model", "system", "id", false);
+        let json_body = build_json_response_body(DEFAULT_API_URL, "model", "system", "id", false);
+
+        for body in [tool_body, json_body] {
+            assert!(body.get("max_tokens").is_none());
+            assert!(body.get("response_format").is_none());
+            assert!(body.get("reasoning_effort").is_none());
+            assert_eq!(
+                body.get("max_completion_tokens").and_then(|v| v.as_u64()),
+                Some(DEFAULT_MAX_COMPLETION_TOKENS as u64)
+            );
+            assert_eq!(
+                body.pointer("/reasoning/effort").and_then(|v| v.as_str()),
+                Some("minimal")
+            );
+        }
+    }
+
+    #[test]
+    fn test_direct_openai_chat_body_uses_native_reasoning_effort() {
+        let body = build_json_response_body(
+            "https://api.openai.com/v1/chat/completions",
+            "model",
+            "system",
+            "id",
+            false,
+        );
+        assert!(body.get("reasoning").is_none());
+        assert_eq!(
+            body.get("reasoning_effort").and_then(|v| v.as_str()),
+            Some("minimal")
+        );
+    }
+
+    #[test]
+    fn test_response_shape_summary_is_structural() {
+        let resp: serde_json::Value = serde_json::from_str(
+            r#"{"choices":[{"finish_reason":"length","message":{"role":"assistant","content":null}}],"usage":{"total_tokens":10}}"#,
+        )
+        .unwrap();
+        let summary = response_shape_summary(&resp);
+        assert!(summary.contains("finish_reason:length"));
+        assert!(summary.contains("content:null"));
+        assert!(summary.contains("tool_calls:0"));
+        assert!(!summary.contains("assistant"));
+    }
+
+    #[test]
+    fn test_provider_error_summary_is_bounded() {
+        let resp: serde_json::Value = serde_json::from_str(
+            r#"{"error":{"message":"Forbidden","code":"forbidden","type":"upstream_error"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            provider_error_summary(&resp),
+            "Forbidden (code=forbidden, type=upstream_error)"
+        );
+    }
+
+    #[test]
+    fn test_parse_decision_response_accepts_content_when_tool_call_expected() {
+        let resp: serde_json::Value = serde_json::from_str(
+            r#"{"choices":[{"message":{"content":"{\"decision\":\"APPROVE\",\"reason\":\"ok\",\"risk\":1}"}}]}"#,
+        )
+        .unwrap();
+        let d = parse_decision_response(&resp, true).unwrap();
+        assert_eq!(d.decision, "APPROVE");
+    }
+
+    #[test]
+    fn test_parse_decision_response_accepts_tool_call_when_content_expected() {
+        let resp: serde_json::Value = serde_json::from_str(
+            r#"{
+                "choices": [{
+                    "message": {
+                        "content": "",
+                        "tool_calls": [{
+                            "function": {
+                                "name": "decide",
+                                "arguments": "{\"decision\":\"APPROVE\",\"reason\":\"safe\",\"risk\":1}"
+                            }
+                        }]
+                    }
+                }]
+            }"#,
+        )
+        .unwrap();
+        let d = parse_decision_response(&resp, false).unwrap();
+        assert_eq!(d.decision, "APPROVE");
+    }
+
+    #[test]
+    fn test_parse_json_content_accepts_text_parts() {
+        let resp: serde_json::Value = serde_json::from_str(
+            r#"{"choices":[{"message":{"content":[{"type":"text","text":"{\"decision\":\"DENY\",\"reason\":\"bad\",\"risk\":9}"}]}}]}"#,
+        )
+        .unwrap();
+        let d = parse_json_content(&resp).unwrap();
+        assert_eq!(d.decision, "DENY");
     }
 
     #[test]
@@ -3617,6 +3889,49 @@ mod tests {
         let evaluator = mock_server_evaluator(port, 2, vec![]).await;
         let result = evaluator.evaluate_llm("id", None).await;
         assert!(result.is_allow(), "got: {}", result);
+        let _ = mock.await;
+    }
+
+    #[tokio::test]
+    async fn test_tool_choice_client_error_switches_to_json_format() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // First response: 404 refusing the forced tool_choice → downgraded to
+        // ParseError so the retry uses JSON mode. Second response: success.
+        let unsupported =
+            r#"{"error":{"message":"No endpoints found that support the provided 'tool_choice' value"}}"#
+                .to_string();
+        let good_body = r#"{"choices":[{"message":{"content":"{\"decision\":\"APPROVE\",\"reason\":\"ok\",\"risk\":1}"}}]}"#.to_string();
+        let responses = vec![(404, unsupported, None), (200, good_body, None)];
+        let mock = tokio::spawn(run_mock(listener, responses));
+
+        let evaluator = mock_server_evaluator(port, 2, vec![]).await;
+        let result = evaluator.evaluate_llm("pwd", None).await;
+        assert!(result.is_allow(), "got: {}", result);
+        let _ = mock.await;
+    }
+
+    #[tokio::test]
+    async fn test_embedded_provider_error_is_client_error_not_parse_noise() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // HTTP 200 with an embedded error object: classified ClientError
+        // (non-retriable, so exactly one request), and the chain must surface
+        // the provider message, not a "no tool_calls" parse error.
+        let err_body =
+            r#"{"error":{"message":"Forbidden","code":"forbidden","type":"upstream_error"}}"#
+                .to_string();
+        let responses = vec![(200, err_body, None)];
+        let mock = tokio::spawn(run_mock(listener, responses));
+
+        let evaluator = mock_server_evaluator(port, 0, vec![]).await;
+        let result = evaluator.evaluate_llm("id", None).await;
+        match result {
+            EvalResult::Error(msg) => {
+                assert!(msg.contains("Forbidden"), "got: {msg}");
+            }
+            other => panic!("expected Error, got {other}"),
+        }
         let _ = mock.await;
     }
 }
