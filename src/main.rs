@@ -6,7 +6,6 @@ mod client_config;
 mod grant_rules;
 mod injection;
 mod mcp;
-mod redact;
 mod secrets;
 mod server;
 mod session;
@@ -19,6 +18,7 @@ mod winsvc;
 
 use guard::evaluate;
 use guard::learned_rules::{AutoShimMode, LearnedRuleStore, LearningConfig};
+use guard::redact;
 
 use anyhow::{Context, Result};
 use clap::{ArgAction, CommandFactory, Parser, Subcommand};

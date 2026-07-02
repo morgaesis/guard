@@ -6,3 +6,4 @@ pub mod policy;
 pub mod principal;
 pub mod profile;
 pub mod proxy;
+pub mod redact;
