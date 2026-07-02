@@ -1359,7 +1359,10 @@ impl Evaluator {
         // happens in the caller's layer, not here.
         let redacted_command = redact_for_llm(command);
         if redacted_command != command {
-            tracing::info!("redacted secret-shaped content from LLM prompt");
+            // debug, not info: with the broadened redaction surface this
+            // fires on most commands carrying any high-entropy argument and
+            // would dominate the journal on secret-heavy traffic.
+            tracing::debug!("redacted secret-shaped content from LLM prompt");
         }
 
         let api_url = self.llm_config.api_url();
@@ -2347,10 +2350,13 @@ fn permissive_patterns() -> &'static (Regex, Regex) {
 /// the LLM. The audit log still sees the original command — redaction is a
 /// pre-LLM transform, not an output transform.
 ///
-/// Any match is replaced with `[REDACTED]`. Patterns are conservative: the AWS
-/// secret-key pattern in particular only fires when paired with a `secret`
-/// context word nearby, because bare 40-char base64 is common in totally benign
-/// commands.
+/// This list holds ONLY the LLM-path delta over the shared engine in
+/// `crate::redact` (which `redact_for_llm` runs afterward): command text
+/// arrives as one multi-line string, so PEM blocks need a dotall match
+/// across lines, where the line-oriented output engine matches the header
+/// line only. Named `KEY=value` pairs, provider key prefixes (`sk-*`,
+/// `AKIA*`), JWTs, `Bearer`/`Basic` tokens, and high-entropy values are all
+/// covered by the shared engine — do not re-add them here.
 fn llm_redaction_patterns() -> &'static Vec<(Regex, &'static str)> {
     static P: OnceLock<Vec<(Regex, &str)>> = OnceLock::new();
     P.get_or_init(|| {
@@ -2360,44 +2366,6 @@ fn llm_redaction_patterns() -> &'static Vec<(Regex, &'static str)> {
                 Regex::new(r"(?s)-----BEGIN [A-Z ]+-----.*?-----END [A-Z ]+-----")
                     .expect("valid regex"),
                 "[REDACTED]",
-            ),
-            // OpenRouter-style key (more specific prefix than OpenAI, so match first).
-            (
-                Regex::new(r"sk-or-[A-Za-z0-9_-]{30,}").expect("valid regex"),
-                "[REDACTED]",
-            ),
-            // Anthropic-style key.
-            (
-                Regex::new(r"sk-ant-[A-Za-z0-9_-]{30,}").expect("valid regex"),
-                "[REDACTED]",
-            ),
-            // OpenAI-style key (generic sk- prefix).
-            (
-                Regex::new(r"sk-[A-Za-z0-9_-]{30,}").expect("valid regex"),
-                "[REDACTED]",
-            ),
-            // AWS Access Key ID.
-            (
-                Regex::new(r"AKIA[0-9A-Z]{16}").expect("valid regex"),
-                "[REDACTED]",
-            ),
-            // Generic JWT (3-segment, eyJ header).
-            (
-                Regex::new(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
-                    .expect("valid regex"),
-                "[REDACTED]",
-            ),
-            // Bearer tokens.
-            (
-                Regex::new(r"Bearer\s+[A-Za-z0-9._~+/-]{20,}").expect("valid regex"),
-                "Bearer [REDACTED]",
-            ),
-            // AWS secret access key: only when paired with a `secret` context.
-            // Matches `aws_secret_access_key=<40 base64/+/ chars>` or similar.
-            (
-                Regex::new(r"(?i)(secret[_a-z]*\s*[=:]\s*['\x22]?)([A-Za-z0-9/+]{40})")
-                    .expect("valid regex"),
-                "${1}[REDACTED]",
             ),
         ]
     })

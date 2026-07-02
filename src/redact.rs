@@ -23,9 +23,12 @@ fn redaction_patterns() -> &'static Vec<(Regex, &'static str)> {
             (Regex::new(r"sk-[A-Za-z0-9_-]{20,}").unwrap(), "[REDACTED]"),
             // AWS access key id
             (Regex::new(r"\bAKIA[0-9A-Z]{16}\b").unwrap(), "[REDACTED]"),
-            // JWT tokens (eyJ header)
+            // JWT tokens (eyJ header). The first-segment minimum of 8 admits
+            // the shortest real headers (`{"alg":"none"}` encodes to 16
+            // chars after `eyJ`) while the three-segment dot structure keeps
+            // prose from matching.
             (
-                Regex::new(r"eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+").unwrap(),
+                Regex::new(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+").unwrap(),
                 "[REDACTED]",
             ),
             // Standalone long base64 blobs (lines of 40+ base64 chars, like encoded keys/certs)
@@ -51,8 +54,18 @@ fn bare_token_pattern() -> &'static Regex {
 /// material: it must mix upper case, lower case, and digits. This skips long
 /// lowercase hex digests (sha256 sums), kebab-case slugs, and all-caps
 /// identifiers, none of which are credentials. Random base64url of this
-/// length fails the test with negligible probability.
+/// length fails the test with negligible probability (~2e-8 for 86 chars).
+///
+/// Deliberate limit: a bare single-case or hex-only credential (some
+/// providers issue 64-hex tokens) is indistinguishable from a sha256 digest
+/// without name context, and digests are pervasive in docker/git output --
+/// so a bare one is not redacted here. The named, flow-style, and catch-all
+/// passes still cover such a credential anywhere a key name or `NAME=` shape
+/// accompanies it.
 fn redact_bare_long_tokens(text: &str) -> String {
+    if !bare_token_pattern().is_match(text) {
+        return text.to_string();
+    }
     bare_token_pattern()
         .replace_all(text, |caps: &regex::Captures| {
             let run = &caps[0];
@@ -68,17 +81,38 @@ fn redact_bare_long_tokens(text: &str) -> String {
         .to_string()
 }
 
+/// Secret-bearing key-name shape, shared by the name-based pass and the
+/// flow-style name/value pass. KEY and PASS require a non-empty prefix: bare
+/// `key:` and `pass:` fields are pervasive structural metadata (Kubernetes
+/// selector/toleration `key:` entries, Docker JSON `"Key"` members, test
+/// reports' `pass:`) and are never credentials by themselves. Bare `token:`,
+/// `secret:`, `auth:`, and `cred(s):` DO match: an inline scalar under those
+/// names is a credential often enough (docker `config.json` `"auth"`,
+/// `token:` in kubeconfigs) that redaction wins the trade.
+const SECRET_NAME_SUBPATTERN: &str = r"(?:[A-Za-z0-9_.-]*(?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIALS?|CREDS?|AUTHORIZATION|AUTH|BEARER)|[A-Za-z0-9_.-]+(?:KEY|PASS))";
+
+/// Value shape consumed after a secret-bearing name: a full double-quoted
+/// string (escaped quotes included, newlines excluded), a full single-quoted
+/// string, or an unquoted run. Consuming quoted values whole prevents a
+/// secret with spaces or escaped quotes from leaking its tail
+/// (`password: "abc def"` must not become `password: "[REDACTED] def"`).
+const SECRET_VALUE_SUBPATTERN: &str = r#"(?:"(?:\\.|[^"\\\n])*"|'[^'\n]*'|[^"'\s}{,]+)"#;
+
 /// Name-based secret redaction: a key name ending in a secret-bearing word,
-/// followed by `=` or `:`, has its value redacted regardless of the value's
-/// shape. Handles unquoted env/CLI pairs (`MY_TOKEN=x`, `--api-key=x`), YAML
-/// (`password: x`), and JSON with quoted names and values
-/// (`"apikey": "x",` -- the shape CloudStack/cmk responses use).
+/// followed by `=`/`:` (or their URL-encoded forms `%3D`/`%3A`, so query
+/// strings in logged URLs cannot smuggle a value past the separator check),
+/// has its value redacted regardless of the value's shape. Handles unquoted
+/// env/CLI pairs (`MY_TOKEN=x`, `--api-key=x`), YAML (`password: x`), and
+/// JSON with quoted names and values (`"apikey": "x",` -- the shape
+/// CloudStack/cmk responses use).
 fn named_secret_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
-        Regex::new(
-            r#"(?i)(["']?)([A-Za-z0-9_.-]*(?:TOKEN|KEY|SECRET|PASSWORD|PASSWD|PASSPHRASE|PASS|CREDENTIALS?|CREDS?|AUTHORIZATION|AUTH|BEARER))(["']?\s*[=:]\s*["']?)([^"'\s}{,]+)"#,
-        )
+        Regex::new(&format!(
+            r#"(?i)(["']?)({name})(["']?\s*(?:[=:]|%3[dDaA])\s*)({value})"#,
+            name = SECRET_NAME_SUBPATTERN,
+            value = SECRET_VALUE_SUBPATTERN,
+        ))
         .unwrap()
     })
 }
@@ -104,7 +138,22 @@ const NAMED_SECRET_STOPLIST: &[&str] = &[
     "sacred",
 ];
 
+/// Replacement for a consumed value, preserving the value's quote style so
+/// redacted JSON/YAML stays parseable (`"apikey": "[REDACTED]"`).
+fn redacted_value_like(value: &str) -> &'static str {
+    if value.starts_with('"') {
+        "\"[REDACTED]\""
+    } else if value.starts_with('\'') {
+        "'[REDACTED]'"
+    } else {
+        "[REDACTED]"
+    }
+}
+
 fn redact_named_secrets(text: &str) -> String {
+    if !named_secret_pattern().is_match(text) {
+        return text.to_string();
+    }
     named_secret_pattern()
         .replace_all(text, |caps: &regex::Captures| {
             let name = &caps[2];
@@ -114,7 +163,57 @@ fn redact_named_secrets(text: &str) -> String {
             {
                 caps[0].to_string()
             } else {
-                format!("{}{}{}[REDACTED]", &caps[1], &caps[2], &caps[3])
+                format!(
+                    "{}{}{}{}",
+                    &caps[1],
+                    &caps[2],
+                    &caps[3],
+                    redacted_value_like(&caps[4])
+                )
+            }
+        })
+        .to_string()
+}
+
+/// Flow-style / single-line JSON `name`/`value` pairs:
+/// `env: [{name: API_TOKEN, value: abc123}]` or
+/// `{"name": "DB_PASSWORD", "value": "hunter2"}`. The stateful
+/// `name:`-then-`value:` pass only pairs across ADJACENT LINES, and the
+/// catch-all deliberately excludes the generic `value` key, so without this
+/// pass a low-entropy secret in flow style leaks. Only fires when the
+/// `name` member's value has a secret-bearing shape.
+fn flow_name_value_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(&format!(
+            r#"(?i)(["']?name["']?\s*:\s*["']?)({name})(["']?\s*,\s*["']?value["']?\s*:\s*)({value})"#,
+            name = SECRET_NAME_SUBPATTERN,
+            value = SECRET_VALUE_SUBPATTERN,
+        ))
+        .unwrap()
+    })
+}
+
+fn redact_flow_name_values(text: &str) -> String {
+    if !flow_name_value_pattern().is_match(text) {
+        return text.to_string();
+    }
+    flow_name_value_pattern()
+        .replace_all(text, |caps: &regex::Captures| {
+            let name = &caps[2];
+            if NAMED_SECRET_STOPLIST
+                .iter()
+                .any(|stop| name.eq_ignore_ascii_case(stop))
+            {
+                caps[0].to_string()
+            } else {
+                format!(
+                    "{}{}{}{}",
+                    &caps[1],
+                    &caps[2],
+                    &caps[3],
+                    redacted_value_like(&caps[4])
+                )
             }
         })
         .to_string()
@@ -178,6 +277,9 @@ const CATCHALL_EXCLUDED_NAMES: &[&str] = &[
 /// has no lookahead, so the exclusion is a code-level check in the
 /// replacement closure rather than part of the pattern itself.
 fn redact_catchall(text: &str) -> String {
+    if !catchall_pattern().is_match(text) {
+        return text.to_string();
+    }
     catchall_pattern()
         .replace_all(text, |caps: &regex::Captures| {
             let name = &caps[2];
@@ -221,9 +323,15 @@ pub fn redact_output(text: &str) -> String {
     let mut result = text.to_string();
 
     for (pattern, replacement) in redaction_patterns() {
-        result = pattern.replace_all(&result, *replacement).to_string();
+        // is_match first: redaction runs per output line of every guarded
+        // command, and most lines match nothing -- skip the allocation
+        // replace_all + to_string would otherwise pay on every pass.
+        if pattern.is_match(&result) {
+            result = pattern.replace_all(&result, *replacement).to_string();
+        }
     }
 
+    let result = redact_flow_name_values(&result);
     let result = redact_named_secrets(&result);
     let result = redact_bare_long_tokens(&result);
     redact_catchall(&result)
@@ -279,7 +387,7 @@ pub fn redact_output_text(text: &str) -> String {
 pub fn redact_exact_secrets(text: &str, secrets: &[&str]) -> String {
     let mut result = text.to_string();
     for secret in secrets {
-        if secret.len() >= 8 && !secret.is_empty() {
+        if secret.len() >= 8 && result.contains(*secret) {
             result = result.replace(*secret, "[REDACTED]");
         }
     }
@@ -592,6 +700,102 @@ mod tests {
         let input = "aws_access_key_id = AKIAIOSFODNN7EXAMPLE";
         let output = redact_output_text(input);
         assert!(!output.contains("AKIAIOSFODNN7EXAMPLE"), "got: {output}");
+    }
+
+    #[test]
+    fn test_no_redact_bare_key_field_kubernetes_selector() {
+        // Bare `key:` is structural metadata (selectors, tolerations), not a
+        // credential; it must never be redacted.
+        let input = "      - key: kubernetes.io/hostname\n        operator: In\n      - key: node-role.kubernetes.io/control-plane";
+        let output = redact_output_text(input);
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn test_no_redact_bare_key_field_docker_json() {
+        let input = r#"  {"Key": "com.docker.compose.project", "Value": "guard"}"#;
+        let output = redact_output_text(input);
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn test_no_redact_bare_pass_field() {
+        let input = "pass: true\nfail: 0";
+        let output = redact_output_text(input);
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn test_redact_flow_style_yaml_env_pair() {
+        let input = "env: [{name: API_TOKEN, value: abc123def456}]";
+        let output = redact_output_text(input);
+        assert!(!output.contains("abc123def456"), "got: {output}");
+        assert!(output.contains("API_TOKEN"), "got: {output}");
+    }
+
+    #[test]
+    fn test_redact_flow_style_json_env_pair() {
+        let input = r#"{"name": "DB_PASSWORD", "value": "hunter2"}"#;
+        let output = redact_output_text(input);
+        assert!(!output.contains("hunter2"), "got: {output}");
+        assert!(output.contains("DB_PASSWORD"), "got: {output}");
+    }
+
+    #[test]
+    fn test_no_redact_flow_style_non_secret_pair() {
+        let input = "env: [{name: LOG_LEVEL, value: debug}]";
+        let output = redact_output_text(input);
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn test_redact_quoted_value_with_spaces_no_tail_leak() {
+        let input = r#"password: "correct horse battery staple""#;
+        let output = redact_output_text(input);
+        assert!(!output.contains("horse"), "tail leaked: {output}");
+        assert!(!output.contains("staple"), "tail leaked: {output}");
+        assert!(output.contains("[REDACTED]"), "got: {output}");
+    }
+
+    #[test]
+    fn test_redact_quoted_value_with_escaped_quote() {
+        let input = r#""password": "ab\"cd efgh""#;
+        let output = redact_output_text(input);
+        assert!(!output.contains("efgh"), "tail leaked: {output}");
+        assert!(output.contains("[REDACTED]"), "got: {output}");
+    }
+
+    #[test]
+    fn test_redact_url_encoded_separator() {
+        let input = "GET /cb?access_token%3Dsupersecretvalue123 HTTP/1.1";
+        let output = redact_output_text(input);
+        assert!(!output.contains("supersecretvalue123"), "got: {output}");
+        assert!(output.contains("[REDACTED]"), "got: {output}");
+    }
+
+    #[test]
+    fn test_redacted_json_stays_quoted() {
+        let input = r#""secretkey": "yVdeOc2BpPsUtozcx13Mp96CyCJPKm9wZycmXgLA0uXSuT""#;
+        let output = redact_output_text(input);
+        assert!(
+            output.contains(r#""secretkey": "[REDACTED]""#),
+            "quote style must be preserved, got: {output}"
+        );
+    }
+
+    #[test]
+    fn test_redact_short_header_jwt() {
+        // {"alg":"none"} encodes to a 16-char first segment after eyJ.
+        let input = "token eyJhbGciOiJub25lIn0.eyJzdWIiOiJhIn0.x1y2z3";
+        let output = redact_output_text(input);
+        assert!(!output.contains("eyJhbGciOiJub25lIn0"), "got: {output}");
+    }
+
+    #[test]
+    fn test_no_redact_ansible_status_line() {
+        let input = "ok: [agents-k] => {\"changed\": false, \"ping\": \"pong\"}";
+        let output = redact_output_text(input);
+        assert_eq!(output, input);
     }
 
     #[test]
