@@ -7756,7 +7756,14 @@ mod tests {
             &["-oConnectTimeout=5", "host01", "id"][..],
             // Host-key handling injected by the --hostkey mode must not
             // knock the diagnostic off the fast path.
-            &["-o", "StrictHostKeyChecking=accept-new", "-o", "UpdateHostKeys=yes", "host01", "id"][..],
+            &[
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                "UpdateHostKeys=yes",
+                "host01",
+                "id",
+            ][..],
         ] {
             assert!(
                 ssh_options_all_readonly_safe(&args(ok)),
@@ -7823,7 +7830,10 @@ mod tests {
         // argument, not an ssh option, and ssh does not re-parse it; it does
         // not affect the fast-path decision for the (fixed) command itself.
         assert!(ssh_options_all_readonly_safe(&args(&[
-            "host01", "id", "-o", "ProxyCommand=nc x 22"
+            "host01",
+            "id",
+            "-o",
+            "ProxyCommand=nc x 22"
         ])));
     }
 
@@ -7853,7 +7863,9 @@ mod tests {
         // Security-preserving values keep the fast path (accept-new is what
         // the --hostkey mode injects).
         assert!(ssh_o_directive_readonly_safe("StrictHostKeyChecking=yes"));
-        assert!(ssh_o_directive_readonly_safe("StrictHostKeyChecking=accept-new"));
+        assert!(ssh_o_directive_readonly_safe(
+            "StrictHostKeyChecking=accept-new"
+        ));
         // Disabling or deferring host-key verification forfeits to the
         // evaluator rather than auto-allowing over an unauthenticated channel.
         for weak in [
