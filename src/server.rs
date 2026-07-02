@@ -179,6 +179,42 @@ impl std::fmt::Display for CallerIdentity {
     }
 }
 
+/// How ssh should treat the remote host key for a guarded ssh command.
+/// Default (`OnlyExisting`) preserves ssh's own strict behavior: the daemon
+/// injects nothing, so a first-contact host still fails closed. The relaxed
+/// modes are opt-in and only ever apply when `binary == "ssh"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SshHostKeyMode {
+    /// Only connect to hosts already in known_hosts (no injection).
+    OnlyExisting,
+    /// Trust-on-first-use: accept and record an unknown host key, but still
+    /// refuse if a known key changed (`StrictHostKeyChecking=accept-new`).
+    AcceptNew,
+    /// Accept any host key without recording it (`StrictHostKeyChecking=no`,
+    /// `UserKnownHostsFile=/dev/null`). This gives up host authentication and
+    /// is intentionally excluded from the deterministic fast path.
+    AcceptAll,
+}
+
+impl SshHostKeyMode {
+    /// The ssh `-o` options this mode injects ahead of the caller's args.
+    /// `OnlyExisting` injects nothing so the default is a no-op.
+    fn ssh_options(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Self::OnlyExisting => &[],
+            Self::AcceptNew => &[
+                ("StrictHostKeyChecking", "accept-new"),
+                ("UpdateHostKeys", "yes"),
+            ],
+            Self::AcceptAll => &[
+                ("StrictHostKeyChecking", "no"),
+                ("UserKnownHostsFile", "/dev/null"),
+            ],
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecuteRequest {
     pub binary: String,
@@ -226,6 +262,37 @@ pub struct ExecuteRequest {
     /// Safe for any caller: its only effect is "ask the LLM again."
     #[serde(default)]
     pub reevaluate: bool,
+    /// SSH host-key behavior for first-contact workflows. Only applied when
+    /// `binary == "ssh"`; the default (`None`/`OnlyExisting`) preserves ssh's
+    /// existing strict host-key checking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_hostkey: Option<SshHostKeyMode>,
+}
+
+impl ExecuteRequest {
+    /// Prepend the ssh `-o` options implied by the requested host-key mode so
+    /// the policy decision, the evaluator, the audit log, and the spawned
+    /// process all see the identical command. A no-op for non-ssh binaries and
+    /// for `OnlyExisting`/absent modes, which keep ssh's strict default.
+    fn apply_ssh_hostkey_options(&mut self) {
+        if self.binary != "ssh" {
+            return;
+        }
+        let options = match self.ssh_hostkey {
+            Some(mode) => mode.ssh_options(),
+            None => return,
+        };
+        if options.is_empty() {
+            return;
+        }
+        let mut injected = Vec::with_capacity(self.args.len() + options.len() * 2);
+        for (key, value) in options {
+            injected.push("-o".to_string());
+            injected.push(format!("{key}={value}"));
+        }
+        injected.append(&mut self.args);
+        self.args = injected;
+    }
 }
 
 /// A structured rollback command (no shell). Each arg is a single argv element.
@@ -3517,6 +3584,12 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         }
     }
 
+    // Fold the requested ssh host-key mode into the command now that the verb
+    // (if any) has been rendered. From here on, request.args carries any
+    // injected `-o` options, so the policy decision, the evaluator, the audit
+    // record, and the spawned process all act on the same command.
+    request.apply_ssh_hostkey_options();
+
     // Check recursion depth
     let depth: u32 = std::env::var("GUARD_DEPTH")
         .ok()
@@ -3789,8 +3862,14 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
     // read-only commands. Like a trusted verb, it is a deterministic allow
     // that precedes the evaluator; it never applies when the caller injected
     // env/secrets (which could change the command's meaning) and is disabled
-    // in paranoid mode.
-    if request.env.is_empty() && request.secrets.is_empty() {
+    // in paranoid mode. `accept-all` host-key mode is excluded explicitly:
+    // its injected `StrictHostKeyChecking=no` already fails the ssh option
+    // allow-list, but keeping the guard here documents that giving up host
+    // authentication never rides the fast path even if the diagnostic is fixed.
+    if request.env.is_empty()
+        && request.secrets.is_empty()
+        && !matches!(request.ssh_hostkey, Some(SshHostKeyMode::AcceptAll))
+    {
         if let Some(reason) =
             deterministic_safe_allow_reason(config, &request.binary, &request.args)
         {
@@ -5713,6 +5792,7 @@ async fn execute_snapshot(
         revert: None,
         confirm_within_secs: None,
         reevaluate: false,
+        ssh_hostkey: None,
         require_approval: None,
         wait_approval_secs: None,
         verb: None,
@@ -5819,6 +5899,7 @@ async fn run_provisional_revert(config: &ServerConfig, p: &Provisional) -> Execu
         revert: None,
         confirm_within_secs: None,
         reevaluate: false,
+        ssh_hostkey: None,
         require_approval: None,
         wait_approval_secs: None,
         verb: None,
@@ -6638,6 +6719,7 @@ pub struct Client {
     wait_approval_secs: Option<u64>,
     verb: Option<VerbInvocation>,
     reevaluate: bool,
+    ssh_hostkey: Option<SshHostKeyMode>,
 }
 
 impl Client {
@@ -6654,6 +6736,7 @@ impl Client {
             wait_approval_secs: None,
             verb: None,
             reevaluate: false,
+            ssh_hostkey: None,
         }
     }
 
@@ -6668,6 +6751,14 @@ impl Client {
     /// `PolicyEngine` deny rule.
     pub fn with_reevaluate(mut self, reevaluate: bool) -> Self {
         self.reevaluate = reevaluate;
+        self
+    }
+
+    /// Set the ssh host-key mode carried onto each `guard run` request. Only
+    /// affects ssh commands; the daemon injects the corresponding `-o` options
+    /// server-side before evaluation and execution.
+    pub fn with_hostkey(mut self, mode: SshHostKeyMode) -> Self {
+        self.ssh_hostkey = Some(mode);
         self
     }
 
@@ -6887,6 +6978,7 @@ impl Client {
             wait_approval_secs: self.wait_approval_secs,
             verb: self.verb.clone(),
             reevaluate: self.reevaluate,
+            ssh_hostkey: self.ssh_hostkey,
         }
     }
 
@@ -7362,6 +7454,7 @@ mod tests {
             revert: None,
             confirm_within_secs: None,
             reevaluate: false,
+            ssh_hostkey: None,
             require_approval: None,
             wait_approval_secs: None,
             verb: None,
@@ -7442,6 +7535,7 @@ mod tests {
             revert: None,
             confirm_within_secs: None,
             reevaluate: false,
+            ssh_hostkey: None,
             require_approval: None,
             wait_approval_secs: None,
             verb: None,
@@ -7500,6 +7594,7 @@ mod tests {
             revert: None,
             confirm_within_secs: None,
             reevaluate: false,
+            ssh_hostkey: None,
             require_approval: None,
             wait_approval_secs: None,
             verb: None,
@@ -7535,6 +7630,7 @@ mod tests {
             revert: None,
             confirm_within_secs: None,
             reevaluate: false,
+            ssh_hostkey: None,
             require_approval: None,
             wait_approval_secs: None,
             verb: None,
@@ -7716,6 +7812,94 @@ mod tests {
         let (cfg, _buf) = make_test_config();
         let reason = deterministic_safe_allow_reason(&cfg, "ssh", &args(&["host01", "id"]));
         assert!(reason.is_some(), "fixed ssh diagnostic should be allowed");
+    }
+
+    fn ssh_request(mode: Option<SshHostKeyMode>, argv: &[&str]) -> ExecuteRequest {
+        ExecuteRequest {
+            binary: "ssh".to_string(),
+            args: args(argv),
+            auth_token: None,
+            env: HashMap::new(),
+            secrets: HashMap::new(),
+            stream: false,
+            session_token: None,
+            revert: None,
+            confirm_within_secs: None,
+            require_approval: None,
+            wait_approval_secs: None,
+            verb: None,
+            reevaluate: false,
+            ssh_hostkey: mode,
+        }
+    }
+
+    #[test]
+    fn apply_ssh_hostkey_injects_options_by_mode() {
+        // OnlyExisting / absent: no change, ssh keeps its strict default.
+        for mode in [None, Some(SshHostKeyMode::OnlyExisting)] {
+            let mut req = ssh_request(mode, &["host01", "id"]);
+            req.apply_ssh_hostkey_options();
+            assert_eq!(req.args, args(&["host01", "id"]), "mode {mode:?}");
+        }
+
+        // AcceptNew prepends accept-new + UpdateHostKeys ahead of the host.
+        let mut req = ssh_request(Some(SshHostKeyMode::AcceptNew), &["host01", "id"]);
+        req.apply_ssh_hostkey_options();
+        assert_eq!(
+            req.args,
+            args(&[
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                "UpdateHostKeys=yes",
+                "host01",
+                "id",
+            ])
+        );
+
+        // AcceptAll gives up host verification.
+        let mut req = ssh_request(Some(SshHostKeyMode::AcceptAll), &["host01", "id"]);
+        req.apply_ssh_hostkey_options();
+        assert_eq!(
+            req.args,
+            args(&[
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "host01",
+                "id",
+            ])
+        );
+    }
+
+    #[test]
+    fn apply_ssh_hostkey_is_noop_for_non_ssh() {
+        let mut req = ssh_request(Some(SshHostKeyMode::AcceptAll), &["get", "pods"]);
+        req.binary = "kubectl".to_string();
+        req.apply_ssh_hostkey_options();
+        assert_eq!(req.args, args(&["get", "pods"]));
+    }
+
+    #[test]
+    fn accept_new_hostkey_keeps_fixed_diagnostic_on_fast_path() {
+        // The options accept-new injects are allow-listed, so a fixed
+        // diagnostic still qualifies for the deterministic fast path.
+        let (cfg, _buf) = make_test_config();
+        let mut req = ssh_request(Some(SshHostKeyMode::AcceptNew), &["host01", "id"]);
+        req.apply_ssh_hostkey_options();
+        assert!(deterministic_safe_allow_reason(&cfg, "ssh", &req.args).is_some());
+    }
+
+    #[test]
+    fn accept_all_hostkey_forfeits_fast_path() {
+        // accept-all injects StrictHostKeyChecking=no, which the option
+        // allow-list rejects, so even a fixed diagnostic forfeits to the
+        // evaluator rather than auto-allowing over an unauthenticated channel.
+        let (cfg, _buf) = make_test_config();
+        let mut req = ssh_request(Some(SshHostKeyMode::AcceptAll), &["host01", "id"]);
+        req.apply_ssh_hostkey_options();
+        assert!(deterministic_safe_allow_reason(&cfg, "ssh", &req.args).is_none());
     }
 
     #[test]
@@ -7951,6 +8135,7 @@ mod tests {
             revert: None,
             confirm_within_secs: None,
             reevaluate: false,
+            ssh_hostkey: None,
             require_approval: None,
             wait_approval_secs: None,
             verb: Some(VerbInvocation {
@@ -7999,6 +8184,7 @@ mod tests {
             revert: None,
             confirm_within_secs: None,
             reevaluate: false,
+            ssh_hostkey: None,
             require_approval: None,
             wait_approval_secs: None,
             verb: Some(VerbInvocation {
@@ -8049,6 +8235,7 @@ mod tests {
             revert: None,
             confirm_within_secs: None,
             reevaluate: false,
+            ssh_hostkey: None,
             require_approval: None,
             wait_approval_secs: None,
             verb: None,
@@ -8101,6 +8288,7 @@ mod tests {
             revert: None,
             confirm_within_secs: None,
             reevaluate: false,
+            ssh_hostkey: None,
             require_approval: None,
             wait_approval_secs: None,
             verb: None,
@@ -8376,6 +8564,7 @@ mod tests {
             revert: None,
             confirm_within_secs: None,
             reevaluate: false,
+            ssh_hostkey: None,
             require_approval: None,
             wait_approval_secs: None,
             verb: None,
@@ -8448,6 +8637,7 @@ mod tests {
             revert: None,
             confirm_within_secs: None,
             reevaluate: false,
+            ssh_hostkey: None,
             require_approval: None,
             wait_approval_secs: None,
             verb: None,
@@ -8500,6 +8690,7 @@ mod tests {
             revert: None,
             confirm_within_secs: None,
             reevaluate: false,
+            ssh_hostkey: None,
             require_approval: None,
             wait_approval_secs: None,
             verb: None,
@@ -8764,6 +8955,7 @@ mod tests {
             revert: Some(revert),
             confirm_within_secs: None,
             reevaluate: false,
+            ssh_hostkey: None,
             require_approval: None,
             wait_approval_secs: None,
             verb: None,
@@ -9130,6 +9322,7 @@ mod tests {
             revert: None,
             confirm_within_secs: None,
             reevaluate: false,
+            ssh_hostkey: None,
             require_approval: None,
             wait_approval_secs: None,
             verb: None,
@@ -9217,6 +9410,7 @@ mod tests {
             revert: None,
             confirm_within_secs: None,
             reevaluate: false,
+            ssh_hostkey: None,
             require_approval: None,
             wait_approval_secs: None,
             verb: None,
@@ -9298,6 +9492,7 @@ mod tests {
             revert: None,
             confirm_within_secs: None,
             reevaluate: false,
+            ssh_hostkey: None,
             require_approval: None,
             wait_approval_secs: None,
             verb: None,
@@ -9378,6 +9573,7 @@ mod tests {
             revert: None,
             confirm_within_secs: None,
             reevaluate: false,
+            ssh_hostkey: None,
             require_approval: None,
             wait_approval_secs: None,
             verb: None,
@@ -9450,6 +9646,7 @@ mod tests {
             revert: None,
             confirm_within_secs: None,
             reevaluate: false,
+            ssh_hostkey: None,
             require_approval: None,
             wait_approval_secs: None,
             verb: None,
@@ -9526,6 +9723,7 @@ mod tests {
             revert: None,
             confirm_within_secs: None,
             reevaluate: false,
+            ssh_hostkey: None,
             require_approval: None,
             wait_approval_secs: None,
             verb: None,

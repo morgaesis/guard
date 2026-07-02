@@ -9,9 +9,13 @@ User=guard
 Group=guard
 WorkingDirectory=/var/lib/guard
 EnvironmentFile=-/etc/default/guard
+# The daemon spawns ssh itself, so `guard run ssh --hostkey accept-new` needs a
+# writable HOME/.ssh for ssh to record newly accepted host keys. Pin HOME to the
+# state directory and have systemd pre-create .ssh (owned by the guard user).
+Environment=HOME=/var/lib/guard
 RuntimeDirectory=guard
 RuntimeDirectoryMode=0755
-StateDirectory=guard
+StateDirectory=guard guard/.ssh
 ExecStart=/usr/local/bin/guard server start --socket /run/guard/guard.sock --state-db /var/lib/guard/state.db
 Restart=on-failure
 RestartSec=5

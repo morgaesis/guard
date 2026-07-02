@@ -74,6 +74,13 @@ enum MainArgs {
         /// should be allowed.
         #[arg(long = "reevaluate", action = ArgAction::SetTrue)]
         reevaluate: bool,
+        /// SSH host-key policy for a guarded `ssh` command. `only-existing`
+        /// (default) keeps ssh's strict checking; `accept-new` trusts a new
+        /// host on first contact but still rejects a changed key; `accept-all`
+        /// gives up host verification and never rides the deterministic fast
+        /// path. Only affects `ssh`.
+        #[arg(long = "hostkey", value_enum, default_value = "only-existing")]
+        hostkey: SshHostKeyCliMode,
         /// Binary to execute
         binary: String,
         /// Arguments to pass to the binary
@@ -973,6 +980,7 @@ async fn main() -> Result<()> {
             require_approval,
             wait_approval,
             reevaluate,
+            hostkey,
             binary,
             args,
         }) => {
@@ -985,7 +993,7 @@ async fn main() -> Result<()> {
                 wait_approval,
                 reevaluate,
             };
-            run_exec(binary, args, env_vars, secret_vars, gating).await
+            run_exec(binary, args, env_vars, secret_vars, gating, hostkey.into()).await
         }
         Ok(MainArgs::Server(cmd)) => run_server(cmd).await,
         Ok(MainArgs::Profile(cmd)) => handle_profile(cmd),
@@ -2052,6 +2060,25 @@ struct GatingOptions {
     reevaluate: bool,
 }
 
+/// CLI spelling of the ssh host-key mode. Kebab-case value names
+/// (`only-existing`, `accept-new`, `accept-all`) are derived by clap.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum SshHostKeyCliMode {
+    OnlyExisting,
+    AcceptNew,
+    AcceptAll,
+}
+
+impl From<SshHostKeyCliMode> for server::SshHostKeyMode {
+    fn from(value: SshHostKeyCliMode) -> Self {
+        match value {
+            SshHostKeyCliMode::OnlyExisting => Self::OnlyExisting,
+            SshHostKeyCliMode::AcceptNew => Self::AcceptNew,
+            SshHostKeyCliMode::AcceptAll => Self::AcceptAll,
+        }
+    }
+}
+
 /// Parse a `--revert "binary arg1 arg2"` string into a structured RevertSpec
 /// (no shell is ever run; this only splits the operator's command into argv).
 fn parse_revert(spec: &str) -> Result<server::RevertSpec> {
@@ -2084,6 +2111,7 @@ async fn run_exec(
     env_vars: HashMap<String, String>,
     secret_vars: HashMap<String, String>,
     gating: GatingOptions,
+    hostkey: server::SshHostKeyMode,
 ) -> Result<()> {
     let config = client_config::ClientConfig::load().ok().unwrap_or_default();
 
@@ -2101,7 +2129,8 @@ async fn run_exec(
             gating.require_approval,
             gating.wait_approval,
         )
-        .with_reevaluate(gating.reevaluate);
+        .with_reevaluate(gating.reevaluate)
+        .with_hostkey(hostkey);
     if let Some(token) = config.auth_token {
         client = client.with_auth(token);
     }
