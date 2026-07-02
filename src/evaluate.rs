@@ -2380,7 +2380,9 @@ fn llm_redaction_patterns() -> &'static Vec<(Regex, &'static str)> {
 pub fn redact_for_llm(command: &str) -> String {
     let mut result = command.to_string();
     for (pattern, replacement) in llm_redaction_patterns() {
-        result = pattern.replace_all(&result, *replacement).to_string();
+        if pattern.is_match(&result) {
+            result = pattern.replace_all(&result, *replacement).to_string();
+        }
     }
     crate::redact::redact_output_text(&result)
 }

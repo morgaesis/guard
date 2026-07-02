@@ -91,12 +91,17 @@ fn redact_bare_long_tokens(text: &str) -> String {
 /// `token:` in kubeconfigs) that redaction wins the trade.
 const SECRET_NAME_SUBPATTERN: &str = r"(?:[A-Za-z0-9_.-]*(?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIALS?|CREDS?|AUTHORIZATION|AUTH|BEARER)|[A-Za-z0-9_.-]+(?:KEY|PASS))";
 
-/// Value shape consumed after a secret-bearing name: a full double-quoted
-/// string (escaped quotes included, newlines excluded), a full single-quoted
-/// string, or an unquoted run. Consuming quoted values whole prevents a
-/// secret with spaces or escaped quotes from leaking its tail
-/// (`password: "abc def"` must not become `password: "[REDACTED] def"`).
-const SECRET_VALUE_SUBPATTERN: &str = r#"(?:"(?:\\.|[^"\\\n])*"|'[^'\n]*'|[^"'\s}{,]+)"#;
+/// Value shape consumed after a secret-bearing name, in preference order: a
+/// full double-quoted string (backslash escapes included), a full
+/// single-quoted string (YAML `''` doubling included), an UNTERMINATED
+/// quote consumed to end of line, or an unquoted run. Consuming quoted
+/// values whole prevents a secret with spaces or escaped quotes from
+/// leaking its tail (`password: "abc def"` must not become
+/// `password: "[REDACTED] def"`), and the unterminated alternatives cover a
+/// quoted multi-line value whose first line -- open quote, no close --
+/// arrives alone through the per-line output path.
+const SECRET_VALUE_SUBPATTERN: &str =
+    r#"(?:"(?:\\.|[^"\\\n])*"|'(?:''|[^'\n])*'|"[^\n]*|'[^\n]*|[^"'\s}{,]+)"#;
 
 /// Name-based secret redaction: a key name ending in a secret-bearing word,
 /// followed by `=`/`:` (or their URL-encoded forms `%3D`/`%3A`, so query
@@ -175,18 +180,22 @@ fn redact_named_secrets(text: &str) -> String {
         .to_string()
 }
 
-/// Flow-style / single-line JSON `name`/`value` pairs:
-/// `env: [{name: API_TOKEN, value: abc123}]` or
-/// `{"name": "DB_PASSWORD", "value": "hunter2"}`. The stateful
-/// `name:`-then-`value:` pass only pairs across ADJACENT LINES, and the
-/// catch-all deliberately excludes the generic `value` key, so without this
-/// pass a low-entropy secret in flow style leaks. Only fires when the
-/// `name` member's value has a secret-bearing shape.
-fn flow_name_value_pattern() -> &'static Regex {
+/// Flow-style / single-line JSON `name`/`value` pairs within one object:
+/// `env: [{name: API_TOKEN, value: abc123}]`,
+/// `{"name": "DB_PASSWORD", "value": "hunter2"}`, the reversed member order
+/// (`{value: hunter2, name: DB_PASSWORD}`), and pairs with intervening
+/// members (`{name: DB_PASSWORD, optional: false, value: hunter2}`). The
+/// stateful `name:`-then-`value:` pass only pairs across adjacent lines,
+/// and the catch-all deliberately excludes the generic `value` key, so
+/// without this a low-entropy secret in flow style leaks. The gap between
+/// the two members may not cross `{`/`}` (stays inside one object) or a
+/// newline. Only fires when the `name` member's value has a secret-bearing
+/// shape.
+fn flow_name_then_value_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(&format!(
-            r#"(?i)(["']?name["']?\s*:\s*["']?)({name})(["']?\s*,\s*["']?value["']?\s*:\s*)({value})"#,
+            r#"(?i)(["']?name["']?\s*:\s*["']?)({name})(["']?\s*,[^{{}}\n]*?["']?\bvalue["']?\s*:\s*)({value})"#,
             name = SECRET_NAME_SUBPATTERN,
             value = SECRET_VALUE_SUBPATTERN,
         ))
@@ -194,29 +203,50 @@ fn flow_name_value_pattern() -> &'static Regex {
     })
 }
 
-fn redact_flow_name_values(text: &str) -> String {
-    if !flow_name_value_pattern().is_match(text) {
+fn flow_value_then_name_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(&format!(
+            r#"(?i)(["']?\bvalue["']?\s*:\s*)({value})(\s*,[^{{}}\n]*?["']?name["']?\s*:\s*["']?)({name})"#,
+            name = SECRET_NAME_SUBPATTERN,
+            value = SECRET_VALUE_SUBPATTERN,
+        ))
+        .unwrap()
+    })
+}
+
+/// Apply one flow-pair pattern; `name_group`/`value_group` say which capture
+/// holds the env-var name (stoplist-checked) and which holds the value to
+/// redact.
+fn redact_flow_with(pattern: &Regex, text: &str, name_group: usize, value_group: usize) -> String {
+    if !pattern.is_match(text) {
         return text.to_string();
     }
-    flow_name_value_pattern()
+    pattern
         .replace_all(text, |caps: &regex::Captures| {
-            let name = &caps[2];
+            let name = &caps[name_group];
             if NAMED_SECRET_STOPLIST
                 .iter()
                 .any(|stop| name.eq_ignore_ascii_case(stop))
             {
-                caps[0].to_string()
-            } else {
-                format!(
-                    "{}{}{}{}",
-                    &caps[1],
-                    &caps[2],
-                    &caps[3],
-                    redacted_value_like(&caps[4])
-                )
+                return caps[0].to_string();
             }
+            let mut out = String::new();
+            for group in 1..=4 {
+                if group == value_group {
+                    out.push_str(redacted_value_like(&caps[group]));
+                } else {
+                    out.push_str(&caps[group]);
+                }
+            }
+            out
         })
         .to_string()
+}
+
+fn redact_flow_name_values(text: &str) -> String {
+    let forward = redact_flow_with(flow_name_then_value_pattern(), text, 2, 4);
+    redact_flow_with(flow_value_then_name_pattern(), &forward, 4, 2)
 }
 
 /// Catch-all: `ANY_VAR=<high-entropy value>` (hex 20+, base64 24+, or
@@ -794,6 +824,47 @@ mod tests {
     #[test]
     fn test_no_redact_ansible_status_line() {
         let input = "ok: [agents-k] => {\"changed\": false, \"ping\": \"pong\"}";
+        let output = redact_output_text(input);
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn test_redact_unterminated_quoted_value() {
+        // First line of a quoted multi-line value: open quote, no close.
+        let input = r#"password: "unterminated secret value"#;
+        let output = redact_output_text(input);
+        assert!(!output.contains("unterminated"), "got: {output}");
+        assert!(!output.contains("secret value"), "got: {output}");
+        assert!(output.contains("[REDACTED]"), "got: {output}");
+    }
+
+    #[test]
+    fn test_redact_yaml_doubled_single_quote_value() {
+        let input = "password: 'ab''cd efgh'";
+        let output = redact_output_text(input);
+        assert!(!output.contains("efgh"), "tail leaked: {output}");
+        assert!(output.contains("[REDACTED]"), "got: {output}");
+    }
+
+    #[test]
+    fn test_redact_flow_style_reversed_order() {
+        let input = "{value: hunter2, name: DB_PASSWORD}";
+        let output = redact_output_text(input);
+        assert!(!output.contains("hunter2"), "got: {output}");
+        assert!(output.contains("DB_PASSWORD"), "got: {output}");
+    }
+
+    #[test]
+    fn test_redact_flow_style_intervening_member() {
+        let input = r#"{"name": "DB_PASSWORD", "optional": false, "value": "hunter2"}"#;
+        let output = redact_output_text(input);
+        assert!(!output.contains("hunter2"), "got: {output}");
+        assert!(output.contains("\"optional\": false"), "got: {output}");
+    }
+
+    #[test]
+    fn test_no_redact_flow_style_intervening_non_secret() {
+        let input = "{name: LOG_LEVEL, optional: false, value: debug}";
         let output = redact_output_text(input);
         assert_eq!(output, input);
     }
