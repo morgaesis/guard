@@ -191,12 +191,34 @@ fn redact_named_secrets(text: &str) -> String {
 /// the two members may not cross `{`/`}` (stays inside one object) or a
 /// newline. Only fires when the `name` member's value has a secret-bearing
 /// shape.
+/// Zero or more complete `key: value,` members between the correlated pair.
+/// Structured (rather than a lazy any-character gap) so that a `value:`
+/// embedded inside a sibling member's string literal
+/// (`"description": "value: decoy"`) or a hyphenated sibling key
+/// (`old-value:`) cannot hijack the correlation and leave the real secret
+/// member unredacted: the gap only advances over whole members, so the pair
+/// keys can only match actual member keys.
+fn flow_member_gap() -> String {
+    format!(
+        r#"(?:\s*["']?[A-Za-z0-9_.-]+["']?\s*:\s*{value}\s*,)*?"#,
+        value = SECRET_VALUE_SUBPATTERN
+    )
+}
+
+/// Anchor for the first key of a correlated pair: start of line or an
+/// object/array/member boundary. Without it, `value` could anchor inside a
+/// hyphenated key like `old-value` (`-` is a non-word char, so `\b` alone
+/// does not prevent that).
+const FLOW_KEY_ANCHOR: &str = r"(?:^|[{\[,])\s*";
+
 fn flow_name_then_value_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(&format!(
-            r#"(?i)(["']?name["']?\s*:\s*["']?)({name})(["']?\s*,[^{{}}\n]*?["']?\bvalue["']?\s*:\s*)({value})"#,
+            r#"(?im)({anchor}["']?name["']?\s*:\s*["']?)({name})(["']?\s*,{gap}\s*["']?value["']?\s*:\s*)({value})"#,
+            anchor = FLOW_KEY_ANCHOR,
             name = SECRET_NAME_SUBPATTERN,
+            gap = flow_member_gap(),
             value = SECRET_VALUE_SUBPATTERN,
         ))
         .unwrap()
@@ -207,8 +229,10 @@ fn flow_value_then_name_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(&format!(
-            r#"(?i)(["']?\bvalue["']?\s*:\s*)({value})(\s*,[^{{}}\n]*?["']?name["']?\s*:\s*["']?)({name})"#,
+            r#"(?im)({anchor}["']?value["']?\s*:\s*)({value})(\s*,{gap}\s*["']?name["']?\s*:\s*["']?)({name})"#,
+            anchor = FLOW_KEY_ANCHOR,
             name = SECRET_NAME_SUBPATTERN,
+            gap = flow_member_gap(),
             value = SECRET_VALUE_SUBPATTERN,
         ))
         .unwrap()
@@ -217,8 +241,11 @@ fn flow_value_then_name_pattern() -> &'static Regex {
 
 /// Apply one flow-pair pattern; `name_group`/`value_group` say which capture
 /// holds the env-var name (stoplist-checked) and which holds the value to
-/// redact.
+/// redact. Contract: the pattern must expose exactly captures 1..=4 that
+/// concatenate back to the whole match (the replacement loop below rebuilds
+/// the match from them).
 fn redact_flow_with(pattern: &Regex, text: &str, name_group: usize, value_group: usize) -> String {
+    debug_assert_eq!(pattern.captures_len(), 5, "flow patterns expose 1..=4");
     if !pattern.is_match(text) {
         return text.to_string();
     }
@@ -759,16 +786,14 @@ mod tests {
     fn test_redact_flow_style_yaml_env_pair() {
         let input = "env: [{name: API_TOKEN, value: abc123def456}]";
         let output = redact_output_text(input);
-        assert!(!output.contains("abc123def456"), "got: {output}");
-        assert!(output.contains("API_TOKEN"), "got: {output}");
+        assert_eq!(output, "env: [{name: API_TOKEN, value: [REDACTED]}]");
     }
 
     #[test]
     fn test_redact_flow_style_json_env_pair() {
         let input = r#"{"name": "DB_PASSWORD", "value": "hunter2"}"#;
         let output = redact_output_text(input);
-        assert!(!output.contains("hunter2"), "got: {output}");
-        assert!(output.contains("DB_PASSWORD"), "got: {output}");
+        assert_eq!(output, r#"{"name": "DB_PASSWORD", "value": "[REDACTED]"}"#);
     }
 
     #[test]
@@ -850,16 +875,52 @@ mod tests {
     fn test_redact_flow_style_reversed_order() {
         let input = "{value: hunter2, name: DB_PASSWORD}";
         let output = redact_output_text(input);
-        assert!(!output.contains("hunter2"), "got: {output}");
-        assert!(output.contains("DB_PASSWORD"), "got: {output}");
+        assert_eq!(output, "{value: [REDACTED], name: DB_PASSWORD}");
     }
 
     #[test]
     fn test_redact_flow_style_intervening_member() {
         let input = r#"{"name": "DB_PASSWORD", "optional": false, "value": "hunter2"}"#;
         let output = redact_output_text(input);
-        assert!(!output.contains("hunter2"), "got: {output}");
-        assert!(output.contains("\"optional\": false"), "got: {output}");
+        assert_eq!(
+            output,
+            r#"{"name": "DB_PASSWORD", "optional": false, "value": "[REDACTED]"}"#
+        );
+    }
+
+    #[test]
+    fn test_flow_gap_not_hijacked_by_value_in_string_literal() {
+        // `value:` inside a sibling member's string literal must not become
+        // the correlation target; the REAL value member must be redacted.
+        let input = r#"{"name":"DB_PASSWORD","description":"value: decoy","value":"hunter2"}"#;
+        let output = redact_output_text(input);
+        assert!(!output.contains("hunter2"), "real secret leaked: {output}");
+        assert!(
+            output.contains(r#""description":"value: decoy""#),
+            "decoy member must stay intact, got: {output}"
+        );
+    }
+
+    #[test]
+    fn test_flow_gap_not_hijacked_by_hyphenated_sibling_key() {
+        let input = "{name: DB_PASSWORD, old-value: decoy, value: hunter2}";
+        let output = redact_output_text(input);
+        assert!(!output.contains("hunter2"), "real secret leaked: {output}");
+        assert!(
+            output.contains("old-value: decoy"),
+            "sibling member must stay intact, got: {output}"
+        );
+    }
+
+    #[test]
+    fn test_flow_reversed_not_anchored_inside_hyphenated_key() {
+        let input = "{old-value: decoy, value: hunter2, name: A_TOKEN}";
+        let output = redact_output_text(input);
+        assert!(!output.contains("hunter2"), "real secret leaked: {output}");
+        assert!(
+            output.contains("old-value: decoy"),
+            "sibling member must stay intact, got: {output}"
+        );
     }
 
     #[test]
