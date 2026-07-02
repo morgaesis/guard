@@ -711,7 +711,7 @@ Guard provides defense in depth through three layers:
 
 1. **Environment isolation** (`env_clear`): Child processes inherit only safe environment variables (`PATH`, `HOME`, `USER`, `LANG`, `TERM`, etc.) plus any per-run or tool-configured variables the caller explicitly requested.
 
-2. **Output redaction**: Known secret values (API keys, auth tokens, tool secrets, per-run injected secrets) are exact-match redacted from stdout/stderr before returning to the agent. Regex patterns catch `*_TOKEN`, `*_KEY`, `*_SECRET`, `*_PASSWORD`, PEM blocks, and JWTs.
+2. **Output redaction**: Known secret values (API keys, auth tokens, tool secrets, per-run injected secrets) are exact-match redacted from stdout/stderr before returning to the agent. Pattern-based redaction catches secrets guard has never seen: secret-bearing key names (`*_TOKEN`, `*_KEY`, `apikey`, `secretkey`, `*_PASSWORD`, ...) in env, YAML, and quoted-JSON form, PEM blocks, JWTs, `Bearer`/`Basic` header tokens, `sk-*`/`AKIA*` keys, and bare high-entropy key material. The same engine redacts all text sent to the LLM evaluator, so a credential embedded in a command or session context never reaches the model. On by default; `--no-redact` disables it.
 
 3. **LLM evaluation**: Each command is analyzed for destructive intent, privilege escalation, reverse shells, obfuscated payloads, tool side-channel abuse, and prompt injection. The LLM evaluates the full command including all chained parts.
 

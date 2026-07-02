@@ -1368,9 +1368,15 @@ impl Evaluator {
         // Build the per-call system prompt. Session-supplied context is
         // appended after the base prompt so the static guardrails still
         // anchor the evaluator.
+        // Session context is caller-supplied free text; redact it like the
+        // command itself before it enters the prompt.
         let system_prompt = match prompt_append {
             Some(extra) if !extra.trim().is_empty() => {
-                format!("{}\n\nSession context:\n{}", self.system_prompt, extra)
+                format!(
+                    "{}\n\nSession context:\n{}",
+                    self.system_prompt,
+                    redact_for_llm(extra)
+                )
             }
             _ => self.system_prompt.clone(),
         };
@@ -1849,6 +1855,7 @@ fn build_create_verb_body(
         Some(b) => format!("Target binary: {b}\n\nOperator request:\n{prose}"),
         None => format!("Operator request:\n{prose}"),
     };
+    let user = redact_for_llm(&user);
     serde_json::json!({
         "model": model,
         "messages": [
@@ -1936,6 +1943,7 @@ fn build_create_deny_shape_body(
         "Binary: {binary}\nMost recent denial reason: {last_reason}\n\nDenied argument strings \
          (quoted exactly; match them without the surrounding quotes):\n{examples}"
     );
+    let user = redact_for_llm(&user);
     serde_json::json!({
         "model": model,
         "messages": [
@@ -2012,6 +2020,7 @@ fn build_confirm_verb_promotion_body(
         args.join(" "),
         consequence.as_str()
     );
+    let user = redact_for_llm(&user);
     serde_json::json!({
         "model": model,
         "messages": [
@@ -2395,12 +2404,17 @@ fn llm_redaction_patterns() -> &'static Vec<(Regex, &'static str)> {
 }
 
 /// Apply pre-LLM redaction to a command string.
+///
+/// Runs the LLM-specific patterns above, then the full output-redaction
+/// engine, so both directions -- text entering a model and command output
+/// leaving the daemon -- share one definition of "secret-shaped". Every
+/// LLM request body builder routes its untrusted free text through this.
 pub fn redact_for_llm(command: &str) -> String {
     let mut result = command.to_string();
     for (pattern, replacement) in llm_redaction_patterns() {
         result = pattern.replace_all(&result, *replacement).to_string();
     }
-    result
+    crate::redact::redact_output_text(&result)
 }
 
 #[cfg(test)]
@@ -3376,6 +3390,32 @@ mod tests {
         let r1 = redact_for_llm(s);
         let r2 = redact_for_llm(&r1);
         assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn test_redact_for_llm_json_apikey() {
+        // CloudStack/cmk response shape: quoted compound key name, quoted
+        // value, trailing comma. Must never reach a model.
+        let s = r#"echo '"apikey": "dpFmM7VLB07-kQrfHXWLOsIqy1jvcPUFTzYdaUxKfrKPplbrLPGqrK_a2wRIzT3vFTdb3vCgMFuVJErzWa5S3g",'"#;
+        let r = redact_for_llm(s);
+        assert!(!r.contains("dpFmM7VLB07"), "got: {r}");
+        assert!(r.contains("[REDACTED]"), "got: {r}");
+    }
+
+    #[test]
+    fn test_redact_for_llm_env_pair() {
+        let s = "export MY_TOKEN=abc123secretvalue";
+        let r = redact_for_llm(s);
+        assert!(!r.contains("abc123secretvalue"), "got: {r}");
+        assert!(r.contains("[REDACTED]"), "got: {r}");
+    }
+
+    #[test]
+    fn test_redact_for_llm_hex_value_catchall() {
+        let s = "curl -b 'X_CT0=9c52ab235e556a3f8b1d2e4f6a7c9d0e1f2a3b4c5d6e7f'";
+        let r = redact_for_llm(s);
+        assert!(!r.contains("9c52ab235e556a3f"), "got: {r}");
+        assert!(r.contains("[REDACTED]"), "got: {r}");
     }
 
     // --- Retry loop tests using a mock HTTP server ---

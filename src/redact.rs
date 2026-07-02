@@ -1,50 +1,132 @@
 use regex::Regex;
 use std::sync::OnceLock;
 
-/// Compiled redaction patterns, initialized once.
+/// Value-shaped patterns that need no key-name context: recognizable token
+/// formats and blobs. These run BEFORE the name-based pattern so that a
+/// scheme-prefixed value (`Authorization: Bearer <token>`) is consumed as a
+/// whole before the name-based pass sees the line.
 fn redaction_patterns() -> &'static Vec<(Regex, &'static str)> {
     static PATTERNS: OnceLock<Vec<(Regex, &str)>> = OnceLock::new();
     PATTERNS.get_or_init(|| {
         vec![
-            // 1. Named secret vars: *_TOKEN, *_KEY, *_SECRET, *_PASSWORD, *_CREDENTIAL, *_AUTH
-            (
-                Regex::new(r#"(?i)([_-](TOKEN|KEY|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)\s*[=:]\s*["']?)([^"'\s}{,]+)"#).unwrap(),
-                "${1}[REDACTED]",
-            ),
-            // 2. Bare keywords: password, passwd, secret, token, bearer
-            (
-                Regex::new(r#"(?i)((password|passwd|secret|token|bearer)\s*[=:]\s*["']?)([^"'\s}{,]+)"#).unwrap(),
-                "${1}[REDACTED]",
-            ),
-            // 3. PEM private key blocks
+            // PEM private key blocks
             (
                 Regex::new(r"(-----BEGIN [A-Z ]*PRIVATE KEY-----).*").unwrap(),
                 "$1 [REDACTED]",
             ),
-            // 4. sk-* prefixed keys (OpenAI, Anthropic, Stripe, etc.)
+            // HTTP auth scheme tokens: `Bearer <token>` / `Basic <b64>`
             (
-                Regex::new(r"sk-[A-Za-z0-9_-]{20,}").unwrap(),
-                "[REDACTED]",
+                Regex::new(r"(?i)\b(Bearer|Basic)[ \t]+[A-Za-z0-9._~+/=-]{16,}").unwrap(),
+                "$1 [REDACTED]",
             ),
-            // 5. JWT tokens (eyJ header)
+            // sk-* prefixed keys (OpenAI, Anthropic, Stripe, etc.)
+            (Regex::new(r"sk-[A-Za-z0-9_-]{20,}").unwrap(), "[REDACTED]"),
+            // AWS access key id
+            (Regex::new(r"\bAKIA[0-9A-Z]{16}\b").unwrap(), "[REDACTED]"),
+            // JWT tokens (eyJ header)
             (
                 Regex::new(r"eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+").unwrap(),
                 "[REDACTED]",
             ),
-            // 7. Standalone long base64 blobs (lines of 40+ base64 chars, like encoded keys/certs)
+            // Standalone long base64 blobs (lines of 40+ base64 chars, like encoded keys/certs)
             (
-                Regex::new(r"^[A-Za-z0-9+/]{40,}={0,2}$").unwrap(),
+                Regex::new(r"(?m)^[A-Za-z0-9+/]{40,}={0,2}$").unwrap(),
                 "[REDACTED]",
             ),
         ]
     })
 }
 
+/// Bare long URL-safe base64 runs (64+ chars), the shape of CloudStack
+/// API/secret keys (86 chars) and similar opaque key material, wherever they
+/// appear -- including positions with no `name=`/`name:` context at all
+/// (table cells, bare `echo` output). The length threshold sits just above
+/// the 63-char DNS-label ceiling so Kubernetes object names can never match.
+fn bare_token_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| Regex::new(r"[A-Za-z0-9_-]{64,}").unwrap())
+}
+
+/// Redact bare long tokens, but only when the run looks like random key
+/// material: it must mix upper case, lower case, and digits. This skips long
+/// lowercase hex digests (sha256 sums), kebab-case slugs, and all-caps
+/// identifiers, none of which are credentials. Random base64url of this
+/// length fails the test with negligible probability.
+fn redact_bare_long_tokens(text: &str) -> String {
+    bare_token_pattern()
+        .replace_all(text, |caps: &regex::Captures| {
+            let run = &caps[0];
+            let has_lower = run.bytes().any(|b| b.is_ascii_lowercase());
+            let has_upper = run.bytes().any(|b| b.is_ascii_uppercase());
+            let has_digit = run.bytes().any(|b| b.is_ascii_digit());
+            if has_lower && has_upper && has_digit {
+                "[REDACTED]".to_string()
+            } else {
+                run.to_string()
+            }
+        })
+        .to_string()
+}
+
+/// Name-based secret redaction: a key name ending in a secret-bearing word,
+/// followed by `=` or `:`, has its value redacted regardless of the value's
+/// shape. Handles unquoted env/CLI pairs (`MY_TOKEN=x`, `--api-key=x`), YAML
+/// (`password: x`), and JSON with quoted names and values
+/// (`"apikey": "x",` -- the shape CloudStack/cmk responses use).
+fn named_secret_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(["']?)([A-Za-z0-9_.-]*(?:TOKEN|KEY|SECRET|PASSWORD|PASSWD|PASSPHRASE|PASS|CREDENTIALS?|CREDS?|AUTHORIZATION|AUTH|BEARER))(["']?\s*[=:]\s*["']?)([^"'\s}{,]+)"#,
+        )
+        .unwrap()
+    })
+}
+
+/// Key names whose secret-word suffix is coincidental English, not a
+/// credential: redacting their values would corrupt benign output. Checked
+/// case-insensitively against the full captured name.
+const NAMED_SECRET_STOPLIST: &[&str] = &[
+    "monkey",
+    "donkey",
+    "turkey",
+    "whiskey",
+    "hockey",
+    "jockey",
+    "lackey",
+    "hotkey",
+    "turnkey",
+    "low-key",
+    "bypass",
+    "compass",
+    "overpass",
+    "underpass",
+    "sacred",
+];
+
+fn redact_named_secrets(text: &str) -> String {
+    named_secret_pattern()
+        .replace_all(text, |caps: &regex::Captures| {
+            let name = &caps[2];
+            if NAMED_SECRET_STOPLIST
+                .iter()
+                .any(|stop| name.eq_ignore_ascii_case(stop))
+            {
+                caps[0].to_string()
+            } else {
+                format!("{}{}{}[REDACTED]", &caps[1], &caps[2], &caps[3])
+            }
+        })
+        .to_string()
+}
+
 /// Catch-all: `ANY_VAR=<high-entropy value>` (hex 20+, base64 24+, or
 /// mixed-alnum 40+). Catches things like `X_CT0=9c52ab...`,
 /// `SESSION_ID=a3f8b1...`, etc. -- secret-shaped values whose variable name
-/// doesn't contain a TOKEN/KEY/SECRET/PASSWORD/CREDENTIAL/AUTH substring, so
-/// patterns 1-2 miss them.
+/// doesn't end in a TOKEN/KEY/SECRET/PASSWORD/CREDENTIAL/AUTH word, so the
+/// name-based pass misses them. The name and value may each be quoted
+/// (JSON), and the trailing group tolerates closing punctuation
+/// (`"...",` / `"..."}`) so JSON object members match.
 ///
 /// The trailing group matches end-of-line/end-of-string, not just a
 /// following whitespace/quote char: every real call site strips the
@@ -55,7 +137,7 @@ fn redaction_patterns() -> &'static Vec<(Regex, &'static str)> {
 fn catchall_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
-        Regex::new(r#"(?im)([A-Z_][A-Z0-9_]*)(\s*[=:]\s*["']?)([0-9a-f]{20,}|[A-Za-z0-9+/]{24,}={0,2}|[A-Za-z0-9_-]{40,})(["']?(?:\s|$))"#).unwrap()
+        Regex::new(r#"(?im)(["']?)([A-Z_][A-Z0-9_]*)(["']?\s*[=:]\s*["']?)([0-9a-f]{20,}|[A-Za-z0-9+/]{24,}={0,2}|[A-Za-z0-9_-]{40,})(["']?[,;}\]]*(?:\s|$))"#).unwrap()
     })
 }
 
@@ -68,8 +150,28 @@ fn catchall_pattern() -> &'static Regex {
 /// these correctly when the preceding `name:` line is secret-bearing; the
 /// catch-all firing unconditionally on every `value:`/`data:` line would
 /// both duplicate that and false-positive on non-secret values it can't see
-/// the context for.
-const CATCHALL_EXCLUDED_NAMES: &[&str] = &["VALUE", "DATA", "NAME", "TYPE", "KIND", "ID"];
+/// the context for. Digest-style names (`sha`, `digest`, `commit`, ...) are
+/// excluded for the same reason: their hex values are content addresses, not
+/// credentials, and they are pervasive in JSON output from git tooling and
+/// registries.
+const CATCHALL_EXCLUDED_NAMES: &[&str] = &[
+    "VALUE",
+    "DATA",
+    "NAME",
+    "TYPE",
+    "KIND",
+    "ID",
+    "SHA",
+    "SHA1",
+    "SHA256",
+    "SHA512",
+    "DIGEST",
+    "COMMIT",
+    "CHECKSUM",
+    "FINGERPRINT",
+    "ETAG",
+    "REVISION",
+];
 
 /// Apply the catch-all pattern, skipping a match whose captured name is a
 /// generic structural key (see `CATCHALL_EXCLUDED_NAMES`). The `regex` crate
@@ -78,14 +180,14 @@ const CATCHALL_EXCLUDED_NAMES: &[&str] = &["VALUE", "DATA", "NAME", "TYPE", "KIN
 fn redact_catchall(text: &str) -> String {
     catchall_pattern()
         .replace_all(text, |caps: &regex::Captures| {
-            let name = &caps[1];
+            let name = &caps[2];
             if CATCHALL_EXCLUDED_NAMES
                 .iter()
                 .any(|excluded| name.eq_ignore_ascii_case(excluded))
             {
                 caps[0].to_string()
             } else {
-                format!("{}{}[REDACTED]{}", &caps[1], &caps[2], &caps[4])
+                format!("{}{}{}[REDACTED]{}", &caps[1], &caps[2], &caps[3], &caps[5])
             }
         })
         .to_string()
@@ -109,14 +211,21 @@ fn yaml_value_pattern() -> &'static Regex {
 }
 
 /// Apply redaction patterns to the given text, replacing sensitive values with [REDACTED].
+///
+/// Pass order matters: value-shaped patterns run first so a scheme-prefixed
+/// token (`Bearer <token>`) is consumed whole; the name-based pass then
+/// redacts anything a secret-bearing key name points at; the bare-token and
+/// catch-all passes sweep up secret-shaped values with weak or no name
+/// context.
 pub fn redact_output(text: &str) -> String {
-    let patterns = redaction_patterns();
     let mut result = text.to_string();
 
-    for (pattern, replacement) in patterns {
+    for (pattern, replacement) in redaction_patterns() {
         result = pattern.replace_all(&result, *replacement).to_string();
     }
 
+    let result = redact_named_secrets(&result);
+    let result = redact_bare_long_tokens(&result);
     redact_catchall(&result)
 }
 
@@ -374,6 +483,123 @@ mod tests {
 
         assert_eq!(name, "        - name: SERVICE_AUTH_TOKEN");
         assert_eq!(value, "          value: \"[REDACTED]\"");
+    }
+
+    #[test]
+    fn test_redact_cloudstack_json_apikey() {
+        // The exact leak shape: cmk JSON output with a quoted compound key
+        // name (no separator before "key") and a trailing comma.
+        let input = r#"      "apikey": "dpFmM7VLB07-kQrfHXWLOsIqy1jvcPUFTzYdaUxKfrKPplbrLPGqrK_a2wRIzT3vFTdb3vCgMFuVJErzWa5S3g","#;
+        let output = redact_output_text(input);
+        assert!(output.contains("\"apikey\""), "got: {output}");
+        assert!(!output.contains("dpFmM7VLB07"), "got: {output}");
+        assert!(output.contains("[REDACTED]"), "got: {output}");
+    }
+
+    #[test]
+    fn test_redact_cloudstack_json_secretkey() {
+        let input = r#"      "secretkey": "yVdeOc2BpPsUtozcx13Mp96CyCJPKm9wZycmXgLA0uXSuT-kqrPWfblcJ0KHPUW9wgSekgBBB0uzsSopcgvHkQ""#;
+        let output = redact_output_text(input);
+        assert!(output.contains("\"secretkey\""), "got: {output}");
+        assert!(!output.contains("yVdeOc2BpPsUtozcx13"), "got: {output}");
+    }
+
+    #[test]
+    fn test_redact_json_quoted_token_short_value() {
+        // Name-based redaction fires on the key name alone; the value does
+        // not need to look high-entropy.
+        let input = r#"{"token": "abc123def456"}"#;
+        let output = redact_output_text(input);
+        assert!(!output.contains("abc123def456"), "got: {output}");
+        assert!(output.contains("[REDACTED]"), "got: {output}");
+    }
+
+    #[test]
+    fn test_redact_unquoted_compound_apikey() {
+        let input = "apikey = 0Xw9kQrfHXWLOsIqy1jv";
+        let output = redact_output_text(input);
+        assert!(!output.contains("0Xw9kQrf"), "got: {output}");
+        assert!(output.contains("[REDACTED]"), "got: {output}");
+    }
+
+    #[test]
+    fn test_stoplist_names_not_redacted() {
+        let input = "monkey: banana\nbypass: true\nturkey: roasted\nhotkey: ctrl+c";
+        let output = redact_output_text(input);
+        assert_eq!(output, input, "stoplist names must not be redacted");
+    }
+
+    #[test]
+    fn test_redact_catchall_json_trailing_comma() {
+        let input = r#"  "CS_ENDPOINT_REF": "9c52ab235e556a3f8b1d2e4f6a7c9d0e","#;
+        let output = redact_output_text(input);
+        assert!(!output.contains("9c52ab235e556a3f"), "got: {output}");
+        assert!(output.contains("[REDACTED]"), "got: {output}");
+    }
+
+    #[test]
+    fn test_no_redact_json_git_sha() {
+        let input = r#"  "sha": "0123456789abcdef0123456789abcdef01234567","#;
+        let output = redact_output_text(input);
+        assert_eq!(output, input, "digest-style names must not be redacted");
+    }
+
+    #[test]
+    fn test_redact_bare_long_urlsafe_token() {
+        // 86-char CloudStack-shaped key with no name context at all (table
+        // cell, bare echo).
+        let input = "| dpFmM7VLB07kQrfHXWLOsIqy1jvcPUFTzYdaUxKfrKPplbrLPGqrKa2wRIzT3vFTdb3vCgMFuVJErzWa5S3g |";
+        let output = redact_output_text(input);
+        assert!(!output.contains("dpFmM7VLB07"), "got: {output}");
+        assert!(output.contains("[REDACTED]"), "got: {output}");
+    }
+
+    #[test]
+    fn test_no_redact_long_lowercase_digest() {
+        // 64-char lowercase hex (sha256sum output): a content address, not a
+        // credential; the mixed-case gate must skip it.
+        let input =
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  guard.tar.gz";
+        let output = redact_output_text(input);
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn test_no_redact_long_kebab_slug() {
+        let input = "refs/heads/feature/a-very-long-lowercase-branch-name-that-keeps-going-and-going-forever";
+        let output = redact_output_text(input);
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn test_redact_authorization_bearer_header() {
+        let input = "Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz012345";
+        let output = redact_output_text(input);
+        assert!(!output.contains("ghp_abcdefghij"), "got: {output}");
+        assert!(output.contains("[REDACTED]"), "got: {output}");
+    }
+
+    #[test]
+    fn test_redact_basic_auth_header() {
+        let input = "Authorization: Basic dXNlcjpodW50ZXIyaHVudGVyMg==";
+        let output = redact_output_text(input);
+        assert!(!output.contains("dXNlcjpodW50ZXIy"), "got: {output}");
+        assert!(output.contains("[REDACTED]"), "got: {output}");
+    }
+
+    #[test]
+    fn test_redact_aws_access_key_id() {
+        let input = "aws_access_key_id = AKIAIOSFODNN7EXAMPLE";
+        let output = redact_output_text(input);
+        assert!(!output.contains("AKIAIOSFODNN7EXAMPLE"), "got: {output}");
+    }
+
+    #[test]
+    fn test_redaction_is_idempotent() {
+        let input = r#"      "apikey": "dpFmM7VLB07-kQrfHXWLOsIqy1jvcPUFTzYdaUxKfrKPplbrLPGqrK_a2wRIzT3vFTdb3vCgMFuVJErzWa5S3g","#;
+        let once = redact_output_text(input);
+        let twice = redact_output_text(&once);
+        assert_eq!(once, twice);
     }
 
     #[test]
