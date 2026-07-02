@@ -2,7 +2,7 @@
 //!
 //! Secrets are stored per-UID: each caller has its own private namespace
 //! keyed by key name. Two users can reuse the same key name (e.g.
-//! `OPNSENSE_API_KEY`) without collision, and one user cannot read, list,
+//! `APPLIANCE_API_KEY`) without collision, and one user cannot read, list,
 //! overwrite, or delete another user's secrets. The daemon UID has a
 //! separate admin-only `list_all` entry point that returns the full
 //! (uid, key) set for observability; it still cannot read another user's
@@ -1028,7 +1028,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("guard/u1000")).unwrap();
         fs::create_dir_all(root.join("guard/u1001/nested")).unwrap();
-        fs::write(root.join("guard/u1000/OPNSENSE_API_KEY.gpg"), b"x").unwrap();
+        fs::write(root.join("guard/u1000/APPLIANCE_API_KEY.gpg"), b"x").unwrap();
         fs::write(root.join("guard/u1001/nested/token.gpg"), b"y").unwrap();
         fs::write(root.join("guard/LEGACY.gpg"), b"z").unwrap();
         fs::write(root.join("guard/.gpg-id"), b"test").unwrap();
@@ -1037,7 +1037,7 @@ mod tests {
         assert_eq!(
             all,
             vec![
-                (1000u32, "OPNSENSE_API_KEY".to_string()),
+                (1000u32, "APPLIANCE_API_KEY".to_string()),
                 (1001u32, "nested/token".to_string())
             ]
         );

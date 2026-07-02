@@ -202,7 +202,7 @@ Most file reads are safe administration. Reading /etc/passwd, /etc/hosts, log fi
 Authenticated HTTP requests are a first-class pattern when credentials arrive
 via `--secret` environment-variable injection. When the command references an
 env var whose value was pre-injected by the invocation (for example `curl -u
-"$OPNSENSE_API_KEY:$OPNSENSE_API_SECRET" https://fw.example/api/system/status`,
+"$APPLIANCE_API_KEY:$APPLIANCE_API_SECRET" https://fw.example/api/system/status`,
 `curl -H "Authorization: Bearer $TOKEN" https://host/api/...`, `curl --user
 "$USER:$PASS" ...`, `wget --http-user=$USER --http-password=$PASS ...`, or an
 analogous pattern with `http` / `httpie` / `hurl`), and the HTTP verb is
@@ -227,6 +227,13 @@ writing request bodies that include the injected secret into an unrelated
 destination. Also deny mutating verbs (`POST`, `PUT`, `PATCH`, `DELETE`) in
 readonly mode unless the session prompt explicitly names the endpoint and the
 mutation.
+
+For authenticated remote appliance and service-management APIs, fixed
+authenticated GET/search/status calls through a named SSH host or localhost
+tunnel are read-only administration and should be allowed. Bounded response
+handling such as `head -c`, `wc -c`, or `jq` field extraction is not a secret
+leak by itself. Continue to deny direct credential probes such as printing
+token lengths or dumping the environment.
 
 When the command is ambiguous -- it could be legitimate or malicious depending on context -- lean toward allowing it. False denials are more disruptive than false approvals in a guarded environment where secrets are already protected architecturally.
 

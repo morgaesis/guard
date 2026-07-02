@@ -26,6 +26,7 @@ use crate::session_store::SessionStore;
 pub use crate::session::HistoricalStatus;
 use crate::tool_config::ToolRegistry;
 use anyhow::{bail, Context, Result};
+use guard::policy::PolicyMode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -83,6 +84,24 @@ impl std::fmt::Display for CallerIdentity {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SshHostKeyMode {
+    OnlyExisting,
+    AcceptNew,
+    AcceptAll,
+}
+
+impl SshHostKeyMode {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::OnlyExisting => "only-existing",
+            Self::AcceptNew => "accept-new",
+            Self::AcceptAll => "accept-all",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecuteRequest {
     pub binary: String,
     pub args: Vec<String>,
@@ -101,6 +120,50 @@ pub struct ExecuteRequest {
     /// allow/deny patterns short-circuit the decision before the evaluator.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_token: Option<String>,
+    /// SSH host-key behavior for first-contact workflows. Only applied when
+    /// binary == "ssh"; default preserves ssh's existing strict behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_hostkey: Option<SshHostKeyMode>,
+}
+
+impl ExecuteRequest {
+    fn audit_args(&self) -> Vec<String> {
+        let mut args = self.args.clone();
+        if self.binary == "ssh" {
+            if let Some(mode) = &self.ssh_hostkey {
+                args.push(format!("[guard:ssh-hostkey={}]", mode.as_str()));
+            }
+        }
+        args
+    }
+
+    fn audit_command_line(&self) -> String {
+        let args = self.audit_args();
+        if args.is_empty() {
+            self.binary.clone()
+        } else {
+            format!("{} {}", self.binary, args.join(" "))
+        }
+    }
+
+    fn policy_args(&self) -> Vec<String> {
+        let mut args = execution_args(self);
+        let mut env_keys: Vec<&str> = self.env.keys().map(String::as_str).collect();
+        env_keys.sort_unstable();
+        if !env_keys.is_empty() {
+            args.push(format!("[guard:env={}]", env_keys.join(",")));
+        }
+        let mut secret_env_keys: Vec<&str> = self.secrets.keys().map(String::as_str).collect();
+        secret_env_keys.sort_unstable();
+        if !secret_env_keys.is_empty() {
+            args.push(format!("[guard:secret-env={}]", secret_env_keys.join(",")));
+        }
+        args
+    }
+
+    fn has_injections(&self) -> bool {
+        !self.env.is_empty() || !self.secrets.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -425,12 +488,13 @@ impl ServerConfig {
         reason: &str,
     ) {
         let action = if allowed { "ALLOWED" } else { "DENIED" };
+        let command = self.redact_log_text(&format!("{} {}", binary, args.join(" ")));
+        let reason = self.redact_log_text(reason);
         tracing::info!(
-            "[AUDIT] {} caller={} cmd=\"{} {}\" reason=\"{}\"",
+            "[AUDIT] {} caller={} cmd=\"{}\" reason=\"{}\"",
             action,
             caller,
-            binary,
-            args.join(" "),
+            command,
             reason
         );
     }
@@ -447,13 +511,24 @@ impl ServerConfig {
         args: &[String],
         reason: &str,
     ) {
+        let command = self.redact_log_text(&format!("{} {}", binary, args.join(" ")));
+        let reason = self.redact_log_text(reason);
         tracing::info!(
-            "[AUDIT] EXEC_FAILED caller={} cmd=\"{} {}\" reason=\"{}\"",
+            "[AUDIT] EXEC_FAILED caller={} cmd=\"{}\" reason=\"{}\"",
             caller,
-            binary,
-            args.join(" "),
+            command,
             reason
         );
+    }
+
+    fn redact_log_text(&self, text: &str) -> String {
+        if !self.redact {
+            return text.to_string();
+        }
+        let secret_refs: Vec<&str> = self.redact_secrets.iter().map(String::as_str).collect();
+        let text = redact_exact_secrets(text, &secret_refs);
+        let text = crate::evaluate::redact_for_llm(&text);
+        redact_output_text(&text)
     }
 }
 
@@ -683,10 +758,11 @@ async fn handle_client_unix(stream: UnixStream, config: &ServerConfig) -> Result
         };
 
         if let Err(_e) = config.validate_token(request.auth_token.as_deref()) {
+            let audit_args = request.audit_args();
             config.log_audit_policy(
                 &caller,
                 &request.binary,
-                &request.args,
+                &audit_args,
                 false,
                 "invalid auth token",
             );
@@ -709,7 +785,8 @@ async fn handle_client_unix(stream: UnixStream, config: &ServerConfig) -> Result
         } else {
             execute_command(request.clone(), config, &caller).await
         };
-        emit_exec_audit_events(config, &caller, &request.binary, &request.args, &result);
+        let audit_args = request.audit_args();
+        emit_exec_audit_events(config, &caller, &request.binary, &audit_args, &result);
 
         let resp = result.into_response();
         if request.stream {
@@ -823,12 +900,7 @@ async fn handle_admin_request(
                     message: format!("failed to persist session grant: {}", err),
                 };
             }
-            tracing::info!(
-                "[AUDIT] SESSION_GRANT caller={} token={} ttl={:?}",
-                caller,
-                token,
-                ttl_secs
-            );
+            tracing::info!("{}", session_grant_audit_line(caller, &token, ttl_secs));
             AdminResponse::Ok
         }
         AdminRequest::SessionRevoke { token } => {
@@ -844,12 +916,7 @@ async fn handle_admin_request(
                     message: format!("failed to persist session revoke: {}", err),
                 };
             }
-            tracing::info!(
-                "[AUDIT] SESSION_REVOKE caller={} token={} existed={}",
-                caller,
-                token,
-                removed
-            );
+            tracing::info!("{}", session_revoke_audit_line(caller, &token, removed));
             AdminResponse::Ok
         }
         AdminRequest::SessionList {
@@ -1177,10 +1244,11 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
 
         if let Err(_e) = config.validate_token(request.auth_token.as_deref()) {
             let caller = CallerIdentity::Unknown;
+            let audit_args = request.audit_args();
             config.log_audit_policy(
                 &caller,
                 &request.binary,
-                &request.args,
+                &audit_args,
                 false,
                 "invalid auth token",
             );
@@ -1209,7 +1277,8 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
         } else {
             execute_command(request.clone(), config, &caller).await
         };
-        emit_exec_audit_events(config, &caller, &request.binary, &request.args, &result);
+        let audit_args = request.audit_args();
+        emit_exec_audit_events(config, &caller, &request.binary, &audit_args, &result);
 
         let resp = result.into_response();
         if request.stream {
@@ -1456,7 +1525,8 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         .unwrap_or(0);
     if depth >= MAX_GUARD_DEPTH {
         let reason = format!("guard recursion depth exceeded (max {})", MAX_GUARD_DEPTH);
-        config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
+        let audit_args = request.audit_args();
+        config.log_audit_policy(caller, &request.binary, &audit_args, false, &reason);
         let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
         record_live_session_interaction(
             config,
@@ -1492,7 +1562,8 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         } else {
             format!("invalid binary name: '{}'", request.binary)
         };
-        config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
+        let audit_args = request.audit_args();
+        config.log_audit_policy(caller, &request.binary, &audit_args, false, &reason);
         let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
         record_live_session_interaction(
             config,
@@ -1518,17 +1589,25 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
     } else {
         format!("{} {}", request.binary, request.args.join(" "))
     };
+    let policy_args = request.policy_args();
+    let policy_command_line = if policy_args.is_empty() {
+        request.binary.clone()
+    } else {
+        format!("{} {}", request.binary, policy_args.join(" "))
+    };
+    let audit_args = request.audit_args();
+    let audit_command_line = request.audit_command_line();
 
     if let Err(reason) = validate_request_injections(&request, config, caller, &command_line).await
     {
-        config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
+        config.log_audit_policy(caller, &request.binary, &audit_args, false, &reason);
         let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
         record_live_session_interaction(
             config,
             session_token.as_deref(),
             SessionInteraction {
                 at_unix: 0,
-                command: command_line.clone(),
+                command: audit_command_line.clone(),
                 allowed: false,
                 source: SessionDecisionSource::Validation,
                 reason: reason.clone(),
@@ -1540,32 +1619,48 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         return ExecuteResult::denied(reason);
     }
 
-    // Session grants short-circuit both directions: deny wins before the
-    // evaluator, allow skips the evaluator entirely.
-    //
-    // If the caller passes a session_token that the daemon does not know
-    // about (revoked, expired, or never existed), the request is rejected
-    // — silently falling through to base policy would let an agent run
-    // with surprise rules when its operator-issued grant is gone.
+    if let Some(reason) = deterministic_credential_deny_reason(&request.binary, &request.args) {
+        config.log_audit_policy(caller, &request.binary, &audit_args, false, &reason);
+        let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
+        record_live_session_interaction(
+            config,
+            session_token.as_deref(),
+            SessionInteraction {
+                at_unix: 0,
+                command: audit_command_line.clone(),
+                allowed: false,
+                source: SessionDecisionSource::Validation,
+                reason: reason.clone(),
+                risk: None,
+                exec_status: SessionExecStatus::NotAttempted,
+            },
+        )
+        .await;
+        return ExecuteResult::denied(reason);
+    }
+
+    // Session grants short-circuit both directions after non-bypassable
+    // validation and credential-deny checks. Deny wins before the evaluator;
+    // allow skips the evaluator entirely.
     if let Some(ref token) = request.session_token {
         let (decision, exists) = {
             let reg = config.sessions.read().await;
-            let decision = reg.check(token, &request.binary, &request.args);
+            let decision = reg.check(token, &request.binary, &policy_args);
             (decision, reg.has(token))
         };
         if !exists {
             let reason = format!(
-                "unknown session token: '{}' is revoked, expired, or never existed",
-                token
+                "unknown session token: {} is revoked, expired, or never existed",
+                redacted_session_token(token)
             );
-            config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
+            config.log_audit_policy(caller, &request.binary, &audit_args, false, &reason);
             let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
             return ExecuteResult::denied(reason);
         }
         if let Some((decision, reason)) = decision {
             match decision {
                 SessionDecision::Deny => {
-                    config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
+                    config.log_audit_policy(caller, &request.binary, &audit_args, false, &reason);
                     let _ =
                         write_policy_decision(stream_output, stream_writer, false, &reason).await;
                     record_live_session_interaction(
@@ -1573,7 +1668,7 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
                         session_token.as_deref(),
                         SessionInteraction {
                             at_unix: 0,
-                            command: command_line.clone(),
+                            command: audit_command_line.clone(),
                             allowed: false,
                             source: SessionDecisionSource::SessionDeny,
                             reason: reason.clone(),
@@ -1585,7 +1680,7 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
                     return ExecuteResult::denied(reason);
                 }
                 SessionDecision::Allow => {
-                    config.log_audit_policy(caller, &request.binary, &request.args, true, &reason);
+                    config.log_audit_policy(caller, &request.binary, &audit_args, true, &reason);
                     if let Err(e) =
                         write_policy_decision(stream_output, stream_writer, true, &reason).await
                     {
@@ -1609,7 +1704,7 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
                         session_token.as_deref(),
                         SessionInteraction {
                             at_unix: 0,
-                            command: command_line.clone(),
+                            command: audit_command_line.clone(),
                             allowed: true,
                             source: SessionDecisionSource::SessionAllow,
                             reason,
@@ -1629,14 +1724,14 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
             "unknown binary: '{}' is not available on the guard server PATH",
             request.binary
         );
-        config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
+        config.log_audit_policy(caller, &request.binary, &audit_args, false, &reason);
         let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
         record_live_session_interaction(
             config,
             session_token.as_deref(),
             SessionInteraction {
                 at_unix: 0,
-                command: command_line.clone(),
+                command: audit_command_line.clone(),
                 allowed: false,
                 source: SessionDecisionSource::Validation,
                 reason: reason.clone(),
@@ -1648,95 +1743,11 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         return ExecuteResult::denied(reason);
     }
 
-    if config.preflight {
-        if let Some(reason) = deterministic_credential_deny_reason(&request.binary, &request.args) {
-            config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
-            let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
-            record_live_session_interaction(
-                config,
-                session_token.as_deref(),
-                SessionInteraction {
-                    at_unix: 0,
-                    command: command_line.clone(),
-                    allowed: false,
-                    source: SessionDecisionSource::Validation,
-                    reason: reason.clone(),
-                    risk: None,
-                    exec_status: SessionExecStatus::NotAttempted,
-                },
-            )
-            .await;
-            return ExecuteResult::denied(reason);
-        }
-    }
-
-    // Pull session-scoped additive prompt, if any. The evaluator appends
-    // it to the system prompt for this single call so the LLM has the
-    // session context that the static glob patterns cannot express.
-    let session_prompt = if let Some(ref token) = request.session_token {
-        let reg = config.sessions.read().await;
-        reg.prompt_append_for(token)
-    } else {
-        None
-    };
-
-    let eval_result = config
-        .evaluator
-        .evaluate_with_context(&command_line, session_prompt.as_deref())
-        .await;
-
-    match eval_result {
-        crate::evaluate::EvalResult::Deny {
-            reason,
-            source,
-            risk,
-        } => {
-            config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
-            let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
-            record_live_session_interaction(
-                config,
-                session_token.as_deref(),
-                SessionInteraction {
-                    at_unix: 0,
-                    command: command_line.clone(),
-                    allowed: false,
-                    source: session_source_from_eval(source),
-                    reason: reason.clone(),
-                    risk,
-                    exec_status: SessionExecStatus::NotAttempted,
-                },
-            )
-            .await;
-            ExecuteResult::denied(reason)
-        }
-        crate::evaluate::EvalResult::Error(e) => {
-            tracing::error!("evaluation error: {}", e);
-            let reason = format!("evaluation error: {}", e);
-            config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
-            let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
-            record_live_session_interaction(
-                config,
-                session_token.as_deref(),
-                SessionInteraction {
-                    at_unix: 0,
-                    command: command_line.clone(),
-                    allowed: false,
-                    source: SessionDecisionSource::EvaluatorError,
-                    reason: reason.clone(),
-                    risk: None,
-                    exec_status: SessionExecStatus::NotAttempted,
-                },
-            )
-            .await;
-            ExecuteResult::denied(reason)
-        }
-        crate::evaluate::EvalResult::Allow {
-            reason,
-            source,
-            risk,
-        } => {
-            tracing::debug!("command allowed: {}", reason);
-            config.log_audit_policy(caller, &request.binary, &request.args, true, &reason);
+    if !matches!(request.ssh_hostkey, Some(SshHostKeyMode::AcceptAll)) && !request.has_injections()
+    {
+        if let Some(reason) = deterministic_safe_allow_reason(config, &request.binary, &policy_args)
+        {
+            config.log_audit_policy(caller, &request.binary, &audit_args, true, &reason);
             if let Err(e) = write_policy_decision(stream_output, stream_writer, true, &reason).await
             {
                 return ExecuteResult::exec_failed(reason, format!("client stream error: {}", e));
@@ -1756,7 +1767,106 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
                 session_token.as_deref(),
                 SessionInteraction {
                     at_unix: 0,
-                    command: command_line,
+                    command: audit_command_line.clone(),
+                    allowed: true,
+                    source: SessionDecisionSource::StaticPolicy,
+                    reason,
+                    risk: None,
+                    exec_status: result.session_exec_status(),
+                },
+            )
+            .await;
+            return result;
+        }
+    }
+
+    // Pull session-scoped additive prompt, if any. The evaluator appends
+    // it to the system prompt for this single call so the LLM has the
+    // session context that the static glob patterns cannot express.
+    let session_prompt = if let Some(ref token) = request.session_token {
+        let reg = config.sessions.read().await;
+        reg.prompt_append_for(token)
+    } else {
+        None
+    };
+
+    let eval_result = config
+        .evaluator
+        .evaluate_with_context(&policy_command_line, session_prompt.as_deref())
+        .await;
+
+    match eval_result {
+        crate::evaluate::EvalResult::Deny {
+            reason,
+            source,
+            risk,
+        } => {
+            config.log_audit_policy(caller, &request.binary, &audit_args, false, &reason);
+            let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
+            record_live_session_interaction(
+                config,
+                session_token.as_deref(),
+                SessionInteraction {
+                    at_unix: 0,
+                    command: audit_command_line.clone(),
+                    allowed: false,
+                    source: session_source_from_eval(source),
+                    reason: reason.clone(),
+                    risk,
+                    exec_status: SessionExecStatus::NotAttempted,
+                },
+            )
+            .await;
+            ExecuteResult::denied(reason)
+        }
+        crate::evaluate::EvalResult::Error(e) => {
+            tracing::error!("evaluation error: {}", e);
+            let reason = format!("evaluation error: {}", e);
+            config.log_audit_policy(caller, &request.binary, &audit_args, false, &reason);
+            let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
+            record_live_session_interaction(
+                config,
+                session_token.as_deref(),
+                SessionInteraction {
+                    at_unix: 0,
+                    command: audit_command_line.clone(),
+                    allowed: false,
+                    source: SessionDecisionSource::EvaluatorError,
+                    reason: reason.clone(),
+                    risk: None,
+                    exec_status: SessionExecStatus::NotAttempted,
+                },
+            )
+            .await;
+            ExecuteResult::denied(reason)
+        }
+        crate::evaluate::EvalResult::Allow {
+            reason,
+            source,
+            risk,
+        } => {
+            tracing::debug!("command allowed: {}", reason);
+            config.log_audit_policy(caller, &request.binary, &audit_args, true, &reason);
+            if let Err(e) = write_policy_decision(stream_output, stream_writer, true, &reason).await
+            {
+                return ExecuteResult::exec_failed(reason, format!("client stream error: {}", e));
+            }
+            let result = exec_after_approval(
+                request,
+                config,
+                caller,
+                reason.clone(),
+                depth,
+                stream_output,
+                stream_writer,
+            )
+            .await;
+            record_live_session_interaction(
+                config,
+                session_token.as_deref(),
+                SessionInteraction {
+                    at_unix: 0,
+                    command: audit_command_line,
                     allowed: true,
                     source: session_source_from_eval(source),
                     reason,
@@ -1775,6 +1885,28 @@ fn session_source_from_eval(source: crate::evaluate::EvalSource) -> SessionDecis
         crate::evaluate::EvalSource::Llm => SessionDecisionSource::Llm,
         crate::evaluate::EvalSource::StaticPolicy => SessionDecisionSource::StaticPolicy,
     }
+}
+
+fn redacted_session_token(token: &str) -> String {
+    format!("<redacted len={}>", token.len())
+}
+
+fn session_grant_audit_line(caller: &CallerIdentity, token: &str, ttl_secs: Option<u64>) -> String {
+    format!(
+        "[AUDIT] SESSION_GRANT caller={} token={} ttl={:?}",
+        caller,
+        redacted_session_token(token),
+        ttl_secs
+    )
+}
+
+fn session_revoke_audit_line(caller: &CallerIdentity, token: &str, removed: bool) -> String {
+    format!(
+        "[AUDIT] SESSION_REVOKE caller={} token={} existed={}",
+        caller,
+        redacted_session_token(token),
+        removed
+    )
 }
 
 async fn persist_session_snapshot(
@@ -1888,10 +2020,15 @@ async fn exec_after_approval<W: AsyncWrite + Unpin>(
     stream_writer: &mut W,
 ) -> ExecuteResult {
     if config.dry_run {
+        let args_for_log: Vec<String> = request
+            .args
+            .iter()
+            .map(|arg| config.redact_log_text(arg))
+            .collect();
         tracing::info!(
             "Dry-run: not executing {} {:?} ({})",
             request.binary,
-            request.args,
+            args_for_log,
             caller
         );
         return ExecuteResult::dry_run(allow_reason);
@@ -1935,15 +2072,16 @@ async fn exec_after_approval<W: AsyncWrite + Unpin>(
     }
 
     let caller_uid = match caller {
-        CallerIdentity::Unix { uid } => *uid,
-        _ => {
+        CallerIdentity::Unix { uid } => Some(*uid),
+        _ => None,
+    };
+    for (env_var, secret_key) in &request.secrets {
+        let Some(caller_uid) = caller_uid else {
             return ExecuteResult::exec_failed(
                 allow_reason,
                 "secret injection requires a unix socket caller".to_string(),
             );
-        }
-    };
-    for (env_var, secret_key) in &request.secrets {
+        };
         let value = match config.secrets.get(caller_uid, secret_key).await {
             Ok(Some(value)) => value,
             Ok(None) => {
@@ -1965,15 +2103,21 @@ async fn exec_after_approval<W: AsyncWrite + Unpin>(
         tool_env.insert(env_var.clone(), value);
     }
 
+    let exec_args = execution_args(&request);
+
+    let exec_args_for_log: Vec<String> = exec_args
+        .iter()
+        .map(|arg| config.redact_log_text(arg))
+        .collect();
     tracing::info!(
         "Executing: {} {:?} ({})",
         request.binary,
-        request.args,
+        exec_args_for_log,
         caller
     );
 
     let mut cmd = Command::new(&request.binary);
-    cmd.args(&request.args);
+    cmd.args(&exec_args);
     cmd.stdin(Stdio::null());
 
     // SECURITY: Clear ALL inherited env vars. The child process gets only what we
@@ -2184,6 +2328,164 @@ fn deterministic_credential_deny_reason(binary: &str, args: &[String]) -> Option
     None
 }
 
+fn deterministic_safe_allow_reason(
+    config: &ServerConfig,
+    binary: &str,
+    args: &[String],
+) -> Option<String> {
+    if matches!(config.evaluator.mode(), Some(PolicyMode::Paranoid)) {
+        return None;
+    }
+
+    if binary == "ssh" {
+        let destination = crate::ssh::extract_destination(args)?;
+        let remote_command = crate::ssh::extract_command(args);
+        if remote_command.trim().is_empty() || ssh_args_include_risky_transport(args) {
+            return None;
+        }
+        if is_fixed_readonly_diagnostic(&remote_command) {
+            return Some(format!(
+                "deterministic safe allow: fixed read-only remote command on {}",
+                destination
+            ));
+        }
+        return None;
+    }
+
+    if matches!(binary, "id" | "whoami" | "hostname" | "uptime") {
+        return Some("deterministic safe allow: fixed local identity/status command".to_string());
+    }
+
+    None
+}
+
+fn ssh_args_include_risky_transport(args: &[String]) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if matches!(arg.as_str(), "-A" | "-D" | "-J" | "-L" | "-R" | "-W" | "-w") {
+            return true;
+        }
+        if matches!(arg.as_str(), "-o") {
+            if let Some(value) = args.get(i + 1) {
+                if ssh_option_is_risky_transport(value) {
+                    return true;
+                }
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("-o") {
+            if ssh_option_is_risky_transport(value) {
+                return true;
+            }
+        }
+        if arg.starts_with("-D")
+            || arg.starts_with("-J")
+            || arg.starts_with("-L")
+            || arg.starts_with("-R")
+            || arg.starts_with("-W")
+            || arg.starts_with("-w")
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn ssh_option_is_risky_transport(value: &str) -> bool {
+    let lower = value.trim_start().to_ascii_lowercase();
+    let key = lower
+        .split(|ch: char| ch == '=' || ch.is_whitespace())
+        .next()
+        .unwrap_or("");
+    matches!(
+        key,
+        "forwardagent"
+            | "proxycommand"
+            | "proxyjump"
+            | "localcommand"
+            | "permitlocalcommand"
+            | "localforward"
+            | "remoteforward"
+            | "dynamicforward"
+            | "tunnel"
+    )
+}
+
+fn is_fixed_readonly_diagnostic(command: &str) -> bool {
+    if contains_shell_control(command) {
+        return false;
+    }
+    let lower = command.trim().to_ascii_lowercase();
+    let tokens = command_tokens(&lower);
+    if tokens.is_empty() {
+        return false;
+    }
+
+    matches!(
+        tokens.as_slice(),
+        [cmd] if matches!(cmd.as_str(), "id" | "whoami" | "hostname" | "uptime")
+    ) || matches!(
+        tokens.as_slice(),
+        [cmd, flag] if cmd == "uname" && matches!(flag.as_str(), "-a" | "-r" | "-sr")
+    ) || matches!(
+        tokens.as_slice(),
+        [cmd, flag] if cmd == "df" && matches!(flag.as_str(), "-h" | "-hi")
+    )
+}
+
+fn contains_shell_control(command: &str) -> bool {
+    command.contains(';')
+        || command.contains("&&")
+        || command.contains("||")
+        || command.contains('|')
+        || command.contains('>')
+        || command.contains('<')
+        || command.contains('`')
+        || command.contains("$(")
+        || command.contains('\n')
+}
+
+fn execution_args(request: &ExecuteRequest) -> Vec<String> {
+    if request.binary != "ssh" {
+        return request.args.clone();
+    }
+
+    match request
+        .ssh_hostkey
+        .as_ref()
+        .unwrap_or(&SshHostKeyMode::OnlyExisting)
+    {
+        SshHostKeyMode::OnlyExisting => request.args.clone(),
+        SshHostKeyMode::AcceptNew => with_ssh_options(
+            &request.args,
+            &[
+                ("StrictHostKeyChecking", "accept-new"),
+                ("UpdateHostKeys", "yes"),
+            ],
+        ),
+        SshHostKeyMode::AcceptAll => with_ssh_options(
+            &request.args,
+            &[
+                ("StrictHostKeyChecking", "no"),
+                ("UserKnownHostsFile", "/dev/null"),
+            ],
+        ),
+    }
+}
+
+fn with_ssh_options(args: &[String], options: &[(&str, &str)]) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len() + options.len() * 2);
+    for (key, value) in options {
+        out.push("-o".to_string());
+        out.push(format!("{key}={value}"));
+    }
+    out.extend(args.iter().cloned());
+    out
+}
+
 fn has_token(tokens: &[String], needle: &str) -> bool {
     tokens.iter().any(|token| token == needle)
 }
@@ -2253,6 +2555,12 @@ async fn validate_request_injections(
                 key
             ));
         }
+        if dangerous_env_name(key) {
+            return Err(format!(
+                "dangerous injected environment variable name: '{}'",
+                key
+            ));
+        }
     }
 
     for env_var in request.secrets.keys() {
@@ -2296,6 +2604,32 @@ async fn validate_request_injections(
     }
 
     Ok(())
+}
+
+fn dangerous_env_name(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    upper == "BASH_ENV"
+        || upper == "ENV"
+        || upper == "LD_PRELOAD"
+        || upper == "LD_LIBRARY_PATH"
+        || upper == "DYLD_INSERT_LIBRARIES"
+        || upper == "DYLD_LIBRARY_PATH"
+        || upper == "PYTHONPATH"
+        || upper == "PYTHONHOME"
+        || upper == "RUBYOPT"
+        || upper == "NODE_OPTIONS"
+        || upper == "PERL5OPT"
+        || upper == "PERL5LIB"
+        || upper == "GIT_CONFIG"
+        || upper == "GIT_CONFIG_GLOBAL"
+        || upper == "GIT_CONFIG_SYSTEM"
+        || upper == "GIT_SSH"
+        || upper == "GIT_SSH_COMMAND"
+        || upper == "SSH_AUTH_SOCK"
+        || upper == "SSH_ASKPASS"
+        || upper.starts_with("LD_AUDIT")
+        || upper.starts_with("GIT_CONFIG_KEY_")
+        || upper.starts_with("GIT_CONFIG_VALUE_")
 }
 
 #[derive(Debug)]
@@ -2584,7 +2918,25 @@ impl Client {
         env: HashMap<String, String>,
         secrets: HashMap<String, String>,
     ) -> Result<ExecuteResponse> {
-        let request = self.build_execute_request(binary, args, env, secrets, false);
+        self.execute_with_injections_and_hostkey(
+            binary,
+            args,
+            env,
+            secrets,
+            SshHostKeyMode::OnlyExisting,
+        )
+        .await
+    }
+
+    pub async fn execute_with_injections_and_hostkey(
+        &self,
+        binary: &str,
+        args: &[String],
+        env: HashMap<String, String>,
+        secrets: HashMap<String, String>,
+        ssh_hostkey: SshHostKeyMode,
+    ) -> Result<ExecuteResponse> {
+        let request = self.build_execute_request(binary, args, env, secrets, ssh_hostkey, false);
 
         tracing::debug!(
             binary = %binary,
@@ -2632,7 +2984,30 @@ impl Client {
     where
         F: FnMut(OutputStream, &str),
     {
-        let request = self.build_execute_request(binary, args, env, secrets, true);
+        self.execute_streaming_with_injections_and_hostkey(
+            binary,
+            args,
+            env,
+            secrets,
+            SshHostKeyMode::OnlyExisting,
+            on_output,
+        )
+        .await
+    }
+
+    pub async fn execute_streaming_with_injections_and_hostkey<F>(
+        &self,
+        binary: &str,
+        args: &[String],
+        env: HashMap<String, String>,
+        secrets: HashMap<String, String>,
+        ssh_hostkey: SshHostKeyMode,
+        mut on_output: F,
+    ) -> Result<ExecuteResponse>
+    where
+        F: FnMut(OutputStream, &str),
+    {
+        let request = self.build_execute_request(binary, args, env, secrets, ssh_hostkey, true);
 
         tracing::debug!(
             binary = %binary,
@@ -2658,6 +3033,7 @@ impl Client {
         args: &[String],
         env: HashMap<String, String>,
         secrets: HashMap<String, String>,
+        ssh_hostkey: SshHostKeyMode,
         stream: bool,
     ) -> ExecuteRequest {
         ExecuteRequest {
@@ -2668,6 +3044,10 @@ impl Client {
             secrets,
             stream,
             session_token: self.session_token.clone(),
+            ssh_hostkey: match ssh_hostkey {
+                SshHostKeyMode::OnlyExisting => None,
+                other => Some(other),
+            },
         }
     }
 
@@ -3028,6 +3408,265 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_safe_allow_accepts_fixed_ssh_identity_check() {
+        let (cfg, _) = make_test_config();
+        let args = vec!["host01".to_string(), "id".to_string()];
+        let reason = deterministic_safe_allow_reason(&cfg, "ssh", &args)
+            .expect("fixed remote id should be allowed");
+        assert!(reason.contains("fixed read-only remote command"));
+    }
+
+    #[test]
+    fn deterministic_safe_allow_rejects_http_status_over_ssh() {
+        let (cfg, _) = make_test_config();
+        let args = vec![
+            "host01".to_string(),
+            "curl".to_string(),
+            "http://localhost:19999/api/status".to_string(),
+        ];
+        assert!(deterministic_safe_allow_reason(&cfg, "ssh", &args).is_none());
+    }
+
+    #[test]
+    fn deterministic_safe_allow_rejects_chained_remote_command() {
+        let (cfg, _) = make_test_config();
+        let args = vec!["host01".to_string(), "id && uptime".to_string()];
+        assert!(deterministic_safe_allow_reason(&cfg, "ssh", &args).is_none());
+    }
+
+    #[test]
+    fn deterministic_safe_allow_rejects_ssh_forwarding() {
+        let (cfg, _) = make_test_config();
+        let args = vec![
+            "-L".to_string(),
+            "8080:localhost:80".to_string(),
+            "host01".to_string(),
+            "id".to_string(),
+        ];
+        assert!(deterministic_safe_allow_reason(&cfg, "ssh", &args).is_none());
+    }
+
+    #[test]
+    fn deterministic_safe_allow_rejects_concatenated_ssh_transport_options() {
+        let (cfg, _) = make_test_config();
+        let risky = [
+            vec![
+                "-oProxyCommand=sh -c id".to_string(),
+                "host01".to_string(),
+                "id".to_string(),
+            ],
+            vec![
+                "-oForwardAgent=yes".to_string(),
+                "host01".to_string(),
+                "id".to_string(),
+            ],
+            vec![
+                "-oProxyJump=jump01".to_string(),
+                "host01".to_string(),
+                "id".to_string(),
+            ],
+            vec![
+                "-oTunnel=yes".to_string(),
+                "host01".to_string(),
+                "id".to_string(),
+            ],
+            vec![
+                "-Jjump01".to_string(),
+                "host01".to_string(),
+                "id".to_string(),
+            ],
+            vec!["-w0:0".to_string(), "host01".to_string(), "id".to_string()],
+        ];
+
+        for args in risky {
+            assert!(
+                deterministic_safe_allow_reason(&cfg, "ssh", &args).is_none(),
+                "unexpected deterministic allow for {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn deterministic_safe_allow_rejects_separate_ssh_transport_options() {
+        let (cfg, _) = make_test_config();
+        let risky = [
+            vec![
+                "-o".to_string(),
+                "ProxyCommand=sh -c id".to_string(),
+                "host01".to_string(),
+                "id".to_string(),
+            ],
+            vec![
+                "-o".to_string(),
+                "PermitLocalCommand=yes".to_string(),
+                "host01".to_string(),
+                "id".to_string(),
+            ],
+            vec![
+                "-J".to_string(),
+                "jump01".to_string(),
+                "host01".to_string(),
+                "id".to_string(),
+            ],
+            vec![
+                "-w".to_string(),
+                "0:0".to_string(),
+                "host01".to_string(),
+                "id".to_string(),
+            ],
+        ];
+
+        for args in risky {
+            assert!(
+                deterministic_safe_allow_reason(&cfg, "ssh", &args).is_none(),
+                "unexpected deterministic allow for {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn deterministic_safe_allow_rejects_mutating_http_method() {
+        let (cfg, _) = make_test_config();
+        let args = vec![
+            "host01".to_string(),
+            "curl -X POST http://localhost:19999/api/status".to_string(),
+        ];
+        assert!(deterministic_safe_allow_reason(&cfg, "ssh", &args).is_none());
+    }
+
+    #[test]
+    fn deterministic_safe_allow_disabled_for_paranoid_remote_access() {
+        let (mut cfg, _) = make_test_config();
+        let eval_config = EvalConfig::default()
+            .llm_enabled(false)
+            .mode(PolicyMode::Paranoid);
+        cfg.evaluator = Evaluator::new(eval_config).expect("build evaluator").into();
+        let args = vec!["host01".to_string(), "id".to_string()];
+        assert!(deterministic_safe_allow_reason(&cfg, "ssh", &args).is_none());
+    }
+
+    #[test]
+    fn execution_args_default_preserves_ssh_args() {
+        let request = ExecuteRequest {
+            binary: "ssh".to_string(),
+            args: vec!["host01".to_string(), "id".to_string()],
+            auth_token: None,
+            env: HashMap::new(),
+            secrets: HashMap::new(),
+            stream: false,
+            session_token: None,
+            ssh_hostkey: None,
+        };
+        assert_eq!(execution_args(&request), request.args);
+    }
+
+    #[test]
+    fn execution_args_accept_new_adds_strict_host_key_accept_new() {
+        let request = ExecuteRequest {
+            binary: "ssh".to_string(),
+            args: vec!["host01".to_string(), "id".to_string()],
+            auth_token: None,
+            env: HashMap::new(),
+            secrets: HashMap::new(),
+            stream: false,
+            session_token: None,
+            ssh_hostkey: Some(SshHostKeyMode::AcceptNew),
+        };
+        assert_eq!(
+            execution_args(&request),
+            vec![
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                "UpdateHostKeys=yes",
+                "host01",
+                "id"
+            ]
+        );
+    }
+
+    #[test]
+    fn execution_args_accept_all_disables_known_hosts_persistence() {
+        let request = ExecuteRequest {
+            binary: "ssh".to_string(),
+            args: vec!["host01".to_string(), "id".to_string()],
+            auth_token: None,
+            env: HashMap::new(),
+            secrets: HashMap::new(),
+            stream: false,
+            session_token: None,
+            ssh_hostkey: Some(SshHostKeyMode::AcceptAll),
+        };
+        assert_eq!(
+            execution_args(&request),
+            vec![
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "host01",
+                "id"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_all_hostkey_does_not_use_deterministic_safe_allow() {
+        let (cfg, _) = make_test_config();
+        let request = ExecuteRequest {
+            binary: "ssh".to_string(),
+            args: vec!["host01".to_string(), "id".to_string()],
+            auth_token: None,
+            env: HashMap::new(),
+            secrets: HashMap::new(),
+            stream: false,
+            session_token: None,
+            ssh_hostkey: Some(SshHostKeyMode::AcceptAll),
+        };
+
+        let result = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+        assert!(!result.policy_allowed());
+        assert!(result.policy_reason().contains("default-deny"));
+    }
+
+    #[tokio::test]
+    async fn unknown_session_token_reason_is_redacted() {
+        let (cfg, _) = make_test_config();
+        let token = "0123456789abcdef0123456789abcdef".to_string();
+        let request = ExecuteRequest {
+            binary: "id".to_string(),
+            args: vec![],
+            auth_token: None,
+            env: HashMap::new(),
+            secrets: HashMap::new(),
+            stream: false,
+            session_token: Some(token.clone()),
+            ssh_hostkey: None,
+        };
+
+        let result = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+        assert!(!result.policy_reason().contains(&token));
+        assert!(result.policy_reason().contains("<redacted len=32>"));
+    }
+
+    #[test]
+    fn session_admin_audit_lines_redact_tokens() {
+        let caller = CallerIdentity::Unix { uid: 0 };
+        let token = "0123456789abcdef0123456789abcdef".to_string();
+
+        let output = format!(
+            "{}\n{}",
+            session_grant_audit_line(&caller, &token, Some(60)),
+            session_revoke_audit_line(&caller, &token, true)
+        );
+
+        assert!(output.contains("SESSION_GRANT"));
+        assert!(output.contains("SESSION_REVOKE"));
+        assert!(!output.contains(&token));
+        assert!(output.contains("<redacted len=32>"));
+    }
+
+    #[test]
     fn parse_admin_response_line_accepts_admin_response() {
         let line = r#"{"result":"error","message":"admin denied"}"#;
         match parse_admin_response_line(line, "secret_set").unwrap() {
@@ -3063,10 +3702,10 @@ mod tests {
 
     #[test]
     fn secret_key_validation_allows_namespaced_keys() {
-        assert!(is_valid_secret_key("opnsense-apikey-secret"));
-        assert!(is_valid_secret_key("atlas/opnsense-apikey"));
-        assert!(!is_valid_secret_key("../opnsense"));
-        assert!(!is_valid_secret_key("atlas/../opnsense"));
+        assert!(is_valid_secret_key("appliance-apikey-secret"));
+        assert!(is_valid_secret_key("infra/appliance-apikey"));
+        assert!(!is_valid_secret_key("../appliance"));
+        assert!(!is_valid_secret_key("infra/../appliance"));
         assert!(!is_valid_secret_key("bad key"));
         assert!(!is_valid_secret_key("/absolute"));
     }
@@ -3074,12 +3713,12 @@ mod tests {
     #[test]
     fn invalid_shell_secret_reference_points_to_injected_env() {
         let reason = invalid_shell_secret_reference(
-            "echo '$opnsense-apikey-secret'",
-            "OPNSENSE_APIKEY_SECRET",
-            "opnsense-apikey-secret",
+            "echo '$appliance-apikey-secret'",
+            "APPLIANCE_APIKEY_SECRET",
+            "appliance-apikey-secret",
         )
         .expect("dashed shell-style reference should be rejected");
-        assert!(reason.contains("$OPNSENSE_APIKEY_SECRET"));
+        assert!(reason.contains("$APPLIANCE_APIKEY_SECRET"));
     }
 
     #[tokio::test]
@@ -3093,6 +3732,7 @@ mod tests {
             secrets: HashMap::from([("API_TOKEN".to_string(), "api/token".to_string())]),
             stream: false,
             session_token: None,
+            ssh_hostkey: None,
         };
 
         let err = validate_request_injections(
@@ -3121,6 +3761,7 @@ mod tests {
             )]),
             stream: false,
             session_token: None,
+            ssh_hostkey: None,
         };
 
         let result = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
@@ -3132,20 +3773,21 @@ mod tests {
     async fn invalid_secret_shell_reference_denies_before_policy_evaluation() {
         let (cfg, _) = make_test_config();
         cfg.secrets
-            .set(1000, "opnsense-apikey-secret", "dummy_api_key_12345")
+            .set(1000, "appliance-apikey-secret", "dummy_api_key_12345")
             .await
             .unwrap();
         let request = ExecuteRequest {
             binary: "echo".to_string(),
-            args: vec!["$opnsense-apikey-secret".to_string()],
+            args: vec!["$appliance-apikey-secret".to_string()],
             auth_token: None,
             env: HashMap::new(),
             secrets: HashMap::from([(
-                "OPNSENSE_APIKEY_SECRET".to_string(),
-                "opnsense-apikey-secret".to_string(),
+                "APPLIANCE_APIKEY_SECRET".to_string(),
+                "appliance-apikey-secret".to_string(),
             )]),
             stream: false,
             session_token: None,
+            ssh_hostkey: None,
         };
 
         let result = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
@@ -3153,6 +3795,147 @@ mod tests {
         assert!(result
             .policy_reason()
             .contains("invalid secret environment reference"));
+    }
+
+    #[tokio::test]
+    async fn dangerous_env_injection_denies_before_policy_evaluation() {
+        let (cfg, _) = make_test_config();
+        let request = ExecuteRequest {
+            binary: "id".to_string(),
+            args: vec![],
+            auth_token: None,
+            env: HashMap::from([("LD_PRELOAD".to_string(), ".cache/libhook.so".to_string())]),
+            secrets: HashMap::new(),
+            stream: false,
+            session_token: None,
+            ssh_hostkey: None,
+        };
+
+        let result = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+        assert!(!result.policy_allowed());
+        assert!(result
+            .policy_reason()
+            .contains("dangerous injected environment variable name"));
+    }
+
+    #[tokio::test]
+    async fn env_injection_disables_deterministic_safe_allow() {
+        let (cfg, _) = make_test_config();
+        let request = ExecuteRequest {
+            binary: "id".to_string(),
+            args: vec![],
+            auth_token: None,
+            env: HashMap::from([("SAFE_CONTEXT".to_string(), "1".to_string())]),
+            secrets: HashMap::new(),
+            stream: false,
+            session_token: None,
+            ssh_hostkey: None,
+        };
+
+        let result = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+        assert!(!result.policy_allowed());
+        assert!(result.policy_reason().contains("default-deny"));
+    }
+
+    #[tokio::test]
+    async fn session_allow_does_not_bypass_credential_deny() {
+        let (cfg, _) = make_test_config();
+        let token = "session-preflight-hard-deny".to_string();
+        {
+            let mut reg = cfg.sessions.write().await;
+            reg.grant(
+                token.clone(),
+                SessionGrant {
+                    allow: vec!["cat *".to_string()],
+                    deny: vec![],
+                    expires_at: None,
+                    prompt_append: None,
+                    granted_at: 0,
+                },
+            );
+        }
+        let request = ExecuteRequest {
+            binary: "cat".to_string(),
+            args: vec![".env".to_string()],
+            auth_token: None,
+            env: HashMap::new(),
+            secrets: HashMap::new(),
+            stream: false,
+            session_token: Some(token),
+            ssh_hostkey: None,
+        };
+
+        let result = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+        assert!(!result.policy_allowed());
+        assert!(result
+            .policy_reason()
+            .contains("credential preflight denied"));
+    }
+
+    #[tokio::test]
+    async fn tcp_approved_command_without_secrets_executes() {
+        let (cfg, _) = make_test_config();
+        let request = ExecuteRequest {
+            binary: "id".to_string(),
+            args: vec![],
+            auth_token: None,
+            env: HashMap::new(),
+            secrets: HashMap::new(),
+            stream: false,
+            session_token: None,
+            ssh_hostkey: None,
+        };
+
+        let result = exec_after_approval(
+            request,
+            &cfg,
+            &CallerIdentity::Tcp {
+                token: "<test>".to_string(),
+            },
+            "test allow".to_string(),
+            0,
+            false,
+            &mut tokio::io::sink(),
+        )
+        .await;
+
+        assert!(result.policy_allowed());
+        assert_eq!(result.session_exec_status(), SessionExecStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn tcp_approved_command_with_secrets_fails_before_exec() {
+        let (cfg, _) = make_test_config();
+        let request = ExecuteRequest {
+            binary: "id".to_string(),
+            args: vec![],
+            auth_token: None,
+            env: HashMap::new(),
+            secrets: HashMap::from([("API_TOKEN".to_string(), "api-token".to_string())]),
+            stream: false,
+            session_token: None,
+            ssh_hostkey: None,
+        };
+
+        let result = exec_after_approval(
+            request,
+            &cfg,
+            &CallerIdentity::Tcp {
+                token: "<test>".to_string(),
+            },
+            "test allow".to_string(),
+            0,
+            false,
+            &mut tokio::io::sink(),
+        )
+        .await;
+
+        assert!(result.policy_allowed());
+        assert_eq!(result.session_exec_status(), SessionExecStatus::Failed);
+        let response = result.into_response();
+        assert!(response
+            .reason
+            .contains("secret injection requires a unix socket caller"));
     }
 
     #[test]
@@ -3331,6 +4114,27 @@ mod tests {
         assert!(!output.contains("EXEC_FAILED"));
     }
 
+    #[test]
+    fn audit_logs_redact_secret_shaped_arguments() {
+        let (mut cfg, buf) = make_test_config();
+        cfg.redact = true;
+        let caller = CallerIdentity::Unix { uid: 42 };
+        let secret = "Bearer abcdefghijklmnopqrstuvwxyz123456".to_string();
+
+        let output = capture(&buf, || {
+            cfg.log_audit_policy(
+                &caller,
+                "curl",
+                &["-H".into(), format!("Authorization: {secret}")],
+                true,
+                "approved",
+            );
+        });
+
+        assert!(output.contains("Bearer [REDACTED]"));
+        assert!(!output.contains(&secret));
+    }
+
     /// Regression: each user has an independent namespace. Two users
     /// can store the same key name without collision; neither can see
     /// the other's keys through the user-scoped list, but the daemon
@@ -3439,6 +4243,7 @@ mod tests {
             secrets: secrets_map,
             stream: false,
             session_token: None,
+            ssh_hostkey: None,
         };
 
         let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 30_001 }).await;

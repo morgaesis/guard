@@ -47,9 +47,29 @@ impl Default for McpConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum McpSshHostKeyMode {
+    OnlyExisting,
+    AcceptNew,
+    AcceptAll,
+}
+
+impl From<McpSshHostKeyMode> for server::SshHostKeyMode {
+    fn from(value: McpSshHostKeyMode) -> Self {
+        match value {
+            McpSshHostKeyMode::OnlyExisting => Self::OnlyExisting,
+            McpSshHostKeyMode::AcceptNew => Self::AcceptNew,
+            McpSshHostKeyMode::AcceptAll => Self::AcceptAll,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 struct GuardToolArgs {
     binary: String,
     args: Vec<String>,
+    #[serde(default)]
+    hostkey: Option<McpSshHostKeyMode>,
     #[serde(default)]
     env: HashMap<String, String>,
     #[serde(default)]
@@ -104,7 +124,15 @@ impl GuardExecutor for ClientExecutor {
         };
 
         let response = client
-            .execute_with_injections(&args.binary, &args.args, env, secrets)
+            .execute_with_injections_and_hostkey(
+                &args.binary,
+                &args.args,
+                env,
+                secrets,
+                args.hostkey
+                    .map(Into::into)
+                    .unwrap_or(server::SshHostKeyMode::OnlyExisting),
+            )
             .await
             .context("failed to execute command through guard server")?;
 
@@ -325,6 +353,11 @@ impl<E: GuardExecutor> McpServer<E> {
                                 "type": "array",
                                 "items": { "type": "string" },
                                 "description": "Arguments to pass to the binary."
+                            },
+                            "hostkey": {
+                                "type": "string",
+                                "enum": ["only-existing", "accept-new", "accept-all"],
+                                "description": "SSH host-key policy for guarded ssh commands. Defaults to only-existing."
                             },
                             "env": {
                                 "type": "object",
@@ -598,6 +631,22 @@ mod tests {
             response["result"]["tools"][0]["inputSchema"]["required"],
             json!(["binary", "args"])
         );
+        assert_eq!(
+            response["result"]["tools"][0]["inputSchema"]["properties"]["hostkey"]["enum"],
+            json!(["only-existing", "accept-new", "accept-all"])
+        );
+    }
+
+    #[test]
+    fn guard_tool_args_accepts_hostkey_mode() {
+        let args: GuardToolArgs = serde_json::from_value(json!({
+            "binary": "ssh",
+            "args": ["host01", "id"],
+            "hostkey": "accept-new"
+        }))
+        .unwrap();
+
+        assert_eq!(args.hostkey, Some(McpSshHostKeyMode::AcceptNew));
     }
 
     #[tokio::test]
@@ -672,8 +721,8 @@ mod tests {
     fn guard_tool_secret_map_derives_and_dedupes_secret_env_names() {
         let secrets = guard_tool_secret_map(
             &[
-                "opnsense-apikey-secret".to_string(),
-                "opnsense-apikey-secret".to_string(),
+                "appliance-apikey-secret".to_string(),
+                "appliance-apikey-secret".to_string(),
             ],
             HashMap::from([(
                 "AWS_SESSION_TOKEN".to_string(),
@@ -683,8 +732,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            secrets.get("OPNSENSE_APIKEY_SECRET").map(String::as_str),
-            Some("opnsense-apikey-secret")
+            secrets.get("APPLIANCE_APIKEY_SECRET").map(String::as_str),
+            Some("appliance-apikey-secret")
         );
         assert_eq!(
             secrets.get("AWS_SESSION_TOKEN").map(String::as_str),
@@ -695,9 +744,9 @@ mod tests {
     #[test]
     fn guard_tool_secret_map_rejects_conflicting_secret_mappings() {
         let err = guard_tool_secret_map(
-            &["opnsense-apikey-secret".to_string()],
+            &["appliance-apikey-secret".to_string()],
             HashMap::from([(
-                "OPNSENSE_APIKEY_SECRET".to_string(),
+                "APPLIANCE_APIKEY_SECRET".to_string(),
                 "other-secret".to_string(),
             )]),
         )

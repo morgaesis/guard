@@ -116,7 +116,8 @@ Guard walks up from your current directory to `/` looking for `.env` files (clos
 | Variable | Default | Description |
 |---|---|---|
 | `SSH_GUARD_LLM_API_KEY` / `OPENROUTER_API_KEY` | (none) | LLM API key (required). `OPENROUTER_API_KEY` is the conventional name and is accepted for compatibility. |
-| `SSH_GUARD_API_URL` | `https://openrouter.ai/api/v1/chat/completions` | Any OpenAI-compatible endpoint |
+| `SSH_GUARD_LLM_API_URL` | `https://openrouter.ai/api/v1/chat/completions` | Any OpenAI-compatible endpoint. `SSH_GUARD_API_URL` remains accepted as a compatibility alias. |
+| `SSH_GUARD_LLM_TIMEOUT` | `30` | LLM call timeout in seconds. `SSH_GUARD_TIMEOUT` remains accepted as a compatibility alias. |
 | `SSH_GUARD_LLM_MODELS` | (unset) | Optional comma-separated fallback chain (e.g. `openai/gpt-5.4-nano,meta-llama/llama-4-maverick`). When set, overrides `--llm-model` and is tried in order, each with its own retry budget. Primary model when unset: `openai/gpt-5.4-nano`. |
 | `SSH_GUARD_LLM_RETRIES` | `2` | Retries per model on transient failures (429, timeouts, parse errors). 1-2. |
 | `SSH_GUARD_MODE` | `readonly` | `readonly`, `safe`, or `paranoid` |
@@ -270,8 +271,7 @@ The simplest flow is `guard session new`, which mints a token and (optionally) g
 eval "$(guard session new \
   --allow 'mkdir /tmp/job-42*' \
   --allow 'rm /tmp/job-42/scratch*' \
-  --prompt 'This session is preparing /tmp/job-42 as scratch space.' \
-  --ttl 3600)"
+  --prompt 'This session is preparing /tmp/job-42 as scratch space.')"
 
 # Now any agent launched from this shell inherits GUARD_SESSION
 claude
@@ -287,7 +287,7 @@ To grant rules to an existing token (e.g. one the agent already has):
 guard session grant <token> --allow '<glob>' --deny '<glob>' [--ttl N] [--prompt TEXT]
 ```
 
-Matching deny patterns win over allow patterns, and everything that does not match a session rule falls through to the normal evaluator. Session grants are persisted in the daemon state database and survive daemon restarts by default. The default path is the XDG state dir (`$XDG_STATE_HOME/guard/state.db` or `~/.local/state/guard/state.db`); override it with `--state-db` or `SSH_GUARD_STATE_DB`. `guard session revoke <token>` is daemon-UID-only; `guard session list` is visible over the Unix socket to exec-allowed local users, but it redacts the bearer token, rule bodies, and prompt text unless the caller is the daemon UID.
+Matching deny patterns win over allow patterns, and everything that does not match a session rule falls through to the normal evaluator. Session grants default to a one-week TTL; pass `--ttl SECONDS` for a shorter or longer expiry, or `--no-ttl` for a grant that does not expire automatically. Grants are persisted in the daemon state database and survive daemon restarts by default. The default path is the XDG state dir (`$XDG_STATE_HOME/guard/state.db` or `~/.local/state/guard/state.db`); override it with `--state-db` or `SSH_GUARD_STATE_DB`. `guard session revoke <token>` is daemon-UID-only; `guard session list` is visible over the Unix socket to exec-allowed local users, but it redacts the bearer token, rule bodies, and prompt text unless the caller is the daemon UID.
 
 For operator forensics, `guard session show <token>` is daemon-UID-only and prints the full prompt, aggregate allow/deny and exec outcome counts, source breakdown (`llm`, `static_policy`, `session_allow`, `session_deny`, `validation`), a risk histogram for LLM-evaluated calls, and a bounded recent interaction log. Those summaries are loaded from the state database, so they remain available after a service restart within the configured retention window.
 
@@ -295,7 +295,15 @@ For operator forensics, `guard session show <token>` is daemon-UID-only and prin
 
 `guard run` can request stored secrets for one approved command without requiring a shim or persistent tool config. The daemon resolves the secret values immediately before exec, injects them into the child environment, and includes those values in exact-match output redaction.
 
-`guard secrets add/list/remove` are Unix-socket-only, per-user operations. Any exec-allowed local user can manage their own secret namespace; TCP clients cannot use secret storage or `--secret`, because the namespace is keyed from Unix peer credentials. When the daemon UID runs `guard secrets list`, it gets an aggregate names-only view across every UID namespace; duplicate key names can appear more than once and are intentionally not annotated with ownership in the default list output.
+`guard secrets add/list/remove` are Unix-socket-only, per-user operations. The
+singular `guard secret` form is an alias, and `set`/`put`, `ls`, `rm`/`delete`
+are accepted aliases for the common secret subcommands. Any exec-allowed local
+user can manage their own secret namespace; TCP clients cannot use secret
+storage or `--secret` / `--secrets`, because the namespace is keyed from Unix
+peer credentials. When the daemon UID runs `guard secrets list`, it gets an
+aggregate names-only view across every UID namespace; duplicate key names can
+appear more than once and are intentionally not annotated with ownership in the
+default list output.
 
 For daemon-side migration and cleanup, use `guard secrets list --detailed` as the daemon UID. That view includes `uid=` for namespaced entries and `origin=legacy` for pre-namespace flat secrets that still need operator migration.
 
@@ -311,31 +319,44 @@ For a stored secret with a shell-safe name, `--secret NAME` injects `$NAME`:
 
 ```bash
 guard run \
-  --secret OPNSENSE_API_KEY \
-  --secret OPNSENSE_API_SECRET \
-  --secret OPNSENSE_USERNAME \
-  ssh opnsense-host 'configctl system status'
+  --secret APPLIANCE_API_KEY \
+  --secret APPLIANCE_API_SECRET \
+  --secret APPLIANCE_USERNAME \
+  ssh appliance-host 'appliancectl system status'
 ```
 
 For a stored secret with dashes, slashes, or lowercase names, bare `--secret` derives an uppercase env var by replacing separators with underscores:
 
 ```bash
-guard run --secret opnsense-apikey-secret \
-  sh -c 'opnsense-tool --key "$OPNSENSE_APIKEY_SECRET"'
+guard run --secret appliance-apikey-secret \
+  sh -c 'appliance-tool --key "$APPLIANCE_APIKEY_SECRET"'
 ```
 
 Map a different environment variable name to a stored secret key with `ENV_VAR=secret-name`:
 
 ```bash
-guard run --secret OPNSENSE_API_KEY=atlas/opnsense-apikey ssh opnsense-host uptime
+guard run --secret APPLIANCE_API_KEY=infra/appliance-apikey ssh appliance-host uptime
 ```
 
 Plain per-run environment values are also supported for non-secret settings:
 
 ```bash
-guard run --env OPNSENSE_HOST=opnsense-host --secret OPNSENSE_API_KEY \
-  sh -c 'ssh "$OPNSENSE_HOST" uptime'
+guard run --env APPLIANCE_HOST=appliance-host --secret APPLIANCE_API_KEY \
+  sh -c 'ssh "$APPLIANCE_HOST" uptime'
 ```
+
+For guarded SSH first-contact workflows, `--hostkey` controls host-key
+handling without asking the agent to pass raw SSH options:
+
+```bash
+guard run --hostkey accept-new ssh appliance-host uptime
+```
+
+The default is `only-existing`, which preserves SSH's existing host-key
+verification behavior. `accept-new` adds new hosts to the daemon or caller
+known-hosts file but still rejects changed keys. `accept-all` disables host-key
+verification for that invocation and should be reserved for disposable or
+out-of-band verified targets.
 
 ## Admin authorization
 
@@ -345,15 +366,42 @@ The non-privileged `guard status` (run as your normal user or any other exec-all
 
 The `--prompt` / `--prompt-file` flags attach a free-form context fragment that is appended to the LLM system prompt under a `Session context:` heading for evaluator calls made under that token. Use them for guidance the static glob patterns cannot express. The decision cache is bypassed when a session prompt is in play, because cached verdicts were made under the base prompt and may not hold under the extended context.
 
-Because grants are now durable, broad sessions deserve the same care as any other persistent authorization state. Prefer explicit TTLs for elevated sessions, and treat `allow=["*"]` as an operator override that must be revoked intentionally rather than something a daemon restart will clear for you.
+Because grants are durable for their TTL, broad sessions deserve the same care as any other persistent authorization state. Treat `--no-ttl` and `allow=["*"]` as operator overrides that must be revoked intentionally rather than something a daemon restart will clear for you.
 
 ## Execution identity
 
 By default the daemon executes approved commands as its own service identity. If you want guard to act as a local secret broker and redactor for per-user files such as `~/.aws/config` or `~/.cmk/config`, start a root-owned daemon with `--exec-as-caller` and only a Unix socket listener. In that mode guard authenticates the caller by Unix peer credentials and drops the child process to that UID before exec, so the command runs with the caller's filesystem access instead of the daemon's or root's. TCP listeners are intentionally incompatible with this mode because a token is not a trustworthy local UID.
 
+The packaged daemon-identity unit is `deployment/systemd/guard.service`.
+Use `deployment/systemd/guard-exec-as-caller.service` as the starting point
+for caller-identity deployments; it intentionally does not set `User=guard`
+because the daemon must start as root before dropping approved child
+processes to the connecting UID. In daemon-identity mode, `HOME=/var/lib/guard`
+keeps `--hostkey accept-new` known-hosts persistence under service-owned state.
+In caller-identity mode, `--hostkey accept-new` writes to the caller's SSH
+known-hosts state.
+
 ## Agent integration
 
 Point your agent's command execution at `guard run` instead of direct execution.
+
+### PATH shims
+
+For agents that call ordinary tool names directly, install shims and prepend the
+printed directory to the agent's `PATH`:
+
+```bash
+guard shim ssh,scp,sftp,sudo
+# or install the built-in set:
+guard shim --default-tools
+```
+
+The command prints an `export PATH=...` line. Add that export to the environment
+used to launch agents. After that, calls such as `ssh host id` or `sudo id`
+resolve to generated wrappers that run `guard run <tool> "$@"`.
+
+Systemd deployment does not install profile hooks automatically; keep shim PATH
+opt-in per agent or per service.
 
 ### MCP server
 
@@ -378,13 +426,13 @@ Optional per-call environment and secret references mirror `guard run`:
 ```json
 {
   "binary": "sh",
-  "args": ["-lc", "[ -n \"$OPNSENSE_APIKEY_SECRET\" ] && echo set"],
-  "secrets": ["opnsense-apikey-secret"],
+  "args": ["-lc", "[ -n \"$APPLIANCE_APIKEY_SECRET\" ] && echo set"],
+  "secrets": ["appliance-apikey-secret"],
   "secretEnv": {
-    "OPNSENSE_API_KEY": "atlas/opnsense-apikey"
+    "APPLIANCE_API_KEY": "infra/appliance-apikey"
   },
   "env": {
-    "TARGET_HOST": "opnsense-prod"
+    "TARGET_HOST": "appliance-prod"
   }
 }
 ```
@@ -421,7 +469,8 @@ Never use interactive sessions.
 ```bash
 export SSH_GUARD_LLM_API_KEY="..."
 export SSH_GUARD_MODE=readonly
-alias ssh=guard
+guard shim ssh,scp,sftp,sudo
+export PATH="$HOME/.guard/shims:$PATH"
 ```
 
 </details>
@@ -457,12 +506,16 @@ Guard provides defense in depth through three layers:
 
 ## Audit logging
 
-Guard logs all decisions via `tracing`. Configure log level with `RUST_LOG`:
+Guard logs all decisions via `tracing`. Use `-v` for info, `-vv` for debug, and
+`-vvv` for trace when launching guard directly:
 
 ```bash
-RUST_LOG=info guard server start    # decisions + token usage
-RUST_LOG=debug guard server start   # verbose request/response logging
+guard -v server start    # decisions + token usage
+guard -vv server start   # verbose request/response logging
 ```
+
+`RUST_LOG` still takes precedence over `-v`, then `GUARD_LOG_LEVEL` /
+`SSH_GUARD_LOG_LEVEL`, then the default `warn`.
 
 LLM token usage is logged per evaluation:
 

@@ -17,13 +17,48 @@ mod tool_config;
 use guard::evaluate;
 
 use anyhow::{Context, Result};
-use clap::{ArgAction, CommandFactory, Parser, Subcommand};
+use clap::{Arg, ArgAction, Command, CommandFactory, Parser, Subcommand};
 use guard::policy::PolicyMode;
 use injection::{collect_unique_pairs, derive_env_name, is_valid_env_name};
 use std::collections::HashMap;
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 use tracing_subscriber::{fmt, EnvFilter};
+
+const DEFAULT_SESSION_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "kebab-case")]
+enum SshHostKeyCliMode {
+    AcceptNew,
+    #[value(name = "accept-all-unsafe", alias = "accept-all")]
+    AcceptAllUnsafe,
+    OnlyExisting,
+}
+
+impl From<SshHostKeyCliMode> for server::SshHostKeyMode {
+    fn from(value: SshHostKeyCliMode) -> Self {
+        match value {
+            SshHostKeyCliMode::AcceptNew => Self::AcceptNew,
+            SshHostKeyCliMode::AcceptAllUnsafe => Self::AcceptAll,
+            SshHostKeyCliMode::OnlyExisting => Self::OnlyExisting,
+        }
+    }
+}
+
+#[derive(Parser)]
+#[command(
+    name = "guard",
+    about = "Policy-gated command execution for agents and automation."
+)]
+struct Cli {
+    /// Increase logging verbosity (-v = info, -vv = debug, -vvv = trace).
+    #[arg(short = 'v', long = "verbose", action = ArgAction::Count, global = true)]
+    verbose: u8,
+
+    #[command(subcommand)]
+    command: MainArgs,
+}
 
 #[derive(Parser)]
 #[allow(clippy::large_enum_variant)]
@@ -34,7 +69,7 @@ enum MainArgs {
     // forwarding `-h` to `df`. Users can still see the help for the `run`
     // subcommand via `guard help run`.
     #[clap(
-        alias = "exec",
+        visible_alias = "exec",
         disable_help_flag = true,
         after_help = "Use `guard run <binary> --help` to pass --help to the child command."
     )]
@@ -44,8 +79,14 @@ enum MainArgs {
         env_vars: Vec<(String, String)>,
         /// Inject a stored secret. Bare SECRET derives an env var; ENV_VAR=SECRET sets one.
         /// Repeat the flag or pass a comma-separated list for multiple secrets.
-        #[arg(long = "secret", value_name = "SECRET[,SECRET]", value_parser = parse_secret_mapping, value_delimiter = ',')]
+        #[arg(long = "secret", visible_alias = "secrets", value_name = "SECRET|ENV_VAR=SECRET[,...]", value_parser = parse_secret_mapping, value_delimiter = ',')]
         secret_vars: Vec<(String, String)>,
+        /// Session grant token. Overrides GUARD_SESSION when set.
+        #[arg(long = "session", value_name = "TOKEN")]
+        session: Option<String>,
+        /// SSH host-key policy for guarded ssh commands. accept-all-unsafe disables verification.
+        #[arg(long = "hostkey", value_enum, default_value_t = SshHostKeyCliMode::OnlyExisting)]
+        hostkey: SshHostKeyCliMode,
         /// Binary to execute
         binary: String,
         /// Arguments to pass to the binary
@@ -56,18 +97,21 @@ enum MainArgs {
     #[clap(subcommand)]
     Server(ServerCommands),
     /// Manage secrets
-    #[clap(subcommand, alias = "secret")]
+    #[clap(subcommand, visible_alias = "secret")]
     Secrets(SecretCommands),
     /// Install shim scripts for command interposition
     Shim {
         /// Comma-separated list of tools to shim (e.g. ssh,kubectl,helm)
         #[arg(value_delimiter = ',')]
         tools: Option<Vec<String>>,
+        /// Generate all built-in default shims.
+        #[arg(long = "default-tools", action = ArgAction::SetTrue, conflicts_with = "tools")]
+        default_tools: bool,
         /// List installed shims
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["remove", "tools", "default_tools", "env_vars", "secret_vars", "user"])]
         list: bool,
         /// Remove shims (all or specified tools)
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["default_tools", "env_vars", "secret_vars", "user"])]
         remove: bool,
         /// Custom shim directory
         #[arg(long, value_name = "PATH")]
@@ -75,8 +119,8 @@ enum MainArgs {
         /// Inject an environment variable (KEY=VALUE, repeatable)
         #[arg(long = "env", value_name = "KEY=VALUE", value_parser = parse_env_assignment)]
         env_vars: Vec<(String, String)>,
-        /// Inject a secret as an env var (ENV_VAR=secret-name). Repeat or comma-separate.
-        #[arg(long = "secret", value_name = "ENV_VAR=SECRET[,ENV_VAR=SECRET]", value_parser = parse_env_assignment, value_delimiter = ',')]
+        /// Inject a stored secret. Bare SECRET derives an env var; ENV_VAR=SECRET sets one.
+        #[arg(long = "secret", visible_alias = "secrets", value_name = "SECRET|ENV_VAR=SECRET[,...]", value_parser = parse_secret_mapping, value_delimiter = ',')]
         secret_vars: Vec<(String, String)>,
         /// Apply env/secret config to a specific user (UID or token name)
         #[arg(long)]
@@ -95,17 +139,19 @@ enum MainArgs {
     /// uptime, evaluation mode, and dry-run state. The full config
     /// snapshot is restricted to the daemon UID.
     Status {
-        #[arg(long)]
+        /// UNIX socket path to connect to.
+        #[arg(long, value_name = "PATH")]
         socket: Option<String>,
     },
 }
 
 #[derive(Subcommand)]
 enum SessionCommands {
-    /// Mint a fresh session token (UUID-shaped). With any of --prompt /
-    /// --allow / --deny / --ttl, also installs the grant in one round
+    /// Mint a fresh bearer session token (UUID-shaped). With any of --prompt /
+    /// --allow / --deny / --ttl / --no-ttl, also installs the grant in one round
     /// trip. Prints `export GUARD_SESSION=<token>` on stdout so you can
-    /// `eval $(guard session new ...)` to set it for the current shell.
+    /// `eval $(guard session new ...)` to set it for the current shell. Do not paste
+    /// bearer session tokens into logs or tickets.
     New {
         /// Glob pattern to allow in this session (repeatable)
         #[arg(long = "allow", value_name = "GLOB")]
@@ -113,14 +159,17 @@ enum SessionCommands {
         /// Glob pattern to deny in this session (repeatable, beats allow)
         #[arg(long = "deny", value_name = "GLOB")]
         deny: Vec<String>,
-        /// Time-to-live in seconds; omit for no expiry (cleared on daemon restart)
+        /// Time-to-live in seconds; defaults to 604800 (1 week). Prefer shorter TTLs for elevated grants.
         #[arg(long, value_name = "SECONDS")]
         ttl: Option<u64>,
+        /// Install the grant without an expiry. Avoid for broad or elevated grants.
+        #[arg(long = "no-ttl", action = ArgAction::SetTrue, conflicts_with = "ttl")]
+        no_ttl: bool,
         /// Free-form context appended to the LLM system prompt for this session.
         #[arg(long, value_name = "TEXT")]
         prompt: Option<String>,
         /// Read session context from a file.
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", conflicts_with = "prompt")]
         prompt_file: Option<PathBuf>,
         /// Server socket path (defaults to configured)
         #[arg(long, value_name = "PATH")]
@@ -128,7 +177,7 @@ enum SessionCommands {
     },
     /// Grant a session token extra allow/deny patterns
     Grant {
-        /// Opaque session token; the agent passes this as GUARD_SESSION or --session
+        /// Bearer session token; the agent passes this as GUARD_SESSION or --session.
         token: String,
         /// Glob pattern to allow in this session (repeatable)
         #[arg(long = "allow", value_name = "GLOB")]
@@ -136,17 +185,19 @@ enum SessionCommands {
         /// Glob pattern to deny in this session (repeatable, beats allow)
         #[arg(long = "deny", value_name = "GLOB")]
         deny: Vec<String>,
-        /// Time-to-live in seconds; omit for no expiry (cleared on daemon restart)
+        /// Time-to-live in seconds; defaults to 604800 (1 week). Prefer shorter TTLs for elevated grants.
         #[arg(long, value_name = "SECONDS")]
         ttl: Option<u64>,
+        /// Install the grant without an expiry. Avoid for broad or elevated grants.
+        #[arg(long = "no-ttl", action = ArgAction::SetTrue, conflicts_with = "ttl")]
+        no_ttl: bool,
         /// Free-form context appended to the LLM system prompt for evaluator
         /// calls made under this session token. Use to give the model context
         /// the static glob patterns cannot express.
         #[arg(long, value_name = "TEXT")]
         prompt: Option<String>,
-        /// Read prompt from a file (alternative to --prompt). Mutually
-        /// exclusive with --prompt; --prompt-file wins if both are given.
-        #[arg(long, value_name = "PATH")]
+        /// Read prompt from a file instead of --prompt.
+        #[arg(long, value_name = "PATH", conflicts_with = "prompt")]
         prompt_file: Option<PathBuf>,
         /// Server socket path (defaults to configured)
         #[arg(long, value_name = "PATH")]
@@ -167,6 +218,9 @@ enum SessionCommands {
         /// Number of recent interactions to print.
         #[arg(long, value_name = "N", default_value_t = 20)]
         limit: usize,
+        /// Print the bearer session token in output. Avoid when output may be logged.
+        #[arg(long = "reveal-token", action = ArgAction::SetTrue)]
+        reveal_token: bool,
         /// Server socket path (defaults to configured)
         #[arg(long, value_name = "PATH")]
         socket: Option<String>,
@@ -186,6 +240,9 @@ enum SessionCommands {
         /// still see "(hidden)").
         #[arg(long = "full", action = ArgAction::SetTrue)]
         full: bool,
+        /// Print bearer session tokens in output. Avoid when output may be logged.
+        #[arg(long = "reveal-token", action = ArgAction::SetTrue)]
+        reveal_token: bool,
         /// Server socket path (defaults to configured)
         #[arg(long, value_name = "PATH")]
         socket: Option<String>,
@@ -257,7 +314,7 @@ enum ServerCommands {
         #[arg(long, value_name = "PORT")]
         tcp_port: Option<u16>,
 
-        /// Shared token required for TCP clients.
+        /// Shared token required for TCP clients. Avoid command-line secrets; prefer an environment file.
         #[arg(long, value_name = "TOKEN")]
         auth_token: Option<String>,
 
@@ -277,7 +334,7 @@ enum ServerCommands {
         #[arg(long, value_name = "PATH")]
         shim_dir: Option<PathBuf>,
 
-        /// LLM provider API key. Prefer the GUARD_LLM_API_KEY env var.
+        /// LLM provider API key. Avoid command-line secrets; prefer SSH_GUARD_LLM_API_KEY or OPENROUTER_API_KEY.
         #[arg(long, value_name = "KEY")]
         llm_api_key: Option<String>,
 
@@ -366,6 +423,10 @@ enum ServerCommands {
         system_prompt_append: Option<PathBuf>,
     },
     /// Connect to guard server and execute a command
+    #[clap(
+        disable_help_flag = true,
+        after_help = "Use `guard server connect <binary> --help` to pass --help to the child command."
+    )]
     Connect {
         /// UNIX socket path to connect to.
         #[arg(long, value_name = "PATH")]
@@ -375,7 +436,7 @@ enum ServerCommands {
         #[arg(long, value_name = "PORT")]
         tcp_port: Option<u16>,
 
-        /// Shared token for TCP connections.
+        /// Shared token for TCP connections. Avoid command-line secrets; prefer `guard config set-token --stdin`.
         #[arg(long, value_name = "TOKEN")]
         token: Option<String>,
 
@@ -385,8 +446,14 @@ enum ServerCommands {
 
         /// Inject a stored secret. Bare SECRET derives an env var; ENV_VAR=SECRET sets one.
         /// Repeat the flag or pass a comma-separated list for multiple secrets.
-        #[arg(long = "secret", value_name = "SECRET[,SECRET]", value_parser = parse_secret_mapping, value_delimiter = ',')]
+        #[arg(long = "secret", visible_alias = "secrets", value_name = "SECRET|ENV_VAR=SECRET[,...]", value_parser = parse_secret_mapping, value_delimiter = ',')]
         secret_vars: Vec<(String, String)>,
+        /// Session grant token. Overrides GUARD_SESSION when set.
+        #[arg(long = "session", value_name = "TOKEN")]
+        session: Option<String>,
+        /// SSH host-key policy for guarded ssh commands. accept-all-unsafe disables verification.
+        #[arg(long = "hostkey", value_enum, default_value_t = SshHostKeyCliMode::OnlyExisting)]
+        hostkey: SshHostKeyCliMode,
 
         /// Binary to execute
         binary: String,
@@ -397,7 +464,8 @@ enum ServerCommands {
     },
     /// Show server status (alias for top-level `guard status`)
     Status {
-        #[arg(long)]
+        /// UNIX socket path to connect to.
+        #[arg(long, value_name = "PATH")]
         socket: Option<String>,
     },
 }
@@ -418,8 +486,12 @@ enum ConfigCommands {
     },
     /// Set auth token
     SetToken {
-        /// Shared token for TCP connections.
-        token: String,
+        /// Shared token for TCP connections. Avoid this positional form in shells; prefer --stdin.
+        #[arg(value_name = "TOKEN", required_unless_present = "stdin")]
+        token: Option<String>,
+        /// Read the token from stdin.
+        #[arg(long = "stdin", action = ArgAction::SetTrue, conflicts_with = "token")]
+        stdin: bool,
     },
     /// Set default user
     SetUser {
@@ -442,7 +514,7 @@ enum McpCommands {
         #[arg(long, value_name = "PORT")]
         tcp_port: Option<u16>,
 
-        /// Shared token for TCP connections.
+        /// Shared token for TCP connections. Avoid command-line secrets; prefer configured client auth.
         #[arg(long, value_name = "TOKEN")]
         token: Option<String>,
 
@@ -455,19 +527,22 @@ enum McpCommands {
 #[derive(Subcommand)]
 enum SecretCommands {
     /// Store a secret in guard's configured backend.
+    #[command(visible_aliases = ["set", "put"])]
     Add {
         /// Secret key used by --secret and tool configs.
         key: String,
-        /// Secret value. Omit to read piped stdin or prompt interactively.
+        /// Secret value. Avoid this positional form in shells; omit to read piped stdin or prompt interactively.
         value: Option<String>,
     },
     /// List stored secret keys.
+    #[command(visible_alias = "ls")]
     List {
         /// Include daemon-only ownership/origin detail for migration work.
         #[arg(long, action = ArgAction::SetTrue)]
         detailed: bool,
     },
     /// Remove a stored secret.
+    #[command(visible_aliases = ["rm", "delete"])]
     Remove {
         /// Secret key to remove.
         key: String,
@@ -483,13 +558,6 @@ fn guard_env(suffix: &str) -> Option<String> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Log level: RUST_LOG > GUARD_LOG_LEVEL > SSH_GUARD_LOG_LEVEL > "info"
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        let level = guard_env("LOG_LEVEL").unwrap_or_else(|| "warn".to_string());
-        EnvFilter::new(level)
-    });
-    fmt().with_env_filter(filter).with_target(true).init();
-
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     // Top-level --version / -V sniff. We cannot scan for --help / -h here
@@ -502,38 +570,17 @@ async fn main() -> Result<()> {
         println!("guard v{}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-    if run_help_requested(&args) {
-        return print_run_help();
+    if let Some(help_target) = explicit_help_requested(&args) {
+        return print_explicit_help(help_target);
     }
 
-    let result = MainArgs::try_parse_from(std::env::args());
+    let result = Cli::try_parse_from(std::env::args());
 
     match result {
-        Ok(MainArgs::Run {
-            env_vars,
-            secret_vars,
-            binary,
-            args,
-        }) => {
-            let env_vars = env_pairs_to_map(env_vars).map_err(anyhow::Error::msg)?;
-            let secret_vars = secret_pairs_to_map(secret_vars).map_err(anyhow::Error::msg)?;
-            run_exec(binary, args, env_vars, secret_vars).await
+        Ok(cli) => {
+            init_logging(cli.verbose);
+            dispatch(cli.command).await
         }
-        Ok(MainArgs::Server(cmd)) => run_server(cmd).await,
-        Ok(MainArgs::Secrets(subcommand)) => handle_secrets(subcommand).await,
-        Ok(MainArgs::Shim {
-            tools,
-            list,
-            remove,
-            path,
-            env_vars,
-            secret_vars,
-            user,
-        }) => handle_shim(tools, list, remove, path, env_vars, secret_vars, user).await,
-        Ok(MainArgs::Config(subcommand)) => handle_config(subcommand).await,
-        Ok(MainArgs::Mcp(subcommand)) => run_mcp(subcommand).await,
-        Ok(MainArgs::Session(subcommand)) => handle_session(subcommand).await,
-        Ok(MainArgs::Status { socket }) => handle_status(socket).await,
         Err(ref e)
             if e.kind() == clap::error::ErrorKind::DisplayHelp
                 || e.kind() == clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
@@ -549,6 +596,65 @@ async fn main() -> Result<()> {
     }
 }
 
+fn init_logging(verbosity: u8) {
+    // RUST_LOG > verbosity flag > GUARD_LOG_LEVEL > SSH_GUARD_LOG_LEVEL > warn.
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        let level = match verbosity {
+            0 => guard_env("LOG_LEVEL").unwrap_or_else(|| "warn".to_string()),
+            1 => "info".to_string(),
+            2 => "debug".to_string(),
+            _ => "trace".to_string(),
+        };
+        EnvFilter::new(level)
+    });
+    fmt().with_env_filter(filter).with_target(true).init();
+}
+
+async fn dispatch(command: MainArgs) -> Result<()> {
+    match command {
+        MainArgs::Run {
+            env_vars,
+            secret_vars,
+            session,
+            hostkey,
+            binary,
+            args,
+        } => {
+            let env_vars = env_pairs_to_map(env_vars).map_err(anyhow::Error::msg)?;
+            let secret_vars = secret_pairs_to_map(secret_vars).map_err(anyhow::Error::msg)?;
+            run_exec(binary, args, env_vars, secret_vars, session, hostkey.into()).await
+        }
+        MainArgs::Server(cmd) => run_server(cmd).await,
+        MainArgs::Secrets(subcommand) => handle_secrets(subcommand).await,
+        MainArgs::Shim {
+            tools,
+            default_tools,
+            list,
+            remove,
+            path,
+            env_vars,
+            secret_vars,
+            user,
+        } => {
+            handle_shim(
+                tools,
+                default_tools,
+                list,
+                remove,
+                path,
+                env_vars,
+                secret_vars,
+                user,
+            )
+            .await
+        }
+        MainArgs::Config(subcommand) => handle_config(subcommand).await,
+        MainArgs::Mcp(subcommand) => run_mcp(subcommand).await,
+        MainArgs::Session(subcommand) => handle_session(subcommand).await,
+        MainArgs::Status { socket } => handle_status(socket).await,
+    }
+}
+
 /// Returns true if the user asked for `--version` / `-V` at the top level,
 /// before any subcommand. We scan only the very first positional token so
 /// that `guard run foo -V` does not trigger a top-level version print.
@@ -559,22 +665,87 @@ fn top_level_version_requested(args: &[String]) -> bool {
     }
 }
 
-fn run_help_requested(args: &[String]) -> bool {
-    matches!(args.first().map(String::as_str), Some("run" | "exec"))
-        && matches!(args.get(1).map(String::as_str), Some("--help" | "-h"))
-        && args.len() == 2
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExplicitHelpTarget {
+    Run,
+    ServerConnect,
 }
 
-fn print_run_help() -> Result<()> {
-    let command = MainArgs::command();
-    let mut run = command
-        .find_subcommand("run")
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("internal error: run help is unavailable"))?;
-    run = run.bin_name("guard run");
-    run.print_help()?;
+fn explicit_help_requested(args: &[String]) -> Option<ExplicitHelpTarget> {
+    let args = strip_leading_global_flags(args);
+    match args {
+        [cmd, rest @ ..] if matches!(cmd.as_str(), "run" | "exec") => {
+            let rest = strip_leading_global_flags(rest);
+            if let [help] = rest
+                && is_help_flag(help)
+            {
+                Some(ExplicitHelpTarget::Run)
+            } else {
+                None
+            }
+        }
+        [server, connect, rest @ ..] if server == "server" && connect == "connect" => {
+            let rest = strip_leading_global_flags(rest);
+            if let [help] = rest
+                && is_help_flag(help)
+            {
+                Some(ExplicitHelpTarget::ServerConnect)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn strip_leading_global_flags(args: &[String]) -> &[String] {
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        if arg == "--verbose"
+            || arg.starts_with("-v") && arg.chars().all(|ch| ch == '-' || ch == 'v')
+        {
+            index += 1;
+        } else {
+            break;
+        }
+    }
+    &args[index..]
+}
+
+fn is_help_flag(arg: &str) -> bool {
+    arg == "--help" || arg == "-h"
+}
+
+fn print_explicit_help(target: ExplicitHelpTarget) -> Result<()> {
+    let mut help_command = explicit_help_command(target)?;
+    help_command.print_help()?;
     println!();
     Ok(())
+}
+
+fn explicit_help_command(target: ExplicitHelpTarget) -> Result<Command> {
+    let command = Cli::command();
+    let mut help_command = match target {
+        ExplicitHelpTarget::Run => command
+            .find_subcommand("run")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("internal error: run help is unavailable"))?
+            .bin_name("guard run"),
+        ExplicitHelpTarget::ServerConnect => command
+            .find_subcommand("server")
+            .and_then(|server| server.find_subcommand("connect"))
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("internal error: server connect help is unavailable"))?
+            .bin_name("guard server connect"),
+    };
+    help_command = help_command.arg(
+        Arg::new("verbose")
+            .short('v')
+            .long("verbose")
+            .action(ArgAction::Count)
+            .help("Increase logging verbosity (-v = info, -vv = debug, -vvv = trace)"),
+    );
+    Ok(help_command)
 }
 
 fn current_uid() -> u32 {
@@ -705,13 +876,22 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
 
             let mut eval_config = evaluate::EvalConfig::default()
                 .llm_enabled(llm_enabled)
-                .llm_timeout_secs(llm_timeout.unwrap_or(30));
+                .llm_timeout_secs(
+                    llm_timeout
+                        .or_else(|| guard_env("LLM_TIMEOUT").and_then(|v| v.parse::<u64>().ok()))
+                        .or_else(|| guard_env("TIMEOUT").and_then(|v| v.parse::<u64>().ok()))
+                        .unwrap_or(30),
+                );
 
             if let Some(api_key) = api_key.filter(|value| !value.is_empty()) {
                 eval_config = eval_config.llm_api_key(api_key);
             }
 
-            if let Some(api_url) = llm_api_url.filter(|value| !value.is_empty()) {
+            let api_url = llm_api_url
+                .filter(|value| !value.is_empty())
+                .or_else(|| guard_env("LLM_API_URL").filter(|value| !value.is_empty()))
+                .or_else(|| guard_env("API_URL").filter(|value| !value.is_empty()));
+            if let Some(api_url) = api_url {
                 eval_config = eval_config.llm_api_url(api_url);
             }
 
@@ -921,6 +1101,8 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             token,
             env_vars,
             secret_vars,
+            session,
+            hostkey,
             binary,
             args,
         } => {
@@ -931,10 +1113,8 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             if let Some(token) = token {
                 client = client.with_auth(token);
             }
-            if let Ok(session) = std::env::var("GUARD_SESSION") {
-                if !session.is_empty() {
-                    client = client.with_session(session);
-                }
+            if let Some(session) = explicit_or_env_session(session) {
+                client = client.with_session(session);
             }
 
             tracing::info!(
@@ -944,11 +1124,12 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             );
             let mut streamed_output = false;
             let resp = client
-                .execute_streaming_with_injections(
+                .execute_streaming_with_injections_and_hostkey(
                     &binary,
                     &args,
                     env_vars,
                     secret_vars,
+                    hostkey.into(),
                     |stream, data| {
                         streamed_output = true;
                         match stream {
@@ -992,6 +1173,8 @@ async fn run_exec(
     args: Vec<String>,
     env_vars: HashMap<String, String>,
     secret_vars: HashMap<String, String>,
+    session: Option<String>,
+    hostkey: server::SshHostKeyMode,
 ) -> Result<()> {
     let config = client_config::ClientConfig::load().ok().unwrap_or_default();
 
@@ -1001,10 +1184,8 @@ async fn run_exec(
     if let Some(token) = config.auth_token {
         client = client.with_auth(token);
     }
-    if let Ok(session) = std::env::var("GUARD_SESSION") {
-        if !session.is_empty() {
-            client = client.with_session(session);
-        }
+    if let Some(session) = explicit_or_env_session(session) {
+        client = client.with_session(session);
     }
 
     tracing::info!(
@@ -1014,19 +1195,26 @@ async fn run_exec(
     );
     let mut streamed_output = false;
     let resp = client
-        .execute_streaming_with_injections(&binary, &args, env_vars, secret_vars, |stream, data| {
-            streamed_output = true;
-            match stream {
-                server::OutputStream::Stdout => {
-                    print!("{}", data);
-                    let _ = std::io::stdout().flush();
+        .execute_streaming_with_injections_and_hostkey(
+            &binary,
+            &args,
+            env_vars,
+            secret_vars,
+            hostkey,
+            |stream, data| {
+                streamed_output = true;
+                match stream {
+                    server::OutputStream::Stdout => {
+                        print!("{}", data);
+                        let _ = std::io::stdout().flush();
+                    }
+                    server::OutputStream::Stderr => {
+                        eprint!("{}", data);
+                        let _ = std::io::stderr().flush();
+                    }
                 }
-                server::OutputStream::Stderr => {
-                    eprint!("{}", data);
-                    let _ = std::io::stderr().flush();
-                }
-            }
-        })
+            },
+        )
         .await?;
 
     if resp.allowed {
@@ -1056,6 +1244,14 @@ async fn run_exec(
         eprintln!("DENIED: {}", resp.reason);
         std::process::exit(1);
     }
+}
+
+fn explicit_or_env_session(explicit: Option<String>) -> Option<String> {
+    explicit.filter(|session| !session.is_empty()).or_else(|| {
+        std::env::var("GUARD_SESSION")
+            .ok()
+            .filter(|session| !session.is_empty())
+    })
 }
 
 async fn run_mcp(subcommand: McpCommands) -> Result<()> {
@@ -1262,6 +1458,14 @@ fn generate_session_token() -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+fn resolve_session_ttl(ttl: Option<u64>, no_ttl: bool) -> Option<u64> {
+    if no_ttl {
+        None
+    } else {
+        Some(ttl.unwrap_or(DEFAULT_SESSION_TTL_SECS))
+    }
+}
+
 async fn handle_session(subcommand: SessionCommands) -> Result<()> {
     let config = client_config::ClientConfig::load().ok().unwrap_or_default();
 
@@ -1272,6 +1476,7 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
         allow,
         deny,
         ttl,
+        no_ttl,
         prompt,
         prompt_file,
         socket,
@@ -1281,6 +1486,7 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
         let has_grant = !allow.is_empty()
             || !deny.is_empty()
             || ttl.is_some()
+            || *no_ttl
             || prompt.is_some()
             || prompt_file.is_some();
 
@@ -1299,7 +1505,7 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                 token: token.clone(),
                 allow: allow.clone(),
                 deny: deny.clone(),
-                ttl_secs: *ttl,
+                ttl_secs: resolve_session_ttl(*ttl, *no_ttl),
                 prompt_append,
             };
             match client.send_admin(request).await? {
@@ -1319,17 +1525,17 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
         // not pollute the captured value.
         println!("export GUARD_SESSION={}", token);
         if has_grant {
-            eprintln!("granted session {}", token);
+            eprintln!("granted session; export line printed to stdout");
         } else {
             eprintln!(
-                "minted session {} (no grant installed; run `guard session grant {} ...` to attach rules)",
-                token, token
+                "minted session (no grant installed; run `guard session grant <token> ...` to attach rules)"
             );
         }
         return Ok(());
     }
 
     let mut print_full_prompt = false;
+    let mut reveal_tokens = false;
 
     let (socket_override, request) = match subcommand {
         SessionCommands::New { .. } => unreachable!("handled above"),
@@ -1338,6 +1544,7 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
             allow,
             deny,
             ttl,
+            no_ttl,
             prompt,
             prompt_file,
             socket,
@@ -1355,7 +1562,7 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                     token,
                     allow,
                     deny,
-                    ttl_secs: ttl,
+                    ttl_secs: resolve_session_ttl(ttl, no_ttl),
                     prompt_append,
                 },
             )
@@ -1366,18 +1573,23 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
         SessionCommands::Show {
             token,
             limit,
+            reveal_token,
             socket,
-        } => (
-            socket,
-            server::AdminRequest::SessionShow {
-                token,
-                limit: Some(limit),
-            },
-        ),
+        } => {
+            reveal_tokens = reveal_token;
+            (
+                socket,
+                server::AdminRequest::SessionShow {
+                    token,
+                    limit: Some(limit),
+                },
+            )
+        }
         SessionCommands::List {
             history,
             since,
             full,
+            reveal_token,
             socket,
         } => {
             let since_unix = match since.as_deref() {
@@ -1388,6 +1600,7 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
             // since shows the entire retention window.
             let include_history = history || since_unix.is_some();
             print_full_prompt = full;
+            reveal_tokens = reveal_token;
             (
                 socket,
                 server::AdminRequest::SessionList {
@@ -1416,7 +1629,7 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                 for g in &grants {
                     println!(
                         "[active]  token={} allow={:?} deny={:?} granted_at={} expires_at={} prompt={}",
-                        g.token,
+                        format_session_token(&g.token, reveal_tokens),
                         g.allow,
                         g.deny,
                         g.granted_at,
@@ -1434,7 +1647,7 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                     println!(
                         "{} token={} allow={:?} deny={:?} granted_at={} ended_at={} prompt={}",
                         label,
-                        h.token,
+                        format_session_token(&h.token, reveal_tokens),
                         h.allow,
                         h.deny,
                         h.granted_at,
@@ -1448,7 +1661,7 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
             if let Some(active) = report.active {
                 println!(
                     "token={} status=active granted_at={} expires_at={} allow={:?} deny={:?}",
-                    active.token,
+                    format_session_token(&active.token, reveal_tokens),
                     active.granted_at,
                     active
                         .expires_at
@@ -1604,9 +1817,21 @@ async fn handle_config(subcommand: ConfigCommands) -> Result<()> {
             config.save()?;
             println!("Server port set");
         }
-        ConfigCommands::SetToken { token } => {
+        ConfigCommands::SetToken { token, stdin } => {
             let mut config =
                 client_config::ClientConfig::load().context("failed to load client config")?;
+            let token = if stdin {
+                let mut value = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut value)
+                    .context("failed to read token from stdin")?;
+                value.trim_end_matches(['\r', '\n']).to_string()
+            } else {
+                token.context("token is required unless --stdin is used")?
+            };
+            if token.is_empty() {
+                anyhow::bail!("token must not be empty");
+            }
             config.auth_token = Some(token);
             config.save()?;
             println!("Token set");
@@ -1752,6 +1977,7 @@ async fn handle_secrets(subcommand: SecretCommands) -> Result<()> {
 
 async fn handle_shim(
     tools: Option<Vec<String>>,
+    default_tools: bool,
     list: bool,
     remove: bool,
     path: Option<PathBuf>,
@@ -1828,12 +2054,22 @@ async fn handle_shim(
         return Ok(());
     }
 
-    // Default: install shims
-    let tools_to_install = tools.unwrap_or_else(|| vec!["ssh".to_string(), "scp".to_string()]);
+    // Default: install common remote-access shims. --default-tools installs
+    // the broader built-in set for agent PATH interposition.
+    let tools_to_install = match (tools, default_tools) {
+        (Some(tools), _) => tools,
+        (None, true) => shim::DEFAULT_TOOLS
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .collect(),
+        (None, false) => vec!["ssh".to_string(), "scp".to_string(), "sftp".to_string()],
+    };
     let generator = shim::ShimGenerator::new(std::env::current_exe()?, shim_dir.clone());
     let tools_refs: Vec<&str> = tools_to_install.iter().map(|s| s.as_str()).collect();
     generator.generate(&tools_refs)?;
     println!("Installed shims to: {}", shim_dir.display());
+    println!("{}", generator.path_instruction());
+    println!("Add that PATH export to agent environments that should use guarded tools.");
 
     // Register tool configs if env/secret flags were provided
     if !env_vars.is_empty() || !secret_vars.is_empty() {
@@ -1985,6 +2221,107 @@ mod tests {
             panic!("expected start");
         };
         assert!(exec_as_caller);
+    }
+
+    #[test]
+    fn shim_accepts_default_tools_flag() {
+        match MainArgs::try_parse_from(["guard", "shim", "--default-tools"]) {
+            Ok(MainArgs::Shim {
+                default_tools,
+                tools,
+                ..
+            }) => {
+                assert!(default_tools);
+                assert!(tools.is_none());
+            }
+            Ok(_) => panic!("expected shim variant"),
+            Err(e) => panic!("parser rejected valid shim args: {}", e),
+        }
+    }
+
+    #[test]
+    fn root_verbose_flag_is_global() {
+        let cli = Cli::try_parse_from(["guard", "-vv", "status"]).expect("parse root verbose");
+        assert_eq!(cli.verbose, 2);
+        assert!(matches!(cli.command, MainArgs::Status { .. }));
+
+        let cli = Cli::try_parse_from(["guard", "status", "-v"]).expect("parse subcommand verbose");
+        assert_eq!(cli.verbose, 1);
+        assert!(matches!(cli.command, MainArgs::Status { .. }));
+    }
+
+    #[test]
+    fn top_level_secret_alias_selects_secrets_command() {
+        match Cli::try_parse_from(["guard", "secret", "ls"])
+            .expect("parse secret alias")
+            .command
+        {
+            MainArgs::Secrets(SecretCommands::List { detailed }) => assert!(!detailed),
+            _ => panic!("expected secrets list via alias"),
+        }
+    }
+
+    #[test]
+    fn run_accepts_plural_secrets_alias() {
+        match MainArgs::try_parse_from(["guard", "run", "--secrets", "api-token", "id"]) {
+            Ok(MainArgs::Run { secret_vars, .. }) => assert_eq!(
+                secret_vars,
+                vec![("API_TOKEN".to_string(), "api-token".to_string())]
+            ),
+            Ok(_) => panic!("expected run variant"),
+            Err(e) => panic!("parser rejected --secrets alias: {}", e),
+        }
+    }
+
+    #[test]
+    fn server_connect_accepts_plural_secrets_alias() {
+        match MainArgs::try_parse_from([
+            "guard",
+            "server",
+            "connect",
+            "--secrets",
+            "API_TOKEN=api-token",
+            "id",
+        ]) {
+            Ok(MainArgs::Server(ServerCommands::Connect { secret_vars, .. })) => assert_eq!(
+                secret_vars,
+                vec![("API_TOKEN".to_string(), "api-token".to_string())]
+            ),
+            Ok(_) => panic!("expected server connect variant"),
+            Err(e) => panic!("parser rejected --secrets alias: {}", e),
+        }
+    }
+
+    #[test]
+    fn shim_accepts_plural_secrets_alias() {
+        match MainArgs::try_parse_from(["guard", "shim", "--secrets", "API_TOKEN=api-token", "ssh"])
+        {
+            Ok(MainArgs::Shim {
+                secret_vars, tools, ..
+            }) => {
+                assert_eq!(
+                    secret_vars,
+                    vec![("API_TOKEN".to_string(), "api-token".to_string())]
+                );
+                assert_eq!(tools, Some(vec!["ssh".to_string()]));
+            }
+            Ok(_) => panic!("expected shim variant"),
+            Err(e) => panic!("parser rejected --secrets alias: {}", e),
+        }
+    }
+
+    #[test]
+    fn session_ttl_defaults_to_one_week() {
+        assert_eq!(
+            resolve_session_ttl(None, false),
+            Some(DEFAULT_SESSION_TTL_SECS)
+        );
+    }
+
+    #[test]
+    fn session_ttl_can_be_overridden_or_disabled() {
+        assert_eq!(resolve_session_ttl(Some(3600), false), Some(3600));
+        assert_eq!(resolve_session_ttl(None, true), None);
     }
 
     #[test]
@@ -2207,9 +2544,9 @@ mod tests {
             "guard",
             "run",
             "--secret",
-            "OPNSENSE_API_KEY",
+            "APPLIANCE_API_KEY",
             "--secret",
-            "OPNSENSE_API_SECRET=atlas/opnsense-api-secret",
+            "APPLIANCE_API_SECRET=infra/appliance-api-secret",
             "ssh",
             "fw",
             "configctl",
@@ -2227,12 +2564,12 @@ mod tests {
                     secret_vars,
                     vec![
                         (
-                            "OPNSENSE_API_KEY".to_string(),
-                            "OPNSENSE_API_KEY".to_string()
+                            "APPLIANCE_API_KEY".to_string(),
+                            "APPLIANCE_API_KEY".to_string()
                         ),
                         (
-                            "OPNSENSE_API_SECRET".to_string(),
-                            "atlas/opnsense-api-secret".to_string()
+                            "APPLIANCE_API_SECRET".to_string(),
+                            "infra/appliance-api-secret".to_string()
                         )
                     ]
                 );
@@ -2248,6 +2585,32 @@ mod tests {
             }
             Ok(_) => panic!("expected Run variant"),
             Err(e) => panic!("parser rejected valid run secret injection: {}", e),
+        }
+    }
+
+    #[test]
+    fn run_accepts_hostkey_mode() {
+        match MainArgs::try_parse_from([
+            "guard",
+            "run",
+            "--hostkey",
+            "accept-new",
+            "ssh",
+            "host01",
+            "id",
+        ]) {
+            Ok(MainArgs::Run {
+                hostkey,
+                binary,
+                args,
+                ..
+            }) => {
+                assert_eq!(hostkey, SshHostKeyCliMode::AcceptNew);
+                assert_eq!(binary, "ssh");
+                assert_eq!(args, vec!["host01".to_string(), "id".to_string()]);
+            }
+            Ok(_) => panic!("expected Run variant"),
+            Err(e) => panic!("parser rejected valid hostkey mode: {}", e),
         }
     }
 
@@ -2278,12 +2641,12 @@ mod tests {
 
     #[test]
     fn bare_secret_name_derives_shell_safe_env_name() {
-        let parsed = parse_secret_mapping("opnsense-apikey-secret").unwrap();
+        let parsed = parse_secret_mapping("appliance-apikey-secret").unwrap();
         assert_eq!(
             parsed,
             (
-                "OPNSENSE_APIKEY_SECRET".to_string(),
-                "opnsense-apikey-secret".to_string()
+                "APPLIANCE_APIKEY_SECRET".to_string(),
+                "appliance-apikey-secret".to_string()
             )
         );
     }
@@ -2295,17 +2658,45 @@ mod tests {
     }
 
     #[test]
-    fn run_help_requested_only_when_help_is_the_run_command() {
-        assert!(run_help_requested(&[
-            "run".to_string(),
-            "--help".to_string()
-        ]));
-        assert!(run_help_requested(&["exec".to_string(), "-h".to_string()]));
-        assert!(!run_help_requested(&[
-            "run".to_string(),
-            "df".to_string(),
-            "--help".to_string()
-        ]));
+    fn explicit_help_requested_only_for_guard_help_forms() {
+        assert_eq!(
+            explicit_help_requested(&["run".to_string(), "--help".to_string()]),
+            Some(ExplicitHelpTarget::Run)
+        );
+        assert_eq!(
+            explicit_help_requested(&["-v".to_string(), "exec".to_string(), "-h".to_string()]),
+            Some(ExplicitHelpTarget::Run)
+        );
+        assert_eq!(
+            explicit_help_requested(&[
+                "-vv".to_string(),
+                "server".to_string(),
+                "connect".to_string(),
+                "--help".to_string()
+            ]),
+            Some(ExplicitHelpTarget::ServerConnect)
+        );
+        assert_eq!(
+            explicit_help_requested(&["run".to_string(), "df".to_string(), "--help".to_string()]),
+            None
+        );
+    }
+
+    #[test]
+    fn run_and_connect_accept_explicit_session() {
+        match MainArgs::try_parse_from(["guard", "run", "--session", "tok", "id"]) {
+            Ok(MainArgs::Run { session, .. }) => assert_eq!(session.as_deref(), Some("tok")),
+            Ok(_) => panic!("expected run variant"),
+            Err(e) => panic!("parser rejected run --session: {}", e),
+        }
+
+        match MainArgs::try_parse_from(["guard", "server", "connect", "--session", "tok", "id"]) {
+            Ok(MainArgs::Server(ServerCommands::Connect { session, .. })) => {
+                assert_eq!(session.as_deref(), Some("tok"))
+            }
+            Ok(_) => panic!("expected server connect variant"),
+            Err(e) => panic!("parser rejected connect --session: {}", e),
+        }
     }
 
     #[test]

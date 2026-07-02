@@ -1,12 +1,10 @@
 [Unit]
-Description=guard server
+Description=guard server (execute approved commands as caller)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=guard
-Group=guard
 WorkingDirectory=/var/lib/guard
 Environment=HOME=/var/lib/guard
 EnvironmentFile=-/etc/default/guard
@@ -15,14 +13,14 @@ RuntimeDirectoryMode=0755
 StateDirectory=guard
 StateDirectoryMode=0700
 ExecStartPre=/usr/bin/install -d -m 0700 /var/lib/guard/.ssh
-ExecStart=/usr/local/bin/guard server start --socket /run/guard/guard.sock --users 1000
+ExecStart=/usr/local/bin/guard server start --socket /run/guard/guard.sock --users 1000 --exec-as-caller
 Restart=on-failure
 RestartSec=5
-NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=/run/guard /var/lib/guard
+ProtectHome=false
+# Add any non-/home caller home roots used on this host.
+ReadWritePaths=/run/guard /var/lib/guard /home
 
 [Install]
 WantedBy=multi-user.target
