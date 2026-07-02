@@ -197,10 +197,15 @@ fn redact_named_secrets(text: &str) -> String {
 /// (`"description": "value: decoy"`) or a hyphenated sibling key
 /// (`old-value:`) cannot hijack the correlation and leave the real secret
 /// member unredacted: the gap only advances over whole members, so the pair
-/// keys can only match actual member keys.
+/// keys can only match actual member keys. A gap member's value may be
+/// empty (`optional: ,` -- YAML null shorthand); the value is optional in
+/// the GAP grammar only, never in the correlated pair's value capture.
+/// Nested object/array siblings are deliberately outside this grammar: they
+/// break correlation, and such values are covered by the entropy-based
+/// passes instead.
 fn flow_member_gap() -> String {
     format!(
-        r#"(?:\s*["']?[A-Za-z0-9_.-]+["']?\s*:\s*{value}\s*,)*?"#,
+        r#"(?:\s*["']?[A-Za-z0-9_.-]+["']?\s*:\s*(?:{value}\s*)?,)*?"#,
         value = SECRET_VALUE_SUBPATTERN
     )
 }
@@ -894,10 +899,9 @@ mod tests {
         // the correlation target; the REAL value member must be redacted.
         let input = r#"{"name":"DB_PASSWORD","description":"value: decoy","value":"hunter2"}"#;
         let output = redact_output_text(input);
-        assert!(!output.contains("hunter2"), "real secret leaked: {output}");
-        assert!(
-            output.contains(r#""description":"value: decoy""#),
-            "decoy member must stay intact, got: {output}"
+        assert_eq!(
+            output,
+            r#"{"name":"DB_PASSWORD","description":"value: decoy","value":"[REDACTED]"}"#
         );
     }
 
@@ -905,10 +909,9 @@ mod tests {
     fn test_flow_gap_not_hijacked_by_hyphenated_sibling_key() {
         let input = "{name: DB_PASSWORD, old-value: decoy, value: hunter2}";
         let output = redact_output_text(input);
-        assert!(!output.contains("hunter2"), "real secret leaked: {output}");
-        assert!(
-            output.contains("old-value: decoy"),
-            "sibling member must stay intact, got: {output}"
+        assert_eq!(
+            output,
+            "{name: DB_PASSWORD, old-value: decoy, value: [REDACTED]}"
         );
     }
 
@@ -916,11 +919,18 @@ mod tests {
     fn test_flow_reversed_not_anchored_inside_hyphenated_key() {
         let input = "{old-value: decoy, value: hunter2, name: A_TOKEN}";
         let output = redact_output_text(input);
-        assert!(!output.contains("hunter2"), "real secret leaked: {output}");
-        assert!(
-            output.contains("old-value: decoy"),
-            "sibling member must stay intact, got: {output}"
+        assert_eq!(
+            output,
+            "{old-value: decoy, value: [REDACTED], name: A_TOKEN}"
         );
+    }
+
+    #[test]
+    fn test_flow_gap_allows_empty_scalar_sibling() {
+        // YAML null shorthand between the pair must not break correlation.
+        let input = "{name: DB_PASSWORD, optional: , value: hunter2}";
+        let output = redact_output_text(input);
+        assert_eq!(output, "{name: DB_PASSWORD, optional: , value: [REDACTED]}");
     }
 
     #[test]
