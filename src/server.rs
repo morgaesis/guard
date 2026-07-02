@@ -26,6 +26,7 @@ use guard::gating::approval::{Approval, ApprovalRegistry, ApprovalSnapshot, Appr
 use guard::gating::provisional::{Provisional, ProvisionalRegistry, ProvisionalStatus};
 use guard::gating::verb::VerbCatalog;
 use guard::gating::{decide_gate, Coverage, GateMode, GateOutcome, Reversibility};
+use guard::policy::PolicyMode;
 use guard::principal::{scope_eq, PrincipalKey};
 
 // Re-export so main.rs can pattern-match on history status without a
@@ -3784,6 +3785,59 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         }
     }
 
+    // Deterministic pre-LLM fast allow for a fixed set of trivially safe
+    // read-only commands. Like a trusted verb, it is a deterministic allow
+    // that precedes the evaluator; it never applies when the caller injected
+    // env/secrets (which could change the command's meaning) and is disabled
+    // in paranoid mode.
+    if request.env.is_empty() && request.secrets.is_empty() {
+        if let Some(reason) =
+            deterministic_safe_allow_reason(config, &request.binary, &request.args)
+        {
+            config.log_audit_policy(caller, &request.binary, &request.args, true, &reason);
+            if let Err(e) = write_policy_decision(stream_output, stream_writer, true, &reason).await
+            {
+                return ExecuteResult::exec_failed_after_start(
+                    reason,
+                    format!("client stream error: {}", e),
+                );
+            }
+            let inputs = GateInputs {
+                reason: reason.clone(),
+                risk: Some(0),
+                reversibility: None,
+                revert_preauthorized: false,
+                verb: None,
+                bypass: true,
+            };
+            let result = route_gated_allow(
+                request,
+                config,
+                caller,
+                inputs,
+                depth,
+                stream_output,
+                stream_writer,
+            )
+            .await;
+            record_live_session_interaction(
+                config,
+                session_token.as_deref(),
+                SessionInteraction {
+                    at_unix: 0,
+                    command: command_line.clone(),
+                    allowed: true,
+                    source: SessionDecisionSource::StaticPolicy,
+                    reason,
+                    risk: Some(0),
+                    exec_status: result.session_exec_status(),
+                },
+            )
+            .await;
+            return result;
+        }
+    }
+
     // Pull session-scoped additive prompt, if any. The evaluator appends
     // it to the system prompt for this single call so the LLM has the
     // session context that the static glob patterns cannot express.
@@ -6013,6 +6067,181 @@ fn has_token(tokens: &[String], needle: &str) -> bool {
     tokens.iter().any(|token| token == needle)
 }
 
+/// Environment variable names that let a caller turn a benign child command
+/// into arbitrary code execution: dynamic-linker preload/audit hooks, per-
+/// language startup-file/option injectors, and git's command/config
+/// overrides. Blocked from `--env`/`--secret` injection regardless of the
+/// target binary — a value under any of these names is code, not data, and
+/// the child would run it before its own logic. Compared case-insensitively;
+/// the `_KEY_`/`_VALUE_` git-config families and `LD_AUDIT*` are prefix
+/// matches because they are numbered/suffixed.
+fn dangerous_env_name(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "BASH_ENV"
+            | "ENV"
+            | "LD_PRELOAD"
+            | "LD_LIBRARY_PATH"
+            | "DYLD_INSERT_LIBRARIES"
+            | "DYLD_LIBRARY_PATH"
+            | "PYTHONPATH"
+            | "PYTHONHOME"
+            | "PYTHONSTARTUP"
+            | "RUBYOPT"
+            | "NODE_OPTIONS"
+            | "PERL5OPT"
+            | "PERL5LIB"
+            | "GIT_CONFIG"
+            | "GIT_CONFIG_GLOBAL"
+            | "GIT_CONFIG_SYSTEM"
+            | "GIT_SSH"
+            | "GIT_SSH_COMMAND"
+            | "SSH_AUTH_SOCK"
+            | "SSH_ASKPASS"
+    ) || upper.starts_with("LD_AUDIT")
+        || upper.starts_with("GIT_CONFIG_KEY_")
+        || upper.starts_with("GIT_CONFIG_VALUE_")
+}
+
+/// Deterministic pre-LLM ALLOW for a small, fixed set of trivially safe
+/// read-only commands: local identity/status (`id`, `whoami`, `hostname`,
+/// `uptime`) and, over `ssh`, a fixed read-only diagnostic as the remote
+/// command. Returns the allow reason, or `None` to fall through to the LLM.
+///
+/// This is a latency/cost optimization only. It is deliberately narrow:
+/// paranoid mode disables it; any shell metacharacter, injected env/secret
+/// (checked by the caller), or risky SSH transport option
+/// (`-L`/`-D`/`-J`/`-W`/`ProxyCommand`/`LocalCommand`/forwarding) forfeits
+/// the fast path back to the model. Like a trusted verb, it is a
+/// deterministic allow and intentionally precedes the evaluator.
+fn deterministic_safe_allow_reason(
+    config: &ServerConfig,
+    binary: &str,
+    args: &[String],
+) -> Option<String> {
+    if matches!(config.evaluator.mode(), Some(PolicyMode::Paranoid)) {
+        return None;
+    }
+
+    if binary == "ssh" {
+        let destination = crate::ssh::extract_destination(args)?;
+        let remote_command = crate::ssh::extract_command(args);
+        if remote_command.trim().is_empty() || ssh_args_include_risky_transport(args) {
+            return None;
+        }
+        if is_fixed_readonly_diagnostic(&remote_command) {
+            return Some(format!(
+                "deterministic safe allow: fixed read-only remote command on {}",
+                destination
+            ));
+        }
+        return None;
+    }
+
+    if matches!(binary, "id" | "whoami" | "hostname" | "uptime") {
+        return Some("deterministic safe allow: fixed local identity/status command".to_string());
+    }
+
+    None
+}
+
+/// True if any argument requests SSH agent forwarding, port/socket
+/// forwarding, a jump host, or a command/config channel that could turn a
+/// read-only diagnostic into arbitrary local or remote code. Handles both
+/// the short flags and `-o Option=...` (spaced or concatenated) forms.
+fn ssh_args_include_risky_transport(args: &[String]) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if matches!(arg.as_str(), "-A" | "-D" | "-J" | "-L" | "-R" | "-W" | "-w") {
+            return true;
+        }
+        if arg == "-o" {
+            if let Some(value) = args.get(i + 1) {
+                if ssh_option_is_risky_transport(value) {
+                    return true;
+                }
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("-o") {
+            if ssh_option_is_risky_transport(value) {
+                return true;
+            }
+        }
+        if arg.starts_with("-D")
+            || arg.starts_with("-J")
+            || arg.starts_with("-L")
+            || arg.starts_with("-R")
+            || arg.starts_with("-W")
+            || arg.starts_with("-w")
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn ssh_option_is_risky_transport(value: &str) -> bool {
+    let lower = value.trim_start().to_ascii_lowercase();
+    let key = lower
+        .split(|ch: char| ch == '=' || ch.is_whitespace())
+        .next()
+        .unwrap_or("");
+    matches!(
+        key,
+        "forwardagent"
+            | "proxycommand"
+            | "proxyjump"
+            | "localcommand"
+            | "permitlocalcommand"
+            | "localforward"
+            | "remoteforward"
+            | "dynamicforward"
+            | "tunnel"
+    )
+}
+
+/// True only for an exact, whole read-only diagnostic command (no shell
+/// control, no arguments beyond a fixed safe flag). Anything else returns
+/// false and falls back to the model.
+fn is_fixed_readonly_diagnostic(command: &str) -> bool {
+    if contains_shell_control(command) {
+        return false;
+    }
+    let lower = command.trim().to_ascii_lowercase();
+    let tokens = command_tokens(&lower);
+    if tokens.is_empty() {
+        return false;
+    }
+
+    matches!(
+        tokens.as_slice(),
+        [cmd] if matches!(cmd.as_str(), "id" | "whoami" | "hostname" | "uptime")
+    ) || matches!(
+        tokens.as_slice(),
+        [cmd, flag] if cmd == "uname" && matches!(flag.as_str(), "-a" | "-r" | "-sr")
+    ) || matches!(
+        tokens.as_slice(),
+        [cmd, flag] if cmd == "df" && matches!(flag.as_str(), "-h" | "-hi")
+    )
+}
+
+fn contains_shell_control(command: &str) -> bool {
+    command.contains(';')
+        || command.contains("&&")
+        || command.contains("||")
+        || command.contains('|')
+        || command.contains('>')
+        || command.contains('<')
+        || command.contains('`')
+        || command.contains("$(")
+        || command.contains('\n')
+}
+
 fn command_tokens(command: &str) -> Vec<String> {
     command
         .split(|c: char| {
@@ -6075,6 +6304,12 @@ async fn validate_request_injections(
         if !is_valid_env_name(key) {
             return Err(format!(
                 "invalid injected environment variable name: '{}'",
+                key
+            ));
+        }
+        if dangerous_env_name(key) {
+            return Err(format!(
+                "dangerous injected environment variable name: '{}'",
                 key
             ));
         }
@@ -7322,6 +7557,149 @@ mod tests {
         );
         let buf = SharedBuf(Arc::new(Mutex::new(Vec::new())));
         (cfg, buf)
+    }
+
+    fn paranoid_test_config() -> ServerConfig {
+        let eval_config = EvalConfig::default()
+            .llm_enabled(false)
+            .mode(PolicyMode::Paranoid);
+        let evaluator = Evaluator::new(eval_config).expect("build evaluator");
+        let secrets = SecretManager::with_backend(EnvBackend::default());
+        ServerConfig::new(
+            None,
+            None,
+            evaluator,
+            secrets,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            ToolRegistry::empty(),
+            Vec::new(),
+            false,
+            SessionRegistry::new(),
+            None,
+            false,
+            None,
+        )
+    }
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn dangerous_env_name_blocks_code_injection_vectors() {
+        for name in [
+            "LD_PRELOAD",
+            "ld_preload",
+            "BASH_ENV",
+            "GIT_SSH_COMMAND",
+            "PYTHONPATH",
+            "NODE_OPTIONS",
+            "LD_AUDIT",
+            "LD_AUDIT_2",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_0",
+            "DYLD_INSERT_LIBRARIES",
+        ] {
+            assert!(dangerous_env_name(name), "{name} must be blocked");
+        }
+        for name in ["PATH", "HOME", "AWS_PROFILE", "MY_TOKEN", "GIT_AUTHOR_NAME"] {
+            assert!(!dangerous_env_name(name), "{name} must be allowed");
+        }
+    }
+
+    #[test]
+    fn safe_allow_accepts_fixed_local_identity() {
+        let (cfg, _buf) = make_test_config();
+        assert!(deterministic_safe_allow_reason(&cfg, "id", &[]).is_some());
+        assert!(deterministic_safe_allow_reason(&cfg, "whoami", &[]).is_some());
+        assert!(deterministic_safe_allow_reason(&cfg, "hostname", &[]).is_some());
+        assert!(deterministic_safe_allow_reason(&cfg, "uptime", &[]).is_some());
+        // A non-fixed local command falls through to the LLM.
+        assert!(deterministic_safe_allow_reason(&cfg, "cat", &args(&["/etc/passwd"])).is_none());
+    }
+
+    #[test]
+    fn safe_allow_disabled_in_paranoid_mode() {
+        let cfg = paranoid_test_config();
+        assert!(deterministic_safe_allow_reason(&cfg, "id", &[]).is_none());
+    }
+
+    #[test]
+    fn safe_allow_accepts_fixed_ssh_diagnostic() {
+        let (cfg, _buf) = make_test_config();
+        let reason = deterministic_safe_allow_reason(&cfg, "ssh", &args(&["host01", "id"]));
+        assert!(reason.is_some(), "fixed ssh diagnostic should be allowed");
+    }
+
+    #[test]
+    fn safe_allow_rejects_ssh_arbitrary_remote_command() {
+        let (cfg, _buf) = make_test_config();
+        assert!(
+            deterministic_safe_allow_reason(&cfg, "ssh", &args(&["host01", "rm", "-rf", "/"]))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn safe_allow_rejects_ssh_chained_remote_command() {
+        let (cfg, _buf) = make_test_config();
+        assert!(
+            deterministic_safe_allow_reason(&cfg, "ssh", &args(&["host01", "id; rm -rf /"]))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn safe_allow_rejects_ssh_forwarding_and_proxy() {
+        let (cfg, _buf) = make_test_config();
+        assert!(ssh_args_include_risky_transport(&args(&[
+            "-L",
+            "8080:localhost:80",
+            "h",
+            "id"
+        ])));
+        assert!(ssh_args_include_risky_transport(&args(&["-A", "h", "id"])));
+        assert!(ssh_args_include_risky_transport(&args(&[
+            "-o",
+            "ProxyCommand=nc x 22",
+            "h",
+            "id"
+        ])));
+        assert!(ssh_args_include_risky_transport(&args(&[
+            "-oProxyJump=jump",
+            "h",
+            "id"
+        ])));
+        // A benign -o option is not risky transport.
+        assert!(!ssh_args_include_risky_transport(&args(&[
+            "-o",
+            "ConnectTimeout=5",
+            "h",
+            "id"
+        ])));
+        assert!(deterministic_safe_allow_reason(
+            &cfg,
+            "ssh",
+            &args(&["-L", "8080:localhost:80", "host01", "id"])
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn is_fixed_readonly_diagnostic_is_narrow() {
+        assert!(is_fixed_readonly_diagnostic("id"));
+        assert!(is_fixed_readonly_diagnostic("uname -a"));
+        assert!(is_fixed_readonly_diagnostic("df -h"));
+        assert!(!is_fixed_readonly_diagnostic("id && rm -rf /"));
+        assert!(!is_fixed_readonly_diagnostic("cat /etc/shadow"));
+        assert!(!is_fixed_readonly_diagnostic("uname -a; whoami"));
+        assert!(!is_fixed_readonly_diagnostic(""));
     }
 
     /// Trusted-verb + consequence-gate interaction: `trusted` only skips the
