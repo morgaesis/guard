@@ -6127,7 +6127,7 @@ fn deterministic_safe_allow_reason(
     if binary == "ssh" {
         let destination = crate::ssh::extract_destination(args)?;
         let remote_command = crate::ssh::extract_command(args);
-        if remote_command.trim().is_empty() || ssh_args_include_risky_transport(args) {
+        if remote_command.trim().is_empty() || !ssh_options_all_readonly_safe(args) {
             return None;
         }
         if is_fixed_readonly_diagnostic(&remote_command) {
@@ -6146,46 +6146,121 @@ fn deterministic_safe_allow_reason(
     None
 }
 
-/// True if any argument requests SSH agent forwarding, port/socket
-/// forwarding, a jump host, or a command/config channel that could turn a
-/// read-only diagnostic into arbitrary local or remote code. Handles both
-/// the short flags and `-o Option=...` (spaced or concatenated) forms.
-fn ssh_args_include_risky_transport(args: &[String]) -> bool {
+/// Allow-list (deny-by-default) check on the ssh options in an invocation.
+/// Returns true only when every option is on a small set known to be safe for
+/// a read-only diagnostic: no command execution, no agent / X11 / port /
+/// socket forwarding, no proxy or jump host, no tunnel, no external config or
+/// identity/library file, and no control socket. Any unrecognized option
+/// forfeits the fast path to the evaluator.
+///
+/// The scan covers the whole "option zone", not just the options before the
+/// destination. ssh honors options that appear *between* the destination and
+/// the remote command (e.g. `ssh host -o ProxyCommand=... id`), so scanning
+/// stops only at the command itself — the second positional (non-option)
+/// token. Everything from there on is the remote command's own arguments,
+/// which ssh does not re-parse as options. (Verified against ssh's own
+/// `-G` dry run: an `-o` before the command token is applied; one after it is
+/// not.)
+///
+/// This is intentionally stricter than enumerating dangerous options: an
+/// option we have not vetted (including future ssh additions, `-F` external
+/// configs, `-I` PKCS#11 modules, `-E`/`-i`/`-S` file paths, and `-o`
+/// directives outside the vetted keyword set) never takes the fast path.
+/// Combined short flags such as `-Cq` are treated as unrecognized rather than
+/// decomposed, again forfeiting to the evaluator.
+fn ssh_options_all_readonly_safe(args: &[String]) -> bool {
+    // 0 = before the destination, 1 = between destination and remote command.
+    let mut positionals_seen = 0;
     let mut i = 0;
     while i < args.len() {
-        let arg = &args[i];
-        if matches!(arg.as_str(), "-A" | "-D" | "-J" | "-L" | "-R" | "-W" | "-w") {
-            return true;
+        let arg = args[i].as_str();
+
+        // A non-option token is either the destination (first) or the start
+        // of the remote command (second). Once the command starts, the rest
+        // are command arguments that ssh does not treat as options.
+        if !arg.starts_with('-') {
+            positionals_seen += 1;
+            if positionals_seen >= 2 {
+                return true;
+            }
+            i += 1;
+            continue;
         }
+        // A bare "-" is not a valid ssh option; be conservative.
+        if arg == "-" {
+            return false;
+        }
+
+        // `-o directive` (separate value): only a vetted keyword is allowed.
         if arg == "-o" {
-            if let Some(value) = args.get(i + 1) {
-                if ssh_option_is_risky_transport(value) {
-                    return true;
+            match args.get(i + 1) {
+                Some(value) if ssh_o_directive_readonly_safe(value) => {
+                    i += 2;
+                    continue;
                 }
+                _ => return false,
+            }
+        }
+        // `-oDirective` (concatenated value).
+        if let Some(value) = arg.strip_prefix("-o") {
+            if ssh_o_directive_readonly_safe(value) {
+                i += 1;
+                continue;
+            }
+            return false;
+        }
+
+        // `-p port` / `-l login`: the value is an inert port or username.
+        // Consume the value token so it is not mistaken for a positional.
+        if arg == "-p" || arg == "-l" {
+            if args.get(i + 1).is_none() {
+                return false;
             }
             i += 2;
             continue;
         }
-        if let Some(value) = arg.strip_prefix("-o") {
-            if ssh_option_is_risky_transport(value) {
-                return true;
-            }
+        // `-p2222` / `-lroot` (concatenated value).
+        if arg.starts_with("-p") || arg.starts_with("-l") {
+            i += 1;
+            continue;
         }
-        if arg.starts_with("-D")
-            || arg.starts_with("-J")
-            || arg.starts_with("-L")
-            || arg.starts_with("-R")
-            || arg.starts_with("-W")
-            || arg.starts_with("-w")
-        {
-            return true;
+
+        // Bare boolean flags known safe for a read-only diagnostic.
+        if is_safe_ssh_flag(arg) {
+            i += 1;
+            continue;
         }
-        i += 1;
+
+        // Anything else (forwarding, proxy, jump, tunnel, external config or
+        // key/library file, control socket, X11, unknown option) forfeits.
+        return false;
     }
-    false
+    true
 }
 
-fn ssh_option_is_risky_transport(value: &str) -> bool {
+/// Boolean ssh flags that cannot turn a read-only diagnostic into code
+/// execution, forwarding, or file indirection: address-family selection,
+/// compression, quiet/verbose logging, no-tty, and the *restrictive* toggles
+/// that disable agent / X11 / GSSAPI forwarding.
+fn is_safe_ssh_flag(arg: &str) -> bool {
+    if matches!(arg, "-4" | "-6" | "-C" | "-q" | "-T" | "-a" | "-x" | "-k") {
+        return true;
+    }
+    // Verbosity: `-v`, `-vv`, `-vvv`, ...
+    arg.len() >= 2 && arg[1..].bytes().all(|b| b == b'v')
+}
+
+/// True only for an `-o keyword[=value]` directive whose keyword is on a small
+/// vetted set (batch/non-interactive behavior, connection timeouts, keepalive,
+/// and host-key handling). Everything else — ProxyCommand, ProxyJump,
+/// LocalCommand, RemoteCommand, *Forward, Tunnel, Include, IdentityFile,
+/// ControlPath, and any unknown keyword — is rejected. A value containing a
+/// newline is rejected outright so a second directive cannot be smuggled onto
+/// a later line past the first-keyword check.
+fn ssh_o_directive_readonly_safe(value: &str) -> bool {
+    if value.contains('\n') || value.contains('\r') {
+        return false;
+    }
     let lower = value.trim_start().to_ascii_lowercase();
     let key = lower
         .split(|ch: char| ch == '=' || ch.is_whitespace())
@@ -6193,15 +6268,14 @@ fn ssh_option_is_risky_transport(value: &str) -> bool {
         .unwrap_or("");
     matches!(
         key,
-        "forwardagent"
-            | "proxycommand"
-            | "proxyjump"
-            | "localcommand"
-            | "permitlocalcommand"
-            | "localforward"
-            | "remoteforward"
-            | "dynamicforward"
-            | "tunnel"
+        "batchmode"
+            | "connecttimeout"
+            | "connectionattempts"
+            | "serveraliveinterval"
+            | "serveralivecountmax"
+            | "stricthostkeychecking"
+            | "updatehostkeys"
+            | "checkhostip"
     )
 }
 
@@ -7656,39 +7730,136 @@ mod tests {
     }
 
     #[test]
+    fn ssh_options_allow_list_permits_only_vetted_options() {
+        // Options a read-only diagnostic may legitimately carry, in both the
+        // separate-value and concatenated forms.
+        for ok in [
+            &["host01", "id"][..],
+            &["-4", "host01", "id"][..],
+            &["-6", "-C", "-q", "host01", "id"][..],
+            &["-v", "host01", "id"][..],
+            &["-vvv", "host01", "id"][..],
+            &["-T", "-a", "-x", "-k", "host01", "id"][..],
+            &["-p", "2222", "host01", "id"][..],
+            &["-p2222", "host01", "id"][..],
+            &["-l", "root", "host01", "id"][..],
+            &["-lroot", "host01", "id"][..],
+            &["-o", "ConnectTimeout=5", "host01", "id"][..],
+            &["-o", "BatchMode=yes", "host01", "id"][..],
+            &["-oConnectTimeout=5", "host01", "id"][..],
+            // Host-key handling injected by the --hostkey mode must not
+            // knock the diagnostic off the fast path.
+            &["-o", "StrictHostKeyChecking=accept-new", "-o", "UpdateHostKeys=yes", "host01", "id"][..],
+        ] {
+            assert!(
+                ssh_options_all_readonly_safe(&args(ok)),
+                "options should be allow-listed: {ok:?}"
+            );
+        }
+
+        // Every unvetted option forfeits the fast path. This covers the
+        // classes an allow-list must reject: forwarding, proxy/jump, tunnel,
+        // external config (-F) and PKCS#11 module (-I), identity/log/socket
+        // files, and any -o directive outside the vetted keyword set.
+        for bad in [
+            &["-A", "host01", "id"][..],
+            &["-X", "host01", "id"][..],
+            &["-Y", "host01", "id"][..],
+            &["-L", "8080:localhost:80", "host01", "id"][..],
+            &["-R", "9000:localhost:22", "host01", "id"][..],
+            &["-D", "1080", "host01", "id"][..],
+            &["-W", "host:22", "host01", "id"][..],
+            &["-J", "jump", "host01", "id"][..],
+            &["-F", "/tmp/evil_ssh_config", "host01", "id"][..],
+            &["-I", "/tmp/pkcs11.so", "host01", "id"][..],
+            &["-E", "/tmp/log", "host01", "id"][..],
+            &["-i", "/tmp/key", "host01", "id"][..],
+            &["-S", "/tmp/ctl.sock", "host01", "id"][..],
+            &["-o", "ProxyCommand=nc x 22", "host01", "id"][..],
+            &["-oProxyJump=jump", "host01", "id"][..],
+            &["-o", "LocalCommand=touch /tmp/x", "host01", "id"][..],
+            &["-o", "RemoteCommand=cat /etc/shadow", "host01", "id"][..],
+            &["-o", "PermitLocalCommand=yes", "host01", "id"][..],
+            &["-o", "Include=/tmp/evil", "host01", "id"][..],
+            // Combined short flags are not decomposed; forfeit conservatively.
+            &["-Cq", "host01", "id"][..],
+        ] {
+            assert!(
+                !ssh_options_all_readonly_safe(&args(bad)),
+                "option should forfeit the fast path: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_options_reject_dangerous_option_between_host_and_command() {
+        // ssh honors options placed between the destination and the remote
+        // command (confirmed against `ssh -G`), so the allow-list must scan
+        // past the destination up to the command token. A proxy/forward/jump
+        // in that position must forfeit the fast path.
+        for bad in [
+            &["host01", "-o", "ProxyCommand=nc x 22", "id"][..],
+            &["host01", "-L", "8080:localhost:80", "id"][..],
+            &["host01", "-J", "jump", "id"][..],
+            &["host01", "-oProxyJump=jump", "id"][..],
+            &["host01", "-F", "/tmp/evil_ssh_config", "id"][..],
+        ] {
+            assert!(
+                !ssh_options_all_readonly_safe(&args(bad)),
+                "option between host and command must forfeit: {bad:?}"
+            );
+        }
+        // An option that appears *after* the command token is a command
+        // argument, not an ssh option, and ssh does not re-parse it; it does
+        // not affect the fast-path decision for the (fixed) command itself.
+        assert!(ssh_options_all_readonly_safe(&args(&[
+            "host01", "id", "-o", "ProxyCommand=nc x 22"
+        ])));
+    }
+
+    #[test]
+    fn ssh_o_directive_rejects_newline_smuggled_second_directive() {
+        // A single -o value carrying a second directive on a later line must
+        // be rejected outright rather than inspected only up to its first
+        // keyword.
+        assert!(!ssh_o_directive_readonly_safe(
+            "ConnectTimeout=5\nProxyCommand=nc attacker 22"
+        ));
+        assert!(!ssh_o_directive_readonly_safe(
+            "BatchMode=yes\rLocalCommand=touch /tmp/x"
+        ));
+        assert!(!ssh_options_all_readonly_safe(&args(&[
+            "-o",
+            "ConnectTimeout=5\nProxyCommand=nc x 22",
+            "host01",
+            "id"
+        ])));
+        // The same keyword without a newline stays on the fast path.
+        assert!(ssh_o_directive_readonly_safe("ConnectTimeout=5"));
+    }
+
+    #[test]
     fn safe_allow_rejects_ssh_forwarding_and_proxy() {
         let (cfg, _buf) = make_test_config();
-        assert!(ssh_args_include_risky_transport(&args(&[
-            "-L",
-            "8080:localhost:80",
-            "h",
-            "id"
-        ])));
-        assert!(ssh_args_include_risky_transport(&args(&["-A", "h", "id"])));
-        assert!(ssh_args_include_risky_transport(&args(&[
-            "-o",
-            "ProxyCommand=nc x 22",
-            "h",
-            "id"
-        ])));
-        assert!(ssh_args_include_risky_transport(&args(&[
-            "-oProxyJump=jump",
-            "h",
-            "id"
-        ])));
-        // A benign -o option is not risky transport.
-        assert!(!ssh_args_include_risky_transport(&args(&[
-            "-o",
-            "ConnectTimeout=5",
-            "h",
-            "id"
-        ])));
+        for reject in [
+            &["-L", "8080:localhost:80", "host01", "id"][..],
+            &["-A", "host01", "id"][..],
+            &["-o", "ProxyCommand=nc x 22", "host01", "id"][..],
+            &["-oProxyJump=jump", "host01", "id"][..],
+            &["-F", "/tmp/evil_ssh_config", "host01", "id"][..],
+        ] {
+            assert!(
+                deterministic_safe_allow_reason(&cfg, "ssh", &args(reject)).is_none(),
+                "ssh with {reject:?} must not take the fast path"
+            );
+        }
+        // A benign, vetted option still allows the fixed diagnostic.
         assert!(deterministic_safe_allow_reason(
             &cfg,
             "ssh",
-            &args(&["-L", "8080:localhost:80", "host01", "id"])
+            &args(&["-o", "ConnectTimeout=5", "host01", "id"])
         )
-        .is_none());
+        .is_some());
     }
 
     #[test]
