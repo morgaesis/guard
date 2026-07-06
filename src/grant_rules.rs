@@ -116,7 +116,7 @@ fn infer_namespaces(prose: &str) -> BTreeSet<String> {
     }
 
     let lower = prose.to_ascii_lowercase();
-    for known in ["nextcloud", "ingress-nginx", "traefik", "nginx"] {
+    for known in ["grafana", "ingress-nginx", "traefik", "nginx"] {
         if lower.contains(known) {
             namespaces.insert(known.to_string());
         }
@@ -555,9 +555,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nextcloud_kubernetes_grant_generates_narrow_static_rules() {
+    fn grafana_kubernetes_grant_generates_narrow_static_rules() {
         let compiled = compile_session_grant_rules(
-            "readonly access to the nextcloud stuff in the morgaesis-dev kube cluster, not the secrets, and write access to scaling replicas and editing ingresses",
+            "readonly access to the grafana stuff in the staging kube cluster, not the secrets, and write access to scaling replicas and editing ingresses",
         );
 
         assert!(compiled
@@ -575,35 +575,35 @@ mod tests {
         assert!(compiled
             .allow
             .iter()
-            .any(|pattern| pattern == "kubectl -n nextcloud get pods"));
+            .any(|pattern| pattern == "kubectl -n grafana get pods"));
         assert!(compiled
             .allow
             .iter()
-            .any(|pattern| pattern == "kubectl get * -n nextcloud"));
+            .any(|pattern| pattern == "kubectl get * -n grafana"));
         assert!(compiled
             .allow
             .iter()
-            .any(|pattern| pattern == "kubectl --context morgaesis-dev -n nextcloud get pods"));
+            .any(|pattern| pattern == "kubectl --context staging -n grafana get pods"));
         assert!(compiled
             .allow
             .iter()
-            .any(|pattern| pattern == "kubectl --context morgaesis-dev get * -n nextcloud"));
+            .any(|pattern| pattern == "kubectl --context staging get * -n grafana"));
         assert!(compiled
             .allow
             .iter()
-            .any(|pattern| pattern == "kubectl scale deployment/* --replicas=* -n nextcloud"));
+            .any(|pattern| pattern == "kubectl scale deployment/* --replicas=* -n grafana"));
         assert!(compiled
             .allow
             .iter()
-            .any(|pattern| pattern == "kubectl -n nextcloud edit ingress"));
+            .any(|pattern| pattern == "kubectl -n grafana edit ingress"));
         assert!(compiled
             .allow
             .iter()
-            .any(|pattern| pattern == "kubectl patch ingress * -n nextcloud"));
+            .any(|pattern| pattern == "kubectl patch ingress * -n grafana"));
         assert!(!compiled
             .allow
             .iter()
-            .any(|pattern| pattern.contains("nextcloud*")));
+            .any(|pattern| pattern.contains("grafana*")));
     }
 
     #[test]

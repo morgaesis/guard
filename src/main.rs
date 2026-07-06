@@ -3988,7 +3988,7 @@ mod tests {
             "grant",
             "tok",
             "--static-only",
-            "readonly nextcloud kube access",
+            "readonly grafana kube access",
         ]) {
             Ok(MainArgs::Grant {
                 token,
@@ -3997,7 +3997,7 @@ mod tests {
                 ..
             }) => {
                 assert_eq!(token.as_deref(), Some("tok"));
-                assert_eq!(prose.as_deref(), Some("readonly nextcloud kube access"));
+                assert_eq!(prose.as_deref(), Some("readonly grafana kube access"));
                 assert!(static_only);
             }
             Ok(_) => panic!("expected top-level grant"),
@@ -4008,7 +4008,7 @@ mod tests {
     #[test]
     fn top_level_grant_bare_prose_mints_session() {
         let command = top_level_grant_to_session_command(
-            Some("readonly nextcloud kube access".to_string()),
+            Some("readonly grafana kube access".to_string()),
             None,
             Vec::new(),
             Vec::new(),
@@ -4028,7 +4028,7 @@ mod tests {
                 static_only,
                 ..
             } => {
-                assert_eq!(prose.as_deref(), Some("readonly nextcloud kube access"));
+                assert_eq!(prose.as_deref(), Some("readonly grafana kube access"));
                 assert_eq!(ttl, Some(120));
                 assert!(static_only);
             }
@@ -4069,7 +4069,7 @@ mod tests {
             "grant",
             "tok",
             "--no-llm-fallback",
-            "readonly nextcloud kube access",
+            "readonly grafana kube access",
         ]) {
             Ok(MainArgs::Session(SessionCommands::Grant {
                 token,
@@ -4078,7 +4078,7 @@ mod tests {
                 ..
             })) => {
                 assert_eq!(token, "tok");
-                assert_eq!(prose.as_deref(), Some("readonly nextcloud kube access"));
+                assert_eq!(prose.as_deref(), Some("readonly grafana kube access"));
                 assert!(static_only);
             }
             Ok(_) => panic!("expected session grant"),
@@ -4095,7 +4095,7 @@ mod tests {
             "tok",
             "--auto-amend",
             "--no-auto-amend",
-            "readonly nextcloud kube access",
+            "readonly grafana kube access",
         ]) {
             Ok(MainArgs::Session(SessionCommands::Grant {
                 auto_amend,
@@ -4141,7 +4141,7 @@ mod tests {
             "get",
             "pods",
             "-n",
-            "nextcloud",
+            "grafana",
         ]) {
             Ok(MainArgs::Appeal {
                 session,
@@ -4151,7 +4151,7 @@ mod tests {
             }) => {
                 assert_eq!(session.as_deref(), Some("tok"));
                 assert_eq!(binary, "kubectl");
-                assert_eq!(args, vec!["get", "pods", "-n", "nextcloud"]);
+                assert_eq!(args, vec!["get", "pods", "-n", "grafana"]);
             }
             Ok(_) => panic!("expected top-level appeal"),
             Err(err) => panic!("expected top-level appeal parse, got {err}"),
