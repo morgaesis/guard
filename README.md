@@ -518,29 +518,29 @@ There is also a top-level shorthand. With a quoted prose description it mints an
 grants a fresh session, again printing an eval-friendly export line:
 
 ```bash
-eval "$(guard grant --ttl 3600 --static-only 'readonly access to nextcloud resources in the morgaesis-dev kube cluster, not secrets, with write access for scaling replicas and editing ingresses')"
+eval "$(guard grant --ttl 3600 --static-only 'readonly access to grafana resources in the staging kube cluster, not secrets, with write access for scaling replicas and editing ingresses')"
 ```
 
 For an existing token, pass the token first:
 
 ```bash
-guard grant <token> "readonly access to nextcloud resources in the morgaesis-dev kube cluster, not secrets, with write access for scaling replicas and editing ingresses"
+guard grant <token> "readonly access to grafana resources in the staging kube cluster, not secrets, with write access for scaling replicas and editing ingresses"
 ```
 
-Prose grants are compiled at grant time into conservative static rules when guard recognizes the domain. The first compiler handles Kubernetes: it infers namespaces such as `nextcloud`, optional contexts such as `morgaesis-dev`, adds hard denies for shell-control, secret access, token creation, raw kubeconfig reads, `exec`, `cp`, `port-forward`, and deletes, then adds namespace-scoped read, scale, and ingress/reverse-proxy rules implied by the prose. Safe command examples in backticks are added as exact static allows. Unrecognized prose is still stored as session LLM context, but does not create broad static globs.
+Prose grants are compiled at grant time into conservative static rules when guard recognizes the domain. The first compiler handles Kubernetes: it infers namespaces such as `grafana`, optional contexts such as `staging`, adds hard denies for shell-control, secret access, token creation, raw kubeconfig reads, `exec`, `cp`, `port-forward`, and deletes, then adds namespace-scoped read, scale, and ingress/reverse-proxy rules implied by the prose. Safe command examples in backticks are added as exact static allows. Unrecognized prose is still stored as session LLM context, but does not create broad static globs.
 
-Session allow/deny patterns use guard's shell-style glob matcher, not regex. `*`, `?`, and bracket classes are supported, but the match is against the flat reconstructed command line; it does not understand shell quoting, Kubernetes resource schemas, or argument semantics. Generated rules therefore use broad globs sparingly: for example, Kubernetes prose grants may add namespace-bounded `get * -n nextcloud` and `describe * -n nextcloud` read globs, backed by explicit secret and mutating-resource denies. Automatic amendments do not add globs at all; they add exact `binary + argv` rules, so literal `*` or `[` characters in an appealed command do not become wildcards.
+Session allow/deny patterns use guard's shell-style glob matcher, not regex. `*`, `?`, and bracket classes are supported, but the match is against the flat reconstructed command line; it does not understand shell quoting, Kubernetes resource schemas, or argument semantics. Generated rules therefore use broad globs sparingly: for example, Kubernetes prose grants may add namespace-bounded `get * -n grafana` and `describe * -n grafana` read globs, backed by explicit secret and mutating-resource denies. Automatic amendments do not add globs at all; they add exact `binary + argv` rules, so literal `*` or `[` characters in an appealed command do not become wildcards.
 
 Matching deny patterns win over allow patterns, and by default everything that does not match a session rule falls through to the normal evaluator with the session prose/prompt appended. Prose grants enable `auto_amend` by default so fresh low-risk LLM fallback approvals can add exact session allows, and fresh high-risk LLM denials can add exact session denies. Use `--no-auto-amend` to keep fallback non-mutating, or `--auto-amend` to opt a manual `--allow`/`--deny` grant into the same behavior. Cache hits, static policy hits, and learned-rule hits never amend a session; session fallback also does not promote global learned rules. Add `--static-only` (alias `--no-llm-fallback`) to `guard grant`, `guard session grant`, or `guard session new` to deny any session-rule miss instead of falling through to the LLM; static-only grants disable auto-amend.
 
 To ask for a one-off amendment without executing the command, appeal it:
 
 ```bash
-guard appeal --session <token> kubectl get httproute -n nextcloud
+guard appeal --session <token> kubectl get httproute -n grafana
 # or, when GUARD_SESSION is already set:
-guard appeal kubectl get httproute -n nextcloud
+guard appeal kubectl get httproute -n grafana
 # equivalent explicit session subcommand:
-guard session appeal <token> kubectl get httproute -n nextcloud
+guard session appeal <token> kubectl get httproute -n grafana
 ```
 
 An appeal runs the evaluator with the session context and then either amends an exact allow, amends an exact deny for a high-risk denial, or refuses to amend. It exits nonzero when the appealed command remains denied. Appeals are admin RPCs, like grant/revoke/show, because they can change durable authorization state.

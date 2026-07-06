@@ -8666,7 +8666,7 @@ mod tests {
             sessions.grant(
                 token.clone(),
                 SessionGrant {
-                    allow: vec!["kubectl -n nextcloud get pods*".into()],
+                    allow: vec!["kubectl -n grafana get pods*".into()],
                     deny: Vec::new(),
                     allow_exact: Vec::new(),
                     deny_exact: Vec::new(),
