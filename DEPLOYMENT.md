@@ -14,7 +14,7 @@ cross-platform principal, with exact parity to a Unix peer uid, so consequence
 gating, per-principal secret/`--env` injection, and daemon-principal admin all
 work over the pipe. The operator is whoever runs as the daemon's own principal
 (its SID on Windows, its uid on Unix). Connect access is governed by the pipe
-ACL — Administrators/SYSTEM/Authenticated Users by default; tighten it to a
+ACL - Administrators/SYSTEM/Authenticated Users by default; tighten it to a
 specific agent SID on a multi-user host.
 
 A TCP loopback transport is also available with `--tcp-port` (default
@@ -48,11 +48,13 @@ daemon runs as a separate principal (a dedicated uid on Unix, the service
 account on Windows); workers are agents that reach the system only through
 `guard run` and `guard verb`.
 
-1. The foreman mints a scoped session grant for each worker —
+1. The foreman mints a scoped session grant for each worker:
    `guard session new --allow '<glob>' --prompt '<intent>' --ttl <secs>`, or
-   `guard grant` with a prose description — and hands the worker the resulting
+   `guard grant` with a prose description, and hands the worker the resulting
    `GUARD_SESSION` token. The grant narrows what the worker may attempt without
-   relaxing the global mode.
+   relaxing the global mode. The token is bearer access to that scoped session.
+   Generated static-grant notes are stored separately from prompt context and
+   appear in `session list` / `session show`.
 
 2. The foreman loads a gated verb catalog with `--verbs`
    ([`examples/verbs-kubectl.yaml`](examples/verbs-kubectl.yaml) is a reference).
@@ -71,7 +73,7 @@ account on Windows); workers are agents that reach the system only through
 4. The foreman reviews held work with `guard approvals` / `guard provisionals`
    and decides with `guard approve|deny|confirm|revert <handle>`. These control
    RPCs are accepted only from the daemon's own principal, so a worker can never
-   approve its own held command — the irreversible steps stay with the operator.
+   approve its own held command. The irreversible steps stay with the operator.
 
 The trust boundary is the principal split: workers run as a different principal
 than the daemon, so the gate, the secret namespace, and the approval RPCs are all
@@ -118,31 +120,31 @@ exec, making it a per-user secret broker. `--exec-as-caller` is Unix-only.
 
 ## OS-level sandboxing profiles
 
-`guard profile seccomp` emits a default-allow seccomp profile (use via
-`--security-opt seccomp=<file>` on Docker/Podman) that denies
-container-escape and host-tampering syscalls (`mount`, `pivot_root`,
-`ptrace`, kernel module load, etc.) while leaving the daemon's legitimate
-operation -- spawning approved child commands, TLS calls to the LLM
-provider, reading/writing its state directory -- intact.
+Static hardening profile examples live under `deployment/hardening/`.
+`seccomp-deny-escape.json` is a default-allow seccomp profile for
+Docker/Podman `--security-opt seccomp=<file>` deployments. It denies
+container-escape and host-tampering syscalls such as `mount`, `pivot_root`,
+`ptrace`, kernel module load, keyring manipulation, and host clock changes
+while leaving normal daemon operation intact.
 
-`guard profile apparmor --exe <path-to-binary> --data-dir <state-dir>`
-emits an AppArmor profile confining the daemon to its binary, data
-directory, and child-command execution. Apply it alongside the systemd
-hardening directives below; it is a complementary, OS-level layer, not a
-replacement for `NoNewPrivileges`/`User=guard`/`--users`.
+`guard.apparmor.example` confines the daemon to its binary, state directory,
+system libraries, certificates, and child-command execution paths. Set the
+executable path and data directory to match the deployment before loading it.
+Use these files alongside the systemd hardening directives below; they are an
+OS-level layer, not a replacement for `NoNewPrivileges`, `User=guard`, or
+`--users`.
 
 ## Auto-learned deny shapes
 
 Auto-learned deny shapes (`--learn-deny`, on by default) write a state file,
 `learned-deny.yaml`, alongside `learned-rules.yaml` and `state.db` in the
-daemon's state directory. It's a deny-only fast path the daemon populates
-itself from repeated LLM denials -- it never grants a bypass, so it needs no
-operator review step, and upgrading an existing deployment enables it
-automatically. Check `guard status` for `learn_deny enabled=... shapes=N` to
-see whether it's active and how many shapes it has learned; disable with
+daemon's state directory. It is a deny-only fast path the daemon populates
+itself from repeated LLM denials. It never grants a bypass, so it needs no
+operator review step. Check `guard status` for `learn_deny enabled=... shapes=N` to
+see whether it is active and how many shapes it has learned; disable with
 `--no-learn-deny` / `GUARD_LEARN_DENY=false` if you want to fully opt out
 (this stops new learning; it does not retroactively remove shapes already on
-disk -- delete or edit `learned-deny.yaml` for that). A caller can force a
+disk, delete or edit `learned-deny.yaml` for that). A caller can force a
 fresh LLM look past a specific auto-learned deny with `guard run --reevaluate`.
 
 ## Auto-verb-promotion
@@ -185,7 +187,7 @@ classification to key eligibility on, so the store stays inert). If you
 already run `--gate consequence` without `--verbs`, upgrading in place will,
 for the first time, create a live verb catalog under the default state
 directory and start populating it with `trusted: true` verbs from ordinary
-traffic — a real change in what "no `--verbs` flag" means for that
+traffic - a real change in what "no `--verbs` flag" means for that
 deployment. If you'd rather opt in deliberately, either add `--no-learn-allow`
 or configure `--verbs` explicitly and review `guard verb list` periodically.
 

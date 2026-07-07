@@ -65,7 +65,7 @@ impl SessionStore {
         let mut grants = HashMap::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT token, allow_json, deny_json, allow_exact_json, deny_exact_json, expires_at, prompt_append, granted_at, static_only, auto_amend
+                "SELECT token, allow_json, deny_json, allow_exact_json, deny_exact_json, expires_at, prompt_append, generated_notes_json, granted_at, static_only, auto_amend
                  FROM session_grants",
             )?;
             let rows = stmt.query_map([], |row| {
@@ -83,9 +83,10 @@ impl SessionStore {
                         deny_exact: decode_exact_vec(&deny_exact_json)?,
                         expires_at: decode_optional_u64(row.get(5)?)?,
                         prompt_append: row.get(6)?,
-                        granted_at: decode_u64(row.get(7)?)?,
-                        static_only: decode_bool(row.get(8)?)?,
-                        auto_amend: decode_bool(row.get(9)?)?,
+                        generated_notes: decode_vec(&row.get::<_, String>(7)?)?,
+                        granted_at: decode_u64(row.get(8)?)?,
+                        static_only: decode_bool(row.get(9)?)?,
+                        auto_amend: decode_bool(row.get(10)?)?,
                     },
                 ))
             })?;
@@ -98,7 +99,7 @@ impl SessionStore {
         let mut history = Vec::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT token, allow_json, deny_json, allow_exact_json, deny_exact_json, granted_at, expires_at, ended_at, status, prompt_append, static_only, auto_amend
+                "SELECT token, allow_json, deny_json, allow_exact_json, deny_exact_json, granted_at, expires_at, ended_at, status, prompt_append, generated_notes_json, static_only, auto_amend
                  FROM session_history
                  ORDER BY ended_at ASC, id ASC",
             )?;
@@ -119,8 +120,9 @@ impl SessionStore {
                     ended_at: decode_u64(row.get(7)?)?,
                     status: decode_historical_status(&status)?,
                     prompt_append: row.get(9)?,
-                    static_only: decode_bool(row.get(10)?)?,
-                    auto_amend: decode_bool(row.get(11)?)?,
+                    generated_notes: decode_vec(&row.get::<_, String>(10)?)?,
+                    static_only: decode_bool(row.get(11)?)?,
+                    auto_amend: decode_bool(row.get(12)?)?,
                 })
             })?;
             for row in rows {
@@ -183,8 +185,8 @@ impl SessionStore {
         for (token, grant) in snapshot.grants_snapshot() {
             tx.execute(
                 "INSERT INTO session_grants
-                 (token, allow_json, deny_json, allow_exact_json, deny_exact_json, expires_at, prompt_append, granted_at, static_only, auto_amend)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 (token, allow_json, deny_json, allow_exact_json, deny_exact_json, expires_at, prompt_append, generated_notes_json, granted_at, static_only, auto_amend)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     token,
                     encode_vec(&grant.allow)?,
@@ -193,6 +195,7 @@ impl SessionStore {
                     encode_exact_vec(&grant.deny_exact)?,
                     encode_optional_u64(grant.expires_at)?,
                     grant.prompt_append,
+                    encode_vec(&grant.generated_notes)?,
                     encode_u64(grant.granted_at)?,
                     encode_bool(grant.static_only),
                     encode_bool(grant.auto_amend)
@@ -203,8 +206,8 @@ impl SessionStore {
         for grant in snapshot.history_snapshot() {
             tx.execute(
                 "INSERT INTO session_history
-                 (token, allow_json, deny_json, allow_exact_json, deny_exact_json, granted_at, expires_at, ended_at, status, prompt_append, static_only, auto_amend)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 (token, allow_json, deny_json, allow_exact_json, deny_exact_json, granted_at, expires_at, ended_at, status, prompt_append, generated_notes_json, static_only, auto_amend)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     grant.token,
                     encode_vec(&grant.allow)?,
@@ -216,6 +219,7 @@ impl SessionStore {
                     encode_u64(grant.ended_at)?,
                     encode_historical_status(grant.status),
                     grant.prompt_append,
+                    encode_vec(&grant.generated_notes)?,
                     encode_bool(grant.static_only),
                     encode_bool(grant.auto_amend)
                 ],
@@ -265,6 +269,7 @@ impl SessionStore {
                 deny_exact_json TEXT NOT NULL DEFAULT '[]',
                 expires_at INTEGER,
                 prompt_append TEXT,
+                generated_notes_json TEXT NOT NULL DEFAULT '[]',
                 granted_at INTEGER NOT NULL,
                 static_only INTEGER NOT NULL DEFAULT 0,
                 auto_amend INTEGER NOT NULL DEFAULT 0
@@ -281,6 +286,7 @@ impl SessionStore {
                 ended_at INTEGER NOT NULL,
                 status TEXT NOT NULL,
                 prompt_append TEXT,
+                generated_notes_json TEXT NOT NULL DEFAULT '[]',
                 static_only INTEGER NOT NULL DEFAULT 0,
                 auto_amend INTEGER NOT NULL DEFAULT 0
             );
@@ -315,6 +321,12 @@ impl SessionStore {
         ensure_column(
             conn,
             "session_grants",
+            "generated_notes_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
+        ensure_column(
+            conn,
+            "session_grants",
             "static_only",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
@@ -334,6 +346,12 @@ impl SessionStore {
             conn,
             "session_grants",
             "deny_exact_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
+        ensure_column(
+            conn,
+            "session_history",
+            "generated_notes_json",
             "TEXT NOT NULL DEFAULT '[]'",
         )?;
         ensure_column(
@@ -670,6 +688,7 @@ mod tests {
                 )],
                 expires_at: None,
                 prompt_append: Some("persistent".into()),
+                generated_notes: vec!["generated note".into()],
                 granted_at: now.saturating_sub(2),
                 static_only: true,
                 auto_amend: true,
@@ -688,6 +707,7 @@ mod tests {
                 ended_at: now.saturating_sub(5),
                 status: HistoricalStatus::Revoked,
                 prompt_append: None,
+                generated_notes: Vec::new(),
                 static_only: false,
                 auto_amend: false,
             }],
@@ -719,6 +739,13 @@ mod tests {
         assert_eq!(
             report.active.and_then(|grant| grant.prompt_append),
             Some("persistent".into())
+        );
+        let report = loaded.show("tok", 10).expect("session report");
+        assert_eq!(
+            report
+                .active
+                .and_then(|grant| grant.generated_notes.into_iter().next()),
+            Some("generated note".into())
         );
         assert!(loaded.static_only_for("tok"));
         assert!(loaded.auto_amend_for("tok"));
