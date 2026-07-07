@@ -115,7 +115,7 @@ over a Unix-domain socket and a Windows SID over a named pipe; either way it is 
 kernel-verified local peer, so gating works on both platforms. It requires a
 local listener (`--socket`) and is refused with a TCP listener, which carries
 only a bearer token and no peer identity. Approval, denial, confirmation, and
-manual revert are restricted to **the daemon's own principal** — the operator
+manual revert are restricted to **the daemon's own principal** - the operator
 decides the irreversible steps, never the agent.
 
 ```bash
@@ -125,16 +125,18 @@ guard server start --gate consequence --exec-as-caller \
 # Reversible: runs now.
 guard run ls -la /etc/nginx/
 
-# Recoverable: applied behind an auto-revert envelope.
+# Recoverable: executes inside an auto-revert envelope.
 guard run --revert "systemctl stop app" --confirm-within 900 \
   systemctl restart app
-# PROVISIONAL (containment envelope): ... handle: 3f9c...
+# PROVISIONAL containment envelope: ... handle: 3f9c...
+# result: executed, auto-reverts unless confirmed
 #   confirm: guard confirm 3f9c...   (else auto-reverts)
 guard confirm 3f9c...     # operator: keep it
 
 # Irreversible: held for operator approval, not executed.
 guard run rm -rf /var/data
-# HELD for operator approval: ... handle: a1b2...
+# HELD for daemon-principal approval: ... handle: a1b2...
+# result: not executed until approved
 #   approve: guard approve a1b2...
 guard approvals                 # operator: review the queue
 guard approve a1b2...           # operator: execute the exact held command
@@ -143,7 +145,7 @@ guard deny a1b2...              # operator: reject it
 
 A free-form `--revert` is assessed by the evaluator at arm time, with the forward
 command as context, for both policy compliance and whether it is a sensible
-inverse of the forward action — the daemon may run it unattended, so it is gated
+inverse of the forward action. The daemon may run it unattended, so it is gated
 as the consequential action it is. Only an explicit approval arms the envelope;
 any other verdict escalates the command to operator review (it is held, not armed
 with an unverified rollback and not silently denied), so an agent cannot smuggle
@@ -151,9 +153,12 @@ an arbitrary or off-target command into the rollback slot. An operator-authored
 verb revert is the slow clock and is not re-evaluated. A recoverable command with
 no usable revert is held, not run unconfined. Held commands fail closed: an
 unattended queue denies on a TTL rather than stalling. Held and provisional state
-survives a daemon restart, and a revert never runs unattended at boot — a
+survives a daemon restart, and a revert never runs unattended at boot. A
 past-deadline provisional becomes `needs_operator_decision` for explicit
-handling. Inspect state with `guard provisionals` and `guard approvals`.
+handling. `DENIED` means the command did not execute. Evaluator errors, invalid
+revert commands, missing approval snapshots, and unsafe replay checks fail closed
+and return an explicit denial or hold reason. Inspect state with `guard
+provisionals` and `guard approvals`.
 
 ### Verbs: the typed interface
 
@@ -165,7 +170,7 @@ rollback. The agent calls the verb; it never composes raw shell.
 
 ```bash
 guard verb list
-# restart-service [recoverable] trusted revertable — Restart a systemd unit
+# restart-service [recoverable] trusted revertable - Restart a systemd unit
 #     --param unit=<^[a-zA-Z0-9@._-]+$>
 
 guard verb run restart-service --param unit=nginx
@@ -197,8 +202,8 @@ to a safety gate the model cannot talk its way past: a synthesized verb is never
 `trusted` (so the LLM still evaluates the rendered command at run time), its binary
 may not be a shell or interpreter, its parameter patterns may not admit whitespace
 or shell metacharacters, and its name must be kebab-case. This lets an operator add
-narrow, least-privilege verbs — including per-resource limits a tool's own RBAC
-cannot express — without writing YAML by hand.
+narrow, least-privilege verbs - including per-resource limits a tool's own RBAC
+cannot express - without writing YAML by hand.
 
 A caller does not have to name a verb to benefit from one: a raw command
 (`guard run kubectl get pods -n foo`) reverse-matches any catalog verb whose
@@ -211,7 +216,7 @@ and trust the same way `guard verb run` would.
 allow-side counterpart to `GUARD_LEARN_DENY`, for deployments too unattended
 for an operator to act on learned-rule notices. Repeated low-risk approvals of
 the same command shape are appended to the catalog automatically as a
-`trusted` verb — restricted to reversible shapes, or recoverable shapes with a
+`trusted` verb - restricted to reversible shapes, or recoverable shapes with a
 validated revert; irreversible shapes are never eligible, since they hold for
 operator approval regardless of `trusted`. Every parameter's allowed values
 are pinned to the exact values actually observed, never a model-authored
@@ -273,9 +278,9 @@ Two opt-in features exist for deployments with specific constraints:
   [`examples/`](examples/README.md) for `deny-policy.yaml` and
   `hybrid-policy.yaml`. `commands.allow` is also parsed (for the
   `--no-llm` fallback mode and backward compatibility) but, while the LLM is
-  enabled, an allow pattern never skips it -- glob patterns over a flat
-  command string can't be trusted with that the way `guard verb`'s
-  anchored-regex, single-argv parameters can. Use `guard verb` for a
+  enabled, an allow pattern never skips it. Static and session policy patterns
+  are shell-style globs over a flat reconstructed command line, while verb
+  parameters are anchored regexes rendered as single argv elements. Use `guard verb` for a
   deterministic, LLM-skipping allow.
 - **Fallback model chain** via `GUARD_LLM_MODELS`. Fails over to
   alternate providers after the primary exhausts its retries. See
@@ -283,7 +288,7 @@ Two opt-in features exist for deployments with specific constraints:
 - **Learned-rule candidates** via `--learn-rules`. Repeated low-risk LLM
   approvals surface as a candidate in the policy reason text, with a
   ready-to-run `guard verb create --prompt` suggestion. Candidates do not
-  grant themselves a bypass -- only an operator running that command can,
+  grant themselves a bypass. Only an operator running that command can,
   through the same synthesis safety gate as any other verb.
 
 Enable either only when a concrete latency or uptime constraint forces it.
@@ -302,7 +307,7 @@ Guard walks up from your current directory to `/` looking for `.env` files (clos
 | `GUARD_LLM_RETRIES` | `2` | Retries per model on transient failures (429, timeouts, parse errors). 1-2. |
 | `GUARD_LLM_TIMEOUT` | `30` | LLM call timeout in seconds. |
 | `GUARD_AUTH_TOKEN` | (none) | Shared token for TCP clients. Use this for loopback TCP daemons instead of passing `--auth-token` on the command line. |
-| `GUARD_ADMIN_TOKEN` | (none) | Separate token for TCP admin RPCs such as `guard grant`, `guard session show`, and the full `guard status`. The Windows launcher generates and stores one automatically. |
+| `GUARD_ADMIN_TOKEN` | (none) | Separate token for TCP admin RPCs such as `guard grant`, session mutation, detailed secret ownership inspection, and the full `guard status`. The Windows launcher generates and stores one automatically. |
 | `GUARD_MODE` | `readonly` | `readonly`, `safe`, or `paranoid` |
 | `GUARD_DRY_RUN` | `false` | Evaluate policy but do not execute approved commands. Useful for prompt and policy testing. |
 | `GUARD_LEARN_RULES` | `false` | Learn static allows from repeated low-risk LLM approvals. |
@@ -423,6 +428,17 @@ Static patterns are checked first. If a command matches a deny pattern, it is re
 
 See [`examples/deny-policy.yaml`](examples/deny-policy.yaml) for a reference policy with documented limitations of static glob matching.
 
+### Command access summary
+
+`guard help-tree` prints a categorized access summary. The user section covers
+execution, liveness, per-user secret add/remove/list, redacted session reads,
+known-token session show, token-only session minting, verb use, and local hold
+inspection. The local setup section covers client-side shim and config files.
+`guard help-tree --admin` adds daemon-principal and TCP admin-token commands
+such as session grant/revoke/appeal, grant-installing session creation, gate
+decisions, detailed secret ownership inspection, verb creation, and full daemon
+status.
+
 ### Learned static rules
 
 For services with repetitive low-risk calls, enable learned rules:
@@ -488,7 +504,7 @@ The additive prompt is appended to whichever base prompt is active (readonly, sa
 
 ## Session grants
 
-Session grants hand a specific agent narrow extra permissions for a specific run, without relaxing the global mode. The agent identifies its session by the `GUARD_SESSION` env var; every `guard run` (and `guard server connect`) reads that env var and forwards it as the session token in the request. Operators attach allow/deny patterns, prose intent, and prompt context to that token.
+Session grants hand a specific agent narrow extra permissions for a specific run, without relaxing the global mode. The agent identifies its session by the `GUARD_SESSION` env var; every `guard run` (and `guard server connect`) reads that env var and forwards it as the session token in the request. Operators attach allow/deny patterns, prose intent, and optional evaluator context to that token. The token is a bearer credential; treat it like access to the scoped session itself.
 
 The simplest flow is `guard session new`, which mints a token and (optionally) grants it in one round trip, printing an eval-friendly export line:
 
@@ -506,7 +522,7 @@ claude
 GUARD_SESSION="$GUARD_SESSION" my-agent
 ```
 
-Inside the agent's process tree, every `guard run` call automatically picks up `GUARD_SESSION` from the inherited environment, so the model itself does not need to know or pass the token explicitly — it is bound to the shell that launched the agent.
+Inside the agent's process tree, every `guard run` call automatically picks up `GUARD_SESSION` from the inherited environment, so the model itself does not need to know or pass the token explicitly. The scope is bound to the shell that launched the agent.
 
 To grant rules to an existing token (e.g. one the agent already has):
 
@@ -527,11 +543,11 @@ For an existing token, pass the token first:
 guard grant <token> "readonly access to grafana resources in the staging kube cluster, not secrets, with write access for scaling replicas and editing ingresses"
 ```
 
-Prose grants are compiled at grant time into conservative static rules when guard recognizes the domain. The first compiler handles Kubernetes: it infers namespaces such as `grafana`, optional contexts such as `staging`, adds hard denies for shell-control, secret access, token creation, raw kubeconfig reads, `exec`, `cp`, `port-forward`, and deletes, then adds namespace-scoped read, scale, and ingress/reverse-proxy rules implied by the prose. Safe command examples in backticks are added as exact static allows. Unrecognized prose is still stored as session LLM context, but does not create broad static globs.
+Prose grants are compiled at grant time into conservative static rules when guard recognizes the domain. The first compiler handles Kubernetes: it infers namespaces such as `grafana`, optional contexts such as `staging`, adds hard denies for shell-control, secret access, token creation, raw kubeconfig reads, `exec`, `cp`, `port-forward`, and deletes, then adds namespace-scoped read, scale, and ingress/reverse-proxy rules implied by the prose. Safe command examples in backticks are added as exact static allows. Unrecognized prose is still stored as session LLM context, but does not create broad static globs. Generated static-grant notes are stored and displayed separately from the evaluator prompt so operators can audit which compiler output explains the generated rules without expanding the model context.
 
 Session allow/deny patterns use guard's shell-style glob matcher, not regex. `*`, `?`, and bracket classes are supported, but the match is against the flat reconstructed command line; it does not understand shell quoting, Kubernetes resource schemas, or argument semantics. Generated rules therefore use broad globs sparingly: for example, Kubernetes prose grants may add namespace-bounded `get * -n grafana` and `describe * -n grafana` read globs, backed by explicit secret and mutating-resource denies. Automatic amendments do not add globs at all; they add exact `binary + argv` rules, so literal `*` or `[` characters in an appealed command do not become wildcards.
 
-Matching deny patterns win over allow patterns, and by default everything that does not match a session rule falls through to the normal evaluator with the session prose/prompt appended. Prose grants enable `auto_amend` by default so fresh low-risk LLM fallback approvals can add exact session allows, and fresh high-risk LLM denials can add exact session denies. Use `--no-auto-amend` to keep fallback non-mutating, or `--auto-amend` to opt a manual `--allow`/`--deny` grant into the same behavior. Cache hits, static policy hits, and learned-rule hits never amend a session; session fallback also does not promote global learned rules. Add `--static-only` (alias `--no-llm-fallback`) to `guard grant`, `guard session grant`, or `guard session new` to deny any session-rule miss instead of falling through to the LLM; static-only grants disable auto-amend.
+Matching deny patterns win over allow patterns, and by default everything that does not match a session rule falls through to the normal evaluator with the session prose and optional `--prompt` context appended. Prose grants enable `auto_amend` by default so fresh low-risk LLM fallback approvals can add exact session allows, and fresh high-risk LLM denials can add exact session denies. Use `--no-auto-amend` to keep fallback non-mutating, or `--auto-amend` to opt a manual `--allow`/`--deny` grant into the same behavior. Cache hits, static policy hits, and learned-rule hits never amend a session; session fallback also does not promote global learned rules. Add `--static-only` (alias `--no-llm-fallback`) to `guard grant`, `guard session grant`, or `guard session new` to deny any session-rule miss instead of falling through to the LLM; static-only grants disable auto-amend.
 
 To ask for a one-off amendment without executing the command, appeal it:
 
@@ -543,21 +559,21 @@ guard appeal kubectl get httproute -n grafana
 guard session appeal <token> kubectl get httproute -n grafana
 ```
 
-An appeal runs the evaluator with the session context and then either amends an exact allow, amends an exact deny for a high-risk denial, or refuses to amend. It exits nonzero when the appealed command remains denied. Appeals are admin RPCs, like grant/revoke/show, because they can change durable authorization state.
+An appeal runs the evaluator with the session context and then either amends an exact allow, amends an exact deny for a high-risk denial, or refuses to amend. It exits nonzero when the appealed command remains denied. Appeals are admin RPCs, like grant and revoke, because they can change durable authorization state.
 
-Session grants are persisted in the daemon state database and survive daemon restarts by default. The default path is the XDG state dir (`$XDG_STATE_HOME/guard/state.db` or `~/.local/state/guard/state.db`); override it with `--state-db` or `GUARD_STATE_DB`. `guard session revoke <token>` is restricted to the daemon principal; `guard session list` is visible over a local listener to exec-allowed callers, but it redacts the bearer token, rule bodies, and prompt text unless the caller is the daemon principal.
+Session grants are persisted in the daemon state database and survive daemon restarts by default. The default path is the XDG state dir (`$XDG_STATE_HOME/guard/state.db` or `~/.local/state/guard/state.db`); override it with `--state-db` or `GUARD_STATE_DB`. `guard session revoke <token>` is restricted to the daemon principal. `guard session list` is visible over a local listener to exec-allowed callers: non-admin callers see redacted tokens, hidden rule bodies, hidden generated notes, and hidden prompt text for other sessions. If `GUARD_SESSION` matches an active or historical grant, that row is shown as `token=(current)` with its own rules, prompt context, and generated notes visible, but the raw token is still not printed.
 
-For operator forensics, `guard session show <token>` is restricted to the daemon principal and prints the full prompt, aggregate allow/deny and exec outcome counts, source breakdown (`llm`, `cache`, `static_policy`, `session_allow`, `session_deny`, `session_static_only`, `validation`), a risk histogram for LLM-evaluated calls, and a bounded recent interaction log. Those summaries are loaded from the state database, so they remain available after a service restart within the configured retention window.
+For forensics, `guard session show <token>` prints prompt context, generated notes, aggregate allow/deny and exec outcome counts, source breakdown (`llm`, `cache`, `static_policy`, `session_allow`, `session_deny`, `session_static_only`, `validation`), a risk histogram for LLM-evaluated calls, and a bounded recent interaction log. Daemon-principal and TCP admin-token callers see the raw token. Non-admin local callers may show a session only by presenting its token and receive the same session details with tokens rendered as `(provided)`. Those summaries are loaded from the state database, so they remain available after a service restart within the configured retention window.
 
 ## Per-run secret injection
 
 `guard run` can request stored secrets for one approved command without requiring a shim or persistent tool config. The daemon resolves the secret values immediately before exec, injects them into the child environment, and includes those values in exact-match output redaction.
 
-`guard secrets add/list/remove` and `--secret`/`--env` injection are local-caller operations on both platforms. They require an authenticated local peer — a Unix-socket uid or a Windows named-pipe SID — and the secret namespace is keyed from that principal. A bearer-token TCP caller is refused, because a token is not a trustworthy local identity. Any local caller can manage its own secret namespace. When the daemon principal runs `guard secrets list`, it gets an aggregate names-only view across every principal's namespace; duplicate key names can appear more than once and are intentionally not annotated with ownership in the default list output.
+`guard secrets add/list/remove` and `--secret`/`--env` injection are local-caller operations on both platforms. They require an authenticated local peer - a Unix-socket uid or a Windows named-pipe SID - and the secret namespace is keyed from that principal. A bearer-token TCP caller is refused, because a token is not a trustworthy local identity. Any local caller can manage its own secret namespace. When the daemon principal runs `guard secrets list`, it gets an aggregate names-only view across every principal's namespace; duplicate key names can appear more than once and are intentionally not annotated with ownership in the default list output.
 
 For daemon-side migration and cleanup, use `guard secrets list --detailed` as the daemon principal. That view annotates the owning principal for namespaced entries and `origin=legacy` for pre-namespace flat secrets that still need operator migration.
 
-Upgrade note: pre-namespace flat secrets are no longer served through normal per-user `guard secrets list` / `guard run --secret` paths. Migrate them before rollout:
+Pre-namespace flat secrets are excluded from normal per-user `guard secrets list` / `guard run --secret` paths. Migrate them before rollout:
 
 - `pass`: move `guard/<key>` to `guard/u<uid>/<key>`
 - `env`: rename `GUARD_SECRET_<KEY>` to `GUARD_SECRET_U<uid>_<KEY>`
@@ -597,19 +613,19 @@ guard run --env OPNSENSE_HOST=opnsense-host --secret OPNSENSE_API_KEY \
 
 ## Admin authorization
 
-Session admin RPCs (`session new` / `grant` / `revoke`, plus the privileged subset of `status`) are restricted to **the daemon's own principal** over a local listener — its uid over a Unix-domain socket, its SID over a Windows named pipe. `session list` is the local-listener exception: exec-allowed local callers may see that grants exist, when they were granted, and when they expire, but the daemon redacts the session token, allow/deny patterns, and prompt text unless the caller is the daemon principal. On TCP transports, non-Ping admin RPCs require the separate `GUARD_ADMIN_TOKEN`; the ordinary TCP exec `GUARD_AUTH_TOKEN` is not enough to mint grants.
+Session mutating RPCs (`grant`, grant-installing `session new`, `appeal`, and `revoke`, plus the privileged subset of `status`) are restricted to **the daemon's own principal** over a local listener: its uid over a Unix-domain socket, its SID over a Windows named pipe. Token-only `session new` runs locally and does not contact the daemon. `session list` is visible to exec-allowed local callers with redaction. Non-admin callers see that grants exist, when they were granted, and when they expire, but tokens, rule bodies, generated notes, and prompt text are hidden for other sessions. If `GUARD_SESSION` names a session the caller already has, that row is shown as `token=(current)` and includes its own rules, generated notes, and prompt context without printing the raw token. `session show <token>` accepts a known token from an exec-allowed local caller and prints details with token output hidden as `(provided)`. On TCP transports, non-Ping admin RPCs require the separate `GUARD_ADMIN_TOKEN`; the ordinary TCP exec `GUARD_AUTH_TOKEN` is not enough to mint grants.
 
-The non-privileged `guard status` (run as your normal user or any other exec-allowed UID, or over TCP without the admin token) returns only client + server version, uptime, evaluation mode, and dry-run state. It is a liveness probe — enough to confirm the connection works and what mode the evaluator is in, but nothing that would help fingerprint the deployment or escalate privilege.
+The non-privileged `guard status` (run as your normal user or any other exec-allowed UID, or over TCP without the admin token) returns only client + server version, uptime, evaluation mode, and dry-run state. It is a liveness probe - enough to confirm the connection works and what mode the evaluator is in, but nothing that would help fingerprint the deployment or escalate privilege.
 
 The `--prompt` / `--prompt-file` flags attach a free-form context fragment that is appended to the LLM system prompt under a `Session context:` heading for evaluator calls made under that token. Prose grants use the same context path after static rule synthesis. Use prompt/prose for guidance the static glob patterns cannot express. The decision cache is bypassed when a session prompt is in play, because cached verdicts were made under the base prompt and may not hold under the extended context.
 
-Because grants are now durable, broad sessions deserve the same care as any other persistent authorization state. Prefer explicit TTLs for elevated sessions, and treat `allow=["*"]` as an operator override that must be revoked intentionally rather than something a daemon restart will clear for you. Generated prose rules intentionally stay narrow; if guard cannot infer a safe static rule, it relies on LLM fallback or denies under `--static-only`.
+Durable grants deserve the same care as any other persistent authorization state. Prefer explicit TTLs for elevated sessions, and treat `allow=["*"]` as an operator override that must be revoked intentionally rather than something a daemon restart clears. Generated prose rules intentionally stay narrow; if guard cannot infer a safe static rule, it relies on LLM fallback or denies under `--static-only`.
 
 ## Execution identity
 
 By default the daemon executes approved commands as its own service identity, on both platforms. That service identity is the containment boundary: an agent calling through the daemon runs commands with the daemon's authority, not its own, and approval of held commands rests on the daemon's principal being distinct from the agent's.
 
-`--exec-as-caller` (Unix only) extends this into a per-user secret broker and redactor for files such as `~/.aws/config` or `~/.cmk/config`. Start a root-owned daemon with `--exec-as-caller` and only a Unix socket listener; guard authenticates the caller by Unix peer credentials and drops the child process to that uid before exec, so the command runs with the caller's filesystem access instead of root's. TCP listeners are incompatible with this mode because a token is not a trustworthy local uid. Windows has no setuid-style identity drop, so containment there rests on running the daemon as a dedicated Windows service account: the daemon owns the named pipe, the state database, and any brokered credentials under an NTFS ACL that excludes the interactive agent's account. The agent connects to the pipe under its own SID — distinct from the daemon's — so it cannot approve its own held commands or read the daemon's state and credentials. See [`deployment/windows/install-guard.ps1`](deployment/windows/install-guard.ps1).
+`--exec-as-caller` (Unix only) extends this into a per-user secret broker and redactor for files such as `~/.aws/config` or `~/.cmk/config`. Start a root-owned daemon with `--exec-as-caller` and only a Unix socket listener; guard authenticates the caller by Unix peer credentials and drops the child process to that uid before exec, so the command runs with the caller's filesystem access instead of root's. TCP listeners are incompatible with this mode because a token is not a trustworthy local uid. Windows has no setuid-style identity drop, so containment there rests on running the daemon as a dedicated Windows service account: the daemon owns the named pipe, the state database, and any brokered credentials under an NTFS ACL that excludes the interactive agent's account. The agent connects to the pipe under its own SID - distinct from the daemon's - so it cannot approve its own held commands or read the daemon's state and credentials. See [`deployment/windows/install-guard.ps1`](deployment/windows/install-guard.ps1).
 
 ## Agent integration
 
@@ -711,7 +727,7 @@ Guard provides defense in depth through three layers:
 
 1. **Environment isolation** (`env_clear`): Child processes inherit only safe environment variables (`PATH`, `HOME`, `USER`, `LANG`, `TERM`, etc.) plus any per-run or tool-configured variables the caller explicitly requested.
 
-2. **Output redaction**: Known secret values (API keys, auth tokens, tool secrets, per-run injected secrets) are exact-match redacted from stdout/stderr before returning to the agent. Pattern-based redaction catches secrets guard has never seen: secret-bearing key names (`*_TOKEN`, `*_KEY`, `apikey`, `secretkey`, `*_PASSWORD`, ...) in env, YAML, and quoted-JSON form, single-line flow-style `name`/`value` env pairs, PEM blocks, JWTs, `Bearer`/`Basic` header tokens, `sk-*`/`AKIA*` keys, and bare high-entropy key material. Quoted JSON/YAML values stay quoted after replacement, so redacted structured output remains parseable. The same engine redacts all text sent to the LLM evaluator, so a credential embedded in a command or session context never reaches the model. Output redaction is on by default; `--no-redact` disables output redaction only — LLM-bound text is always pre-redacted regardless of the flag.
+2. **Output redaction**: Known secret values (API keys, auth tokens, tool secrets, per-run injected secrets) are exact-match redacted from stdout/stderr before returning to the agent. Pattern-based redaction catches secrets guard has never seen: secret-bearing key names (`*_TOKEN`, `*_KEY`, `apikey`, `secretkey`, `*_PASSWORD`, ...) in env, YAML, and quoted-JSON form, single-line flow-style `name`/`value` env pairs, PEM blocks, JWTs, `Bearer`/`Basic` header tokens, `sk-*`/`AKIA*` keys, and bare high-entropy key material. Quoted JSON/YAML values stay quoted after replacement, so redacted structured output remains parseable. The same engine redacts all text sent to the LLM evaluator, so a credential embedded in a command or session context never reaches the model. Output redaction is on by default; `--no-redact` disables output redaction only - LLM-bound text is always pre-redacted regardless of the flag.
 
 3. **LLM evaluation**: Each command is analyzed for destructive intent, privilege escalation, reverse shells, obfuscated payloads, tool side-channel abuse, and prompt injection. The LLM evaluates the full command including all chained parts.
 

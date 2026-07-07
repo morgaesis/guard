@@ -403,6 +403,11 @@ pub enum AdminRequest {
         /// unix-seconds value are returned. None = no time filter.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         since_unix: Option<u64>,
+        /// Optional session token already held by the caller. Non-admin local
+        /// callers can see rule bodies and prompt text for this token, while
+        /// raw token values remain redacted in list output.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        visible_token: Option<String>,
     },
     SessionShow {
         token: String,
@@ -491,6 +496,7 @@ impl AdminRequest {
             self,
             Self::Ping
                 | Self::SessionList { .. }
+                | Self::SessionShow { .. }
                 | Self::SecretSet { .. }
                 | Self::SecretDelete { .. }
                 | Self::SecretExists { .. }
@@ -1884,7 +1890,7 @@ fn merge_unique(target: &mut Vec<String>, additions: Vec<String>) {
 fn combine_session_prompt(
     prompt_append: Option<String>,
     prose: Option<&str>,
-    compiled: &CompiledGrantRules,
+    _compiled: &CompiledGrantRules,
 ) -> Option<String> {
     let mut sections = Vec::new();
     let prompt_append = prompt_append
@@ -1893,12 +1899,6 @@ fn combine_session_prompt(
     if let Some(prose) = prose.map(str::trim).filter(|value| !value.is_empty()) {
         sections.push(format!("Session grant prose:\n{prose}"));
     }
-    if !compiled.notes.is_empty() {
-        sections.push(format!(
-            "Generated static grant notes:\n- {}",
-            compiled.notes.join("\n- ")
-        ));
-    }
     if sections.is_empty() {
         return prompt_append;
     }
@@ -1906,6 +1906,69 @@ fn combine_session_prompt(
         sections.push(format!("Additional session context:\n{prompt}"));
     }
     Some(sections.join("\n\n"))
+}
+
+fn caller_is_session_admin(config: &ServerConfig, caller: &CallerIdentity) -> bool {
+    matches!(caller.principal(), Some(ref p) if config.daemon_principal.eq_ci(p))
+        || matches!(caller, CallerIdentity::TcpAdmin { .. })
+}
+
+fn caller_can_view_session(
+    config: &ServerConfig,
+    caller: &CallerIdentity,
+    token: &str,
+    visible_token: Option<&str>,
+) -> bool {
+    caller_is_session_admin(config, caller) || visible_token == Some(token)
+}
+
+fn redact_session_summary_for_list(grant: &mut SessionGrantSummary, admin: bool, can_view: bool) {
+    if !admin {
+        grant.token = if can_view {
+            "(current)".to_string()
+        } else {
+            "(hidden)".to_string()
+        };
+    }
+    if !can_view {
+        grant.allow.clear();
+        grant.deny.clear();
+        grant.allow_exact.clear();
+        grant.deny_exact.clear();
+        grant.generated_notes.clear();
+        if grant.prompt_append.is_some() {
+            grant.prompt_append = Some("(hidden)".to_string());
+        }
+    }
+}
+
+fn redact_historical_grant_for_list(grant: &mut HistoricalGrant, admin: bool, can_view: bool) {
+    if !admin {
+        grant.token = if can_view {
+            "(current)".to_string()
+        } else {
+            "(hidden)".to_string()
+        };
+    }
+    if !can_view {
+        grant.allow.clear();
+        grant.deny.clear();
+        grant.allow_exact.clear();
+        grant.deny_exact.clear();
+        grant.generated_notes.clear();
+        if grant.prompt_append.is_some() {
+            grant.prompt_append = Some("(hidden)".to_string());
+        }
+    }
+}
+
+fn redact_session_report_for_non_admin(report: &mut SessionReport) {
+    if let Some(active) = &mut report.active {
+        active.token = "(provided)".to_string();
+    }
+    for grant in &mut report.history {
+        grant.token = "(provided)".to_string();
+    }
 }
 
 async fn handle_session_appeal(
@@ -2194,6 +2257,7 @@ async fn handle_admin_request(
                 deny_exact: Vec::new(),
                 expires_at,
                 prompt_append,
+                generated_notes: compiled.notes.clone(),
                 static_only,
                 auto_amend,
                 granted_at: 0, // SessionRegistry::grant fills the current time
@@ -2252,6 +2316,7 @@ async fn handle_admin_request(
         AdminRequest::SessionList {
             include_history,
             since_unix,
+            visible_token,
         } => {
             // Opportunistic purge so list shows fresh state and history
             // bookkeeping stays bounded.
@@ -2263,22 +2328,15 @@ async fn handle_admin_request(
                 tracing::warn!("failed to persist purged session state: {}", err);
             }
             let reg = config.sessions.read().await;
-            let show_prompt = matches!(caller.principal(), Some(ref p) if config.daemon_principal.eq_ci(p))
-                || matches!(caller, CallerIdentity::TcpAdmin { .. });
+            let is_admin = caller_is_session_admin(config, caller);
+            let visible_token = visible_token.as_deref();
             let grants = reg
                 .list()
                 .into_iter()
                 .map(|mut grant| {
-                    if !show_prompt {
-                        grant.token = "(hidden)".to_string();
-                        grant.allow.clear();
-                        grant.deny.clear();
-                        grant.allow_exact.clear();
-                        grant.deny_exact.clear();
-                        if grant.prompt_append.is_some() {
-                            grant.prompt_append = Some("(hidden)".to_string());
-                        }
-                    }
+                    let can_view =
+                        caller_can_view_session(config, caller, &grant.token, visible_token);
+                    redact_session_summary_for_list(&mut grant, is_admin, can_view);
                     grant
                 })
                 .collect();
@@ -2286,16 +2344,9 @@ async fn handle_admin_request(
                 reg.list_history(since_unix)
                     .into_iter()
                     .map(|mut grant| {
-                        if !show_prompt {
-                            grant.token = "(hidden)".to_string();
-                            grant.allow.clear();
-                            grant.deny.clear();
-                            grant.allow_exact.clear();
-                            grant.deny_exact.clear();
-                            if grant.prompt_append.is_some() {
-                                grant.prompt_append = Some("(hidden)".to_string());
-                            }
-                        }
+                        let can_view =
+                            caller_can_view_session(config, caller, &grant.token, visible_token);
+                        redact_historical_grant_for_list(&mut grant, is_admin, can_view);
                         grant
                     })
                     .collect()
@@ -2314,7 +2365,12 @@ async fn handle_admin_request(
             }
             let reg = config.sessions.read().await;
             match reg.show(&token, limit.unwrap_or(20)) {
-                Some(report) => AdminResponse::SessionShow { report },
+                Some(mut report) => {
+                    if !caller_is_session_admin(config, caller) {
+                        redact_session_report_for_non_admin(&mut report);
+                    }
+                    AdminResponse::SessionShow { report }
+                }
                 None => AdminResponse::Error {
                     message: format!("unknown session token: '{}'", token),
                 },
@@ -8620,6 +8676,7 @@ mod tests {
                     deny_exact: Vec::new(),
                     expires_at: None,
                     prompt_append: None,
+                    generated_notes: Vec::new(),
                     static_only: true,
                     auto_amend: false,
                     granted_at: 0,
@@ -8672,6 +8729,7 @@ mod tests {
                     deny_exact: Vec::new(),
                     expires_at: None,
                     prompt_append: None,
+                    generated_notes: Vec::new(),
                     static_only: true,
                     auto_amend: false,
                     granted_at: 0,
@@ -8802,6 +8860,7 @@ mod tests {
             AdminRequest::SessionList {
                 include_history: false,
                 since_unix: None,
+                visible_token: None,
             },
         )
         .await;
@@ -8818,6 +8877,68 @@ mod tests {
                 assert!(hidden.allow_exact.is_empty());
                 assert!(hidden.deny_exact.is_empty());
                 assert_eq!(hidden.prompt_append.as_deref(), Some("(hidden)"));
+                assert!(hidden.generated_notes.is_empty());
+            }
+            other => panic!("unexpected {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_list_shows_current_session_details_without_raw_token_for_user() {
+        let (mut cfg, _) = make_test_config();
+        cfg.daemon_uid = 777;
+        cfg.daemon_principal = PrincipalKey::from_uid(777);
+
+        let daemon = CallerIdentity::Unix { uid: 777 };
+        let user = CallerIdentity::Unix { uid: 20_002 };
+        let token = format!("session-visible-{}", std::process::id());
+
+        let grant = handle_admin_request(
+            &cfg,
+            &daemon,
+            AdminRequest::SessionGrant {
+                token: token.clone(),
+                allow: vec!["mkdir /tmp/work/*".into()],
+                deny: Vec::new(),
+                ttl_secs: None,
+                prompt_append: Some("operator prompt".into()),
+                prose: Some("kubernetes access for namespace nextcloud".into()),
+                static_only: false,
+                auto_amend: false,
+            },
+        )
+        .await;
+        assert!(matches!(grant, AdminResponse::Ok));
+
+        let listed = handle_admin_request(
+            &cfg,
+            &user,
+            AdminRequest::SessionList {
+                include_history: false,
+                since_unix: None,
+                visible_token: Some(token.clone()),
+            },
+        )
+        .await;
+        match listed {
+            AdminResponse::SessionList { grants, .. } => {
+                let visible = grants
+                    .iter()
+                    .find(|grant| grant.token == "(current)")
+                    .expect("current session grant visible to token holder");
+                assert!(
+                    !visible.allow.is_empty(),
+                    "current token holder should see grant rules"
+                );
+                assert_eq!(
+                    visible.prompt_append.as_deref(),
+                    Some("Session grant prose:\nkubernetes access for namespace nextcloud\n\nAdditional session context:\noperator prompt")
+                );
+                assert!(!visible.generated_notes.is_empty());
+                assert!(
+                    grants.iter().all(|grant| grant.token != token),
+                    "non-admin list output must not echo raw bearer tokens"
+                );
             }
             other => panic!("unexpected {:?}", other),
         }

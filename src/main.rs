@@ -28,10 +28,18 @@ use std::collections::HashMap;
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::fmt::format::Writer;
+use tracing_subscriber::fmt::time::FormatTime;
+use tracing_subscriber::{fmt as tracing_fmt, EnvFilter};
 
 #[derive(Parser)]
+#[command(
+    name = "guard",
+    about = "LLM-evaluated command gate for AI agents",
+    after_help = "Access model:\n  Non-admin local callers can run commands, manage their own secret namespace, read liveness status, list sessions with redaction, show a known session token, list/run verbs, inspect their own held approvals/provisionals, and manage local client setup.\n  Daemon-principal callers or TCP admin-token callers can grant/revoke/appeal sessions, approve/deny/confirm/revert gates, create verbs, read full daemon status, and inspect detailed secret ownership.\n\nUse `guard help-tree` for a categorized access summary."
+)]
 #[allow(clippy::large_enum_variant)]
 enum MainArgs {
     /// Execute a command through the guard server
@@ -91,9 +99,6 @@ enum MainArgs {
     #[clap(subcommand)]
     Server(ServerCommands),
 
-    /// Generate a container hardening profile (seccomp or AppArmor) to stdout.
-    #[clap(subcommand)]
-    Profile(ProfileCommands),
     /// Manage secrets
     #[clap(subcommand, alias = "secret")]
     Secrets(SecretCommands),
@@ -130,7 +135,8 @@ enum MainArgs {
     /// Manage session grants (extra allow/deny for a specific session token)
     #[clap(subcommand)]
     Session(SessionCommands),
-    /// Shorthand for `guard session new <prose>` or `guard session grant <token> ...`
+    /// Shorthand for `guard session new <prose>` or `guard session grant <token> ...`.
+    /// Daemon-principal or TCP admin-token only when it installs or updates a grant.
     Grant {
         /// Opaque session token to update, or quoted prose to create a fresh session.
         token: Option<String>,
@@ -168,7 +174,8 @@ enum MainArgs {
         #[arg(long, value_name = "PATH")]
         socket: Option<String>,
     },
-    /// Ask the evaluator to amend or deny a session grant without executing the command
+    /// Ask the evaluator to amend or deny a session grant without executing the command.
+    /// Daemon-principal or TCP admin-token only.
     #[clap(
         disable_help_flag = true,
         after_help = "Use `guard appeal --session <token> <binary> --help` to pass --help to the appealed command."
@@ -193,6 +200,13 @@ enum MainArgs {
         #[arg(long)]
         socket: Option<String>,
     },
+    /// Print a categorized command tree with access markers.
+    #[clap(name = "help-tree")]
+    HelpTree {
+        /// Include daemon-principal/admin-token commands.
+        #[arg(long, action = ArgAction::SetTrue)]
+        admin: bool,
+    },
     /// List provisional (containment-envelope) executions awaiting confirmation.
     Provisionals {
         #[arg(long)]
@@ -205,7 +219,7 @@ enum MainArgs {
         #[arg(long)]
         socket: Option<String>,
     },
-    /// Revert a provisional now (manual rollback). Daemon-UID only.
+    /// Revert a provisional immediately (manual rollback). Daemon-UID only.
     Revert {
         handle: String,
         #[arg(long)]
@@ -288,10 +302,11 @@ enum VerbCommands {
 
 #[derive(Subcommand)]
 enum SessionCommands {
-    /// Mint a fresh session token (UUID-shaped). With any of --prompt /
-    /// --allow / --deny / --ttl, also installs the grant in one round
-    /// trip. Prints `export GUARD_SESSION=<token>` on stdout so you can
-    /// `eval $(guard session new ...)` to set it for the current shell.
+    /// Mint a fresh session token (UUID-shaped). With grant prose or any
+    /// grant flags, also installs the grant in one round trip and requires
+    /// the daemon principal or TCP admin token. Prints `export
+    /// GUARD_SESSION=<token>` on stdout so you can `eval $(guard session
+    /// new ...)` to set it for the current shell.
     New {
         /// Prose describing the intended access. Known domains are compiled to
         /// static session rules; misses fall through to the LLM unless
@@ -326,7 +341,8 @@ enum SessionCommands {
         #[arg(long, value_name = "PATH")]
         socket: Option<String>,
     },
-    /// Grant a session token extra allow/deny patterns
+    /// Grant a session token extra allow/deny patterns.
+    /// Daemon-principal or TCP admin-token only.
     Grant {
         /// Opaque session token; the agent passes this as GUARD_SESSION or --session
         token: String,
@@ -367,6 +383,7 @@ enum SessionCommands {
         socket: Option<String>,
     },
     /// Ask the evaluator to amend or deny a session grant without executing the command.
+    /// Daemon-principal or TCP admin-token only.
     #[clap(
         disable_help_flag = true,
         after_help = "Use `guard session appeal <token> <binary> --help` to pass --help to the appealed command."
@@ -383,7 +400,7 @@ enum SessionCommands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Revoke a session grant
+    /// Revoke a session grant. Daemon-principal or TCP admin-token only.
     Revoke {
         /// Session token to revoke.
         token: String,
@@ -473,27 +490,6 @@ fn parse_env_bool(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
     )
-}
-
-#[derive(Subcommand)]
-enum ProfileCommands {
-    /// Emit a seccomp profile (use via `--security-opt seccomp=<file>` on
-    /// Docker/Podman). Default-allow with container-escape and host-tampering
-    /// syscalls denied.
-    Seccomp,
-    /// Emit an AppArmor profile confining the daemon to its binary, data
-    /// directory, and child-command execution, denying host tampering.
-    Apparmor {
-        /// AppArmor profile name.
-        #[arg(long, default_value = "guard")]
-        name: String,
-        /// Absolute path to the guard binary the profile attaches to.
-        #[arg(long, default_value = "/usr/local/bin/guard")]
-        exe: String,
-        /// Data directory (state + brokered credentials) guard may read/write.
-        #[arg(long = "data-dir", default_value = "/var/lib/guard")]
-        data_dir: String,
-    },
 }
 
 #[derive(Subcommand)]
@@ -719,7 +715,7 @@ enum ServerCommands {
         system_prompt_append: Option<PathBuf>,
 
         /// Consequence gating: `off` (default) or `consequence`. When enabled,
-        /// LLM-approved commands are routed by reversibility — reversible runs
+        /// LLM-approved commands are routed by reversibility - reversible runs
         /// immediately, recoverable runs behind an auto-revert envelope, and
         /// irreversible is held for operator approval. Requires a Unix-socket
         /// listener (incompatible with --tcp-port). Env: GUARD_GATE.
@@ -947,7 +943,13 @@ async fn main() -> Result<()> {
         let level = guard_env("LOG_LEVEL").unwrap_or_else(|| "warn".to_string());
         EnvFilter::new(level)
     });
-    fmt().with_env_filter(filter).with_target(true).init();
+    tracing_fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .with_timer(UtcTimestamp)
+        .with_ansi(color_enabled_for_stderr())
+        .with_writer(std::io::stderr)
+        .init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -965,8 +967,8 @@ async fn main() -> Result<()> {
         );
         return Ok(());
     }
-    if run_help_requested(&args) {
-        return print_run_help();
+    if let Some((path, bin_name)) = passthrough_command_help_requested(&args) {
+        return print_nested_help(&path, bin_name);
     }
 
     let result = MainArgs::try_parse_from(std::env::args());
@@ -996,7 +998,6 @@ async fn main() -> Result<()> {
             run_exec(binary, args, env_vars, secret_vars, gating, hostkey.into()).await
         }
         Ok(MainArgs::Server(cmd)) => run_server(cmd).await,
-        Ok(MainArgs::Profile(cmd)) => handle_profile(cmd),
         Ok(MainArgs::Provisionals { socket }) => handle_provisionals(socket).await,
         Ok(MainArgs::Confirm { handle, socket }) => {
             handle_gate_action(socket, "confirm", handle).await
@@ -1077,6 +1078,10 @@ async fn main() -> Result<()> {
             .await
         }
         Ok(MainArgs::Status { socket }) => handle_status(socket).await,
+        Ok(MainArgs::HelpTree { admin }) => {
+            print_help_tree(admin);
+            Ok(())
+        }
         Err(ref e)
             if e.kind() == clap::error::ErrorKind::DisplayHelp
                 || e.kind() == clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
@@ -1086,6 +1091,7 @@ async fn main() -> Result<()> {
             e.exit();
         }
         Err(e) => {
+            log_cli_usage_error(&args, &e);
             eprintln!("{}", e);
             std::process::exit(1);
         }
@@ -1102,22 +1108,225 @@ fn top_level_version_requested(args: &[String]) -> bool {
     }
 }
 
-fn run_help_requested(args: &[String]) -> bool {
-    matches!(args.first().map(String::as_str), Some("run" | "exec"))
-        && matches!(args.get(1).map(String::as_str), Some("--help" | "-h"))
-        && args.len() == 2
+fn passthrough_command_help_requested(
+    args: &[String],
+) -> Option<(Vec<&'static str>, &'static str)> {
+    let is_help = |idx| matches!(args.get(idx).map(String::as_str), Some("--help" | "-h"));
+    match args.first().map(String::as_str) {
+        Some("run" | "exec") if is_help(1) && args.len() == 2 => Some((vec!["run"], "guard run")),
+        Some("appeal") if is_help(1) && args.len() == 2 => Some((vec!["appeal"], "guard appeal")),
+        Some("session")
+            if matches!(args.get(1).map(String::as_str), Some("appeal"))
+                && is_help(2)
+                && args.len() == 3 =>
+        {
+            Some((vec!["session", "appeal"], "guard session appeal"))
+        }
+        _ => None,
+    }
 }
 
-fn print_run_help() -> Result<()> {
-    let command = MainArgs::command();
-    let mut run = command
-        .find_subcommand("run")
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("internal error: run help is unavailable"))?;
-    run = run.bin_name("guard run");
-    run.print_help()?;
+fn print_nested_help(path: &[&str], bin_name: &str) -> Result<()> {
+    let mut command = MainArgs::command();
+    for name in path {
+        command = command.find_subcommand(name).cloned().ok_or_else(|| {
+            anyhow::anyhow!("internal error: help for `{}` is unavailable", bin_name)
+        })?;
+    }
+    command = command.bin_name(bin_name);
+    command.print_help()?;
     println!();
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum AnsiColor {
+    Red,
+    Green,
+    Yellow,
+    Cyan,
+    Bold,
+}
+
+fn color_enabled_for_stdout() -> bool {
+    color_enabled(std::io::stdout().is_terminal())
+}
+
+fn color_enabled_for_stderr() -> bool {
+    color_enabled(std::io::stderr().is_terminal())
+}
+
+fn color_enabled(is_terminal: bool) -> bool {
+    is_terminal
+        && std::env::var_os("NO_COLOR").is_none()
+        && std::env::var("TERM")
+            .map(|term| term != "dumb")
+            .unwrap_or(true)
+}
+
+fn paint(text: impl AsRef<str>, color: AnsiColor, enabled: bool) -> String {
+    if !enabled {
+        return text.as_ref().to_string();
+    }
+    let code = match color {
+        AnsiColor::Red => "31",
+        AnsiColor::Green => "32",
+        AnsiColor::Yellow => "33",
+        AnsiColor::Cyan => "36",
+        AnsiColor::Bold => "1",
+    };
+    format!("\x1b[{code}m{}\x1b[0m", text.as_ref())
+}
+
+struct UtcTimestamp;
+
+impl FormatTime for UtcTimestamp {
+    fn format_time(&self, writer: &mut Writer<'_>) -> std::fmt::Result {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        write!(writer, "{}", unix_seconds_to_utc(now))
+    }
+}
+
+fn unix_seconds_to_utc(ts: u64) -> String {
+    let days = (ts / 86_400) as i64;
+    let seconds = ts % 86_400;
+    let hour = seconds / 3_600;
+    let minute = (seconds % 3_600) / 60;
+    let second = seconds % 60;
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i64, u64, u64) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    (year, month as u64, day as u64)
+}
+
+fn format_timestamp(ts: u64) -> String {
+    format!("{} ({ts})", unix_seconds_to_utc(ts))
+}
+
+fn format_optional_timestamp(ts: Option<u64>) -> String {
+    ts.map(format_timestamp)
+        .unwrap_or_else(|| "(never)".to_string())
+}
+
+fn log_cli_usage_error(args: &[String], error: &clap::Error) {
+    let command_path = cli_command_path(args);
+    tracing::warn!(
+        "[AUDIT] CLI_USAGE_ERROR command={} kind={:?} argc={}",
+        command_path,
+        error.kind(),
+        args.len()
+    );
+}
+
+fn cli_command_path(args: &[String]) -> String {
+    let mut parts = args
+        .iter()
+        .filter(|arg| !arg.starts_with('-'))
+        .map(String::as_str);
+    let Some(first) = parts.next() else {
+        return "(top-level)".to_string();
+    };
+    let Some(second) = parts.next() else {
+        return first.to_string();
+    };
+    let allowed_second = match first {
+        "server" => matches!(second, "start" | "connect" | "status"),
+        "secrets" | "secret" => matches!(second, "add" | "list" | "remove"),
+        "config" => matches!(
+            second,
+            "show"
+                | "set-server"
+                | "set-port"
+                | "set-token"
+                | "set-admin-token"
+                | "set-user"
+                | "clear"
+        ),
+        "mcp" => matches!(second, "serve"),
+        "session" => matches!(
+            second,
+            "new" | "grant" | "appeal" | "revoke" | "show" | "list"
+        ),
+        "verb" => matches!(second, "list" | "run" | "create"),
+        _ => false,
+    };
+    if allowed_second {
+        format!("{first} {second}")
+    } else {
+        first.to_string()
+    }
+}
+
+fn print_help_tree(admin: bool) {
+    let color = color_enabled_for_stdout();
+    println!("{}", paint("guard access summary", AnsiColor::Bold, color));
+    println!("  user");
+    println!("    run|exec <binary> [args...]");
+    println!("    server connect <binary> [args...]");
+    println!("    status");
+    println!("    server status");
+    println!("    secrets|secret add|remove|list");
+    println!("    verb list");
+    println!("    verb run <name> --param key=value");
+    println!("    session list [--history] [--since duration] [--full]");
+    println!("    session show <token>");
+    println!("    session new");
+    println!("    provisionals");
+    println!("    approvals [handle]");
+    println!("    approval-note <handle> <text>");
+    println!("    mcp serve");
+    println!();
+    println!("  local setup");
+    println!("    shim [tools] [--list|--remove]");
+    println!("    config show|set-server|set-port|set-token|set-admin-token|set-user|clear");
+    if admin {
+        println!();
+        println!("{}", paint("  admin", AnsiColor::Yellow, color));
+        println!("    server start");
+        println!("    session new [prose] [--allow glob] [--deny glob]");
+        println!("    session grant <token> [prose] [--allow glob] [--deny glob]");
+        println!("    session appeal <token> <binary> [args...]");
+        println!("    session revoke <token>");
+        println!("    grant [token] [prose]");
+        println!("    appeal --session <token> <binary> [args...]");
+        println!("    secrets list --detailed");
+        println!("    approve|deny <handle>");
+        println!("    confirm|revert <handle>");
+        println!("    verb create --prompt <text>");
+    } else {
+        println!();
+        println!(
+            "{}",
+            paint(
+                "Run `guard help-tree --admin` to include daemon-principal/admin-token commands.",
+                AnsiColor::Cyan,
+                color,
+            )
+        );
+    }
+    println!();
+    println!("Access markers:");
+    println!("  user commands are available to allowed local callers.");
+    println!("  local setup commands edit client-side files for the invoking account.");
+    println!("  session show requires the token; list hides raw tokens for non-admin callers.");
+    println!("  admin commands require the daemon principal or the TCP admin token.");
 }
 
 #[cfg(unix)]
@@ -1159,25 +1368,6 @@ fn default_guard_state_dir() -> Option<PathBuf> {
         return Some(dir.join("guard"));
     }
     dirs::home_dir().map(|dir| dir.join(".guard"))
-}
-
-fn handle_profile(cmd: ProfileCommands) -> Result<()> {
-    match cmd {
-        ProfileCommands::Seccomp => {
-            println!("{}", guard::profile::seccomp_json());
-        }
-        ProfileCommands::Apparmor {
-            name,
-            exe,
-            data_dir,
-        } => {
-            print!(
-                "{}",
-                guard::profile::apparmor_profile(&name, &exe, &data_dir)
-            );
-        }
-    }
-    Ok(())
 }
 
 async fn run_server(cmd: ServerCommands) -> Result<()> {
@@ -1296,8 +1486,8 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             // local peer (a Unix-socket uid or a Windows named-pipe SID) can be
             // the operator. A TCP listener carries only a bearer token, so it
             // both cannot reach the operator gate and needlessly widens the exec
-            // surface. Enforce on the FINAL resolved transport — after --tcp-port,
-            // GUARD_TCP_PORT, and the platform default — so an env-set TCP
+            // surface. Enforce on the FINAL resolved transport - after --tcp-port,
+            // GUARD_TCP_PORT, and the platform default - so an env-set TCP
             // port cannot slip a listener in beside the gate.
             if gate_mode.is_on() {
                 if tcp_port.is_some() {
@@ -1425,7 +1615,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
 
             // Model resolution precedence (single primary model):
             //   1. --llm-model CLI flag
-            //   2. GUARD_LLM_MODEL env var (singular — primary model)
+            //   2. GUARD_LLM_MODEL env var (singular - primary model)
             //   3. evaluate::EvalConfig default (DEFAULT_MODEL in evaluate.rs)
             //
             // The fallback chain (GUARD_LLM_MODELS / --llm-models) is
@@ -1830,7 +2020,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                         // This file grants real, permanent LLM-bypassing
                         // trust once auto-promotion populates it -- harden
                         // its permissions explicitly rather than relying on
-                        // process umask, since it is now created
+                        // process umask, since this path is created
                         // automatically rather than only when an operator
                         // deliberately opted in via --verbs.
                         #[cfg(unix)]
@@ -2043,7 +2233,12 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 }
                 Ok(())
             } else {
-                eprintln!("DENIED: {}", resp.reason);
+                let color = color_enabled_for_stderr();
+                eprintln!(
+                    "{}: {}",
+                    paint("DENIED", AnsiColor::Red, color),
+                    resp.reason
+                );
                 std::process::exit(1);
             }
         }
@@ -2095,12 +2290,21 @@ fn parse_revert(spec: &str) -> Result<server::RevertSpec> {
 }
 
 fn print_coverage(coverage: &Option<guard::gating::Coverage>) {
+    let color = color_enabled_for_stderr();
     if let Some(c) = coverage {
         for line in &c.checked {
-            eprintln!("  checked:     {}", line);
+            eprintln!(
+                "  {}     {}",
+                paint("checked:", AnsiColor::Green, color),
+                line
+            );
         }
         for line in &c.not_checked {
-            eprintln!("  NOT checked: {}", line);
+            eprintln!(
+                "  {} {}",
+                paint("NOT checked:", AnsiColor::Yellow, color),
+                line
+            );
         }
     }
 }
@@ -2166,16 +2370,23 @@ async fn run_exec(
     // behind an auto-revert timer.
     match resp.status {
         Some(server::GateStatus::Held) => {
+            let color = color_enabled_for_stderr();
             let handle = resp.handle.clone().unwrap_or_default();
-            eprintln!("HELD for operator approval: {}", resp.reason);
+            eprintln!(
+                "{} for daemon-principal approval: {}",
+                paint("HELD", AnsiColor::Yellow, color),
+                resp.reason
+            );
             eprintln!("  handle:  {}", handle);
             eprintln!("  approve: guard approve {}", handle);
             eprintln!("  poll:    guard approvals {}", handle);
+            eprintln!("  result:  not executed until approved");
             print_coverage(&resp.coverage);
             // Not executed; exit non-zero so callers do not treat it as success.
             std::process::exit(75); // EX_TEMPFAIL: try again after approval
         }
         Some(server::GateStatus::Provisional) => {
+            let color = color_enabled_for_stderr();
             if !streamed_output {
                 if let Some(stdout) = &resp.stdout {
                     print!("{}", stdout);
@@ -2185,9 +2396,14 @@ async fn run_exec(
                 }
             }
             let handle = resp.handle.clone().unwrap_or_default();
-            eprintln!("PROVISIONAL (containment envelope): {}", resp.reason);
+            eprintln!(
+                "{} containment envelope: {}",
+                paint("PROVISIONAL", AnsiColor::Yellow, color),
+                resp.reason
+            );
             eprintln!("  handle:  {}", handle);
-            eprintln!("  confirm: guard confirm {}  (else auto-reverts)", handle);
+            eprintln!("  confirm: guard confirm {}", handle);
+            eprintln!("  result:  executed, auto-reverts unless confirmed");
             print_coverage(&resp.coverage);
             if let Some(code) = resp.exit_code {
                 std::process::exit(code);
@@ -2195,7 +2411,12 @@ async fn run_exec(
             return Ok(());
         }
         Some(server::GateStatus::DryRun) => {
-            println!("[DRY-RUN] {}", resp.reason);
+            let color = color_enabled_for_stdout();
+            println!(
+                "{} {}",
+                paint("[DRY-RUN]", AnsiColor::Cyan, color),
+                resp.reason
+            );
             print_coverage(&resp.coverage);
             return Ok(());
         }
@@ -2221,12 +2442,17 @@ async fn run_exec(
         }
         Ok(())
     } else {
+        let color = color_enabled_for_stderr();
         tracing::warn!(
             binary = %binary,
             reason = %resp.reason,
             "DENIED"
         );
-        eprintln!("DENIED: {}", resp.reason);
+        eprintln!(
+            "{}: {}",
+            paint("DENIED", AnsiColor::Red, color),
+            resp.reason
+        );
         std::process::exit(1);
     }
 }
@@ -2252,14 +2478,16 @@ async fn handle_provisionals(socket: Option<String>) -> Result<()> {
             if items.is_empty() {
                 println!("(no provisional executions)");
             }
+            let color = color_enabled_for_stdout();
             for p in &items {
+                let status = paint(&p.status, AnsiColor::Yellow, color);
                 println!(
                     "[{}] handle={} cmd={:?} revert={:?} deadline={} reason={:?}{}",
-                    p.status,
+                    status,
                     p.handle,
                     p.command,
                     p.revert_command,
-                    p.deadline_unix,
+                    format_timestamp(p.deadline_unix),
                     p.reason,
                     p.revert_detail
                         .as_ref()
@@ -2291,12 +2519,20 @@ async fn handle_approval_note_cmd(
         .await?
     {
         server::AdminResponse::ApprovalShow { item } => {
+            let color = color_enabled_for_stdout();
             println!(
                 "[{}] handle={} cmd={:?}",
-                item.status, item.handle, item.command
+                paint(&item.status, AnsiColor::Yellow, color),
+                item.handle,
+                item.command
             );
             for n in &item.notes {
-                println!("  note [{}] {}: {}", n.at_unix, n.author, n.text);
+                println!(
+                    "  note [{}] {}: {}",
+                    format_timestamp(n.at_unix),
+                    n.author,
+                    n.text
+                );
             }
             Ok(())
         }
@@ -2322,21 +2558,38 @@ async fn handle_approvals(socket: Option<String>, handle: Option<String>) -> Res
             if items.is_empty() {
                 println!("(no approvals)");
             }
+            let color = color_enabled_for_stdout();
             for a in &items {
+                let status_color = match a.status.as_str() {
+                    "approved" => AnsiColor::Green,
+                    "denied" | "expired" | "exec_failed" => AnsiColor::Red,
+                    _ => AnsiColor::Yellow,
+                };
                 println!(
-                    "[{}] handle={} risk={:?} class={:?} cmd={:?} fp={} reason={:?}",
-                    a.status, a.handle, a.risk, a.reversibility, a.command, a.fingerprint, a.reason
+                    "[{}] handle={} risk={:?} class={:?} created={} deadline={} cmd={:?} fp={} reason={:?}",
+                    paint(&a.status, status_color, color),
+                    a.handle,
+                    a.risk,
+                    a.reversibility,
+                    format_timestamp(a.created_unix),
+                    format_timestamp(a.deadline_unix),
+                    a.command,
+                    a.fingerprint,
+                    a.reason
                 );
             }
             Ok(())
         }
         server::AdminResponse::ApprovalShow { item } => {
+            let color = color_enabled_for_stdout();
             println!(
-                "[{}] handle={} risk={:?} class={:?} cmd={:?} fp={}",
-                item.status,
+                "[{}] handle={} risk={:?} class={:?} created={} deadline={} cmd={:?} fp={}",
+                paint(&item.status, AnsiColor::Yellow, color),
                 item.handle,
                 item.risk,
                 item.reversibility,
+                format_timestamp(item.created_unix),
+                format_timestamp(item.deadline_unix),
                 item.command,
                 item.fingerprint
             );
@@ -2353,7 +2606,12 @@ async fn handle_approvals(socket: Option<String>, handle: Option<String>) -> Res
                 println!("decision: {}", reason);
             }
             for n in &item.notes {
-                println!("  note [{}] {}: {}", n.at_unix, n.author, n.text);
+                println!(
+                    "  note [{}] {}: {}",
+                    format_timestamp(n.at_unix),
+                    n.author,
+                    n.text
+                );
             }
             Ok(())
         }
@@ -2379,7 +2637,7 @@ async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                     }
                     for v in &items {
                         println!(
-                            "{} [{}]{}{}{} — {}",
+                            "{} [{}]{}{}{} - {}",
                             v.name,
                             v.consequence,
                             if v.trusted { " trusted" } else { "" },
@@ -2514,15 +2772,22 @@ fn render_gated_response(
 ) -> Result<()> {
     match resp.status {
         Some(server::GateStatus::Held) => {
+            let color = color_enabled_for_stderr();
             let handle = resp.handle.clone().unwrap_or_default();
-            eprintln!("HELD for operator approval: {}", resp.reason);
+            eprintln!(
+                "{} for daemon-principal approval: {}",
+                paint("HELD", AnsiColor::Yellow, color),
+                resp.reason
+            );
             eprintln!("  handle:  {}", handle);
             eprintln!("  approve: guard approve {}", handle);
             eprintln!("  poll:    guard approvals {}", handle);
+            eprintln!("  result:  not executed until approved");
             print_coverage(&resp.coverage);
             std::process::exit(75);
         }
         Some(server::GateStatus::Provisional) => {
+            let color = color_enabled_for_stderr();
             if !streamed {
                 if let Some(out) = &resp.stdout {
                     print!("{}", out);
@@ -2532,9 +2797,14 @@ fn render_gated_response(
                 }
             }
             let handle = resp.handle.clone().unwrap_or_default();
-            eprintln!("PROVISIONAL (containment envelope): {}", resp.reason);
+            eprintln!(
+                "{} containment envelope: {}",
+                paint("PROVISIONAL", AnsiColor::Yellow, color),
+                resp.reason
+            );
             eprintln!("  handle:  {}", handle);
-            eprintln!("  confirm: guard confirm {}  (else auto-reverts)", handle);
+            eprintln!("  confirm: guard confirm {}", handle);
+            eprintln!("  result:  executed, auto-reverts unless confirmed");
             print_coverage(&resp.coverage);
             if let Some(code) = resp.exit_code {
                 std::process::exit(code);
@@ -2542,7 +2812,12 @@ fn render_gated_response(
             Ok(())
         }
         Some(server::GateStatus::DryRun) => {
-            println!("[DRY-RUN] {}", resp.reason);
+            let color = color_enabled_for_stdout();
+            println!(
+                "{} {}",
+                paint("[DRY-RUN]", AnsiColor::Cyan, color),
+                resp.reason
+            );
             print_coverage(&resp.coverage);
             Ok(())
         }
@@ -2561,7 +2836,13 @@ fn render_gated_response(
                 }
                 Ok(())
             } else {
-                eprintln!("DENIED ({}): {}", label, resp.reason);
+                let color = color_enabled_for_stderr();
+                eprintln!(
+                    "{} ({}): {}",
+                    paint("DENIED", AnsiColor::Red, color),
+                    label,
+                    resp.reason
+                );
                 std::process::exit(1);
             }
         }
@@ -2694,7 +2975,7 @@ fn resolve_client_endpoint(
     }
     // Fall back to the well-known default. If it doesn't exist the
     // connect will fail with a clear "failed to connect" error, which
-    // is more useful than the previous "No server configured" since
+    // is more useful than a plain "No server configured" because
     // most local installs use the default anyway.
     #[cfg(unix)]
     {
@@ -2724,7 +3005,7 @@ async fn handle_status(socket: Option<String>) -> Result<()> {
     let (socket_path, tcp_port) = resolve_client_endpoint(socket, &config);
     let client = admin_client(socket_path.clone(), tcp_port, &config);
 
-    // Client info first — useful even when the daemon is unreachable.
+    // Client info first - useful even when the daemon is unreachable.
     println!("Client:");
     println!(
         "  version        {} ({}, {}{})",
@@ -2748,7 +3029,7 @@ async fn handle_status(socket: Option<String>) -> Result<()> {
             dry_run,
         }) => (version, uptime_secs, mode, dry_run),
         Ok(server::AdminResponse::Error { message }) => {
-            eprintln!("Server: ping refused — {}", message);
+            eprintln!("Server: ping refused - {}", message);
             std::process::exit(1);
         }
         Ok(other) => {
@@ -2756,7 +3037,7 @@ async fn handle_status(socket: Option<String>) -> Result<()> {
             std::process::exit(1);
         }
         Err(e) => {
-            eprintln!("Server: unreachable — {}", e);
+            eprintln!("Server: unreachable - {}", e);
             std::process::exit(1);
         }
     };
@@ -2839,7 +3120,7 @@ fn format_prompt(prompt: Option<&str>, full: bool) -> String {
         Some(s) => {
             let preview: String = s.chars().take(60).collect();
             if s.chars().count() > 60 {
-                format!("\"{}…\"", preview)
+                format!("\"{}...\"", preview)
             } else {
                 format!("\"{}\"", preview)
             }
@@ -3127,6 +3408,9 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                 server::AdminRequest::SessionList {
                     include_history,
                     since_unix,
+                    visible_token: std::env::var("GUARD_SESSION")
+                        .ok()
+                        .filter(|value| !value.is_empty()),
                 },
             )
         }
@@ -3147,9 +3431,12 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
             if grants.is_empty() && history.is_empty() {
                 println!("(no session grants)");
             } else {
+                let color = color_enabled_for_stdout();
                 for g in &grants {
+                    let label = paint("[active]", AnsiColor::Green, color);
                     println!(
-                        "[active]  token={} allow={:?} deny={:?} allow_exact={:?} deny_exact={:?} static_only={} auto_amend={} granted_at={} expires_at={} prompt={}",
+                        "{}  token={} allow={:?} deny={:?} allow_exact={:?} deny_exact={:?} static_only={} auto_amend={} granted_at={} expires_at={} prompt={} notes={:?}",
+                        label,
                         g.token,
                         g.allow,
                         g.deny,
@@ -3157,20 +3444,23 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                         g.deny_exact,
                         g.static_only,
                         g.auto_amend,
-                        g.granted_at,
-                        g.expires_at
-                            .map(|t| t.to_string())
-                            .unwrap_or_else(|| "(never)".to_string()),
+                        format_timestamp(g.granted_at),
+                        format_optional_timestamp(g.expires_at),
                         format_prompt(g.prompt_append.as_deref(), print_full_prompt),
+                        g.generated_notes,
                     );
                 }
                 for h in &history {
                     let label = match h.status {
-                        server::HistoricalStatus::Revoked => "[revoked]",
-                        server::HistoricalStatus::Expired => "[expired]",
+                        server::HistoricalStatus::Revoked => {
+                            paint("[revoked]", AnsiColor::Yellow, color)
+                        }
+                        server::HistoricalStatus::Expired => {
+                            paint("[expired]", AnsiColor::Red, color)
+                        }
                     };
                     println!(
-                        "{} token={} allow={:?} deny={:?} allow_exact={:?} deny_exact={:?} static_only={} auto_amend={} granted_at={} ended_at={} prompt={}",
+                        "{} token={} allow={:?} deny={:?} allow_exact={:?} deny_exact={:?} static_only={} auto_amend={} granted_at={} ended_at={} expires_at={} prompt={} notes={:?}",
                         label,
                         h.token,
                         h.allow,
@@ -3179,9 +3469,11 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                         h.deny_exact,
                         h.static_only,
                         h.auto_amend,
-                        h.granted_at,
-                        h.ended_at,
+                        format_timestamp(h.granted_at),
+                        format_timestamp(h.ended_at),
+                        format_optional_timestamp(h.expires_at),
                         format_prompt(h.prompt_append.as_deref(), print_full_prompt),
+                        h.generated_notes,
                     );
                 }
             }
@@ -3193,11 +3485,8 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                     active.token,
                     active.static_only,
                     active.auto_amend,
-                    active.granted_at,
-                    active
-                        .expires_at
-                        .map(|t| t.to_string())
-                        .unwrap_or_else(|| "(never)".to_string()),
+                    format_timestamp(active.granted_at),
+                    format_optional_timestamp(active.expires_at),
                     active.allow,
                     active.deny,
                     active.allow_exact,
@@ -3207,6 +3496,7 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                     "prompt={}",
                     format_prompt(active.prompt_append.as_deref(), true)
                 );
+                println!("notes={:?}", active.generated_notes);
             } else {
                 println!("status=inactive");
             }
@@ -3217,21 +3507,19 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                     server::HistoricalStatus::Expired => "expired",
                 };
                 println!(
-                    "history status={} static_only={} auto_amend={} granted_at={} ended_at={} expires_at={} allow={:?} deny={:?} allow_exact={:?} deny_exact={:?} prompt={}",
+                    "history status={} static_only={} auto_amend={} granted_at={} ended_at={} expires_at={} allow={:?} deny={:?} allow_exact={:?} deny_exact={:?} prompt={} notes={:?}",
                     label,
                     entry.static_only,
                     entry.auto_amend,
-                    entry.granted_at,
-                    entry.ended_at,
-                    entry
-                        .expires_at
-                        .map(|t| t.to_string())
-                        .unwrap_or_else(|| "(never)".to_string()),
+                    format_timestamp(entry.granted_at),
+                    format_timestamp(entry.ended_at),
+                    format_optional_timestamp(entry.expires_at),
                     entry.allow,
                     entry.deny,
                     entry.allow_exact,
                     entry.deny_exact,
                     format_prompt(entry.prompt_append.as_deref(), true),
+                    entry.generated_notes,
                 );
             }
 
@@ -3275,6 +3563,7 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
             if report.recent.is_empty() {
                 println!("recent (none)");
             } else {
+                let color = color_enabled_for_stdout();
                 for interaction in &report.recent {
                     let exec = match interaction.exec_status {
                         session::SessionExecStatus::NotAttempted => "not_attempted",
@@ -3284,10 +3573,15 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                         session::SessionExecStatus::Held => "held",
                         session::SessionExecStatus::Provisional => "provisional",
                     };
+                    let allowed = if interaction.allowed {
+                        paint("true", AnsiColor::Green, color)
+                    } else {
+                        paint("false", AnsiColor::Red, color)
+                    };
                     println!(
                         "recent at={} allowed={} source={:?} risk={} exec={} cmd={:?} reason={:?}",
-                        interaction.at_unix,
-                        interaction.allowed,
+                        format_timestamp(interaction.at_unix),
+                        allowed,
                         interaction.source,
                         interaction
                             .risk
@@ -3341,8 +3635,8 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
 }
 
 async fn handle_config(subcommand: ConfigCommands) -> Result<()> {
-    // Surface load errors loudly for every subcommand — this catches the
-    // relative-XDG_CONFIG_HOME case that previously fell through silently
+    // Surface load errors loudly for every subcommand - this catches the
+    // relative-XDG_CONFIG_HOME case that can otherwise fall through silently
     // and risked writing to the default path instead of the intended one.
     match subcommand {
         ConfigCommands::Show => {
@@ -4327,7 +4621,7 @@ mod tests {
         }
     }
 
-    /// Same story for `--help` — must be forwarded, not caught by clap's
+    /// Same story for `--help` - must be forwarded, not caught by clap's
     /// subcommand help handler.
     #[test]
     fn run_forwards_long_help_flag_to_child() {
@@ -4448,17 +4742,43 @@ mod tests {
     }
 
     #[test]
-    fn run_help_requested_only_when_help_is_the_run_command() {
-        assert!(run_help_requested(&[
-            "run".to_string(),
-            "--help".to_string()
-        ]));
-        assert!(run_help_requested(&["exec".to_string(), "-h".to_string()]));
-        assert!(!run_help_requested(&[
-            "run".to_string(),
-            "df".to_string(),
-            "--help".to_string()
-        ]));
+    fn passthrough_help_requested_only_for_bare_command_help() {
+        assert_eq!(
+            passthrough_command_help_requested(&["run".to_string(), "--help".to_string()]),
+            Some((vec!["run"], "guard run"))
+        );
+        assert_eq!(
+            passthrough_command_help_requested(&["exec".to_string(), "-h".to_string()]),
+            Some((vec!["run"], "guard run"))
+        );
+        assert_eq!(
+            passthrough_command_help_requested(&["appeal".to_string(), "--help".to_string()]),
+            Some((vec!["appeal"], "guard appeal"))
+        );
+        assert_eq!(
+            passthrough_command_help_requested(&[
+                "session".to_string(),
+                "appeal".to_string(),
+                "-h".to_string()
+            ]),
+            Some((vec!["session", "appeal"], "guard session appeal"))
+        );
+        assert_eq!(
+            passthrough_command_help_requested(&[
+                "run".to_string(),
+                "df".to_string(),
+                "--help".to_string()
+            ]),
+            None
+        );
+        assert_eq!(
+            passthrough_command_help_requested(&[
+                "appeal".to_string(),
+                "kubectl".to_string(),
+                "--help".to_string()
+            ]),
+            None
+        );
     }
 
     #[test]
@@ -4524,7 +4844,7 @@ mod tests {
 
     /// `guard help run` should show the subcommand help via clap. Note:
     /// because `Run` disables its own help flag, `guard run --help` would
-    /// forward `--help` to the child instead — users get run help via
+    /// forward `--help` to the child instead - users get run help via
     /// `guard help run`. The instructions explicitly permit this tradeoff.
     #[test]
     fn help_run_shows_subcommand_help() {
@@ -4543,6 +4863,34 @@ mod tests {
             "-V".to_string()
         ]));
         assert!(!top_level_version_requested(&[]));
+    }
+
+    #[test]
+    fn cli_command_path_avoids_unknown_positional_values() {
+        assert_eq!(
+            cli_command_path(&["ssh".to_string(), "prod-host".to_string()]),
+            "ssh"
+        );
+        assert_eq!(
+            cli_command_path(&["profile".to_string(), "seccomp".to_string()]),
+            "profile"
+        );
+        assert_eq!(
+            cli_command_path(&[
+                "session".to_string(),
+                "show".to_string(),
+                "token".to_string()
+            ]),
+            "session show"
+        );
+        assert_eq!(
+            cli_command_path(&[
+                "config".to_string(),
+                "set-token".to_string(),
+                "secret".to_string()
+            ]),
+            "config set-token"
+        );
     }
 
     #[test]

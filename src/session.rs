@@ -40,6 +40,11 @@ pub struct SessionGrant {
     /// related psql copy commands as expected".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_append: Option<String>,
+    /// Notes produced by static grant synthesis. These explain generated
+    /// allow/deny rules for display, but are not appended to the evaluator
+    /// prompt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub generated_notes: Vec<String>,
     /// If true, commands that miss the grant's static allow/deny rules are
     /// denied instead of falling through to the normal evaluator.
     #[serde(default)]
@@ -107,6 +112,8 @@ pub struct HistoricalGrant {
     pub status: HistoricalStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_append: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub generated_notes: Vec<String>,
     #[serde(default)]
     pub static_only: bool,
     #[serde(default)]
@@ -139,6 +146,8 @@ pub struct SessionGrantSummary {
     pub granted_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_append: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub generated_notes: Vec<String>,
     #[serde(default)]
     pub static_only: bool,
     #[serde(default)]
@@ -362,6 +371,7 @@ impl SessionRegistry {
                 expires_at: g.expires_at,
                 granted_at: g.granted_at,
                 prompt_append: g.prompt_append.clone(),
+                generated_notes: g.generated_notes.clone(),
                 static_only: g.static_only,
                 auto_amend: g.auto_amend,
             })
@@ -405,6 +415,7 @@ impl SessionRegistry {
                     expires_at: grant.expires_at,
                     granted_at: grant.granted_at,
                     prompt_append: grant.prompt_append.clone(),
+                    generated_notes: grant.generated_notes.clone(),
                     static_only: grant.static_only,
                     auto_amend: grant.auto_amend,
                 })
@@ -671,6 +682,7 @@ fn historical(
         ended_at,
         status,
         prompt_append: grant.prompt_append,
+        generated_notes: grant.generated_notes,
         static_only: grant.static_only,
         auto_amend: grant.auto_amend,
     }
@@ -707,6 +719,7 @@ mod tests {
                 expires_at: None,
                 granted_at: 0,
                 prompt_append: None,
+                generated_notes: Vec::new(),
                 static_only: false,
                 auto_amend: false,
             },
@@ -814,6 +827,7 @@ mod tests {
                 expires_at: Some(1),
                 granted_at: 0, // 1970-01-01 +1s
                 prompt_append: None,
+                generated_notes: Vec::new(),
                 static_only: false,
                 auto_amend: false,
             },
@@ -842,6 +856,7 @@ mod tests {
                 expires_at: None,
                 granted_at: 0,
                 prompt_append: Some("session is restoring a backup".to_string()),
+                generated_notes: Vec::new(),
                 static_only: false,
                 auto_amend: false,
             },
@@ -866,6 +881,7 @@ mod tests {
                 expires_at: Some(1),
                 granted_at: 0,
                 prompt_append: Some("ignored".to_string()),
+                generated_notes: Vec::new(),
                 static_only: false,
                 auto_amend: false,
             },
@@ -886,6 +902,7 @@ mod tests {
                 expires_at: None,
                 granted_at: 0,
                 prompt_append: None,
+                generated_notes: Vec::new(),
                 static_only: false,
                 auto_amend: false,
             },
@@ -900,6 +917,7 @@ mod tests {
                 expires_at: Some(1),
                 granted_at: 0,
                 prompt_append: None,
+                generated_notes: Vec::new(),
                 static_only: false,
                 auto_amend: false,
             },
@@ -929,6 +947,7 @@ mod tests {
                 expires_at: None,
                 granted_at: 0,
                 prompt_append: None,
+                generated_notes: Vec::new(),
                 static_only: true,
                 auto_amend: true,
             },
@@ -963,6 +982,7 @@ mod tests {
                 expires_at: Some(1),
                 granted_at: 0,
                 prompt_append: None,
+                generated_notes: Vec::new(),
                 static_only: false,
                 auto_amend: false,
             },
@@ -987,6 +1007,7 @@ mod tests {
                 expires_at: None,
                 granted_at: 0,
                 prompt_append: None,
+                generated_notes: Vec::new(),
                 static_only: false,
                 auto_amend: false,
             },
