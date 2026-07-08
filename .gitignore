@@ -3,6 +3,7 @@
 .cache/
 tmp/
 *.log
+*.html
 /target/
 /docs/demo.svg
 TODO.md
