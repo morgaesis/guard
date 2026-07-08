@@ -5,6 +5,7 @@ use crate::session::{
 use anyhow::{Context, Result};
 use guard::gating::approval::Approval;
 use guard::gating::provisional::Provisional;
+use guard::gating::read_grant::ReadGrant;
 use rusqlite::{params, Connection};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -316,6 +317,12 @@ impl SessionStore {
                 json TEXT NOT NULL,
                 status TEXT NOT NULL,
                 created_unix INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS read_grants (
+                target_path TEXT PRIMARY KEY,
+                json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                expires_unix INTEGER NOT NULL
             );",
         )?;
         ensure_column(
@@ -501,6 +508,68 @@ impl SessionStore {
         })
         .await
         .context("load_approvals task failed")?
+    }
+
+    // --- Filesystem read grants. Persisted incrementally per-row (keyed by
+    // target path) and committed before the ACLs are applied, so a crash after
+    // granting still leaves a row the reconciler can revoke on restart.
+
+    pub async fn save_read_grant(&self, g: ReadGrant) -> Result<()> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = Self::open_connection(&path)?;
+            Self::init_schema(&conn)?;
+            let json = serde_json::to_string(&g).context("encode read grant")?;
+            conn.execute(
+                "INSERT OR REPLACE INTO read_grants (target_path, json, status, expires_unix)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    g.target_path,
+                    json,
+                    g.status.as_str(),
+                    encode_u64(g.expires_unix)?
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("save_read_grant task failed")?
+    }
+
+    pub async fn delete_read_grant(&self, target_path: String) -> Result<()> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = Self::open_connection(&path)?;
+            Self::init_schema(&conn)?;
+            conn.execute(
+                "DELETE FROM read_grants WHERE target_path = ?1",
+                params![target_path],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("delete_read_grant task failed")?
+    }
+
+    pub async fn load_read_grants(&self) -> Result<Vec<ReadGrant>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = Self::open_connection(&path)?;
+            Self::init_schema(&conn)?;
+            let mut stmt = conn.prepare("SELECT json FROM read_grants")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for row in rows {
+                let json = row?;
+                match serde_json::from_str::<ReadGrant>(&json) {
+                    Ok(g) => out.push(g),
+                    Err(e) => tracing::warn!("skipping unreadable read-grant row: {}", e),
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .context("load_read_grants task failed")?
     }
 }
 

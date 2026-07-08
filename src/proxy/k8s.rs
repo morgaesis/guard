@@ -428,6 +428,35 @@ mod tests {
     }
 
     #[test]
+    fn redact_helm_release_secret_is_opaque_by_default() {
+        // Helm stores release state as a Secret of type `helm.sh/release.v1`
+        // whose `data.release` is an opaque, doubly-base64-and-gzip-encoded blob
+        // rather than any structured type the proxy models. Redaction must not
+        // require that value to be parseable: it strips `data` wholesale (masking
+        // by default) and succeeds, leaving metadata/type/labels intact so
+        // `helm list`/`status`/`upgrade` can read the release inventory.
+        let mut v: Value = serde_json::json!({
+            "kind": "Secret",
+            "apiVersion": "v1",
+            "metadata": {
+                "name": "sh.helm.release.v1.cert-manager.v1",
+                "namespace": "cert-manager",
+                "labels": {"owner": "helm", "name": "cert-manager", "version": "1"}
+            },
+            "type": "helm.sh/release.v1",
+            "data": {"release": "SDRzSUFBQUFBQUFDLzZvR0FBWU5BUUFBQUE9PQ=="}
+        });
+        let n = redact_secret_response(&mut v);
+        assert_eq!(
+            n, 1,
+            "the opaque Helm release Secret is redacted, not rejected"
+        );
+        assert!(v.get("data").is_none(), "opaque release blob is stripped");
+        assert_eq!(v["type"], "helm.sh/release.v1");
+        assert_eq!(v["metadata"]["labels"]["owner"], "helm");
+    }
+
+    #[test]
     fn redact_secret_list() {
         let mut v: Value = serde_json::json!({
             "kind": "SecretList",

@@ -13,9 +13,11 @@
 //! and Secret `watch`es are denied: their streams cannot be redacted or gated
 //! per object.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -61,6 +63,71 @@ pub struct KubeProxy {
     /// Bridge to the daemon's consequence machinery, attached before serving.
     /// When present, recoverable writes are wrapped in an auto-revert envelope.
     gate: OnceLock<Arc<dyn GateSink>>,
+    /// Resources this proxy forwarded a create for (and armed an auto-revert on),
+    /// mapped to the revert handle. This is evidence-based provenance: a later
+    /// delete of a resource in this set is guard's own creation being cleaned up
+    /// (e.g. a Helm post-install hook deleting its check resource), so it is
+    /// contained rather than an unrecorded destructive delete. Entries are scoped
+    /// to the creating connection and removed when their revert resolves.
+    created: Mutex<CreatedRegistry>,
+    /// Monotonic per-connection id, assigned in the accept loop, so a created
+    /// resource's provenance is scoped to the connection that created it.
+    next_conn: AtomicU64,
+}
+
+/// Identity of a resource the proxy tracks as guard-created, for delete
+/// provenance matching.
+///
+/// The `conn` field scopes provenance to the connection that created the
+/// resource. The proxy authenticates no caller -- its brokered kubeconfig is
+/// credential-free (`with_no_client_auth`) -- so a single TLS/HTTP connection is
+/// the finest caller identity available. A delete arriving on a different
+/// connection than the create never matches, so one agent cannot use provenance
+/// to bypass policy and delete a resource another agent created. Kubernetes
+/// clients (client-go, used by kubectl/helm) negotiate HTTP/2 and multiplex a
+/// process's whole session over one connection, so a legitimate same-process
+/// create-then-delete (e.g. a Helm post-install hook) still matches.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CreatedKey {
+    conn: u64,
+    group: String,
+    resource: String,
+    namespace: Option<String>,
+    name: String,
+}
+
+/// Tracks resources the proxy forwarded a create for (and armed an auto-revert
+/// on), each mapped to its auto-revert handle. Pure: no clock, no I/O.
+#[derive(Debug, Default)]
+struct CreatedRegistry {
+    items: HashMap<CreatedKey, String>,
+}
+
+impl CreatedRegistry {
+    /// Record a created resource against its auto-revert handle.
+    fn remember(&mut self, key: CreatedKey, handle: String) {
+        self.items.insert(key, handle);
+    }
+
+    /// Consume and return the auto-revert handle for a created resource, if the
+    /// delete's key (connection included) matches a recorded create. Consuming
+    /// ensures a resource is only ever contained-deleted once.
+    fn take(&mut self, key: &CreatedKey) -> Option<String> {
+        self.items.remove(key)
+    }
+
+    /// Drop any provenance entry whose auto-revert resolved (confirmed or
+    /// reverted). Without this a create record would live for the rest of the
+    /// process, so a delete of a same-named resource an operator later recreated
+    /// outside guard would still match a stale entry and bypass policy.
+    fn forget_by_handle(&mut self, handle: &str) {
+        self.items.retain(|_, h| h != handle);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.items.len()
+    }
 }
 
 impl KubeProxy {
@@ -84,7 +151,16 @@ impl KubeProxy {
             policy_path,
             real_kubeconfig,
             gate: OnceLock::new(),
+            created: Mutex::new(CreatedRegistry::default()),
+            next_conn: AtomicU64::new(1),
         }
+    }
+
+    /// Drop provenance for a resolved auto-revert. Called by the daemon when a
+    /// proxy-armed create-revert is confirmed or reverted, so a create record
+    /// cannot outlive the revert window it was tied to.
+    pub fn forget_created_by_handle(&self, handle: &str) {
+        self.created.lock().unwrap().forget_by_handle(handle);
     }
 
     /// Attach the daemon's consequence bridge before serving. Idempotent; a
@@ -141,6 +217,9 @@ impl KubeProxy {
             };
             let acceptor = acceptor.clone();
             let me = self.clone();
+            // A per-connection id scopes delete provenance to the connection that
+            // created a resource (the proxy authenticates no caller).
+            let conn_id = self.next_conn.fetch_add(1, Ordering::Relaxed);
             tokio::spawn(async move {
                 let tls_stream = match acceptor.accept(tcp).await {
                     Ok(s) => s,
@@ -152,7 +231,7 @@ impl KubeProxy {
                 let io = TokioIo::new(tls_stream);
                 let svc = service_fn(move |req| {
                     let me = me.clone();
-                    async move { Ok::<_, std::convert::Infallible>(me.route(req).await) }
+                    async move { Ok::<_, std::convert::Infallible>(me.route(req, conn_id).await) }
                 });
                 if let Err(e) = auto::Builder::new(TokioExecutor::new())
                     .serve_connection(io, svc)
@@ -166,7 +245,7 @@ impl KubeProxy {
 
     /// Classify and dispatch one request. Always returns a response (never errors
     /// the connection); upstream and policy failures become HTTP status bodies.
-    async fn route(&self, req: Request<Incoming>) -> Response<ProxyBody> {
+    async fn route(&self, req: Request<Incoming>, conn_id: u64) -> Response<ProxyBody> {
         let method = req.method().clone();
         let path = req.uri().path().to_string();
         let query = req.uri().query().unwrap_or("").to_string();
@@ -175,7 +254,7 @@ impl KubeProxy {
             // Non-resource paths: discovery, /version, /openapi, /healthz. Clients
             // need these. Allow safe reads; block anything else.
             if method == Method::GET || method == Method::HEAD {
-                return self.forward(req, &path, &query, false, None).await;
+                return self.forward(req, &path, &query, false, None, conn_id).await;
             }
             return status_resp(
                 StatusCode::FORBIDDEN,
@@ -212,8 +291,33 @@ impl KubeProxy {
             );
         }
 
-        let decision = self.policy.read().await.decide(&op);
         let label = format!("{} {}", op.verb.as_str(), path);
+
+        // A delete of a resource guard itself created (and is still tracking for
+        // auto-revert) in this process is contained cleanup — e.g. a Helm
+        // post-install hook deleting its own check resource. Allow it and cancel
+        // the now-moot create-revert, rather than holding or denying it like an
+        // unrecorded destructive delete. Provenance is evidence-based: only a
+        // resource the proxy forwarded a create for matches, so deletes of
+        // resources with no creation record keep the strict policy handling.
+        if op.verb == Verb::Delete && op.subresource.is_none() {
+            if let Some(handle) = self.take_created_provenance(&op, conn_id) {
+                tracing::info!(
+                    target: "guard::kubeproxy",
+                    "ALLOW {} (contained: guard-created this session, resolving auto-revert {})",
+                    label,
+                    handle
+                );
+                if let Some(gate) = self.gate.get() {
+                    gate.resolve(&handle).await;
+                }
+                return self
+                    .forward(req, &path, &query, false, Some(op), conn_id)
+                    .await;
+            }
+        }
+
+        let decision = self.policy.read().await.decide(&op);
         match decision.action {
             ApiAction::Deny => {
                 tracing::info!(target: "guard::kubeproxy", "DENY {} ({})", label, decision.reason);
@@ -237,7 +341,8 @@ impl KubeProxy {
             ApiAction::Allow => {
                 let redact = decision.redact_secrets && op.is_secrets() && op.is_read();
                 tracing::info!(target: "guard::kubeproxy", "ALLOW {}{}", label, if redact { " (redacting)" } else { "" });
-                self.forward(req, &path, &query, redact, Some(op)).await
+                self.forward(req, &path, &query, redact, Some(op), conn_id)
+                    .await
             }
         }
     }
@@ -249,8 +354,12 @@ impl KubeProxy {
         query: &str,
         redact: bool,
         op: Option<ApiOp>,
+        conn_id: u64,
     ) -> Response<ProxyBody> {
-        match self.forward_inner(req, path, query, redact, op).await {
+        match self
+            .forward_inner(req, path, query, redact, op, conn_id)
+            .await
+        {
             Ok(resp) => resp,
             Err(e) => {
                 tracing::warn!(target: "guard::kubeproxy", "upstream error for {path}: {e:#}");
@@ -270,6 +379,7 @@ impl KubeProxy {
         query: &str,
         redact: bool,
         op: Option<ApiOp>,
+        conn_id: u64,
     ) -> Result<Response<ProxyBody>> {
         let (parts, body) = req.into_parts();
 
@@ -327,6 +437,8 @@ impl KubeProxy {
         }
         if let Some(token) = self.upstream.bearer() {
             rb = rb.bearer_auth(token);
+        } else if let Some((user, pass)) = self.upstream.basic_auth() {
+            rb = rb.basic_auth(user, Some(pass));
         }
         if !collected.is_empty() {
             rb = rb.body(collected);
@@ -380,7 +492,7 @@ impl KubeProxy {
             let bytes = upstream_resp.bytes().await.context("read write response")?;
             if status.is_success() {
                 if let Some(o) = op.as_ref() {
-                    self.arm_write_revert(o, snapshot, &bytes).await;
+                    self.arm_write_revert(o, snapshot, &bytes, conn_id).await;
                 }
             }
             return Ok(builder
@@ -410,6 +522,8 @@ impl KubeProxy {
             .header(header::ACCEPT, "application/json");
         if let Some(token) = self.upstream.bearer() {
             rb = rb.bearer_auth(token);
+        } else if let Some((user, pass)) = self.upstream.basic_auth() {
+            rb = rb.basic_auth(user, Some(pass));
         }
         let resp = rb.send().await.ok()?;
         if !resp.status().is_success() {
@@ -427,14 +541,21 @@ impl KubeProxy {
     /// Arm an auto-revert envelope for a write the proxy just forwarded. For an
     /// update/patch with a captured prior state, the revert restores it; for a
     /// create, it deletes the (possibly server-named) object from the response.
-    async fn arm_write_revert(&self, op: &ApiOp, snapshot: Option<Vec<u8>>, response_body: &[u8]) {
+    async fn arm_write_revert(
+        &self,
+        op: &ApiOp,
+        snapshot: Option<Vec<u8>>,
+        response_body: &[u8],
+        conn_id: u64,
+    ) {
         let Some(gate) = self.gate.get() else {
             return;
         };
-        let (revert, name) = if let Some(snap) = snapshot {
+        let (revert, name, created_key) = if let Some(snap) = snapshot {
             (
                 ApiRevert::Restore { object_json: snap },
                 op.name.clone().unwrap_or_default(),
+                None,
             )
         } else {
             let value: serde_json::Value = match serde_json::from_slice(response_body) {
@@ -464,6 +585,13 @@ impl KubeProxy {
                 .and_then(|n| n.as_str())
                 .map(String::from)
                 .or_else(|| op.namespace.clone());
+            let key = CreatedKey {
+                conn: conn_id,
+                group: op.group.clone(),
+                resource: op.resource.clone(),
+                namespace: namespace.clone(),
+                name: name.to_string(),
+            };
             (
                 ApiRevert::DeleteCreated {
                     group: op.group.clone(),
@@ -472,6 +600,7 @@ impl KubeProxy {
                     namespace,
                 },
                 name.to_string(),
+                Some(key),
             )
         };
         let ns = op.namespace.as_deref().unwrap_or("(cluster)");
@@ -484,6 +613,11 @@ impl KubeProxy {
             .await
         {
             Some(handle) => {
+                // Record provenance for a created object so a later delete of it
+                // is recognized as guard's own contained cleanup.
+                if let Some(key) = created_key {
+                    self.created.lock().unwrap().remember(key, handle.clone());
+                }
                 tracing::info!(target: "guard::kubeproxy", "armed auto-revert {handle} for {label}")
             }
             None => tracing::warn!(
@@ -491,6 +625,22 @@ impl KubeProxy {
                 "could not arm auto-revert for {label} (capacity)"
             ),
         }
+    }
+
+    /// If this delete targets a resource the proxy forwarded a create for in
+    /// this process, remove and return its auto-revert handle — evidence the
+    /// delete is guard's own creation being cleaned up. Consumes the record so a
+    /// resource is only ever contained-deleted once.
+    fn take_created_provenance(&self, op: &ApiOp, conn_id: u64) -> Option<String> {
+        let name = op.name.clone()?;
+        let key = CreatedKey {
+            conn: conn_id,
+            group: op.group.clone(),
+            resource: op.resource.clone(),
+            namespace: op.namespace.clone(),
+            name,
+        };
+        self.created.lock().unwrap().take(&key)
     }
 }
 
@@ -582,5 +732,127 @@ async fn policy_reloader(path: PathBuf, policy: Arc<RwLock<ApiPolicy>>) {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn created_key(conn: u64, name: &str) -> CreatedKey {
+        CreatedKey {
+            conn,
+            group: String::new(),
+            resource: "configmaps".to_string(),
+            namespace: Some("dev".to_string()),
+            name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn provenance_is_scoped_to_the_creating_connection() {
+        // Caller A (connection 1) creates a resource; the proxy records its
+        // auto-revert handle keyed to that connection.
+        let mut reg = CreatedRegistry::default();
+        reg.remember(created_key(1, "foo"), "handle-A".to_string());
+
+        // Caller B on a different connection deletes the same
+        // group/resource/namespace/name: no provenance match, so the delete
+        // falls through to normal (strict) policy instead of the bypass.
+        assert_eq!(reg.take(&created_key(2, "foo")), None);
+        assert_eq!(
+            reg.len(),
+            1,
+            "a non-matching take must not consume the entry"
+        );
+
+        // Caller A deleting its own creation still matches and is contained.
+        assert_eq!(
+            reg.take(&created_key(1, "foo")),
+            Some("handle-A".to_string())
+        );
+        assert_eq!(reg.len(), 0, "a matching take consumes the entry once");
+    }
+
+    #[test]
+    fn provenance_is_dropped_when_its_revert_resolves() {
+        let mut reg = CreatedRegistry::default();
+        reg.remember(created_key(1, "foo"), "handle-A".to_string());
+
+        // The create's auto-revert resolves (operator confirm, or auto/manual
+        // revert): the daemon drops the provenance by handle.
+        reg.forget_by_handle("handle-A");
+        assert_eq!(reg.len(), 0);
+
+        // A later delete of a same-named resource (e.g. one an operator recreated
+        // outside guard) no longer matches the stale entry and goes through
+        // normal policy.
+        assert_eq!(reg.take(&created_key(1, "foo")), None);
+    }
+
+    fn test_proxy() -> KubeProxy {
+        let yaml = "apiVersion: v1\n\
+             kind: Config\n\
+             current-context: ctx\n\
+             clusters: [{name: c, cluster: {server: \"https://x:6443\"}}]\n\
+             contexts: [{name: ctx, context: {cluster: c, user: u}}]\n\
+             users: [{name: u, user: {token: t}}]\n";
+        let upstream = Upstream::from_kubeconfig_str(yaml, None).expect("upstream");
+        let tls = ProxyTls::generate().expect("tls");
+        KubeProxy::new(
+            "127.0.0.1:0".parse().unwrap(),
+            tls,
+            upstream,
+            ApiPolicy::deny_all(),
+            None,
+            PathBuf::from("/nonexistent/kubeconfig"),
+        )
+    }
+
+    fn delete_op(name: &str) -> ApiOp {
+        ApiOp {
+            verb: Verb::Delete,
+            group: String::new(),
+            version: "v1".to_string(),
+            resource: "configmaps".to_string(),
+            subresource: None,
+            namespace: Some("dev".to_string()),
+            name: Some(name.to_string()),
+            dry_run: false,
+        }
+    }
+
+    #[test]
+    fn take_created_provenance_matches_only_the_creating_connection() {
+        let proxy = test_proxy();
+        proxy
+            .created
+            .lock()
+            .unwrap()
+            .remember(created_key(1, "foo"), "h1".to_string());
+
+        let op = delete_op("foo");
+        // A delete on a different connection does not match.
+        assert_eq!(proxy.take_created_provenance(&op, 2), None);
+        // The creating connection matches and consumes the record.
+        assert_eq!(
+            proxy.take_created_provenance(&op, 1),
+            Some("h1".to_string())
+        );
+        assert_eq!(proxy.take_created_provenance(&op, 1), None);
+    }
+
+    #[test]
+    fn forget_created_by_handle_clears_public_provenance() {
+        let proxy = test_proxy();
+        proxy
+            .created
+            .lock()
+            .unwrap()
+            .remember(created_key(1, "foo"), "h1".to_string());
+
+        proxy.forget_created_by_handle("h1");
+
+        assert_eq!(proxy.take_created_provenance(&delete_op("foo"), 1), None);
     }
 }

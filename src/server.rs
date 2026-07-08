@@ -10,6 +10,7 @@
 //! - Socket: 0666 so local clients can connect before UID validation
 
 use crate::evaluate::Evaluator;
+use crate::grant_profile::ProfileCatalog;
 use crate::grant_rules::{compile_session_grant_rules, CompiledGrantRules};
 use crate::injection::is_valid_env_name;
 use crate::redact::{
@@ -24,6 +25,10 @@ use crate::session_store::SessionStore;
 use crate::shim::ShimGenerator;
 use guard::gating::approval::{Approval, ApprovalRegistry, ApprovalSnapshot, ApprovalStatus};
 use guard::gating::provisional::{Provisional, ProvisionalRegistry, ProvisionalStatus};
+use guard::gating::read_grant::{
+    ancestor_dirs_within, clamp_ttl, credential_path_deny_reason, AclEntry, GrantReadRegistry,
+    ReadGrant, ReadGrantStatus,
+};
 use guard::gating::verb::VerbCatalog;
 use guard::gating::{decide_gate, Coverage, GateMode, GateOutcome, Reversibility};
 use guard::policy::PolicyMode;
@@ -311,6 +316,46 @@ pub struct VerbInvocation {
     pub params: std::collections::BTreeMap<String, String>,
 }
 
+/// A filesystem read-grant request. Routed through the same policy pipeline as a
+/// brokered command (static credential deny-list, then session allow/deny globs,
+/// then the LLM evaluator), never through an admin/operator side channel, so a
+/// session-token holder can request one without per-grant operator involvement.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum GrantRequest {
+    /// Grant guard's brokering identity a time-boxed read grant on `path`.
+    Read {
+        path: String,
+        ttl_secs: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_token: Option<String>,
+        #[serde(default)]
+        reevaluate: bool,
+    },
+    /// Revoke an active read grant on `path` early (de-escalation; not gated).
+    Revoke {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_token: Option<String>,
+    },
+}
+
+impl GrantRequest {
+    fn path(&self) -> &str {
+        match self {
+            Self::Read { path, .. } | Self::Revoke { path, .. } => path,
+        }
+    }
+
+    fn session_token(&self) -> Option<&str> {
+        match self {
+            Self::Read { session_token, .. } | Self::Revoke { session_token, .. } => {
+                session_token.as_deref()
+            }
+        }
+    }
+}
+
 /// Resolved verb context threaded into gate routing.
 #[derive(Debug, Clone)]
 struct VerbContext {
@@ -381,6 +426,11 @@ pub enum AdminRequest {
         prompt_append: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prose: Option<String>,
+        /// Name of an operator-defined profile to seed this grant from. Unknown
+        /// names are rejected; a known profile's ttl/allow/deny/prompt are merged
+        /// in before the grant is installed on the normal path.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile: Option<String>,
         #[serde(default)]
         static_only: bool,
         #[serde(default)]
@@ -413,6 +463,12 @@ pub enum AdminRequest {
         token: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<usize>,
+        /// The caller's own authenticated session token (from `$GUARD_SESSION`).
+        /// A non-admin caller may inspect a grant only when this equals `token`
+        /// -- i.e. the caller is asking about the very token it holds. Absent
+        /// for the daemon-principal case, which is authorized regardless.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_token: Option<String>,
     },
     SecretSet {
         key: String,
@@ -789,6 +845,9 @@ enum IncomingMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         admin_token: Option<String>,
     },
+    Grant {
+        grant: GrantRequest,
+    },
     Execute(Box<ExecuteRequest>),
 }
 
@@ -897,6 +956,13 @@ pub struct ServerConfig {
     pub approvals: Arc<RwLock<ApprovalRegistry>>,
     /// Operator-authored verb catalog (the typed, least-expressive interface).
     pub verbs: Arc<RwLock<VerbCatalog>>,
+    /// Operator-authored session-grant profiles: named {ttl, allow, deny,
+    /// prompt_append} bundles that `guard session new --profile <name>` mints a
+    /// grant from. Loaded at startup from `--profiles` / `GUARD_PROFILES`; empty
+    /// by default. A profile is only a pre-authored convenience: the grant it
+    /// mints takes the identical install/validation path as a hand-authored one,
+    /// so it is no new trust boundary.
+    pub profiles: ProfileCatalog,
     /// Optional server-wide binary allow-list. `None` (the default) imposes no
     /// restriction. When `Some`, only binaries permitted by [`binary_allowed`]
     /// may execute, on every route (raw run, verb, and gated approval), as a
@@ -916,6 +982,11 @@ pub struct ServerConfig {
     /// the credentials only the daemon holds. Set by the entrypoint from
     /// `--kube-proxy`; `None` means no proxy listener.
     pub kube_proxy: Option<Arc<guard::proxy::KubeProxy>>,
+    /// Active filesystem read grants (Unix-only). Time-boxed POSIX ACL read
+    /// grants issued via `guard grant-read`; the sweeper auto-revokes them at
+    /// expiry and startup reconciliation revokes any that expired while the
+    /// daemon was down.
+    pub read_grants: Arc<RwLock<GrantReadRegistry>>,
 }
 
 impl ServerConfig {
@@ -971,6 +1042,8 @@ impl ServerConfig {
             provisional: Arc::new(RwLock::new(ProvisionalRegistry::new())),
             approvals: Arc::new(RwLock::new(ApprovalRegistry::new())),
             verbs: Arc::new(RwLock::new(VerbCatalog::empty())),
+            // No profiles by default; the entrypoint sets this from --profiles.
+            profiles: ProfileCatalog::empty(),
             // No binary restriction by default; the entrypoint sets this from
             // --allow-bin / GUARD_ALLOW_BIN, like the gate fields above.
             allowed_binaries: None,
@@ -979,6 +1052,7 @@ impl ServerConfig {
             extra_child_env: Vec::new(),
             // No API proxy by default; the entrypoint sets this from --kube-proxy.
             kube_proxy: None,
+            read_grants: Arc::new(RwLock::new(GrantReadRegistry::new())),
         }
     }
 
@@ -1156,6 +1230,12 @@ impl Server {
         self.config.verbs = Arc::new(RwLock::new(catalog));
     }
 
+    /// Install the operator-defined session-grant profiles. Must be called
+    /// before `run`.
+    pub fn set_profiles(&mut self, catalog: ProfileCatalog) {
+        self.config.profiles = catalog;
+    }
+
     /// Restrict which binaries may execute. `None` imposes no restriction (the
     /// default); an empty list denies everything. Must be called before `run`.
     pub fn set_allowed_binaries(&mut self, allowed: Option<Vec<String>>) {
@@ -1235,14 +1315,71 @@ impl Server {
         }
     }
 
+    /// Load persisted read grants at startup. Any grant already past its TTL is
+    /// revoked immediately (a read grant only removes access, so this is always
+    /// safe to do unattended, unlike a provisional revert); a grant still within
+    /// its TTL is re-armed by loading it Active so the sweeper fires at its
+    /// deadline.
+    #[cfg(unix)]
+    async fn startup_read_grants(&self) {
+        let Some(store) = &self.config.session_store else {
+            return;
+        };
+        let rows = match store.load_read_grants().await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::error!("failed to load read-grant state: {}", e);
+                return;
+            }
+        };
+        let reg = GrantReadRegistry::from_rows(rows);
+        let now = now_unix();
+        let mut surviving = GrantReadRegistry::new();
+        for grant in reg.list() {
+            if grant.status == ReadGrantStatus::Active && now >= grant.expires_unix {
+                match revoke_read_grant_acls(&grant).await {
+                    Ok(()) => {
+                        tracing::warn!(
+                            "[AUDIT] READ_GRANT_REVOKED handle={} path=\"{}\" source=startup-expired",
+                            grant.handle,
+                            grant.target_path
+                        );
+                        delete_read_grant_row(&self.config, &grant.target_path).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "[AUDIT] READ_GRANT_REVOKE_FAILED handle={} path=\"{}\" source=startup-expired detail=\"{}\"",
+                            grant.handle,
+                            grant.target_path,
+                            e
+                        );
+                        surviving.insert(grant);
+                    }
+                }
+            } else {
+                surviving.insert(grant);
+            }
+        }
+        *self.config.read_grants.write().await = surviving;
+    }
+
     pub async fn run(&self) -> Result<()> {
         tracing::info!("Server::run() called");
 
-        // Consequence gating: load persisted state (with boot-safe recovery) and
-        // start the single sweeper that fires due auto-reverts and expires holds.
+        // Consequence gating: load persisted state (with boot-safe recovery).
         if self.config.gate.is_on() {
             tracing::info!("Consequence gating: {}", self.config.gate);
             self.startup_gating().await;
+        }
+        // Reconcile persisted read grants (revoke expired, re-arm live).
+        #[cfg(unix)]
+        self.startup_read_grants().await;
+
+        // The single sweeper drives both consequence-gate reverts (gate-on only)
+        // and read-grant expiries (Unix, gate-independent), so it runs whenever
+        // either is live. Without this a read grant could outlive its TTL simply
+        // because the daemon runs without consequence gating.
+        if self.config.gate.is_on() || cfg!(unix) {
             let config = self.config.clone();
             tokio::spawn(async move { gating_sweeper(config).await });
         }
@@ -1766,6 +1903,15 @@ where
                 writer.write_all(b"\n").await?;
                 continue;
             }
+            IncomingMessage::Grant { grant } => {
+                let result = handle_grant_request(config, &caller, grant).await;
+                let resp = result.into_response();
+                writer
+                    .write_all(serde_json::to_string(&resp)?.as_bytes())
+                    .await?;
+                writer.write_all(b"\n").await?;
+                continue;
+            }
             IncomingMessage::Execute(req) => *req,
         };
 
@@ -1962,12 +2108,15 @@ fn redact_historical_grant_for_list(grant: &mut HistoricalGrant, admin: bool, ca
     }
 }
 
-fn redact_session_report_for_non_admin(report: &mut SessionReport) {
+/// Mask the raw bearer token in a session report shown to its own holder. The
+/// grant contents (rules, prompt, stats) are intentionally left intact for
+/// self-diagnosis; only the token string is hidden so it is not echoed back.
+fn mask_session_report_token(report: &mut SessionReport) {
     if let Some(active) = &mut report.active {
-        active.token = "(provided)".to_string();
+        active.token = "(current)".to_string();
     }
     for grant in &mut report.history {
-        grant.token = "(provided)".to_string();
+        grant.token = "(current)".to_string();
     }
 }
 
@@ -2224,9 +2373,10 @@ async fn handle_admin_request(
             token,
             mut allow,
             mut deny,
-            ttl_secs,
+            mut ttl_secs,
             prompt_append,
             prose,
+            profile,
             static_only,
             auto_amend,
         } => {
@@ -2235,13 +2385,39 @@ async fn handle_admin_request(
                     message: "session token must not be empty".to_string(),
                 };
             }
+            // Expand a named operator profile into this grant before the usual
+            // prose compilation. An unknown name fails loudly rather than
+            // minting an empty (unrestricted) grant. The profile only seeds the
+            // same fields an operator would type; the grant is installed on the
+            // identical path below, so it is no separate trust boundary.
+            let mut profile_prompt: Option<String> = None;
+            if let Some(name) = profile.as_deref() {
+                match config.profiles.get(name) {
+                    Some(p) => {
+                        merge_unique(&mut allow, p.allow.clone());
+                        merge_unique(&mut deny, p.deny.clone());
+                        ttl_secs = ttl_secs.or(p.ttl_secs);
+                        profile_prompt = p.prompt_append.clone();
+                    }
+                    None => {
+                        return AdminResponse::Error {
+                            message: format!("unknown session profile: '{}'", name),
+                        };
+                    }
+                }
+            }
             let compiled = prose
                 .as_deref()
                 .map(compile_session_grant_rules)
                 .unwrap_or_default();
             merge_unique(&mut allow, compiled.allow.clone());
             merge_unique(&mut deny, compiled.deny.clone());
-            let prompt_append = combine_session_prompt(prompt_append, prose.as_deref(), &compiled);
+            // Fold the profile's evaluator context in with any request/prose prompt.
+            let base_prompt = match (prompt_append, profile_prompt) {
+                (Some(request), Some(profile)) => Some(format!("{request}\n\n{profile}")),
+                (some, None) | (None, some) => some,
+            };
+            let prompt_append = combine_session_prompt(base_prompt, prose.as_deref(), &compiled);
             let auto_amend = auto_amend && !static_only;
             let expires_at = ttl_secs.map(|secs| {
                 std::time::SystemTime::now()
@@ -2250,6 +2426,10 @@ async fn handle_admin_request(
                     .unwrap_or(0)
                     + secs
             });
+            let mut generated_notes = compiled.notes.clone();
+            if let Some(name) = profile.as_deref() {
+                generated_notes.push(format!("session minted from profile '{name}'"));
+            }
             let grant = SessionGrant {
                 allow,
                 deny,
@@ -2257,7 +2437,7 @@ async fn handle_admin_request(
                 deny_exact: Vec::new(),
                 expires_at,
                 prompt_append,
-                generated_notes: compiled.notes.clone(),
+                generated_notes,
                 static_only,
                 auto_amend,
                 granted_at: 0, // SessionRegistry::grant fills the current time
@@ -2276,9 +2456,10 @@ async fn handle_admin_request(
                 };
             }
             tracing::info!(
-                "[AUDIT] SESSION_GRANT caller={} token={} ttl={:?} static_only={} auto_amend={} generated_allow={} generated_deny={}",
+                "[AUDIT] SESSION_GRANT caller={} token={} profile={:?} ttl={:?} static_only={} auto_amend={} generated_allow={} generated_deny={}",
                 caller,
                 token,
+                profile,
                 ttl_secs,
                 static_only,
                 auto_amend,
@@ -2355,7 +2536,11 @@ async fn handle_admin_request(
             };
             AdminResponse::SessionList { grants, history }
         }
-        AdminRequest::SessionShow { token, limit } => {
+        AdminRequest::SessionShow {
+            token,
+            limit,
+            caller_token,
+        } => {
             {
                 let mut reg = config.sessions.write().await;
                 reg.purge_expired();
@@ -2363,11 +2548,31 @@ async fn handle_admin_request(
             if let Err(err) = persist_current_sessions(config).await {
                 tracing::warn!("failed to persist purged session state: {}", err);
             }
+            let is_admin = caller_is_session_admin(config, caller);
+            // A non-admin caller may inspect only the grant on its own token: the
+            // token it presents as its identity ($GUARD_SESSION) must equal the
+            // token it is asking about. That token is the same bearer credential
+            // used for session auth, so equality is proof the caller holds it.
+            // Merely naming another session's token is not enough -- that path
+            // returns a denial, never the grant's contents.
+            let is_self = !token.is_empty() && caller_token.as_deref() == Some(token.as_str());
+            if !is_admin && !is_self {
+                tracing::warn!(
+                    "[AUDIT] SESSION_SHOW_REJECTED caller={} reason=\"not the token holder\"",
+                    caller
+                );
+                return AdminResponse::Error {
+                    message: "not authorized: a session token may only inspect its own grant"
+                        .to_string(),
+                };
+            }
             let reg = config.sessions.read().await;
             match reg.show(&token, limit.unwrap_or(20)) {
                 Some(mut report) => {
-                    if !caller_is_session_admin(config, caller) {
-                        redact_session_report_for_non_admin(&mut report);
+                    // A self-inspecting holder sees the full grant (rules, prompt,
+                    // expiry) but never has its own raw bearer token echoed back.
+                    if !is_admin {
+                        mask_session_report_token(&mut report);
                     }
                     AdminResponse::SessionShow { report }
                 }
@@ -2774,6 +2979,7 @@ async fn handle_confirm(
     match updated {
         Ok(p) => {
             persist_provisional(config, &p).await;
+            forget_proxy_provenance(config, handle);
             tracing::info!("[AUDIT] CONFIRM handle={} caller={}", handle, caller);
             AdminResponse::GateAction {
                 message: format!("provisional {} confirmed; change kept", handle),
@@ -2866,6 +3072,9 @@ async fn finish_revert(
     if let Some(u) = &updated {
         persist_provisional(config, u).await;
     }
+    // The create-revert is terminal (whether it succeeded or failed); drop any
+    // kube-proxy provenance tied to it so it cannot outlive its window.
+    forget_proxy_provenance(config, &p.handle);
     if status_ok {
         tracing::info!(
             "[AUDIT] REVERT handle={} caller={} kind={} exit={:?}",
@@ -3156,6 +3365,30 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
                     }
                 };
                 let resp = handle_admin_request(config, &caller, admin).await;
+                writer
+                    .write_all(serde_json::to_string(&resp)?.as_bytes())
+                    .await?;
+                writer.write_all(b"\n").await?;
+                continue;
+            }
+            IncomingMessage::Grant { grant } => {
+                // Read grants apply a POSIX ACL for a kernel-verified local uid;
+                // a bearer-token TCP caller carries no such identity, so it can
+                // never be the grant principal. Refuse rather than guess.
+                let reason = format!(
+                    "read grants require a local Unix socket caller: '{}' cannot be requested over TCP",
+                    grant.path()
+                );
+                let resp = ExecuteResponse {
+                    allowed: false,
+                    reason,
+                    exit_code: None,
+                    stdout: None,
+                    stderr: None,
+                    status: None,
+                    handle: None,
+                    coverage: None,
+                };
                 writer
                     .write_all(serde_json::to_string(&resp)?.as_bytes())
                     .await?;
@@ -4730,6 +4963,111 @@ fn apply_exec_identity(
     Ok(None)
 }
 
+/// Strip inherited capabilities from a brokered child before `execve`.
+///
+/// Under the packaged unit the daemon holds `CAP_FOWNER` and
+/// `CAP_DAC_READ_SEARCH` in its ambient set so its own `grant-read` `setfacl`/
+/// `getfacl` calls can manipulate ACLs on files it does not own. Ambient
+/// capabilities are, by design, preserved across `execve()` for a non-privileged
+/// process, so without this every caller-requested command (a plain
+/// `cat /etc/shadow`, an `ansible-playbook` reading arbitrary files) would
+/// inherit those capabilities and bypass file DAC entirely -- `CAP_DAC_READ_SEARCH`
+/// bypasses file read permission checks and `CAP_FOWNER` bypasses the file-owner
+/// checks `chmod`/`setfacl` enforce -- defeating the scoped, policy-gated read
+/// grants. This clears the ambient set (so nothing survives `execve`) and zeroes
+/// the inheritable set (so a target binary carrying its own file-inheritable caps
+/// cannot pick anything up via the `P(inh) & F(inh)` intersection).
+///
+/// Applies only inside the forked child via `pre_exec`; the long-lived daemon
+/// keeps its capabilities for its own direct `setfacl`/`getfacl` `Command`s,
+/// which are separate and never pass through here. Clearing capabilities needs
+/// no privilege (only raising them does), so it is safe under both the default
+/// service-identity model and `--exec-as-caller`.
+///
+/// The capget/capset structs and version magic are declared here because the
+/// `libc` crate does not expose `capget`/`capset` or the `cap_user_*` types; the
+/// calls go through `libc::syscall` with the stable `SYS_capget`/`SYS_capset`
+/// numbers.
+#[cfg(all(unix, target_os = "linux"))]
+#[repr(C)]
+struct CapUserHeader {
+    version: u32,
+    pid: libc::c_int,
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CapUserData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+/// `_LINUX_CAPABILITY_VERSION_3` from `<linux/capability.h>` (64-bit caps).
+#[cfg(all(unix, target_os = "linux"))]
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+#[cfg(unix)]
+fn drop_brokered_child_capabilities(cmd: &mut Command) {
+    // SAFETY: the closure runs in the forked child after `fork()` and before
+    // `execve`. It calls only async-signal-safe raw syscalls (prctl/capget/
+    // capset) and performs no allocation.
+    unsafe {
+        cmd.pre_exec(|| {
+            #[cfg(target_os = "linux")]
+            {
+                // 1. Clear the ambient set: these are the capabilities that would
+                //    otherwise be preserved across `execve` for a non-privileged
+                //    process.
+                if libc::prctl(
+                    libc::PR_CAP_AMBIENT,
+                    libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                ) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // 2. Zero the inheritable set. Reading the current sets first and
+                //    only clearing `inheritable` leaves `permitted`/`effective`
+                //    untouched (they collapse to the ambient set at `execve`
+                //    anyway for a non-privileged target). Dropping bits is always
+                //    permitted; only raising them requires CAP_SETPCAP.
+                let mut header = CapUserHeader {
+                    version: LINUX_CAPABILITY_VERSION_3,
+                    pid: 0,
+                };
+                let mut data = [CapUserData {
+                    effective: 0,
+                    permitted: 0,
+                    inheritable: 0,
+                }; 2];
+                if libc::syscall(
+                    libc::SYS_capget,
+                    &mut header as *mut CapUserHeader,
+                    data.as_mut_ptr(),
+                ) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                data[0].inheritable = 0;
+                data[1].inheritable = 0;
+                if libc::syscall(
+                    libc::SYS_capset,
+                    &header as *const CapUserHeader,
+                    data.as_ptr(),
+                ) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+}
+
 /// Execute a command the policy layer has already approved.
 ///
 /// Entered from either the LLM evaluator path or a session-grant allow
@@ -4883,6 +5221,12 @@ async fn exec_after_approval<W: AsyncWrite + Unpin>(
             return ExecuteResult::exec_failed(allow_reason, format!("exec identity error: {}", e));
         }
     };
+
+    // Drop the daemon's grant-read capabilities (CAP_FOWNER / CAP_DAC_READ_SEARCH)
+    // from the brokered child so they never survive execve into a caller-requested
+    // command. Applies to both the default and --exec-as-caller models.
+    #[cfg(unix)]
+    drop_brokered_child_capabilities(&mut cmd);
 
     for (key, value) in &tool_env {
         cmd.env(key, value);
@@ -5109,6 +5453,19 @@ async fn persist_provisional(config: &ServerConfig, p: &Provisional) {
     }
 }
 
+/// Drop any kube-proxy delete-provenance tied to a now-resolved auto-revert
+/// handle. A proxy-armed create records provenance so a later contained delete
+/// of that object cancels the moot create-revert; once the revert itself
+/// resolves (operator confirm, or auto/manual revert), that provenance must not
+/// outlive its window, or a delete of a same-named resource an operator later
+/// recreates outside guard would still match the stale entry and bypass policy.
+/// A no-op when the proxy is not enabled or the handle was not a proxy create.
+fn forget_proxy_provenance(config: &ServerConfig, handle: &str) {
+    if let Some(proxy) = &config.kube_proxy {
+        proxy.forget_created_by_handle(handle);
+    }
+}
+
 /// Bridges the kube-proxy's synthesized reverts into the daemon's consequence
 /// machinery. Holds a clone of the server config (which shares the provisional
 /// registry and state store), the operator kubeconfig for the `kubectl` revert,
@@ -5198,6 +5555,27 @@ impl guard::proxy::GateSink for DaemonGateSink {
         persist_provisional(&self.config, &provisional).await;
         self.config.provisional.write().await.insert(provisional);
         Some(handle)
+    }
+
+    async fn resolve(&self, handle: &str) {
+        // The created object is already gone by the workload's own action, so the
+        // pending create-revert (a `kubectl delete`) is moot. Confirm it to cancel
+        // the timer; the sweeper then never tries to delete an absent object. A
+        // handle that is already terminal is a no-op.
+        let updated = {
+            let mut reg = self.config.provisional.write().await;
+            reg.confirm(handle)
+        };
+        match updated {
+            Ok(p) => {
+                persist_provisional(&self.config, &p).await;
+                tracing::info!(
+                    "kube-proxy: resolved auto-revert {} (created object deleted by workload)",
+                    handle
+                );
+            }
+            Err(e) => tracing::debug!("kube-proxy: resolve {} was a no-op: {}", handle, e),
+        }
     }
 }
 
@@ -5912,6 +6290,19 @@ async fn gating_sweeper(config: ServerConfig) {
             });
         }
 
+        // Due read-grant expiries. Revoking a read grant only removes access, so
+        // unlike a provisional revert it is always safe to run unattended; there
+        // is no needs-operator-decision path. Persist the Reverting transition
+        // before running so a crash mid-revocation recovers to Active and retries.
+        let due_grants = { config.read_grants.write().await.take_due(now) };
+        for g in due_grants {
+            persist_read_grant(&config, &g).await;
+            let cfg = config.clone();
+            tokio::spawn(async move {
+                finish_read_grant_revert(&cfg, &g, "expiry").await;
+            });
+        }
+
         // Bound the tables: drop terminal rows past the retention window.
         let pruned_p = {
             config
@@ -5936,6 +6327,16 @@ async fn gating_sweeper(config: ServerConfig) {
                     tracing::warn!("failed to delete pruned approval {}: {}", h, e);
                 }
             }
+        }
+        let pruned_g = {
+            config
+                .read_grants
+                .write()
+                .await
+                .prune_terminal(now, GATING_RETENTION_SECS)
+        };
+        for path in pruned_g {
+            delete_read_grant_row(&config, &path).await;
         }
     }
 }
@@ -5971,6 +6372,621 @@ async fn run_provisional_revert(config: &ServerConfig, p: &Provisional) -> Execu
         &mut sink,
     )
     .await
+}
+
+/// Label used for the binary field of a read-grant request's audit records, so
+/// `[AUDIT] ALLOWED`/`DENIED` grep patterns and session allow/deny globs treat a
+/// grant request the same shape as `grant-read <path> --ttl <ttl>`.
+const GRANT_READ_LABEL: &str = "grant-read";
+
+fn grant_read_audit_args(path: &str, ttl: u64) -> Vec<String> {
+    vec![path.to_string(), "--ttl".to_string(), ttl.to_string()]
+}
+
+/// Handle a filesystem read-grant request. Platform-gated to Unix (POSIX ACLs);
+/// on any other platform it fails clearly and immediately, mirroring the
+/// `--exec-as-caller` platform gate.
+async fn handle_grant_request(
+    config: &ServerConfig,
+    caller: &CallerIdentity,
+    grant: GrantRequest,
+) -> ExecuteResult {
+    #[cfg(not(unix))]
+    {
+        let reason = format!(
+            "read grants are not supported on this platform (POSIX ACLs are Unix-only): '{}'",
+            grant.path()
+        );
+        config.log_audit_policy(
+            caller,
+            GRANT_READ_LABEL,
+            &[grant.path().to_string()],
+            false,
+            &reason,
+        );
+        ExecuteResult::denied(reason)
+    }
+    #[cfg(unix)]
+    {
+        match grant {
+            GrantRequest::Read {
+                path,
+                ttl_secs,
+                session_token,
+                reevaluate,
+            } => handle_grant_read(config, caller, path, ttl_secs, session_token, reevaluate).await,
+            GrantRequest::Revoke {
+                path,
+                session_token,
+            } => handle_grant_revoke(config, caller, path, session_token).await,
+        }
+    }
+}
+
+/// Issue a scoped, time-boxed POSIX ACL read grant, routed through the same
+/// policy pipeline as any brokered command: a hard credential deny-list first
+/// (before the evaluator ever sees it), then session allow/deny globs, then the
+/// LLM evaluator. On allow, the ACL entries are applied and an expiry is armed.
+#[cfg(unix)]
+async fn handle_grant_read(
+    config: &ServerConfig,
+    caller: &CallerIdentity,
+    path: String,
+    ttl_secs: u64,
+    session_token: Option<String>,
+    reevaluate: bool,
+) -> ExecuteResult {
+    let ttl = clamp_ttl(ttl_secs);
+
+    // A read grant applies an ACL for a kernel-verified local uid; only a local
+    // Unix peer carries one.
+    let caller_uid = match caller {
+        CallerIdentity::Unix { uid } => *uid,
+        _ => {
+            let reason = "read grants require a local Unix socket caller".to_string();
+            config.log_audit_policy(
+                caller,
+                GRANT_READ_LABEL,
+                &grant_read_audit_args(&path, ttl),
+                false,
+                &reason,
+            );
+            return ExecuteResult::denied(reason);
+        }
+    };
+
+    // Canonicalize first: resolve symlinks and `..` so the deny-list and the
+    // home-boundary check reason about the real target, not a path that only
+    // textually sits under a home directory.
+    let canonical = match std::fs::canonicalize(&path) {
+        Ok(p) => p,
+        Err(e) => {
+            let reason = format!("read-grant denied: cannot resolve '{path}': {e}");
+            config.log_audit_policy(
+                caller,
+                GRANT_READ_LABEL,
+                &grant_read_audit_args(&path, ttl),
+                false,
+                &reason,
+            );
+            return ExecuteResult::denied(reason);
+        }
+    };
+    let canonical_str = canonical.display().to_string();
+    let audit_args = grant_read_audit_args(&canonical_str, ttl);
+
+    // 1. Hard static credential deny-list, BEFORE the evaluator.
+    if let Some(reason) = credential_path_deny_reason(&canonical_str) {
+        config.log_audit_policy(caller, GRANT_READ_LABEL, &audit_args, false, &reason);
+        return ExecuteResult::denied(reason);
+    }
+
+    // 2. Session allow/deny globs short-circuit, exactly as for a command: a
+    // deny wins before the evaluator; an allow skips it.
+    let mut allow_reason: Option<String> = None;
+    if let Some(ref token) = session_token {
+        let (decision, exists, static_only) = {
+            let reg = config.sessions.read().await;
+            (
+                reg.check(token, GRANT_READ_LABEL, &audit_args),
+                reg.has(token),
+                reg.static_only_for(token),
+            )
+        };
+        if !exists {
+            let reason =
+                format!("unknown session token: '{token}' is revoked, expired, or never existed");
+            config.log_audit_policy(caller, GRANT_READ_LABEL, &audit_args, false, &reason);
+            return ExecuteResult::denied(reason);
+        }
+        match decision {
+            Some((SessionDecision::Deny, reason)) => {
+                config.log_audit_policy(caller, GRANT_READ_LABEL, &audit_args, false, &reason);
+                return ExecuteResult::denied(reason);
+            }
+            Some((SessionDecision::Allow, reason)) => allow_reason = Some(reason),
+            None if static_only => {
+                let reason = "session static-only: no matching session allow rule".to_string();
+                config.log_audit_policy(caller, GRANT_READ_LABEL, &audit_args, false, &reason);
+                return ExecuteResult::denied(reason);
+            }
+            None => {}
+        }
+    }
+
+    // 3. LLM evaluator, when no session allow already settled it. Same
+    // `evaluate_with_reevaluate` call the command pipeline uses; the request is
+    // phrased naturally and given assessment context so the model has real
+    // signal about what reading this path means.
+    if allow_reason.is_none() {
+        let session_prompt = match session_token.as_deref() {
+            Some(token) => config.sessions.read().await.prompt_append_for(token),
+            None => None,
+        };
+        let command_line = format!(
+            "grant guard's brokering service account scoped read access to the file {canonical_str} for {ttl} seconds"
+        );
+        let context = format!(
+            "READ-GRANT ASSESSMENT. A brokered caller is asking guard to add a scoped, \
+             time-boxed POSIX ACL read grant for its own low-privilege service account on \
+             the single file below, so a brokered ansible/helm command can read an operator \
+             config/vars/values file. The grant auto-revokes after the TTL; it is not a \
+             command execution and touches no other path.\n\
+             Target file: {canonical_str}\n\
+             TTL: {ttl} seconds\n\
+             APPROVE if this is an ordinary configuration/vars/values file the operator would \
+             let a brokered tool read. DENY if the path looks like it exposes credentials, \
+             private keys, tokens, or other secrets."
+        );
+        let prompt_append = match session_prompt {
+            Some(sp) if !sp.trim().is_empty() => format!("{context}\n\n{sp}"),
+            _ => context,
+        };
+        match config
+            .evaluator
+            .evaluate_with_reevaluate(&command_line, Some(&prompt_append), reevaluate)
+            .await
+        {
+            crate::evaluate::EvalResult::Allow { reason, .. } => allow_reason = Some(reason),
+            crate::evaluate::EvalResult::Deny { reason, .. } => {
+                config.log_audit_policy(caller, GRANT_READ_LABEL, &audit_args, false, &reason);
+                return ExecuteResult::denied(reason);
+            }
+            crate::evaluate::EvalResult::Error(e) => {
+                let reason = format!("evaluation error: {e}");
+                config.log_audit_policy(caller, GRANT_READ_LABEL, &audit_args, false, &reason);
+                return ExecuteResult::denied(reason);
+            }
+        }
+    }
+    let reason = allow_reason.unwrap_or_default();
+
+    if config.dry_run {
+        config.log_audit_policy(caller, GRANT_READ_LABEL, &audit_args, true, &reason);
+        return ExecuteResult::completed(
+            reason,
+            Some(0),
+            Some(format!(
+                "[DRY-RUN] would grant read on {canonical_str} for {ttl}s\n"
+            )),
+            None,
+        );
+    }
+
+    // 4. Determine the grantee: guard's own service account by default, or the
+    // caller's uid under --exec-as-caller (where brokered children run as the
+    // caller, not the daemon).
+    let grantee_uid = if config.exec_as_caller {
+        caller_uid
+    } else {
+        config.daemon_uid
+    };
+    let grantee_gid = match resolve_exec_caller_context(grantee_uid) {
+        Ok(ctx) => ctx.gid,
+        Err(e) => {
+            let reason = format!("grantee uid {grantee_uid} could not be resolved: {e}");
+            config.log_audit_policy(caller, GRANT_READ_LABEL, &audit_args, true, &reason);
+            return ExecuteResult::exec_failed(reason.clone(), reason);
+        }
+    };
+
+    // The traverse boundary is the home directory of the file's owner: walk no
+    // higher than it so a grant can never add traverse ACLs into shared system
+    // paths above a home. Fail closed if the target is not under it.
+    let home_boundary = match owner_home_boundary(&canonical) {
+        Ok(home) => home,
+        Err(e) => {
+            let reason = format!("read-grant denied: {e}");
+            config.log_audit_policy(caller, GRANT_READ_LABEL, &audit_args, false, &reason);
+            return ExecuteResult::denied(reason);
+        }
+    };
+
+    // Plan the entries, commit the grant row, THEN apply the ACLs, so a crash
+    // mid-apply leaves a recoverable row the reconciler can revoke rather than a
+    // permanently-open grant with no record.
+    let entries = match plan_read_grant(&canonical, grantee_uid, grantee_gid, &home_boundary).await
+    {
+        Ok(entries) => entries,
+        Err(e) => {
+            let reason = format!("read-grant denied: {e}");
+            config.log_audit_policy(caller, GRANT_READ_LABEL, &audit_args, false, &reason);
+            return ExecuteResult::denied(reason);
+        }
+    };
+
+    let now = now_unix();
+    let grant = ReadGrant {
+        handle: new_handle(),
+        principal: caller.principal(),
+        granting_session: session_token.clone(),
+        target_path: canonical_str.clone(),
+        grantee_uid,
+        entries: entries.clone(),
+        reason: reason.clone(),
+        created_unix: now,
+        expires_unix: now.saturating_add(ttl),
+        status: ReadGrantStatus::Active,
+        revert_detail: None,
+    };
+    persist_read_grant(config, &grant).await;
+
+    if let Err(e) = apply_read_grant_entries(grantee_uid, &entries).await {
+        // Nothing survived the in-apply rollback, so drop the committed row too.
+        delete_read_grant_row(config, &grant.target_path).await;
+        let exec_reason = format!("failed to apply read grant: {e}");
+        config.log_audit_policy(caller, GRANT_READ_LABEL, &audit_args, true, &reason);
+        config.log_audit_exec_failed(caller, GRANT_READ_LABEL, &audit_args, &exec_reason);
+        return ExecuteResult::exec_failed(reason, exec_reason);
+    }
+
+    let traverse_count = grant.entries.len().saturating_sub(1);
+    config.read_grants.write().await.insert(grant.clone());
+
+    config.log_audit_policy(caller, GRANT_READ_LABEL, &audit_args, true, &reason);
+    tracing::info!(
+        "[AUDIT] READ_GRANT_ISSUED caller={} handle={} path=\"{}\" grantee_uid={} ttl={} traverse_grants={} session={}",
+        caller,
+        grant.handle,
+        grant.target_path,
+        grantee_uid,
+        ttl,
+        traverse_count,
+        session_token.as_deref().unwrap_or("-"),
+    );
+
+    let stdout = format!(
+        "granted read on {} to uid {} for {}s (handle {}); {} ancestor traverse grant(s); auto-revokes at unix {}\n",
+        grant.target_path,
+        grantee_uid,
+        ttl,
+        grant.handle,
+        traverse_count,
+        grant.expires_unix,
+    );
+    ExecuteResult::completed(reason, Some(0), Some(stdout), None)
+}
+
+/// Early revoke of an active read grant. Revocation only removes access, so it
+/// is a de-escalation and is not routed through the evaluator; it is still
+/// audited.
+#[cfg(unix)]
+async fn handle_grant_revoke(
+    config: &ServerConfig,
+    caller: &CallerIdentity,
+    path: String,
+    // Revocation is deliberately NOT scoped to the requesting caller's own
+    // grants: any allowed local caller may revoke any read grant by path. This
+    // is intentional, not an oversight (hence the unused `_session_token`).
+    // Revoking is always safe and monotonic -- it only removes access an
+    // evaluator/operator previously approved and never grants anything -- so
+    // there is no benefit to restricting who may run it, and an operator or a
+    // sibling worker must be able to tear down a grant unattended. See the
+    // ReadGrantStatus lifecycle note in `guard::gating::read_grant`.
+    _session_token: Option<String>,
+) -> ExecuteResult {
+    // Match on the canonical path when it still resolves, else fall back to the
+    // literal path so a grant whose target was since deleted can still be
+    // revoked by the name it was granted under.
+    let key = std::fs::canonicalize(&path)
+        .map(|p| p.display().to_string())
+        .unwrap_or(path);
+    let audit_args = vec![key.clone()];
+
+    let claimed = config.read_grants.write().await.begin_revert(&key);
+    let Some(grant) = claimed else {
+        let reason = format!("no active read grant for '{key}'");
+        config.log_audit_policy(caller, GRANT_READ_LABEL, &audit_args, false, &reason);
+        return ExecuteResult::denied(reason);
+    };
+    persist_read_grant(config, &grant).await;
+    finish_read_grant_revert(config, &grant, "manual").await;
+
+    let reason = format!("revoked read grant on {key}");
+    config.log_audit_policy(caller, GRANT_READ_LABEL, &audit_args, true, &reason);
+    let stdout = format!("{reason}\n");
+    ExecuteResult::completed(reason, Some(0), Some(stdout), None)
+}
+
+/// The home directory of the file at `target`'s owner, used as the ceiling for
+/// ancestor traverse grants. Canonicalized so a symlinked home compares equal.
+#[cfg(unix)]
+fn owner_home_boundary(target: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(target).with_context(|| format!("stat {}", target.display()))?;
+    let owner_uid = meta.uid();
+    let ctx = resolve_exec_caller_context(owner_uid)
+        .with_context(|| format!("resolve owner uid {owner_uid}"))?;
+    let home = std::fs::canonicalize(&ctx.home_dir).unwrap_or(ctx.home_dir);
+    if !target.starts_with(&home) || target == home.as_path() {
+        bail!(
+            "target {} is not under the owning home directory {}",
+            target.display(),
+            home.display()
+        );
+    }
+    Ok(home)
+}
+
+/// Compute the ACL entries a read grant needs WITHOUT applying them: a `--x`
+/// traverse grant on each ancestor directory the grantee cannot already cross,
+/// then the `r` read grant on the leaf. Separated from application so the grant
+/// row can be committed to the state store before any ACL is touched (mirroring
+/// the provisional "commit before the forward command runs" pattern), so a crash
+/// mid-apply always leaves a recoverable row rather than a leaked grant.
+#[cfg(unix)]
+async fn plan_read_grant(
+    target: &Path,
+    grantee_uid: u32,
+    grantee_gid: u32,
+    home_boundary: &Path,
+) -> Result<Vec<AclEntry>> {
+    let ancestors = ancestor_dirs_within(target, home_boundary).ok_or_else(|| {
+        anyhow::anyhow!(
+            "target {} is not under the owning home directory {}",
+            target.display(),
+            home_boundary.display()
+        )
+    })?;
+    // A regular file open requires `--x` (traverse) on every ancestor directory,
+    // so plan it only where the grantee cannot already cross, from the leaf's
+    // parent up to the home boundary.
+    let mut entries = Vec::new();
+    for dir in &ancestors {
+        let meta = std::fs::metadata(dir).with_context(|| format!("stat {}", dir.display()))?;
+        if dir_allows_traverse(&meta, dir, grantee_uid, grantee_gid).await {
+            continue;
+        }
+        entries.push(AclEntry {
+            path: dir.display().to_string(),
+            perms: "x".to_string(),
+        });
+    }
+    entries.push(AclEntry {
+        path: target.display().to_string(),
+        perms: "r".to_string(),
+    });
+    Ok(entries)
+}
+
+/// Apply a planned set of ACL entries. Rolls back everything it applied on a
+/// partial failure so a failed grant never leaves stray ACL entries behind.
+#[cfg(unix)]
+async fn apply_read_grant_entries(grantee_uid: u32, entries: &[AclEntry]) -> Result<()> {
+    let mut applied: Vec<&AclEntry> = Vec::new();
+    for entry in entries {
+        let spec = format!("u:{grantee_uid}:{}", entry.perms);
+        if let Err(e) = setfacl_modify(&spec, Path::new(&entry.path)).await {
+            for done in &applied {
+                let _ = setfacl_remove(grantee_uid, Path::new(&done.path)).await;
+            }
+            return Err(e).with_context(|| format!("grant {} on {}", entry.perms, entry.path));
+        }
+        applied.push(entry);
+    }
+    Ok(())
+}
+
+/// Test/convenience wrapper: plan then apply, returning the applied entries.
+#[cfg(unix)]
+async fn apply_read_grant(
+    target: &Path,
+    grantee_uid: u32,
+    grantee_gid: u32,
+    home_boundary: &Path,
+) -> Result<Vec<AclEntry>> {
+    let entries = plan_read_grant(target, grantee_uid, grantee_gid, home_boundary).await?;
+    apply_read_grant_entries(grantee_uid, &entries).await?;
+    Ok(entries)
+}
+
+/// Whether `uid` (primary group `gid`) can already traverse `dir` without a new
+/// ACL entry: via the base `other`/owner/group execute bits, or an existing
+/// `user:<uid>:` ACL entry that grants execute. Conservative toward adding: an
+/// undetected named-group ACL grant only causes a redundant `--x` entry that is
+/// removed on revoke, never a stripped pre-existing permission.
+#[cfg(unix)]
+async fn dir_allows_traverse(meta: &std::fs::Metadata, dir: &Path, uid: u32, gid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let mode = meta.mode();
+    if mode & 0o001 != 0 {
+        return true;
+    }
+    if meta.uid() == uid && mode & 0o100 != 0 {
+        return true;
+    }
+    if meta.gid() == gid && mode & 0o010 != 0 {
+        return true;
+    }
+    getfacl_user_has_traverse(dir, uid).await
+}
+
+/// Parse `getfacl -n` for a `user:<uid>:` entry whose permission triad grants
+/// execute. Numeric output (`-n`) avoids name resolution; the owner entry
+/// (`user::`) is skipped because the base owner bits are checked separately.
+#[cfg(unix)]
+async fn getfacl_user_has_traverse(dir: &Path, uid: u32) -> bool {
+    let output = Command::new("getfacl")
+        .arg("-n")
+        .arg("--absolute-names")
+        .arg("--")
+        .arg(dir)
+        .output()
+        .await;
+    let Ok(output) = output else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let want = uid.to_string();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.splitn(3, ':');
+        let (Some(kind), Some(qualifier), Some(perms)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if kind == "user" && qualifier == want {
+            // perms triad is r,w,x; execute is the third position.
+            if perms.as_bytes().get(2) == Some(&b'x') {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(unix)]
+async fn setfacl_modify(spec: &str, path: &Path) -> Result<()> {
+    let output = Command::new("setfacl")
+        .arg("-m")
+        .arg(spec)
+        .arg("--")
+        .arg(path)
+        .output()
+        .await
+        .context("spawn setfacl")?;
+    if !output.status.success() {
+        bail!(
+            "setfacl -m {} {}: {}",
+            spec,
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn setfacl_remove(uid: u32, path: &Path) -> Result<()> {
+    // A deleted target has no ACL left to remove; treat that as done.
+    if !path.exists() {
+        return Ok(());
+    }
+    let output = Command::new("setfacl")
+        .arg("-x")
+        .arg(format!("u:{uid}"))
+        .arg("--")
+        .arg(path)
+        .output()
+        .await
+        .context("spawn setfacl")?;
+    if !output.status.success() {
+        bail!(
+            "setfacl -x u:{} {}: {}",
+            uid,
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Remove exactly the ACL entries a grant recorded, in reverse order (leaf
+/// first, then ancestors) so a directory's traverse grant outlives the leaf read
+/// grant during teardown. A per-path failure is collected rather than aborting,
+/// so one stuck path does not strand the rest.
+#[cfg(unix)]
+async fn revoke_read_grant_acls(grant: &ReadGrant) -> Result<()> {
+    let mut errors = Vec::new();
+    for entry in grant.entries.iter().rev() {
+        if let Err(e) = setfacl_remove(grant.grantee_uid, Path::new(&entry.path)).await {
+            errors.push(format!("{}: {}", entry.path, e));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        bail!("{}", errors.join("; "))
+    }
+}
+
+/// Run a read grant's revocation and record the outcome. On non-Unix this is a
+/// no-op (read grants can only be created on Unix).
+async fn finish_read_grant_revert(config: &ServerConfig, grant: &ReadGrant, source: &str) {
+    #[cfg(unix)]
+    {
+        match revoke_read_grant_acls(grant).await {
+            Ok(()) => {
+                config
+                    .read_grants
+                    .write()
+                    .await
+                    .set_revoked(&grant.target_path);
+                if let Some(updated) = config.read_grants.read().await.get(&grant.target_path) {
+                    persist_read_grant(config, updated).await;
+                }
+                tracing::info!(
+                    "[AUDIT] READ_GRANT_REVOKED handle={} path=\"{}\" source={}",
+                    grant.handle,
+                    grant.target_path,
+                    source
+                );
+            }
+            Err(e) => {
+                config
+                    .read_grants
+                    .write()
+                    .await
+                    .set_revert_failed(&grant.target_path, e.to_string());
+                if let Some(updated) = config.read_grants.read().await.get(&grant.target_path) {
+                    persist_read_grant(config, updated).await;
+                }
+                tracing::warn!(
+                    "[AUDIT] READ_GRANT_REVOKE_FAILED handle={} path=\"{}\" source={} detail=\"{}\"",
+                    grant.handle,
+                    grant.target_path,
+                    source,
+                    e
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (config, grant, source);
+    }
+}
+
+async fn persist_read_grant(config: &ServerConfig, g: &ReadGrant) {
+    if let Some(store) = &config.session_store {
+        if let Err(e) = store.save_read_grant(g.clone()).await {
+            tracing::warn!("failed to persist read grant {}: {}", g.target_path, e);
+        }
+    }
+}
+
+async fn delete_read_grant_row(config: &ServerConfig, target_path: &str) {
+    if let Some(store) = &config.session_store {
+        if let Err(e) = store.delete_read_grant(target_path.to_string()).await {
+            tracing::warn!("failed to delete read grant {}: {}", target_path, e);
+        }
+    }
 }
 
 /// The daemon's own principal: its uid on Unix, its process SID on Windows.
@@ -7035,6 +8051,48 @@ impl Client {
             verb: self.verb.clone(),
             reevaluate: self.reevaluate,
             ssh_hostkey: self.ssh_hostkey,
+        }
+    }
+
+    /// Send a filesystem read-grant request (grant or revoke) and return the
+    /// server's `ExecuteResponse`. Routed as its own `IncomingMessage::Grant`
+    /// envelope, but evaluated server-side through the same policy pipeline as a
+    /// command; the daemon requires a local Unix socket peer.
+    pub async fn grant(&self, grant: GrantRequest) -> Result<ExecuteResponse> {
+        let envelope = IncomingMessage::Grant { grant };
+        let line = serde_json::to_string(&envelope)?;
+
+        if let Some(ref socket_path) = self.socket_path {
+            let stream = connect_local(socket_path).await?;
+            let (reader, writer) = tokio::io::split(stream);
+            let mut writer = tokio::io::BufWriter::new(writer);
+            writer.write_all(line.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+            let mut lines = BufReader::new(reader).lines();
+            let response_line = lines
+                .next_line()
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("server closed connection without response"))?;
+            serde_json::from_str(&response_line).context("invalid server response")
+        } else if let Some(port) = self.tcp_port {
+            let addr = format!("127.0.0.1:{}", port);
+            let stream = tokio::net::TcpStream::connect(&addr)
+                .await
+                .context("failed to connect to guard server")?;
+            let (reader, writer) = stream.into_split();
+            let mut writer = tokio::io::BufWriter::new(writer);
+            writer.write_all(line.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+            let mut lines = BufReader::new(reader).lines();
+            let response_line = lines
+                .next_line()
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("server closed connection without response"))?;
+            serde_json::from_str(&response_line).context("invalid server response")
+        } else {
+            anyhow::bail!("no socket path or TCP port configured");
         }
     }
 
@@ -8847,6 +9905,7 @@ mod tests {
                 ttl_secs: None,
                 prompt_append: Some("operator-only prompt".into()),
                 prose: None,
+                profile: None,
                 static_only: false,
                 auto_amend: false,
             },
@@ -8903,6 +9962,7 @@ mod tests {
                 ttl_secs: None,
                 prompt_append: Some("operator prompt".into()),
                 prose: Some("kubernetes access for namespace nextcloud".into()),
+                profile: None,
                 static_only: false,
                 auto_amend: false,
             },
@@ -8963,6 +10023,7 @@ mod tests {
                 ttl_secs: None,
                 prompt_append: Some("operator context".into()),
                 prose: None,
+                profile: None,
                 static_only: false,
                 auto_amend: false,
             },
@@ -9009,6 +10070,7 @@ mod tests {
             AdminRequest::SessionShow {
                 token: token.clone(),
                 limit: Some(1),
+                caller_token: None,
             },
         )
         .await;
@@ -9027,6 +10089,267 @@ mod tests {
             }
             other => panic!("unexpected {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn session_show_self_token_sees_full_grant() {
+        let (mut cfg, _) = make_test_config();
+        cfg.daemon_uid = 777;
+        cfg.daemon_principal = PrincipalKey::from_uid(777);
+
+        let daemon = CallerIdentity::Unix { uid: 777 };
+        let user = CallerIdentity::Unix { uid: 20_003 };
+        let token = format!("session-self-{}", std::process::id());
+
+        let grant = handle_admin_request(
+            &cfg,
+            &daemon,
+            AdminRequest::SessionGrant {
+                token: token.clone(),
+                allow: vec!["kubectl get pods*".into()],
+                deny: vec!["rm*".into()],
+                ttl_secs: Some(3600),
+                prompt_append: Some("cert rotation context".into()),
+                prose: None,
+                profile: None,
+                static_only: false,
+                auto_amend: false,
+            },
+        )
+        .await;
+        assert!(matches!(grant, AdminResponse::Ok));
+
+        // The holder presents its own token as both identity and target.
+        let show = handle_admin_request(
+            &cfg,
+            &user,
+            AdminRequest::SessionShow {
+                token: token.clone(),
+                limit: Some(20),
+                caller_token: Some(token.clone()),
+            },
+        )
+        .await;
+        match show {
+            AdminResponse::SessionShow { report } => {
+                let active = report.active.expect("holder sees its own active grant");
+                assert_eq!(active.allow, vec!["kubectl get pods*".to_string()]);
+                assert_eq!(active.deny, vec!["rm*".to_string()]);
+                assert_eq!(
+                    active.prompt_append.as_deref(),
+                    Some("cert rotation context")
+                );
+                assert!(active.expires_at.is_some(), "remaining time is visible");
+                assert_eq!(
+                    active.token, "(current)",
+                    "self view must not echo the raw bearer token"
+                );
+            }
+            other => panic!("unexpected {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_show_other_token_denied_for_non_admin() {
+        let (mut cfg, _) = make_test_config();
+        cfg.daemon_uid = 777;
+        cfg.daemon_principal = PrincipalKey::from_uid(777);
+
+        let daemon = CallerIdentity::Unix { uid: 777 };
+        let attacker = CallerIdentity::Unix { uid: 20_004 };
+        let token_a = format!("session-a-{}", std::process::id());
+        let token_b = format!("session-b-{}", std::process::id());
+
+        for token in [&token_a, &token_b] {
+            let grant = handle_admin_request(
+                &cfg,
+                &daemon,
+                AdminRequest::SessionGrant {
+                    token: token.clone(),
+                    allow: vec!["echo*".into()],
+                    deny: Vec::new(),
+                    ttl_secs: None,
+                    prompt_append: Some("secret operator context".into()),
+                    prose: None,
+                    profile: None,
+                    static_only: false,
+                    auto_amend: false,
+                },
+            )
+            .await;
+            assert!(matches!(grant, AdminResponse::Ok));
+        }
+
+        // Holder of A tries to inspect B's grant by naming B as the target.
+        let show = handle_admin_request(
+            &cfg,
+            &attacker,
+            AdminRequest::SessionShow {
+                token: token_b.clone(),
+                limit: Some(20),
+                caller_token: Some(token_a.clone()),
+            },
+        )
+        .await;
+        match show {
+            AdminResponse::Error { message } => {
+                assert!(
+                    message.contains("only inspect its own grant"),
+                    "expected a clear authorization denial, got: {message}"
+                );
+                assert!(
+                    !message.contains("secret operator context"),
+                    "denial must not leak the other grant's contents"
+                );
+            }
+            other => panic!("expected denial, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_new_from_profile_mints_expected_grant() {
+        let (mut cfg, _) = make_test_config();
+        cfg.daemon_uid = 777;
+        cfg.daemon_principal = PrincipalKey::from_uid(777);
+        cfg.profiles = ProfileCatalog::from_yaml(
+            "profiles:\n  - name: cert-manager-rotation\n    ttl_secs: 1800\n    allow:\n      - \"kubectl get certificate*\"\n    deny:\n      - \"kubectl delete namespace*\"\n    prompt_append: \"rotating cert-manager certificates\"\n",
+        )
+        .expect("valid profile catalog");
+
+        let daemon = CallerIdentity::Unix { uid: 777 };
+        let token = format!("session-profile-{}", std::process::id());
+
+        // Profile-only: no explicit allow/deny/ttl/prompt on the request.
+        let resp = handle_admin_request(
+            &cfg,
+            &daemon,
+            AdminRequest::SessionGrant {
+                token: token.clone(),
+                allow: Vec::new(),
+                deny: Vec::new(),
+                ttl_secs: None,
+                prompt_append: None,
+                prose: None,
+                profile: Some("cert-manager-rotation".into()),
+                static_only: false,
+                auto_amend: false,
+            },
+        )
+        .await;
+        assert!(matches!(resp, AdminResponse::Ok));
+
+        let reg = cfg.sessions.read().await;
+        let summary = reg
+            .list()
+            .into_iter()
+            .find(|g| g.token == token)
+            .expect("profile grant installed");
+        assert_eq!(summary.allow, vec!["kubectl get certificate*".to_string()]);
+        assert_eq!(summary.deny, vec!["kubectl delete namespace*".to_string()]);
+        assert!(summary.expires_at.is_some(), "profile ttl applied");
+        assert_eq!(
+            summary.prompt_append.as_deref(),
+            Some("rotating cert-manager certificates")
+        );
+        assert!(
+            summary
+                .generated_notes
+                .iter()
+                .any(|note| note.contains("cert-manager-rotation")),
+            "grant records which profile minted it"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_unknown_profile_fails_clearly() {
+        let (mut cfg, _) = make_test_config();
+        cfg.daemon_uid = 777;
+        cfg.daemon_principal = PrincipalKey::from_uid(777);
+        // The profile catalog is left empty.
+
+        let daemon = CallerIdentity::Unix { uid: 777 };
+        let token = format!("session-badprofile-{}", std::process::id());
+        let resp = handle_admin_request(
+            &cfg,
+            &daemon,
+            AdminRequest::SessionGrant {
+                token: token.clone(),
+                allow: Vec::new(),
+                deny: Vec::new(),
+                ttl_secs: None,
+                prompt_append: None,
+                prose: None,
+                profile: Some("does-not-exist".into()),
+                static_only: false,
+                auto_amend: false,
+            },
+        )
+        .await;
+        match resp {
+            AdminResponse::Error { message } => {
+                assert!(
+                    message.contains("unknown session profile")
+                        && message.contains("does-not-exist"),
+                    "expected a clear unknown-profile error, got: {message}"
+                );
+            }
+            other => panic!("expected error, got {:?}", other),
+        }
+        // A failed lookup must not install an (empty, unrestricted) grant.
+        let reg = cfg.sessions.read().await;
+        assert!(
+            reg.list().into_iter().all(|g| g.token != token),
+            "no grant should be installed for an unknown profile"
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_grant_still_deny_short_circuits_and_falls_through() {
+        let (mut cfg, _) = make_test_config();
+        cfg.daemon_uid = 777;
+        cfg.daemon_principal = PrincipalKey::from_uid(777);
+        cfg.profiles = ProfileCatalog::from_yaml(
+            "profiles:\n  - name: scoped\n    allow:\n      - \"kubectl get*\"\n    deny:\n      - \"kubectl delete*\"\n",
+        )
+        .expect("valid profile catalog");
+
+        let daemon = CallerIdentity::Unix { uid: 777 };
+        let token = format!("session-profcheck-{}", std::process::id());
+        let resp = handle_admin_request(
+            &cfg,
+            &daemon,
+            AdminRequest::SessionGrant {
+                token: token.clone(),
+                allow: Vec::new(),
+                deny: Vec::new(),
+                ttl_secs: None,
+                prompt_append: None,
+                prose: None,
+                profile: Some("scoped".into()),
+                static_only: false,
+                auto_amend: false,
+            },
+        )
+        .await;
+        assert!(matches!(resp, AdminResponse::Ok));
+
+        let reg = cfg.sessions.read().await;
+        // A profile-derived grant behaves exactly like any other grant: its deny
+        // glob short-circuits to Deny...
+        assert!(matches!(
+            reg.check(&token, "kubectl", &["delete".into(), "pod".into()]),
+            Some((SessionDecision::Deny, _))
+        ));
+        // ...its allow glob short-circuits to Allow...
+        assert!(matches!(
+            reg.check(&token, "kubectl", &["get".into(), "pods".into()]),
+            Some((SessionDecision::Allow, _))
+        ));
+        // ...and a command matching neither falls through to normal evaluation.
+        assert!(
+            reg.check(&token, "helm", &["list".into()]).is_none(),
+            "an unmatched command must fall through to the evaluator"
+        );
     }
 
     // ---- Consequence-gating orchestration tests -----------------------------
@@ -10014,5 +11337,403 @@ mod tests {
             }
             other => panic!("expected Provisional, got {:?}", other),
         }
+    }
+
+    // ---- Filesystem read-grant tests ----------------------------------------
+
+    #[test]
+    fn grant_envelope_routes_to_its_own_variant() {
+        let grant_json = serde_json::to_string(&IncomingMessage::Grant {
+            grant: GrantRequest::Read {
+                path: "/home/op/values.yaml".to_string(),
+                ttl_secs: 300,
+                session_token: None,
+                reevaluate: false,
+            },
+        })
+        .unwrap();
+        let parsed: IncomingMessage = serde_json::from_str(&grant_json).unwrap();
+        assert!(matches!(parsed, IncomingMessage::Grant { .. }));
+
+        // A bare execute request still routes to Execute, not Grant, under the
+        // untagged enum.
+        let exec: IncomingMessage = serde_json::from_str(r#"{"binary":"ls","args":[]}"#).unwrap();
+        assert!(matches!(exec, IncomingMessage::Execute(_)));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn grant_read_is_denied_on_non_unix_platform() {
+        let (cfg, _buf) = make_test_config();
+        let caller = CallerIdentity::Unix { uid: 1000 };
+        let result = handle_grant_request(
+            &cfg,
+            &caller,
+            GrantRequest::Read {
+                path: "/home/op/values.yaml".to_string(),
+                ttl_secs: 300,
+                session_token: None,
+                reevaluate: false,
+            },
+        )
+        .await;
+        assert!(!result.policy_allowed());
+        assert!(
+            result
+                .policy_reason()
+                .contains("not supported on this platform"),
+            "got: {}",
+            result.policy_reason()
+        );
+    }
+
+    #[cfg(unix)]
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn acl_tools_available() -> bool {
+        let ok = |bin: &str| {
+            std::process::Command::new(bin)
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        ok("setfacl") && ok("getfacl")
+    }
+
+    #[cfg(unix)]
+    async fn getfacl_raw(path: &Path) -> String {
+        let out = Command::new("getfacl")
+            .arg("-n")
+            .arg("--absolute-names")
+            .arg("--")
+            .arg(path)
+            .output()
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    /// Whether a named `user:<uid>:` ACL entry exists on `path` (any perms).
+    #[cfg(unix)]
+    async fn getfacl_has_user(path: &Path, uid: u32) -> bool {
+        let want = format!("user:{uid}:");
+        getfacl_raw(path)
+            .await
+            .lines()
+            .any(|l| l.trim().starts_with(&want))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grant_read_deny_list_short_circuits_before_evaluator() {
+        // The evaluator here is LLM-disabled with no policy, so a request that
+        // reached it would be denied with "default-deny". A .vault_pass path is
+        // instead denied with the deny-list reason, proving the static check
+        // ran before any evaluator involvement.
+        let (cfg, _buf) = make_test_config();
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join(".vault_pass");
+        std::fs::write(&vault, "secret").unwrap();
+        let caller = CallerIdentity::Unix {
+            uid: unsafe { libc::geteuid() },
+        };
+        let result = handle_grant_request(
+            &cfg,
+            &caller,
+            GrantRequest::Read {
+                path: vault.display().to_string(),
+                ttl_secs: 300,
+                session_token: None,
+                reevaluate: false,
+            },
+        )
+        .await;
+        assert!(!result.policy_allowed());
+        assert!(
+            result.policy_reason().contains("credential material"),
+            "expected deny-list reason, got: {}",
+            result.policy_reason()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grant_read_denies_kubeconfig() {
+        let (cfg, _buf) = make_test_config();
+        let dir = tempfile::tempdir().unwrap();
+        let kube = dir.path().join(".kube");
+        std::fs::create_dir_all(&kube).unwrap();
+        let config_file = kube.join("config");
+        std::fs::write(&config_file, "apiVersion: v1").unwrap();
+        let caller = CallerIdentity::Unix {
+            uid: unsafe { libc::geteuid() },
+        };
+        let result = handle_grant_request(
+            &cfg,
+            &caller,
+            GrantRequest::Read {
+                path: config_file.display().to_string(),
+                ttl_secs: 300,
+                session_token: None,
+                reevaluate: false,
+            },
+        )
+        .await;
+        assert!(!result.policy_allowed());
+        assert!(
+            result.policy_reason().contains("kube-proxy"),
+            "got: {}",
+            result.policy_reason()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grant_revoke_is_not_scoped_to_the_requesting_caller() {
+        // Revocation is intentionally an any-caller operation: a grant created
+        // under session A can be revoked by a caller presenting session B's token
+        // (or none at all), because revoking only ever removes access. This
+        // proves that documented design (see the comment at handle_grant_revoke),
+        // not an oversight in the unused `_session_token` parameter.
+        let (cfg, _buf) = make_test_config();
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("values.yaml");
+        std::fs::write(&target, "k: v").unwrap();
+        let key = std::fs::canonicalize(&target)
+            .unwrap()
+            .display()
+            .to_string();
+
+        // Session A seeds an active grant. Empty ACL entries keep revocation free
+        // of any real setfacl call (nothing to remove), so the test does not
+        // depend on ACL tooling being installed.
+        let now = now_unix();
+        cfg.read_grants.write().await.insert(ReadGrant {
+            handle: "hA".to_string(),
+            principal: Some(PrincipalKey::from_uid(4242)),
+            granting_session: Some("session-A".to_string()),
+            target_path: key.clone(),
+            grantee_uid: 4242,
+            entries: Vec::new(),
+            reason: "seeded by session A".to_string(),
+            created_unix: now,
+            expires_unix: now + 300,
+            status: ReadGrantStatus::Active,
+            revert_detail: None,
+        });
+
+        // Session B (a different token) revokes by path alone.
+        let caller_b = CallerIdentity::Unix {
+            uid: unsafe { libc::geteuid() },
+        };
+        let result = handle_grant_revoke(
+            &cfg,
+            &caller_b,
+            target.display().to_string(),
+            Some("session-B".to_string()),
+        )
+        .await;
+
+        assert!(
+            result.policy_allowed(),
+            "any caller may revoke; got: {}",
+            result.policy_reason()
+        );
+        assert_eq!(
+            cfg.read_grants.read().await.get(&key).unwrap().status,
+            ReadGrantStatus::Revoked,
+            "the grant session A created must be revoked by session B"
+        );
+    }
+
+    /// Build a home/pub_dir(0755)/priv_dir(0700)/values.yaml tree and return the
+    /// paths, so ACL tests can exercise "add traverse only where missing".
+    #[cfg(unix)]
+    fn build_grant_tree(home: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let pub_dir = home.join("pub_dir");
+        std::fs::create_dir(&pub_dir).unwrap();
+        set_mode(&pub_dir, 0o755);
+        let priv_dir = pub_dir.join("priv_dir");
+        std::fs::create_dir(&priv_dir).unwrap();
+        set_mode(&priv_dir, 0o700);
+        let target = priv_dir.join("values.yaml");
+        std::fs::write(&target, "k: v").unwrap();
+        set_mode(&target, 0o600);
+        (pub_dir, priv_dir, target)
+    }
+
+    // A uid distinct from the test runner's own, so owner permission bits never
+    // grant it traverse and the "where missing" logic must add an entry.
+    #[cfg(unix)]
+    const TEST_GRANTEE_UID: u32 = 987654;
+    #[cfg(unix)]
+    const TEST_GRANTEE_GID: u32 = 987654;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_read_grant_adds_traverse_only_where_missing_and_only_x() {
+        if !acl_tools_available() {
+            eprintln!("skipping: setfacl/getfacl not available");
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        set_mode(home.path(), 0o755); // world-traversable home: no traverse grant needed here
+        let (pub_dir, priv_dir, target) = build_grant_tree(home.path());
+        let pub_before = getfacl_raw(&pub_dir).await;
+
+        let entries = apply_read_grant(&target, TEST_GRANTEE_UID, TEST_GRANTEE_GID, home.path())
+            .await
+            .expect("apply grant");
+
+        // The private dir was 0700, so a traverse grant was added; the
+        // world-traversable pub dir and home were skipped. The leaf got read.
+        let priv_str = priv_dir.display().to_string();
+        let target_str = target.display().to_string();
+        let pub_str = pub_dir.display().to_string();
+        let home_str = home.path().display().to_string();
+        assert!(
+            entries.iter().any(|e| e.path == priv_str && e.perms == "x"),
+            "priv dir should get an x-only traverse grant: {entries:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.path == target_str && e.perms == "r"),
+            "leaf should get an r grant: {entries:?}"
+        );
+        assert!(
+            !entries.iter().any(|e| e.path == pub_str),
+            "world-traversable pub dir must NOT get a grant: {entries:?}"
+        );
+        assert!(
+            !entries.iter().any(|e| e.path == home_str),
+            "world-traversable home must NOT get a grant: {entries:?}"
+        );
+        // Every ancestor grant is x-only (never r or w).
+        for e in &entries {
+            if e.path != target_str {
+                assert_eq!(e.perms, "x", "ancestor grant must be x-only: {e:?}");
+            }
+        }
+        // The untouched pub dir's ACL is byte-identical to before.
+        assert_eq!(pub_before, getfacl_raw(&pub_dir).await);
+        assert!(getfacl_user_has_traverse(&priv_dir, TEST_GRANTEE_UID).await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn revoke_removes_exactly_added_entries_and_nothing_else() {
+        if !acl_tools_available() {
+            eprintln!("skipping: setfacl/getfacl not available");
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        set_mode(home.path(), 0o755);
+        let (pub_dir, priv_dir, target) = build_grant_tree(home.path());
+
+        // Seed an unrelated pre-existing ACL entry on the private dir; revocation
+        // must leave it untouched (proving "removes exactly the added entries and
+        // nothing else", which a blanket ACL wipe would violate).
+        const OTHER_UID: u32 = 111222;
+        let seed = Command::new("setfacl")
+            .arg("-m")
+            .arg(format!("u:{OTHER_UID}:rx"))
+            .arg("--")
+            .arg(&priv_dir)
+            .output()
+            .await
+            .unwrap();
+        assert!(seed.status.success());
+        assert!(getfacl_has_user(&priv_dir, OTHER_UID).await);
+        let pub_before = getfacl_raw(&pub_dir).await;
+
+        let entries = apply_read_grant(&target, TEST_GRANTEE_UID, TEST_GRANTEE_GID, home.path())
+            .await
+            .expect("apply grant");
+        assert!(getfacl_has_user(&priv_dir, TEST_GRANTEE_UID).await);
+
+        let grant = ReadGrant {
+            handle: "h".to_string(),
+            principal: None,
+            granting_session: None,
+            target_path: target.display().to_string(),
+            grantee_uid: TEST_GRANTEE_UID,
+            entries,
+            reason: "test".to_string(),
+            created_unix: 0,
+            expires_unix: 0,
+            status: ReadGrantStatus::Reverting,
+            revert_detail: None,
+        };
+        revoke_read_grant_acls(&grant).await.expect("revoke");
+
+        // Exactly the granted entry is gone; the pre-existing unrelated entry
+        // survives, and the never-touched pub dir is byte-identical.
+        assert!(
+            !getfacl_has_user(&priv_dir, TEST_GRANTEE_UID).await,
+            "granted entry must be removed"
+        );
+        assert!(
+            getfacl_has_user(&priv_dir, OTHER_UID).await,
+            "pre-existing unrelated ACL entry must survive revocation"
+        );
+        assert!(!getfacl_has_user(&target, TEST_GRANTEE_UID).await);
+        assert_eq!(pub_before, getfacl_raw(&pub_dir).await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn expired_read_grant_is_auto_revoked() {
+        if !acl_tools_available() {
+            eprintln!("skipping: setfacl/getfacl not available");
+            return;
+        }
+        let (cfg, _buf) = make_test_config();
+        let home = tempfile::tempdir().unwrap();
+        set_mode(home.path(), 0o755);
+        let (_pub_dir, priv_dir, target) = build_grant_tree(home.path());
+
+        let entries = apply_read_grant(&target, TEST_GRANTEE_UID, TEST_GRANTEE_GID, home.path())
+            .await
+            .expect("apply grant");
+        assert!(getfacl_user_has_traverse(&priv_dir, TEST_GRANTEE_UID).await);
+
+        let now = now_unix();
+        let grant = ReadGrant {
+            handle: "h".to_string(),
+            principal: None,
+            granting_session: None,
+            target_path: target.display().to_string(),
+            grantee_uid: TEST_GRANTEE_UID,
+            entries,
+            reason: "test".to_string(),
+            created_unix: now,
+            expires_unix: now.saturating_sub(1), // already past its TTL
+            status: ReadGrantStatus::Active,
+            revert_detail: None,
+        };
+        cfg.read_grants.write().await.insert(grant.clone());
+
+        // The sweeper's due-claim drives the timer: an expired Active grant is
+        // taken and then reverted.
+        let due = cfg.read_grants.write().await.take_due(now_unix());
+        assert_eq!(due.len(), 1);
+        finish_read_grant_revert(&cfg, &due[0], "expiry").await;
+
+        assert!(!getfacl_user_has_traverse(&priv_dir, TEST_GRANTEE_UID).await);
+        assert_eq!(
+            cfg.read_grants
+                .read()
+                .await
+                .get(&grant.target_path)
+                .unwrap()
+                .status,
+            ReadGrantStatus::Revoked
+        );
     }
 }

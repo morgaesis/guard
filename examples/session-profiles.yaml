@@ -1,0 +1,62 @@
+# Session-grant profiles: operator-authored, named bundles of the same fields
+# you would otherwise type into `guard session new`. Load with:
+#
+#   guard server start --socket /run/guard/guard.sock \
+#       --profiles /etc/guard/session-profiles.yaml
+#
+# Then mint a bounded session for an agent in one round trip, with no per-session
+# prose authoring:
+#
+#   eval "$(guard session new --profile cert-manager-rotation)"
+#
+# A profile only pre-authors a grant. The minted session takes the identical
+# install and validation path as a hand-authored `guard session new`, so it is
+# no new trust boundary: a session allow-glob short-circuits to ALLOW before the
+# LLM, a session deny-glob short-circuits to DENY, and anything the globs do not
+# cover still falls through to the normal per-command evaluator with the
+# profile's prompt appended as context. Profiles are read once at daemon startup.
+#
+# Each profile has:
+#   name          required, the --profile argument
+#   description   operator-facing note (metadata only)
+#   ttl_secs      grant lifetime in seconds; omit for no expiry
+#   allow / deny  session glob patterns (deny beats allow)
+#   prompt_append evaluator context for commands that fall through the globs
+
+profiles:
+  # A repeatable "box" for cert-manager certificate rotation: the allow globs
+  # cover the expected read/rotate commands, the deny globs fence off the
+  # destructive neighbours, and the prompt tells the evaluator what the session
+  # is doing so borderline fall-through commands are judged in context.
+  - name: cert-manager-rotation
+    description: Rotate cert-manager certificates in the cert-manager namespace
+    ttl_secs: 3600
+    allow:
+      - "kubectl get certificate*"
+      - "kubectl describe certificate*"
+      - "kubectl get secret* -n cert-manager"
+      - "kubectl delete secret* -n cert-manager"
+      - "kubectl annotate certificate*"
+    deny:
+      - "kubectl delete namespace*"
+      - "kubectl delete secret* -n kube-system"
+    prompt_append: >
+      This session performs cert-manager certificate rotation in the
+      cert-manager namespace: deleting a leaf certificate Secret to force
+      reissuance is expected. Deleting namespaces or unrelated system secrets
+      is not.
+
+  # A read-only inspection box with no expiry cap on the daemon side.
+  - name: kube-readonly
+    description: Read-only Kubernetes inspection
+    allow:
+      - "kubectl get*"
+      - "kubectl describe*"
+      - "kubectl logs*"
+    deny:
+      - "kubectl delete*"
+      - "kubectl apply*"
+      - "kubectl edit*"
+    prompt_append: >
+      This session is read-only Kubernetes inspection. Any mutating command is
+      out of scope.
