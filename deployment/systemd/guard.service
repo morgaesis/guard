@@ -20,6 +20,44 @@ ExecStart=/usr/local/bin/guard server start --socket /run/guard/guard.sock --sta
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
+# `guard grant-read` needs to run `setfacl`/`getfacl` against files and
+# directories owned by the operator, not by the guard user -- that is the
+# whole point of the feature (see DEPLOYMENT.md's "grant-read" section). Two
+# capabilities cover exactly that, without making guard root or setuid:
+#   CAP_FOWNER          bypasses the "caller must own the file" check that
+#                        chmod/setfacl otherwise enforce (capabilities(7):
+#                        "set Access Control Lists (ACLs) on arbitrary files").
+#   CAP_DAC_READ_SEARCH  bypasses file read permission checks and directory
+#                        read/execute (search) permission checks generally
+#                        (capabilities(7)), so guard can both traverse an
+#                        ancestor directory it lacks search access to (e.g. a
+#                        caller's 750 home) and read a file to inspect/plan its
+#                        ACL.
+# AmbientCapabilities= is the mechanism designed for exactly this: granting a
+# non-root, non-setuid process a fixed capability set that survives its own
+# execve() and the User= identity switch (systemd.exec(5): "Ambient capability
+# sets are useful if you want to execute a process as a non-privileged user
+# but still want to give it some capabilities" -- it automatically adds the
+# keep-caps securebit to retain them across the User= switch). It is
+# unaffected by NoNewPrivileges=true above: that directive only blocks a
+# process from gaining MORE privilege via an executed file's own setuid/setgid
+# bits or file capabilities (capabilities(7); systemd.exec(5)); it does not
+# touch capabilities the unit itself grants via AmbientCapabilities=.
+#
+# These ambient capabilities are for the daemon's OWN setfacl/getfacl calls
+# only. Because ambient capabilities are otherwise inherited across execve(),
+# guard clears the ambient AND inheritable sets of every brokered (caller-
+# requested) child before it execs (see drop_brokered_child_capabilities in
+# src/server.rs), so a brokered `cat`/`ansible-playbook`/etc. never inherits
+# CAP_DAC_READ_SEARCH or CAP_FOWNER and cannot bypass file DAC.
+#
+# No explicit CapabilityBoundingSet= is set: narrowing the bounding set to just
+# these two would also become a hard ceiling for any descendant that later gains
+# privilege via sudo/setuid-root (a documented privileged-broker use case, run
+# with NoNewPrivileges=false), silently stripping capabilities such a child
+# relies on. AmbientCapabilities= grants the two capabilities without lowering
+# that ceiling.
+AmbientCapabilities=CAP_FOWNER CAP_DAC_READ_SEARCH
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only

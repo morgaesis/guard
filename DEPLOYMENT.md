@@ -80,6 +80,34 @@ than the daemon, so the gate, the secret namespace, and the approval RPCs are al
 beyond their reach. This holds identically on Unix (uid separation) and Windows
 (service-account isolation with ACL'd state and credential directories).
 
+### Session-grant profiles
+
+A session-grant profile is an operator-authored, named bundle of the same fields
+the foreman would otherwise type into `guard session new`: a ttl, allow/deny
+globs, and evaluator prompt context. It pre-authors a recurring, bounded box of
+access (for example, cert-manager certificate rotation) once, so a session does
+not have to be re-authored per worker or per operator round-trip.
+
+The daemon loads a profile catalog from `--profiles <path>` (or the
+`GUARD_PROFILES` environment variable) at `guard server start`. The catalog is a
+`profiles:` list of named entries in operator-controlled YAML
+([`examples/session-profiles.yaml`](examples/session-profiles.yaml) is a
+reference). It is read once at startup, not hot-reloaded, so a catalog change
+takes effect on the next daemon start. An explicitly named path that is missing
+or malformed fails startup loudly rather than starting with no profiles, the same
+as `--verbs`; parsing also rejects duplicate names and a profile that would grant
+nothing.
+
+The foreman mints a session from a profile in one round trip with
+`guard session new --profile <name>`, which returns the `GUARD_SESSION` token to
+hand to a worker. An unknown name is rejected by the daemon. A profile is a no
+new trust boundary: the session it mints takes the identical install and
+validation path as a hand-authored `guard session new`, so it can express nothing
+an operator could not type directly. A session allow-glob short-circuits to allow
+before the evaluator, a deny-glob short-circuits to deny, and anything the globs
+do not cover still falls through to the per-command evaluator with the profile's
+prompt appended as context.
+
 ## Recommended deployment
 
 Choose the deployment model based on what authority the daemon should have.
@@ -96,6 +124,113 @@ hosts.
   and `NoNewPrivileges` prevents setuid helpers such as `sudo` from elevating.
 - This model is useful for read-only inspection, SSH proxying, and secret
   injection where local privilege escalation is not required.
+- A brokered command (`ansible`, `helm`) that needs to read one specific
+  operator-owned config/vars/values file the daemon user does not own does not
+  require a broader trust model for that alone -- see "`grant-read`: scoped
+  file read grants" below, which is the preferred path for exactly this case
+  under the unprivileged model.
+
+### `grant-read`: scoped file read grants
+
+`guard grant-read <path> --ttl <seconds>` grants guard's own service account
+(or, under `--exec-as-caller`, the caller's uid) a time-boxed POSIX ACL read
+grant on one caller-named file, so a brokered `ansible`/`helm` command can read
+an operator config/vars/values file the daemon user does not own -- without
+making the daemon root or dropping to `--exec-as-caller`. The request goes
+through the same static credential deny-list, session allow/deny globs, and
+LLM evaluator as any other brokered request, and the grant auto-revokes at its
+TTL (bounded, no unbounded grant). This is the preferred, default path for the
+"brokered command needs to read an operator file" gap under the unprivileged
+policy-gate model above; `--exec-as-caller` remains documented below for its
+own broader per-uid command-execution use cases (not specific to file reads,
+and not affected by this feature).
+
+Two pieces of host setup are required for `grant-read` to actually work under
+the packaged, unprivileged `guard.service`:
+
+1. **Capabilities to bypass DAC ownership/traversal checks.** `setfacl`/`getfacl`
+   normally require the caller to own the target (or its parent, for adding an
+   entry) and to be able to traverse every ancestor directory. guard's service
+   account owns neither the operator's files nor, typically, the operator's
+   home directory. Two capabilities close this gap without making guard root
+   or setuid:
+   - `CAP_FOWNER` bypasses the "caller must own the file" check `setfacl`/`chmod`
+     enforce (`capabilities(7)` lists "set Access Control Lists (ACLs) on
+     arbitrary files" as one of the operations this capability grants).
+   - `CAP_DAC_READ_SEARCH` bypasses file read permission checks and directory
+     read/execute (search) permission checks generally (`capabilities(7)`), so
+     guard can both traverse an ancestor directory it cannot otherwise search
+     (e.g. an operator's `750` home directory, to add an `--x` ACL entry) and
+     read a file to inspect and plan its ACL.
+
+   The packaged [`deployment/systemd/guard.service`](deployment/systemd/guard.service)
+   already grants both, to the still-unprivileged `guard` user, via:
+
+   ```ini
+   AmbientCapabilities=CAP_FOWNER CAP_DAC_READ_SEARCH
+   ```
+
+   `AmbientCapabilities=` is the mechanism designed for exactly this: it grants
+   a fixed capability set to a non-root, non-setuid process that survives its
+   own `execve()` and the `User=` identity switch (`systemd.exec(5)`: ambient
+   capability sets "are useful if you want to execute a process as a
+   non-privileged user but still want to give it some capabilities"; systemd
+   automatically retains them across the `User=` switch via the `keep-caps`
+   securebit). It is unaffected by `NoNewPrivileges=true`, which only blocks a
+   process from gaining *more* privilege via an executed file's own
+   setuid/setgid bits or file capabilities (`capabilities(7)`,
+   `systemd.exec(5)`) -- it does not touch capabilities the unit itself grants
+   via `AmbientCapabilities=`.
+
+   These capabilities are for the daemon's own `setfacl`/`getfacl` calls only.
+   Because ambient capabilities are otherwise inherited across `execve()`, guard
+   clears the ambient *and* inheritable capability sets of every brokered
+   (caller-requested) child before it execs, so an approved brokered command
+   (`cat`, `ansible-playbook`, `kubectl`, …) never inherits `CAP_DAC_READ_SEARCH`
+   or `CAP_FOWNER` and cannot use them to bypass file DAC or the `grant-read`
+   deny-list; only the daemon's own ACL operations are privileged.
+
+   The unit deliberately sets **no** explicit `CapabilityBoundingSet=`. Narrowing
+   the bounding set to just these two capabilities would make it a hard ceiling
+   for every descendant, including one that later gains privilege via
+   `sudo`/setuid-root under the privileged-broker model (run with
+   `NoNewPrivileges=false`); that would silently strip whatever capabilities a
+   `sudo`-elevated child previously relied on. `AmbientCapabilities=` grants the
+   two capabilities to the daemon without lowering that ceiling for elevated
+   descendants.
+
+2. **A host-specific `ReadWritePaths=` carve-out.** `ProtectSystem=strict` +
+   `ProtectHome=read-only` on the packaged unit mount essentially everything
+   outside `ReadWritePaths=` read-only at the mount-namespace level. Adding an
+   ACL entry is a metadata *write*, so it stays blocked there even with both
+   capabilities above -- `systemd.exec(5)`: "Use `ReadWritePaths=` in order to
+   allow-list specific paths for write access if `ProtectSystem=strict` is
+   used." Because the paths an operator wants to grant reads under are
+   host-specific (wherever that operator's ops checkouts live), this carve-out
+   must **not** be hardcoded into the packaged unit. Add it as a drop-in
+   instead, e.g. `/etc/systemd/system/guard.service.d/60-read-grant-paths.conf`:
+
+   ```ini
+   [Service]
+   ReadWritePaths=/home/OPERATOR_USER/PATH/TO/OPS-CHECKOUT
+   ```
+
+   (`OPERATOR_USER`/`PATH/TO/OPS-CHECKOUT` are placeholders -- substitute the
+   real path(s) for the host.) Carve in the root of the tree files may be
+   granted under, up to and including the operator's home directory: a grant
+   may add a traverse-only ACL entry to ancestor directories between the
+   target file and that home boundary (see `guard::gating::read_grant`), and
+   those writes need the same carve-out as the leaf file's own grant. Reload
+   after adding the drop-in: `systemctl daemon-reload && systemctl restart
+   guard`; `systemctl cat guard.service` shows the merged unit.
+
+   This carve-out only lifts the systemd-level read-only *mount* restriction --
+   it grants no DAC/ACL access by itself, and by itself it exposes nothing.
+   Actual read access is still gated by the deny-list, the session/evaluator
+   decision, and the per-file ACL grant `grant-read` applies and auto-revokes
+   on approval; a path being writable at the mount-namespace level only makes
+   it *possible* for an approved `grant-read` call to place an ACL entry
+   there.
 
 ### Privileged command broker
 
@@ -116,7 +251,30 @@ By default the server validates caller UIDs but executes commands as its own
 service identity, so a root service is a privileged broker, not per-user
 impersonation. A Unix root daemon started with `--exec-as-caller` over a
 Unix-socket-only listener instead drops each child to the calling uid before
-exec, making it a per-user secret broker. `--exec-as-caller` is Unix-only.
+exec, making it a per-user secret broker. `--exec-as-caller` is Unix-only. If
+the only reason to reach for this model is a brokered command needing to read
+one operator-owned config/vars/values file, use `grant-read` under the
+unprivileged policy-gate model instead (see above) -- it solves that
+narrower case without the daemon needing root or per-uid command execution.
+`--exec-as-caller` remains the right tool for its own broader per-uid
+command-execution use cases.
+
+The two packaged systemd units embody these modes.
+[`deployment/systemd/guard.service`](deployment/systemd/guard.service) runs as a
+dedicated `guard` service account with `ProtectHome=read-only`; approved commands
+execute as that account.
+[`deployment/systemd/guard-exec-as-caller.service`](deployment/systemd/guard-exec-as-caller.service)
+runs as root and drops each approved command to the connecting caller's uid.
+
+Choose `guard-exec-as-caller.service` whenever the brokered commands read files
+the invoking user owns — ansible playbooks and inventories, Helm charts and
+values files, a caller's kubeconfig, or anything under the caller's home
+directory. `guard.service` cannot read those files: the dedicated `guard`
+account is a separate unprivileged uid with no access to another user's files,
+so the command runs as `guard` and the read fails. This is the ordinary reason
+to run exec-as-caller, not an edge case. When approved commands only touch paths
+the `guard` account itself owns (its state directory, a broker credential it
+holds), `guard.service` is sufficient.
 
 ## OS-level sandboxing profiles
 
@@ -228,6 +386,7 @@ in `guard verb list`.
 Example systemd files:
 
 - [`deployment/systemd/guard.service`](deployment/systemd/guard.service)
+- [`deployment/systemd/guard-exec-as-caller.service`](deployment/systemd/guard-exec-as-caller.service)
 - [`deployment/systemd/guard.env.example`](deployment/systemd/guard.env.example)
 
 These examples are intentionally generic. Adjust user, group, socket path, allowed UIDs, mode, and hardening directives for the target host.

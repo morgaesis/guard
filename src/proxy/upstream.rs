@@ -71,26 +71,33 @@ struct User {
     key_data: Option<String>,
     #[serde(rename = "client-key")]
     key_file: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
     exec: Option<serde_yaml::Value>,
     #[serde(rename = "auth-provider")]
     auth_provider: Option<serde_yaml::Value>,
 }
 
-/// A configured connection to the real apiserver. Holds the operator's
-/// credentials (a bearer token and/or a client identity baked into the TLS
-/// client); the proxy injects them when it re-originates a request.
+/// A configured connection to the real apiserver. Holds exactly one of the
+/// operator's authentication methods (a bearer token, a client identity baked
+/// into the TLS client, or HTTP basic auth); the proxy injects it when it
+/// re-originates a request. Presenting more than one would make the apiserver
+/// reject the identity, so [`Upstream::from_kubeconfig_str`] resolves a single
+/// method by precedence.
 pub struct Upstream {
     base: String,
     client: reqwest::Client,
     bearer: Option<String>,
+    basic: Option<(String, String)>,
 }
 
 impl std::fmt::Debug for Upstream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Never expose the operator's bearer token in debug output.
+        // Never expose the operator's credentials in debug output.
         f.debug_struct("Upstream")
             .field("base", &self.base)
             .field("bearer", &self.bearer.as_ref().map(|_| "<redacted>"))
+            .field("basic", &self.basic.as_ref().map(|_| "<redacted>"))
             .finish_non_exhaustive()
     }
 }
@@ -168,23 +175,11 @@ impl Upstream {
             builder = builder.danger_accept_invalid_certs(true);
         }
 
-        // Client-certificate identity, if the user authenticates that way.
-        let cert_pem = read_pem(
-            &user.cert_data,
-            user.cert_file.as_deref(),
-            "client-certificate",
-        )?;
-        let key_pem = read_pem(&user.key_data, user.key_file.as_deref(), "client-key")?;
-        if let (Some(cert), Some(key)) = (cert_pem.as_ref(), key_pem.as_ref()) {
-            let mut id = Vec::with_capacity(cert.len() + key.len() + 1);
-            id.extend_from_slice(cert);
-            id.push(b'\n');
-            id.extend_from_slice(key);
-            let identity = reqwest::Identity::from_pem(&id).context("build client identity")?;
-            builder = builder.identity(identity);
-        }
-
-        // Bearer token, if present (inline or from a file).
+        // Resolve exactly one authentication method. A kubeconfig user may carry
+        // several (a client cert alongside basic auth, say); the apiserver rejects
+        // an identity that presents more than one, so pick a single method by
+        // precedence: bearer token, then client certificate, then basic auth. The
+        // lower-precedence fields are dropped, not layered on top.
         let bearer = if let Some(t) = &user.token {
             Some(t.clone())
         } else if let Some(tf) = &user.token_file {
@@ -198,11 +193,50 @@ impl Upstream {
             None
         };
 
+        let cert_pem = read_pem(
+            &user.cert_data,
+            user.cert_file.as_deref(),
+            "client-certificate",
+        )?;
+        let key_pem = read_pem(&user.key_data, user.key_file.as_deref(), "client-key")?;
+        let client_identity = match (cert_pem.as_ref(), key_pem.as_ref()) {
+            (Some(cert), Some(key)) => {
+                let mut id = Vec::with_capacity(cert.len() + key.len() + 1);
+                id.extend_from_slice(cert);
+                id.push(b'\n');
+                id.extend_from_slice(key);
+                Some(reqwest::Identity::from_pem(&id).context("build client identity")?)
+            }
+            _ => None,
+        };
+
+        let basic = match (&user.username, &user.password) {
+            (Some(u), p) => Some((u.clone(), p.clone().unwrap_or_default())),
+            _ => None,
+        };
+
+        // Bind the single method to the client/request path. Attaching the client
+        // certificate is a client-level decision, so only do it when the cert is
+        // the elected method (a token takes precedence and stands alone).
+        let (bearer, basic) = if bearer.is_some() {
+            (bearer, None)
+        } else if client_identity.is_some() {
+            (None, None)
+        } else {
+            (None, basic)
+        };
+        if let Some(identity) = client_identity {
+            if bearer.is_none() && basic.is_none() {
+                builder = builder.identity(identity);
+            }
+        }
+
         let client = builder.build().context("build upstream TLS client")?;
         Ok(Self {
             base: cluster.cluster.server.trim_end_matches('/').to_string(),
             client,
             bearer,
+            basic,
         })
     }
 
@@ -219,6 +253,13 @@ impl Upstream {
     /// The operator's bearer token, injected on each forwarded request.
     pub fn bearer(&self) -> Option<&str> {
         self.bearer.as_deref()
+    }
+
+    /// The operator's HTTP basic-auth credential (`username`, `password`),
+    /// injected on each forwarded request when no bearer token or client
+    /// certificate is configured.
+    pub fn basic_auth(&self) -> Option<(&str, &str)> {
+        self.basic.as_ref().map(|(u, p)| (u.as_str(), p.as_str()))
     }
 }
 
@@ -289,6 +330,48 @@ users:
     }
 
     #[test]
+    fn token_replaces_basic_auth() {
+        // A user carrying basic-auth *and* a token must present exactly one
+        // method upstream: the token wins and the basic-auth fields are dropped,
+        // so the apiserver never sees `[token basicAuth]`.
+        let yaml = r#"
+apiVersion: v1
+kind: Config
+current-context: ctx
+clusters: [{name: c, cluster: {server: "https://x:6443"}}]
+contexts: [{name: ctx, context: {cluster: c, user: u}}]
+users:
+  - name: u
+    user:
+      username: admin
+      password: hunter2
+      token: brokered-secret-token
+"#;
+        let up = Upstream::from_kubeconfig_str(yaml, None).expect("parse");
+        assert_eq!(up.bearer(), Some("brokered-secret-token"));
+        assert_eq!(up.basic_auth(), None, "basic auth must be dropped");
+    }
+
+    #[test]
+    fn basic_auth_without_token_is_used() {
+        let yaml = r#"
+apiVersion: v1
+kind: Config
+current-context: ctx
+clusters: [{name: c, cluster: {server: "https://x:6443"}}]
+contexts: [{name: ctx, context: {cluster: c, user: u}}]
+users:
+  - name: u
+    user:
+      username: admin
+      password: hunter2
+"#;
+        let up = Upstream::from_kubeconfig_str(yaml, None).expect("parse");
+        assert_eq!(up.bearer(), None);
+        assert_eq!(up.basic_auth(), Some(("admin", "hunter2")));
+    }
+
+    #[test]
     fn rejects_exec_plugin() {
         let yaml = r#"
 apiVersion: v1
@@ -317,5 +400,59 @@ users: [{name: u, user: {token: t}}]
         // No current-context and none supplied.
         let err = Upstream::from_kubeconfig_str(yaml, None).unwrap_err();
         assert!(err.to_string().contains("current-context"), "{err}");
+    }
+
+    /// A throwaway client certificate + key as base64-encoded PEM, for exercising
+    /// the client-certificate precedence legs. rcgen is already a dependency (the
+    /// proxy's own TLS material uses it), so this needs no fixture files.
+    fn client_cert_key_b64() -> (String, String) {
+        let key = rcgen::KeyPair::generate().expect("keypair");
+        let params =
+            rcgen::CertificateParams::new(vec!["test-client".to_string()]).expect("params");
+        let cert = params.self_signed(&key).expect("self-sign");
+        let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s.as_bytes());
+        (b64(&cert.pem()), b64(&key.serialize_pem()))
+    }
+
+    #[test]
+    fn token_takes_precedence_over_client_cert() {
+        // A user carrying BOTH a bearer token and a (valid) client certificate
+        // must resolve to the token alone: the certificate is not attached and no
+        // basic auth is layered on, so the apiserver sees exactly one method.
+        let (cert_b64, key_b64) = client_cert_key_b64();
+        let yaml = format!(
+            "apiVersion: v1\n\
+             kind: Config\n\
+             current-context: ctx\n\
+             clusters: [{{name: c, cluster: {{server: \"https://x:6443\"}}}}]\n\
+             contexts: [{{name: ctx, context: {{cluster: c, user: u}}}}]\n\
+             users: [{{name: u, user: {{token: brokered-secret-token, client-certificate-data: {cert_b64}, client-key-data: {key_b64}}}}}]\n"
+        );
+        let up = Upstream::from_kubeconfig_str(&yaml, None).expect("parse");
+        assert_eq!(up.bearer(), Some("brokered-secret-token"));
+        assert_eq!(up.basic_auth(), None);
+    }
+
+    #[test]
+    fn client_cert_takes_precedence_over_basic_auth() {
+        // With no token, a user carrying BOTH a (valid) client certificate and
+        // basic auth resolves to the certificate: basic auth is dropped, not
+        // layered on top.
+        let (cert_b64, key_b64) = client_cert_key_b64();
+        let yaml = format!(
+            "apiVersion: v1\n\
+             kind: Config\n\
+             current-context: ctx\n\
+             clusters: [{{name: c, cluster: {{server: \"https://x:6443\"}}}}]\n\
+             contexts: [{{name: ctx, context: {{cluster: c, user: u}}}}]\n\
+             users: [{{name: u, user: {{username: admin, password: hunter2, client-certificate-data: {cert_b64}, client-key-data: {key_b64}}}}}]\n"
+        );
+        let up = Upstream::from_kubeconfig_str(&yaml, None).expect("parse");
+        assert_eq!(up.bearer(), None);
+        assert_eq!(
+            up.basic_auth(),
+            None,
+            "basic auth must be dropped when a client certificate is elected"
+        );
     }
 }

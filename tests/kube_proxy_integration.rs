@@ -196,13 +196,19 @@ async fn proxy_gates_redacts_and_forwards() {
 #[derive(Clone, Default)]
 struct RecordingSink {
     calls: Arc<std::sync::Mutex<Vec<guard::proxy::ApiMutation>>>,
+    resolved: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 #[async_trait::async_trait]
 impl guard::proxy::GateSink for RecordingSink {
     async fn arm_revert(&self, mutation: guard::proxy::ApiMutation) -> Option<String> {
+        let handle = format!("test-handle-{}", self.calls.lock().unwrap().len());
         self.calls.lock().unwrap().push(mutation);
-        Some("test-handle".to_string())
+        Some(handle)
+    }
+
+    async fn resolve(&self, handle: &str) {
+        self.resolved.lock().unwrap().push(handle.to_string());
     }
 }
 
@@ -458,4 +464,309 @@ async fn proxy_denies_subresource_and_strips_identity_headers() {
         !received.contains_key("x-remote-user"),
         "X-Remote-User must not reach the apiserver, got headers: {received:?}"
     );
+}
+
+/// A `SelfSubjectAccessReview` (`kubectl auth can-i`) is forwarded with the same
+/// single upstream credential the proxy injects on every request, so the
+/// self-check reflects the identity that actually performs writes rather than a
+/// separate or stale one. The header-echo upstream reports the Authorization it
+/// received.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_self_access_review_carries_upstream_credential() {
+    let mock_base = spawn_header_echo_upstream().await;
+    // The operator kubeconfig carries a bearer token; the proxy injects it on
+    // every forwarded request, including the self-access review.
+    let kubeconfig = format!(
+        "apiVersion: v1\nkind: Config\ncurrent-context: ctx\nclusters:\n  - name: c\n    cluster: {{server: \"{mock_base}\"}}\ncontexts:\n  - name: ctx\n    context: {{cluster: c, user: u}}\nusers:\n  - name: u\n    user: {{token: operator-secret-token}}\n"
+    );
+    let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
+    let tls = ProxyTls::generate().expect("tls");
+    let ca_pem = tls.ca_pem().to_string();
+    // Allow the review create (cluster-scoped) so it reaches the upstream.
+    let policy = ApiPolicy::from_yaml(
+        "default: deny\nrules:\n  - verbs: [create]\n    resources: [selfsubjectaccessreviews]\n    namespaces: [\"*\"]\n    action: allow\n",
+    )
+    .expect("policy");
+    let port = free_port();
+    let listen = format!("127.0.0.1:{port}").parse().unwrap();
+    let proxy = Arc::new(KubeProxy::new(
+        listen,
+        tls,
+        upstream,
+        policy,
+        None,
+        std::path::PathBuf::from("unused-in-test-kubeconfig"),
+    ));
+
+    tokio::spawn(proxy.clone().serve());
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let base = format!("https://127.0.0.1:{port}");
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+
+    let review = json!({
+        "kind": "SelfSubjectAccessReview",
+        "apiVersion": "authorization.k8s.io/v1",
+        "spec": {"resourceAttributes": {"namespace": "dev", "verb": "create", "resource": "pods"}}
+    });
+    let resp = client
+        .post(format!(
+            "{base}/apis/authorization.k8s.io/v1/selfsubjectaccessreviews"
+        ))
+        .header("content-type", "application/json")
+        .body(review.to_string())
+        .send()
+        .await
+        .expect("self access review");
+    assert_eq!(resp.status(), 200, "the review is forwarded");
+    let v: Value = resp.json().await.unwrap();
+    let received = v["receivedHeaders"].as_object().expect("headers");
+    assert_eq!(
+        received.get("authorization").and_then(Value::as_str),
+        Some("Bearer operator-secret-token"),
+        "can-i must carry the same upstream credential writes use, got: {received:?}"
+    );
+}
+
+/// Mock apiserver for the provenance test: a POST returns a created Pod named
+/// `check-pod`; a DELETE returns a success Status (the object removed).
+async fn create_delete_mock_handler(
+    req: Request<Incoming>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    let (code, body) = match *req.method() {
+        hyper::Method::POST => (
+            201,
+            json!({"kind": "Pod", "apiVersion": "v1", "metadata": {"name": "check-pod", "namespace": "dev"}}),
+        ),
+        hyper::Method::DELETE => (
+            200,
+            json!({"kind": "Status", "apiVersion": "v1", "status": "Success"}),
+        ),
+        _ => (
+            200,
+            json!({"kind": "Status", "apiVersion": "v1", "status": "Success"}),
+        ),
+    };
+    Ok(Response::builder()
+        .status(code)
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(body.to_string())))
+        .unwrap())
+}
+
+async fn spawn_create_delete_mock() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(io, service_fn(create_delete_mock_handler))
+                    .await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// A delete of a resource guard itself created earlier in the session is
+/// contained cleanup (e.g. a Helm post-install hook removing its own check
+/// resource): it is allowed and its now-moot auto-revert is resolved, rather
+/// than being held like an unrecorded destructive delete. A delete of a
+/// resource with no creation record keeps the strict policy handling (hold).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_allows_contained_delete_of_created_resource() {
+    let mock_base = spawn_create_delete_mock().await;
+    let kubeconfig = format!(
+        "apiVersion: v1\nkind: Config\ncurrent-context: ctx\nclusters:\n  - name: c\n    cluster: {{server: \"{mock_base}\"}}\ncontexts:\n  - name: ctx\n    context: {{cluster: c, user: u}}\nusers:\n  - name: u\n    user: {{}}\n"
+    );
+    let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
+    let tls = ProxyTls::generate().expect("tls");
+    let ca_pem = tls.ca_pem().to_string();
+    let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).expect("policy");
+    let port = free_port();
+    let listen = format!("127.0.0.1:{port}").parse().unwrap();
+    let proxy = Arc::new(KubeProxy::new(
+        listen,
+        tls,
+        upstream,
+        policy,
+        None,
+        std::path::PathBuf::from("unused-in-test-kubeconfig"),
+    ));
+
+    let sink = RecordingSink::default();
+    proxy.attach_gate(Arc::new(sink.clone()));
+
+    tokio::spawn(proxy.clone().serve());
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let base = format!("https://127.0.0.1:{port}");
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+
+    // A delete with no creation record is held for operator approval (strict).
+    let resp = client
+        .delete(format!("{base}/api/v1/namespaces/dev/pods/other-pod"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "delete of an unrecorded resource stays held"
+    );
+
+    // Create a resource through the proxy; guard records its provenance.
+    let resp = client
+        .post(format!("{base}/api/v1/namespaces/dev/pods"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "create forwarded");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Deleting that same resource is now contained cleanup: allowed and forwarded.
+    let resp = client
+        .delete(format!("{base}/api/v1/namespaces/dev/pods/check-pod"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "delete of a guard-created resource is contained and allowed"
+    );
+
+    // The now-moot auto-revert for the create was resolved.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let resolved_count = sink.resolved.lock().unwrap().len();
+    assert_eq!(resolved_count, 1, "the create's auto-revert was resolved");
+
+    // Provenance is single-use: a second delete of the same name has no record
+    // and falls back to the strict hold.
+    let resp = client
+        .delete(format!("{base}/api/v1/namespaces/dev/pods/check-pod"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "provenance is consumed; a repeat delete is held again"
+    );
+}
+
+/// Mock apiserver that returns a Helm release-storage Secret: type
+/// `helm.sh/release.v1` with a single opaque `data.release` blob (Helm's
+/// doubly-base64-and-gzip-encoded release state), which is not a structured type
+/// the proxy models.
+async fn helm_release_mock_handler(
+    _req: Request<Incoming>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    let body = json!({
+        "kind": "Secret",
+        "apiVersion": "v1",
+        "metadata": {
+            "name": "sh.helm.release.v1.cert-manager.v1",
+            "namespace": "dev",
+            "labels": {"owner": "helm", "name": "cert-manager"}
+        },
+        "type": "helm.sh/release.v1",
+        "data": {"release": "SDRzSUFBQUFBQUFDLzZvR0FBWU5BUUFBQUE9PQ=="}
+    });
+    Ok(Response::builder()
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(body.to_string())))
+        .unwrap())
+}
+
+async fn spawn_helm_release_mock() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(io, service_fn(helm_release_mock_handler))
+                    .await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// Regression test: reading Helm's release-storage Secret must return a
+/// redacted-but-successful response. The opaque `data.release` blob is not a
+/// type the proxy can parse, so redaction masks it by default rather than
+/// hard-erroring the whole response -- otherwise `helm list`/`status`/`upgrade`,
+/// which read this Secret, would all fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_redacts_helm_release_secret_without_erroring() {
+    let mock_base = spawn_helm_release_mock().await;
+    let kubeconfig = format!(
+        "apiVersion: v1\nkind: Config\ncurrent-context: ctx\nclusters:\n  - name: c\n    cluster: {{server: \"{mock_base}\"}}\ncontexts:\n  - name: ctx\n    context: {{cluster: c, user: u}}\nusers:\n  - name: u\n    user: {{}}\n"
+    );
+    let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
+    let tls = ProxyTls::generate().expect("tls");
+    let ca_pem = tls.ca_pem().to_string();
+    let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).expect("policy");
+    let port = free_port();
+    let listen = format!("127.0.0.1:{port}").parse().unwrap();
+    let proxy = Arc::new(KubeProxy::new(
+        listen,
+        tls,
+        upstream,
+        policy,
+        None,
+        std::path::PathBuf::from("unused-in-test-kubeconfig"),
+    ));
+
+    tokio::spawn(proxy.clone().serve());
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let base = format!("https://127.0.0.1:{port}");
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+
+    let resp = client
+        .get(format!(
+            "{base}/api/v1/namespaces/dev/secrets/sh.helm.release.v1.cert-manager.v1"
+        ))
+        .send()
+        .await
+        .expect("helm release secret read");
+    assert_eq!(
+        resp.status(),
+        200,
+        "reading the Helm release Secret must succeed, not error on the opaque blob"
+    );
+    let v: Value = resp.json().await.unwrap();
+    assert!(
+        v.get("data").is_none(),
+        "the opaque release blob is redacted"
+    );
+    assert_eq!(
+        v["type"], "helm.sh/release.v1",
+        "the release Secret type survives so helm can identify it"
+    );
+    assert_eq!(v["metadata"]["labels"]["owner"], "helm");
 }

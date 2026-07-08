@@ -3,6 +3,7 @@
 #![allow(unused)]
 
 mod client_config;
+mod grant_profile;
 mod grant_rules;
 mod injection;
 mod mcp;
@@ -176,6 +177,10 @@ enum MainArgs {
     },
     /// Ask the evaluator to amend or deny a session grant without executing the command.
     /// Daemon-principal or TCP admin-token only.
+    //
+    // `disable_help_flag` so `guard appeal <binary> -h` forwards `-h` to the
+    // appealed command rather than printing this subcommand's help. Bare help
+    // (before a binary is named) is recovered by `passthrough_command_help_requested`.
     #[clap(
         disable_help_flag = true,
         after_help = "Use `guard appeal --session <token> <binary> --help` to pass --help to the appealed command."
@@ -258,6 +263,36 @@ enum MainArgs {
     /// Run or list operator-defined verbs (the typed, least-expressive interface).
     #[clap(subcommand)]
     Verb(VerbCommands),
+    /// Grant guard's brokering identity a time-boxed POSIX ACL read grant on a
+    /// specific operator-owned file (Unix only), so a brokered ansible/helm
+    /// command can read a config/vars/values file guard's service account
+    /// otherwise cannot. Evaluated through the same policy pipeline as any
+    /// brokered command (credential deny-list, session globs, LLM evaluator),
+    /// and auto-revoked when the TTL expires.
+    #[clap(name = "grant-read")]
+    GrantRead {
+        /// Path to the single file to grant read access on.
+        path: String,
+        /// Time-to-live in seconds (required; bounded to 24h). No unbounded grant.
+        #[arg(long, value_name = "SECONDS")]
+        ttl: u64,
+        /// Skip the auto-learned deny-shape fast path and force a fresh LLM look.
+        #[arg(long = "reevaluate", action = ArgAction::SetTrue)]
+        reevaluate: bool,
+        /// Server socket path (defaults to configured)
+        #[arg(long, value_name = "PATH")]
+        socket: Option<String>,
+    },
+    /// Revoke an active read grant early (Unix only). De-escalation; not
+    /// re-evaluated by the LLM, but audited.
+    #[clap(name = "grant-revoke")]
+    GrantRevoke {
+        /// Path the grant was issued on.
+        path: String,
+        /// Server socket path (defaults to configured)
+        #[arg(long, value_name = "PATH")]
+        socket: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -313,6 +348,11 @@ enum SessionCommands {
         /// --static-only is set.
         #[arg(value_name = "PROSE")]
         prose: Option<String>,
+        /// Mint this grant from an operator-defined profile (see --profiles on
+        /// `guard server start`): a named {ttl, allow, deny, prompt} bundle.
+        /// Works standalone; an unknown name is rejected by the daemon.
+        #[arg(long, value_name = "NAME")]
+        profile: Option<String>,
         /// Glob pattern to allow in this session (repeatable)
         #[arg(long = "allow", value_name = "GLOB")]
         allow: Vec<String>,
@@ -384,6 +424,10 @@ enum SessionCommands {
     },
     /// Ask the evaluator to amend or deny a session grant without executing the command.
     /// Daemon-principal or TCP admin-token only.
+    //
+    // `disable_help_flag`: same rationale as the top-level `Appeal` variant --
+    // `-h`/`--help` after the binary must reach the appealed command. Bare help is
+    // recovered by `passthrough_command_help_requested`.
     #[clap(
         disable_help_flag = true,
         after_help = "Use `guard session appeal <token> <binary> --help` to pass --help to the appealed command."
@@ -408,10 +452,12 @@ enum SessionCommands {
         #[arg(long, value_name = "PATH")]
         socket: Option<String>,
     },
-    /// Show one session in detail, including prompt, aggregate stats, and recent interactions.
+    /// Show one session in detail, including prompt, aggregate stats, and recent
+    /// interactions. With no token, defaults to the caller's own `$GUARD_SESSION`.
+    /// A non-daemon caller may only inspect the grant on its own token.
     Show {
-        /// Session token to inspect.
-        token: String,
+        /// Session token to inspect. Defaults to $GUARD_SESSION when omitted.
+        token: Option<String>,
         /// Number of recent interactions to print.
         #[arg(long, value_name = "N", default_value_t = 20)]
         limit: usize,
@@ -728,6 +774,13 @@ enum ServerCommands {
         #[arg(long, value_name = "PATH")]
         verbs: Option<PathBuf>,
 
+        /// Path to the session-grant profile catalog YAML: operator-authored,
+        /// named {ttl, allow, deny, prompt} bundles that `guard session new
+        /// --profile <name>` mints a grant from. Read once at startup.
+        /// Env: GUARD_PROFILES.
+        #[arg(long, value_name = "PATH")]
+        profiles: Option<PathBuf>,
+
         /// Restrict which binaries the server may execute, regardless of the LLM
         /// decision. Repeat or comma-separate (e.g. `--allow-bin kubectl,git`).
         /// Bare names match by command name via the daemon PATH; path-qualified
@@ -1016,6 +1069,13 @@ async fn main() -> Result<()> {
             socket,
         }) => handle_approval_note_cmd(socket, handle, text).await,
         Ok(MainArgs::Verb(subcommand)) => handle_verb(subcommand).await,
+        Ok(MainArgs::GrantRead {
+            path,
+            ttl,
+            reevaluate,
+            socket,
+        }) => handle_grant_read(path, ttl, reevaluate, socket).await,
+        Ok(MainArgs::GrantRevoke { path, socket }) => handle_grant_revoke(path, socket).await,
         Ok(MainArgs::Secrets(subcommand)) => handle_secrets(subcommand).await,
         Ok(MainArgs::Shim {
             tools,
@@ -1108,22 +1168,70 @@ fn top_level_version_requested(args: &[String]) -> bool {
     }
 }
 
+// The `run`/`exec` and `appeal` commands disable clap's help flag so that
+// `-h`/`--help` after the target binary forward to that binary instead of
+// printing guard's own help. The cost is that a help flag meant for guard
+// (before any binary is named) would otherwise error, so it is recovered here
+// and redirected to the subcommand's own help.
 fn passthrough_command_help_requested(
     args: &[String],
 ) -> Option<(Vec<&'static str>, &'static str)> {
     let is_help = |idx| matches!(args.get(idx).map(String::as_str), Some("--help" | "-h"));
     match args.first().map(String::as_str) {
         Some("run" | "exec") if is_help(1) && args.len() == 2 => Some((vec!["run"], "guard run")),
-        Some("appeal") if is_help(1) && args.len() == 2 => Some((vec!["appeal"], "guard appeal")),
+        // `guard appeal [--session T] [--socket P] <binary> ...`: the binary is
+        // the first positional. Help before it is guard's; after it forwards.
+        Some("appeal") if appeal_self_help_requested(&args[1..], &["--session", "--socket"], 0) => {
+            Some((vec!["appeal"], "guard appeal"))
+        }
+        // `guard session appeal [--socket P] <token> <binary> ...`: the binary is
+        // the second positional (token is the first).
         Some("session")
             if matches!(args.get(1).map(String::as_str), Some("appeal"))
-                && is_help(2)
-                && args.len() == 3 =>
+                && appeal_self_help_requested(&args[2..], &["--socket"], 1) =>
         {
             Some((vec!["session", "appeal"], "guard session appeal"))
         }
         _ => None,
     }
+}
+
+/// True if `-h`/`--help` in an appeal invocation is meant for guard rather than
+/// the appealed command: it appears before the `<binary>` positional has been
+/// consumed. `value_flags` are the guard options that take a separate value (so
+/// their value is not miscounted as a positional); `leading_positionals` is how
+/// many positionals precede `<binary>` (0 for top-level appeal, 1 for `session
+/// appeal`, whose first positional is the token).
+fn appeal_self_help_requested(
+    args: &[String],
+    value_flags: &[&str],
+    leading_positionals: usize,
+) -> bool {
+    let mut positionals = 0usize;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "--help" || arg == "-h" {
+            // `<binary>` is the positional at index `leading_positionals`; it is
+            // consumed once `positionals` exceeds that count.
+            return positionals <= leading_positionals;
+        }
+        if arg.starts_with('-') && arg != "-" {
+            if value_flags.contains(&arg) && !arg.contains('=') {
+                i += 2;
+            } else {
+                i += 1;
+            }
+        } else {
+            positionals += 1;
+            if positionals > leading_positionals {
+                // The binary has been named; everything after belongs to it.
+                return false;
+            }
+            i += 1;
+        }
+    }
+    false
 }
 
 fn print_nested_help(path: &[&str], bin_name: &str) -> Result<()> {
@@ -1285,8 +1393,10 @@ fn print_help_tree(admin: bool) {
     println!("    secrets|secret add|remove|list");
     println!("    verb list");
     println!("    verb run <name> --param key=value");
+    println!("    grant-read <path> --ttl <secs>");
+    println!("    grant-revoke <path>");
     println!("    session list [--history] [--since duration] [--full]");
-    println!("    session show <token>");
+    println!("    session show [token]  (defaults to $GUARD_SESSION)");
     println!("    session new");
     println!("    provisionals");
     println!("    approvals [handle]");
@@ -1325,7 +1435,7 @@ fn print_help_tree(admin: bool) {
     println!("Access markers:");
     println!("  user commands are available to allowed local callers.");
     println!("  local setup commands edit client-side files for the invoking account.");
-    println!("  session show requires the token; list hides raw tokens for non-admin callers.");
+    println!("  session show reveals a full grant only to the daemon or the token's own holder; list hides raw tokens for non-admin callers.");
     println!("  admin commands require the daemon principal or the TCP admin token.");
 }
 
@@ -1414,6 +1524,7 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
             system_prompt_append,
             gate,
             verbs,
+            profiles,
             allow_bin,
             child_env,
             kube_proxy,
@@ -2056,6 +2167,26 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                     catalog.version()
                 );
                 srv.set_verbs(catalog);
+            }
+
+            // Session-grant profiles: flag wins, else GUARD_PROFILES. An
+            // explicitly-named path must exist -- a typo should fail loudly, the
+            // same as --verbs, rather than silently starting with no profiles.
+            let profiles_path = profiles.or_else(|| {
+                guard_env("PROFILES")
+                    .filter(|v| !v.is_empty())
+                    .map(PathBuf::from)
+            });
+            if let Some(path) = profiles_path {
+                let catalog = grant_profile::ProfileCatalog::load(&path).with_context(|| {
+                    format!("failed to load session profile catalog {}", path.display())
+                })?;
+                tracing::info!(
+                    "Loaded session profile catalog from {} ({} profile(s))",
+                    path.display(),
+                    catalog.names().len()
+                );
+                srv.set_profiles(catalog);
             }
 
             // Binary allow-list: flag wins, else GUARD_ALLOW_BIN (comma-separated).
@@ -3000,6 +3131,71 @@ fn admin_client(
     }
 }
 
+/// Resolve a possibly-relative path against the client's working directory. The
+/// daemon canonicalizes again server-side; making it absolute here ensures the
+/// server resolves the file the caller meant, not one relative to the daemon CWD.
+fn absolute_path(path: &str) -> String {
+    let p = PathBuf::from(path);
+    if p.is_absolute() {
+        return path.to_string();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(p).display().to_string(),
+        Err(_) => path.to_string(),
+    }
+}
+
+fn print_grant_response(resp: &server::ExecuteResponse) -> Result<()> {
+    if resp.allowed {
+        if let Some(out) = &resp.stdout {
+            print!("{}", out);
+            let _ = std::io::stdout().flush();
+        }
+        Ok(())
+    } else {
+        let color = color_enabled_for_stderr();
+        eprintln!("{} {}", paint("DENIED", AnsiColor::Red, color), resp.reason);
+        std::process::exit(1);
+    }
+}
+
+async fn handle_grant_read(
+    path: String,
+    ttl: u64,
+    reevaluate: bool,
+    socket: Option<String>,
+) -> Result<()> {
+    let config = client_config::ClientConfig::load().ok().unwrap_or_default();
+    let (socket_path, tcp_port) = resolve_client_endpoint(socket, &config);
+    let client = server::Client::new(socket_path, tcp_port);
+    let session_token = std::env::var("GUARD_SESSION")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let grant = server::GrantRequest::Read {
+        path: absolute_path(&path),
+        ttl_secs: ttl,
+        session_token,
+        reevaluate,
+    };
+    let resp = client.grant(grant).await?;
+    print_grant_response(&resp)
+}
+
+async fn handle_grant_revoke(path: String, socket: Option<String>) -> Result<()> {
+    let config = client_config::ClientConfig::load().ok().unwrap_or_default();
+    let (socket_path, tcp_port) = resolve_client_endpoint(socket, &config);
+    let client = server::Client::new(socket_path, tcp_port);
+    let session_token = std::env::var("GUARD_SESSION")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let grant = server::GrantRequest::Revoke {
+        path: absolute_path(&path),
+        session_token,
+    };
+    let resp = client.grant(grant).await?;
+    print_grant_response(&resp)
+}
+
 async fn handle_status(socket: Option<String>) -> Result<()> {
     let config = client_config::ClientConfig::load().ok().unwrap_or_default();
     let (socket_path, tcp_port) = resolve_client_endpoint(socket, &config);
@@ -3217,6 +3413,7 @@ fn top_level_grant_to_session_command(
             let prose = prose.or(other);
             SessionCommands::New {
                 prose,
+                profile: None,
                 allow,
                 deny,
                 ttl,
@@ -3256,6 +3453,7 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
     // we send a SessionGrant for the freshly-minted token.
     if let SessionCommands::New {
         prose,
+        profile,
         allow,
         deny,
         ttl,
@@ -3269,6 +3467,7 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
     {
         let token = generate_session_token();
         let has_grant = prose.is_some()
+            || profile.is_some()
             || !allow.is_empty()
             || !deny.is_empty()
             || ttl.is_some()
@@ -3294,6 +3493,7 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                 ttl_secs: *ttl,
                 prompt_append,
                 prose: prose.clone(),
+                profile: profile.clone(),
                 static_only: *static_only,
                 auto_amend,
             };
@@ -3357,6 +3557,7 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                     ttl_secs: ttl,
                     prompt_append,
                     prose,
+                    profile: None,
                     static_only,
                     auto_amend,
                 },
@@ -3382,13 +3583,24 @@ async fn handle_session(subcommand: SessionCommands) -> Result<()> {
             token,
             limit,
             socket,
-        } => (
-            socket,
-            server::AdminRequest::SessionShow {
-                token,
-                limit: Some(limit),
-            },
-        ),
+        } => {
+            let self_token = std::env::var("GUARD_SESSION")
+                .ok()
+                .filter(|value| !value.is_empty());
+            let target = token.or_else(|| self_token.clone()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "guard session show needs a <token> argument or GUARD_SESSION to be set"
+                )
+            })?;
+            (
+                socket,
+                server::AdminRequest::SessionShow {
+                    token: target,
+                    limit: Some(limit),
+                    caller_token: self_token,
+                },
+            )
+        }
         SessionCommands::List {
             history,
             since,
@@ -4012,6 +4224,7 @@ mod tests {
                 system_prompt_append,
                 gate,
                 verbs,
+                profiles,
                 allow_bin,
                 child_env,
                 kube_proxy,
@@ -4062,6 +4275,7 @@ mod tests {
                 system_prompt_append,
                 gate,
                 verbs,
+                profiles,
                 allow_bin,
                 child_env,
                 kube_proxy,
@@ -4755,11 +4969,31 @@ mod tests {
             passthrough_command_help_requested(&["appeal".to_string(), "--help".to_string()]),
             Some((vec!["appeal"], "guard appeal"))
         );
+        // Help after guard's own options (but before the binary) is still guard's.
+        assert_eq!(
+            passthrough_command_help_requested(&[
+                "appeal".to_string(),
+                "--session".to_string(),
+                "tok".to_string(),
+                "--help".to_string()
+            ]),
+            Some((vec!["appeal"], "guard appeal"))
+        );
         assert_eq!(
             passthrough_command_help_requested(&[
                 "session".to_string(),
                 "appeal".to_string(),
                 "-h".to_string()
+            ]),
+            Some((vec!["session", "appeal"], "guard session appeal"))
+        );
+        // Token given, binary not yet: help is still for guard.
+        assert_eq!(
+            passthrough_command_help_requested(&[
+                "session".to_string(),
+                "appeal".to_string(),
+                "tok".to_string(),
+                "--help".to_string()
             ]),
             Some((vec!["session", "appeal"], "guard session appeal"))
         );
@@ -4771,11 +5005,22 @@ mod tests {
             ]),
             None
         );
+        // Once the binary is named, `--help`/`-h` belong to the appealed command.
         assert_eq!(
             passthrough_command_help_requested(&[
                 "appeal".to_string(),
                 "kubectl".to_string(),
                 "--help".to_string()
+            ]),
+            None
+        );
+        assert_eq!(
+            passthrough_command_help_requested(&[
+                "session".to_string(),
+                "appeal".to_string(),
+                "tok".to_string(),
+                "df".to_string(),
+                "-h".to_string()
             ]),
             None
         );
