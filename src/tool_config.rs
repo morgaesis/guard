@@ -85,6 +85,27 @@ impl ToolRegistry {
         }
     }
 
+    /// An empty registry watching a path that can never be a real operator
+    /// config file. `empty()` deliberately watches the real
+    /// `dirs::config_dir()` path (so a daemon that starts with a missing or
+    /// broken config can still hot-reload once an operator fixes it), which
+    /// makes it unsafe for tests: any test that reaches `reload_if_stale()`
+    /// with a registry built via `empty()` reads the machine's real
+    /// `~/.config/guard/tools.yaml` if one happens to exist, making the test
+    /// depend on host state instead of its own fixtures.
+    #[cfg(test)]
+    pub(crate) fn isolated_for_tests() -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "guard-test-tools-registry-{}-nonexistent.yaml",
+            std::process::id()
+        ));
+        Self {
+            config: ToolConfigFile::default(),
+            path,
+            last_modified: None,
+        }
+    }
+
     pub fn get(&self, tool: &str) -> Option<&ToolConfig> {
         self.config.tools.get(tool)
     }
@@ -230,6 +251,21 @@ mod tests {
     fn load_missing_file() {
         let reg = ToolRegistry::load("/tmp/nonexistent-guard-test.yaml").unwrap();
         assert!(reg.get("aws").is_none());
+    }
+
+    #[test]
+    fn isolated_for_tests_never_watches_the_real_config_path() {
+        let reg = ToolRegistry::isolated_for_tests();
+        if let Some(real_path) = ToolRegistry::config_path() {
+            assert_ne!(
+                reg.path, real_path,
+                "a test registry must never watch the operator's real tools.yaml"
+            );
+        }
+        assert!(
+            !reg.path.exists(),
+            "the isolated path must not coincide with a file that actually exists"
+        );
     }
 
     #[test]
