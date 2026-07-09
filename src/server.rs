@@ -4074,7 +4074,7 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
                             format!("client stream error: {}", e),
                         );
                     }
-                    let result = exec_after_approval(
+                    let result = exec_with_read_grant_retry(
                         request,
                         config,
                         caller,
@@ -5148,6 +5148,156 @@ fn drop_brokered_child_capabilities(cmd: &mut Command) {
 /// match. Failures returned from here are exec-level, not policy-level,
 /// so the audit stream can tell "policy said no" apart from "policy
 /// said yes but the kernel refused".
+/// TTL for a read grant issued by the transparent retry path. Shorter than an
+/// explicit `grant-read` default: the grant exists to unblock the one command
+/// that just failed, not to stand open.
+#[cfg(unix)]
+const AUTO_READ_GRANT_TTL_SECS: u64 = 600;
+
+/// Cap on grant+retry rounds for one command (a run may trip over several
+/// operator files in sequence, e.g. an inventory and a vars file).
+#[cfg(unix)]
+const AUTO_READ_GRANT_MAX_ROUNDS: usize = 3;
+
+/// Extract the absolute file path named by a permission-denied error line, if
+/// any. Understands the common shapes: `cat: /path: Permission denied`,
+/// `[Errno 13] Permission denied: '/path'`, and `open /path: permission
+/// denied`.
+#[cfg(unix)]
+fn permission_denied_path(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let lower = line.to_ascii_lowercase();
+        if !(lower.contains("permission denied") || lower.contains("eacces")) {
+            continue;
+        }
+        // Quoted path first (Python/ansible: `... denied: '/path'`).
+        for quote in ['\'', '"'] {
+            for (i, chunk) in line.split(quote).enumerate() {
+                if i % 2 == 1 && chunk.starts_with('/') {
+                    return Some(chunk.to_string());
+                }
+            }
+        }
+        // Plain token (coreutils/Go: `cat: /path: Permission denied`).
+        for token in line.split_whitespace() {
+            let t = token.trim_matches(|c: char| {
+                matches!(
+                    c,
+                    ',' | ':' | ';' | '(' | ')' | '[' | ']' | '<' | '>' | '\'' | '"'
+                )
+            });
+            if t.starts_with('/') && t.len() > 1 {
+                return Some(t.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Execute an approved command; when it fails naming a file it could not read,
+/// transparently run the read-grant pipeline on that file (credential
+/// deny-list, session rules, evaluator, pinned TTL ACL, full audit — exactly
+/// as an explicit `grant-read`) and retry the command. A denied or failed
+/// grant returns the original failure untouched; each round must unblock a
+/// new path or the loop stops. The agent never has to know `grant-read`
+/// exists, and nothing is granted that an explicit request would not get.
+async fn exec_with_read_grant_retry<W: AsyncWrite + Unpin>(
+    request: ExecuteRequest,
+    config: &ServerConfig,
+    caller: &CallerIdentity,
+    allow_reason: String,
+    depth: u32,
+    stream_output: bool,
+    stream_writer: &mut W,
+) -> ExecuteResult {
+    #[cfg(not(unix))]
+    {
+        exec_after_approval(
+            request,
+            config,
+            caller,
+            allow_reason,
+            depth,
+            stream_output,
+            stream_writer,
+        )
+        .await
+    }
+    #[cfg(unix)]
+    {
+        let mut result = exec_after_approval(
+            request.clone(),
+            config,
+            caller,
+            allow_reason.clone(),
+            depth,
+            stream_output,
+            stream_writer,
+        )
+        .await;
+        let mut granted: std::collections::HashSet<String> = std::collections::HashSet::new();
+        loop {
+            if granted.len() >= AUTO_READ_GRANT_MAX_ROUNDS {
+                break;
+            }
+            let ExecOutcome::Completed {
+                exit_code,
+                stdout,
+                stderr,
+            } = &result.exec
+            else {
+                break;
+            };
+            if !matches!(exit_code, Some(c) if *c != 0) {
+                break;
+            }
+            let combined = format!(
+                "{}\n{}",
+                stderr.as_deref().unwrap_or(""),
+                stdout.as_deref().unwrap_or("")
+            );
+            let Some(path) = permission_denied_path(&combined) else {
+                break;
+            };
+            if !granted.insert(path.clone()) {
+                // The grant did not unblock this path; do not loop on it.
+                break;
+            }
+            let grant = handle_grant_read(
+                config,
+                caller,
+                path.clone(),
+                AUTO_READ_GRANT_TTL_SECS,
+                request.session_token.clone(),
+                false,
+            )
+            .await;
+            if !(grant.policy_allowed() && matches!(grant.exec, ExecOutcome::Completed { .. })) {
+                // Denied (credential path, session deny, evaluator) or the ACL
+                // failed to apply: surface the command's own failure.
+                break;
+            }
+            tracing::info!(
+                "[AUDIT] READ_GRANT_AUTO caller={} path=\"{}\" ttl={}s (retrying after permission denied)",
+                caller,
+                path,
+                AUTO_READ_GRANT_TTL_SECS
+            );
+            result = exec_after_approval(
+                request.clone(),
+                config,
+                caller,
+                allow_reason.clone(),
+                depth,
+                stream_output,
+                stream_writer,
+            )
+            .await;
+        }
+        result
+    }
+}
+
 async fn exec_after_approval<W: AsyncWrite + Unpin>(
     request: ExecuteRequest,
     config: &ServerConfig,
@@ -5920,7 +6070,7 @@ async fn route_gated_allow<W: AsyncWrite + Unpin>(
 ) -> ExecuteResult {
     // Gating off, or an operator-authored static-policy allow: execute directly.
     if !config.gate.is_on() || inputs.bypass {
-        return exec_after_approval(
+        return exec_with_read_grant_retry(
             request,
             config,
             caller,
@@ -5946,7 +6096,7 @@ async fn route_gated_allow<W: AsyncWrite + Unpin>(
 
     match outcome {
         GateOutcome::ExecuteNow => {
-            exec_after_approval(
+            exec_with_read_grant_retry(
                 request,
                 config,
                 caller,
@@ -6844,9 +6994,9 @@ async fn handle_grant_read(
     // Plan the entries, commit the grant row, THEN apply the ACLs, so a crash
     // mid-apply leaves a recoverable row the reconciler can revoke rather than a
     // permanently-open grant with no record.
-    let entries = match plan_read_grant(&canonical, grantee_uid, grantee_gid, &home_boundary).await
+    let planned = match plan_read_grant(&canonical, grantee_uid, grantee_gid, &home_boundary).await
     {
-        Ok(entries) => entries,
+        Ok(planned) => planned,
         Err(e) => {
             let reason = format!("read-grant denied: {e}");
             config.log_audit_policy(caller, GRANT_READ_LABEL, &audit_args, false, &reason);
@@ -6861,7 +7011,7 @@ async fn handle_grant_read(
         granting_session: session_token.clone(),
         target_path: canonical_str.clone(),
         grantee_uid,
-        entries: entries.clone(),
+        entries: planned.iter().map(|p| p.entry.clone()).collect(),
         reason: reason.clone(),
         created_unix: now,
         expires_unix: now.saturating_add(ttl),
@@ -6870,7 +7020,7 @@ async fn handle_grant_read(
     };
     persist_read_grant(config, &grant).await;
 
-    if let Err(e) = apply_read_grant_entries(grantee_uid, &entries).await {
+    if let Err(e) = apply_read_grant_entries(grantee_uid, &planned).await {
         // Nothing survived the in-apply rollback, so drop the committed row too.
         delete_read_grant_row(config, &grant.target_path).await;
         let exec_reason = format!("failed to apply read grant: {e}");
@@ -6979,7 +7129,8 @@ async fn plan_read_grant(
     grantee_uid: u32,
     grantee_gid: u32,
     home_boundary: &Path,
-) -> Result<Vec<AclEntry>> {
+) -> Result<Vec<PlannedAclEntry>> {
+    use std::os::unix::fs::MetadataExt;
     let ancestors = ancestor_dirs_within(target, home_boundary).ok_or_else(|| {
         anyhow::anyhow!(
             "target {} is not under the owning home directory {}",
@@ -6996,32 +7147,124 @@ async fn plan_read_grant(
         if dir_allows_traverse(&meta, dir, grantee_uid, grantee_gid).await {
             continue;
         }
-        entries.push(AclEntry {
-            path: dir.display().to_string(),
-            perms: "x".to_string(),
+        entries.push(PlannedAclEntry {
+            entry: AclEntry {
+                path: dir.display().to_string(),
+                perms: "x".to_string(),
+            },
+            dev: meta.dev(),
+            ino: meta.ino(),
         });
     }
-    entries.push(AclEntry {
-        path: target.display().to_string(),
-        perms: "r".to_string(),
+    let target_meta =
+        std::fs::metadata(target).with_context(|| format!("stat {}", target.display()))?;
+    // An ACL binds to the inode, and every hard link is another name for it: a
+    // grant vetted under one benign name must not open a credential file
+    // linked to the same inode elsewhere.
+    if target_meta.is_file() && target_meta.nlink() > 1 {
+        anyhow::bail!(
+            "target {} has {} hard links; the same inode is reachable under other names",
+            target.display(),
+            target_meta.nlink()
+        );
+    }
+    entries.push(PlannedAclEntry {
+        entry: AclEntry {
+            path: target.display().to_string(),
+            perms: "r".to_string(),
+        },
+        dev: target_meta.dev(),
+        ino: target_meta.ino(),
     });
     Ok(entries)
 }
 
-/// Apply a planned set of ACL entries. Rolls back everything it applied on a
-/// partial failure so a failed grant never leaves stray ACL entries behind.
+/// A planned ACL entry pinned to the inode that was vetted. `dev`/`ino` are
+/// captured in the same pass as the policy checks and re-verified through an
+/// `O_PATH` descriptor at apply time, so a path component swapped for a
+/// symlink between evaluation and apply cannot redirect the setfacl to a
+/// different file.
 #[cfg(unix)]
-async fn apply_read_grant_entries(grantee_uid: u32, entries: &[AclEntry]) -> Result<()> {
-    let mut applied: Vec<&AclEntry> = Vec::new();
-    for entry in entries {
-        let spec = format!("u:{grantee_uid}:{}", entry.perms);
-        if let Err(e) = setfacl_modify(&spec, Path::new(&entry.path)).await {
-            for done in &applied {
-                let _ = setfacl_remove(grantee_uid, Path::new(&done.path)).await;
+#[derive(Debug)]
+struct PlannedAclEntry {
+    entry: AclEntry,
+    dev: u64,
+    ino: u64,
+}
+
+/// Open a planned entry's path and verify it is still the exact inode that was
+/// vetted. The returned handle pins the inode: setfacl is addressed through
+/// its `/proc/<pid>/fd/<n>` path while the handle stays open, so nothing the
+/// caller does to the path afterwards can retarget the grant.
+#[cfg(unix)]
+fn open_pinned_inode(planned: &PlannedAclEntry) -> Result<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::fs::MetadataExt;
+    let cpath = std::ffi::CString::new(planned.entry.path.as_bytes())
+        .context("planned path contains a NUL byte")?;
+    let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("open {}", planned.entry.path));
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let meta = file
+        .metadata()
+        .with_context(|| format!("fstat {}", planned.entry.path))?;
+    if meta.dev() != planned.dev || meta.ino() != planned.ino {
+        anyhow::bail!(
+            "{} changed between policy evaluation and apply (vetted inode {}:{}, found {}:{}); grant aborted",
+            planned.entry.path,
+            planned.dev,
+            planned.ino,
+            meta.dev(),
+            meta.ino()
+        );
+    }
+    Ok(file)
+}
+
+/// The daemon-side procfs path naming an open descriptor. Spawned setfacl
+/// children resolve it through the daemon's fd table (same uid), reaching the
+/// pinned inode regardless of what the original path now points at.
+#[cfg(unix)]
+fn proc_fd_path(file: &std::fs::File) -> PathBuf {
+    use std::os::fd::AsRawFd;
+    PathBuf::from(format!(
+        "/proc/{}/fd/{}",
+        std::process::id(),
+        file.as_raw_fd()
+    ))
+}
+
+/// Apply a planned set of ACL entries, each addressed through a verified
+/// pinned descriptor. Rolls back everything it applied on a partial failure so
+/// a failed grant never leaves stray ACL entries behind.
+#[cfg(unix)]
+async fn apply_read_grant_entries(grantee_uid: u32, entries: &[PlannedAclEntry]) -> Result<()> {
+    // Applied descriptors stay open for the whole apply so a rollback removes
+    // the entries from the same inodes they were added to.
+    let mut applied: Vec<std::fs::File> = Vec::new();
+    for planned in entries {
+        let pinned = match open_pinned_inode(planned) {
+            Ok(f) => f,
+            Err(e) => {
+                for done in &applied {
+                    let _ = setfacl_remove(grantee_uid, &proc_fd_path(done)).await;
+                }
+                return Err(e);
             }
-            return Err(e).with_context(|| format!("grant {} on {}", entry.perms, entry.path));
+        };
+        let spec = format!("u:{grantee_uid}:{}", planned.entry.perms);
+        if let Err(e) = setfacl_modify(&spec, &proc_fd_path(&pinned)).await {
+            for done in &applied {
+                let _ = setfacl_remove(grantee_uid, &proc_fd_path(done)).await;
+            }
+            return Err(e).with_context(|| {
+                format!("grant {} on {}", planned.entry.perms, planned.entry.path)
+            });
         }
-        applied.push(entry);
+        applied.push(pinned);
     }
     Ok(())
 }
@@ -7034,9 +7277,9 @@ async fn apply_read_grant(
     grantee_gid: u32,
     home_boundary: &Path,
 ) -> Result<Vec<AclEntry>> {
-    let entries = plan_read_grant(target, grantee_uid, grantee_gid, home_boundary).await?;
-    apply_read_grant_entries(grantee_uid, &entries).await?;
-    Ok(entries)
+    let planned = plan_read_grant(target, grantee_uid, grantee_gid, home_boundary).await?;
+    apply_read_grant_entries(grantee_uid, &planned).await?;
+    Ok(planned.into_iter().map(|p| p.entry).collect())
 }
 
 /// Whether `uid` (primary group `gid`) can already traverse `dir` without a new
@@ -12015,6 +12258,193 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn permission_denied_path_understands_common_error_shapes() {
+        // coreutils
+        assert_eq!(
+            permission_denied_path("cat: /home/op/vars.yml: Permission denied").as_deref(),
+            Some("/home/op/vars.yml")
+        );
+        // Python / ansible
+        assert_eq!(
+            permission_denied_path("[Errno 13] Permission denied: '/home/op/inventory.ini'")
+                .as_deref(),
+            Some("/home/op/inventory.ini")
+        );
+        // Go tools (helm etc.)
+        assert_eq!(
+            permission_denied_path("Error: open /home/op/values.yaml: permission denied")
+                .as_deref(),
+            Some("/home/op/values.yaml")
+        );
+        // A denied line with no path, and unrelated failures, yield nothing.
+        assert_eq!(permission_denied_path("permission denied"), None);
+        assert_eq!(
+            permission_denied_path("error: /home/op/vars.yml: no such file"),
+            None
+        );
+    }
+
+    /// A permission failure naming a path the grant pipeline rejects (here:
+    /// unresolvable) must surface the command's own failure unchanged — no
+    /// retry loop, no grant row.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_grant_retry_returns_original_failure_when_grant_denied() {
+        let (cfg, _buf) = make_test_config();
+        let caller = CallerIdentity::Unix {
+            uid: unsafe { libc::geteuid() },
+        };
+        let request = ExecuteRequest {
+            binary: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "echo \"cat: /definitely/missing/vars.yml: Permission denied\" >&2; exit 1"
+                    .to_string(),
+            ],
+            auth_token: None,
+            env: HashMap::new(),
+            secrets: HashMap::new(),
+            stream: false,
+            session_token: None,
+            revert: None,
+            confirm_within_secs: None,
+            reevaluate: false,
+            ssh_hostkey: None,
+            require_approval: None,
+            wait_approval_secs: None,
+            verb: None,
+        };
+        let mut sink = tokio::io::sink();
+        let result = exec_with_read_grant_retry(
+            request,
+            &cfg,
+            &caller,
+            "test allow".to_string(),
+            0,
+            false,
+            &mut sink,
+        )
+        .await;
+        match &result.exec {
+            ExecOutcome::Completed { exit_code, .. } => assert_eq!(*exit_code, Some(1)),
+            other => panic!("expected the original failure, got {other:?}"),
+        }
+        assert!(
+            cfg.read_grants.read().await.list().is_empty(),
+            "a denied grant must leave no grant row"
+        );
+    }
+
+    /// The full transparent path: a command fails naming a readable-policy
+    /// file, the read-grant pipeline (session-allowed here) applies a TTL ACL,
+    /// and the command is retried and succeeds. The agent never issued
+    /// `grant-read`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_grant_retry_grants_and_reruns_after_permission_denied() {
+        if !acl_tools_available() {
+            eprintln!("skipping: setfacl/getfacl not available");
+            return;
+        }
+        // The grant walks up to the file owner's home directory, so the target
+        // must live under the real home.
+        let Some(home) = dirs::home_dir() else {
+            eprintln!("skipping: no home directory");
+            return;
+        };
+        let Ok(dir) = tempfile::tempdir_in(&home) else {
+            eprintln!("skipping: home directory not writable");
+            return;
+        };
+        let target = dir.path().join("values.yaml");
+        std::fs::write(&target, "k: v").unwrap();
+        let canonical = std::fs::canonicalize(&target)
+            .unwrap()
+            .display()
+            .to_string();
+        let flag = dir.path().join("ran-once");
+
+        let (mut cfg, _buf) = make_test_config();
+        // The grantee must resolve to a real account for the ACL to apply.
+        cfg.daemon_uid = unsafe { libc::geteuid() };
+        // A session allow rule authorizes the grant deterministically, so the
+        // test never reaches the (unconfigured) evaluator.
+        cfg.sessions.write().await.grant(
+            "sess-retry".to_string(),
+            SessionGrant {
+                allow: vec!["grant-read*".to_string()],
+                deny: Vec::new(),
+                allow_exact: Vec::new(),
+                deny_exact: Vec::new(),
+                expires_at: None,
+                prompt_append: None,
+                generated_notes: Vec::new(),
+                granted_at: 0,
+                static_only: false,
+                auto_amend: false,
+            },
+        );
+
+        let script = format!(
+            "if [ -e '{}' ]; then exit 0; else echo \"cat: {}: Permission denied\" >&2; touch '{}'; exit 1; fi",
+            flag.display(),
+            canonical,
+            flag.display()
+        );
+        let request = ExecuteRequest {
+            binary: "sh".to_string(),
+            args: vec!["-c".to_string(), script],
+            auth_token: None,
+            env: HashMap::new(),
+            secrets: HashMap::new(),
+            stream: false,
+            session_token: Some("sess-retry".to_string()),
+            revert: None,
+            confirm_within_secs: None,
+            reevaluate: false,
+            ssh_hostkey: None,
+            require_approval: None,
+            wait_approval_secs: None,
+            verb: None,
+        };
+        let caller = CallerIdentity::Unix {
+            uid: unsafe { libc::geteuid() },
+        };
+        let mut sink = tokio::io::sink();
+        let result = exec_with_read_grant_retry(
+            request,
+            &cfg,
+            &caller,
+            "test allow".to_string(),
+            0,
+            false,
+            &mut sink,
+        )
+        .await;
+        match &result.exec {
+            ExecOutcome::Completed { exit_code, .. } => assert_eq!(
+                *exit_code,
+                Some(0),
+                "the retried command must succeed after the grant"
+            ),
+            other => panic!("expected a completed retry, got {other:?}"),
+        }
+        let grant = cfg
+            .read_grants
+            .read()
+            .await
+            .get(&canonical)
+            .cloned()
+            .expect("the transparent grant must be recorded");
+        assert_eq!(grant.status, ReadGrantStatus::Active);
+        assert_eq!(grant.granting_session.as_deref(), Some("sess-retry"));
+
+        // Cleanup: revoke so no ACL outlives the test.
+        let _ = handle_grant_revoke(&cfg, &caller, canonical, None).await;
+    }
+
     /// Build a home/pub_dir(0755)/priv_dir(0700)/values.yaml tree and return the
     /// paths, so ACL tests can exercise "add traverse only where missing".
     #[cfg(unix)]
@@ -12087,6 +12517,62 @@ mod tests {
         // The untouched pub dir's ACL is byte-identical to before.
         assert_eq!(pub_before, getfacl_raw(&pub_dir).await);
         assert!(getfacl_user_has_traverse(&priv_dir, TEST_GRANTEE_UID).await);
+    }
+
+    /// The apply is pinned to the inodes vetted at plan time: swapping the
+    /// target for a different file between evaluation and apply must abort the
+    /// grant and roll back any ancestor entries already applied.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_grant_apply_aborts_when_target_swapped_after_plan() {
+        if !acl_tools_available() {
+            eprintln!("skipping: setfacl/getfacl not available");
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        set_mode(home.path(), 0o755);
+        let (_pub_dir, priv_dir, target) = build_grant_tree(home.path());
+
+        let planned = plan_read_grant(&target, TEST_GRANTEE_UID, TEST_GRANTEE_GID, home.path())
+            .await
+            .expect("plan grant");
+
+        // Swap the vetted target for a symlink to a different file: the
+        // original inode stays alive under another name so the filesystem
+        // cannot recycle its number, and the path now resolves to the "secret".
+        let secret = home.path().join("id_rsa");
+        std::fs::write(&secret, "PRIVATE KEY").unwrap();
+        std::fs::rename(&target, priv_dir.join("orig.yaml")).unwrap();
+        std::os::unix::fs::symlink(&secret, &target).unwrap();
+
+        let err = apply_read_grant_entries(TEST_GRANTEE_UID, &planned)
+            .await
+            .expect_err("apply must refuse the swapped inode");
+        assert!(
+            err.to_string()
+                .contains("changed between policy evaluation"),
+            "got: {err:#}"
+        );
+        assert!(
+            !getfacl_user_has_traverse(&priv_dir, TEST_GRANTEE_UID).await,
+            "the ancestor traverse entry applied before the abort must be rolled back"
+        );
+    }
+
+    /// A multi-hardlink target is refused at plan time: the ACL binds to the
+    /// inode, which is reachable under every other link name.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_grant_denies_multi_hardlink_target() {
+        let home = tempfile::tempdir().unwrap();
+        set_mode(home.path(), 0o755);
+        let (_pub_dir, priv_dir, target) = build_grant_tree(home.path());
+        std::fs::hard_link(&target, priv_dir.join("alias.yaml")).unwrap();
+
+        let err = plan_read_grant(&target, TEST_GRANTEE_UID, TEST_GRANTEE_GID, home.path())
+            .await
+            .expect_err("multi-hardlink target must be refused");
+        assert!(err.to_string().contains("hard links"), "got: {err:#}");
     }
 
     #[cfg(unix)]

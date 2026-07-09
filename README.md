@@ -570,6 +570,33 @@ Session grants are persisted in the daemon state database and survive daemon res
 
 For forensics, `guard session show <token>` prints prompt context, generated notes, aggregate allow/deny and exec outcome counts, source breakdown (`llm`, `cache`, `static_policy`, `session_allow`, `session_deny`, `session_static_only`, `validation`), a risk histogram for LLM-evaluated calls, and a bounded recent interaction log. Daemon-principal and TCP admin-token callers see the raw token. Non-admin local callers may show a session only by presenting its token and receive the same session details with tokens rendered as `(provided)`. Those summaries are loaded from the state database, so they remain available after a service restart within the configured retention window.
 
+## Scoped file read grants
+
+Brokered tools routinely need to read operator-owned files (ansible vars,
+helm values) that guard's low-privilege service account cannot open. A read
+grant adds a time-boxed POSIX ACL for exactly one file (Unix only):
+
+```bash
+guard grant-read ~/ops/values.yaml --ttl 600
+guard grant-revoke ~/ops/values.yaml   # early teardown; auto-revokes at TTL anyway
+```
+
+The request runs through the same pipeline as any command: a hard
+credential-path deny-list (key material, kubeconfigs, env files) before the
+evaluator ever sees it, then session allow/deny rules, then the LLM. Ancestor
+directories get traverse-only entries, never above the file owner's home. The
+apply is pinned to the inode vetted at evaluation time (multi-hardlink
+targets are refused, and a path swapped for a symlink in between aborts the
+grant), grants persist in the state database, and the sweeper revokes them at
+TTL or on startup if the daemon was down when one expired.
+
+Agents normally never need the command: when a brokered command fails naming
+a file it could not read, the daemon runs the same grant pipeline on that
+path automatically and, on an allow, applies a short-TTL grant and retries
+the command. A denied path (credential file, session deny, evaluator deny)
+returns the command's own failure unchanged, and every grant and retry is
+audited.
+
 ## Per-run secret injection
 
 `guard run` can request stored secrets for one approved command without requiring a shim or persistent tool config. The daemon resolves the secret values immediately before exec, injects them into the child environment, and includes those values in exact-match output redaction.
