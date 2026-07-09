@@ -260,7 +260,9 @@ on writes). A `hold` parks the request in the same operator queue as held
 commands: the client blocks while `guard approvals` shows the operation, `guard
 approve` releases it to the apiserver, and `guard deny` or TTL expiry fails it
 closed (holds require `--gate consequence`; without it they deny). Interactive
-subresources (`exec`/`attach`/`portforward`) and Secret `watch`es are denied.
+subresources (`exec`/`attach`/`portforward`/`proxy`) and
+`pods/ephemeralcontainers` are denied outright (they tunnel code execution or
+an arbitrary request into a running workload), as are Secret `watch`es.
 Under `--gate consequence`, a recoverable write is wrapped in the auto-revert
 envelope: the proxy snapshots the prior object and synthesizes a `kubectl`-based
 revert armed in the provisional registry, so `guard confirm` keeps it and the
@@ -332,6 +334,15 @@ Guard walks up from your current directory to `/` looking for `.env` files (clos
 | `GUARD_ALLOW_BIN` | (none) | Comma-separated binary allow-list. When set, only these binaries may execute, on every route, regardless of the LLM decision. Bare names match by command name via the daemon PATH; path-qualified entries must match exactly. |
 | `GUARD_GATE` | `off` | Consequence gating: `off` or `consequence`. Requires a local listener (`--socket`: a Unix-domain socket on Unix, a named pipe on Windows); refused over TCP. |
 | `GUARD_VERBS` | (none) | Path to the verb catalog YAML. Hot-reloaded on change. |
+| `GUARD_PROFILES` | (none) | Path to the session-profile YAML (named `{ttl, allow, deny, prompt}` bundles for `guard session new --profile <name>`; see `examples/session-profiles.yaml`). |
+| `GUARD_PREFLIGHT` | `false` | Deterministic pre-LLM checks: reject binaries not on the daemon `PATH` and known credential-disclosure patterns before any LLM call. Coarse by design; enable where LLM cost/latency dominates over false positives. Flag: `--preflight`. |
+| `GUARD_CACHE` | `true` | In-memory cache of LLM decisions keyed on the exact command line. Disable with `--no-cache` or `GUARD_CACHE=false`. |
+| `GUARD_CACHE_CAPACITY` | `1024` | Maximum cached decisions (`--cache-capacity`). |
+| `GUARD_CACHE_TTL` | `3600` | Cache entry TTL in seconds (`--cache-ttl`). |
+| `GUARD_STATE_DB` | XDG state dir | Path to the SQLite state database (sessions, holds, provisionals, read grants). |
+| `GUARD_CHILD_ENV` | (none) | Comma-separated daemon env vars forwarded to brokered children (e.g. a `KUBECONFIG` only the daemon can read). Values come from the daemon's environment, never the caller's. |
+| `GUARD_EXEC_AS_CALLER` | `false` | Run brokered children as the calling uid instead of the daemon account (Unix). |
+| `GUARD_KUBE_PROXY` | (none) | Kubernetes API proxy listen address (loopback only); see the kube-proxy section. Companions: `GUARD_KUBE_PROXY_KUBECONFIG`, `GUARD_KUBE_CONTEXT`, `GUARD_API_POLICY`, `GUARD_BROKERED_KUBECONFIG_OUT`. |
 
 The primary model is `openai/gpt-5.4-mini` via OpenRouter by default. Set it
 per-invocation with `--llm-model <slug>`. To configure a true fallback chain
@@ -339,6 +350,19 @@ across providers, use `GUARD_LLM_MODELS` (comma-separated) or
 `--llm-models`. `--llm-timeout <seconds>` controls the per-call HTTP timeout.
 
 See [`.env.example`](.env.example) for a copyable template.
+
+### SSH host keys
+
+`guard run --hostkey <mode>` controls how a brokered `ssh` treats the remote
+host key. `only-existing` (default) injects nothing, preserving ssh's own
+configured behavior. `accept-new` injects `StrictHostKeyChecking=accept-new`
+and `UpdateHostKeys=yes` for first-contact key learning while still refusing
+a changed key. `accept-all` injects `StrictHostKeyChecking=no` with a null
+known-hosts file, giving up host authentication entirely; it exists for
+disposable lab targets and never rides any deterministic fast path, so the
+evaluator always sees it. Injected options are folded into the argv before
+policy evaluation, so the decision, the audit record, and the spawned
+process all see the same command.
 
 ## Examples
 

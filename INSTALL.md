@@ -21,7 +21,7 @@ Install from a GitHub release artifact:
 
 ```bash
 # Example for Linux x86_64 -- substitute the version tag you want
-GUARD_VERSION=v0.3.0
+GUARD_VERSION=v0.4.0
 curl -fsSLO "https://github.com/morgaesis/guard/releases/download/${GUARD_VERSION}/guard-${GUARD_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 tar -xzf "guard-${GUARD_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 install -m 0755 guard ~/.local/bin/guard

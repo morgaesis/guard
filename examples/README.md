@@ -54,6 +54,13 @@ regex per parameter, single-argv rendering, no shell), which is what makes
   of time, not a new bypass: the minted session takes the identical path as a
   hand-authored one. Load with `--profiles`.
 
+- **[api-policy.yaml](api-policy.yaml)** -- Kubernetes API proxy policy.
+  First-match-wins rules over typed API operations (verb, resource, namespace,
+  subresource) for `guard server start --kube-proxy`: reads allowed with
+  Secret values redacted, non-production writes allowed behind the auto-revert
+  envelope, deletes held for operator approval. Hot-reloaded; the proxy is
+  default-deny without it. Load with `--api-policy`.
+
 - **[fallback-models.env](fallback-models.env)** -- Multi-model fallback chain.
   Adds retry-then-failover across multiple LLM providers via
   `GUARD_LLM_MODELS`. Only needed when your uptime requirements exceed a

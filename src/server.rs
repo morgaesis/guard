@@ -8845,6 +8845,41 @@ mod tests {
     use tracing::subscriber::with_default;
     use tracing_subscriber::fmt::MakeWriter;
 
+    /// `IncomingMessage` is untagged, so the grant wire shape must keep
+    /// resolving to the Grant variant (not fall through to Execute) and the
+    /// tagged `action` must select the right operation.
+    #[test]
+    fn grant_wire_shape_parses_to_grant_variant() {
+        let msg: IncomingMessage = serde_json::from_str(
+            r#"{"grant":{"action":"read","path":"/home/op/values.yaml","ttl_secs":600,"session_token":"tok"}}"#,
+        )
+        .expect("grant read parses");
+        match msg {
+            IncomingMessage::Grant {
+                grant: GrantRequest::Read { path, ttl_secs, .. },
+            } => {
+                assert_eq!(path, "/home/op/values.yaml");
+                assert_eq!(ttl_secs, 600);
+            }
+            other => panic!("expected Grant/Read, got {other:?}"),
+        }
+
+        let msg: IncomingMessage =
+            serde_json::from_str(r#"{"grant":{"action":"revoke","path":"/home/op/values.yaml"}}"#)
+                .expect("grant revoke parses");
+        assert!(matches!(
+            msg,
+            IncomingMessage::Grant {
+                grant: GrantRequest::Revoke { .. }
+            }
+        ));
+
+        // An execute request must not be captured by the Grant arm.
+        let msg: IncomingMessage =
+            serde_json::from_str(r#"{"binary":"ls","args":["-l"]}"#).expect("execute parses");
+        assert!(matches!(msg, IncomingMessage::Execute(_)));
+    }
+
     // ---- Audit-line redaction helpers ---------------------------------------
 
     /// Argv rendered into audit lines must have inline credentials masked:
