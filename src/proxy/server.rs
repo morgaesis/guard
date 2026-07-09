@@ -271,8 +271,15 @@ impl KubeProxy {
         // `portForward`, and `logs` itself. A get/list/watch ApiPolicy allow
         // rule has no visibility into the tunneled request, so it would
         // silently approve what is really an unrestricted network pivot.
+        // `ephemeralcontainers` is in the same class: a PATCH/PUT injects a
+        // container into a running pod, which is code execution equivalent to
+        // `exec`. It is denied outright regardless of policy, not left to a
+        // `pods` write rule that has no visibility into what it enables.
         if let Some(sub) = op.subresource.as_deref() {
-            if matches!(sub, "exec" | "attach" | "portforward" | "proxy") {
+            if matches!(
+                sub,
+                "exec" | "attach" | "portforward" | "proxy" | "ephemeralcontainers"
+            ) {
                 return status_resp(
                     StatusCode::FORBIDDEN,
                     &format!("guard kube-proxy: subresource '{sub}' is not permitted"),
@@ -391,9 +398,16 @@ impl KubeProxy {
 
         // A recoverable write we will wrap in an auto-revert envelope: snapshot
         // the prior object first (for an update/patch), then forward, then arm.
+        // Only bare-resource writes are tracked: a subresource write is a
+        // different object shape than its parent, so a create-provenance record
+        // for it would let an eviction (`pods/{n}/eviction`) masquerade as a pod
+        // create and launder a later delete through the contained-delete path,
+        // and a `Restore` of a `scale`/`status` object does not round-trip
+        // through the daemon's `kubectl replace` revert.
         let track_write = op.as_ref().is_some_and(|o| {
             self.gate.get().is_some()
                 && !o.dry_run
+                && o.subresource.is_none()
                 && o.reversibility() == Some(Reversibility::Recoverable)
                 && matches!(o.verb, Verb::Create | Verb::Update | Verb::Patch)
         });
@@ -462,7 +476,27 @@ impl KubeProxy {
             }
         }
 
-        if redact && status.is_success() && is_json(&upstream_headers) {
+        // A Secret read must never reach the raw-stream path below with values
+        // intact. Redact a successful JSON body; buffer and pass through a
+        // non-success body (a Status error carries no Secret values); fail closed
+        // on a successful body whose content-type we cannot parse and redact.
+        if redact {
+            if !status.is_success() {
+                let bytes = upstream_resp
+                    .bytes()
+                    .await
+                    .context("read Secret error response")?;
+                return Ok(builder
+                    .body(full_body(bytes))
+                    .expect("build Secret error response"));
+            }
+            if !is_json(&upstream_headers) {
+                return Ok(status_resp(
+                    StatusCode::BAD_GATEWAY,
+                    "guard kube-proxy: refusing to stream a non-JSON Secret response unredacted",
+                    "InternalError",
+                ));
+            }
             let bytes = upstream_resp
                 .bytes()
                 .await

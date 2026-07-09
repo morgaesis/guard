@@ -1,5 +1,16 @@
 # Roadmap
 
+## Foundations
+
+The pillars every other capability routes through. New integrations plug into these
+rather than reimplementing them.
+
+- LLM evaluator (`src/evaluate.rs`): descriptive-prompt risk assessment producing an approve/deny verdict plus a reversibility classification, with pre-LLM command and session-context redaction.
+- Consequence gate (`src/gating/mod.rs::decide_gate`, `provisional.rs`): deterministic fail-safe routing of an approved command into execute-now / contained-with-revert / hold-for-operator. Reversibility can only raise the gate, never lower it. Protocol-agnostic; the command path and the API-proxy path route through the same machinery.
+- Verb catalog (`src/gating/verb.rs`): operator-authored and auto-promoted typed operations rendered to argv with no shell, so parameter and flag injection are structurally impossible.
+- Principal and admin model (`src/principal.rs`): per-principal credential injection and daemon-UID operator approval, over Unix-socket, TCP, and Windows named-pipe transports.
+- Secret handling (`src/secrets.rs`, `src/redact.rs`): pluggable backends (`pass`/`env`/`local`/Vault/Infisical) with per-principal path namespacing, exact-match and regex output redaction, and never surfacing secret values to a client or an LLM provider.
+
 ## Capabilities
 
 - LLM-only evaluation with descriptive prompts (no hard-coded static policies by default).
@@ -69,9 +80,25 @@
 
 - Auto-verb-promotion (`--learn-allow`, on by default, requires `--gate consequence`): the allow-side counterpart, for unattended deployments where an operator cannot review every learned-rule notice. Repeated low-risk approvals of the same `(service, binary, first-arg, arity)` shape are bucketed with their argv evidence and reversibility votes; once a bucket qualifies, the daemon derives an argv template by diffing evidence positionally - every parameter pattern is a plain alternation of the exact, regex-escaped values actually observed, never a model-authored regex - and appends a trusted verb to the catalog. Irreversible shapes are never eligible; recoverable shapes require a validated revert. A promoted verb is stamped to the model + prompts that justified it, so a model or prompt change silently stops trusting verbs promoted under stale judgment. `VerbCatalog::match_command` lets a raw command reverse-match any catalog verb (hand-authored or promoted), so a caller benefits without naming the verb. `guard verb list` is the transparent, editable record of what has been auto-promoted.
 
-## Next
+- Named grant profiles (`guard session new --profile <name>`): operator-authored reusable allow/deny/prompt bundles (`src/grant_profile.rs`, `ProfileCatalog`) applied at session mint as a lightweight boxed-access primitive, loaded and hot-reloaded at daemon startup.
 
-- Kubernetes API proxy breadth: route held deletes through the operator-approval queue so a blocked delete can be released, gate `exec`/`attach`/`portforward` and Secret `watch` streams per object rather than denying them, and persist proxy-armed snapshot files in a restart-stable location.
+- Session-grant self-inspection: a session can report its own effective allow/deny overlay and prompt fragment, so an agent can discover the box it is operating in without operator round-trips.
+
+- Transparent file-read grants (`src/gating/read_grant.rs`): a policy-gated, TTL-scoped POSIX ACL primitive that lets a brokered command (ansible/helm) read operator-owned files the daemon's own unprivileged account cannot otherwise see. A compiled credential-shaped-path deny-list refuses grants over secret material, paths are canonicalized before the deny check, and every grant is audit-logged and swept on TTL with startup reconciliation.
+
+## Direction
+
+The command gate and the API-proxy gate are converging on one generic
+consequence-routing engine: an integration is a protocol plug-in onto the shared
+evaluator and gate, not a parallel policy path. Near-term work under that bet:
+
+- Protocol-agnostic REST proxy engine: generalize `src/proxy/` behind a `ProtocolConfig` trait - a generic path-segment request parser plus a per-protocol table mapping resource type to durability class (durable state vs reprovisionable compute) and a per-protocol credential resolver. Kubernetes remains the reference config; GitHub and Vercel are example configs, tested against mocks with adversarial coverage. The gating spine (`decide_gate`, `provisional.rs`, the `GateSink` trait) is already protocol-agnostic and carries through unchanged.
+- Evaluator-integrated proxy gate: a proxied request no rule matches reaches the LLM evaluator (prose intent + verb/path + redacted body shape + session context), not just static allow/deny/hold.
+- Reversibility as an evaluator input: a genuinely constructible auto-revert widens what the evaluator will approve at the margin. The approve/deny decision becomes revert-aware; the deterministic execute-now / contain / hold routing in `decide_gate` stays a hard floor.
+- Snapshot-based auto-revert generalized: snapshot-before-mutate then restore-or-delete-on-revert for any REST API with idempotent reads. Pure side-effect endpoints (trigger a deploy, send a request with no readable prior state) have no constructible revert and fail closed to hold or deny.
+- Self-tuning over proxied traffic: extend the existing evidence-only learned-rule promotion and deny-shape learning to API-request shapes, keeping the narrow exact-value synthesis rather than a model-authored regex.
+- Rarity-based escalation: a request shape statistically rare within a session's lifetime gets forced evaluator scrutiny even when a broader rule would otherwise fast-path it, failing toward more scrutiny under uncertainty.
+- Transparent read grants: fold the explicit `guard grant-read`/`grant-revoke` subcommands away - a brokered approved command that hits a file-permission error is retried once under the same TTL ACL grant, deny-list, and audit mechanism, with no separate CLI call the agent must remember.
 - Filesystem gate for in-process mutations (Linux): a seccomp user-notification supervisor that gates file-mutating syscalls per path, and an overlay diff/revert envelope that runs a tool against a copy-on-write upper layer and commits or discards the changeset as a unit.
 - Secret-value binding hardening: extend the held-command value binding to the verb-rendered argv, so an operator-reviewed verb invocation also fails closed if a referenced secret changes between hold and approval.
 - MCP transport breadth: server-initiated SSE streaming on the HTTP MCP endpoint, added only when an agent runtime needs streamed tool output rather than the current request/response shape.

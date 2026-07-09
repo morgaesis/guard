@@ -24,6 +24,16 @@
 # Secret responses so values never reach the client. Reading Secret values is
 # always redacted on an allowed Secret read regardless of this flag -- set it to
 # document intent, or on broad read rules.
+#
+# A write to a subresource is authorized only by a rule that names it in
+# `subresources` (e.g. `scale`, `eviction`, `status`). A plain resource rule
+# covers the bare resource and its read subresources (`log`, a `status` GET) but
+# never a write subresource, because a write subresource can carry effects the
+# parent verb does not model: `pods/eviction` terminates a pod, `*/scale`
+# changes replica counts, `serviceaccounts/token` mints a credential.
+# `pods/ephemeralcontainers` (code execution in a running container) and the
+# interactive subresources `exec`/`attach`/`portforward`/`proxy` are denied
+# outright regardless of policy.
 
 default: deny
 
@@ -38,12 +48,24 @@ rules:
 
   # Recoverable writes confined to non-production namespaces. Each runs behind
   # the auto-revert envelope (the proxy snapshots the prior object and restores
-  # it if the operator does not confirm in time).
+  # it if the operator does not confirm in time). This covers bare-resource
+  # writes only; write subresources need an explicit rule (below).
   - verbs: [create, update, patch]
     resources: ["*"]
     namespaces: [dev, staging, sandbox]
     action: allow
     description: "writes allowed in non-production namespaces"
+
+  # Scaling a workload in non-production. `subresources: [scale]` is required
+  # because a plain deployments write rule does not authorize the scale
+  # subresource. Eviction (`kubectl drain`) would likewise need
+  # `subresources: [eviction]` on a pods rule.
+  - verbs: [update, patch]
+    resources: [deployments, statefulsets, replicasets]
+    namespaces: [dev, staging, sandbox]
+    subresources: [scale]
+    action: allow
+    description: "scaling workloads in non-production namespaces"
 
   # Deleting a namespace removes everything in it: always hold for approval.
   - verbs: [delete]

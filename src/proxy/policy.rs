@@ -1,8 +1,9 @@
 //! Operator-authored policy over Kubernetes API operations — the proxy's "slow
 //! clock", analogous to the verb catalog. Only the operator edits it; agents
-//! cannot. Rules match an [`ApiOp`] by verb/resource/namespace and yield an
-//! action (allow, deny, hold) plus, for allowed reads, whether to redact secret
-//! values from the response. Default is fail-safe deny.
+//! cannot. Rules match an [`ApiOp`] by verb/resource/namespace/subresource and
+//! yield an action (allow, deny, hold) plus, for allowed reads, whether to
+//! redact secret values from the response. A write to a subresource is
+//! authorized only by a rule that names it. Default is fail-safe deny.
 
 use super::k8s::ApiOp;
 use serde::{Deserialize, Serialize};
@@ -40,6 +41,16 @@ pub struct ApiRule {
     /// Namespaces matched, or `*`. A cluster-scoped request matches only `*`.
     #[serde(default = "any_glob")]
     pub namespaces: Vec<String>,
+    /// Write subresources this rule authorizes, e.g. `scale`, `eviction`,
+    /// `status`. Empty (the default) means the rule covers only the bare
+    /// resource: a write to a subresource is never authorized by a plain
+    /// resource rule, because a write subresource can carry effects the parent
+    /// verb does not model (evicting a pod, injecting an ephemeral container,
+    /// minting a token). Read subresources (`log`, a `status` GET) are always
+    /// covered by a matching read rule and do not need listing here. `*` allows
+    /// any write subresource on the matched resource.
+    #[serde(default)]
+    pub subresources: Vec<String>,
     pub action: ApiAction,
     /// For an allowed read of a Secret, strip `data`/`stringData` from the
     /// response so values never reach the client.
@@ -55,6 +66,19 @@ impl ApiRule {
         glob_any(&self.verbs, op.verb.as_str())
             && glob_any(&self.resources, &op.resource)
             && namespace_matches(&self.namespaces, op.namespace.as_deref())
+            && self.subresource_matches(op)
+    }
+
+    /// A write to a subresource is authorized only when the rule names that
+    /// subresource, so a bare `pods`/`patch` rule cannot silently cover
+    /// `pods/ephemeralcontainers` or `pods/eviction`. Bare-resource requests and
+    /// read subresources are unaffected.
+    fn subresource_matches(&self, op: &ApiOp) -> bool {
+        match op.subresource.as_deref() {
+            None => true,
+            Some(_) if op.is_read() => true,
+            Some(sub) => glob_any(&self.subresources, sub),
+        }
     }
 }
 
@@ -184,6 +208,100 @@ rules:
             p.decide(&op("POST", "/api/v1/namespaces/d/pods")).action,
             ApiAction::Deny,
             "unmatched create falls to default deny"
+        );
+    }
+
+    #[test]
+    fn write_subresource_not_covered_by_bare_resource_rule() {
+        // A plain pods write rule must not authorize ephemeralcontainers (code
+        // execution) or eviction (pod termination) writes.
+        let p = policy(
+            r#"
+default: deny
+rules:
+  - verbs: [create, update, patch]
+    resources: [pods]
+    namespaces: [dev]
+    action: allow
+"#,
+        );
+        assert_eq!(
+            p.decide(&op(
+                "PATCH",
+                "/api/v1/namespaces/dev/pods/web-0/ephemeralcontainers"
+            ))
+            .action,
+            ApiAction::Deny,
+            "ephemeralcontainers write is not covered by a pods write rule"
+        );
+        assert_eq!(
+            p.decide(&op("POST", "/api/v1/namespaces/dev/pods/web-0/eviction"))
+                .action,
+            ApiAction::Deny,
+            "eviction write is not covered by a pods write rule"
+        );
+        // The bare pods write still works.
+        assert_eq!(
+            p.decide(&op("POST", "/api/v1/namespaces/dev/pods")).action,
+            ApiAction::Allow
+        );
+    }
+
+    #[test]
+    fn read_subresource_covered_by_resource_read_rule() {
+        // Reading logs/status under a resource read rule keeps working; only
+        // write subresources need an explicit grant.
+        let p = policy(
+            r#"
+default: deny
+rules:
+  - verbs: [get, list, watch]
+    resources: [pods]
+    namespaces: [dev]
+    action: allow
+"#,
+        );
+        assert_eq!(
+            p.decide(&op("GET", "/api/v1/namespaces/dev/pods/web-0/log"))
+                .action,
+            ApiAction::Allow
+        );
+        assert_eq!(
+            p.decide(&op("GET", "/api/v1/namespaces/dev/pods/web-0/status"))
+                .action,
+            ApiAction::Allow
+        );
+    }
+
+    #[test]
+    fn write_subresource_allowed_when_named() {
+        let p = policy(
+            r#"
+default: deny
+rules:
+  - verbs: [update, patch]
+    resources: [deployments]
+    namespaces: [dev]
+    subresources: [scale]
+    action: allow
+"#,
+        );
+        assert_eq!(
+            p.decide(&op(
+                "PATCH",
+                "/apis/apps/v1/namespaces/dev/deployments/api/scale"
+            ))
+            .action,
+            ApiAction::Allow
+        );
+        // A different subresource is still not covered.
+        assert_eq!(
+            p.decide(&op(
+                "PATCH",
+                "/apis/apps/v1/namespaces/dev/deployments/api/status"
+            ))
+            .action,
+            ApiAction::Deny
         );
     }
 

@@ -668,6 +668,222 @@ async fn proxy_allows_contained_delete_of_created_resource() {
     );
 }
 
+/// Mock apiserver that returns a Secret read as a 200 with a non-JSON
+/// content-type. A compliant apiserver would honor the proxy's forced
+/// `Accept: application/json`, but a misbehaving aggregated/older server might
+/// not; the proxy must not stream such a body through unredacted.
+async fn non_json_secret_mock_handler(
+    _req: Request<Incoming>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    let body = json!({
+        "kind": "Secret",
+        "metadata": {"name": "db", "namespace": "dev"},
+        "data": {"password": "c2VjcmV0"}
+    });
+    Ok(Response::builder()
+        .status(200)
+        .header("content-type", "text/plain")
+        .body(Full::new(Bytes::from(body.to_string())))
+        .unwrap())
+}
+
+async fn spawn_non_json_secret_mock() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(io, service_fn(non_json_secret_mock_handler))
+                    .await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// Redaction must fail closed when a Secret read comes back with a content-type
+/// the proxy cannot parse: the raw body (with `data` intact) must never reach
+/// the client. The proxy returns a 502 instead of streaming it through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_fails_closed_on_non_json_secret_response() {
+    let mock_base = spawn_non_json_secret_mock().await;
+    let kubeconfig = format!(
+        "apiVersion: v1\nkind: Config\ncurrent-context: ctx\nclusters:\n  - name: c\n    cluster: {{server: \"{mock_base}\"}}\ncontexts:\n  - name: ctx\n    context: {{cluster: c, user: u}}\nusers:\n  - name: u\n    user: {{}}\n"
+    );
+    let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
+    let tls = ProxyTls::generate().expect("tls");
+    let ca_pem = tls.ca_pem().to_string();
+    let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).expect("policy");
+    let port = free_port();
+    let listen = format!("127.0.0.1:{port}").parse().unwrap();
+    let proxy = Arc::new(KubeProxy::new(
+        listen,
+        tls,
+        upstream,
+        policy,
+        None,
+        std::path::PathBuf::from("unused-in-test-kubeconfig"),
+    ));
+
+    tokio::spawn(proxy.clone().serve());
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let base = format!("https://127.0.0.1:{port}");
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+
+    let resp = client
+        .get(format!("{base}/api/v1/namespaces/dev/secrets/db"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        502,
+        "a non-JSON Secret response fails closed"
+    );
+    let text = resp.text().await.unwrap();
+    assert!(
+        !text.contains("c2VjcmV0"),
+        "the secret value must not leak in the fail-closed response"
+    );
+}
+
+async fn eviction_mock_handler(
+    req: Request<Incoming>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    let (code, body) = match *req.method() {
+        // The eviction subresource echoes the evicted pod's name/namespace.
+        hyper::Method::POST => (
+            201,
+            json!({"kind": "Eviction", "apiVersion": "policy/v1", "metadata": {"name": "critical-0", "namespace": "dev"}}),
+        ),
+        _ => (
+            200,
+            json!({"kind": "Status", "apiVersion": "v1", "status": "Success"}),
+        ),
+    };
+    Ok(Response::builder()
+        .status(code)
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(body.to_string())))
+        .unwrap())
+}
+
+async fn spawn_eviction_mock() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(io, service_fn(eviction_mock_handler))
+                    .await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// A write to a subresource must not seed create/delete provenance. Evicting a
+/// pod (`POST pods/{name}/eviction`) returns an Eviction object echoing the
+/// pod's name, but the pod pre-existed and was terminated, not created. If that
+/// echo poisoned the provenance registry, a same-connection `DELETE pods/{name}`
+/// would be treated as contained cleanup and skip policy. It must stay held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_eviction_does_not_launder_a_later_delete() {
+    let mock_base = spawn_eviction_mock().await;
+    let kubeconfig = format!(
+        "apiVersion: v1\nkind: Config\ncurrent-context: ctx\nclusters:\n  - name: c\n    cluster: {{server: \"{mock_base}\"}}\ncontexts:\n  - name: ctx\n    context: {{cluster: c, user: u}}\nusers:\n  - name: u\n    user: {{}}\n"
+    );
+    let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
+    let tls = ProxyTls::generate().expect("tls");
+    let ca_pem = tls.ca_pem().to_string();
+    // Allow the eviction subresource in dev, but hold plain pod deletes.
+    let policy = ApiPolicy::from_yaml(
+        r#"
+default: deny
+rules:
+  - verbs: [create]
+    resources: [pods]
+    namespaces: [dev]
+    subresources: [eviction]
+    action: allow
+  - verbs: [delete]
+    resources: [pods]
+    namespaces: [dev]
+    action: hold
+"#,
+    )
+    .expect("policy");
+    let port = free_port();
+    let listen = format!("127.0.0.1:{port}").parse().unwrap();
+    let proxy = Arc::new(KubeProxy::new(
+        listen,
+        tls,
+        upstream,
+        policy,
+        None,
+        std::path::PathBuf::from("unused-in-test-kubeconfig"),
+    ));
+
+    let sink = RecordingSink::default();
+    proxy.attach_gate(Arc::new(sink.clone()));
+
+    tokio::spawn(proxy.clone().serve());
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let base = format!("https://127.0.0.1:{port}");
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+
+    // Evict the pod: allowed by the eviction rule.
+    let resp = client
+        .post(format!(
+            "{base}/api/v1/namespaces/dev/pods/critical-0/eviction"
+        ))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "eviction forwarded");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // No auto-revert was armed for a subresource write, so no provenance exists.
+    assert_eq!(
+        sink.calls.lock().unwrap().len(),
+        0,
+        "a subresource write arms no auto-revert and seeds no provenance"
+    );
+
+    // Deleting the evicted pod must stay held: the eviction did not launder it.
+    let resp = client
+        .delete(format!("{base}/api/v1/namespaces/dev/pods/critical-0"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "delete of the evicted pod is not contained; policy holds it"
+    );
+}
+
 /// Mock apiserver that returns a Helm release-storage Secret: type
 /// `helm.sh/release.v1` with a single opaque `data.release` blob (Helm's
 /// doubly-base64-and-gzip-encoded release state), which is not a structured type
