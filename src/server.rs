@@ -14,7 +14,8 @@ use crate::grant_profile::ProfileCatalog;
 use crate::grant_rules::{compile_session_grant_rules, CompiledGrantRules};
 use crate::injection::is_valid_env_name;
 use crate::redact::{
-    redact_exact_secrets, redact_output_text, redact_output_with_state, RedactionState,
+    redact_exact_secrets, redact_output, redact_output_text, redact_output_with_state,
+    RedactionState,
 };
 use crate::secrets::{legacy_sentinel, SecretManager};
 use crate::session::{
@@ -164,20 +165,10 @@ impl std::fmt::Display for CallerIdentity {
             #[cfg(windows)]
             Self::Windows { sid } => write!(f, "sid={}", sid),
             Self::Tcp { token } => {
-                let redacted = if token.len() > 8 {
-                    format!("{}...{}", &token[..4], &token[token.len() - 4..])
-                } else {
-                    "***".to_string()
-                };
-                write!(f, "token={}", redacted)
+                write!(f, "token={}", audit_token(token))
             }
             Self::TcpAdmin { token } => {
-                let redacted = if token.len() > 8 {
-                    format!("{}...{}", &token[..4], &token[token.len() - 4..])
-                } else {
-                    "***".to_string()
-                };
-                write!(f, "admin_token={}", redacted)
+                write!(f, "admin_token={}", audit_token(token))
             }
             Self::Unknown => write!(f, "unknown"),
         }
@@ -1138,11 +1129,10 @@ impl ServerConfig {
     ) {
         let action = if allowed { "ALLOWED" } else { "DENIED" };
         tracing::info!(
-            "[AUDIT] {} caller={} cmd=\"{} {}\" reason=\"{}\"",
+            "[AUDIT] {} caller={} cmd=\"{}\" reason=\"{}\"",
             action,
             caller,
-            binary,
-            args.join(" "),
+            audit_command_line(binary, args),
             reason
         );
     }
@@ -1160,10 +1150,9 @@ impl ServerConfig {
         reason: &str,
     ) {
         tracing::info!(
-            "[AUDIT] EXEC_FAILED caller={} cmd=\"{} {}\" reason=\"{}\"",
+            "[AUDIT] EXEC_FAILED caller={} cmd=\"{}\" reason=\"{}\"",
             caller,
-            binary,
-            args.join(" "),
+            audit_command_line(binary, args),
             reason
         );
     }
@@ -2304,9 +2293,9 @@ async fn handle_session_appeal(
             tracing::info!(
                 "[AUDIT] SESSION_APPEAL caller={} token={} allowed=true amended={} cmd={}",
                 caller,
-                token,
+                audit_token(&token),
                 amended,
-                command_line
+                redact_output(&command_line)
             );
             AdminResponse::SessionAppeal {
                 allowed: true,
@@ -2364,9 +2353,9 @@ async fn handle_session_appeal(
             tracing::info!(
                 "[AUDIT] SESSION_APPEAL caller={} token={} allowed=false amended={} cmd={}",
                 caller,
-                token,
+                audit_token(&token),
                 amended,
-                command_line
+                redact_output(&command_line)
             );
             AdminResponse::SessionAppeal {
                 allowed: false,
@@ -2490,7 +2479,7 @@ async fn handle_admin_request(
             tracing::info!(
                 "[AUDIT] SESSION_GRANT caller={} token={} profile={:?} ttl={:?} static_only={} auto_amend={} generated_allow={} generated_deny={}",
                 caller,
-                token,
+                audit_token(&token),
                 profile,
                 ttl_secs,
                 static_only,
@@ -2521,7 +2510,7 @@ async fn handle_admin_request(
             tracing::info!(
                 "[AUDIT] SESSION_REVOKE caller={} token={} existed={}",
                 caller,
-                token,
+                audit_token(&token),
                 removed
             );
             AdminResponse::Ok
@@ -4535,6 +4524,30 @@ fn command_line(binary: &str, args: &[String]) -> String {
     }
 }
 
+/// Render a command line for an audit log entry with secret-shaped values
+/// masked. Argv routinely carries inline credentials (`--password=...`,
+/// `Authorization: Bearer <token>`, connection URLs); the audit trail needs
+/// the command shape, not the values, and the daemon log must not become a
+/// secret store.
+fn audit_command_line(binary: &str, args: &[String]) -> String {
+    redact_output(&command_line(binary, args))
+}
+
+/// Truncate a token for an audit log entry. Tokens are bearer capabilities;
+/// the log needs enough of one to correlate events against
+/// `guard session list`, not the full value. Char-based slicing: the value is
+/// caller-supplied, so byte indexing could split a UTF-8 sequence and panic.
+fn audit_token(token: &str) -> String {
+    let chars: Vec<char> = token.chars().collect();
+    if chars.len() > 8 {
+        let head: String = chars[..4].iter().collect();
+        let tail: String = chars[chars.len() - 4..].iter().collect();
+        format!("{head}...{tail}")
+    } else {
+        "***".to_string()
+    }
+}
+
 fn validate_session_exact_rule_candidate(
     binary: &str,
     args: &[String],
@@ -6092,13 +6105,12 @@ async fn arm_containment<W: AsyncWrite + Unpin>(
                 persist_provisional(config, &u).await;
             }
             tracing::info!(
-                "[AUDIT] PROVISIONAL handle={} caller={} deadline={} window={}s revert=\"{} {}\"",
+                "[AUDIT] PROVISIONAL handle={} caller={} deadline={} window={}s revert=\"{}\"",
                 handle,
                 caller,
                 now.saturating_add(window),
                 window,
-                revert.binary,
-                revert.args.join(" ")
+                audit_command_line(&revert.binary, &revert.args)
             );
             ExecuteResult::provisional(
                 reason,
@@ -6234,13 +6246,12 @@ async fn hold_for_approval<W: AsyncWrite + Unpin>(
     let notify = config.approvals.write().await.enqueue(approval.clone());
     persist_approval(config, &approval).await;
     tracing::info!(
-        "[AUDIT] HELD handle={} caller={} risk={:?} class={:?} cmd=\"{} {}\" ttl={}s",
+        "[AUDIT] HELD handle={} caller={} risk={:?} class={:?} cmd=\"{}\" ttl={}s",
         handle,
         caller,
         risk,
         reversibility.map(|r| r.as_str()),
-        request.binary,
-        request.args.join(" "),
+        audit_command_line(&request.binary, &request.args),
         APPROVAL_TTL_SECS
     );
 
@@ -8575,6 +8586,47 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tracing::subscriber::with_default;
     use tracing_subscriber::fmt::MakeWriter;
+
+    // ---- Audit-line redaction helpers ---------------------------------------
+
+    /// Argv rendered into audit lines must have inline credentials masked:
+    /// the log records the command shape, never the secret values.
+    #[test]
+    fn audit_command_line_masks_inline_credentials() {
+        let line = audit_command_line(
+            "mysql",
+            &[
+                "-u".to_string(),
+                "root".to_string(),
+                "--password=hunter2sekrit".to_string(),
+            ],
+        );
+        assert!(!line.contains("hunter2sekrit"), "got: {line}");
+        assert!(line.contains("mysql"), "command shape survives: {line}");
+
+        let line = audit_command_line(
+            "curl",
+            &[
+                "-H".to_string(),
+                "Authorization: Bearer sk-live-abcdef1234567890".to_string(),
+                "https://api.example.com".to_string(),
+            ],
+        );
+        assert!(!line.contains("sk-live-abcdef1234567890"), "got: {line}");
+        assert!(line.contains("curl"), "got: {line}");
+    }
+
+    /// Tokens in audit lines are truncated head/tail; short and multi-byte
+    /// values must not panic or leak.
+    #[test]
+    fn audit_token_truncates_and_is_char_safe() {
+        assert_eq!(audit_token("abcdefghij"), "abcd...ghij");
+        assert_eq!(audit_token("short"), "***");
+        // Multi-byte chars: byte slicing would panic here.
+        let t = audit_token("éééééééééé");
+        assert!(t.starts_with("éééé"), "got: {t}");
+        assert!(!t.contains("éééééééééé"), "full value never appears: {t}");
+    }
 
     // ---- ExecuteResult result-shape tests -----------------------------------
 
