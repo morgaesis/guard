@@ -5743,6 +5743,14 @@ impl guard::proxy::GateSink for DaemonGateSink {
         let deadline = tokio::time::Instant::now()
             + std::time::Duration::from_secs(APPROVAL_TTL_SECS.saturating_add(60));
         loop {
+            // Register with the notifier before checking status (see
+            // `wait_for_decision`): a decision landing between the check and
+            // the park must complete the park immediately, not wait out the
+            // poll interval.
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
             match self.config.approvals.read().await.get(&handle).cloned() {
                 Some(a) if a.status == ApprovalStatus::Approved => {
                     orphan_guard.armed = false;
@@ -5776,7 +5784,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
             }
             let _ = tokio::time::timeout(
                 remaining.min(std::time::Duration::from_secs(5)),
-                notify.notified(),
+                &mut notified,
             )
             .await;
         }
@@ -6277,8 +6285,15 @@ async fn wait_for_decision<W: AsyncWrite + Unpin>(
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
     let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(1));
     loop {
-        // Check current status first so a decision that landed before we parked
-        // is not missed.
+        // Register with the notifier BEFORE checking status: notify_waiters()
+        // wakes only already-registered waiters, so a decision landing between
+        // the check and the park would otherwise be missed. The streaming path
+        // masks that with its 1s keepalive re-check, but a non-streaming
+        // waiter would stay parked for the full timeout.
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
         if let Some(a) = config.approvals.read().await.get(handle).cloned() {
             if a.status.is_decided() {
                 return approval_to_result(&a);
@@ -6298,7 +6313,7 @@ async fn wait_for_decision<W: AsyncWrite + Unpin>(
         }
 
         tokio::select! {
-            _ = notify.notified() => { /* re-check status at loop top */ }
+            _ = &mut notified => { /* re-check status at loop top */ }
             _ = tokio::time::sleep(remaining) => { /* timeout: re-check, then held */ }
             _ = keepalive.tick(), if stream_output => {
                 let _ = write_stream_message(stream_writer, &ExecuteStreamMessage::Keepalive).await;
@@ -11219,6 +11234,69 @@ mod tests {
         assert!(
             retired,
             "an abandoned hold must be retired, not left pending"
+        );
+    }
+
+    /// A non-streaming `--wait-approval` waiter must return as soon as the
+    /// operator decides, not park until its timeout: the waiter registers with
+    /// the notifier before checking status, so a decision landing in the gap
+    /// still completes the park immediately.
+    #[tokio::test]
+    async fn nonstreaming_wait_approval_returns_promptly_on_decision() {
+        let (cfg, _operator, agent) = gating_config(7014, 1000);
+        let agent_principal = agent.principal();
+
+        let request = ExecuteRequest {
+            binary: "rm".to_string(),
+            args: vec!["-rf".to_string(), "/data".to_string()],
+            auth_token: None,
+            env: HashMap::new(),
+            secrets: HashMap::new(),
+            stream: false,
+            session_token: None,
+            revert: None,
+            confirm_within_secs: None,
+            reevaluate: false,
+            ssh_hostkey: None,
+            require_approval: None,
+            wait_approval_secs: Some(30),
+            verb: None,
+        };
+        let cfg2 = cfg.clone();
+        let waiter = tokio::spawn(async move {
+            let mut sink = tokio::io::sink();
+            hold_for_approval(
+                request,
+                &cfg2,
+                &agent,
+                agent_principal,
+                "destructive".to_string(),
+                Some(10),
+                Some(Reversibility::Irreversible),
+                None,
+                false,
+                &mut sink,
+            )
+            .await
+        });
+
+        let handle = wait_for_pending_hold(&cfg).await;
+        {
+            let mut reg = cfg.approvals.write().await;
+            reg.deny(&handle, now_unix(), "operator rejected".to_string())
+                .unwrap();
+        }
+
+        // Well under the 30s wait: the deny must wake the waiter.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("waiter must wake on the decision, not sit out its timeout")
+            .unwrap();
+        assert!(!result.policy_allowed(), "denied decision is returned");
+        assert!(
+            result.policy_reason().contains("operator rejected"),
+            "got: {}",
+            result.policy_reason()
         );
     }
 
