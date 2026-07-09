@@ -15,6 +15,13 @@ use std::time::Duration;
 pub struct SessionStore {
     path: PathBuf,
     history_retention_secs: u64,
+    /// Serializes session-registry writes and records the revision of the last
+    /// snapshot written. The registry is persisted as a full-table rewrite, so
+    /// two concurrent persists completing out of order would let a stale
+    /// snapshot clobber a newer one on disk; the writer holds this lock across
+    /// the rewrite and drops any snapshot older than what already landed.
+    /// Shared across clones so every handle to the same store agrees.
+    registry_write_gate: std::sync::Arc<tokio::sync::Mutex<u64>>,
 }
 
 impl SessionStore {
@@ -36,13 +43,22 @@ impl SessionStore {
     pub async fn persist_registry(&self, registry: &SessionRegistry) -> Result<()> {
         let path = self.path.clone();
         let retention = self.history_retention_secs;
+        let revision = registry.revision();
         let mut snapshot = registry.clone();
+        let mut last_written = self.registry_write_gate.lock().await;
+        if revision < *last_written {
+            // A newer snapshot already landed; a full-table rewrite from this
+            // one would roll the on-disk state back.
+            return Ok(());
+        }
         tokio::task::spawn_blocking(move || {
             snapshot.purge_expired();
             Self::persist_registry_sync(&path, retention, &snapshot)
         })
         .await
-        .context("session store persist task failed")?
+        .context("session store persist task failed")??;
+        *last_written = revision;
+        Ok(())
     }
 
     pub fn path(&self) -> &Path {
@@ -53,6 +69,7 @@ impl SessionStore {
         let store = Self {
             path,
             history_retention_secs,
+            registry_write_gate: std::sync::Arc::new(tokio::sync::Mutex::new(0)),
         };
         let registry = Self::load_registry_sync(&store.path, history_retention_secs)?;
         Self::persist_registry_sync(&store.path, history_retention_secs, &registry)?;
@@ -729,6 +746,50 @@ fn decode_exec_status(value: &str) -> rusqlite::Result<SessionExecStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stale snapshot (cloned before a later mutation) must never clobber a
+    /// newer snapshot that already landed: the registry is persisted as a
+    /// full-table rewrite, so out-of-order completion would silently roll the
+    /// on-disk state back.
+    #[tokio::test]
+    async fn stale_snapshot_does_not_overwrite_newer_persisted_state() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::open(tmp.path().join("state.db"), 24 * 60 * 60)
+            .await
+            .expect("open store");
+
+        let grant = SessionGrant {
+            allow: vec!["echo*".into()],
+            deny: Vec::new(),
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            expires_at: None,
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            granted_at: 0,
+            static_only: false,
+            auto_amend: false,
+        };
+
+        let mut registry = SessionRegistry::new();
+        registry.grant("first".to_string(), grant.clone());
+        let stale = registry.clone();
+        registry.grant("second".to_string(), grant);
+        let fresh = registry.clone();
+        assert!(fresh.revision() > stale.revision());
+
+        // The newer snapshot lands first; the stale one arrives late (the
+        // out-of-order completion this guards against) and must be dropped.
+        store.persist_registry(&fresh).await.expect("persist fresh");
+        store.persist_registry(&stale).await.expect("persist stale");
+
+        let loaded = store.load_registry().await.expect("load registry");
+        assert!(loaded.has("first"));
+        assert!(
+            loaded.has("second"),
+            "the stale snapshot must not roll back the newer grant"
+        );
+    }
 
     #[tokio::test]
     async fn session_store_round_trips_registry() {

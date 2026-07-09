@@ -264,6 +264,15 @@ pub struct SessionRegistry {
     history: Vec<HistoricalGrant>,
     interactions: Vec<StoredSessionInteraction>,
     history_retention_secs: u64,
+    /// Monotonic mutation counter, bumped by every state-changing operation
+    /// (all of which run under the registry's write lock). A snapshot clone
+    /// carries the revision of the state it represents, so the store can
+    /// refuse to overwrite newer on-disk state with a stale snapshot when
+    /// concurrent persists complete out of order. `purge_expired` does not
+    /// bump: it derives no new state (expiry and retention are re-derived at
+    /// every load), so two same-revision snapshots differ at most in purge
+    /// progress and are interchangeable on disk.
+    revision: u64,
 }
 
 impl Default for SessionRegistry {
@@ -273,6 +282,7 @@ impl Default for SessionRegistry {
             history: Vec::new(),
             interactions: Vec::new(),
             history_retention_secs: DEFAULT_HISTORY_RETENTION_SECS,
+            revision: 0,
         }
     }
 }
@@ -301,7 +311,13 @@ impl SessionRegistry {
                 .map(|(token, interaction)| StoredSessionInteraction { token, interaction })
                 .collect(),
             history_retention_secs,
+            revision: 0,
         }
+    }
+
+    /// The revision of the state this registry (or snapshot clone) represents.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub fn grants_snapshot(&self) -> HashMap<String, SessionGrant> {
@@ -320,6 +336,7 @@ impl SessionRegistry {
     }
 
     pub fn grant(&mut self, token: String, mut grant: SessionGrant) {
+        self.revision += 1;
         if grant.granted_at == 0 {
             grant.granted_at = current_unix_secs();
         }
@@ -340,6 +357,7 @@ impl SessionRegistry {
         let Some(grant) = self.grants.remove(token) else {
             return false;
         };
+        self.revision += 1;
         self.history.push(historical(
             token,
             grant,
@@ -392,6 +410,7 @@ impl SessionRegistry {
     }
 
     pub fn record_interaction(&mut self, token: &str, mut interaction: SessionInteraction) {
+        self.revision += 1;
         if interaction.at_unix == 0 {
             interaction.at_unix = current_unix_secs();
         }
@@ -515,10 +534,17 @@ impl SessionRegistry {
         binary: String,
         args: Vec<String>,
     ) -> Option<bool> {
-        let grant = self.grants.get_mut(token)?;
-        if grant.is_expired(current_unix_secs()) {
+        if self
+            .grants
+            .get(token)
+            .is_none_or(|g| g.is_expired(current_unix_secs()))
+        {
             return None;
         }
+        // Bump even on a Some(false) outcome: the opposite-side retain below
+        // can still have removed a rule.
+        self.revision += 1;
+        let grant = self.grants.get_mut(token).expect("presence checked above");
 
         let rule = SessionExactRule::new(binary, args);
         match decision {
