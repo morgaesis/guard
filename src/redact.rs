@@ -105,7 +105,7 @@ const SECRET_VALUE_SUBPATTERN: &str =
 
 /// Name-based secret redaction: a key name ending in a secret-bearing word,
 /// followed by `=`/`:` (or their URL-encoded forms `%3D`/`%3A`, so query
-/// strings in logged URLs cannot smuggle a value past the separator check),
+/// strings in logged URLs cannot slip a value past the separator check),
 /// has its value redacted regardless of the value's shape. Handles unquoted
 /// env/CLI pairs (`MY_TOKEN=x`, `--api-key=x`), YAML (`password: x`), and
 /// JSON with quoted names and values (`"apikey": "x",` -- the shape
@@ -195,7 +195,7 @@ fn redact_named_secrets(text: &str) -> String {
 /// Structured (rather than a lazy any-character gap) so that a `value:`
 /// embedded inside a sibling member's string literal
 /// (`"description": "value: decoy"`) or a hyphenated sibling key
-/// (`old-value:`) cannot hijack the correlation and leave the real secret
+/// (`old-value:`) cannot take over the correlation and leave the real secret
 /// member unredacted: the gap only advances over whole members, so the pair
 /// keys can only match actual member keys. A gap member's value may be
 /// empty (`optional: ,` -- YAML null shorthand); the value is optional in

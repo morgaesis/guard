@@ -45,8 +45,8 @@ pub struct ApiRule {
     /// `status`. Empty (the default) means the rule covers only the bare
     /// resource: a write to a subresource is never authorized by a plain
     /// resource rule, because a write subresource can carry effects the parent
-    /// verb does not model (evicting a pod, injecting an ephemeral container,
-    /// minting a token). Read subresources (`log`, a `status` GET) are always
+    /// verb does not model (evicting a pod, adding an ephemeral container,
+    /// issuing a token). Read subresources (`log`, a `status` GET) are always
     /// covered by a matching read rule and do not need listing here. `*` allows
     /// any write subresource on the matched resource.
     #[serde(default)]

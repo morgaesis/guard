@@ -30,7 +30,7 @@
 # covers the bare resource and its read subresources (`log`, a `status` GET) but
 # never a write subresource, because a write subresource can carry effects the
 # parent verb does not model: `pods/eviction` terminates a pod, `*/scale`
-# changes replica counts, `serviceaccounts/token` mints a credential.
+# changes replica counts, `serviceaccounts/token` issues a credential.
 # `pods/ephemeralcontainers` (code execution in a running container) and the
 # interactive subresources `exec`/`attach`/`portforward`/`proxy` are denied
 # outright regardless of policy.

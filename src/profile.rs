@@ -5,17 +5,19 @@
 //! They confine the daemon without breaking its legitimate operation: guard
 //! spawns operator-approved child commands, makes TLS calls to the LLM provider,
 //! and reads/writes its own state and credential directory. The profiles bound
-//! the filesystem reach and remove container-escape / host-tampering syscalls
-//! while leaving that legitimate operation intact.
+//! the filesystem reach and remove syscalls that let a process break out of
+//! the container or modify the host without authorization, while leaving
+//! that legitimate operation intact.
 
-/// Syscalls a guard container never needs and that enable container escape,
-/// kernel tampering, or host reconfiguration. Blocking them is safe for the
-/// daemon and its child commands while removing the most dangerous primitives.
-/// This is intentionally a denylist over a default-allow base, so the daemon and
+/// Syscalls a guard container never needs and that would let a process break
+/// out of the container, modify the kernel without authorization, or
+/// reconfigure the host. Blocking them is safe for the daemon and its child
+/// commands while removing the most dangerous primitives. This is
+/// intentionally a denylist over a default-allow base, so the daemon and
 /// arbitrary approved child binaries keep working; only clearly-dangerous
 /// syscalls are refused.
 const DENIED_SYSCALLS: &[&str] = &[
-    // Mount / namespace / root manipulation (container escape).
+    // Mount / namespace / root manipulation (used to break out of a container).
     "mount",
     "umount",
     "umount2",
@@ -27,7 +29,7 @@ const DENIED_SYSCALLS: &[&str] = &[
     "ptrace",
     "process_vm_readv",
     "process_vm_writev",
-    // Kernel image / module tampering.
+    // Kernel image / module modification.
     "kexec_load",
     "kexec_file_load",
     "init_module",
@@ -62,8 +64,9 @@ const DENIED_SYSCALLS: &[&str] = &[
 /// A seccomp profile in the JSON format Docker / containerd / Podman accept via
 /// `--security-opt seccomp=<file>`. Default-allow with an `errno` denial for the
 /// dangerous syscalls in [`DENIED_SYSCALLS`]. Default-allow keeps the daemon and
-/// its approved child processes working; the denials remove escape and
-/// host-tampering primitives.
+/// its approved child processes working; the denials remove the primitives
+/// that let a process break out of the container or modify the host without
+/// authorization.
 pub fn seccomp_json() -> String {
     let names: Vec<serde_json::Value> = DENIED_SYSCALLS
         .iter()
@@ -86,10 +89,10 @@ pub fn seccomp_json() -> String {
 
 /// An AppArmor profile confining the guard daemon to its own binary, its state /
 /// credential directory, and the execution of operator-approved child commands
-/// from the standard system paths, while denying host tampering. `name` is the
-/// profile name, `exe` the absolute path to the guard binary the profile
-/// attaches to, and `data_dir` the directory holding state and brokered
-/// credentials.
+/// from the standard system paths, while denying unauthorized host
+/// modification. `name` is the profile name, `exe` the absolute path to the
+/// guard binary the profile attaches to, and `data_dir` the directory holding
+/// state and brokered credentials.
 pub fn apparmor_profile(name: &str, exe: &str, data_dir: &str) -> String {
     format!(
         r#"#include <tunables/global>

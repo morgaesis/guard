@@ -53,7 +53,8 @@ const DEFAULT_MAX_COMPLETION_TOKENS: u32 = 4096;
 
 /// System guidance for `guard verb create --prompt` synthesis: turn operator
 /// prose into exactly ONE least-privilege, typed verb. Conservative defaults
-/// (read-only/reversible, narrow anchored patterns, no flag/shell injection).
+/// (read-only/reversible, narrow anchored patterns, no flag or shell
+/// metacharacter reinterpretation).
 const SYSTEM_PROMPT_CREATE_VERB: &str = r#"You translate an operator's plain-language request into exactly ONE guard verb:
 a typed, least-privilege, fixed-binary command template an AI agent may invoke
 instead of raw shell. Always answer by calling the create_verb function.

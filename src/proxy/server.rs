@@ -263,18 +263,17 @@ impl KubeProxy {
             );
         };
 
-        // Interactive subresources tunnel arbitrary bytes and cannot be gated at
-        // the request level yet: deny them outright in phase 1. `proxy` is in
-        // the same class: it tunnels an arbitrary HTTP request (any method,
-        // any path) to the target Pod/Service/Node's network endpoint -- for
-        // a Node, that reaches the kubelet API, which exposes `exec`, `run`,
-        // `portForward`, and `logs` itself. A get/list/watch ApiPolicy allow
-        // rule has no visibility into the tunneled request, so it would
-        // silently approve what is really an unrestricted network pivot.
-        // `ephemeralcontainers` is in the same class: a PATCH/PUT injects a
-        // container into a running pod, which is code execution equivalent to
-        // `exec`. It is denied outright regardless of policy, not left to a
-        // `pods` write rule that has no visibility into what it enables.
+        // Interactive subresources carry an opaque byte stream the request-level
+        // gate cannot inspect, so they are denied outright in phase 1. `proxy`
+        // is in the same class: it forwards an arbitrary HTTP request (any
+        // method, any path) to the target Pod/Service/Node endpoint -- for a
+        // Node that reaches the kubelet API, which itself exposes `exec`, `run`,
+        // `portForward`, and `logs`. A get/list/watch ApiPolicy allow rule has
+        // no visibility into the forwarded request, so it would silently approve
+        // far more reach than it appears to. `ephemeralcontainers` is in the
+        // same class: a PATCH/PUT adds a container to a running pod, which gives
+        // the same in-container reach as `exec`. It is denied regardless of
+        // policy, not left to a `pods` write rule that cannot see what it grants.
         if let Some(sub) = op.subresource.as_deref() {
             if matches!(
                 sub,
@@ -727,8 +726,8 @@ fn is_hop_by_hop(name: &header::HeaderName) -> bool {
 /// identity rather than the operator's, bypassing ApiPolicy entirely (it only
 /// evaluates verb/resource/namespace, never identity). `X-Remote-*` are the
 /// equivalent front-proxy identity headers for aggregated API servers; strip
-/// them for the same reason even though exploiting them additionally
-/// requires the apiserver to trust this proxy's client certificate.
+/// them for the same reason, though they only take effect where the apiserver
+/// already trusts this proxy's client certificate.
 fn is_identity_header(name: &header::HeaderName) -> bool {
     let s = name.as_str();
     s.starts_with("impersonate-") || s.starts_with("x-remote-")

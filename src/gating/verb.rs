@@ -3,9 +3,10 @@
 //!
 //! A verb names a fixed binary and an argv template with typed, pattern-validated
 //! parameters. Rendering substitutes each `{param}` as exactly one argv element
-//! (no shell, no word-splitting), so parameter injection is structurally
-//! impossible. A verb declares its own reversibility class (which drives the
-//! consequence gate) and, for recoverable verbs, a structured rollback template.
+//! (no shell, no word-splitting), so a parameter value can never expand into
+//! extra, unintended arguments. A verb declares its own reversibility class
+//! (which drives the consequence gate) and, for recoverable verbs, a
+//! structured rollback template.
 //!
 //! The catalog is the "slow clock": it is a file only the operator (daemon UID)
 //! controls; agents cannot add or change verbs at runtime. A trusted verb may
@@ -27,14 +28,14 @@ use std::time::SystemTime;
 pub struct ParamSpec {
     /// Fully-anchored regex (`^...$`) the value must match. Rejected at load if
     /// not anchored, so a permissive pattern cannot silently allow a substring
-    /// with shell metacharacters or flag-injection.
+    /// with shell metacharacters or a value that gets reinterpreted as a flag.
     pub pattern: String,
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub required: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<String>,
     /// Allow a rendered value to begin with `-`. Off by default so a value can
-    /// never be smuggled in as an option flag (e.g. `-o ProxyCommand=...`).
+    /// never pass itself off as an option flag (e.g. `-o ProxyCommand=...`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_dash: bool,
 }
@@ -482,9 +483,10 @@ fn binary_match_key(binary: &str) -> String {
 
 /// Binary-name match consistent with `gating::deny_shape::binary_matches` and
 /// `server::binary_allowed`: a path-qualified binary (either side) requires an
-/// exact match, so a path-qualified spoof (`/tmp/evil/kubectl`) can never
-/// reverse-match a verb authored for the bare name, or vice versa; a bare name
-/// matches case-insensitively by basename with a stripped `.exe` suffix.
+/// exact match, so a binary reached via a different, path-qualified location
+/// (e.g. `/tmp/other/kubectl`) can never reverse-match a verb authored for the
+/// bare name, or vice versa; a bare name matches case-insensitively by
+/// basename with a stripped `.exe` suffix.
 fn binary_names_match(observed: &str, verb_binary: &str) -> bool {
     if observed.contains('/')
         || observed.contains('\\')
@@ -684,8 +686,8 @@ fn validate_verb(verb: &Verb) -> Result<()> {
 
 /// Compile a parameter pattern as a fully-anchored, full-string regex. The
 /// operator's own outer `^`/`$` are stripped and the pattern is wrapped in
-/// `^(?:...)$`, so a top-level alternation (e.g. `^[a-z]+$|x`) cannot smuggle an
-/// unanchored branch that `is_match` would satisfy on a substring.
+/// `^(?:...)$`, so a top-level alternation (e.g. `^[a-z]+$|x`) cannot introduce
+/// an unanchored branch that `is_match` would satisfy on a substring.
 fn compile_anchored(pattern: &str) -> Result<Regex> {
     let inner = pattern.strip_prefix('^').unwrap_or(pattern);
     let inner = inner.strip_suffix('$').unwrap_or(inner);
@@ -868,7 +870,7 @@ verbs:
 
     #[test]
     fn flag_injection_is_rejected() {
-        // A value beginning with '-' must be refused (argv/flag injection).
+        // A value beginning with '-' must be refused (would be read as an argv flag).
         let yaml = r#"
 verbs:
   - name: ping-host

@@ -3907,7 +3907,7 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
 
     // Validate binary name: reject paths, traversal, and shell metacharacters.
     // Windows path forms (backslash, drive-letter `:`, UNC) are rejected too so a
-    // caller cannot smuggle an absolute/relative trojan path as the "binary".
+    // caller cannot pass an absolute/relative path disguised as the "binary".
     if request.binary.contains('/')
         || request.binary.contains('\\')
         || request.binary.contains(':')
@@ -5207,7 +5207,7 @@ async fn exec_after_approval<W: AsyncWrite + Unpin>(
     // Operator-declared passthroughs (GUARD_CHILD_ENV): forward these daemon
     // env vars to the child so brokered credentials reach a tool generically.
     // The value comes from the DAEMON's environment (not the caller), so an
-    // agent cannot inject one here; e.g. KUBECONFIG points kubectl at a config
+    // agent cannot introduce one here; e.g. KUBECONFIG points kubectl at a config
     // only the daemon can read.
     for var in &config.extra_child_env {
         if let Ok(val) = std::env::var(var) {
@@ -6189,7 +6189,8 @@ async fn execute_snapshot(
                 // Unresolved at hold and still unresolved: consistent (the exec
                 // path surfaces the missing secret on its own).
                 (SECRET_BINDING_UNRESOLVED, None) => true,
-                // Unresolved at hold but now resolves: the swap attack. Reject.
+                // Unresolved at hold but now resolves: a value swap between
+                // hold and approval. Reject.
                 (SECRET_BINDING_UNRESOLVED, Some(_)) => false,
                 // Bound to a value: it must still resolve to the same value.
                 (hash, Some(v)) => hash_secret_value(&binding.salt, &v) == hash,
@@ -7222,7 +7223,7 @@ fn has_token(tokens: &[String], needle: &str) -> bool {
 
 /// Environment variable names that let a caller turn a benign child command
 /// into arbitrary code execution: dynamic-linker preload/audit hooks, per-
-/// language startup-file/option injectors, and git's command/config
+/// language startup-file/option hooks, and git's command/config
 /// overrides. Blocked from `--env`/`--secret` injection regardless of the
 /// target binary — a value under any of these names is code, not data, and
 /// the child would run it before its own logic. Compared case-insensitively;
@@ -7408,7 +7409,7 @@ fn is_safe_ssh_flag(arg: &str) -> bool {
 /// and host-key handling). Everything else — ProxyCommand, ProxyJump,
 /// LocalCommand, RemoteCommand, *Forward, Tunnel, Include, IdentityFile,
 /// ControlPath, and any unknown keyword — is rejected. A value containing a
-/// newline is rejected outright so a second directive cannot be smuggled onto
+/// newline is rejected outright so a second directive cannot be introduced on
 /// a later line past the first-keyword check.
 fn ssh_o_directive_readonly_safe(value: &str) -> bool {
     if value.contains('\n') || value.contains('\r') {
@@ -7430,7 +7431,7 @@ fn ssh_o_directive_readonly_safe(value: &str) -> bool {
         | "checkhostip" => true,
         // Host-key checking is permitted only in its security-preserving
         // forms. Disabling it (`no`/`off`) or deferring to an interactive
-        // prompt (`ask`) would let a man-in-the-middle tamper with the
+        // prompt (`ask`) would let an interposed relay alter the
         // diagnostic's output, so those forfeit to the evaluator rather than
         // taking the deterministic fast path. An empty value falls back to
         // ssh's strict default, which is safe.
