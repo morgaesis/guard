@@ -35,6 +35,17 @@ pub struct ApiMutation {
     pub revert: ApiRevert,
 }
 
+/// Operator decision on a held API request.
+#[derive(Debug, Clone)]
+pub enum HoldDecision {
+    /// The operator approved the exact held request; the proxy forwards it.
+    /// Carries the approval handle for the audit trail.
+    Approved { handle: String },
+    /// Denied, expired, or never enqueued (capacity, no queue). The proxy
+    /// returns the reason to the client and forwards nothing.
+    Denied { reason: String },
+}
+
 /// Implemented by the daemon to arm the proxy's synthesized reverts in its
 /// consequence machinery.
 #[async_trait]
@@ -52,4 +63,15 @@ pub trait GateSink: Send + Sync {
     /// pending revert so the sweeper does not later try to delete an object that
     /// no longer exists. Default: no-op, for sinks that do not track reverts.
     async fn resolve(&self, _handle: &str) {}
+
+    /// Enqueue a policy-held API request for operator approval and wait for the
+    /// decision. The request stays buffered in the proxy while the operator
+    /// reviews it (`guard approvals` / `guard approve` / `guard deny`); only an
+    /// explicit approval releases it, and an unattended hold expires to a
+    /// denial. Default: fail closed, for sinks with no approval queue.
+    async fn hold_request(&self, _label: &str, _reason: &str) -> HoldDecision {
+        HoldDecision::Denied {
+            reason: "no operator-approval queue is attached to this proxy".to_string(),
+        }
+    }
 }

@@ -32,7 +32,7 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio_rustls::TlsAcceptor;
 
-use super::gate::{ApiMutation, ApiRevert, GateSink};
+use super::gate::{ApiMutation, ApiRevert, GateSink, HoldDecision};
 use super::k8s::{self, parse_api_op, ApiOp, Verb};
 use super::policy::{ApiAction, ApiPolicy};
 use super::tls::ProxyTls;
@@ -334,15 +334,51 @@ impl KubeProxy {
                 )
             }
             ApiAction::Hold => {
+                // The request is parked here, still buffered, while the daemon
+                // queues it for the operator (`guard approvals` / `guard approve`).
+                // Only an explicit approval forwards it; a deny, expiry, capacity
+                // refusal, or a proxy running without the daemon's consequence
+                // gate all fail closed to a 403.
+                let Some(gate) = self.gate.get() else {
+                    tracing::info!(
+                        target: "guard::kubeproxy",
+                        "HOLD {} denied: no approval queue (--gate consequence is not active)",
+                        label
+                    );
+                    return status_resp(
+                        StatusCode::FORBIDDEN,
+                        &format!(
+                            "guard kube-proxy: {label} requires operator approval, but the daemon \
+                             is running without --gate consequence (no approval queue); denied"
+                        ),
+                        "Forbidden",
+                    );
+                };
                 tracing::info!(target: "guard::kubeproxy", "HOLD {} ({})", label, decision.reason);
-                status_resp(
-                    StatusCode::FORBIDDEN,
-                    &format!(
-                        "guard kube-proxy: {label} held for operator approval: {}",
-                        decision.reason
-                    ),
-                    "Forbidden",
-                )
+                match gate.hold_request(&label, &decision.reason).await {
+                    HoldDecision::Approved { handle } => {
+                        let redact = decision.redact_secrets && op.is_secrets() && op.is_read();
+                        tracing::info!(
+                            target: "guard::kubeproxy",
+                            "ALLOW {} (operator approved hold {}){}",
+                            label,
+                            handle,
+                            if redact { " (redacting)" } else { "" }
+                        );
+                        self.forward(req, &path, &query, redact, Some(op), conn_id)
+                            .await
+                    }
+                    HoldDecision::Denied { reason } => {
+                        tracing::info!(target: "guard::kubeproxy", "DENY {} (held: {})", label, reason);
+                        status_resp(
+                            StatusCode::FORBIDDEN,
+                            &format!(
+                                "guard kube-proxy: {label} held for operator approval: {reason}"
+                            ),
+                            "Forbidden",
+                        )
+                    }
+                }
             }
             ApiAction::Allow => {
                 let redact = decision.redact_secrets && op.is_secrets() && op.is_read();

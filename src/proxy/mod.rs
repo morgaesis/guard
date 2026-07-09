@@ -25,7 +25,7 @@ pub mod server;
 pub mod tls;
 pub mod upstream;
 
-pub use gate::{ApiMutation, ApiRevert, GateSink};
+pub use gate::{ApiMutation, ApiRevert, GateSink, HoldDecision};
 pub use k8s::{ApiOp, Verb};
 pub use kubeconfig::{brokered_kubeconfig, validate_brokered_kubeconfig, BrokerError};
 pub use policy::{ApiAction, ApiPolicy, ApiRule};

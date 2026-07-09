@@ -2247,6 +2247,13 @@ async fn run_server(cmd: ServerCommands) -> Result<()> {
                 let listen: std::net::SocketAddr = addr_str
                     .parse()
                     .with_context(|| format!("invalid --kube-proxy address '{addr_str}'"))?;
+                if !listen.ip().is_loopback() {
+                    anyhow::bail!(
+                        "--kube-proxy must bind a loopback address (got {listen}): the proxy \
+                         authenticates nothing itself, so a non-loopback bind would offer the \
+                         daemon's cluster credential to anything that can reach the port"
+                    );
+                }
                 let kubeconfig_path = kubeconfig
                     .or_else(|| guard_env("KUBE_PROXY_KUBECONFIG").map(PathBuf::from))
                     .context(

@@ -1294,7 +1294,8 @@ impl Server {
 
         match store.load_approvals().await {
             Ok(rows) => {
-                let (reg, recovered) = ApprovalRegistry::from_rows(rows, now_unix());
+                let now = now_unix();
+                let (mut reg, recovered) = ApprovalRegistry::from_rows(rows, now);
                 if !recovered.is_empty() {
                     tracing::warn!(
                         "[AUDIT] STARTUP_RECOVERY approvals_exec_failed={} handles={:?} (exec interrupted by restart)",
@@ -1308,6 +1309,37 @@ impl Server {
                             }
                         }
                     }
+                }
+                // A kube-proxy hold cannot survive a restart: the parked HTTP
+                // request died with the old process, so a still-pending row
+                // would offer the operator an approval that releases nothing.
+                let orphaned: Vec<String> = reg
+                    .list()
+                    .into_iter()
+                    .filter(|a| {
+                        a.status == ApprovalStatus::Pending
+                            && a.snapshot.binary == KUBE_PROXY_SENTINEL_BINARY
+                    })
+                    .map(|a| a.handle)
+                    .collect();
+                for h in &orphaned {
+                    reg.set_exec_failed(
+                        h,
+                        now,
+                        "daemon restarted; the held API request is gone".to_string(),
+                    );
+                    if let Some(a) = reg.get(h) {
+                        if let Err(e) = store.save_approval(a.clone()).await {
+                            tracing::warn!("failed to persist retired proxy hold {}: {}", h, e);
+                        }
+                    }
+                }
+                if !orphaned.is_empty() {
+                    tracing::warn!(
+                        "[AUDIT] STARTUP_RECOVERY kube_proxy_holds_retired={} handles={:?}",
+                        orphaned.len(),
+                        orphaned
+                    );
                 }
                 *self.config.approvals.write().await = reg;
             }
@@ -1430,7 +1462,7 @@ impl Server {
                 }));
             } else {
                 tracing::info!(
-                    "kube-proxy: --gate consequence not set; recoverable writes forwarded without auto-revert"
+                    "kube-proxy: --gate consequence not set; recoverable writes forwarded without auto-revert and policy 'hold' rules deny fail-closed (no approval queue)"
                 );
             }
             tracing::info!("Starting kube-proxy listener on {}", proxy.listen());
@@ -3125,6 +3157,35 @@ async fn handle_approve(
             }
         }
     };
+    // A kube-proxy hold carries no executable snapshot: approving it releases
+    // the API request parked in the proxy (the proxy waiter forwards it), it
+    // never spawns a process. A caller cannot steer a real command into this
+    // branch by naming the sentinel binary, because the row must also be owned
+    // by the daemon principal, which peer credentials assign only to the
+    // daemon's own gate sink.
+    if snapshot.binary == KUBE_PROXY_SENTINEL_BINARY
+        && matches!(&snapshot.principal, Some(p) if config.daemon_principal.eq_ci(p))
+    {
+        let now = now_unix();
+        {
+            let mut reg = config.approvals.write().await;
+            reg.set_result(handle, now, None, None, None);
+        }
+        if let Some(a) = config.approvals.read().await.get(handle).cloned() {
+            persist_approval(config, &a).await;
+        }
+        tracing::info!(
+            "[AUDIT] APPROVED handle={} caller={} (kube-proxy request released)",
+            handle,
+            caller
+        );
+        return AdminResponse::GateAction {
+            message: format!("approved held API request {handle}; the proxy is forwarding it"),
+            exit_code: None,
+            stdout: None,
+            stderr: None,
+        };
+    }
     // Gate-on-prediction: if this hold came from a verb and the catalog changed
     // since it was held, the approved artifact may no longer mean what the
     // operator reviewed. Void the approval rather than execute a stale rendering.
@@ -5466,6 +5527,53 @@ fn forget_proxy_provenance(config: &ServerConfig, handle: &str) {
     }
 }
 
+/// Sentinel binary naming a kube-proxy-originated row in the provisional and
+/// approval registries. Such a row is never executed: approving one releases
+/// the API request parked in the proxy instead of spawning a process.
+const KUBE_PROXY_SENTINEL_BINARY: &str = "(kube-proxy)";
+
+/// Retires a kube-proxy hold whose parked request vanished (the brokered
+/// client disconnected while waiting), so the queue never offers the operator
+/// an approval that releases nothing. Disarmed on a normal decision.
+struct ProxyHoldOrphanGuard {
+    config: ServerConfig,
+    handle: String,
+    armed: bool,
+}
+
+impl Drop for ProxyHoldOrphanGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let config = self.config.clone();
+        let handle = self.handle.clone();
+        tokio::spawn(async move {
+            let now = now_unix();
+            {
+                let mut reg = config.approvals.write().await;
+                match reg.get(&handle).map(|a| a.status) {
+                    Some(s) if s.is_pending() => {}
+                    _ => return,
+                }
+                reg.set_exec_failed(
+                    &handle,
+                    now,
+                    "requester disconnected before a decision; the held API request is gone"
+                        .to_string(),
+                );
+            }
+            if let Some(a) = config.approvals.read().await.get(&handle).cloned() {
+                persist_approval(&config, &a).await;
+            }
+            tracing::info!(
+                "[AUDIT] HOLD_ORPHANED handle={} (kube-proxy client disconnected)",
+                handle
+            );
+        });
+    }
+}
+
 /// Bridges the kube-proxy's synthesized reverts into the daemon's consequence
 /// machinery. Holds a clone of the server config (which shares the provisional
 /// registry and state store), the operator kubeconfig for the `kubectl` revert,
@@ -5540,7 +5648,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
         let provisional = Provisional {
             handle: handle.clone(),
             principal,
-            binary: "(kube-proxy)".to_string(),
+            binary: KUBE_PROXY_SENTINEL_BINARY.to_string(),
             args: vec![mutation.label.clone()],
             revert_binary,
             revert_args,
@@ -5555,6 +5663,110 @@ impl guard::proxy::GateSink for DaemonGateSink {
         persist_provisional(&self.config, &provisional).await;
         self.config.provisional.write().await.insert(provisional);
         Some(handle)
+    }
+
+    async fn hold_request(&self, label: &str, reason: &str) -> guard::proxy::HoldDecision {
+        use guard::proxy::HoldDecision;
+        let principal = Some(self.config.daemon_principal.clone());
+        if let Some(why) = gate_capacity_reason(&self.config, principal.as_ref()).await {
+            return HoldDecision::Denied { reason: why };
+        }
+        let handle = new_handle();
+        let now = now_unix();
+        // The snapshot is descriptive, not executable: the sentinel binary plus
+        // the operation label. Approval releases the parked request; nothing is
+        // ever spawned from this row (see the sentinel branch in
+        // `handle_approve`).
+        let snapshot = ApprovalSnapshot {
+            binary: KUBE_PROXY_SENTINEL_BINARY.to_string(),
+            args: vec![label.to_string()],
+            env: std::collections::BTreeMap::new(),
+            secret_keys: std::collections::BTreeMap::new(),
+            verb_name: None,
+            verb_params: std::collections::BTreeMap::new(),
+            catalog_version: None,
+            principal,
+            secret_binding: None,
+        };
+        let approval = Approval {
+            handle: handle.clone(),
+            snapshot,
+            reason: reason.to_string(),
+            risk: None,
+            reversibility: None,
+            created_unix: now,
+            ttl_secs: APPROVAL_TTL_SECS,
+            status: ApprovalStatus::Pending,
+            decided_unix: None,
+            decided_reason: None,
+            result_exit: None,
+            result_stdout: None,
+            result_stderr: None,
+            notes: Vec::new(),
+        };
+        let notify = self
+            .config
+            .approvals
+            .write()
+            .await
+            .enqueue(approval.clone());
+        persist_approval(&self.config, &approval).await;
+        tracing::info!(
+            "[AUDIT] HELD handle={} caller=(kube-proxy) api=\"{}\" ttl={}s",
+            handle,
+            label,
+            APPROVAL_TTL_SECS
+        );
+        // If the brokered client disconnects while parked, this future is
+        // dropped mid-await; the guard then retires the orphaned hold.
+        let mut orphan_guard = ProxyHoldOrphanGuard {
+            config: self.config.clone(),
+            handle: handle.clone(),
+            armed: true,
+        };
+        // The sweeper expires the row at its TTL and wakes this waiter; the
+        // slack past the TTL is a backstop against a missed wakeup, not a
+        // second policy timer.
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(APPROVAL_TTL_SECS.saturating_add(60));
+        loop {
+            match self.config.approvals.read().await.get(&handle).cloned() {
+                Some(a) if a.status == ApprovalStatus::Approved => {
+                    orphan_guard.armed = false;
+                    return HoldDecision::Approved { handle };
+                }
+                Some(a) if a.status.is_decided() => {
+                    orphan_guard.armed = false;
+                    return HoldDecision::Denied {
+                        reason: a
+                            .decided_reason
+                            .unwrap_or_else(|| a.status.as_str().to_string()),
+                    };
+                }
+                Some(_) => {}
+                None => {
+                    orphan_guard.armed = false;
+                    return HoldDecision::Denied {
+                        reason: "held request disappeared from the queue".to_string(),
+                    };
+                }
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                // Past TTL plus slack: the sweeper's expiry (or an operator
+                // decision) is authoritative, but nothing woke us. Leave the
+                // row to the sweeper and fail closed.
+                orphan_guard.armed = false;
+                return HoldDecision::Denied {
+                    reason: "expired without operator approval".to_string(),
+                };
+            }
+            let _ = tokio::time::timeout(
+                remaining.min(std::time::Duration::from_secs(5)),
+                notify.notified(),
+            )
+            .await;
+        }
     }
 
     async fn resolve(&self, handle: &str) {
@@ -10834,6 +11046,127 @@ mod tests {
         assert_eq!(
             cfg.approvals.read().await.get(&handle).unwrap().status,
             ApprovalStatus::Approved
+        );
+    }
+
+    /// Wait (bounded) for a pending approval row to appear and return its handle.
+    async fn wait_for_pending_hold(cfg: &ServerConfig) -> String {
+        for _ in 0..100 {
+            let pending: Vec<String> = cfg
+                .approvals
+                .read()
+                .await
+                .list()
+                .into_iter()
+                .filter(|a| a.status == ApprovalStatus::Pending)
+                .map(|a| a.handle)
+                .collect();
+            if let Some(h) = pending.into_iter().next() {
+                return h;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("no pending hold appeared");
+    }
+
+    /// A kube-proxy `hold` parks the request in the approval queue: an operator
+    /// approve releases the waiter without spawning any process, an operator
+    /// deny fails it closed, and a waiter that vanishes undecided (client
+    /// disconnect) retires its row so the queue never offers a dead approval.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kube_proxy_hold_routes_through_approval_queue() {
+        let (cfg, operator, _agent) = gating_config(7013, 1000);
+        let sink = Arc::new(DaemonGateSink {
+            config: cfg.clone(),
+            kubeconfig: PathBuf::from("unused-in-test"),
+            snapshot_dir: std::env::temp_dir(),
+            window_secs: 60,
+        });
+
+        // Approve: the waiter returns Approved with the queue handle; the row is
+        // Approved and carries no exec result (nothing ran).
+        let s = sink.clone();
+        let waiter = tokio::spawn(async move {
+            guard::proxy::GateSink::hold_request(&*s, "delete namespaces/prod", "namespace delete")
+                .await
+        });
+        let handle = wait_for_pending_hold(&cfg).await;
+        let resp = handle_admin_request(
+            &cfg,
+            &operator,
+            AdminRequest::Approve {
+                handle: handle.clone(),
+            },
+        )
+        .await;
+        match resp {
+            AdminResponse::GateAction {
+                message, exit_code, ..
+            } => {
+                assert!(message.contains("forwarding"), "got: {message}");
+                assert_eq!(exit_code, None, "a released API hold executes nothing");
+            }
+            other => panic!("operator approve should release the hold, got {:?}", other),
+        }
+        match waiter.await.unwrap() {
+            guard::proxy::HoldDecision::Approved { handle: h } => assert_eq!(h, handle),
+            other => panic!("expected Approved, got {:?}", other),
+        }
+        assert_eq!(
+            cfg.approvals.read().await.get(&handle).unwrap().status,
+            ApprovalStatus::Approved
+        );
+
+        // Deny: the waiter fails closed with the operator's reason.
+        let s = sink.clone();
+        let waiter = tokio::spawn(async move {
+            guard::proxy::GateSink::hold_request(&*s, "delete namespaces/prod", "namespace delete")
+                .await
+        });
+        let handle = wait_for_pending_hold(&cfg).await;
+        let resp = handle_admin_request(
+            &cfg,
+            &operator,
+            AdminRequest::Deny {
+                handle: handle.clone(),
+            },
+        )
+        .await;
+        assert!(
+            !matches!(resp, AdminResponse::Error { .. }),
+            "operator deny should succeed: {:?}",
+            resp
+        );
+        match waiter.await.unwrap() {
+            guard::proxy::HoldDecision::Denied { .. } => {}
+            other => panic!("expected Denied, got {:?}", other),
+        }
+        assert_eq!(
+            cfg.approvals.read().await.get(&handle).unwrap().status,
+            ApprovalStatus::Denied
+        );
+
+        // Disconnect: dropping the waiter mid-hold retires the pending row.
+        let s = sink.clone();
+        let waiter = tokio::spawn(async move {
+            guard::proxy::GateSink::hold_request(&*s, "delete namespaces/prod", "namespace delete")
+                .await
+        });
+        let handle = wait_for_pending_hold(&cfg).await;
+        waiter.abort();
+        let mut retired = false;
+        for _ in 0..100 {
+            if cfg.approvals.read().await.get(&handle).unwrap().status == ApprovalStatus::ExecFailed
+            {
+                retired = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            retired,
+            "an abandoned hold must be retired, not left pending"
         );
     }
 

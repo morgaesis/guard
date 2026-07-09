@@ -15,7 +15,10 @@
 # deny). Actions:
 #   allow  -> forward to the apiserver
 #   deny   -> reject at the proxy; the apiserver is never contacted
-#   hold   -> hold for operator approval before the request reaches the apiserver
+#   hold   -> park the request for operator approval before it reaches the
+#             apiserver: the client blocks while `guard approvals` lists it,
+#             `guard approve` releases it, `guard deny` or TTL expiry fails it
+#             closed. Requires `--gate consequence`; without it, holds deny.
 #
 # Verbs: get, list, watch (reads); create, update, patch (writes); delete,
 # deletecollection. A dry-run write is treated as a read.

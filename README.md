@@ -252,14 +252,19 @@ The daemon reads the real bearer token or client certificate from its kubeconfig
 (`exec`/`auth-provider` plugins are rejected) and emits a brokered kubeconfig that
 points only at the proxy and is validated to carry no credential, so the proxy is
 the sole path to the cluster. `--kube-proxy` refuses to start with
-`--exec-as-caller`. Policy actions are `allow`, `deny`, and `hold`; an allowed
-Secret read has its `data`/`stringData` redacted from the response (something the
-cluster's admission control cannot do, since admission fires only on writes).
-Interactive subresources (`exec`/`attach`/`portforward`) and Secret `watch`es are
-denied. Under `--gate consequence`, a recoverable write is wrapped in the
-auto-revert envelope: the proxy snapshots the prior object and synthesizes a
-`kubectl`-based revert armed in the provisional registry, so `guard confirm` keeps
-it and the sweeper rolls it back otherwise. See
+`--exec-as-caller` and binds loopback addresses only, since the proxy
+authenticates nothing itself. Policy actions are `allow`, `deny`, and `hold`; an
+allowed Secret read has its `data`/`stringData` redacted from the response
+(something the cluster's admission control cannot do, since admission fires only
+on writes). A `hold` parks the request in the same operator queue as held
+commands: the client blocks while `guard approvals` shows the operation, `guard
+approve` releases it to the apiserver, and `guard deny` or TTL expiry fails it
+closed (holds require `--gate consequence`; without it they deny). Interactive
+subresources (`exec`/`attach`/`portforward`) and Secret `watch`es are denied.
+Under `--gate consequence`, a recoverable write is wrapped in the auto-revert
+envelope: the proxy snapshots the prior object and synthesizes a `kubectl`-based
+revert armed in the provisional registry, so `guard confirm` keeps it and the
+sweeper rolls it back otherwise. See
 [`examples/api-policy.yaml`](examples/api-policy.yaml).
 
 ## Configuration

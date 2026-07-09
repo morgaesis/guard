@@ -136,7 +136,8 @@ async fn proxy_gates_redacts_and_forwards() {
     let v: Value = resp.json().await.unwrap();
     assert_eq!(v["data"]["key"], "value", "ConfigMap data is not redacted");
 
-    // 3. A delete is held for operator approval -> 403, apiserver never hit.
+    // 3. A policy-held delete with no approval queue attached (no gate sink
+    //    here) fails closed -> 403, apiserver never hit.
     let resp = client
         .delete(format!("{base}/api/v1/namespaces/dev/pods/web-0"))
         .send()
@@ -148,7 +149,7 @@ async fn proxy_gates_redacts_and_forwards() {
     assert!(v["message"]
         .as_str()
         .unwrap()
-        .contains("held for operator approval"));
+        .contains("requires operator approval"));
 
     // 4. An interactive subresource is denied outright.
     let resp = client
@@ -985,4 +986,109 @@ async fn proxy_redacts_helm_release_secret_without_erroring() {
         "the release Secret type survives so helm can identify it"
     );
     assert_eq!(v["metadata"]["labels"]["owner"], "helm");
+}
+
+/// Gate sink standing in for the daemon's approval queue with an operator who
+/// approves every held request.
+#[derive(Clone, Default)]
+struct ApprovingSink;
+
+#[async_trait::async_trait]
+impl guard::proxy::GateSink for ApprovingSink {
+    async fn arm_revert(&self, _mutation: guard::proxy::ApiMutation) -> Option<String> {
+        None
+    }
+
+    async fn hold_request(&self, _label: &str, _reason: &str) -> guard::proxy::HoldDecision {
+        guard::proxy::HoldDecision::Approved {
+            handle: "test-approved".to_string(),
+        }
+    }
+}
+
+/// A policy `hold` routes through the attached approval queue: an approved hold
+/// forwards to the upstream, while a proxy running without any queue (no gate
+/// sink) fails the hold closed with a 403 that names the missing gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_hold_forwards_on_approval_and_fails_closed_without_queue() {
+    let mock_base = spawn_mock_upstream().await;
+    let kubeconfig = format!(
+        "apiVersion: v1\nkind: Config\ncurrent-context: ctx\nclusters:\n  - name: c\n    cluster: {{server: \"{mock_base}\"}}\ncontexts:\n  - name: ctx\n    context: {{cluster: c, user: u}}\nusers:\n  - name: u\n    user: {{}}\n"
+    );
+    let policy_yaml = r#"
+default: deny
+rules:
+  - verbs: [delete]
+    resources: [pods]
+    namespaces: [dev]
+    action: hold
+"#;
+
+    // No gate sink attached: the hold cannot queue anywhere, so it denies and
+    // says why.
+    let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
+    let tls = ProxyTls::generate().expect("tls");
+    let ca_pem = tls.ca_pem().to_string();
+    let policy = ApiPolicy::from_yaml(policy_yaml).expect("policy");
+    let port = free_port();
+    let listen = format!("127.0.0.1:{port}").parse().unwrap();
+    let proxy = Arc::new(KubeProxy::new(
+        listen,
+        tls,
+        upstream,
+        policy,
+        None,
+        std::path::PathBuf::from("unused-in-test-kubeconfig"),
+    ));
+    tokio::spawn(proxy.clone().serve());
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let base = format!("https://127.0.0.1:{port}");
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    let resp = client
+        .delete(format!("{base}/api/v1/namespaces/dev/pods/web-0"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "hold without a queue fails closed");
+    let text = resp.text().await.unwrap();
+    assert!(
+        text.contains("--gate consequence"),
+        "the denial names the missing approval queue: {text}"
+    );
+
+    // Approval queue attached and the operator approves: the held delete is
+    // released and forwarded to the upstream.
+    let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
+    let tls = ProxyTls::generate().expect("tls");
+    let ca_pem = tls.ca_pem().to_string();
+    let policy = ApiPolicy::from_yaml(policy_yaml).expect("policy");
+    let port = free_port();
+    let listen = format!("127.0.0.1:{port}").parse().unwrap();
+    let proxy = Arc::new(KubeProxy::new(
+        listen,
+        tls,
+        upstream,
+        policy,
+        None,
+        std::path::PathBuf::from("unused-in-test-kubeconfig"),
+    ));
+    proxy.attach_gate(Arc::new(ApprovingSink));
+    tokio::spawn(proxy.clone().serve());
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let base = format!("https://127.0.0.1:{port}");
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    let resp = client
+        .delete(format!("{base}/api/v1/namespaces/dev/pods/web-0"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "an approved hold is forwarded upstream");
 }
