@@ -233,7 +233,11 @@ authenticated GET/search/status calls through a named SSH host or localhost
 tunnel are read-only administration and should be allowed. Bounded response
 handling such as `head -c`, `wc -c`, or `jq` field extraction is not a secret
 leak by itself. Continue to deny direct credential probes such as printing
-token lengths or dumping the environment.
+token lengths or dumping the environment, and deny any request that reads or
+uploads a local file whose path or name suggests stored secret material
+(`secrets/`, `credentials`, private keys, kubeconfigs, `.env` files) --
+a workflow that genuinely needs that belongs behind an operator-authored
+trusted verb or session allow rule, not this evaluation.
 
 When the command is ambiguous -- it could be legitimate or malicious depending on context -- lean toward allowing it. False denials are more disruptive than false approvals in a guarded environment where secrets are already protected architecturally.
 

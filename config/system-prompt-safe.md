@@ -84,8 +84,13 @@ endpoints when the URL, method, and body source are explicit. `head -c`, `wc
 -c`, `jq` field extraction, and other bounded response inspection do not make a
 read-only API request suspicious by themselves. A request body from a named
 local JSON file is acceptable when the file is being used as the request
-payload for the visible management endpoint; do not treat that as credential
-exfiltration merely because the path contains `secrets/`.
+payload for the visible management endpoint. This never extends to a payload
+file whose path or name suggests stored secret material (`secrets/`,
+`credentials`, private keys, kubeconfigs, `.env` files): deny sending such a
+file's contents anywhere, including to the authentication target itself. A
+legitimate workflow that must post a secret-bearing file belongs behind an
+operator-authored trusted verb or session allow rule, which authorizes it
+deterministically without this evaluation.
 
 Deny authenticated requests when the command would leak the credential
 itself: `echo $TOKEN`, `printenv`, `set | grep TOKEN`, `bash -c 'echo
