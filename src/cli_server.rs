@@ -9,6 +9,21 @@ fn default_state_db_path() -> Option<PathBuf> {
     default_guard_state_dir().map(|dir| dir.join("state.db"))
 }
 
+/// Resolve the GUARD_MODE env value: unset or blank defaults to readonly,
+/// and a present-but-invalid value fails startup loudly (like --gate)
+/// instead of silently falling back to readonly.
+pub(crate) fn resolve_policy_mode(value: Option<String>) -> Result<PolicyMode> {
+    match value.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        Some(value) => PolicyMode::parse(value).ok_or_else(|| {
+            anyhow::anyhow!(
+                "invalid GUARD_MODE value '{}' (expected 'readonly', 'paranoid', or 'safe')",
+                value
+            )
+        }),
+        None => Ok(PolicyMode::Readonly),
+    }
+}
+
 fn default_learned_rules_path() -> Option<PathBuf> {
     default_guard_state_dir().map(|dir| dir.join("learned-rules.yaml"))
 }
@@ -175,16 +190,10 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 }
             }
 
-            // Plain stdout, not tracing: the default log filter is "warn", so
-            // info-level lines are invisible on a plain foreground start and the
-            // operator would otherwise get no confirmation of where the daemon
-            // listens.
             if let Some(ref path) = socket_path {
-                println!("guard server listening on socket {}", path.display());
                 tracing::info!("Socket: {}", path.display());
             }
             if let Some(port) = tcp_port {
-                println!("guard server listening on tcp 127.0.0.1:{}", port);
                 tracing::info!("TCP: 127.0.0.1:{}", port);
             }
             let auth_token = auth_token
@@ -339,9 +348,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 eval_config = eval_config.llm_models(models_chain);
             }
 
-            let mode = guard_env("MODE")
-                .and_then(|value| PolicyMode::parse(&value))
-                .unwrap_or(PolicyMode::Readonly);
+            let mode = resolve_policy_mode(guard_env("MODE"))?;
 
             tracing::info!("Using built-in {} policy mode", mode.as_str());
             eval_config = eval_config.mode(mode);
@@ -642,6 +649,10 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 (session::SessionRegistry::new(), None)
             };
 
+            let socket_announcement = socket_path
+                .as_ref()
+                .map(|path| format!("guard server listening on socket {}", path.display()));
+
             tracing::info!("Creating server instance...");
             let mut srv = server::Server::new(
                 socket_path,
@@ -882,6 +893,18 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 }
                 tracing::info!("Kube-proxy enabled on {}", proxy.listen());
                 srv.set_kube_proxy(proxy);
+            }
+
+            // Plain stdout, not tracing: the default log filter is "warn", so
+            // info-level lines are invisible on a plain foreground start and the
+            // operator would otherwise get no confirmation of where the daemon
+            // listens. Printed after all startup validation so a refused start
+            // never claims a listener.
+            if let Some(line) = socket_announcement {
+                println!("{line}");
+            }
+            if let Some(port) = tcp_port {
+                println!("guard server listening on tcp 127.0.0.1:{}", port);
             }
 
             srv.run().await

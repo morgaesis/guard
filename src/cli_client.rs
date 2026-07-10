@@ -1138,9 +1138,9 @@ fn parse_since_to_unix(value: &str) -> Result<u64> {
     Ok(now.saturating_sub(n.saturating_mul(multiplier)))
 }
 
-/// Mint a 128-bit hex session token. Uniqueness collision is the only
-/// failure mode and is statistically irrelevant for in-memory grants
-/// that clear on daemon restart.
+/// Mint a 128-bit session token as 32 lowercase hex chars. Uniqueness
+/// collision is the only failure mode and is statistically irrelevant
+/// at any plausible grant volume.
 fn generate_session_token() -> String {
     use rand::Rng;
     let mut bytes = [0u8; 16];
@@ -1165,10 +1165,11 @@ pub(crate) fn top_level_grant_to_session_command(
     let single_positional_prose = prose.is_none()
         && token_or_prose
             .as_deref()
-            .is_some_and(looks_like_quoted_grant_prose);
+            .is_some_and(|value| !looks_like_session_token(value));
 
-    // A positional that is not quoted-grant prose is a session token (Grant);
-    // otherwise (absent, or prose-shaped) it starts a New session.
+    // A lone positional shaped like a session token (32 lowercase hex chars)
+    // targets that session (Grant); anything else (absent, multi-word, or a
+    // plain word like `readonly`) is prose that starts a New session.
     match token_or_prose {
         Some(token) if !single_positional_prose => SessionCommands::Grant {
             token,
@@ -1215,8 +1216,13 @@ fn resolve_session_auto_amend(
     }
 }
 
-fn looks_like_quoted_grant_prose(value: &str) -> bool {
-    value.split_whitespace().nth(1).is_some()
+/// Session tokens minted by `generate_session_token` are exactly 32 lowercase
+/// hex characters; anything else in the positional slot is grant prose.
+fn looks_like_session_token(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {

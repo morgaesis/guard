@@ -367,9 +367,9 @@ fn top_level_grant_bare_prose_mints_session() {
 }
 
 #[test]
-fn top_level_grant_single_word_keeps_token_path() {
+fn top_level_grant_token_shaped_word_keeps_token_path() {
     let command = top_level_grant_to_session_command(
-        Some("tok".to_string()),
+        Some("0123456789abcdef0123456789abcdef".to_string()),
         None,
         vec!["whoami".to_string()],
         Vec::new(),
@@ -384,11 +384,62 @@ fn top_level_grant_single_word_keeps_token_path() {
 
     match command {
         SessionCommands::Grant { token, allow, .. } => {
-            assert_eq!(token, "tok");
+            assert_eq!(token, "0123456789abcdef0123456789abcdef");
             assert_eq!(allow, vec!["whoami"]);
         }
-        _ => panic!("expected single-word top-level grant to update a session"),
+        _ => panic!("expected token-shaped top-level grant to update a session"),
     }
+}
+
+#[test]
+fn top_level_grant_plain_word_is_prose_not_token() {
+    // `guard grant readonly` must not target a session literally named
+    // "readonly"; a single word that is not 32 lowercase hex chars is prose.
+    let command = top_level_grant_to_session_command(
+        Some("readonly".to_string()),
+        None,
+        Vec::new(),
+        Vec::new(),
+        None,
+        None,
+        None,
+        false,
+        false,
+        false,
+        None,
+    );
+
+    match command {
+        SessionCommands::New { prose, .. } => {
+            assert_eq!(prose.as_deref(), Some("readonly"));
+        }
+        _ => panic!("expected non-token single word to mint a session with prose"),
+    }
+}
+
+#[test]
+fn guard_mode_env_resolution() {
+    use guard::policy::PolicyMode;
+
+    assert_eq!(
+        cli_server::resolve_policy_mode(None).unwrap(),
+        PolicyMode::Readonly
+    );
+    assert_eq!(
+        cli_server::resolve_policy_mode(Some(String::new())).unwrap(),
+        PolicyMode::Readonly
+    );
+    assert_eq!(
+        cli_server::resolve_policy_mode(Some("paranoid".to_string())).unwrap(),
+        PolicyMode::Paranoid
+    );
+
+    let err = cli_server::resolve_policy_mode(Some("bogus".to_string())).unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("bogus"), "message: {message}");
+    assert!(message.contains("readonly"), "message: {message}");
+    assert!(message.contains("paranoid"), "message: {message}");
+    assert!(message.contains("safe"), "message: {message}");
 }
 
 #[test]

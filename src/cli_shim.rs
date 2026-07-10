@@ -18,46 +18,7 @@ pub(crate) async fn handle_shim(
     });
 
     if list {
-        let generator = shim::ShimGenerator::new(std::env::current_exe()?, shim_dir);
-        let installed = generator.list_installed()?;
-        if installed.is_empty() {
-            println!("No shims installed");
-        } else {
-            let registry = tool_config::ToolRegistry::load_default()
-                .unwrap_or_else(|_| tool_config::ToolRegistry::empty());
-            for s in installed {
-                print!("  - {}", s);
-                if let Some(tc) = registry.get(&s) {
-                    let parts: Vec<String> = tc
-                        .env
-                        .iter()
-                        .map(|(k, v)| format!("{k}={v}"))
-                        .chain(tc.secrets.iter().map(|(k, v)| format!("{k}=<secret:{v}>")))
-                        .collect();
-                    if !parts.is_empty() {
-                        print!("  [{}]", parts.join(", "));
-                    }
-                    for (uid, user_override) in &tc.users {
-                        let user_parts: Vec<String> = user_override
-                            .env
-                            .iter()
-                            .map(|(k, v)| format!("{k}={v}"))
-                            .chain(
-                                user_override
-                                    .secrets
-                                    .iter()
-                                    .map(|(k, v)| format!("{k}=<secret:{v}>")),
-                            )
-                            .collect();
-                        if !user_parts.is_empty() {
-                            print!("  user({uid}): [{}]", user_parts.join(", "));
-                        }
-                    }
-                }
-                println!();
-            }
-        }
-        return Ok(());
+        return print_installed_shims(shim_dir);
     }
 
     if remove {
@@ -78,8 +39,16 @@ pub(crate) async fn handle_shim(
         return Ok(());
     }
 
-    // Default: install shims
-    let tools_to_install = tools.unwrap_or_else(|| vec!["ssh".to_string(), "scp".to_string()]);
+    // Installing is an explicit action: bare `guard shim` only reports what is
+    // installed, so a stray invocation never writes shim scripts.
+    let Some(tools_to_install) = tools else {
+        if !env_vars.is_empty() || !secret_vars.is_empty() || user.is_some() {
+            anyhow::bail!(
+                "no tools named; specify which tools to configure, e.g. `guard shim ssh,scp --env KEY=VALUE`"
+            );
+        }
+        return print_installed_shims(shim_dir);
+    };
     let generator = shim::ShimGenerator::new(std::env::current_exe()?, shim_dir.clone());
     let tools_refs: Vec<&str> = tools_to_install.iter().map(|s| s.as_str()).collect();
     generator.generate(&tools_refs)?;
@@ -122,5 +91,48 @@ pub(crate) async fn handle_shim(
         }
     }
 
+    Ok(())
+}
+
+fn print_installed_shims(shim_dir: PathBuf) -> Result<()> {
+    let generator = shim::ShimGenerator::new(std::env::current_exe()?, shim_dir);
+    let installed = generator.list_installed()?;
+    if installed.is_empty() {
+        println!("No shims installed");
+    } else {
+        let registry = tool_config::ToolRegistry::load_default()
+            .unwrap_or_else(|_| tool_config::ToolRegistry::empty());
+        for s in installed {
+            print!("  - {}", s);
+            if let Some(tc) = registry.get(&s) {
+                let parts: Vec<String> = tc
+                    .env
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .chain(tc.secrets.iter().map(|(k, v)| format!("{k}=<secret:{v}>")))
+                    .collect();
+                if !parts.is_empty() {
+                    print!("  [{}]", parts.join(", "));
+                }
+                for (uid, user_override) in &tc.users {
+                    let user_parts: Vec<String> = user_override
+                        .env
+                        .iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .chain(
+                            user_override
+                                .secrets
+                                .iter()
+                                .map(|(k, v)| format!("{k}=<secret:{v}>")),
+                        )
+                        .collect();
+                    if !user_parts.is_empty() {
+                        print!("  user({uid}): [{}]", user_parts.join(", "));
+                    }
+                }
+            }
+            println!();
+        }
+    }
     Ok(())
 }

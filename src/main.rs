@@ -117,9 +117,11 @@ enum MainArgs {
     /// Manage secrets
     #[clap(subcommand, alias = "secret")]
     Secrets(SecretCommands),
-    /// Install shim scripts for command interposition
+    /// Manage shim scripts for command interposition. Naming tools installs
+    /// their shims; bare `guard shim` lists what is installed.
     Shim {
-        /// Comma-separated list of tools to shim (e.g. ssh,kubectl,helm)
+        /// Comma-separated list of tools to shim (e.g. ssh,kubectl,helm);
+        /// required to install, omit to list installed shims
         #[arg(value_delimiter = ',')]
         tools: Option<Vec<String>>,
         /// List installed shims
@@ -351,7 +353,7 @@ enum VerbCommands {
 
 #[derive(Subcommand)]
 enum SessionCommands {
-    /// Mint a fresh session token (UUID-shaped). With grant prose or any
+    /// Mint a fresh session token (32 lowercase hex chars). With grant prose or any
     /// grant flags, also installs the grant in one round trip and requires
     /// the daemon principal or TCP admin token. Prints `export
     /// GUARD_SESSION=<token>` on stdout so you can `eval $(guard session
@@ -373,7 +375,8 @@ enum SessionCommands {
         /// Glob pattern to deny in this session (repeatable, beats allow)
         #[arg(long = "deny", value_name = "GLOB")]
         deny: Vec<String>,
-        /// Time-to-live in seconds; omit for no expiry (cleared on daemon restart)
+        /// Time-to-live in seconds; omit for no expiry (grants persist in the
+        /// state DB and are reloaded on daemon restart)
         #[arg(long, value_name = "SECONDS")]
         ttl: Option<u64>,
         /// Free-form context appended to the LLM system prompt for this session.
@@ -411,7 +414,8 @@ enum SessionCommands {
         /// Glob pattern to deny in this session (repeatable, beats allow)
         #[arg(long = "deny", value_name = "GLOB")]
         deny: Vec<String>,
-        /// Time-to-live in seconds; omit for no expiry (cleared on daemon restart)
+        /// Time-to-live in seconds; omit for no expiry (grants persist in the
+        /// state DB and are reloaded on daemon restart)
         #[arg(long, value_name = "SECONDS")]
         ttl: Option<u64>,
         /// Free-form context appended to the LLM system prompt for evaluator

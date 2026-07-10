@@ -1359,7 +1359,10 @@ impl Evaluator {
         let api_key = match &self.llm_config.api_key {
             Some(k) => k.clone(),
             None => {
-                return EvalResult::Error("LLM API key not configured".to_string());
+                return EvalResult::Error(
+                    "LLM API key not configured; set GUARD_LLM_API_KEY (or OPENROUTER_API_KEY) in the daemon's environment"
+                        .to_string(),
+                );
             }
         };
 
