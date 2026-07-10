@@ -25,7 +25,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::rustls::{self, pki_types};
 
 use guard::proxy::{
-    ApiPolicy, GithubProtocol, KubeProxy, ProtocolConfig, ProxyTls, Upstream, VercelProtocol,
+    ApiPolicy, ApiProxy, GithubProtocol, ProtocolConfig, ProxyTls, Upstream, VercelProtocol,
 };
 
 /// Requests the mock upstream actually served: (method, path?query).
@@ -116,7 +116,7 @@ async fn spawn_proxy(
     let policy = ApiPolicy::from_yaml(policy_yaml).expect("policy");
     let port = free_port();
     let listen = format!("127.0.0.1:{port}").parse().unwrap();
-    let proxy = Arc::new(KubeProxy::with_protocol(
+    let proxy = Arc::new(ApiProxy::with_protocol(
         protocol,
         listen,
         tls,

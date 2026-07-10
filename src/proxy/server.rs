@@ -37,8 +37,8 @@ use tokio::sync::RwLock;
 use tokio_rustls::TlsAcceptor;
 
 use super::gate::{ApiMutation, GateSink, HoldDecision};
-use super::k8s::{ApiOp, Verb};
 use super::k8s_protocol::KubernetesProtocol;
+use super::op::{ApiOp, Verb};
 use super::policy::{ApiAction, ApiPolicy};
 use super::protocol::ProtocolConfig;
 use super::tls::ProxyTls;
@@ -53,9 +53,10 @@ const POLICY_RELOAD_SECS: u64 = 5;
 
 type ProxyBody = BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
 
-/// A configured Kubernetes API proxy: TLS identity, upstream connection, and the
-/// hot-reloaded operator policy. Hosted by the daemon alongside the gate socket.
-pub struct KubeProxy {
+/// A configured API proxy: TLS identity, upstream connection, the attached
+/// protocol plug-in, and the hot-reloaded operator policy. Hosted by the daemon
+/// alongside the gate socket.
+pub struct ApiProxy {
     listen: SocketAddr,
     proxy_url: String,
     tls: ProxyTls,
@@ -199,7 +200,7 @@ impl CreatedRegistry {
     }
 }
 
-impl KubeProxy {
+impl ApiProxy {
     /// Assemble a Kubernetes proxy. `policy_path` (when set) is hot-reloaded
     /// while serving; when unset, `policy` is used as-is (typically a
     /// default-deny).
@@ -967,7 +968,7 @@ mod tests {
         assert_eq!(reg.take(&created_key(1, "foo")), None);
     }
 
-    fn test_proxy() -> KubeProxy {
+    fn test_proxy() -> ApiProxy {
         let yaml = "apiVersion: v1\n\
              kind: Config\n\
              current-context: ctx\n\
@@ -976,7 +977,7 @@ mod tests {
              users: [{name: u, user: {token: t}}]\n";
         let upstream = Upstream::from_kubeconfig_str(yaml, None).expect("upstream");
         let tls = ProxyTls::generate().expect("tls");
-        KubeProxy::new(
+        ApiProxy::new(
             "127.0.0.1:0".parse().unwrap(),
             tls,
             upstream,

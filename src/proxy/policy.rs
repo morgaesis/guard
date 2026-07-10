@@ -5,7 +5,7 @@
 //! redact secret values from the response. A write to a subresource is
 //! authorized only by a rule that names it. Default is fail-safe deny.
 
-use super::k8s::ApiOp;
+use super::op::ApiOp;
 use serde::{Deserialize, Serialize};
 
 /// What to do with a matched request.

@@ -8,7 +8,8 @@
 use serde_json::Value;
 
 use super::gate::ApiRevert;
-use super::k8s::{self, ApiOp, Verb};
+use super::k8s;
+use super::op::{ApiOp, Verb};
 use super::protocol::{CreatedIdentity, PlannedRevert, ProtocolConfig};
 use crate::gating::Reversibility;
 

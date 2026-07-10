@@ -10,7 +10,7 @@
 //! implementation.
 
 use super::gate::ApiRevert;
-use super::k8s::ApiOp;
+use super::op::ApiOp;
 
 /// Identity of an object a tracked write created. The proxy records it (scoped
 /// to the creating connection) so a later delete of the same object is

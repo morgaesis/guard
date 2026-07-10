@@ -18,7 +18,7 @@ use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
 
-use guard::proxy::{ApiPolicy, KubeProxy, ProxyTls, Upstream};
+use guard::proxy::{ApiPolicy, ApiProxy, ProxyTls, Upstream};
 
 /// Mock apiserver: returns a Secret (with data), a ConfigMap (with data), or a
 /// generic OK for everything else. Records nothing; the proxy is what we test.
@@ -91,7 +91,7 @@ async fn proxy_gates_redacts_and_forwards() {
     let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).expect("policy");
     let port = free_port();
     let listen = format!("127.0.0.1:{port}").parse().unwrap();
-    let proxy = Arc::new(KubeProxy::new(
+    let proxy = Arc::new(ApiProxy::new(
         listen,
         tls,
         upstream,
@@ -272,7 +272,7 @@ async fn proxy_arms_auto_revert_for_writes() {
     let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).expect("policy");
     let port = free_port();
     let listen = format!("127.0.0.1:{port}").parse().unwrap();
-    let proxy = Arc::new(KubeProxy::new(
+    let proxy = Arc::new(ApiProxy::new(
         listen,
         tls,
         upstream,
@@ -399,7 +399,7 @@ async fn proxy_denies_subresource_and_strips_identity_headers() {
     let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).expect("policy");
     let port = free_port();
     let listen = format!("127.0.0.1:{port}").parse().unwrap();
-    let proxy = Arc::new(KubeProxy::new(
+    let proxy = Arc::new(ApiProxy::new(
         listen,
         tls,
         upstream,
@@ -490,7 +490,7 @@ async fn proxy_self_access_review_carries_upstream_credential() {
     .expect("policy");
     let port = free_port();
     let listen = format!("127.0.0.1:{port}").parse().unwrap();
-    let proxy = Arc::new(KubeProxy::new(
+    let proxy = Arc::new(ApiProxy::new(
         listen,
         tls,
         upstream,
@@ -595,7 +595,7 @@ async fn proxy_allows_contained_delete_of_created_resource() {
     let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).expect("policy");
     let port = free_port();
     let listen = format!("127.0.0.1:{port}").parse().unwrap();
-    let proxy = Arc::new(KubeProxy::new(
+    let proxy = Arc::new(ApiProxy::new(
         listen,
         tls,
         upstream,
@@ -723,7 +723,7 @@ async fn proxy_fails_closed_on_non_json_secret_response() {
     let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).expect("policy");
     let port = free_port();
     let listen = format!("127.0.0.1:{port}").parse().unwrap();
-    let proxy = Arc::new(KubeProxy::new(
+    let proxy = Arc::new(ApiProxy::new(
         listen,
         tls,
         upstream,
@@ -832,7 +832,7 @@ rules:
     .expect("policy");
     let port = free_port();
     let listen = format!("127.0.0.1:{port}").parse().unwrap();
-    let proxy = Arc::new(KubeProxy::new(
+    let proxy = Arc::new(ApiProxy::new(
         listen,
         tls,
         upstream,
@@ -946,7 +946,7 @@ async fn proxy_redacts_helm_release_secret_without_erroring() {
     let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).expect("policy");
     let port = free_port();
     let listen = format!("127.0.0.1:{port}").parse().unwrap();
-    let proxy = Arc::new(KubeProxy::new(
+    let proxy = Arc::new(ApiProxy::new(
         listen,
         tls,
         upstream,
@@ -1032,7 +1032,7 @@ rules:
     let policy = ApiPolicy::from_yaml(policy_yaml).expect("policy");
     let port = free_port();
     let listen = format!("127.0.0.1:{port}").parse().unwrap();
-    let proxy = Arc::new(KubeProxy::new(
+    let proxy = Arc::new(ApiProxy::new(
         listen,
         tls,
         upstream,
@@ -1068,7 +1068,7 @@ rules:
     let policy = ApiPolicy::from_yaml(policy_yaml).expect("policy");
     let port = free_port();
     let listen = format!("127.0.0.1:{port}").parse().unwrap();
-    let proxy = Arc::new(KubeProxy::new(
+    let proxy = Arc::new(ApiProxy::new(
         listen,
         tls,
         upstream,
@@ -1137,7 +1137,7 @@ async fn proxy_rarity_escalation_holds_only_rare_shapes() {
     let listen = format!("127.0.0.1:{port}").parse().unwrap();
     // Threshold 2: the first two occurrences of a shape are escalated.
     let proxy = Arc::new(
-        KubeProxy::new(
+        ApiProxy::new(
             listen,
             tls,
             upstream,

@@ -196,7 +196,7 @@ pub struct ServerConfig {
     /// against the operator policy, and re-originates to the real apiserver with
     /// the credentials only the daemon holds. Set by the entrypoint from
     /// `--kube-proxy`; `None` means no proxy listener.
-    pub kube_proxy: Option<Arc<guard::proxy::KubeProxy>>,
+    pub kube_proxy: Option<Arc<guard::proxy::ApiProxy>>,
     /// Active filesystem read grants (Unix-only). Time-boxed POSIX ACL read
     /// grants issued via `guard grant-read`; the sweeper auto-revokes them at
     /// expiry and startup reconciliation revokes any that expired while the

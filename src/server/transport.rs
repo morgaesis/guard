@@ -80,7 +80,7 @@ impl Server {
 
     /// Attach a Kubernetes API proxy to run alongside the gate socket. Must be
     /// called before `run`.
-    pub fn set_kube_proxy(&mut self, proxy: Arc<guard::proxy::KubeProxy>) {
+    pub fn set_kube_proxy(&mut self, proxy: Arc<guard::proxy::ApiProxy>) {
         self.config.kube_proxy = Some(proxy);
     }
 

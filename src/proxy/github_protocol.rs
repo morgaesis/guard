@@ -7,7 +7,7 @@
 
 use serde_json::Value;
 
-use super::k8s::{ApiOp, Verb};
+use super::op::{ApiOp, Verb};
 use super::protocol::{PlannedRevert, ProtocolConfig};
 
 /// Stateless, like the Kubernetes reference implementation.

@@ -861,7 +861,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 let rarity_threshold = api_rarity_escalation
                     .or_else(|| guard_env("API_RARITY_ESCALATION").and_then(|v| v.parse().ok()))
                     .unwrap_or(0);
-                let mut proxy = guard::proxy::KubeProxy::new(
+                let mut proxy = guard::proxy::ApiProxy::new(
                     listen,
                     tls,
                     upstream,
