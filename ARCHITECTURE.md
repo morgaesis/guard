@@ -2,7 +2,7 @@
 
 Source of truth hierarchy:
 
-1. `src/server.rs` -- privileged guard daemon: request protocol, policy evaluation, command execution, environment isolation, and output redaction.
+1. `src/server/` -- privileged guard daemon: request protocol, policy evaluation, command execution, environment isolation, and output redaction.
 2. `src/evaluate.rs` -- LLM evaluator: prompt selection, OpenAI-compatible API calls, response parsing, token usage tracking.
 3. `src/main.rs` -- operator-facing CLI: server start, client commands, shim management, MCP server, secret management.
 4. `src/session.rs` and `src/session_store.rs` -- session grant model, retention rules, and SQLite-backed persistence for grants, session interaction history, and consequence-gating runtime state (provisional executions and operator approvals).
