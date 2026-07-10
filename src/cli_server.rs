@@ -93,6 +93,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             kube_context,
             api_policy,
             brokered_kubeconfig_out,
+            api_rarity_escalation,
             // Consumed in `main` (Windows SCM dispatch); irrelevant to the
             // server run itself, which is identical in service and foreground.
             service: _,
@@ -840,14 +841,25 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                         guard::proxy::ApiPolicy::deny_all()
                     }
                 };
-                let proxy = Arc::new(guard::proxy::KubeProxy::new(
+                let rarity_threshold = api_rarity_escalation
+                    .or_else(|| guard_env("API_RARITY_ESCALATION").and_then(|v| v.parse().ok()))
+                    .unwrap_or(0);
+                let mut proxy = guard::proxy::KubeProxy::new(
                     listen,
                     tls,
                     upstream,
                     policy,
                     api_policy_path,
                     kubeconfig_path.clone(),
-                ));
+                );
+                if rarity_threshold > 0 {
+                    proxy = proxy.with_rarity_escalation(rarity_threshold);
+                    tracing::info!(
+                        "kube-proxy rarity escalation on: shapes seen < {} times this run are held for review",
+                        rarity_threshold
+                    );
+                }
+                let proxy = Arc::new(proxy);
                 if let Some(out) = brokered_kubeconfig_out
                     .or_else(|| guard_env("BROKERED_KUBECONFIG_OUT").map(PathBuf::from))
                 {

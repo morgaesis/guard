@@ -1092,3 +1092,95 @@ rules:
         .unwrap();
     assert_eq!(resp.status(), 200, "an approved hold is forwarded upstream");
 }
+
+/// Gate sink that counts hold requests and approves each, so a test can assert
+/// how many requests were escalated to the queue.
+#[derive(Clone, Default)]
+struct CountingSink {
+    holds: Arc<std::sync::Mutex<u32>>,
+}
+
+#[async_trait::async_trait]
+impl guard::proxy::GateSink for CountingSink {
+    async fn arm_revert(&self, _mutation: guard::proxy::ApiMutation) -> Option<String> {
+        None
+    }
+
+    async fn hold_request(&self, _label: &str, _reason: &str) -> guard::proxy::HoldDecision {
+        *self.holds.lock().unwrap() += 1;
+        guard::proxy::HoldDecision::Approved {
+            handle: "test-approved".to_string(),
+        }
+    }
+}
+
+/// Rarity escalation holds a policy-allowed request while its shape is still
+/// rare (seen fewer than `threshold` times), then lets the shape flow without a
+/// hold once it is established. Object name is not part of the shape, so
+/// distinctly-named reads of the same resource share one rare window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_rarity_escalation_holds_only_rare_shapes() {
+    let mock_base = spawn_mock_upstream().await;
+    let kubeconfig = format!(
+        "apiVersion: v1\nkind: Config\ncurrent-context: ctx\nclusters:\n  - name: c\n    cluster: {{server: \"{mock_base}\"}}\ncontexts:\n  - name: ctx\n    context: {{cluster: c, user: u}}\nusers:\n  - name: u\n    user: {{}}\n"
+    );
+    // A broad read-allow rule: every read is permitted by policy, so only rarity
+    // escalation can hold one.
+    let policy = ApiPolicy::from_yaml(
+        "default: deny\nrules:\n  - verbs: [get, list]\n    resources: [\"*\"]\n    namespaces: [\"*\"]\n    action: allow\n",
+    )
+    .expect("policy");
+    let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
+    let tls = ProxyTls::generate().expect("tls");
+    let ca_pem = tls.ca_pem().to_string();
+    let port = free_port();
+    let listen = format!("127.0.0.1:{port}").parse().unwrap();
+    // Threshold 2: the first two occurrences of a shape are escalated.
+    let proxy = Arc::new(
+        KubeProxy::new(
+            listen,
+            tls,
+            upstream,
+            policy,
+            None,
+            std::path::PathBuf::from("unused-in-test-kubeconfig"),
+        )
+        .with_rarity_escalation(2),
+    );
+    let sink = CountingSink::default();
+    proxy.attach_gate(Arc::new(sink.clone()));
+    tokio::spawn(proxy.clone().serve());
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let base = format!("https://127.0.0.1:{port}");
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+
+    // Four reads of the same shape (configmaps in dev), different object names.
+    // The first two are within the rare window -> escalated (but approved, so
+    // still 200); the last two flow without a hold.
+    for name in ["a", "b", "c", "d"] {
+        let resp = client
+            .get(format!("{base}/api/v1/namespaces/dev/configmaps/{name}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "read {name} forwards (approved)");
+    }
+    // A read of a different shape (a new namespace) is rare on its own.
+    let resp = client
+        .get(format!("{base}/api/v1/namespaces/prod/configmaps/x"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let holds = *sink.holds.lock().unwrap();
+    assert_eq!(
+        holds, 3,
+        "2 holds for the first shape's rare window + 1 for the new-namespace shape"
+    );
+}

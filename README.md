@@ -266,7 +266,10 @@ an arbitrary request into a running workload), as are Secret `watch`es.
 Under `--gate consequence`, a recoverable write is wrapped in the auto-revert
 envelope: the proxy snapshots the prior object and synthesizes a `kubectl`-based
 revert armed in the provisional registry, so `guard confirm` keeps it and the
-sweeper rolls it back otherwise. See
+sweeper rolls it back otherwise. `--api-rarity-escalation N` optionally holds a
+policy-allowed request for operator review while its shape (verb, resource, and
+namespace, ignoring the object name) has been seen fewer than N times this run,
+so a broad allow rule fails toward scrutiny on a rare or first-seen shape. See
 [`examples/api-policy.yaml`](examples/api-policy.yaml).
 
 ## Configuration
@@ -343,6 +346,7 @@ Guard walks up from your current directory to `/` looking for `.env` files (clos
 | `GUARD_CHILD_ENV` | (none) | Comma-separated daemon env vars forwarded to brokered children (e.g. a `KUBECONFIG` only the daemon can read). Values come from the daemon's environment, never the caller's. |
 | `GUARD_EXEC_AS_CALLER` | `false` | Run brokered children as the calling uid instead of the daemon account (Unix). |
 | `GUARD_KUBE_PROXY` | (none) | Kubernetes API proxy listen address (loopback only); see the kube-proxy section. Companions: `GUARD_KUBE_PROXY_KUBECONFIG`, `GUARD_KUBE_CONTEXT`, `GUARD_API_POLICY`, `GUARD_BROKERED_KUBECONFIG_OUT`. |
+| `GUARD_API_RARITY_ESCALATION` | `0` | Escalate a policy-allowed proxy request to the operator hold queue while its shape (verb x resource x namespace) has been seen fewer than N times this run. 0 disables it; requires `--gate consequence`. Flag: `--api-rarity-escalation`. |
 
 The primary model is `openai/gpt-5.4-mini` via OpenRouter by default. Set it
 per-invocation with `--llm-model <slug>`. To configure a true fallback chain

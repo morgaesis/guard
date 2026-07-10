@@ -52,6 +52,7 @@ fn parse_start(args: &[&str]) -> ServerCommands {
             kube_context,
             api_policy,
             brokered_kubeconfig_out,
+            api_rarity_escalation,
             service,
         }) => ServerCommands::Start {
             socket,
@@ -103,6 +104,7 @@ fn parse_start(args: &[&str]) -> ServerCommands {
             kube_context,
             api_policy,
             brokered_kubeconfig_out,
+            api_rarity_escalation,
             service,
         },
         _ => panic!("expected server start args"),

@@ -843,6 +843,15 @@ enum ServerCommands {
         #[arg(long = "brokered-kubeconfig-out", value_name = "PATH")]
         brokered_kubeconfig_out: Option<PathBuf>,
 
+        /// Escalate a policy-allowed proxy request to the operator hold queue
+        /// when its shape (verb x resource x namespace, object name excluded)
+        /// has been seen fewer than N times this run, so a broad allow rule
+        /// fails toward review on a rare or first-seen shape. Requires
+        /// --gate consequence (the hold queue). 0 (default) disables it.
+        /// Env: GUARD_API_RARITY_ESCALATION.
+        #[arg(long = "api-rarity-escalation", value_name = "N")]
+        api_rarity_escalation: Option<u64>,
+
         /// Internal marker: launched under the Windows Service Control Manager.
         /// The Windows installer sets this in the service binPath so startup
         /// answers the SCM start/stop handshake instead of running in the

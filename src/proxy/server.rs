@@ -81,6 +81,67 @@ pub struct KubeProxy {
     /// Monotonic per-connection id, assigned in the accept loop, so a created
     /// resource's provenance is scoped to the connection that created it.
     next_conn: AtomicU64,
+    /// Rarity-based escalation: counts request shapes over the proxy's
+    /// lifetime and escalates a policy-allowed request whose shape is still
+    /// rare to the operator hold queue, so a broad allow rule fails toward
+    /// scrutiny on the first few occurrences of any shape it covers. Disabled
+    /// (threshold 0) unless the operator opts in.
+    rarity: RarityTracker,
+}
+
+/// A request shape for rarity accounting: the typed operation minus its object
+/// name, so `get pods/web-0` and `get pods/web-1` count as one shape while a
+/// first access to a new namespace, resource, or verb counts as its own. The
+/// object name is deliberately excluded -- naming a fresh object per request
+/// must not let a caller keep every request looking "new" and either evade
+/// escalation or self-inflict a hold on every call.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ShapeKey {
+    protocol: String,
+    verb: &'static str,
+    group: String,
+    resource: String,
+    subresource: Option<String>,
+    namespace: Option<String>,
+}
+
+/// Counts request shapes seen over the proxy's lifetime and reports whether a
+/// shape is still under the escalation threshold. `threshold` is the number of
+/// occurrences that must accrue before a shape stops being escalated; 0
+/// disables escalation entirely (the common case). The map is unbounded by
+/// design: the shape space is the operator's own API surface (verb x resource
+/// x namespace), not attacker-chosen object names, so it is naturally small.
+struct RarityTracker {
+    threshold: u64,
+    seen: Mutex<HashMap<ShapeKey, u64>>,
+}
+
+impl RarityTracker {
+    fn new(threshold: u64) -> Self {
+        Self {
+            threshold,
+            seen: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.threshold > 0
+    }
+
+    /// Record one occurrence of `key` and return true if, BEFORE this
+    /// occurrence, the shape had been seen fewer than `threshold` times -- i.e.
+    /// this request is still within the rare window and should be escalated.
+    /// A no-op returning false when escalation is disabled.
+    fn observe_is_rare(&self, key: ShapeKey) -> bool {
+        if !self.enabled() {
+            return false;
+        }
+        let mut seen = self.seen.lock().unwrap();
+        let count = seen.entry(key).or_insert(0);
+        let rare = *count < self.threshold;
+        *count = count.saturating_add(1);
+        rare
+    }
 }
 
 /// Identity of a resource the proxy tracks as guard-created, for delete
@@ -186,7 +247,19 @@ impl KubeProxy {
             gate: OnceLock::new(),
             created: Mutex::new(CreatedRegistry::default()),
             next_conn: AtomicU64::new(1),
+            rarity: RarityTracker::new(0),
         }
+    }
+
+    /// Enable rarity-based escalation: a policy-allowed request whose shape has
+    /// been seen fewer than `threshold` times is escalated to the operator hold
+    /// queue instead of forwarded, so a broad allow rule fails toward scrutiny
+    /// on the first few occurrences of any shape it covers. Requires an
+    /// attached gate (the hold queue); with `threshold` 0 or no gate it is a
+    /// no-op. Builder-style, applied before serving.
+    pub fn with_rarity_escalation(mut self, threshold: u64) -> Self {
+        self.rarity = RarityTracker::new(threshold);
+        self
     }
 
     /// Drop provenance for a resolved auto-revert. Called by the daemon when a
@@ -352,61 +425,112 @@ impl KubeProxy {
                 )
             }
             ApiAction::Hold => {
-                // The request is parked here, still buffered, while the daemon
-                // queues it for the operator (`guard approvals` / `guard approve`).
-                // Only an explicit approval forwards it; a deny, expiry, capacity
-                // refusal, or a proxy running without the daemon's consequence
-                // gate all fail closed to a 403.
-                let Some(gate) = self.gate.get() else {
-                    tracing::info!(
-                        target: "guard::kubeproxy",
-                        "HOLD {} denied: no approval queue (--gate consequence is not active)",
-                        label
-                    );
-                    return status_resp(
-                        StatusCode::FORBIDDEN,
-                        &format!(
-                            "guard kube-proxy: {label} requires operator approval, but the daemon \
-                             is running without --gate consequence (no approval queue); denied"
-                        ),
-                        "Forbidden",
-                    );
-                };
-                tracing::info!(target: "guard::kubeproxy", "HOLD {} ({})", label, decision.reason);
-                match gate.hold_request(&label, &decision.reason).await {
-                    HoldDecision::Approved { handle } => {
-                        // Redaction follows the protocol's classification, not
-                        // the rule flag: a secret-material read that passes the
-                        // gate (allowed or operator-approved) is always
-                        // redacted, so no policy wording can leak values.
-                        let redact = self.protocol.redactable_read(&op);
-                        tracing::info!(
-                            target: "guard::kubeproxy",
-                            "ALLOW {} (operator approved hold {}){}",
-                            label,
-                            handle,
-                            if redact { " (redacting)" } else { "" }
-                        );
-                        self.forward(req, &path, &query, redact, Some(op), conn_id)
-                            .await
-                    }
-                    HoldDecision::Denied { reason } => {
-                        tracing::info!(target: "guard::kubeproxy", "DENY {} (held: {})", label, reason);
-                        status_resp(
-                            StatusCode::FORBIDDEN,
-                            &format!(
-                                "guard kube-proxy: {label} held for operator approval: {reason}"
-                            ),
-                            "Forbidden",
-                        )
-                    }
-                }
+                self.route_hold(req, &path, &query, &op, &decision.reason, conn_id)
+                    .await
             }
             ApiAction::Allow => {
+                // Rarity escalation: a broad allow rule fails toward scrutiny on
+                // a shape it covers that the proxy has rarely (or never) seen.
+                // The check is a no-op unless the operator enabled it and a hold
+                // queue is attached, so the default allow path is unchanged.
+                if self.rarity.enabled() && self.gate.get().is_some() {
+                    let key = self.shape_key(&op);
+                    if self.rarity.observe_is_rare(key) {
+                        let reason = format!(
+                            "{} (rare request shape escalated for review)",
+                            decision.reason
+                        );
+                        tracing::info!(
+                            target: "guard::kubeproxy",
+                            "ESCALATE {} (rare shape under an allow rule)",
+                            label
+                        );
+                        return self
+                            .route_hold(req, &path, &query, &op, &reason, conn_id)
+                            .await;
+                    }
+                }
                 let redact = self.protocol.redactable_read(&op);
                 tracing::info!(target: "guard::kubeproxy", "ALLOW {}{}", label, if redact { " (redacting)" } else { "" });
                 self.forward(req, &path, &query, redact, Some(op), conn_id)
                     .await
+            }
+        }
+    }
+
+    /// The rarity-accounting shape for an operation: everything that
+    /// distinguishes one kind of request from another except the object name.
+    fn shape_key(&self, op: &ApiOp) -> ShapeKey {
+        ShapeKey {
+            protocol: self.protocol.name().to_string(),
+            verb: op.verb.as_str(),
+            group: op.group.clone(),
+            resource: op.resource.clone(),
+            subresource: op.subresource.clone(),
+            namespace: op.namespace.clone(),
+        }
+    }
+
+    /// Park a request for operator approval and forward it on approval. Shared
+    /// by an `ApiAction::Hold` policy decision and by rarity escalation of an
+    /// otherwise-allowed request. Fails closed to a 403 when no hold queue is
+    /// attached (the daemon is running without `--gate consequence`), on a
+    /// deny/expiry, or on a capacity refusal.
+    async fn route_hold(
+        &self,
+        req: Request<Incoming>,
+        path: &str,
+        query: &str,
+        op: &ApiOp,
+        reason: &str,
+        conn_id: u64,
+    ) -> Response<ProxyBody> {
+        // Same label the caller logged: "<verb> <path>".
+        let label = format!("{} {}", op.verb.as_str(), path);
+        let label = label.as_str();
+        // The request is parked here, still buffered, while the daemon queues it
+        // for the operator (`guard approvals` / `guard approve`). Only an
+        // explicit approval forwards it.
+        let Some(gate) = self.gate.get() else {
+            tracing::info!(
+                target: "guard::kubeproxy",
+                "HOLD {} denied: no approval queue (--gate consequence is not active)",
+                label
+            );
+            return status_resp(
+                StatusCode::FORBIDDEN,
+                &format!(
+                    "guard kube-proxy: {label} requires operator approval, but the daemon \
+                     is running without --gate consequence (no approval queue); denied"
+                ),
+                "Forbidden",
+            );
+        };
+        tracing::info!(target: "guard::kubeproxy", "HOLD {} ({})", label, reason);
+        match gate.hold_request(label, reason).await {
+            HoldDecision::Approved { handle } => {
+                // Redaction follows the protocol's classification, not the rule
+                // flag: a secret-material read that passes the gate (allowed or
+                // operator-approved) is always redacted, so no policy wording can
+                // leak values.
+                let redact = self.protocol.redactable_read(op);
+                tracing::info!(
+                    target: "guard::kubeproxy",
+                    "ALLOW {} (operator approved hold {}){}",
+                    label,
+                    handle,
+                    if redact { " (redacting)" } else { "" }
+                );
+                self.forward(req, path, query, redact, Some(op.clone()), conn_id)
+                    .await
+            }
+            HoldDecision::Denied { reason } => {
+                tracing::info!(target: "guard::kubeproxy", "DENY {} (held: {})", label, reason);
+                status_resp(
+                    StatusCode::FORBIDDEN,
+                    &format!("guard kube-proxy: {label} held for operator approval: {reason}"),
+                    "Forbidden",
+                )
             }
         }
     }
@@ -873,6 +997,56 @@ mod tests {
             name: Some(name.to_string()),
             dry_run: false,
         }
+    }
+
+    #[test]
+    fn rarity_tracker_escalates_until_threshold_then_stops() {
+        let t = RarityTracker::new(2);
+        let key = || ShapeKey {
+            protocol: "kubernetes".to_string(),
+            verb: "get",
+            group: String::new(),
+            resource: "pods".to_string(),
+            subresource: None,
+            namespace: Some("dev".to_string()),
+        };
+        // First two occurrences are still under the threshold -> escalate.
+        assert!(t.observe_is_rare(key()));
+        assert!(t.observe_is_rare(key()));
+        // The shape has now been seen `threshold` times; it is no longer rare.
+        assert!(!t.observe_is_rare(key()));
+        assert!(!t.observe_is_rare(key()));
+        // A different shape starts its own count.
+        let other = ShapeKey {
+            resource: "secrets".to_string(),
+            ..key()
+        };
+        assert!(t.observe_is_rare(other));
+    }
+
+    #[test]
+    fn rarity_tracker_disabled_never_escalates() {
+        let t = RarityTracker::new(0);
+        assert!(!t.enabled());
+        let key = ShapeKey {
+            protocol: "kubernetes".to_string(),
+            verb: "delete",
+            group: String::new(),
+            resource: "namespaces".to_string(),
+            subresource: None,
+            namespace: None,
+        };
+        assert!(!t.observe_is_rare(key));
+    }
+
+    #[test]
+    fn shape_key_ignores_object_name() {
+        let proxy = test_proxy();
+        // Two deletes of differently-named objects share a shape.
+        assert_eq!(
+            proxy.shape_key(&delete_op("a")),
+            proxy.shape_key(&delete_op("b"))
+        );
     }
 
     #[test]
