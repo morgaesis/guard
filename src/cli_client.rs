@@ -518,7 +518,7 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                         println!("  evidence: {}", ev);
                     }
                     println!();
-                    match serde_yaml::to_string(&verb) {
+                    match serde_yaml_ng::to_string(&verb) {
                         Ok(y) => print!("{}", y),
                         Err(_) => println!("{:#?}", verb),
                     }
@@ -714,16 +714,6 @@ pub(crate) async fn run_mcp(subcommand: McpCommands) -> Result<()> {
     }
 }
 
-/// Well-known system socket path, matching the systemd RuntimeDirectory
-/// layout in deployment/systemd/. Used as the default endpoint when it
-/// exists; otherwise the default is the home-dir socket a no-flag
-/// `guard server start` binds (~/.guard/guard.sock).
-#[cfg(unix)]
-const DEFAULT_CLIENT_SOCKET: &str = "/run/guard/guard.sock";
-/// Default endpoint on platforms without a Unix-socket default (loopback TCP).
-#[cfg(not(unix))]
-const DEFAULT_CLIENT_TCP_PORT: u16 = 8123;
-
 /// Where the resolved endpoint came from. Decides the remediation hint
 /// attached to connect failures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -762,7 +752,7 @@ pub(crate) fn resolve_client_endpoint_with_source(
 
 #[cfg(unix)]
 fn default_client_socket_exists() -> bool {
-    std::path::Path::new(DEFAULT_CLIENT_SOCKET).exists()
+    std::path::Path::new(defaults::SYSTEM_SOCKET).exists()
 }
 
 #[cfg(not(unix))]
@@ -804,7 +794,11 @@ fn resolve_endpoint(
     #[cfg(windows)]
     {
         let _ = default_socket_exists;
-        (None, Some(DEFAULT_CLIENT_TCP_PORT), EndpointSource::Default)
+        (
+            None,
+            Some(defaults::DEFAULT_TCP_PORT),
+            EndpointSource::Default,
+        )
     }
     // Nothing configured anywhere: prefer the system socket (the systemd
     // RuntimeDirectory layout) when it exists, else the home-dir socket a
@@ -814,21 +808,24 @@ fn resolve_endpoint(
     {
         if default_socket_exists {
             (
-                Some(PathBuf::from(DEFAULT_CLIENT_SOCKET)),
+                Some(PathBuf::from(defaults::SYSTEM_SOCKET)),
                 None,
                 EndpointSource::Default,
             )
         } else {
-            let socket = dirs::home_dir()
-                .map(|h| h.join(".guard").join("guard.sock"))
-                .unwrap_or_else(|| PathBuf::from(DEFAULT_CLIENT_SOCKET));
+            let socket =
+                defaults::home_socket().unwrap_or_else(|| PathBuf::from(defaults::SYSTEM_SOCKET));
             (Some(socket), None, EndpointSource::Default)
         }
     }
     #[cfg(not(any(unix, windows)))]
     {
         let _ = default_socket_exists;
-        (None, Some(DEFAULT_CLIENT_TCP_PORT), EndpointSource::Default)
+        (
+            None,
+            Some(defaults::DEFAULT_TCP_PORT),
+            EndpointSource::Default,
+        )
     }
 }
 
@@ -1133,10 +1130,7 @@ fn parse_since_to_unix(value: &str) -> Result<u64> {
     let n: u64 = num_part
         .parse()
         .with_context(|| format!("invalid --since value: '{}'", value))?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now = guard::env::now_unix();
     Ok(now.saturating_sub(n.saturating_mul(multiplier)))
 }
 
@@ -1806,7 +1800,7 @@ mod tests {
     fn endpoint_default_prefers_system_socket_when_present() {
         let (socket, port, source) =
             resolve_endpoint(None, None, None, &config_with(None, None), true);
-        assert_eq!(socket, Some(PathBuf::from(DEFAULT_CLIENT_SOCKET)));
+        assert_eq!(socket, Some(PathBuf::from(defaults::SYSTEM_SOCKET)));
         assert_eq!(port, None);
         assert_eq!(source, EndpointSource::Default);
     }
@@ -1818,7 +1812,7 @@ mod tests {
             resolve_endpoint(None, None, None, &config_with(None, None), false);
         let expected = dirs::home_dir()
             .map(|h| h.join(".guard").join("guard.sock"))
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_CLIENT_SOCKET));
+            .unwrap_or_else(|| PathBuf::from(defaults::SYSTEM_SOCKET));
         assert_eq!(socket, Some(expected));
         assert_eq!(port, None);
         assert_eq!(source, EndpointSource::Default);
@@ -1830,7 +1824,7 @@ mod tests {
         let (socket, port, source) =
             resolve_endpoint(None, None, None, &config_with(None, None), false);
         assert_eq!(socket, None);
-        assert_eq!(port, Some(DEFAULT_CLIENT_TCP_PORT));
+        assert_eq!(port, Some(defaults::DEFAULT_TCP_PORT));
         assert_eq!(source, EndpointSource::Default);
     }
 

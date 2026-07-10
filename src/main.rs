@@ -7,6 +7,7 @@ mod cli_server;
 mod cli_shim;
 mod client_config;
 mod daemon_client;
+mod defaults;
 mod grant_profile;
 mod grant_rules;
 mod injection;
@@ -33,7 +34,6 @@ use std::collections::HashMap;
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::FormatTime;
@@ -1317,10 +1317,7 @@ struct UtcTimestamp;
 
 impl FormatTime for UtcTimestamp {
     fn format_time(&self, writer: &mut Writer<'_>) -> std::fmt::Result {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = guard::env::now_unix();
         write!(writer, "{}", unix_seconds_to_utc(now))
     }
 }

@@ -172,7 +172,7 @@ impl VerbCatalog {
     /// template placeholders that reference an undeclared param.
     pub fn from_yaml(text: &str) -> Result<Self> {
         let file: CatalogFile =
-            serde_yaml::from_str(text).context("failed to parse verb catalog")?;
+            serde_yaml_ng::from_str(text).context("failed to parse verb catalog")?;
         let mut verbs = BTreeMap::new();
         for verb in file.verbs {
             validate_verb(&verb)?;
@@ -370,36 +370,36 @@ impl VerbCatalog {
 /// not preserved across an append; the prose/evidence are stored in-band.)
 fn compose_appended_catalog(existing: &str, verb: &Verb) -> Result<String> {
     let body = existing.strip_prefix('\u{feff}').unwrap_or(existing);
-    let verb_value = serde_yaml::to_value(verb).context("failed to serialize verb")?;
+    let verb_value = serde_yaml_ng::to_value(verb).context("failed to serialize verb")?;
 
     if body.trim().is_empty() {
-        let mut map = serde_yaml::Mapping::new();
+        let mut map = serde_yaml_ng::Mapping::new();
         map.insert(
-            serde_yaml::Value::String("verbs".to_string()),
-            serde_yaml::Value::Sequence(vec![verb_value]),
+            serde_yaml_ng::Value::String("verbs".to_string()),
+            serde_yaml_ng::Value::Sequence(vec![verb_value]),
         );
-        return serde_yaml::to_string(&serde_yaml::Value::Mapping(map))
+        return serde_yaml_ng::to_string(&serde_yaml_ng::Value::Mapping(map))
             .context("failed to serialize the new catalog");
     }
 
-    let mut doc: serde_yaml::Value =
-        serde_yaml::from_str(body).context("the existing verb catalog is not valid YAML")?;
+    let mut doc: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(body).context("the existing verb catalog is not valid YAML")?;
     let map = doc
         .as_mapping_mut()
         .ok_or_else(|| anyhow::anyhow!("verb catalog is not a YAML mapping"))?;
-    let key = serde_yaml::Value::String("verbs".to_string());
-    let is_seq = matches!(map.get(&key), Some(serde_yaml::Value::Sequence(_)));
-    let is_null_or_absent = matches!(map.get(&key), None | Some(serde_yaml::Value::Null));
+    let key = serde_yaml_ng::Value::String("verbs".to_string());
+    let is_seq = matches!(map.get(&key), Some(serde_yaml_ng::Value::Sequence(_)));
+    let is_null_or_absent = matches!(map.get(&key), None | Some(serde_yaml_ng::Value::Null));
     if is_seq {
-        if let Some(serde_yaml::Value::Sequence(seq)) = map.get_mut(&key) {
+        if let Some(serde_yaml_ng::Value::Sequence(seq)) = map.get_mut(&key) {
             seq.push(verb_value);
         }
     } else if is_null_or_absent {
-        map.insert(key, serde_yaml::Value::Sequence(vec![verb_value]));
+        map.insert(key, serde_yaml_ng::Value::Sequence(vec![verb_value]));
     } else {
         bail!("the catalog's `verbs` key is not a sequence");
     }
-    serde_yaml::to_string(&doc).context("failed to serialize the updated catalog")
+    serde_yaml_ng::to_string(&doc).context("failed to serialize the updated catalog")
 }
 
 /// Binaries a synthesized verb may not use: shells and interpreters where a

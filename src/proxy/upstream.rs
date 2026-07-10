@@ -73,9 +73,9 @@ struct User {
     key_file: Option<String>,
     username: Option<String>,
     password: Option<String>,
-    exec: Option<serde_yaml::Value>,
+    exec: Option<serde_yaml_ng::Value>,
     #[serde(rename = "auth-provider")]
-    auth_provider: Option<serde_yaml::Value>,
+    auth_provider: Option<serde_yaml_ng::Value>,
 }
 
 /// A configured connection to the real apiserver. Holds exactly one of the
@@ -113,7 +113,7 @@ impl Upstream {
 
     /// Build an upstream from kubeconfig YAML text.
     pub fn from_kubeconfig_str(text: &str, context: Option<&str>) -> Result<Self> {
-        let cfg: KubeConfig = serde_yaml::from_str(text).context("parse kubeconfig")?;
+        let cfg: KubeConfig = serde_yaml_ng::from_str(text).context("parse kubeconfig")?;
 
         let ctx_name = context
             .map(str::to_string)

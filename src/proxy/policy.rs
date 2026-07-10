@@ -109,8 +109,8 @@ impl ApiPolicy {
         }
     }
 
-    pub fn from_yaml(yaml: &str) -> Result<Self, serde_yaml::Error> {
-        serde_yaml::from_str(yaml)
+    pub fn from_yaml(yaml: &str) -> Result<Self, serde_yaml_ng::Error> {
+        serde_yaml_ng::from_str(yaml)
     }
 
     pub fn load_file(path: &std::path::Path) -> std::io::Result<Self> {

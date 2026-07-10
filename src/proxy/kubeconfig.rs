@@ -66,15 +66,15 @@ pub fn brokered_kubeconfig(proxy_url: &str, ca_data_b64: &str) -> String {
         "current-context": "guard-proxy",
         "users": [{ "name": "guard-agent", "user": {} }],
     });
-    serde_yaml::to_string(&cfg).expect("serialize brokered kubeconfig")
+    serde_yaml_ng::to_string(&cfg).expect("serialize brokered kubeconfig")
 }
 
 /// Validate that `yaml` is a brokered config carrying no credential: every user's
 /// `user` map must be free of token/cert/key/exec/auth-provider/password fields.
 /// This is the invariant that keeps the proxy the sole path to the cluster.
 pub fn validate_brokered_kubeconfig(yaml: &str) -> Result<(), BrokerError> {
-    let doc: serde_yaml::Value =
-        serde_yaml::from_str(yaml).map_err(|e| BrokerError::Parse(e.to_string()))?;
+    let doc: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(yaml).map_err(|e| BrokerError::Parse(e.to_string()))?;
 
     let users = match doc.get("users").and_then(|u| u.as_sequence()) {
         Some(seq) => seq,
@@ -113,7 +113,7 @@ mod tests {
         let yaml = brokered_kubeconfig("https://127.0.0.1:8443", "QkFTRTY0Q0E=");
         validate_brokered_kubeconfig(&yaml).expect("generated config must validate");
 
-        let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&yaml).unwrap();
         // Server points at the proxy; CA present.
         assert_eq!(
             doc["clusters"][0]["cluster"]["server"].as_str(),

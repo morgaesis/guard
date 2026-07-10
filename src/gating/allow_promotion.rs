@@ -71,10 +71,10 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::verb::{is_kebab_name, ParamSpec, Verb, VerbCommand};
 use super::{Reversibility, EXECUTE_NOW_MAX_RISK, HOLD_RISK_THRESHOLD};
+use crate::env::now_unix;
 use crate::learned_rules::{infer_service_from_binary, looks_dangerous_for_learned_allow};
 
 /// Evidence samples kept per observation bucket: enough to see whether more
@@ -193,7 +193,7 @@ impl AllowPromotionStore {
             if content.trim().is_empty() {
                 AllowPromotionFile::default()
             } else {
-                serde_yaml::from_str(&content)
+                serde_yaml_ng::from_str(&content)
                     .with_context(|| format!("failed to parse {}", config.path.display()))?
             }
         } else {
@@ -387,7 +387,7 @@ impl AllowPromotionStore {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        let content = serde_yaml::to_string(&self.data)?;
+        let content = serde_yaml_ng::to_string(&self.data)?;
         std::fs::write(&self.config.path, content)
             .with_context(|| format!("failed to write {}", self.config.path.display()))
     }
@@ -608,13 +608,6 @@ pub(crate) fn build_candidate_verb(
         auto_promoted: true,
         promotion_stamp: Some(promotion_stamp),
     }
-}
-
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

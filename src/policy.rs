@@ -221,7 +221,7 @@ impl PolicyEngine {
 
     /// Load configuration from a YAML string.
     pub fn load_yaml(yaml: &str) -> Result<Self> {
-        let config: PolicyConfig = serde_yaml::from_str(yaml)?;
+        let config: PolicyConfig = serde_yaml_ng::from_str(yaml)?;
         Self::from_config(&config.policy)
     }
 

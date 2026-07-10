@@ -795,10 +795,7 @@ mod tests {
         let store = SessionStore::open(tmp.path().join("state.db"), 24 * 60 * 60)
             .await
             .expect("open store");
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_secs())
-            .unwrap_or(0);
+        let now = guard::env::now_unix();
 
         let mut grants = HashMap::new();
         grants.insert(

@@ -417,13 +417,7 @@ pub(super) async fn handle_admin_request(
             };
             let prompt_append = combine_session_prompt(base_prompt, prose.as_deref(), &compiled);
             let auto_amend = auto_amend && !static_only;
-            let expires_at = ttl_secs.map(|secs| {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0)
-                    + secs
-            });
+            let expires_at = ttl_secs.map(|secs| now_unix() + secs);
             let mut generated_notes = compiled.notes.clone();
             if let Some(name) = profile.as_deref() {
                 generated_notes.push(format!("session minted from profile '{name}'"));
@@ -727,10 +721,7 @@ pub(super) async fn handle_admin_request(
             },
         },
         AdminRequest::Ping => {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+            let now = now_unix();
             let mode = config
                 .evaluator
                 .mode()
@@ -744,10 +735,7 @@ pub(super) async fn handle_admin_request(
             }
         }
         AdminRequest::Status => {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+            let now = now_unix();
             let session_count = config.sessions.read().await.list().len();
             let cache_size = config.evaluator.cache_size().await;
             let learned_rule_count = config.evaluator.learned_rule_count().await;

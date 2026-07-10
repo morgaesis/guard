@@ -221,10 +221,7 @@ impl ServerConfig {
             daemon_uid: current_uid(),
             daemon_principal: resolve_daemon_principal(),
             sessions: Arc::new(RwLock::new(sessions)),
-            started_at_unix: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
+            started_at_unix: guard::env::now_unix(),
             state_db_path,
             // Gating defaults to off; the daemon entrypoint enables it and
             // populates the registries from persisted state before serving.

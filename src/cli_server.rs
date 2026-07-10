@@ -146,8 +146,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             // Windows (winplat::pipe_name maps `--socket <name>` to
             // \\.\pipe\<name>). On Unix it also falls back to a home-dir default.
             #[cfg(unix)]
-            let socket_path = configured_socket
-                .or_else(|| dirs::home_dir().map(|h| h.join(".guard").join("guard.sock")));
+            let socket_path = configured_socket.or_else(defaults::home_socket);
             #[cfg(windows)]
             let socket_path = configured_socket;
 
@@ -159,7 +158,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                     #[cfg(windows)]
                     {
                         if socket_path.is_none() {
-                            Some(8123)
+                            Some(defaults::DEFAULT_TCP_PORT)
                         } else {
                             None
                         }

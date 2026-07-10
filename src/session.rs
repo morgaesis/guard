@@ -12,10 +12,10 @@
 //! while `session_store.rs` persists grants and bounded interaction
 //! history across daemon restarts.
 
+use guard::env::now_unix;
 use guard::policy::{Decision, PolicyRule};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Default daemon-side history retention. Anything older than this is
 /// dropped on the next opportunistic purge. 24h matches the "I want
@@ -338,7 +338,7 @@ impl SessionRegistry {
     pub fn grant(&mut self, token: String, mut grant: SessionGrant) {
         self.revision += 1;
         if grant.granted_at == 0 {
-            grant.granted_at = current_unix_secs();
+            grant.granted_at = now_unix();
         }
         // If we are overwriting an active grant, archive the previous
         // version so the audit trail still shows what was in effect.
@@ -346,7 +346,7 @@ impl SessionRegistry {
             self.history.push(historical(
                 &token,
                 prev,
-                current_unix_secs(),
+                now_unix(),
                 HistoricalStatus::Revoked,
             ));
         }
@@ -361,7 +361,7 @@ impl SessionRegistry {
         self.history.push(historical(
             token,
             grant,
-            current_unix_secs(),
+            now_unix(),
             HistoricalStatus::Revoked,
         ));
         true
@@ -372,11 +372,11 @@ impl SessionRegistry {
         let Some(grant) = self.grants.get(token) else {
             return false;
         };
-        !grant.is_expired(current_unix_secs())
+        !grant.is_expired(now_unix())
     }
 
     pub fn list(&self) -> Vec<SessionGrantSummary> {
-        let now = current_unix_secs();
+        let now = now_unix();
         self.grants
             .iter()
             .filter(|(_, g)| !g.is_expired(now))
@@ -412,7 +412,7 @@ impl SessionRegistry {
     pub fn record_interaction(&mut self, token: &str, mut interaction: SessionInteraction) {
         self.revision += 1;
         if interaction.at_unix == 0 {
-            interaction.at_unix = current_unix_secs();
+            interaction.at_unix = now_unix();
         }
         self.interactions.push(StoredSessionInteraction {
             token: token.to_string(),
@@ -422,7 +422,7 @@ impl SessionRegistry {
 
     pub fn show(&self, token: &str, limit: usize) -> Option<SessionReport> {
         let active = self.grants.get(token).and_then(|grant| {
-            if grant.is_expired(current_unix_secs()) {
+            if grant.is_expired(now_unix()) {
                 None
             } else {
                 Some(SessionGrantSummary {
@@ -507,7 +507,7 @@ impl SessionRegistry {
     /// has not expired, and has a prompt attached.
     pub fn prompt_append_for(&self, token: &str) -> Option<String> {
         let grant = self.grants.get(token)?;
-        if grant.is_expired(current_unix_secs()) {
+        if grant.is_expired(now_unix()) {
             return None;
         }
         grant.prompt_append.clone()
@@ -517,14 +517,14 @@ impl SessionRegistry {
         let Some(grant) = self.grants.get(token) else {
             return false;
         };
-        !grant.is_expired(current_unix_secs()) && grant.static_only
+        !grant.is_expired(now_unix()) && grant.static_only
     }
 
     pub fn auto_amend_for(&self, token: &str) -> bool {
         let Some(grant) = self.grants.get(token) else {
             return false;
         };
-        !grant.is_expired(current_unix_secs()) && grant.auto_amend
+        !grant.is_expired(now_unix()) && grant.auto_amend
     }
 
     pub fn amend_exact(
@@ -537,7 +537,7 @@ impl SessionRegistry {
         if self
             .grants
             .get(token)
-            .is_none_or(|g| g.is_expired(current_unix_secs()))
+            .is_none_or(|g| g.is_expired(now_unix()))
         {
             return None;
         }
@@ -572,7 +572,7 @@ impl SessionRegistry {
     /// Remove expired entries (move them to history) and trim history
     /// older than the retention window. Called opportunistically.
     pub fn purge_expired(&mut self) {
-        let now = current_unix_secs();
+        let now = now_unix();
         let retention_cutoff = now.saturating_sub(self.history_retention_secs);
 
         let expired_tokens: Vec<String> = self
@@ -607,7 +607,7 @@ impl SessionRegistry {
         args: &[String],
     ) -> Option<(SessionDecision, String)> {
         let grant = self.grants.get(token)?;
-        if grant.is_expired(current_unix_secs()) {
+        if grant.is_expired(now_unix()) {
             return None;
         }
 
@@ -720,13 +720,6 @@ fn command_line(cmd: &str, args: &[String]) -> String {
     } else {
         format!("{} {}", cmd, args.join(" "))
     }
-}
-
-fn current_unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1039,8 +1032,8 @@ mod tests {
             },
         );
         reg.revoke("a");
-        let after = current_unix_secs() + 1;
-        let before = current_unix_secs().saturating_sub(60);
+        let after = now_unix() + 1;
+        let before = now_unix().saturating_sub(60);
         assert_eq!(reg.list_history(Some(after)).len(), 0);
         assert_eq!(reg.list_history(Some(before)).len(), 1);
     }

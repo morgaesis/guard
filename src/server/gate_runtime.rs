@@ -1,3 +1,7 @@
+// Re-exported so sibling server modules keep a single import path for the
+// gating clock.
+pub(super) use guard::env::now_unix;
+
 use guard::gating::approval::{Approval, ApprovalSnapshot, ApprovalStatus};
 use guard::gating::provisional::{Provisional, ProvisionalStatus};
 use guard::gating::{decide_gate, Coverage, GateOutcome, Reversibility};
@@ -22,13 +26,6 @@ use super::{
 // ===========================================================================
 // Consequence gating: routing of LLM-approved commands by reversibility.
 // ===========================================================================
-
-pub(super) fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
 
 /// Mint an unguessable handle for a provisional/approval, using the same
 /// entropy source as session tokens (128 bits hex).

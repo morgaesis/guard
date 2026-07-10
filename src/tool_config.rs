@@ -54,7 +54,7 @@ impl ToolRegistry {
         let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let config: ToolConfigFile = serde_yaml::from_str(&content)
+        let config: ToolConfigFile = serde_yaml_ng::from_str(&content)
             .with_context(|| format!("failed to parse {}", path.display()))?;
 
         Ok(Self {
@@ -140,7 +140,7 @@ impl ToolRegistry {
         }
 
         let content = std::fs::read_to_string(&self.path)?;
-        self.config = serde_yaml::from_str(&content)?;
+        self.config = serde_yaml_ng::from_str(&content)?;
         self.last_modified = current_mtime;
         Ok(true)
     }
@@ -221,7 +221,7 @@ impl ToolRegistry {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let content = serde_yaml::to_string(&self.config)?;
+        let content = serde_yaml_ng::to_string(&self.config)?;
         std::fs::write(&self.path, content)?;
         Ok(())
     }

@@ -74,7 +74,7 @@ impl ProfileCatalog {
     /// rather than silently minting an empty (unrestricted) grant later.
     pub fn from_yaml(text: &str) -> Result<Self> {
         let file: ProfileFile =
-            serde_yaml::from_str(text).context("failed to parse session profile catalog")?;
+            serde_yaml_ng::from_str(text).context("failed to parse session profile catalog")?;
         let mut profiles = BTreeMap::new();
         for profile in file.profiles {
             validate_profile(&profile)?;

@@ -46,7 +46,7 @@ impl ClientConfig {
         }
 
         let content = std::fs::read_to_string(&path)?;
-        let config: ClientConfig = serde_yaml::from_str(&content)?;
+        let config: ClientConfig = serde_yaml_ng::from_str(&content)?;
         Ok(config)
     }
 
@@ -58,7 +58,7 @@ impl ClientConfig {
             std::fs::create_dir_all(parent)?;
         }
 
-        let content = serde_yaml::to_string(self)?;
+        let content = serde_yaml_ng::to_string(self)?;
         std::fs::write(&path, content)?;
         Ok(())
     }

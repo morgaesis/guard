@@ -40,10 +40,10 @@ enum LocalStoreVariant {
 
 /// Normalize a YAML mapping key (which may be an integer for legacy uid-keyed
 /// files, or a string) to the principal's raw string form.
-fn yaml_key_to_principal_string(value: &serde_yaml::Value) -> Option<String> {
+fn yaml_key_to_principal_string(value: &serde_yaml_ng::Value) -> Option<String> {
     match value {
-        serde_yaml::Value::String(s) => Some(s.clone()),
-        serde_yaml::Value::Number(n) => Some(n.to_string()),
+        serde_yaml_ng::Value::String(s) => Some(s.clone()),
+        serde_yaml_ng::Value::Number(n) => Some(n.to_string()),
         _ => None,
     }
 }
@@ -55,14 +55,15 @@ fn parse_store_variant(content: &str) -> Result<LocalStoreVariant> {
     // The namespaced shape is `{ <principal>: { <key>: <value> } }`. Parse
     // through `Value` so a legacy integer uid key (`1000:`) and a string
     // key (`"1000":` or a SID) both normalize to the principal raw string.
-    if let Ok(serde_yaml::Value::Mapping(map)) = serde_yaml::from_str::<serde_yaml::Value>(content)
+    if let Ok(serde_yaml_ng::Value::Mapping(map)) =
+        serde_yaml_ng::from_str::<serde_yaml_ng::Value>(content)
     {
         let mut namespaced: LocalStore = HashMap::new();
         let mut all_namespaced = true;
         for (k, v) in &map {
             let (Some(principal), Ok(inner)) = (
                 yaml_key_to_principal_string(k),
-                serde_yaml::from_value::<HashMap<String, String>>(v.clone()),
+                serde_yaml_ng::from_value::<HashMap<String, String>>(v.clone()),
             ) else {
                 all_namespaced = false;
                 break;
@@ -73,7 +74,7 @@ fn parse_store_variant(content: &str) -> Result<LocalStoreVariant> {
             return Ok(LocalStoreVariant::Namespaced(namespaced));
         }
     }
-    if let Ok(store) = serde_yaml::from_str::<LegacyLocalStore>(content) {
+    if let Ok(store) = serde_yaml_ng::from_str::<LegacyLocalStore>(content) {
         return Ok(LocalStoreVariant::Legacy(store));
     }
     bail!("content did not match either the namespaced or legacy secrets-file shape")
@@ -138,8 +139,8 @@ impl LocalBackend {
         }
 
         let content = match secrets {
-            LocalStoreVariant::Namespaced(store) => serde_yaml::to_string(store)?,
-            LocalStoreVariant::Legacy(store) => serde_yaml::to_string(store)?,
+            LocalStoreVariant::Namespaced(store) => serde_yaml_ng::to_string(store)?,
+            LocalStoreVariant::Legacy(store) => serde_yaml_ng::to_string(store)?,
         };
 
         if let Some(ref recipient) = self.gpg_recipient {
@@ -314,9 +315,9 @@ mod tests {
         // key to the uid principal's raw string, so the matching uid principal
         // reads its own namespace with no migration. A string SID key is
         // preserved verbatim.
-        let legacy_int: serde_yaml::Value =
-            serde_yaml::from_str("1000:\n  OPNSENSE_API_KEY: v\n").unwrap();
-        let serde_yaml::Value::Mapping(map) = legacy_int else {
+        let legacy_int: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str("1000:\n  OPNSENSE_API_KEY: v\n").unwrap();
+        let serde_yaml_ng::Value::Mapping(map) = legacy_int else {
             panic!("expected mapping");
         };
         let (int_key, inner) = map.iter().next().unwrap();
@@ -325,12 +326,12 @@ mod tests {
             Some(PrincipalKey::from_uid(1000).as_str())
         );
         // The inner map deserializes as the per-key value store.
-        let inner: HashMap<String, String> = serde_yaml::from_value(inner.clone()).unwrap();
+        let inner: HashMap<String, String> = serde_yaml_ng::from_value(inner.clone()).unwrap();
         assert_eq!(inner.get("OPNSENSE_API_KEY").map(String::as_str), Some("v"));
 
-        let sid_keyed: serde_yaml::Value =
-            serde_yaml::from_str("S-1-5-21-1-2-3-1001:\n  WIN_KEY: v\n").unwrap();
-        let serde_yaml::Value::Mapping(map) = sid_keyed else {
+        let sid_keyed: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str("S-1-5-21-1-2-3-1001:\n  WIN_KEY: v\n").unwrap();
+        let serde_yaml_ng::Value::Mapping(map) = sid_keyed else {
             panic!("expected mapping");
         };
         let (sid_key, _) = map.iter().next().unwrap();
