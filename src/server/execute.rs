@@ -444,6 +444,17 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
     } else {
         None
     };
+    // Reversibility as an evaluator input: a constructible rollback widens
+    // what the evaluator may approve at the margin, while decide_gate's
+    // deterministic routing stays the hard floor (the fragment says so
+    // explicitly). Only meaningful under the consequence gate, where the
+    // envelope actually arms. A non-empty prompt append bypasses the decision
+    // cache, so a revert-aware verdict is never replayed for a revert-less
+    // request.
+    let session_prompt = merge_revert_context(
+        session_prompt,
+        config.gate.is_on() && request.revert.is_some(),
+    );
 
     // Trusted verb: an operator-reviewed shape skips the LLM evaluator (a
     // deterministic allow path, like a static-policy allow). The verb's declared
@@ -1897,5 +1908,31 @@ fn redact_command_text_inner(
         redacted
     } else {
         redact_output_text(&text)
+    }
+}
+
+/// The evaluator context fragment appended when the caller supplied a rollback
+/// under the consequence gate. It informs the marginal approve/deny decision
+/// only; the deterministic post-approval routing in `decide_gate` (and the
+/// separate rollback assessment before an envelope arms) is unaffected.
+const REVERT_AVAILABLE_CONTEXT: &str = "REVERSIBILITY CONTEXT. The caller supplied a rollback \
+command for this action. If you approve and classify it as recoverable, the daemon validates the \
+rollback separately and executes the action inside an auto-revert containment envelope that rolls \
+it back unattended unless an operator confirms. A constructible rollback may justify approving a \
+borderline recoverable action; it never justifies approving an irreversible or high-risk one, and \
+it does not change your reversibility classification duties.";
+
+/// Merge the session prompt with the revert-availability fragment. Returns
+/// `None` only when neither applies, preserving the cache semantics: any
+/// non-empty append bypasses the decision cache.
+pub(super) fn merge_revert_context(
+    session_prompt: Option<String>,
+    revert_supplied: bool,
+) -> Option<String> {
+    match (session_prompt, revert_supplied) {
+        (sp, false) => sp,
+        (None, true) => Some(REVERT_AVAILABLE_CONTEXT.to_string()),
+        (Some(sp), true) if sp.trim().is_empty() => Some(REVERT_AVAILABLE_CONTEXT.to_string()),
+        (Some(sp), true) => Some(format!("{REVERT_AVAILABLE_CONTEXT}\n\n{sp}")),
     }
 }

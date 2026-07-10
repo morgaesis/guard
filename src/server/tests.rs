@@ -3868,3 +3868,18 @@ async fn expired_read_grant_is_auto_revoked() {
         ReadGrantStatus::Revoked
     );
 }
+
+/// The revert-availability fragment reaches the evaluator prompt only when a
+/// rollback was supplied under the gate, composes with a session prompt, and
+/// never turns a no-context call into a cache-bypassing one.
+#[test]
+fn revert_context_merges_only_when_supplied() {
+    use super::execute::merge_revert_context;
+    assert_eq!(merge_revert_context(None, false), None);
+    let sp = merge_revert_context(Some("session ctx".to_string()), false);
+    assert_eq!(sp.as_deref(), Some("session ctx"));
+    let with = merge_revert_context(None, true).expect("fragment present");
+    assert!(with.contains("REVERSIBILITY CONTEXT"));
+    let both = merge_revert_context(Some("session ctx".to_string()), true).expect("merged");
+    assert!(both.contains("REVERSIBILITY CONTEXT") && both.ends_with("session ctx"));
+}
