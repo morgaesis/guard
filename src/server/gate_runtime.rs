@@ -27,7 +27,7 @@ pub(super) fn new_handle() -> String {
 /// identity exactly); on Windows the key is the caller's SID, so it reconstructs
 /// `Windows { sid }`. A `None` owner (or an unparseable Unix key) means the
 /// daemon executes as its own identity (non-exec-as-caller deployments).
-fn reconstruct_caller(
+pub(super) fn reconstruct_caller(
     principal: Option<PrincipalKey>,
     fallback: &CallerIdentity,
 ) -> CallerIdentity {
