@@ -81,11 +81,22 @@ See [DEPLOYMENT.md](DEPLOYMENT.md).
 
 A TCP loopback transport is also available. It carries only a bearer token and no
 local principal, so consequence gating and secret/`--env` injection are refused
-over TCP, and admin RPCs require a separate admin token:
+over TCP, and admin RPCs require a separate admin token.
+
+A TCP server refuses to start without an exec token (`GUARD_AUTH_TOKEN` or
+`--auth-token`; prefer the environment variable so the token stays out of
+process listings and shell history). Clients present the same token via
+`guard config set-token`; the separate admin token is only needed for admin
+RPCs such as `guard grant`:
 
 ```powershell
+# Server
+$env:GUARD_AUTH_TOKEN = "<exec-token>"
 guard server start --tcp-port 8123
+
+# Clients
 guard config set-port 8123
+guard config set-token <exec-token>
 guard config set-admin-token <admin-token>
 guard run whoami
 ```
@@ -97,10 +108,10 @@ Configuration is environment-driven. See [`.env.example`](.env.example) for all 
 Key variables:
 
 - `GUARD_LLM_API_KEY` / `OPENROUTER_API_KEY` -- LLM API key (required)
-- `GUARD_LLM_API_URL` / `GUARD_API_URL` -- LLM endpoint (default: OpenRouter)
+- `GUARD_LLM_API_URL` -- LLM endpoint (default: OpenRouter)
 - `GUARD_LLM_MODEL` -- Primary model (default: `openai/gpt-5.4-mini`). For a fallback chain, use `GUARD_LLM_MODELS` with a comma-separated list; the chain takes precedence over this single-model value when set.
 - `GUARD_MODE` -- Evaluation mode (default: `readonly`)
-- `GUARD_LLM_TIMEOUT` / `GUARD_TIMEOUT` -- LLM call timeout in seconds (default: `30`)
+- `GUARD_LLM_TIMEOUT` -- LLM call timeout in seconds (default: `30`)
 - `GUARD_AUTH_TOKEN` -- Shared token for TCP clients
 - `GUARD_ADMIN_TOKEN` -- Separate token for TCP admin RPCs such as `guard grant`
 - `GUARD_LEARN_RULES` -- Learn static allows from repeated low-risk approvals

@@ -73,9 +73,18 @@ still blocking destructive or credential-seeking commands. Use `paranoid` for
 untrusted agents, adversarial testing, or first contact with an unfamiliar
 workspace where even broad reads and network access should be treated as risky.
 
+The policy mode is a daemon-side setting: the server reads `GUARD_MODE` once at
+startup, and the execute request carries no mode. Setting `GUARD_MODE` in the
+client's environment has no effect. Set the mode where the server starts:
+
 ```bash
-GUARD_MODE=safe guard run sudo systemctl status ssh --no-pager  # allowed
-GUARD_MODE=paranoid guard run sudo systemctl status ssh --no-pager  # denied
+# With a daemon started as:
+GUARD_MODE=safe guard server start &
+guard run sudo systemctl status ssh --no-pager   # allowed
+
+# With a daemon started as:
+GUARD_MODE=paranoid guard server start &
+guard run sudo systemctl status ssh --no-pager   # denied
 ```
 
 All modes evaluate `sudo` by the underlying command:
@@ -309,18 +318,24 @@ All configuration via environment variables, CLI flags, or `.env` files.
 
 Guard walks up from your current directory to `/` looking for `.env` files (closest wins), so you can scope config per project.
 
+Unless marked "(client)", a variable is read by the daemon at startup; setting it in a client's environment has no effect.
+
 | Variable | Default | Description |
 |---|---|---|
 | `GUARD_LLM_API_KEY` / `OPENROUTER_API_KEY` | (none) | LLM API key (required). `OPENROUTER_API_KEY` is the conventional name and is accepted for compatibility. |
 | `GUARD_LLM_API_URL` | `https://openrouter.ai/api/v1/chat/completions` | Any OpenAI-compatible endpoint |
+| `GUARD_LLM_MODEL` | `openai/gpt-5.4-mini` | Primary evaluation model. `--llm-model` takes precedence; a non-empty `GUARD_LLM_MODELS` chain supersedes both. |
 | `GUARD_LLM_MODELS` | (unset) | Optional comma-separated fallback chain (e.g. `openai/gpt-5.4-mini,meta-llama/llama-4-maverick`). When set, overrides `--llm-model` and is tried in order, each with its own retry budget. Primary model when unset: `openai/gpt-5.4-mini`. |
 | `GUARD_LLM_RETRIES` | `2` | Retries per model on transient failures (429, timeouts, parse errors). 1-2. |
 | `GUARD_LLM_TIMEOUT` | `30` | LLM call timeout in seconds. |
 | `GUARD_AUTH_TOKEN` | (none) | Shared token for TCP clients. Use this for loopback TCP daemons instead of passing `--auth-token` on the command line. |
 | `GUARD_ADMIN_TOKEN` | (none) | Separate token for TCP admin RPCs such as `guard grant`, session mutation, detailed secret ownership inspection, and the full `guard status`. The Windows launcher generates and stores one automatically. |
+| `GUARD_TCP_PORT` | (none) | Daemon: TCP listen port on 127.0.0.1 (same as `--tcp-port`). Client: endpoint override, connect to 127.0.0.1:`<port>` instead of a socket. |
+| `GUARD_SOCKET` | (none) | (client) Endpoint override: Unix-domain socket path (Unix) or named-pipe name (Windows) to connect to. |
 | `GUARD_MODE` | `readonly` | `readonly`, `safe`, or `paranoid` |
 | `GUARD_DRY_RUN` | `false` | Evaluate policy but do not execute approved commands. Useful for prompt and policy testing. |
 | `GUARD_LEARN_RULES` | `false` | Learn static allows from repeated low-risk LLM approvals. |
+| `GUARD_LEARNED_RULES` | `<state dir>/learned-rules.yaml` | Path to the learned static rules YAML (used with `GUARD_LEARN_RULES`). |
 | `GUARD_LEARN_MIN_APPROVALS` | `2` | Approvals required before promotion. |
 | `GUARD_LEARN_MAX_RISK` | `2` | Highest LLM risk score eligible for promotion. |
 | `GUARD_LEARN_SHIMS` | `suggest` | `off`, `suggest`, or `create` service shims for learned SSH/API wrappers. |
@@ -347,6 +362,8 @@ Guard walks up from your current directory to `/` looking for `.env` files (clos
 | `GUARD_EXEC_AS_CALLER` | `false` | Run brokered children as the calling uid instead of the daemon account (Unix). |
 | `GUARD_KUBE_PROXY` | (none) | Kubernetes API proxy listen address (loopback only); see the kube-proxy section. Companions: `GUARD_KUBE_PROXY_KUBECONFIG`, `GUARD_KUBE_CONTEXT`, `GUARD_API_POLICY`, `GUARD_BROKERED_KUBECONFIG_OUT`. |
 | `GUARD_API_RARITY_ESCALATION` | `0` | Escalate a policy-allowed proxy request to the operator hold queue while its shape (verb x resource x namespace) has been seen fewer than N times this run. 0 disables it; requires `--gate consequence`. Flag: `--api-rarity-escalation`. |
+| `GUARD_LOG_LEVEL` | `warn` | Log level (`error`, `warn`, `info`, `debug`, `trace`) when `RUST_LOG` is unset. Read by every guard process, daemon and client alike. |
+| `GUARD_MCP_TOKEN` | (none) | (client) Bearer token required by the HTTP MCP transport (`guard mcp serve --http`); `--http-token` overrides it. |
 
 The primary model is `openai/gpt-5.4-mini` via OpenRouter by default. Set it
 per-invocation with `--llm-model <slug>`. To configure a true fallback chain
@@ -354,6 +371,20 @@ across providers, use `GUARD_LLM_MODELS` (comma-separated) or
 `--llm-models`. `--llm-timeout <seconds>` controls the per-call HTTP timeout.
 
 See [`.env.example`](.env.example) for a copyable template.
+
+### Endpoint resolution
+
+The client resolves the daemon endpoint in order: the `--socket` flag, then the
+`GUARD_TCP_PORT` and `GUARD_SOCKET` environment variables, then the client
+config (`~/.config/guard/client.yaml`, written by `guard config set-server` /
+`set-port`), then a default socket: `/run/guard/guard.sock` when it exists (the
+systemd layout), otherwise `~/.guard/guard.sock`.
+
+The daemon shares part of that chain: started without `--socket`, it reads
+`server_socket` from the same client config and binds there when set, otherwise
+it binds `~/.guard/guard.sock`. `guard config set-server` therefore points the
+client and any flagless daemon on the same host at the same endpoint, and a bare
+`guard server start` followed by `guard run ...` works with no configuration.
 
 ### SSH host keys
 
@@ -691,6 +722,12 @@ By default the daemon executes approved commands as its own service identity, on
 
 Point your agent's command execution at `guard run` instead of direct execution.
 
+Exit codes for scripted callers: an approved command propagates the child
+process's exit code, a denied command exits `1` with the denial reason on
+stderr, and a command held for operator approval exits `75` (EX_TEMPFAIL)
+with the approval handle on stderr, so the caller can retry after
+`guard approve`.
+
 ### MCP server
 
 Guard can run as a stdio MCP server so agents call a tool instead of shelling out:
@@ -700,7 +737,8 @@ guard config set-server ~/.guard/guard.sock
 guard mcp serve
 ```
 
-The server exposes a `guard_run` tool:
+The server exposes three tools: `guard_run`, `guard_verbs`, and
+`guard_approvals`. `guard_run` executes a command through the daemon:
 
 ```json
 {
@@ -739,6 +777,20 @@ Response:
 
 Denied commands return a normal MCP tool result with `allowed: false` and the denial reason. Transport or daemon failures still use `isError: true`.
 
+The other two tools take no arguments and are read-only. `guard_verbs` lists
+the operator-defined verb catalog: each verb names a binary, its consequence
+class, and its validated parameters; invoke a verb through `guard_run`.
+`guard_approvals` lists the caller's held approvals and provisional
+(auto-revert) executions, scoped to the caller by the daemon; it is how an
+agent polls whether an operator has approved a held command or which
+provisionals are still inside their revert window.
+
+`guard mcp serve` defaults to stdio and the configured daemon endpoint;
+`--socket`, `--tcp-port`, and `--token` override the endpoint. `--tool-name`
+renames the execute tool (default `guard_run`). `--http <addr>` serves
+Streamable-HTTP on a local address instead of stdio and requires a bearer
+token via `--http-token` or `GUARD_MCP_TOKEN`.
+
 <details>
 <summary><b>Claude Code (CLAUDE.md)</b></summary>
 
@@ -755,8 +807,11 @@ Never use interactive sessions.
 <summary><b>OpenHands / SWE-Agent</b></summary>
 
 ```bash
+# Where the daemon starts (the API key and policy mode are daemon-side settings):
 export GUARD_LLM_API_KEY="..."
-export GUARD_MODE=readonly
+GUARD_MODE=readonly guard server start &
+
+# In the agent's environment:
 alias ssh='guard run ssh'
 ```
 

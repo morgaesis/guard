@@ -451,8 +451,11 @@ ls -l /run/guard/guard.sock
   gating and credential brokering, since both authorize on the named-pipe SID.
   For a no-gating deployment, run `guard server start --tcp-port 8123
   --learn-rules` from a service manager or scheduled task, set
-  `GUARD_LLM_API_KEY` / `OPENROUTER_API_KEY` in that service environment, and
-  use `guard config set-port 8123` for clients on the same host.
+  `GUARD_LLM_API_KEY` / `OPENROUTER_API_KEY` and `GUARD_AUTH_TOKEN` in that
+  service environment (a TCP listener refuses to start without an exec token;
+  the environment variable keeps it out of process listings), and configure
+  clients on the same host with `guard config set-port 8123` and
+  `guard config set-token <exec-token>`.
 - The socket can be world-connectable at the filesystem layer because authorization is enforced by peer UID in the server.
 - Omit `--users` to allow any local UNIX-socket caller. Add `--users` only when the daemon should reject all callers outside a specific UID list.
 - The packaged unit stores persistent session state at `/var/lib/guard/state.db`, which remains writable under the default systemd sandbox profile.
