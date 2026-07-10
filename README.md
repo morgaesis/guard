@@ -654,28 +654,23 @@ For forensics, `guard session show <token>` prints prompt context, generated not
 
 Brokered tools routinely need to read operator-owned files (ansible vars,
 helm values) that guard's low-privilege service account cannot open. A read
-grant adds a time-boxed POSIX ACL for exactly one file (Unix only):
+grant adds a time-boxed POSIX ACL for exactly one file (Unix only) through the
+transparent retry path.
 
-```bash
-guard grant-read ~/ops/values.yaml --ttl 600
-guard grant-revoke ~/ops/values.yaml   # early teardown; auto-revokes at TTL anyway
-```
-
-The request runs through the same pipeline as any command: a hard
+When a brokered command fails naming a file it could not read, the daemon runs
+the read-grant pipeline on that path automatically. The pipeline applies a hard
 credential-path deny-list (key material, kubeconfigs, env files) before the
-evaluator ever sees it, then session allow/deny rules, then the LLM. Ancestor
-directories get traverse-only entries, never above the file owner's home. The
-apply is pinned to the inode vetted at evaluation time (multi-hardlink
+evaluator sees the request, then session allow/deny rules, then the LLM. On an
+allow, guard applies a short-TTL ACL grant to its brokering account (or the
+caller account under `--exec-as-caller`) and retries the original command.
+
+Ancestor directories get traverse-only entries, never above the file owner's
+home. The apply is pinned to the inode vetted at evaluation time (multi-hardlink
 targets are refused, and a path swapped for a symlink in between aborts the
 grant), grants persist in the state database, and the sweeper revokes them at
-TTL or on startup if the daemon was down when one expired.
-
-Agents normally never need the command: when a brokered command fails naming
-a file it could not read, the daemon runs the same grant pipeline on that
-path automatically and, on an allow, applies a short-TTL grant and retries
-the command. A denied path (credential file, session deny, evaluator deny)
-returns the command's own failure unchanged, and every grant and retry is
-audited.
+TTL or on startup if the daemon was down when one expired. A denied path
+(credential file, session deny, evaluator deny) returns the command's own
+failure unchanged, and every grant and retry is audited.
 
 ## Per-run secret injection
 

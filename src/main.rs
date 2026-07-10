@@ -41,9 +41,8 @@ use tracing_subscriber::{fmt as tracing_fmt, EnvFilter};
 
 use cli_client::{
     handle_approval_note_cmd, handle_approvals, handle_config, handle_gate_action,
-    handle_grant_read, handle_grant_revoke, handle_provisionals, handle_session, handle_status,
-    handle_verb, run_exec, run_mcp, top_level_grant_to_session_command, GatingOptions,
-    SshHostKeyCliMode,
+    handle_provisionals, handle_session, handle_status, handle_verb, run_exec, run_mcp,
+    top_level_grant_to_session_command, GatingOptions, SshHostKeyCliMode,
 };
 use cli_secrets::handle_secrets;
 use cli_server::run_server;
@@ -279,36 +278,6 @@ enum MainArgs {
     /// Run or list operator-defined verbs (the typed, least-expressive interface).
     #[clap(subcommand)]
     Verb(VerbCommands),
-    /// Grant guard's brokering identity a time-boxed POSIX ACL read grant on a
-    /// specific operator-owned file (Unix only), so a brokered ansible/helm
-    /// command can read a config/vars/values file guard's service account
-    /// otherwise cannot. Evaluated through the same policy pipeline as any
-    /// brokered command (credential deny-list, session globs, LLM evaluator),
-    /// and auto-revoked when the TTL expires.
-    #[clap(name = "grant-read")]
-    GrantRead {
-        /// Path to the single file to grant read access on.
-        path: String,
-        /// Time-to-live in seconds (required; bounded to 24h). No unbounded grant.
-        #[arg(long, value_name = "SECONDS")]
-        ttl: u64,
-        /// Skip the auto-learned deny-shape fast path and force a fresh LLM look.
-        #[arg(long = "reevaluate", action = ArgAction::SetTrue)]
-        reevaluate: bool,
-        /// Server socket path (defaults to configured)
-        #[arg(long, value_name = "PATH")]
-        socket: Option<String>,
-    },
-    /// Revoke an active read grant early (Unix only). De-escalation; not
-    /// re-evaluated by the LLM, but audited.
-    #[clap(name = "grant-revoke")]
-    GrantRevoke {
-        /// Path the grant was issued on.
-        path: String,
-        /// Server socket path (defaults to configured)
-        #[arg(long, value_name = "PATH")]
-        socket: Option<String>,
-    },
 }
 
 #[derive(Subcommand)]
@@ -1127,13 +1096,6 @@ async fn main() -> Result<()> {
             socket,
         }) => handle_approval_note_cmd(socket, handle, text).await,
         Ok(MainArgs::Verb(subcommand)) => handle_verb(subcommand).await,
-        Ok(MainArgs::GrantRead {
-            path,
-            ttl,
-            reevaluate,
-            socket,
-        }) => handle_grant_read(path, ttl, reevaluate, socket).await,
-        Ok(MainArgs::GrantRevoke { path, socket }) => handle_grant_revoke(path, socket).await,
         Ok(MainArgs::Secrets(subcommand)) => handle_secrets(subcommand).await,
         Ok(MainArgs::Shim {
             tools,
@@ -1448,8 +1410,6 @@ fn print_help_tree(admin: bool) {
     println!("    secrets|secret add|remove|list");
     println!("    verb list");
     println!("    verb run <name> --param key=value");
-    println!("    grant-read <path> --ttl <secs>");
-    println!("    grant-revoke <path>");
     println!("    session list [--history] [--since duration] [--full]");
     println!("    session show [token]  (defaults to $GUARD_SESSION)");
     println!("    session new");

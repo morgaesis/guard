@@ -87,7 +87,7 @@ pub(crate) use transport::winplat;
 pub use transport::Server;
 pub use wire::{
     AdminRequest, AdminResponse, ApprovalSummary, ExecuteRequest, ExecuteResponse, GateStatus,
-    GrantRequest, OutputStream, RevertSpec, SshHostKeyMode, VerbInvocation, VerbSummary,
+    OutputStream, RevertSpec, SshHostKeyMode, VerbInvocation, VerbSummary,
 };
 pub(crate) use wire::{ExecuteStreamMessage, IncomingMessage};
 
@@ -173,7 +173,7 @@ struct ServerConfig {
     pub protocol_registry:
         Arc<RwLock<std::collections::HashMap<String, Arc<guard::proxy::ApiProxy>>>>,
     /// Active filesystem read grants (Unix-only). Time-boxed POSIX ACL read
-    /// grants issued via `guard grant-read`; the sweeper auto-revokes them at
+    /// grants issued by the automatic retry path; the sweeper revokes them at
     /// expiry and startup reconciliation revokes any that expired while the
     /// daemon was down.
     pub read_grants: Arc<RwLock<GrantReadRegistry>>,

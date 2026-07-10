@@ -1412,7 +1412,7 @@ fn apply_exec_identity(
 /// Strip inherited capabilities from a brokered child before `execve`.
 ///
 /// Under the packaged unit the daemon holds `CAP_FOWNER` and
-/// `CAP_DAC_READ_SEARCH` in its ambient set so its own `grant-read` `setfacl`/
+/// `CAP_DAC_READ_SEARCH` in its ambient set so its own read-grant `setfacl`/
 /// `getfacl` calls can manipulate ACLs on files it does not own. Ambient
 /// capabilities are, by design, preserved across `execve()` for a non-privileged
 /// process, so without this every caller-requested command (a plain
@@ -1520,11 +1520,10 @@ fn drop_brokered_child_capabilities(cmd: &mut Command) {
 /// match. Failures returned from here are exec-level, not policy-level,
 /// so the audit stream can tell "policy said no" apart from "policy
 /// said yes but the kernel refused".
-/// TTL for a read grant issued by the transparent retry path. Shorter than an
-/// explicit `grant-read` default: the grant exists to unblock the one command
-/// that just failed, not to stand open.
+/// TTL for a read grant issued by the transparent retry path. The grant exists
+/// to unblock the one command that just failed, not to stand open.
 #[cfg(unix)]
-const AUTO_READ_GRANT_TTL_SECS: u64 = 600;
+pub(super) const AUTO_READ_GRANT_TTL_SECS: u64 = 600;
 
 /// Cap on grant+retry rounds for one command (a run may trip over several
 /// operator files in sequence, e.g. an inventory and a vars file).
@@ -1568,11 +1567,9 @@ pub(super) fn permission_denied_path(output: &str) -> Option<String> {
 
 /// Execute an approved command; when it fails naming a file it could not read,
 /// transparently run the read-grant pipeline on that file (credential
-/// deny-list, session rules, evaluator, pinned TTL ACL, full audit — exactly
-/// as an explicit `grant-read`) and retry the command. A denied or failed
-/// grant returns the original failure untouched; each round must unblock a
-/// new path or the loop stops. The agent never has to know `grant-read`
-/// exists, and nothing is granted that an explicit request would not get.
+/// deny-list, session rules, evaluator, pinned TTL ACL, full audit) and retry
+/// the command. A denied or failed grant returns the original failure
+/// untouched; each round must unblock a new path or the loop stops.
 pub(super) async fn exec_with_read_grant_retry<W: AsyncWrite + Unpin>(
     request: ExecuteRequest,
     config: &ServerConfig,
@@ -1635,15 +1632,9 @@ pub(super) async fn exec_with_read_grant_retry<W: AsyncWrite + Unpin>(
                 // The grant did not unblock this path; do not loop on it.
                 break;
             }
-            let grant = handle_grant_read(
-                config,
-                caller,
-                path.clone(),
-                AUTO_READ_GRANT_TTL_SECS,
-                request.session_token.clone(),
-                false,
-            )
-            .await;
+            let grant =
+                handle_grant_read(config, caller, path.clone(), request.session_token.clone())
+                    .await;
             if !(grant.policy_allowed() && matches!(grant.exec, ExecOutcome::Completed { .. })) {
                 // Denied (credential path, session deny, evaluator) or the ACL
                 // failed to apply: surface the command's own failure.
@@ -1818,7 +1809,7 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
         }
     };
 
-    // Drop the daemon's grant-read capabilities (CAP_FOWNER / CAP_DAC_READ_SEARCH)
+    // Drop the daemon's read-grant capabilities (CAP_FOWNER / CAP_DAC_READ_SEARCH)
     // from the brokered child so they never survive execve into a caller-requested
     // command. Applies to both the default and --exec-as-caller models.
     #[cfg(unix)]

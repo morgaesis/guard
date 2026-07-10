@@ -1,11 +1,10 @@
 //! Client for the guard daemon's local socket / TCP endpoint. Used by the
 //! CLI (`guard run`, `guard secrets`, ...) and the MCP server to send
-//! execute, grant, and admin requests over the wire protocol defined in
-//! `server::wire`.
+//! execute and admin requests over the wire protocol defined in `server::wire`.
 
 use crate::server::{
     AdminRequest, AdminResponse, ExecuteRequest, ExecuteResponse, ExecuteStreamMessage,
-    GrantRequest, IncomingMessage, OutputStream, RevertSpec, SshHostKeyMode, VerbInvocation,
+    IncomingMessage, OutputStream, RevertSpec, SshHostKeyMode, VerbInvocation,
 };
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
@@ -261,48 +260,6 @@ impl Client {
             verb: self.verb.clone(),
             reevaluate: self.reevaluate,
             ssh_hostkey: self.ssh_hostkey,
-        }
-    }
-
-    /// Send a filesystem read-grant request (grant or revoke) and return the
-    /// server's `ExecuteResponse`. Routed as its own `IncomingMessage::Grant`
-    /// envelope, but evaluated server-side through the same policy pipeline as a
-    /// command; the daemon requires a local Unix socket peer.
-    pub async fn grant(&self, grant: GrantRequest) -> Result<ExecuteResponse> {
-        let envelope = IncomingMessage::Grant { grant };
-        let line = serde_json::to_string(&envelope)?;
-
-        if let Some(ref socket_path) = self.socket_path {
-            let stream = connect_local(socket_path).await?;
-            let (reader, writer) = tokio::io::split(stream);
-            let mut writer = tokio::io::BufWriter::new(writer);
-            writer.write_all(line.as_bytes()).await?;
-            writer.write_all(b"\n").await?;
-            writer.flush().await?;
-            let mut lines = BufReader::new(reader).lines();
-            let response_line = lines
-                .next_line()
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("server closed connection without response"))?;
-            serde_json::from_str(&response_line).context("invalid server response")
-        } else if let Some(port) = self.tcp_port {
-            let addr = format!("127.0.0.1:{}", port);
-            let stream = tokio::net::TcpStream::connect(&addr)
-                .await
-                .context("failed to connect to guard server")?;
-            let (reader, writer) = stream.into_split();
-            let mut writer = tokio::io::BufWriter::new(writer);
-            writer.write_all(line.as_bytes()).await?;
-            writer.write_all(b"\n").await?;
-            writer.flush().await?;
-            let mut lines = BufReader::new(reader).lines();
-            let response_line = lines
-                .next_line()
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("server closed connection without response"))?;
-            serde_json::from_str(&response_line).context("invalid server response")
-        } else {
-            anyhow::bail!("no socket path or TCP port configured");
         }
     }
 

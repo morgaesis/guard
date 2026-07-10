@@ -30,7 +30,6 @@ use tokio::sync::RwLock;
 use super::admin::handle_admin_request;
 use super::execute::{execute_command, execute_command_streaming};
 use super::gate_runtime::{gating_sweeper, now_unix, DaemonGateSink, API_PROXY_SENTINEL_BINARY};
-use super::grants::handle_grant_request;
 #[cfg(unix)]
 use super::grants::{delete_read_grant_row, revoke_read_grant_acls};
 use super::wire::{
@@ -826,15 +825,6 @@ where
                 writer.write_all(b"\n").await?;
                 continue;
             }
-            IncomingMessage::Grant { grant } => {
-                let result = handle_grant_request(config, &caller, grant).await;
-                let resp = result.into_response();
-                writer
-                    .write_all(serde_json::to_string(&resp)?.as_bytes())
-                    .await?;
-                writer.write_all(b"\n").await?;
-                continue;
-            }
             IncomingMessage::Execute(req) => *req,
         };
 
@@ -980,30 +970,6 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
                     }
                 };
                 let resp = handle_admin_request(config, &caller, admin).await;
-                writer
-                    .write_all(serde_json::to_string(&resp)?.as_bytes())
-                    .await?;
-                writer.write_all(b"\n").await?;
-                continue;
-            }
-            IncomingMessage::Grant { grant } => {
-                // Read grants apply a POSIX ACL for a kernel-verified local uid;
-                // a bearer-token TCP caller carries no such identity, so it can
-                // never be the grant principal. Refuse rather than guess.
-                let reason = format!(
-                    "read grants require a local Unix socket caller: '{}' cannot be requested over TCP",
-                    grant.path()
-                );
-                let resp = ExecuteResponse {
-                    allowed: false,
-                    reason,
-                    exit_code: None,
-                    stdout: None,
-                    stderr: None,
-                    status: None,
-                    handle: None,
-                    coverage: None,
-                };
                 writer
                     .write_all(serde_json::to_string(&resp)?.as_bytes())
                     .await?;

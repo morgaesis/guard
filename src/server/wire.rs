@@ -218,38 +218,6 @@ pub struct VerbInvocation {
     pub params: std::collections::BTreeMap<String, String>,
 }
 
-/// A filesystem read-grant request. Routed through the same policy pipeline as a
-/// brokered command (static credential deny-list, then session allow/deny globs,
-/// then the LLM evaluator), never through an admin/operator side channel, so a
-/// session-token holder can request one without per-grant operator involvement.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "action", rename_all = "snake_case")]
-pub enum GrantRequest {
-    /// Grant guard's brokering identity a time-boxed read grant on `path`.
-    Read {
-        path: String,
-        ttl_secs: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        session_token: Option<String>,
-        #[serde(default)]
-        reevaluate: bool,
-    },
-    /// Revoke an active read grant on `path` early (de-escalation; not gated).
-    Revoke {
-        path: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        session_token: Option<String>,
-    },
-}
-
-impl GrantRequest {
-    pub(super) fn path(&self) -> &str {
-        match self {
-            Self::Read { path, .. } | Self::Revoke { path, .. } => path,
-        }
-    }
-}
-
 /// Resolved verb context threaded into gate routing.
 #[derive(Debug, Clone)]
 pub(super) struct VerbContext {
@@ -741,9 +709,6 @@ pub(crate) enum IncomingMessage {
         admin: AdminRequest,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         admin_token: Option<String>,
-    },
-    Grant {
-        grant: GrantRequest,
     },
     Execute(Box<ExecuteRequest>),
 }

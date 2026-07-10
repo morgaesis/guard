@@ -2,13 +2,13 @@
 use crate::server::execute::{exec_with_read_grant_retry, permission_denied_path};
 #[cfg(unix)]
 use crate::server::gate_runtime::now_unix;
-use crate::server::grants::handle_grant_request;
+use crate::server::grants::handle_grant_read;
 #[cfg(unix)]
 use crate::server::grants::{
     apply_read_grant, apply_read_grant_entries, finish_read_grant_revert,
-    getfacl_user_has_traverse, handle_grant_revoke, plan_read_grant, revoke_read_grant_acls,
+    getfacl_user_has_traverse, plan_read_grant, revoke_read_grant_acls,
 };
-use crate::server::wire::{CallerIdentity, GrantRequest};
+use crate::server::wire::CallerIdentity;
 #[cfg(unix)]
 use crate::server::wire::{ExecOutcome, ExecuteRequest};
 #[cfg(unix)]
@@ -31,17 +31,7 @@ use super::make_test_config;
 async fn grant_read_is_denied_on_non_unix_platform() {
     let (cfg, _buf) = make_test_config();
     let caller = CallerIdentity::Unix { uid: 1000 };
-    let result = handle_grant_request(
-        &cfg,
-        &caller,
-        GrantRequest::Read {
-            path: "/home/op/values.yaml".to_string(),
-            ttl_secs: 300,
-            session_token: None,
-            reevaluate: false,
-        },
-    )
-    .await;
+    let result = handle_grant_read(&cfg, &caller, "/home/op/values.yaml".to_string(), None).await;
     assert!(!result.policy_allowed());
     assert!(
         result
@@ -107,17 +97,7 @@ async fn grant_read_deny_list_short_circuits_before_evaluator() {
     let caller = CallerIdentity::Unix {
         uid: unsafe { libc::geteuid() },
     };
-    let result = handle_grant_request(
-        &cfg,
-        &caller,
-        GrantRequest::Read {
-            path: vault.display().to_string(),
-            ttl_secs: 300,
-            session_token: None,
-            reevaluate: false,
-        },
-    )
-    .await;
+    let result = handle_grant_read(&cfg, &caller, vault.display().to_string(), None).await;
     assert!(!result.policy_allowed());
     assert!(
         result.policy_reason().contains("credential material"),
@@ -138,17 +118,7 @@ async fn grant_read_denies_kubeconfig() {
     let caller = CallerIdentity::Unix {
         uid: unsafe { libc::geteuid() },
     };
-    let result = handle_grant_request(
-        &cfg,
-        &caller,
-        GrantRequest::Read {
-            path: config_file.display().to_string(),
-            ttl_secs: 300,
-            session_token: None,
-            reevaluate: false,
-        },
-    )
-    .await;
+    let result = handle_grant_read(&cfg, &caller, config_file.display().to_string(), None).await;
     assert!(!result.policy_allowed());
     assert!(
         result.policy_reason().contains("kube-proxy"),
@@ -159,12 +129,9 @@ async fn grant_read_denies_kubeconfig() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn grant_revoke_is_not_scoped_to_the_requesting_caller() {
-    // Revocation is intentionally an any-caller operation: a grant created
-    // under session A can be revoked by a caller presenting session B's token
-    // (or none at all), because revoking only ever removes access. This
-    // proves that documented design (see the comment at handle_grant_revoke),
-    // not an oversight in the unused `_session_token` parameter.
+async fn read_grant_revert_marks_seeded_grant_revoked() {
+    // The kept revocation path operates on the active registry entry and only
+    // removes access. It does not depend on a caller token or grant RPC.
     let (cfg, _buf) = make_test_config();
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("values.yaml");
@@ -174,9 +141,8 @@ async fn grant_revoke_is_not_scoped_to_the_requesting_caller() {
         .display()
         .to_string();
 
-    // Session A seeds an active grant. Empty ACL entries keep revocation free
-    // of any real setfacl call (nothing to remove), so the test does not
-    // depend on ACL tooling being installed.
+    // Empty ACL entries keep revocation free of any real setfacl call, so the
+    // test does not depend on ACL tooling being installed.
     let now = now_unix();
     cfg.read_grants.write().await.insert(ReadGrant {
         handle: "hA".to_string(),
@@ -192,27 +158,18 @@ async fn grant_revoke_is_not_scoped_to_the_requesting_caller() {
         revert_detail: None,
     });
 
-    // Session B (a different token) revokes by path alone.
-    let caller_b = CallerIdentity::Unix {
-        uid: unsafe { libc::geteuid() },
-    };
-    let result = handle_grant_revoke(
-        &cfg,
-        &caller_b,
-        target.display().to_string(),
-        Some("session-B".to_string()),
-    )
-    .await;
+    let claimed = cfg
+        .read_grants
+        .write()
+        .await
+        .begin_revert(&key)
+        .expect("active grant should be claimable for revert");
+    finish_read_grant_revert(&cfg, &claimed, "test").await;
 
-    assert!(
-        result.policy_allowed(),
-        "any caller may revoke; got: {}",
-        result.policy_reason()
-    );
     assert_eq!(
         cfg.read_grants.read().await.get(&key).unwrap().status,
         ReadGrantStatus::Revoked,
-        "the grant session A created must be revoked by session B"
+        "the active grant must be marked revoked"
     );
 }
 
@@ -294,8 +251,7 @@ async fn read_grant_retry_returns_original_failure_when_grant_denied() {
 
 /// The full transparent path: a command fails naming a readable-policy
 /// file, the read-grant pipeline (session-allowed here) applies a TTL ACL,
-/// and the command is retried and succeeds. The agent never issued
-/// `grant-read`.
+/// and the command is retried and succeeds.
 #[cfg(unix)]
 #[tokio::test]
 async fn read_grant_retry_grants_and_reruns_after_permission_denied() {
@@ -329,7 +285,7 @@ async fn read_grant_retry_grants_and_reruns_after_permission_denied() {
     cfg.sessions.write().await.grant(
         "sess-retry".to_string(),
         SessionGrant {
-            allow: vec!["grant-read*".to_string()],
+            allow: vec!["auto-read-grant*".to_string()],
             deny: Vec::new(),
             allow_exact: Vec::new(),
             deny_exact: Vec::new(),
@@ -397,7 +353,13 @@ async fn read_grant_retry_grants_and_reruns_after_permission_denied() {
     assert_eq!(grant.granting_session.as_deref(), Some("sess-retry"));
 
     // Cleanup: revoke so no ACL outlives the test.
-    let _ = handle_grant_revoke(&cfg, &caller, canonical, None).await;
+    let cleanup = cfg
+        .read_grants
+        .write()
+        .await
+        .begin_revert(&canonical)
+        .expect("transparent grant should be claimable for cleanup");
+    finish_read_grant_revert(&cfg, &cleanup, "test").await;
 }
 
 /// Build a home/pub_dir(0755)/priv_dir(0700)/values.yaml tree and return the

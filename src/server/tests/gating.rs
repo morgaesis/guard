@@ -7,7 +7,7 @@ use crate::server::gate_runtime::{
 use crate::server::gate_runtime::{arm_containment, finish_revert, DaemonGateSink};
 use crate::server::wire::{
     AdminRequest, AdminResponse, CallerIdentity, ExecOutcome, ExecuteRequest, ExecuteResult,
-    GrantRequest, IncomingMessage, RevertSpec,
+    RevertSpec,
 };
 use crate::server::{ServerConfig, APPROVAL_TTL_SECS};
 use guard::gating::approval::{Approval, ApprovalSnapshot, ApprovalStatus};
@@ -1336,26 +1336,4 @@ fn provisional_result_carries_contain_coverage() {
         }
         other => panic!("expected Provisional, got {:?}", other),
     }
-}
-
-// ---- Filesystem read-grant tests ----------------------------------------
-
-#[test]
-fn grant_envelope_routes_to_its_own_variant() {
-    let grant_json = serde_json::to_string(&IncomingMessage::Grant {
-        grant: GrantRequest::Read {
-            path: "/home/op/values.yaml".to_string(),
-            ttl_secs: 300,
-            session_token: None,
-            reevaluate: false,
-        },
-    })
-    .unwrap();
-    let parsed: IncomingMessage = serde_json::from_str(&grant_json).unwrap();
-    assert!(matches!(parsed, IncomingMessage::Grant { .. }));
-
-    // A bare execute request still routes to Execute, not Grant, under the
-    // untagged enum.
-    let exec: IncomingMessage = serde_json::from_str(r#"{"binary":"ls","args":[]}"#).unwrap();
-    assert!(matches!(exec, IncomingMessage::Execute(_)));
 }
