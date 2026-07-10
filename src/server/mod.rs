@@ -26,10 +26,11 @@ use crate::session_store::SessionStore;
 use crate::shim::ShimGenerator;
 use guard::gating::approval::{Approval, ApprovalRegistry, ApprovalSnapshot, ApprovalStatus};
 use guard::gating::provisional::{Provisional, ProvisionalRegistry, ProvisionalStatus};
+#[cfg(unix)]
 use guard::gating::read_grant::{
-    ancestor_dirs_within, clamp_ttl, credential_path_deny_reason, AclEntry, GrantReadRegistry,
-    ReadGrant, ReadGrantStatus,
+    ancestor_dirs_within, clamp_ttl, credential_path_deny_reason, AclEntry, ReadGrantStatus,
 };
+use guard::gating::read_grant::{GrantReadRegistry, ReadGrant};
 use guard::gating::verb::VerbCatalog;
 use guard::gating::{decide_gate, Coverage, GateMode, GateOutcome, Reversibility};
 use guard::policy::PolicyMode;
@@ -47,8 +48,6 @@ use std::collections::HashMap;
 use std::ffi::CString;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -63,8 +62,6 @@ use tokio::sync::{mpsc, RwLock};
 #[cfg(unix)]
 use uzers::os::unix::UserExt;
 
-const DEFAULT_SOCKET_PATH: &str = "/var/run/guard/guard.sock";
-const DEFAULT_TCP_PORT: u16 = 8123;
 const MAX_GUARD_DEPTH: u32 = 5;
 const MAX_REQUEST_BYTES: usize = 1_048_576; // 1MB
 const MAX_OUTPUT_BYTES: usize = 10_485_760; // 10MB
@@ -111,11 +108,14 @@ mod protocol;
 mod tests;
 mod transport;
 
-pub use admin::*;
+// These submodules expose nothing beyond the server module, so a `pub` glob
+// re-export would re-export nothing; siblings still see them via `use super::*`.
+use admin::*;
+use execute::*;
+use gate_runtime::*;
+use grants::*;
+
 pub use client::*;
-pub use execute::*;
-pub use gate_runtime::*;
-pub use grants::*;
 pub use protocol::*;
 pub use transport::*;
 
@@ -128,7 +128,11 @@ pub struct ServerConfig {
     pub redact: bool,
     pub auth_token: Option<String>,
     pub admin_token: Option<String>,
+    /// Unix-socket transport option; carried but never read on Windows.
+    #[cfg_attr(windows, allow(dead_code))]
     pub socket_group: Option<String>,
+    /// Unix-socket peer-UID allowlist; carried but never read on Windows.
+    #[cfg_attr(windows, allow(dead_code))]
     pub allowed_uids: Option<Vec<u32>>,
     pub shim_dir: Option<PathBuf>,
     pub dry_run: bool,
@@ -267,6 +271,7 @@ impl ServerConfig {
         }
     }
 
+    #[cfg(unix)]
     fn validate_uid(&self, uid: u32) -> Result<()> {
         if let Some(ref allowed) = self.allowed_uids {
             // The daemon's own UID is always permitted to connect: it
@@ -467,6 +472,8 @@ fn child_env_allowlist() -> &'static [&'static str] {
     &["PATH"]
 }
 
+// Shim-dir PATH prepending is a Unix construct (see the exec path in execute.rs).
+#[cfg(unix)]
 fn path_with_shim_dir(shim_dir: &std::path::Path) -> Option<std::ffi::OsString> {
     let mut paths = Vec::new();
     paths.push(shim_dir.to_path_buf());

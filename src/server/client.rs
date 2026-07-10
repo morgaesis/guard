@@ -166,11 +166,6 @@ impl Client {
         }
     }
 
-    pub async fn execute(&self, binary: &str, args: &[String]) -> Result<ExecuteResponse> {
-        self.execute_with_injections(binary, args, HashMap::new(), HashMap::new())
-            .await
-    }
-
     pub async fn execute_with_injections(
         &self,
         binary: &str,
@@ -194,25 +189,6 @@ impl Client {
         } else {
             anyhow::bail!("no socket path or TCP port configured");
         }
-    }
-
-    pub async fn execute_streaming<F>(
-        &self,
-        binary: &str,
-        args: &[String],
-        mut on_output: F,
-    ) -> Result<ExecuteResponse>
-    where
-        F: FnMut(OutputStream, &str),
-    {
-        self.execute_streaming_with_injections(
-            binary,
-            args,
-            HashMap::new(),
-            HashMap::new(),
-            on_output,
-        )
-        .await
     }
 
     pub async fn execute_streaming_with_injections<F>(

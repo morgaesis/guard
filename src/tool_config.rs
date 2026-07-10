@@ -1,9 +1,9 @@
 use crate::secrets::SecretManager;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use guard::principal::PrincipalKey;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::SystemTime;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -22,12 +22,6 @@ pub struct ToolConfig {
     pub secrets: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub users: HashMap<String, UserToolOverride>,
-}
-
-impl ToolConfig {
-    pub fn is_empty(&self) -> bool {
-        self.env.is_empty() && self.secrets.is_empty() && self.users.is_empty()
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -236,7 +230,6 @@ impl ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
     use tempfile::NamedTempFile;
 
     #[test]

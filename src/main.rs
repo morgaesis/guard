@@ -1,6 +1,5 @@
 //! guard - LLM-evaluated command gate for AI agents
 //!
-#![allow(unused)]
 
 mod cli_client;
 mod cli_secrets;

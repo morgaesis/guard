@@ -720,6 +720,8 @@ pub(crate) async fn run_mcp(subcommand: McpCommands) -> Result<()> {
 /// `guard server start` binds (~/.guard/guard.sock).
 #[cfg(unix)]
 const DEFAULT_CLIENT_SOCKET: &str = "/run/guard/guard.sock";
+/// Default endpoint on platforms without a Unix-socket default (loopback TCP).
+#[cfg(not(unix))]
 const DEFAULT_CLIENT_TCP_PORT: u16 = 8123;
 
 /// Where the resolved endpoint came from. Decides the remediation hint

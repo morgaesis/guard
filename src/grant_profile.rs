@@ -26,8 +26,10 @@ use std::path::Path;
 #[derive(Debug, Clone, Deserialize)]
 pub struct GrantProfile {
     pub name: String,
-    /// Operator-facing note describing what the profile is for. Metadata only.
+    /// Operator-facing note describing what the profile is for. Metadata only:
+    /// part of the operator YAML schema, never read by the daemon.
     #[serde(default)]
+    #[allow(dead_code)]
     pub description: String,
     #[serde(default)]
     pub allow: Vec<String>,
@@ -57,10 +59,6 @@ pub struct ProfileCatalog {
 impl ProfileCatalog {
     pub fn empty() -> Self {
         Self::default()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.profiles.is_empty()
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -158,9 +156,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_catalog_is_empty() {
+    fn empty_catalog_has_no_names() {
         assert!(ProfileCatalog::from_yaml("profiles: []\n")
             .expect("valid")
+            .names()
             .is_empty());
     }
 }

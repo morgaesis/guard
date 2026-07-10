@@ -2076,7 +2076,9 @@ async fn profile_grant_still_deny_short_circuits_and_falls_through() {
 // ProvisionalStatus, Coverage, GateMode, Reversibility) and AsyncWrite are
 // already in scope via `use super::*;`.
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::pin::Pin;
+#[cfg(unix)]
 use std::task::{Context, Poll};
 
 /// Build a containment-gating config: gate on, a distinct operator
@@ -2120,10 +2122,12 @@ fn contain_request(binary: &str, args: &[&str], revert: RevertSpec) -> ExecuteRe
 /// write, simulating a client stream that drops the instant the daemon
 /// begins forwarding the child's output. The forward child still spawns and
 /// runs (so the mutation may have applied); only streaming its output fails.
+#[cfg(unix)]
 struct FlakyWriter {
     remaining_ok: usize,
 }
 
+#[cfg(unix)]
 impl FlakyWriter {
     fn failing_after(ok_writes: usize) -> Self {
         Self {
@@ -2132,6 +2136,7 @@ impl FlakyWriter {
     }
 }
 
+#[cfg(unix)]
 impl AsyncWrite for FlakyWriter {
     fn poll_write(
         mut self: Pin<&mut Self>,

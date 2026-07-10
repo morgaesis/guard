@@ -22,8 +22,6 @@ use std::collections::HashMap;
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -127,27 +125,6 @@ impl PassBackend {
         Ok(Some(
             String::from_utf8_lossy(&output.stdout).trim().to_string(),
         ))
-    }
-
-    async fn run_pass<I, S>(&self, args: I) -> Result<()>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<OsStr>,
-    {
-        let mut cmd = AsyncCommand::new("pass");
-        cmd.args(args);
-        if let Some(store_dir) = self.store_dir() {
-            cmd.env("PASSWORD_STORE_DIR", store_dir);
-        }
-
-        let output = cmd.output().await?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("pass command failed: {}", stderr.trim());
-        }
-
-        Ok(())
     }
 }
 
@@ -533,13 +510,6 @@ impl LocalBackend {
             path: guard_dir.join(SECRETS_FILE),
             gpg_recipient: None,
         })
-    }
-
-    pub fn with_path(path: PathBuf) -> Self {
-        Self {
-            path,
-            gpg_recipient: None,
-        }
     }
 
     pub fn with_gpg_recipient(mut self, recipient: String) -> Self {
@@ -1294,74 +1264,6 @@ impl SecretBackend for InfisicalBackend {
 }
 
 // ---------------------------------------------------------------------------
-// SecretFd
-// ---------------------------------------------------------------------------
-
-/// File-descriptor wrapper for secret injection. The secret is written to a
-/// temporary file readable only by the owner, and cleaned up on drop.
-///
-/// Owner-only access is enforced differently per platform:
-/// - Unix: an explicit `0600` mode on the file.
-/// - Windows: the temp dir is created under the daemon service account's
-///   `%TEMP%`, which inherits that account's owner-scoped default ACL; no
-///   other account (including the unrelated agent account) can read it.
-#[derive(Debug)]
-pub struct SecretFd {
-    pub path: PathBuf,
-    temp_dir: tempfile::TempDir,
-}
-
-impl SecretFd {
-    fn new(secret: &str) -> Result<Self> {
-        #[cfg(unix)]
-        let temp_dir = tempfile::TempDir::new_in("/tmp")?;
-        #[cfg(windows)]
-        let temp_dir = tempfile::TempDir::new()?;
-        let path = temp_dir.path().join("secret");
-
-        // On Unix, create the file with mode 0600 from the `open()` call
-        // itself (O_CREAT|O_EXCL with the mode argument), rather than
-        // writing the file with the process's default (umask-determined)
-        // permissions and tightening them with a separate set_permissions
-        // call afterward: that write-then-chmod sequence leaves a window
-        // where the file briefly has broader permissions than intended. A
-        // mode of 0600 has no group/other bits for umask to need to strip,
-        // so passing it directly to open() is already correct regardless of
-        // umask, with no separate permissions call needed.
-        #[cfg(unix)]
-        {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&path)?;
-            file.write_all(secret.as_bytes())?;
-        }
-        // On Windows the file inherits the owner-scoped default ACL of the
-        // service account's per-user temp directory (see the type-level
-        // docs), so a plain write is sufficient.
-        #[cfg(windows)]
-        fs::write(&path, secret)?;
-
-        Ok(Self { path, temp_dir })
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for SecretFd {
-    fn drop(&mut self) {
-        if self.path.exists() {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // SecretManager
 // ---------------------------------------------------------------------------
 
@@ -1401,6 +1303,7 @@ impl SecretManager {
         }
     }
 
+    #[cfg(test)]
     pub fn with_backend<B: SecretBackend + 'static>(backend: B) -> Self {
         Self::new(Arc::new(backend))
     }
@@ -1479,20 +1382,6 @@ impl SecretManager {
             key: key.to_string(),
         });
         Ok(())
-    }
-
-    pub async fn inject_fd(&self, principal: &PrincipalKey, key: &str) -> Result<SecretFd> {
-        let secret = match self.get(principal, key).await? {
-            Some(s) => s,
-            None => anyhow::bail!("secret not found: {}", key),
-        };
-
-        SecretFd::new(&secret)
-    }
-
-    pub async fn clear_cache(&self) {
-        let mut cache = self.cache.write().await;
-        cache.clear();
     }
 }
 
@@ -1584,20 +1473,6 @@ pub fn detect_backend() -> BackendType {
     }
 
     BackendType::Env
-}
-
-/// Resolve a UID to a user name via nsswitch; returns None when the UID
-/// has no entry. Used only for display (audit lines, `secrets list`).
-#[cfg(unix)]
-pub fn uid_to_name(uid: u32) -> Option<String> {
-    uzers::get_user_by_uid(uid).and_then(|u| u.name().to_str().map(|s| s.to_string()))
-}
-
-/// No passwd database on Windows; secret namespaces are keyed by SID string and
-/// this display-only helper has no numeric-UID source.
-#[cfg(windows)]
-pub fn uid_to_name(_uid: u32) -> Option<String> {
-    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1761,7 +1636,7 @@ mod tests {
         // Regression test: a get() in flight when a delete() for the same key
         // lands and fully completes must not insert the (now stale) value
         // into the cache afterward -- otherwise every later get() returns the
-        // deleted secret out of cache until clear_cache() or a restart.
+        // deleted secret out of cache until a restart.
         let backend = Arc::new(SlowGetBackend::new());
         backend.inner.store.lock().unwrap().insert(
             (p(1000), "api_key".to_string()),
@@ -1843,26 +1718,6 @@ mod tests {
         };
         assert_eq!(cache.get(&alice_ck).map(String::as_str), Some("alice"));
         assert_eq!(cache.get(&bob_ck).map(String::as_str), Some("bob"));
-    }
-
-    #[tokio::test]
-    async fn secret_fd_creation() {
-        let secret = "test_secret_content";
-        let fd = SecretFd::new(secret).unwrap();
-
-        assert!(fd.path.exists());
-        let content = fs::read_to_string(fd.path()).unwrap();
-        assert_eq!(content, secret);
-
-        // 0600 is a Unix permission semantic; on Windows the temp dir's default
-        // ACL provides owner-only access and there is no mode bit to assert.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let metadata = fs::metadata(fd.path()).unwrap();
-            let mode = metadata.permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600);
-        }
     }
 
     #[tokio::test]

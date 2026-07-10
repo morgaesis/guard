@@ -15,8 +15,7 @@
 //! use guard::shim::ShimGenerator;
 //!
 //! let gen = ShimGenerator::new("/usr/local/bin/guard", "/home/user/.guard/shims");
-//! gen.generate_all()?;
-//! println!("{}", gen.path_instruction());
+//! gen.generate(&["ssh", "scp", "curl"])?;
 //! ```
 
 use anyhow::{bail, Context, Result};
@@ -24,9 +23,9 @@ use std::fs::{self, File};
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-/// Default tools that get shims generated for them.
+/// Well-known shim-managed tools; `remove_all` clears the shims for these.
 pub const DEFAULT_TOOLS: &[(&str, &str)] = &[
     // SSH and file transfer
     ("ssh", "Secure Shell client"),
@@ -42,22 +41,6 @@ pub const DEFAULT_TOOLS: &[(&str, &str)] = &[
     // VCS
     ("git", "Git version control (for add/commit scanning)"),
 ];
-
-/// The set of tools managed by shims.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShimTool {
-    /// The tool name (e.g., "ssh", "curl")
-    pub name: &'static str,
-    /// Human-readable description
-    pub description: &'static str,
-}
-
-impl ShimTool {
-    /// Create a new tool entry.
-    pub const fn new(name: &'static str, description: &'static str) -> Self {
-        Self { name, description }
-    }
-}
 
 /// Shim generator for creating tool wrapper scripts.
 ///
@@ -102,41 +85,10 @@ impl ShimGenerator {
         }
     }
 
-    /// Create a new ShimGenerator with default paths.
-    ///
-    /// Uses `guard` from PATH and `~/.guard/shims` for the shim directory.
-    pub fn with_defaults() -> Result<Self> {
-        let guard_binary = find_guard_binary()?;
-        let shim_dir = default_shim_dir()?;
-
-        Ok(Self::new(guard_binary, shim_dir))
-    }
-
     /// Return the shim directory path.
+    #[cfg(test)]
     pub fn path(&self) -> PathBuf {
         self.shim_dir.clone()
-    }
-
-    /// Return a shell command to prepend the shim directory to PATH.
-    ///
-    /// # Example output
-    ///
-    /// ```text
-    /// export PATH=/home/user/.guard/shims:$PATH
-    /// ```
-    pub fn path_instruction(&self) -> String {
-        #[cfg(windows)]
-        {
-            format!(
-                "$env:Path = '{};' + $env:Path",
-                escape_for_powershell_single(self.shim_dir.to_string_lossy().as_ref())
-            )
-        }
-        #[cfg(not(windows))]
-        format!(
-            "export PATH={}:$PATH",
-            escape_path_for_shell(&self.shim_dir)
-        )
     }
 
     /// Generate a shim for a specific tool.
@@ -240,7 +192,7 @@ impl ShimGenerator {
     /// ```
     /// use guard::shim::ShimGenerator;
     ///
-    /// let gen = ShimGenerator::with_defaults().unwrap();
+    /// let gen = ShimGenerator::new("/usr/local/bin/guard", "/home/user/.guard/shims");
     /// gen.generate(&["ssh", "scp", "curl"])?;
     /// ```
     pub fn generate(&self, tools: &[&str]) -> Result<Vec<PathBuf>> {
@@ -257,14 +209,6 @@ impl ShimGenerator {
             self.shim_dir.display()
         );
         Ok(paths)
-    }
-
-    /// Generate shims for all default tools.
-    ///
-    /// See [`DEFAULT_TOOLS`] for the list of tools.
-    pub fn generate_all(&self) -> Result<Vec<PathBuf>> {
-        let tools: Vec<&str> = DEFAULT_TOOLS.iter().map(|(name, _)| *name).collect();
-        self.generate(&tools)
     }
 
     /// Remove the shim for a specific tool.
@@ -353,16 +297,6 @@ impl ShimGenerator {
         Ok(installed)
     }
 
-    /// Get information about all available tools.
-    ///
-    /// Returns a slice of tool descriptors for all tools that can have shims.
-    pub fn available_tools() -> Vec<ShimTool> {
-        DEFAULT_TOOLS
-            .iter()
-            .map(|(name, desc)| ShimTool::new(name, desc))
-            .collect()
-    }
-
     /// Render the shim script content for a tool.
     fn render_shim(&self, tool: &str) -> String {
         #[cfg(windows)]
@@ -449,48 +383,6 @@ impl ShimGenerator {
     }
 }
 
-/// Find the guard binary in PATH.
-fn find_guard_binary() -> Result<PathBuf> {
-    // First check if there's a configured path
-    if let Ok(path) = std::env::var("GUARD_BIN") {
-        let path = PathBuf::from(&path);
-        if path.exists() {
-            return Ok(path);
-        }
-    }
-
-    // Try to find 'guard' in PATH
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            for name in guard_binary_names() {
-                let candidate = dir.join(name);
-                if candidate.exists() {
-                    return Ok(candidate);
-                }
-            }
-        }
-    }
-
-    bail!("could not find 'guard' binary in PATH. Set GUARD_BIN or ensure guard is in PATH.")
-}
-
-/// Get the default shim directory path.
-fn default_shim_dir() -> Result<PathBuf> {
-    let home = dirs::home_dir().context("could not determine home directory")?;
-
-    Ok(home.join(".guard").join("shims"))
-}
-
-#[cfg(windows)]
-fn guard_binary_names() -> &'static [&'static str] {
-    &["guard.exe", "guard.cmd", "guard"]
-}
-
-#[cfg(not(windows))]
-fn guard_binary_names() -> &'static [&'static str] {
-    &["guard"]
-}
-
 #[cfg(windows)]
 fn shim_file_name(tool: &str) -> String {
     format!("{tool}.cmd")
@@ -526,22 +418,13 @@ fn is_valid_tool_name(name: &str) -> bool {
 /// Escape a path for safe use in a shell script.
 ///
 /// Wraps the path in single quotes, escaping any single quotes within.
+/// Windows shims are cmd/PowerShell forwarders and do no POSIX-shell quoting.
+#[cfg(not(windows))]
 fn escape_for_shell(s: &str) -> String {
     // Replace ' with '\'' (end quote, escaped quote, start new quote)
     // Then wrap in single quotes
     let escaped = s.replace('\'', "'\\''");
     format!("'{}'", escaped)
-}
-
-/// Escape a path for use in double-quoted shell strings.
-///
-/// For use in contexts like: export PATH="...":$PATH
-fn escape_path_for_shell(path: &Path) -> String {
-    escape_for_shell(path.to_string_lossy().as_ref())
-}
-
-fn escape_for_powershell_single(s: &str) -> String {
-    s.replace('\'', "''")
 }
 
 #[cfg(windows)]
@@ -623,6 +506,7 @@ mod tests {
         assert!(!is_valid_tool_name("../../../etc/passwd")); // path traversal
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn test_escape_for_shell() {
         // Simple case - no escaping needed
@@ -642,12 +526,6 @@ mod tests {
             escape_for_shell("/path/with'dquote"),
             "'/path/with'\\''dquote'"
         );
-    }
-
-    #[test]
-    fn test_escape_path_for_shell() {
-        let path = PathBuf::from("/home/user/.guard/shims");
-        assert_eq!(escape_path_for_shell(&path), "'/home/user/.guard/shims'");
     }
 
     // -------------------------------------------------------------------------
@@ -676,23 +554,6 @@ mod tests {
     fn test_shim_generator_new() {
         let gen = ShimGenerator::new("/usr/bin/guard", "/home/user/shims");
         assert_eq!(gen.path(), PathBuf::from("/home/user/shims"));
-    }
-
-    #[test]
-    fn test_shim_generator_path_instruction() {
-        let gen = ShimGenerator::new("/usr/bin/guard", "/home/user/.guard/shims");
-        let instruction = gen.path_instruction();
-        #[cfg(not(windows))]
-        {
-            assert!(instruction.starts_with("export PATH="));
-            assert!(instruction.contains("/home/user/.guard/shims"));
-            assert!(instruction.ends_with(":$PATH"));
-        }
-        #[cfg(windows)]
-        {
-            assert!(instruction.starts_with("$env:Path = "));
-            assert!(instruction.contains(".guard"));
-        }
     }
 
     #[test]
@@ -757,24 +618,6 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_all_tools() -> Result<()> {
-        let (_temp, gen) = temp_shim_dir();
-
-        let paths = gen.generate_all()?;
-        assert_eq!(paths.len(), DEFAULT_TOOLS.len());
-
-        for (name, _) in DEFAULT_TOOLS {
-            assert!(
-                expected_shim_path(&gen, name).exists(),
-                "missing shim for {}",
-                name
-            );
-        }
-
-        Ok(())
-    }
-
-    #[test]
     fn test_generate_invalid_tool_name() {
         let (_temp, gen) = temp_shim_dir();
 
@@ -832,7 +675,8 @@ mod tests {
     fn test_remove_all() -> Result<()> {
         let (_temp, gen) = temp_shim_dir();
 
-        gen.generate_all()?;
+        let tools: Vec<&str> = DEFAULT_TOOLS.iter().map(|(name, _)| *name).collect();
+        gen.generate(&tools)?;
         gen.remove_all()?;
 
         for (name, _) in DEFAULT_TOOLS {
@@ -930,28 +774,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_shim_tool_new() {
-        let tool = ShimTool::new("ssh", "Secure Shell");
-        assert_eq!(tool.name, "ssh");
-        assert_eq!(tool.description, "Secure Shell");
-    }
-
-    #[test]
-    fn test_available_tools() {
-        let tools = ShimGenerator::available_tools();
-
-        // Should have all default tools
-        assert!(!tools.is_empty());
-        assert_eq!(tools.len(), DEFAULT_TOOLS.len());
-
-        // Check that expected tools are present
-        let tool_names: Vec<_> = tools.iter().map(|t| t.name).collect();
-        assert!(tool_names.contains(&"ssh"));
-        assert!(tool_names.contains(&"curl"));
-        assert!(tool_names.contains(&"git"));
-    }
-
     // -------------------------------------------------------------------------
     // Tests for shell escaping edge cases
     // -------------------------------------------------------------------------
@@ -972,18 +794,5 @@ mod tests {
             assert!(content.contains("__guard_fixed_3=ssh"));
             assert!(!content.contains("%*"));
         }
-    }
-
-    #[test]
-    fn test_path_instruction_escapes_path() {
-        let gen = ShimGenerator::new("/usr/bin/guard", "/path/with' spaces/shims");
-        let instruction = gen.path_instruction();
-
-        // Should properly escape the path with spaces
-        assert!(instruction.contains("'"));
-        #[cfg(not(windows))]
-        assert!(instruction.contains("export PATH="));
-        #[cfg(windows)]
-        assert!(instruction.contains("$env:Path"));
     }
 }

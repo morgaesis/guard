@@ -3,6 +3,10 @@ use super::*;
 /// Identifies the caller for per-user secret injection.
 #[derive(Debug, Clone)]
 pub enum CallerIdentity {
+    /// Local caller over a Unix domain socket, identified by peer UID.
+    /// Constructed only by the Unix transport; on Windows it exists for the
+    /// shared match arms (and tests) but is never built.
+    #[cfg_attr(windows, allow(dead_code))]
     Unix {
         uid: u32,
     },
@@ -234,14 +238,6 @@ impl GrantRequest {
     pub(super) fn path(&self) -> &str {
         match self {
             Self::Read { path, .. } | Self::Revoke { path, .. } => path,
-        }
-    }
-
-    fn session_token(&self) -> Option<&str> {
-        match self {
-            Self::Read { session_token, .. } | Self::Revoke { session_token, .. } => {
-                session_token.as_deref()
-            }
         }
     }
 }
@@ -978,6 +974,9 @@ impl ExecuteResult {
     }
 
     /// Reason for the policy decision (allow rationale or denial reason).
+    /// Production paths consume the reason via `into_response`; tests assert
+    /// on it directly.
+    #[cfg(test)]
     pub(super) fn policy_reason(&self) -> &str {
         match &self.policy {
             PolicyOutcome::Allowed { reason } | PolicyOutcome::Denied { reason } => reason,

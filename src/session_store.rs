@@ -61,10 +61,6 @@ impl SessionStore {
         Ok(())
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     fn open_sync(path: PathBuf, history_retention_secs: u64) -> Result<Self> {
         let store = Self {
             path,
@@ -568,6 +564,8 @@ impl SessionStore {
         .context("delete_read_grant task failed")?
     }
 
+    /// Read grants are a POSIX-ACL primitive; only the Unix startup path loads them.
+    #[cfg(unix)]
     pub async fn load_read_grants(&self) -> Result<Vec<ReadGrant>> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {

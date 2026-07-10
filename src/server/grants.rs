@@ -5,6 +5,7 @@ use super::*;
 /// grant request the same shape as `grant-read <path> --ttl <ttl>`.
 const GRANT_READ_LABEL: &str = "grant-read";
 
+#[cfg(unix)]
 fn grant_read_audit_args(path: &str, ttl: u64) -> Vec<String> {
     vec![path.to_string(), "--ttl".to_string(), ttl.to_string()]
 }
@@ -547,7 +548,7 @@ pub(super) async fn apply_read_grant_entries(
 }
 
 /// Test/convenience wrapper: plan then apply, returning the applied entries.
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 pub(super) async fn apply_read_grant(
     target: &Path,
     grantee_uid: u32,

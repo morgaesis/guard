@@ -1,7 +1,6 @@
 use super::*;
 
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct Server {
     config: ServerConfig,
 }
@@ -829,8 +828,9 @@ where
 }
 
 /// Emit POLICY and (optionally) EXEC_FAILED audit events for a single
-/// request. Keeps both handlers aligned so the format stays consistent
-/// whether the caller came in over UNIX or TCP.
+/// request, mirroring what the execute handlers emit inline. Test-only:
+/// the audit-format tests assert on both events through one entry point.
+#[cfg(test)]
 pub(super) fn emit_audit_events(
     config: &ServerConfig,
     caller: &CallerIdentity,
