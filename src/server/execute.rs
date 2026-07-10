@@ -69,20 +69,177 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
     stream_output: bool,
     stream_writer: &mut W,
 ) -> ExecuteResult {
-    let session_token = request.session_token.clone();
+    let mut phase = ExecPhase {
+        config,
+        caller,
+        stream_output,
+        stream_writer,
+        session_token: request.session_token.clone(),
+    };
 
-    // Resolve a verb invocation into a concrete command BEFORE any validation or
-    // evaluation. The rendered binary/args then pass through the same checks as a
-    // raw command; the verb's declared consequence class and rollback drive the
-    // gate. Verbs are operator-authored, so the catalog is hot-reloaded by mtime.
+    let verb_ctx = match resolve_verb_context(&mut phase, &mut request).await {
+        Ok(verb_ctx) => verb_ctx,
+        Err(result) => return result,
+    };
+
+    // Fold the requested ssh host-key mode into the command now that the verb
+    // (if any) has been rendered. From here on, request.args carries any
+    // injected `-o` options, so the policy decision, the evaluator, the audit
+    // record, and the spawned process all act on the same command.
+    request.apply_ssh_hostkey_options();
+
+    let (depth, command_line) = match validate_exec_request(&mut phase, &request).await {
+        Ok(validated) => validated,
+        Err(result) => return result,
+    };
+
+    request = match apply_session_rules(&mut phase, request, &command_line, depth).await {
+        Ok(request) => request,
+        Err(result) => return result,
+    };
+
+    if let Err(result) = enforce_binary_policy(&mut phase, &request, &command_line).await {
+        return result;
+    }
+
+    request = match try_static_fast_allow(&mut phase, request, &command_line, depth).await {
+        Ok(request) => request,
+        Err(result) => return result,
+    };
+
+    let session_prompt = resolve_session_prompt(config, &request).await;
+
+    request =
+        match try_trusted_verb_allow(&mut phase, request, &verb_ctx, &command_line, depth).await {
+            Ok(request) => request,
+            Err(result) => return result,
+        };
+
+    evaluate_and_route(
+        &mut phase,
+        request,
+        verb_ctx,
+        session_prompt,
+        command_line,
+        depth,
+    )
+    .await
+}
+
+/// Shared state threaded through the policy phases of one execute request.
+///
+/// A phase returning `Err(ExecuteResult)` means the request is finished
+/// (denied, failed, or already executed by a fast path) and the result must
+/// be returned to the caller as-is.
+struct ExecPhase<'a, W> {
+    config: &'a ServerConfig,
+    caller: &'a CallerIdentity,
+    stream_output: bool,
+    stream_writer: &'a mut W,
+    session_token: Option<String>,
+}
+
+/// Deny bookkeeping shared by the policy phases: audit the decision, notify a
+/// streaming client, record the interaction on the live session (when one is
+/// attached), and produce the denied result.
+async fn deny_and_record<W: AsyncWrite + Unpin>(
+    phase: &mut ExecPhase<'_, W>,
+    request: &ExecuteRequest,
+    command: String,
+    source: SessionDecisionSource,
+    risk: Option<i32>,
+    reason: String,
+) -> ExecuteResult {
+    phase
+        .config
+        .log_audit_policy(phase.caller, &request.binary, &request.args, false, &reason);
+    let _ = write_policy_decision(
+        phase.stream_output,
+        &mut *phase.stream_writer,
+        false,
+        &reason,
+    )
+    .await;
+    record_live_session_interaction(
+        phase.config,
+        phase.session_token.as_deref(),
+        SessionInteraction {
+            at_unix: 0,
+            command,
+            allowed: false,
+            source,
+            reason: reason.clone(),
+            risk,
+            exec_status: SessionExecStatus::NotAttempted,
+        },
+    )
+    .await;
+    ExecuteResult::denied(reason)
+}
+
+/// Allow bookkeeping shared by the gate-routed allow paths: route the
+/// approved command through the consequence gate, then record the interaction
+/// on the live session with the routed result's exec status.
+async fn route_allow_and_record<W: AsyncWrite + Unpin>(
+    phase: &mut ExecPhase<'_, W>,
+    request: ExecuteRequest,
+    inputs: GateInputs,
+    command: String,
+    source: SessionDecisionSource,
+    depth: u32,
+) -> ExecuteResult {
+    let reason = inputs.reason.clone();
+    let risk = inputs.risk;
+    let result = route_gated_allow(
+        request,
+        phase.config,
+        phase.caller,
+        inputs,
+        depth,
+        phase.stream_output,
+        &mut *phase.stream_writer,
+    )
+    .await;
+    record_live_session_interaction(
+        phase.config,
+        phase.session_token.as_deref(),
+        SessionInteraction {
+            at_unix: 0,
+            command,
+            allowed: true,
+            source,
+            reason,
+            risk,
+            exec_status: result.session_exec_status(),
+        },
+    )
+    .await;
+    result
+}
+
+/// Resolve a verb invocation into a concrete command BEFORE any validation or
+/// evaluation. The rendered binary/args then pass through the same checks as a
+/// raw command; the verb's declared consequence class and rollback drive the
+/// gate. Verbs are operator-authored, so the catalog is hot-reloaded by mtime.
+async fn resolve_verb_context<W: AsyncWrite + Unpin>(
+    phase: &mut ExecPhase<'_, W>,
+    request: &mut ExecuteRequest,
+) -> Result<Option<VerbContext>, ExecuteResult> {
+    let config = phase.config;
     let mut verb_ctx: Option<VerbContext> = None;
     if let Some(invocation) = request.verb.clone() {
         if !config.gate.is_on() {
             let reason =
                 "verbs require consequence gating (start the daemon with --gate consequence)"
                     .to_string();
-            let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
-            return ExecuteResult::denied(reason);
+            let _ = write_policy_decision(
+                phase.stream_output,
+                &mut *phase.stream_writer,
+                false,
+                &reason,
+            )
+            .await;
+            return Err(ExecuteResult::denied(reason));
         }
         let rendered = {
             let mut cat = config.verbs.write().await;
@@ -108,9 +265,15 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
             }
             Err(e) => {
                 let reason = format!("verb error: {}", e);
-                config.log_audit_policy(caller, &invocation.name, &[], false, &reason);
-                let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
-                return ExecuteResult::denied(reason);
+                config.log_audit_policy(phase.caller, &invocation.name, &[], false, &reason);
+                let _ = write_policy_decision(
+                    phase.stream_output,
+                    &mut *phase.stream_writer,
+                    false,
+                    &reason,
+                )
+                .await;
+                return Err(ExecuteResult::denied(reason));
             }
         }
     } else if config.gate.is_on() {
@@ -145,13 +308,17 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
             });
         }
     }
+    Ok(verb_ctx)
+}
 
-    // Fold the requested ssh host-key mode into the command now that the verb
-    // (if any) has been rendered. From here on, request.args carries any
-    // injected `-o` options, so the policy decision, the evaluator, the audit
-    // record, and the spawned process all act on the same command.
-    request.apply_ssh_hostkey_options();
-
+/// Static request validation before any policy decision: recursion depth,
+/// binary-name shape, and injection validation. Returns the recursion depth
+/// and the reconstructed command line, which the session short-circuit and
+/// the evaluator must share.
+async fn validate_exec_request<W: AsyncWrite + Unpin>(
+    phase: &mut ExecPhase<'_, W>,
+    request: &ExecuteRequest,
+) -> Result<(u32, String), ExecuteResult> {
     // Check recursion depth
     let depth: u32 = std::env::var("GUARD_DEPTH")
         .ok()
@@ -159,23 +326,15 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         .unwrap_or(0);
     if depth >= MAX_GUARD_DEPTH {
         let reason = format!("guard recursion depth exceeded (max {})", MAX_GUARD_DEPTH);
-        config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
-        let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
-        record_live_session_interaction(
-            config,
-            session_token.as_deref(),
-            SessionInteraction {
-                at_unix: 0,
-                command: request.binary.clone(),
-                allowed: false,
-                source: SessionDecisionSource::Validation,
-                reason: reason.clone(),
-                risk: None,
-                exec_status: SessionExecStatus::NotAttempted,
-            },
+        return Err(deny_and_record(
+            phase,
+            request,
+            request.binary.clone(),
+            SessionDecisionSource::Validation,
+            None,
+            reason,
         )
-        .await;
-        return ExecuteResult::denied(reason);
+        .await);
     }
 
     // Validate binary name: reject paths, traversal, and shell metacharacters.
@@ -199,57 +358,52 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         } else {
             format!("invalid binary name: '{}'", request.binary)
         };
-        config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
-        let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
-        record_live_session_interaction(
-            config,
-            session_token.as_deref(),
-            SessionInteraction {
-                at_unix: 0,
-                command: request.binary.clone(),
-                allowed: false,
-                source: SessionDecisionSource::Validation,
-                reason: reason.clone(),
-                risk: None,
-                exec_status: SessionExecStatus::NotAttempted,
-            },
+        return Err(deny_and_record(
+            phase,
+            request,
+            request.binary.clone(),
+            SessionDecisionSource::Validation,
+            None,
+            reason,
         )
-        .await;
-        return ExecuteResult::denied(reason);
+        .await);
     }
 
     // Reconstruct full command line early so session short-circuit and
     // evaluator share the same command text.
     let command_line = command_line(&request.binary, &request.args);
 
-    if let Err(reason) = validate_request_injections(&request, config, caller, &command_line).await
+    if let Err(reason) =
+        validate_request_injections(request, phase.config, phase.caller, &command_line).await
     {
-        config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
-        let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
-        record_live_session_interaction(
-            config,
-            session_token.as_deref(),
-            SessionInteraction {
-                at_unix: 0,
-                command: command_line.clone(),
-                allowed: false,
-                source: SessionDecisionSource::Validation,
-                reason: reason.clone(),
-                risk: None,
-                exec_status: SessionExecStatus::NotAttempted,
-            },
+        return Err(deny_and_record(
+            phase,
+            request,
+            command_line.clone(),
+            SessionDecisionSource::Validation,
+            None,
+            reason,
         )
-        .await;
-        return ExecuteResult::denied(reason);
+        .await);
     }
 
-    // Session grants short-circuit both directions: deny wins before the
-    // evaluator, allow skips the evaluator entirely.
-    //
-    // If the caller passes a session_token that the daemon does not know
-    // about (revoked, expired, or never existed), the request is rejected
-    // — silently falling through to base policy would let an agent run
-    // with surprise rules when its operator-issued grant is gone.
+    Ok((depth, command_line))
+}
+
+/// Session grants short-circuit both directions: deny wins before the
+/// evaluator, allow skips the evaluator entirely.
+///
+/// If the caller passes a session_token that the daemon does not know
+/// about (revoked, expired, or never existed), the request is rejected
+/// — silently falling through to base policy would let an agent run
+/// with surprise rules when its operator-issued grant is gone.
+async fn apply_session_rules<W: AsyncWrite + Unpin>(
+    phase: &mut ExecPhase<'_, W>,
+    request: ExecuteRequest,
+    command_line: &str,
+    depth: u32,
+) -> Result<ExecuteRequest, ExecuteResult> {
+    let config = phase.config;
     if let Some(ref token) = request.session_token {
         let (decision, exists, static_only) = {
             let reg = config.sessions.read().await;
@@ -261,58 +415,66 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
                 "unknown session token: '{}' is revoked, expired, or never existed",
                 token
             );
-            config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
-            let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
-            return ExecuteResult::denied(reason);
+            config.log_audit_policy(phase.caller, &request.binary, &request.args, false, &reason);
+            let _ = write_policy_decision(
+                phase.stream_output,
+                &mut *phase.stream_writer,
+                false,
+                &reason,
+            )
+            .await;
+            return Err(ExecuteResult::denied(reason));
         }
         if let Some((decision, reason)) = decision {
             match decision {
                 SessionDecision::Deny => {
-                    config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
-                    let _ =
-                        write_policy_decision(stream_output, stream_writer, false, &reason).await;
-                    record_live_session_interaction(
-                        config,
-                        session_token.as_deref(),
-                        SessionInteraction {
-                            at_unix: 0,
-                            command: command_line.clone(),
-                            allowed: false,
-                            source: SessionDecisionSource::SessionDeny,
-                            reason: reason.clone(),
-                            risk: None,
-                            exec_status: SessionExecStatus::NotAttempted,
-                        },
+                    return Err(deny_and_record(
+                        phase,
+                        &request,
+                        command_line.to_string(),
+                        SessionDecisionSource::SessionDeny,
+                        None,
+                        reason,
                     )
-                    .await;
-                    return ExecuteResult::denied(reason);
+                    .await);
                 }
                 SessionDecision::Allow => {
-                    config.log_audit_policy(caller, &request.binary, &request.args, true, &reason);
-                    if let Err(e) =
-                        write_policy_decision(stream_output, stream_writer, true, &reason).await
+                    config.log_audit_policy(
+                        phase.caller,
+                        &request.binary,
+                        &request.args,
+                        true,
+                        &reason,
+                    );
+                    if let Err(e) = write_policy_decision(
+                        phase.stream_output,
+                        &mut *phase.stream_writer,
+                        true,
+                        &reason,
+                    )
+                    .await
                     {
-                        return ExecuteResult::exec_failed(
+                        return Err(ExecuteResult::exec_failed(
                             reason,
                             format!("client stream error: {}", e),
-                        );
+                        ));
                     }
                     let result = exec_with_read_grant_retry(
                         request,
                         config,
-                        caller,
+                        phase.caller,
                         reason.clone(),
                         depth,
-                        stream_output,
-                        stream_writer,
+                        phase.stream_output,
+                        &mut *phase.stream_writer,
                     )
                     .await;
                     record_live_session_interaction(
                         config,
-                        session_token.as_deref(),
+                        phase.session_token.as_deref(),
                         SessionInteraction {
                             at_unix: 0,
-                            command: command_line.clone(),
+                            command: command_line.to_string(),
                             allowed: true,
                             source: SessionDecisionSource::SessionAllow,
                             reason,
@@ -321,32 +483,34 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
                         },
                     )
                     .await;
-                    return result;
+                    return Err(result);
                 }
             }
         }
         if static_only {
             let reason = "session static-only: no matching session allow rule".to_string();
-            config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
-            let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
-            record_live_session_interaction(
-                config,
-                session_token.as_deref(),
-                SessionInteraction {
-                    at_unix: 0,
-                    command: command_line.clone(),
-                    allowed: false,
-                    source: SessionDecisionSource::SessionStaticOnly,
-                    reason: reason.clone(),
-                    risk: None,
-                    exec_status: SessionExecStatus::NotAttempted,
-                },
+            return Err(deny_and_record(
+                phase,
+                &request,
+                command_line.to_string(),
+                SessionDecisionSource::SessionStaticOnly,
+                None,
+                reason,
             )
-            .await;
-            return ExecuteResult::denied(reason);
+            .await);
         }
     }
+    Ok(request)
+}
 
+/// Deterministic pre-evaluation binary policy: the server-wide allow-list
+/// floor and the --preflight checks (binary existence, credential deny-list).
+async fn enforce_binary_policy<W: AsyncWrite + Unpin>(
+    phase: &mut ExecPhase<'_, W>,
+    request: &ExecuteRequest,
+    command_line: &str,
+) -> Result<(), ExecuteResult> {
+    let config = phase.config;
     // Server-wide binary allow-list: a hard floor enforced before evaluation on
     // every execution route, so a disallowed binary never reaches the LLM or an
     // operator hold. Independent of --preflight.
@@ -355,23 +519,15 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
             "binary '{}' is not in the server allow-list",
             request.binary
         );
-        config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
-        let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
-        record_live_session_interaction(
-            config,
-            session_token.as_deref(),
-            SessionInteraction {
-                at_unix: 0,
-                command: command_line.clone(),
-                allowed: false,
-                source: SessionDecisionSource::Validation,
-                reason: reason.clone(),
-                risk: None,
-                exec_status: SessionExecStatus::NotAttempted,
-            },
+        return Err(deny_and_record(
+            phase,
+            request,
+            command_line.to_string(),
+            SessionDecisionSource::Validation,
+            None,
+            reason,
         )
-        .await;
-        return ExecuteResult::denied(reason);
+        .await);
     }
 
     if config.preflight && !binary_exists_on_path(&request.binary) {
@@ -379,55 +535,48 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
             "unknown binary: '{}' is not available on the guard server PATH",
             request.binary
         );
-        config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
-        let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
-        record_live_session_interaction(
-            config,
-            session_token.as_deref(),
-            SessionInteraction {
-                at_unix: 0,
-                command: command_line.clone(),
-                allowed: false,
-                source: SessionDecisionSource::Validation,
-                reason: reason.clone(),
-                risk: None,
-                exec_status: SessionExecStatus::NotAttempted,
-            },
+        return Err(deny_and_record(
+            phase,
+            request,
+            command_line.to_string(),
+            SessionDecisionSource::Validation,
+            None,
+            reason,
         )
-        .await;
-        return ExecuteResult::denied(reason);
+        .await);
     }
 
     if config.preflight {
         if let Some(reason) = deterministic_credential_deny_reason(&request.binary, &request.args) {
-            config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
-            let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
-            record_live_session_interaction(
-                config,
-                session_token.as_deref(),
-                SessionInteraction {
-                    at_unix: 0,
-                    command: command_line.clone(),
-                    allowed: false,
-                    source: SessionDecisionSource::Validation,
-                    reason: reason.clone(),
-                    risk: None,
-                    exec_status: SessionExecStatus::NotAttempted,
-                },
+            return Err(deny_and_record(
+                phase,
+                request,
+                command_line.to_string(),
+                SessionDecisionSource::Validation,
+                None,
+                reason,
             )
-            .await;
-            return ExecuteResult::denied(reason);
+            .await);
         }
     }
+    Ok(())
+}
 
-    // Deterministic pre-LLM fast allow for a fixed set of trivially safe
-    // read-only commands. Like a trusted verb, it is a deterministic allow
-    // that precedes the evaluator; it never applies when the caller injected
-    // env/secrets (which could change the command's meaning) and is disabled
-    // in paranoid mode. `accept-all` host-key mode is excluded explicitly:
-    // its injected `StrictHostKeyChecking=no` already fails the ssh option
-    // allow-list, but keeping the guard here documents that giving up host
-    // authentication never rides the fast path even if the diagnostic is fixed.
+/// Deterministic pre-LLM fast allow for a fixed set of trivially safe
+/// read-only commands. Like a trusted verb, it is a deterministic allow
+/// that precedes the evaluator; it never applies when the caller injected
+/// env/secrets (which could change the command's meaning) and is disabled
+/// in paranoid mode. `accept-all` host-key mode is excluded explicitly:
+/// its injected `StrictHostKeyChecking=no` already fails the ssh option
+/// allow-list, but keeping the guard here documents that giving up host
+/// authentication never rides the fast path even if the diagnostic is fixed.
+async fn try_static_fast_allow<W: AsyncWrite + Unpin>(
+    phase: &mut ExecPhase<'_, W>,
+    request: ExecuteRequest,
+    command_line: &str,
+    depth: u32,
+) -> Result<ExecuteRequest, ExecuteResult> {
+    let config = phase.config;
     if request.env.is_empty()
         && request.secrets.is_empty()
         && !matches!(request.ssh_hostkey, Some(SshHostKeyMode::AcceptAll))
@@ -435,53 +584,46 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         if let Some(reason) =
             deterministic_safe_allow_reason(config, &request.binary, &request.args)
         {
-            config.log_audit_policy(caller, &request.binary, &request.args, true, &reason);
-            if let Err(e) = write_policy_decision(stream_output, stream_writer, true, &reason).await
+            config.log_audit_policy(phase.caller, &request.binary, &request.args, true, &reason);
+            if let Err(e) = write_policy_decision(
+                phase.stream_output,
+                &mut *phase.stream_writer,
+                true,
+                &reason,
+            )
+            .await
             {
-                return ExecuteResult::exec_failed_after_start(
+                return Err(ExecuteResult::exec_failed_after_start(
                     reason,
                     format!("client stream error: {}", e),
-                );
+                ));
             }
             let inputs = GateInputs {
-                reason: reason.clone(),
+                reason,
                 risk: Some(0),
                 reversibility: None,
                 revert_preauthorized: false,
                 verb: None,
                 bypass: true,
             };
-            let result = route_gated_allow(
+            return Err(route_allow_and_record(
+                phase,
                 request,
-                config,
-                caller,
                 inputs,
+                command_line.to_string(),
+                SessionDecisionSource::StaticPolicy,
                 depth,
-                stream_output,
-                stream_writer,
             )
-            .await;
-            record_live_session_interaction(
-                config,
-                session_token.as_deref(),
-                SessionInteraction {
-                    at_unix: 0,
-                    command: command_line.clone(),
-                    allowed: true,
-                    source: SessionDecisionSource::StaticPolicy,
-                    reason,
-                    risk: Some(0),
-                    exec_status: result.session_exec_status(),
-                },
-            )
-            .await;
-            return result;
+            .await);
         }
     }
+    Ok(request)
+}
 
-    // Pull session-scoped additive prompt, if any. The evaluator appends
-    // it to the system prompt for this single call so the LLM has the
-    // session context that the static glob patterns cannot express.
+/// Pull the session-scoped additive prompt, if any. The evaluator appends
+/// it to the system prompt for this single call so the LLM has the
+/// session context that the static glob patterns cannot express.
+async fn resolve_session_prompt(config: &ServerConfig, request: &ExecuteRequest) -> Option<String> {
     let session_prompt = if let Some(ref token) = request.session_token {
         let reg = config.sessions.read().await;
         reg.prompt_append_for(token)
@@ -495,61 +637,81 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
     // envelope actually arms. A non-empty prompt append bypasses the decision
     // cache, so a revert-aware verdict is never replayed for a revert-less
     // request.
-    let session_prompt = merge_revert_context(
+    merge_revert_context(
         session_prompt,
         config.gate.is_on() && request.revert.is_some(),
-    );
+    )
+}
 
-    // Trusted verb: an operator-reviewed shape skips the LLM evaluator (a
-    // deterministic allow path, like a static-policy allow). The verb's declared
-    // reversibility class drives the gate and its revert is pre-authorized.
+/// Trusted verb: an operator-reviewed shape skips the LLM evaluator (a
+/// deterministic allow path, like a static-policy allow). The verb's declared
+/// reversibility class drives the gate and its revert is pre-authorized.
+async fn try_trusted_verb_allow<W: AsyncWrite + Unpin>(
+    phase: &mut ExecPhase<'_, W>,
+    request: ExecuteRequest,
+    verb_ctx: &Option<VerbContext>,
+    command_line: &str,
+    depth: u32,
+) -> Result<ExecuteRequest, ExecuteResult> {
     if let Some(vc) = verb_ctx.clone() {
         if vc.trusted {
             let reason = format!("trusted verb '{}'", vc.name);
-            config.log_audit_policy(caller, &request.binary, &request.args, true, &reason);
-            if let Err(e) = write_policy_decision(stream_output, stream_writer, true, &reason).await
+            phase.config.log_audit_policy(
+                phase.caller,
+                &request.binary,
+                &request.args,
+                true,
+                &reason,
+            );
+            if let Err(e) = write_policy_decision(
+                phase.stream_output,
+                &mut *phase.stream_writer,
+                true,
+                &reason,
+            )
+            .await
             {
-                return ExecuteResult::exec_failed_after_start(
+                return Err(ExecuteResult::exec_failed_after_start(
                     reason,
                     format!("client stream error: {}", e),
-                );
+                ));
             }
             let inputs = GateInputs {
-                reason: reason.clone(),
+                reason,
                 risk: Some(0),
                 reversibility: Some(vc.class),
                 revert_preauthorized: true,
                 verb: Some(vc),
                 bypass: false,
             };
-            let result = route_gated_allow(
+            return Err(route_allow_and_record(
+                phase,
                 request,
-                config,
-                caller,
                 inputs,
+                command_line.to_string(),
+                SessionDecisionSource::StaticPolicy,
                 depth,
-                stream_output,
-                stream_writer,
             )
-            .await;
-            record_live_session_interaction(
-                config,
-                session_token.as_deref(),
-                SessionInteraction {
-                    at_unix: 0,
-                    command: command_line.clone(),
-                    allowed: true,
-                    source: SessionDecisionSource::StaticPolicy,
-                    reason,
-                    risk: Some(0),
-                    exec_status: result.session_exec_status(),
-                },
-            )
-            .await;
-            return result;
+            .await);
         }
     }
+    Ok(request)
+}
 
+/// Evaluate the command with the LLM evaluator (or its cache/static layers)
+/// and finish the request: learning and session auto-amend bookkeeping on a
+/// fresh LLM verdict, then audit, and on an allow the consequence-gate
+/// routing (execute / contain / hold).
+async fn evaluate_and_route<W: AsyncWrite + Unpin>(
+    phase: &mut ExecPhase<'_, W>,
+    request: ExecuteRequest,
+    verb_ctx: Option<VerbContext>,
+    session_prompt: Option<String>,
+    command_line: String,
+    depth: u32,
+) -> ExecuteResult {
+    let config = phase.config;
+    let session_token = phase.session_token.clone();
     let eval_result = config
         .evaluator
         .evaluate_with_reevaluate(&command_line, session_prompt.as_deref(), request.reevaluate)
@@ -584,44 +746,28 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
                 )
                 .await;
             }
-            config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
-            let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
-            record_live_session_interaction(
-                config,
-                session_token.as_deref(),
-                SessionInteraction {
-                    at_unix: 0,
-                    command: command_line.clone(),
-                    allowed: false,
-                    source: session_source_from_eval(source),
-                    reason: reason.clone(),
-                    risk,
-                    exec_status: SessionExecStatus::NotAttempted,
-                },
+            deny_and_record(
+                phase,
+                &request,
+                command_line,
+                session_source_from_eval(source),
+                risk,
+                reason,
             )
-            .await;
-            ExecuteResult::denied(reason)
+            .await
         }
         crate::evaluate::EvalResult::Error(e) => {
             tracing::error!("evaluation error: {}", e);
             let reason = format!("evaluation error: {}", e);
-            config.log_audit_policy(caller, &request.binary, &request.args, false, &reason);
-            let _ = write_policy_decision(stream_output, stream_writer, false, &reason).await;
-            record_live_session_interaction(
-                config,
-                session_token.as_deref(),
-                SessionInteraction {
-                    at_unix: 0,
-                    command: command_line.clone(),
-                    allowed: false,
-                    source: SessionDecisionSource::EvaluatorError,
-                    reason: reason.clone(),
-                    risk: None,
-                    exec_status: SessionExecStatus::NotAttempted,
-                },
+            deny_and_record(
+                phase,
+                &request,
+                command_line,
+                SessionDecisionSource::EvaluatorError,
+                None,
+                reason,
             )
-            .await;
-            ExecuteResult::denied(reason)
+            .await
         }
         crate::evaluate::EvalResult::Allow {
             reason,
@@ -684,8 +830,14 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
                 }
             }
             tracing::debug!("command allowed: {}", reason);
-            config.log_audit_policy(caller, &request.binary, &request.args, true, &reason);
-            if let Err(e) = write_policy_decision(stream_output, stream_writer, true, &reason).await
+            config.log_audit_policy(phase.caller, &request.binary, &request.args, true, &reason);
+            if let Err(e) = write_policy_decision(
+                phase.stream_output,
+                &mut *phase.stream_writer,
+                true,
+                &reason,
+            )
+            .await
             {
                 return ExecuteResult::exec_failed_after_start(
                     reason,
@@ -705,38 +857,22 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
             let bypass =
                 matches!(source, crate::evaluate::EvalSource::StaticPolicy) && verb_ctx.is_none();
             let inputs = GateInputs {
-                reason: reason.clone(),
+                reason,
                 risk,
                 reversibility: effective_class,
                 revert_preauthorized: verb_ctx.is_some(),
-                verb: verb_ctx.clone(),
+                verb: verb_ctx,
                 bypass,
             };
-            let result = route_gated_allow(
+            route_allow_and_record(
+                phase,
                 request,
-                config,
-                caller,
                 inputs,
+                command_line,
+                session_source_from_eval(source),
                 depth,
-                stream_output,
-                stream_writer,
             )
-            .await;
-            record_live_session_interaction(
-                config,
-                session_token.as_deref(),
-                SessionInteraction {
-                    at_unix: 0,
-                    command: command_line,
-                    allowed: true,
-                    source: session_source_from_eval(source),
-                    reason,
-                    risk,
-                    exec_status: result.session_exec_status(),
-                },
-            )
-            .await;
-            result
+            .await
         }
     }
 }
