@@ -1,4 +1,48 @@
-use super::*;
+use crate::injection::is_valid_env_name;
+use crate::redact::{
+    redact_exact_secrets, redact_output, redact_output_text, redact_output_with_state,
+    RedactionState,
+};
+use crate::session::{
+    SessionAmendment, SessionDecision, SessionDecisionSource, SessionExecStatus,
+    SessionInteraction, SessionRegistry,
+};
+use crate::session_store::SessionStore;
+use crate::shim::ShimGenerator;
+#[cfg(unix)]
+use anyhow::Context;
+use anyhow::{bail, Result};
+use guard::gating::{Coverage, Reversibility};
+use guard::learned_rules::{AutoShimMode, LearningOutcome};
+use std::collections::HashMap;
+#[cfg(unix)]
+use std::ffi::CString;
+use std::path::PathBuf;
+use std::process::Stdio;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
+use tokio::process::Command;
+use tokio::sync::mpsc;
+#[cfg(unix)]
+use uzers::os::unix::UserExt;
+
+use super::gate_runtime::{binary_allowed, route_gated_allow, GateInputs};
+#[cfg(unix)]
+use super::grants::handle_grant_read;
+#[cfg(unix)]
+use super::path_with_shim_dir;
+use super::transport::{write_policy_decision, write_stream_message};
+#[cfg(unix)]
+use super::wire::ExecOutcome;
+use super::wire::{
+    verb_trust_is_current, CallerIdentity, ExecuteRequest, ExecuteResult, ExecuteStreamMessage,
+    OutputStream, RevertSpec, SshHostKeyMode, VerbContext,
+};
+use super::{
+    binary_exists_on_path, child_env_allowlist, deterministic_credential_deny_reason,
+    deterministic_safe_allow_reason, validate_request_injections, ServerConfig, MAX_GUARD_DEPTH,
+    MAX_OUTPUT_BYTES, SESSION_AUTO_AMEND_MAX_ALLOW_RISK, SESSION_AUTO_AMEND_MIN_DENY_RISK,
+    SESSION_EXACT_RULE_MAX_ARGS, SESSION_EXACT_RULE_MAX_ARG_LEN,
+};
 
 pub(super) async fn execute_command(
     request: ExecuteRequest,

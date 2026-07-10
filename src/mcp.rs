@@ -1,3 +1,4 @@
+use crate::daemon_client;
 use crate::injection::{collect_unique_pairs, derive_env_name};
 use crate::server;
 use anyhow::{bail, Context, Result};
@@ -203,8 +204,8 @@ impl ClientExecutor {
     /// Build a bare daemon client carrying only the connection details and the
     /// optional TCP auth token. Used for read-only admin RPCs that the catalog
     /// and approval tools proxy.
-    fn admin_client(&self) -> server::Client {
-        let mut client = server::Client::new(self.socket_path.clone(), self.tcp_port);
+    fn admin_client(&self) -> daemon_client::Client {
+        let mut client = daemon_client::Client::new(self.socket_path.clone(), self.tcp_port);
         if let Some(token) = &self.auth_token {
             client = client.with_auth(token.clone());
         }
@@ -245,7 +246,7 @@ impl GuardExecutor for ClientExecutor {
             None => None,
         };
 
-        let mut client = server::Client::new(self.socket_path.clone(), self.tcp_port)
+        let mut client = daemon_client::Client::new(self.socket_path.clone(), self.tcp_port)
             .with_gating(
                 revert,
                 args.confirm_within,

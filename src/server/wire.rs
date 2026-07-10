@@ -1,8 +1,16 @@
-use super::*;
+use crate::session::{HistoricalGrant, SessionExecStatus, SessionGrantSummary, SessionReport};
+use guard::gating::approval::Approval;
+use guard::gating::provisional::Provisional;
+use guard::gating::{Coverage, Reversibility};
+use guard::principal::PrincipalKey;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+use super::execute::audit_token;
 
 /// Identifies the caller for per-user secret injection.
 #[derive(Debug, Clone)]
-pub enum CallerIdentity {
+pub(super) enum CallerIdentity {
     /// Local caller over a Unix domain socket, identified by peer UID.
     /// Constructed only by the Unix transport; on Windows it exists for the
     /// shared match arms (and tests) but is never built.
@@ -728,7 +736,7 @@ pub struct ServerStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
-pub(super) enum IncomingMessage {
+pub(crate) enum IncomingMessage {
     Admin {
         admin: AdminRequest,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -783,7 +791,7 @@ pub enum GateStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub(super) enum ExecuteStreamMessage {
+pub(crate) enum ExecuteStreamMessage {
     Stdout { data: String },
     Stderr { data: String },
     PolicyDecision { allowed: bool, reason: String },

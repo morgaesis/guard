@@ -81,7 +81,7 @@ pub(crate) async fn run_exec(
         None => None,
     };
 
-    let mut client = server::Client::new(socket_path, tcp_port)
+    let mut client = daemon_client::Client::new(socket_path, tcp_port)
         .with_gating(
             revert,
             gating.confirm_within,
@@ -214,11 +214,11 @@ pub(crate) async fn run_exec(
 }
 
 /// Resolve the admin endpoint and build a client for a gate-control RPC.
-fn gate_client(socket_override: Option<String>) -> (server::Client, EndpointSource) {
+fn gate_client(socket_override: Option<String>) -> (daemon_client::Client, EndpointSource) {
     let config = client_config::ClientConfig::load().ok().unwrap_or_default();
     let (socket_path, tcp_port, source) =
         resolve_client_endpoint_with_source(socket_override, &config);
-    let mut client = server::Client::new(socket_path, tcp_port);
+    let mut client = daemon_client::Client::new(socket_path, tcp_port);
     if let Some(token) = config.auth_token {
         client = client.with_auth(token);
     }
@@ -451,7 +451,7 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                 name: name.clone(),
                 params: param_map,
             };
-            let mut client = server::Client::new(socket_path, tcp_port)
+            let mut client = daemon_client::Client::new(socket_path, tcp_port)
                 .with_verb(invocation)
                 .with_gating(None, confirm_within, false, wait_approval);
             if let Some(token) = config.auth_token {
@@ -837,7 +837,7 @@ fn resolve_endpoint(
 /// `endpoint_for_log()` never contains tokens.
 fn describe_connect_failure(
     err: anyhow::Error,
-    client: &server::Client,
+    client: &daemon_client::Client,
     source: EndpointSource,
 ) -> anyhow::Error {
     let connect_failed = err
@@ -865,8 +865,8 @@ pub(crate) fn admin_client(
     socket_path: Option<PathBuf>,
     tcp_port: Option<u16>,
     config: &client_config::ClientConfig,
-) -> server::Client {
-    let client = server::Client::new(socket_path, tcp_port);
+) -> daemon_client::Client {
+    let client = daemon_client::Client::new(socket_path, tcp_port);
     if let Some(token) = config.admin_token.clone() {
         client.with_admin_token(token)
     } else {
@@ -936,7 +936,7 @@ pub(crate) async fn handle_grant_read(
 ) -> Result<()> {
     let config = client_config::ClientConfig::load().ok().unwrap_or_default();
     let (socket_path, tcp_port, source) = resolve_client_endpoint_with_source(socket, &config);
-    let client = server::Client::new(socket_path, tcp_port);
+    let client = daemon_client::Client::new(socket_path, tcp_port);
     let session_token = std::env::var("GUARD_SESSION")
         .ok()
         .filter(|s| !s.is_empty());
@@ -956,7 +956,7 @@ pub(crate) async fn handle_grant_read(
 pub(crate) async fn handle_grant_revoke(path: String, socket: Option<String>) -> Result<()> {
     let config = client_config::ClientConfig::load().ok().unwrap_or_default();
     let (socket_path, tcp_port, source) = resolve_client_endpoint_with_source(socket, &config);
-    let client = server::Client::new(socket_path, tcp_port);
+    let client = daemon_client::Client::new(socket_path, tcp_port);
     let session_token = std::env::var("GUARD_SESSION")
         .ok()
         .filter(|s| !s.is_empty());

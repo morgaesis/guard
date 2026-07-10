@@ -921,7 +921,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             let env_vars = env_pairs_to_map(env_vars).map_err(anyhow::Error::msg)?;
             let secret_vars = secret_pairs_to_map(secret_vars).map_err(anyhow::Error::msg)?;
             let socket_path = socket.map(PathBuf::from);
-            let mut client = server::Client::new(socket_path, tcp_port);
+            let mut client = daemon_client::Client::new(socket_path, tcp_port);
             if let Some(token) = token {
                 client = client.with_auth(token);
             }

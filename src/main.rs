@@ -6,6 +6,7 @@ mod cli_secrets;
 mod cli_server;
 mod cli_shim;
 mod client_config;
+mod daemon_client;
 mod grant_profile;
 mod grant_rules;
 mod injection;

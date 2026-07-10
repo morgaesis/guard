@@ -1,4 +1,27 @@
-use super::*;
+use crate::grant_rules::{compile_session_grant_rules, CompiledGrantRules};
+use crate::redact::redact_output;
+use crate::secrets::legacy_sentinel;
+use crate::session::{
+    HistoricalGrant, SessionAmendment, SessionDecision, SessionDecisionSource, SessionExecStatus,
+    SessionGrant, SessionGrantSummary, SessionInteraction, SessionReport,
+};
+use guard::principal::{scope_eq, PrincipalKey};
+
+use super::execute::{
+    allow_session_auto_amend_candidate, amend_session_exact_rule, audit_token, command_line,
+    deny_session_auto_amend_candidate, persist_current_sessions, persist_session_snapshot,
+    record_live_session_interaction, session_source_from_eval,
+    validate_session_exact_rule_candidate,
+};
+use super::gate_runtime::{
+    execute_snapshot, finish_revert, forget_proxy_provenance, now_unix, persist_approval,
+    persist_provisional, KUBE_PROXY_SENTINEL_BINARY,
+};
+use super::wire::{
+    verb_effective_trust, AdminRequest, AdminResponse, ApprovalSummary, CallerIdentity,
+    ExecOutcome, ProvisionalSummary, SecretDetail, ServerStatus, VerbSummary,
+};
+use super::{is_valid_secret_key, ServerConfig};
 
 fn merge_unique(target: &mut Vec<String>, additions: Vec<String>) {
     for value in additions {

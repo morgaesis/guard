@@ -1,4 +1,16 @@
-use super::*;
+//! Client for the guard daemon's local socket / TCP endpoint. Used by the
+//! CLI (`guard run`, `guard secrets`, ...) and the MCP server to send
+//! execute, grant, and admin requests over the wire protocol defined in
+//! `server::wire`.
+
+use crate::server::{
+    AdminRequest, AdminResponse, ExecuteRequest, ExecuteResponse, ExecuteStreamMessage,
+    GrantRequest, IncomingMessage, OutputStream, RevertSpec, SshHostKeyMode, VerbInvocation,
+};
+use anyhow::{bail, Context, Result};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 
 pub struct Client {
     socket_path: Option<PathBuf>,
@@ -455,10 +467,7 @@ impl Client {
     }
 }
 
-pub(super) fn parse_admin_response_line(
-    response_line: &str,
-    request_name: &str,
-) -> Result<AdminResponse> {
+fn parse_admin_response_line(response_line: &str, request_name: &str) -> Result<AdminResponse> {
     match serde_json::from_str::<AdminResponse>(response_line) {
         Ok(resp) => Ok(resp),
         Err(admin_err) => {
@@ -551,4 +560,61 @@ where
     }
 
     bail!("server closed connection without response")
+}
+
+/// Connect to the local guard daemon: UNIX domain socket on Unix, named pipe on
+/// Windows. Returns a stream that implements `AsyncRead + AsyncWrite`.
+#[cfg(unix)]
+async fn connect_local(path: &Path) -> Result<tokio::net::UnixStream> {
+    tokio::net::UnixStream::connect(path)
+        .await
+        .context("failed to connect to guard server")
+}
+
+#[cfg(windows)]
+async fn connect_local(path: &Path) -> Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    use tokio::net::windows::named_pipe::ClientOptions;
+    let name = crate::server::winplat::pipe_name(path);
+    ClientOptions::new()
+        .open(&name)
+        .context("failed to connect to guard server")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_admin_response_line, AdminResponse};
+
+    #[test]
+    fn parse_admin_response_line_accepts_admin_response() {
+        let line = r#"{"result":"error","message":"admin denied"}"#;
+        match parse_admin_response_line(line, "secret_set").unwrap() {
+            AdminResponse::Error { message } => assert_eq!(message, "admin denied"),
+            other => panic!("expected admin error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_admin_response_line_maps_execute_invalid_request_to_actionable_error() {
+        let line = r#"{"allowed":false,"reason":"invalid request: data did not match any variant of untagged enum IncomingMessage"}"#;
+        match parse_admin_response_line(line, "secret_set").unwrap() {
+            AdminResponse::Error { message } => {
+                assert!(message.contains("secret_set"));
+                assert!(message.contains("needs restart"));
+            }
+            other => panic!("expected admin error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_admin_response_line_surfaces_malformed_admin_payloads_as_restart_errors() {
+        let line = r#"{"result":"secret_list","items":[{"key":"alpha"}]}"#;
+        match parse_admin_response_line(line, "secret_list").unwrap() {
+            AdminResponse::Error { message } => {
+                assert!(message.contains("secret_list"));
+                assert!(message.contains("malformed admin response"));
+                assert!(message.contains("Restart the daemon"));
+            }
+            other => panic!("expected admin error, got {:?}", other),
+        }
+    }
 }

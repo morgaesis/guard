@@ -1,4 +1,23 @@
-use super::*;
+use guard::gating::approval::{Approval, ApprovalSnapshot, ApprovalStatus};
+use guard::gating::provisional::{Provisional, ProvisionalStatus};
+use guard::gating::{decide_gate, Coverage, GateOutcome, Reversibility};
+use guard::principal::PrincipalKey;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use tokio::io::AsyncWrite;
+
+use super::execute::{audit_command_line, exec_after_approval, exec_with_read_grant_retry};
+use super::grants::{delete_read_grant_row, finish_read_grant_revert, persist_read_grant};
+use super::transport::write_stream_message;
+use super::wire::{
+    CallerIdentity, ExecOutcome, ExecuteRequest, ExecuteResult, ExecuteStreamMessage, RevertSpec,
+    VerbContext,
+};
+use super::{
+    ServerConfig, APPROVAL_TTL_SECS, DEFAULT_CONFIRM_WITHIN_SECS, GATING_RETENTION_SECS,
+    MAX_CONFIRM_WITHIN_SECS, MAX_PENDING_GLOBAL, MAX_PENDING_PER_CALLER, REVERT_EXEC_TIMEOUT_SECS,
+    SWEEPER_GRACE_SECS, SWEEPER_TICK_SECS,
+};
 
 // ===========================================================================
 // Consequence gating: routing of LLM-approved commands by reversibility.

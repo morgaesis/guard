@@ -1,4 +1,23 @@
-use super::*;
+#[cfg(unix)]
+use crate::session::SessionDecision;
+#[cfg(unix)]
+use anyhow::{bail, Context, Result};
+use guard::gating::read_grant::ReadGrant;
+#[cfg(unix)]
+use guard::gating::read_grant::{
+    ancestor_dirs_within, clamp_ttl, credential_path_deny_reason, AclEntry, ReadGrantStatus,
+};
+#[cfg(unix)]
+use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use tokio::process::Command;
+
+#[cfg(unix)]
+use super::execute::resolve_exec_caller_context;
+#[cfg(unix)]
+use super::gate_runtime::{new_handle, now_unix};
+use super::wire::{CallerIdentity, ExecuteResult, GrantRequest};
+use super::ServerConfig;
 
 /// Label used for the binary field of a read-grant request's audit records, so
 /// `[AUDIT] ALLOWED`/`DENIED` grep patterns and session allow/deny globs treat a

@@ -1,4 +1,43 @@
-use super::*;
+use crate::evaluate::Evaluator;
+use crate::grant_profile::ProfileCatalog;
+use crate::secrets::SecretManager;
+use crate::session::SessionRegistry;
+use crate::session_store::SessionStore;
+use crate::tool_config::ToolRegistry;
+#[cfg(unix)]
+use anyhow::bail;
+use anyhow::{Context, Result};
+use guard::gating::approval::{ApprovalRegistry, ApprovalStatus};
+use guard::gating::provisional::ProvisionalRegistry;
+#[cfg(unix)]
+use guard::gating::read_grant::{GrantReadRegistry, ReadGrantStatus};
+use guard::gating::verb::VerbCatalog;
+use guard::gating::GateMode;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::NamedPipeServer;
+use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
+#[cfg(unix)]
+use tokio::process::Command;
+use tokio::sync::RwLock;
+
+use super::admin::handle_admin_request;
+use super::execute::{execute_command, execute_command_streaming};
+use super::gate_runtime::{gating_sweeper, now_unix, DaemonGateSink, KUBE_PROXY_SENTINEL_BINARY};
+use super::grants::handle_grant_request;
+#[cfg(unix)]
+use super::grants::{delete_read_grant_row, revoke_read_grant_acls};
+use super::wire::{
+    AdminRequest, AdminResponse, CallerIdentity, ExecOutcome, ExecuteResponse, ExecuteResult,
+    ExecuteStreamMessage, IncomingMessage,
+};
+use super::{ServerConfig, DEFAULT_CONFIRM_WITHIN_SECS, MAX_REQUEST_BYTES};
 
 #[derive(Clone)]
 pub struct Server {
@@ -466,7 +505,7 @@ impl Server {
 /// The SID is the Windows analog of a Unix peer UID — the kernel-verified
 /// identity of the process on the other end of the local pipe.
 #[cfg(windows)]
-pub(super) mod winplat {
+pub(crate) mod winplat {
     use anyhow::{bail, Context, Result};
     use std::os::windows::io::AsRawHandle;
     use tokio::net::windows::named_pipe::NamedPipeServer;
@@ -866,26 +905,6 @@ fn emit_exec_audit_events(
     if let ExecOutcome::Failed { reason, .. } = &result.exec {
         config.log_audit_exec_failed(caller, binary, args, reason);
     }
-}
-
-/// Connect to the local guard daemon: UNIX domain socket on Unix, named pipe on
-/// Windows. Returns a stream that implements `AsyncRead + AsyncWrite`.
-#[cfg(unix)]
-pub(super) async fn connect_local(path: &std::path::Path) -> Result<UnixStream> {
-    UnixStream::connect(path)
-        .await
-        .context("failed to connect to guard server")
-}
-
-#[cfg(windows)]
-pub(super) async fn connect_local(
-    path: &std::path::Path,
-) -> Result<tokio::net::windows::named_pipe::NamedPipeClient> {
-    use tokio::net::windows::named_pipe::ClientOptions;
-    let name = winplat::pipe_name(path);
-    ClientOptions::new()
-        .open(&name)
-        .context("failed to connect to guard server")
 }
 
 async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig) -> Result<()> {

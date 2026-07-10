@@ -11,56 +11,28 @@
 
 use crate::evaluate::Evaluator;
 use crate::grant_profile::ProfileCatalog;
-use crate::grant_rules::{compile_session_grant_rules, CompiledGrantRules};
 use crate::injection::is_valid_env_name;
-use crate::redact::{
-    redact_exact_secrets, redact_output, redact_output_text, redact_output_with_state,
-    RedactionState,
-};
-use crate::secrets::{legacy_sentinel, SecretManager};
-use crate::session::{
-    HistoricalGrant, SessionAmendment, SessionDecision, SessionDecisionSource, SessionExecStatus,
-    SessionGrant, SessionGrantSummary, SessionInteraction, SessionRegistry, SessionReport,
-};
+use crate::secrets::SecretManager;
+use crate::session::SessionRegistry;
 use crate::session_store::SessionStore;
-use crate::shim::ShimGenerator;
-use guard::gating::approval::{Approval, ApprovalRegistry, ApprovalSnapshot, ApprovalStatus};
-use guard::gating::provisional::{Provisional, ProvisionalRegistry, ProvisionalStatus};
-#[cfg(unix)]
-use guard::gating::read_grant::{
-    ancestor_dirs_within, clamp_ttl, credential_path_deny_reason, AclEntry, ReadGrantStatus,
-};
-use guard::gating::read_grant::{GrantReadRegistry, ReadGrant};
+use guard::gating::approval::ApprovalRegistry;
+use guard::gating::provisional::ProvisionalRegistry;
+use guard::gating::read_grant::GrantReadRegistry;
 use guard::gating::verb::VerbCatalog;
-use guard::gating::{decide_gate, Coverage, GateMode, GateOutcome, Reversibility};
+use guard::gating::GateMode;
 use guard::policy::PolicyMode;
-use guard::principal::{scope_eq, PrincipalKey};
+use guard::principal::PrincipalKey;
 
 // Re-export so main.rs can pattern-match on history status without a
 // direct dependency on the `session` module path.
 pub use crate::session::HistoricalStatus;
 use crate::tool_config::ToolRegistry;
-use anyhow::{bail, Context, Result};
-use guard::learned_rules::{AutoShimMode, LearningOutcome};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-#[cfg(unix)]
-use std::ffi::CString;
+use anyhow::Result;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-#[cfg(windows)]
-use tokio::net::windows::named_pipe::NamedPipeServer;
-use tokio::net::TcpListener;
-#[cfg(unix)]
-use tokio::net::{UnixListener, UnixStream};
-use tokio::process::Command;
-use tokio::sync::{mpsc, RwLock};
-#[cfg(unix)]
-use uzers::os::unix::UserExt;
+use tokio::sync::RwLock;
 
 const MAX_GUARD_DEPTH: u32 = 5;
 const MAX_REQUEST_BYTES: usize = 1_048_576; // 1MB
@@ -99,28 +71,31 @@ const MAX_PENDING_GLOBAL: usize = 256;
 const GATING_RETENTION_SECS: u64 = 24 * 60 * 60;
 
 mod admin;
-mod client;
 mod execute;
 mod gate_runtime;
 mod grants;
-mod protocol;
 #[cfg(test)]
 mod tests;
 mod transport;
+mod wire;
 
-// These submodules expose nothing beyond the server module, so a `pub` glob
-// re-export would re-export nothing; siblings still see them via `use super::*`.
-use admin::*;
-use execute::*;
-use gate_runtime::*;
-use grants::*;
+// The named public surface of the server module: the daemon entrypoint
+// (`Server`, `resolve_daemon_principal`) and the wire types shared with the
+// CLI, the MCP server, and `daemon_client`. Everything else stays internal.
+#[cfg(windows)]
+pub(crate) use transport::winplat;
+pub use transport::Server;
+pub use wire::{
+    AdminRequest, AdminResponse, ApprovalSummary, ExecuteRequest, ExecuteResponse, GateStatus,
+    GrantRequest, OutputStream, RevertSpec, SshHostKeyMode, VerbInvocation, VerbSummary,
+};
+pub(crate) use wire::{ExecuteStreamMessage, IncomingMessage};
 
-pub use client::*;
-pub use protocol::*;
-pub use transport::*;
+use execute::audit_command_line;
+use wire::CallerIdentity;
 
 #[derive(Clone)]
-pub struct ServerConfig {
+struct ServerConfig {
     pub socket_path: Option<PathBuf>,
     pub tcp_port: Option<u16>,
     pub evaluator: Arc<Evaluator>,

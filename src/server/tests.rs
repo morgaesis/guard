@@ -1,4 +1,62 @@
-use super::*;
+use crate::grant_profile::ProfileCatalog;
+use crate::session::{
+    SessionDecision, SessionDecisionSource, SessionExecStatus, SessionGrant, SessionInteraction,
+    SessionRegistry,
+};
+use guard::gating::approval::{Approval, ApprovalSnapshot, ApprovalStatus};
+#[cfg(unix)]
+use guard::gating::provisional::ProvisionalStatus;
+#[cfg(unix)]
+use guard::gating::read_grant::{ReadGrant, ReadGrantStatus};
+use guard::gating::verb::VerbCatalog;
+use guard::gating::{Coverage, GateMode, Reversibility};
+use guard::policy::PolicyMode;
+use guard::principal::PrincipalKey;
+use std::collections::HashMap;
+#[cfg(unix)]
+use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use tokio::io::AsyncWrite;
+#[cfg(unix)]
+use tokio::process::Command;
+use tokio::sync::RwLock;
+
+use super::admin::{handle_admin_request, handle_approval_note};
+#[cfg(windows)]
+use super::binary_path_candidates;
+use super::execute::{
+    allow_session_auto_amend_candidate, audit_command_line, audit_token,
+    deny_session_auto_amend_candidate, execute_command, session_source_from_eval,
+};
+#[cfg(unix)]
+use super::execute::{exec_with_read_grant_retry, permission_denied_path};
+#[cfg(windows)]
+use super::gate_runtime::reconstruct_caller;
+use super::gate_runtime::{
+    approval_to_result, binary_allowed, execute_snapshot, hash_secret_value, hold_for_approval,
+    new_handle, now_unix, route_gated_allow, GateInputs,
+};
+#[cfg(unix)]
+use super::gate_runtime::{arm_containment, finish_revert, DaemonGateSink};
+use super::grants::handle_grant_request;
+#[cfg(unix)]
+use super::grants::{
+    apply_read_grant, apply_read_grant_entries, finish_read_grant_revert,
+    getfacl_user_has_traverse, handle_grant_revoke, plan_read_grant, revoke_read_grant_acls,
+};
+use super::transport::emit_audit_events;
+#[cfg(windows)]
+use super::transport::winplat;
+use super::wire::{
+    AdminRequest, AdminResponse, CallerIdentity, ExecOutcome, ExecuteRequest, ExecuteResult,
+    GateStatus, GrantRequest, IncomingMessage, RevertSpec, SshHostKeyMode, VerbInvocation,
+};
+use super::{
+    binary_exists_on_path, dangerous_env_name, deterministic_credential_deny_reason,
+    deterministic_safe_allow_reason, invalid_shell_secret_reference, is_fixed_readonly_diagnostic,
+    is_valid_secret_key, ssh_o_directive_readonly_safe, ssh_options_all_readonly_safe,
+    validate_request_injections, ServerConfig, APPROVAL_TTL_SECS,
+};
 use crate::evaluate::{EvalConfig, Evaluator};
 use crate::secrets::{EnvBackend, SecretManager};
 use crate::tool_config::ToolRegistry;
@@ -217,40 +275,6 @@ fn binary_allowlist_empty_denies_everything() {
     let allow = Some(vec![]);
     assert!(!binary_allowed(&allow, "kubectl"));
     assert!(!binary_allowed(&allow, "/usr/bin/anything"));
-}
-
-#[test]
-fn parse_admin_response_line_accepts_admin_response() {
-    let line = r#"{"result":"error","message":"admin denied"}"#;
-    match parse_admin_response_line(line, "secret_set").unwrap() {
-        AdminResponse::Error { message } => assert_eq!(message, "admin denied"),
-        other => panic!("expected admin error, got {:?}", other),
-    }
-}
-
-#[test]
-fn parse_admin_response_line_maps_execute_invalid_request_to_actionable_error() {
-    let line = r#"{"allowed":false,"reason":"invalid request: data did not match any variant of untagged enum IncomingMessage"}"#;
-    match parse_admin_response_line(line, "secret_set").unwrap() {
-        AdminResponse::Error { message } => {
-            assert!(message.contains("secret_set"));
-            assert!(message.contains("needs restart"));
-        }
-        other => panic!("expected admin error, got {:?}", other),
-    }
-}
-
-#[test]
-fn parse_admin_response_line_surfaces_malformed_admin_payloads_as_restart_errors() {
-    let line = r#"{"result":"secret_list","items":[{"key":"alpha"}]}"#;
-    match parse_admin_response_line(line, "secret_list").unwrap() {
-        AdminResponse::Error { message } => {
-            assert!(message.contains("secret_list"));
-            assert!(message.contains("malformed admin response"));
-            assert!(message.contains("Restart the daemon"));
-        }
-        other => panic!("expected admin error, got {:?}", other),
-    }
 }
 
 #[test]
@@ -2074,7 +2098,7 @@ async fn profile_grant_still_deny_short_circuits_and_falls_through() {
 
 // The gating types (Approval, ApprovalSnapshot, ApprovalStatus, Provisional,
 // ProvisionalStatus, Coverage, GateMode, Reversibility) and AsyncWrite are
-// already in scope via `use super::*;`.
+// already in scope via the imports at the top of this file.
 use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::pin::Pin;
