@@ -417,10 +417,13 @@ pub(super) async fn plan_read_grant(
 }
 
 /// A planned ACL entry pinned to the inode that was vetted. `dev`/`ino` are
-/// captured in the same pass as the policy checks and re-verified through an
-/// `O_PATH` descriptor at apply time, so a path component swapped for a
-/// symlink between evaluation and apply cannot redirect the setfacl to a
-/// different file.
+/// captured in the same pass as the policy checks and re-verified at apply
+/// time, so a path component swapped for a symlink between evaluation and
+/// apply cannot redirect the setfacl to a different file. On Linux the apply
+/// addresses the pinned descriptor through `/proc/self/fd` for a fully
+/// TOCTOU-closed apply; other unix (where the POSIX-ACL `setfacl`/`getfacl`
+/// tools are not present anyway) re-verify the inode by `fstat` and apply by
+/// path.
 #[cfg(unix)]
 #[derive(Debug)]
 pub(super) struct PlannedAclEntry {
@@ -429,17 +432,16 @@ pub(super) struct PlannedAclEntry {
     ino: u64,
 }
 
-/// Open a planned entry's path and verify it is still the exact inode that was
-/// vetted. The returned handle pins the inode: setfacl is addressed through
-/// its `/proc/<pid>/fd/<n>` path while the handle stays open, so nothing the
-/// caller does to the path afterwards can retarget the grant.
+/// Open `path` and verify it is still the exact inode that was vetted, using
+/// `O_NOFOLLOW` so a final-component symlink swap is rejected outright.
+/// Returns the open handle (which pins the inode) on a match.
 #[cfg(unix)]
-fn open_pinned_inode(planned: &PlannedAclEntry) -> Result<std::fs::File> {
+fn open_verified_inode(planned: &PlannedAclEntry, flags: libc::c_int) -> Result<std::fs::File> {
     use std::os::fd::FromRawFd;
     use std::os::unix::fs::MetadataExt;
     let cpath = std::ffi::CString::new(planned.entry.path.as_bytes())
         .context("planned path contains a NUL byte")?;
-    let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    let fd = unsafe { libc::open(cpath.as_ptr(), flags | libc::O_CLOEXEC | libc::O_NOFOLLOW) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error())
             .with_context(|| format!("open {}", planned.entry.path));
@@ -464,7 +466,7 @@ fn open_pinned_inode(planned: &PlannedAclEntry) -> Result<std::fs::File> {
 /// The daemon-side procfs path naming an open descriptor. Spawned setfacl
 /// children resolve it through the daemon's fd table (same uid), reaching the
 /// pinned inode regardless of what the original path now points at.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn proc_fd_path(file: &std::fs::File) -> PathBuf {
     use std::os::fd::AsRawFd;
     PathBuf::from(format!(
@@ -474,19 +476,21 @@ fn proc_fd_path(file: &std::fs::File) -> PathBuf {
     ))
 }
 
-/// Apply a planned set of ACL entries, each addressed through a verified
-/// pinned descriptor. Rolls back everything it applied on a partial failure so
-/// a failed grant never leaves stray ACL entries behind.
-#[cfg(unix)]
+/// Apply a planned set of ACL entries on Linux, each addressed through a
+/// verified `/proc/self/fd` descriptor so the setfacl lands on exactly the
+/// vetted inode. Rolls back everything it applied on a partial failure so a
+/// failed grant never leaves stray ACL entries behind.
+#[cfg(target_os = "linux")]
 pub(super) async fn apply_read_grant_entries(
     grantee_uid: u32,
     entries: &[PlannedAclEntry],
 ) -> Result<()> {
-    // Applied descriptors stay open for the whole apply so a rollback removes
-    // the entries from the same inodes they were added to.
+    // O_PATH is a Linux extension: a handle that pins the inode without needing
+    // read permission on it. Applied descriptors stay open for the whole apply
+    // so a rollback removes the entries from the same inodes they were added to.
     let mut applied: Vec<std::fs::File> = Vec::new();
     for planned in entries {
-        let pinned = match open_pinned_inode(planned) {
+        let pinned = match open_verified_inode(planned, libc::O_PATH) {
             Ok(f) => f,
             Err(e) => {
                 for done in &applied {
@@ -505,6 +509,39 @@ pub(super) async fn apply_read_grant_entries(
             });
         }
         applied.push(pinned);
+    }
+    Ok(())
+}
+
+/// Apply a planned set of ACL entries on non-Linux unix. There is no `O_PATH`
+/// or `/proc/self/fd` here, so the inode is re-verified by `fstat` (with
+/// `O_NOFOLLOW` rejecting a final-component symlink) and setfacl is then
+/// applied by path. This is best-effort: the POSIX-ACL tools this relies on
+/// are not present on macOS/BSD, so the runtime path fails there regardless;
+/// the verification still refuses a swapped inode before spawning anything.
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(super) async fn apply_read_grant_entries(
+    grantee_uid: u32,
+    entries: &[PlannedAclEntry],
+) -> Result<()> {
+    let mut applied: Vec<&PlannedAclEntry> = Vec::new();
+    for planned in entries {
+        if let Err(e) = open_verified_inode(planned, libc::O_RDONLY) {
+            for done in &applied {
+                let _ = setfacl_remove(grantee_uid, Path::new(&done.entry.path)).await;
+            }
+            return Err(e);
+        }
+        let spec = format!("u:{grantee_uid}:{}", planned.entry.perms);
+        if let Err(e) = setfacl_modify(&spec, Path::new(&planned.entry.path)).await {
+            for done in &applied {
+                let _ = setfacl_remove(grantee_uid, Path::new(&done.entry.path)).await;
+            }
+            return Err(e).with_context(|| {
+                format!("grant {} on {}", planned.entry.perms, planned.entry.path)
+            });
+        }
+        applied.push(planned);
     }
     Ok(())
 }
