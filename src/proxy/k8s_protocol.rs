@@ -1,17 +1,16 @@
 //! The Kubernetes [`ProtocolConfig`] — the reference protocol plug-in.
 //! Delegates parsing and Secret redaction to the pure functions in
 //! [`super::k8s`] and keeps every Kubernetes-specific judgment (interactive
-//! subresources, Secret stream semantics, dry-run writes, `resourceVersion`
-//! stripping, `kubectl`-shaped reverts) out of the protocol-agnostic server
+//! subresources, Secret stream semantics, dry-run writes, Kubernetes metadata
+//! stripping, and revert request shapes) out of the protocol-agnostic server
 //! loop.
 
 use serde_json::Value;
 
-use super::gate::ApiRevert;
+use super::gate::HttpRevert;
 use super::k8s;
 use super::op::{ApiOp, Verb};
 use super::protocol::{CreatedIdentity, PlannedRevert, ProtocolConfig};
-use crate::gating::Reversibility;
 
 /// Stateless: all Kubernetes awareness is in the pure functions it delegates
 /// to, so the protocol is a unit value.
@@ -45,7 +44,7 @@ impl ProtocolConfig for KubernetesProtocol {
                 "exec" | "attach" | "portforward" | "proxy" | "ephemeralcontainers"
             ) {
                 return Some(format!(
-                    "guard kube-proxy: subresource '{sub}' is not permitted"
+                    "guard api-proxy: kubernetes subresource '{sub}' is not permitted"
                 ));
             }
         }
@@ -53,7 +52,9 @@ impl ProtocolConfig for KubernetesProtocol {
         // A Secret watch streams object events we cannot redact in phase 1, so it
         // would leak values: deny it regardless of policy.
         if op.is_secrets() && op.verb == Verb::Watch {
-            return Some("guard kube-proxy: watching Secret values is not permitted".to_string());
+            return Some(
+                "guard api-proxy: watching kubernetes Secret values is not permitted".to_string(),
+            );
         }
 
         None
@@ -67,39 +68,83 @@ impl ProtocolConfig for KubernetesProtocol {
         k8s::redact_secret_response(value)
     }
 
-    /// Only bare-resource recoverable writes are tracked: a subresource write is
+    fn error_body(&self, code: u16, message: &str, reason: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "kind": "Status",
+            "apiVersion": "v1",
+            "metadata": {},
+            "status": "Failure",
+            "message": message,
+            "reason": reason,
+            "code": code,
+        }))
+        .expect("Kubernetes Status JSON serialization is infallible")
+    }
+
+    /// Only bare-resource writes with faithful HTTP reverts are tracked: a subresource write is
     /// a different object shape than its parent, so a create-provenance record
     /// for it would let an eviction (`pods/{n}/eviction`) masquerade as a pod
-    /// create and launder a later delete through the contained-delete path,
-    /// and a `Restore` of a `scale`/`status` object does not round-trip
-    /// through the daemon's `kubectl replace` revert.
+    /// create and launder a later delete through the contained-delete path.
     fn tracks_write(&self, op: &ApiOp) -> bool {
         !op.dry_run
             && op.subresource.is_none()
-            && op.reversibility() == Some(Reversibility::Recoverable)
-            && matches!(op.verb, Verb::Create | Verb::Update | Verb::Patch)
+            && matches!(
+                op.verb,
+                Verb::Create | Verb::Update | Verb::Patch | Verb::Delete
+            )
     }
 
     fn wants_prior_snapshot(&self, op: &ApiOp) -> bool {
-        matches!(op.verb, Verb::Update | Verb::Patch) && op.name.is_some()
+        matches!(op.verb, Verb::Update | Verb::Patch | Verb::Delete) && op.name.is_some()
     }
 
-    /// An update/patch with a usable prior state reverts by restoring it; a
-    /// create (or a write whose prior state could not be captured) reverts by
-    /// deleting the possibly server-named object from the response.
+    /// An update/patch with a usable prior state reverts by PUT-restoring it, a
+    /// delete reverts by POST-recreating the sanitized prior object, and a
+    /// create reverts by deleting the possibly server-named object from the
+    /// response.
     fn plan_revert(
         &self,
         op: &ApiOp,
         prior_object: Option<&[u8]>,
         response: &[u8],
     ) -> Result<PlannedRevert, String> {
-        if let Some(snap) = prior_object.and_then(sanitize_prior_object) {
-            let name = op.name.clone().unwrap_or_default();
-            return Ok(PlannedRevert {
-                label: revert_label(op, &name),
-                revert: ApiRevert::Restore { object_json: snap },
-                created: None,
-            });
+        match op.verb {
+            Verb::Update | Verb::Patch => {
+                let snap = sanitize_prior_object(
+                    prior_object.ok_or_else(|| {
+                        "allowed restore-style write but prior snapshot fetch failed; no auto-revert armed"
+                            .to_string()
+                    })?,
+                )?;
+                let name = op.name.clone().unwrap_or_default();
+                return Ok(PlannedRevert {
+                    label: revert_label(op, &name),
+                    revert: HttpRevert {
+                        method: "PUT".to_string(),
+                        path: build_object_path(op, &name),
+                        body: Some(snap),
+                    },
+                    created: None,
+                });
+            }
+            Verb::Delete => {
+                let snap = sanitize_prior_object(prior_object.ok_or_else(|| {
+                    "allowed delete but prior snapshot fetch failed; no auto-revert armed"
+                        .to_string()
+                })?)?;
+                let name = op.name.clone().unwrap_or_default();
+                return Ok(PlannedRevert {
+                    label: revert_label(op, &name),
+                    revert: HttpRevert {
+                        method: "POST".to_string(),
+                        path: build_collection_path(op),
+                        body: Some(snap),
+                    },
+                    created: None,
+                });
+            }
+            Verb::Create => {}
+            _ => return Err("operation has no Kubernetes HTTP revert".to_string()),
         }
 
         let value: Value = serde_json::from_slice(response).map_err(|_| {
@@ -121,13 +166,16 @@ impl ProtocolConfig for KubernetesProtocol {
             .and_then(|n| n.as_str())
             .map(String::from)
             .or_else(|| op.namespace.clone());
+
         Ok(PlannedRevert {
             label: revert_label(op, name),
-            revert: ApiRevert::DeleteCreated {
-                group: op.group.clone(),
-                resource: op.resource.clone(),
-                name: name.to_string(),
-                namespace: namespace.clone(),
+            revert: HttpRevert {
+                method: "DELETE".to_string(),
+                path: build_object_path_with_namespace(op, namespace.as_deref(), name),
+                // Background cascade matches the kubectl delete default, so a
+                // reverted create cleans up dependents the same way an operator
+                // delete would.
+                body: Some(delete_options_background()),
             },
             created: Some(CreatedIdentity {
                 group: op.group.clone(),
@@ -139,23 +187,76 @@ impl ProtocolConfig for KubernetesProtocol {
     }
 }
 
+/// A `DeleteOptions` body requesting background cascading deletion.
+fn delete_options_background() -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "kind": "DeleteOptions",
+        "apiVersion": "v1",
+        "propagationPolicy": "Background",
+    }))
+    .expect("serialize DeleteOptions")
+}
+
 /// Audit label for a tracked write, e.g. `patch deployments/api in dev`.
 fn revert_label(op: &ApiOp, name: &str) -> String {
     let ns = op.namespace.as_deref().unwrap_or("(cluster)");
     format!("{} {}/{} in {}", op.verb.as_str(), op.resource, name, ns)
 }
 
-/// Strip `resourceVersion` and `managedFields` from a prior-object fetch so
-/// the daemon's `kubectl replace` revert is unconditional. `None` if the body
-/// is not parseable JSON (the caller then falls back to a
-/// delete-the-created-object revert built from the write response).
-fn sanitize_prior_object(bytes: &[u8]) -> Option<Vec<u8>> {
-    let mut value: Value = serde_json::from_slice(bytes).ok()?;
+/// Build the Kubernetes API path for an object.
+fn build_object_path(op: &ApiOp, name: &str) -> String {
+    build_object_path_with_namespace(op, op.namespace.as_deref(), name)
+}
+
+fn build_object_path_with_namespace(op: &ApiOp, namespace: Option<&str>, name: &str) -> String {
+    format!(
+        "{}/{}",
+        build_collection_path_with_namespace(op, namespace),
+        name
+    )
+}
+
+fn build_collection_path(op: &ApiOp) -> String {
+    build_collection_path_with_namespace(op, op.namespace.as_deref())
+}
+
+fn build_collection_path_with_namespace(op: &ApiOp, namespace: Option<&str>) -> String {
+    let mut path = if op.group.is_empty() {
+        format!("/api/{}", op.version)
+    } else {
+        format!("/apis/{}/{}", op.group, op.version)
+    };
+    if let Some(ns) = namespace {
+        path.push_str("/namespaces/");
+        path.push_str(ns);
+    }
+    path.push('/');
+    path.push_str(&op.resource);
+    path
+}
+
+/// Strip server-owned metadata from a prior-object fetch so an HTTP restore can
+/// be accepted as a fresh update/create. Returns an error if the body is not
+/// parseable JSON.
+fn sanitize_prior_object(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let mut value: Value = serde_json::from_slice(bytes)
+        .map_err(|_| "prior snapshot was unparsable; no auto-revert armed".to_string())?;
     if let Some(meta) = value.get_mut("metadata").and_then(|m| m.as_object_mut()) {
         meta.remove("resourceVersion");
+        meta.remove("uid");
+        meta.remove("creationTimestamp");
+        meta.remove("generation");
+        meta.remove("selfLink");
         meta.remove("managedFields");
+        // Recreated objects must not inherit owner references to deleted or
+        // mismatched owners; stale references can make garbage collection remove
+        // the restore immediately.
+        meta.remove("ownerReferences");
     }
-    serde_json::to_vec(&value).ok()
+    if let Some(map) = value.as_object_mut() {
+        map.remove("status");
+    }
+    serde_json::to_vec(&value).map_err(|_| "serialize sanitized snapshot".to_string())
 }
 
 #[cfg(test)]
@@ -202,114 +303,95 @@ mod tests {
     }
 
     #[test]
-    fn only_secret_reads_are_redactable() {
+    fn tracks_bare_writes_with_faithful_reverts() {
         let p = KubernetesProtocol;
-        assert!(p.redactable_read(&op("GET", "/api/v1/namespaces/d/secrets/s")));
-        assert!(p.redactable_read(&op("GET", "/api/v1/namespaces/d/secrets")));
-        assert!(!p.redactable_read(&op("GET", "/api/v1/namespaces/d/configmaps/c")));
-        assert!(!p.redactable_read(&op("POST", "/api/v1/namespaces/d/secrets")));
-    }
+        assert!(p.tracks_write(&op("POST", "/api/v1/namespaces/d/pods")));
+        assert!(p.tracks_write(&op("PUT", "/api/v1/namespaces/d/pods/web")));
+        assert!(p.tracks_write(&op("PATCH", "/api/v1/namespaces/d/configmaps/cfg")));
+        assert!(p.tracks_write(&op("DELETE", "/api/v1/namespaces/d/pods/web")));
 
-    #[test]
-    fn tracked_writes_are_bare_recoverable_mutations() {
-        let p = KubernetesProtocol;
-        assert!(p.tracks_write(&op("POST", "/api/v1/namespaces/d/configmaps")));
-        assert!(p.tracks_write(&op("PUT", "/api/v1/namespaces/d/configmaps/c")));
-        assert!(p.tracks_write(&op("PATCH", "/api/v1/namespaces/d/configmaps/c")));
-        // Reads, deletes, dry-runs, and subresource writes are not tracked.
-        assert!(!p.tracks_write(&op("GET", "/api/v1/namespaces/d/configmaps/c")));
-        assert!(!p.tracks_write(&op("DELETE", "/api/v1/namespaces/d/configmaps/c")));
-        assert!(!p.tracks_write(&op_q(
-            "POST",
-            "/api/v1/namespaces/d/configmaps",
-            "dryRun=All"
-        )));
-        assert!(!p.tracks_write(&op(
+        // Subresource writes and dry-runs are not tracked
+        let sub = op_q(
             "PATCH",
-            "/apis/apps/v1/namespaces/d/deployments/api/scale"
-        )));
+            "/api/v1/namespaces/d/pods/web/status",
+            "dryRun=All",
+        );
+        assert!(!p.tracks_write(&sub));
     }
 
     #[test]
-    fn prior_snapshot_only_for_named_update_or_patch() {
+    fn snapshots_taken_for_restore_style_reverts_on_named_objects() {
         let p = KubernetesProtocol;
-        assert!(p.wants_prior_snapshot(&op("PUT", "/api/v1/namespaces/d/configmaps/c")));
-        assert!(p.wants_prior_snapshot(&op("PATCH", "/api/v1/namespaces/d/configmaps/c")));
-        assert!(!p.wants_prior_snapshot(&op("POST", "/api/v1/namespaces/d/configmaps")));
+        assert!(p.wants_prior_snapshot(&op("PUT", "/api/v1/namespaces/d/pods/web")));
+        assert!(p.wants_prior_snapshot(&op("PATCH", "/api/v1/namespaces/d/configmaps/cfg")));
+        assert!(p.wants_prior_snapshot(&op("DELETE", "/api/v1/namespaces/d/pods/web")));
+        assert!(!p.wants_prior_snapshot(&op("POST", "/api/v1/namespaces/d/pods")));
     }
 
     #[test]
-    fn plan_revert_restores_sanitized_prior_object() {
+    fn delete_restore_recreates_sanitized_prior_object_with_post() {
         let p = KubernetesProtocol;
-        let o = op("PATCH", "/api/v1/namespaces/dev/configmaps/app");
+        let o = op("DELETE", "/apis/apps/v1/namespaces/dev/deployments/api");
         let prior = serde_json::json!({
-            "kind": "ConfigMap",
-            "metadata": {"name": "app", "resourceVersion": "42", "managedFields": []},
-            "data": {"k": "old"}
+            "kind": "Deployment",
+            "apiVersion": "apps/v1",
+            "metadata": {
+                "name": "api",
+                "namespace": "dev",
+                "resourceVersion": "42",
+                "uid": "abc",
+                "creationTimestamp": "2026-01-01T00:00:00Z",
+                "generation": 9,
+                "selfLink": "/old",
+                "managedFields": [],
+                "ownerReferences": [{"name": "gone"}]
+            },
+            "spec": {"replicas": 2},
+            "status": {"readyReplicas": 2}
         })
         .to_string();
         let plan = p
             .plan_revert(&o, Some(prior.as_bytes()), b"{}")
-            .expect("plan");
-        assert_eq!(plan.label, "patch configmaps/app in dev");
-        assert!(plan.created.is_none());
-        let ApiRevert::Restore { object_json } = plan.revert else {
-            panic!("expected a restore revert");
-        };
-        let v: Value = serde_json::from_slice(&object_json).unwrap();
-        assert!(v["metadata"].get("resourceVersion").is_none());
-        assert!(v["metadata"].get("managedFields").is_none());
-        assert_eq!(v["data"]["k"], "old");
+            .expect("delete restore plan");
+        assert_eq!(plan.label, "delete deployments/api in dev");
+        assert_eq!(plan.revert.method, "POST");
+        assert_eq!(plan.revert.path, "/apis/apps/v1/namespaces/dev/deployments");
+        let body: Value = serde_json::from_slice(&plan.revert.body.unwrap()).unwrap();
+        let meta = body["metadata"].as_object().unwrap();
+        for stripped in [
+            "resourceVersion",
+            "uid",
+            "creationTimestamp",
+            "generation",
+            "selfLink",
+            "managedFields",
+            "ownerReferences",
+        ] {
+            assert!(
+                meta.get(stripped).is_none(),
+                "{stripped} should be stripped"
+            );
+        }
+        assert!(body.get("status").is_none());
+        assert_eq!(body["spec"]["replicas"], 2);
     }
 
     #[test]
-    fn plan_revert_deletes_created_object_and_records_identity() {
+    fn restore_style_reverts_fail_without_snapshot() {
         let p = KubernetesProtocol;
-        let o = op("POST", "/api/v1/namespaces/dev/configmaps");
-        // The apiserver may name the object (generateName); the response wins.
-        let resp = serde_json::json!({
-            "kind": "ConfigMap",
-            "metadata": {"name": "app-x7k2", "namespace": "dev"}
-        })
-        .to_string();
-        let plan = p.plan_revert(&o, None, resp.as_bytes()).expect("plan");
-        assert_eq!(plan.label, "create configmaps/app-x7k2 in dev");
-        let ApiRevert::DeleteCreated {
-            group,
-            resource,
-            name,
-            namespace,
-        } = plan.revert
-        else {
-            panic!("expected a delete-created revert");
-        };
-        assert_eq!(group, "");
-        assert_eq!(resource, "configmaps");
-        assert_eq!(name, "app-x7k2");
-        assert_eq!(namespace.as_deref(), Some("dev"));
-        let created = plan.created.expect("created identity recorded");
-        assert_eq!(created.name, "app-x7k2");
-        assert_eq!(created.namespace.as_deref(), Some("dev"));
-    }
-
-    #[test]
-    fn plan_revert_falls_back_to_delete_when_prior_is_unparsable() {
-        // An unparsable prior fetch cannot back a restore; the revert degrades
-        // to deleting the object named in the write response.
-        let p = KubernetesProtocol;
-        let o = op("PUT", "/api/v1/namespaces/dev/configmaps/app");
-        let resp = serde_json::json!({"metadata": {"name": "app", "namespace": "dev"}}).to_string();
-        let plan = p
-            .plan_revert(&o, Some(b"not-json"), resp.as_bytes())
-            .expect("plan");
-        assert!(matches!(plan.revert, ApiRevert::DeleteCreated { .. }));
-    }
-
-    #[test]
-    fn plan_revert_fails_without_a_usable_response() {
-        let p = KubernetesProtocol;
-        let o = op("POST", "/api/v1/namespaces/dev/configmaps");
-        assert!(p.plan_revert(&o, None, b"not-json").is_err());
-        assert!(p.plan_revert(&o, None, b"{\"metadata\":{}}").is_err());
+        assert!(p
+            .plan_revert(
+                &op("PATCH", "/api/v1/namespaces/dev/configmaps/app"),
+                None,
+                br#"{"metadata":{"name":"app"}}"#
+            )
+            .is_err());
+        assert!(p
+            .plan_revert(
+                &op("DELETE", "/api/v1/namespaces/dev/configmaps/app"),
+                None,
+                b"{}"
+            )
+            .is_err());
     }
 }

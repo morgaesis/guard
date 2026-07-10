@@ -10,7 +10,6 @@
 //! (dot-segment traversal) are sent over a raw TLS connection.
 
 use std::convert::Infallible;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -117,13 +116,7 @@ async fn spawn_proxy(
     let port = free_port();
     let listen = format!("127.0.0.1:{port}").parse().unwrap();
     let proxy = Arc::new(ApiProxy::with_protocol(
-        protocol,
-        listen,
-        tls,
-        upstream,
-        policy,
-        None,
-        PathBuf::from("unused-in-test"),
+        protocol, listen, tls, upstream, policy, None,
     ));
     tokio::spawn(proxy.serve());
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -640,5 +633,77 @@ async fn vercel_hostile_paths_and_query_smuggling_are_contained() {
     assert!(
         hits[0].1.contains("decrypt=true"),
         "query forwarded verbatim"
+    );
+}
+
+/// The shipped example policies for the GitHub and Vercel protocols parse and
+/// route representative operations the way their comments promise.
+#[test]
+fn shipped_github_policy_parses_and_behaves() {
+    use guard::proxy::ApiAction;
+    let p = ApiPolicy::from_yaml(include_str!("../examples/github-policy.yaml"))
+        .expect("examples/github-policy.yaml must parse");
+    let gh = GithubProtocol;
+    let op = |m: &str, path: &str| gh.parse_op(m, path, "").expect("parse op");
+
+    // Reads are allowed anywhere.
+    assert_eq!(
+        p.decide(&op("GET", "/repos/octo-org/sandbox/issues"))
+            .action,
+        ApiAction::Allow
+    );
+    // Issue writes are allowed only in the sandbox repository.
+    assert_eq!(
+        p.decide(&op("POST", "/repos/octo-org/sandbox/issues"))
+            .action,
+        ApiAction::Allow
+    );
+    assert_eq!(
+        p.decide(&op("POST", "/repos/octo-org/prod/issues")).action,
+        ApiAction::Deny
+    );
+    // Content writes hold; deletes hold.
+    assert_eq!(
+        p.decide(&op("PUT", "/repos/octo-org/sandbox/contents/README.md"))
+            .action,
+        ApiAction::Hold
+    );
+    assert_eq!(
+        p.decide(&op("DELETE", "/repos/octo-org/sandbox/labels/bug"))
+            .action,
+        ApiAction::Hold
+    );
+}
+
+#[test]
+fn shipped_vercel_policy_parses_and_behaves() {
+    use guard::proxy::ApiAction;
+    let p = ApiPolicy::from_yaml(include_str!("../examples/vercel-policy.yaml"))
+        .expect("examples/vercel-policy.yaml must parse");
+    let vc = VercelProtocol;
+    let op = |m: &str, path: &str| vc.parse_op(m, path, "").expect("parse op");
+
+    // Reads are allowed anywhere, env values redacted by classification.
+    let read = p.decide(&op("GET", "/v9/projects/my-preview-app/env"));
+    assert_eq!(read.action, ApiAction::Allow);
+    // Env writes are allowed only in the named project.
+    assert_eq!(
+        p.decide(&op("POST", "/v9/projects/my-preview-app/env"))
+            .action,
+        ApiAction::Allow
+    );
+    assert_eq!(
+        p.decide(&op("POST", "/v9/projects/prod-site/env")).action,
+        ApiAction::Deny
+    );
+    // Deployment triggers and deletes hold.
+    assert_eq!(
+        p.decide(&op("POST", "/v13/deployments")).action,
+        ApiAction::Hold
+    );
+    assert_eq!(
+        p.decide(&op("DELETE", "/v9/projects/my-preview-app/env/abc"))
+            .action,
+        ApiAction::Hold
     );
 }

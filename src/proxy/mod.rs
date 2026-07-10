@@ -19,11 +19,9 @@
 //! apiserver builds on top of these, asking every protocol-specific question
 //! through the [`protocol::ProtocolConfig`] plug-in surface; [`k8s_protocol`]
 //! is the Kubernetes reference implementation, and `github_protocol`/
-//! `vercel_protocol` (behind the `protocol-examples` cargo feature) are example
-//! configs proving the surface generalizes.
+//! `vercel_protocol` are example configs proving the surface generalizes.
 
 pub mod gate;
-#[cfg(feature = "protocol-examples")]
 pub mod github_protocol;
 pub mod k8s;
 pub mod k8s_protocol;
@@ -34,11 +32,9 @@ pub mod protocol;
 pub mod server;
 pub mod tls;
 pub mod upstream;
-#[cfg(feature = "protocol-examples")]
 pub mod vercel_protocol;
 
-pub use gate::{ApiMutation, ApiRevert, GateSink, HoldDecision};
-#[cfg(feature = "protocol-examples")]
+pub use gate::{ApiMutation, GateSink, HoldDecision, HttpRevert};
 pub use github_protocol::GithubProtocol;
 pub use k8s_protocol::KubernetesProtocol;
 pub use kubeconfig::{brokered_kubeconfig, validate_brokered_kubeconfig, BrokerError};
@@ -47,6 +43,5 @@ pub use policy::{ApiAction, ApiPolicy, ApiRule};
 pub use protocol::{CreatedIdentity, PlannedRevert, ProtocolConfig};
 pub use server::ApiProxy;
 pub use tls::ProxyTls;
-pub use upstream::Upstream;
-#[cfg(feature = "protocol-examples")]
+pub use upstream::{Upstream, UpstreamAuth};
 pub use vercel_protocol::VercelProtocol;

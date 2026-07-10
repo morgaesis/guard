@@ -816,6 +816,37 @@ enum ServerCommands {
         #[arg(long = "child-env", value_name = "VAR[,VAR]", value_delimiter = ',')]
         child_env: Option<Vec<String>>,
 
+        /// Front an HTTP API with a TLS-terminating, protocol-aware proxy on
+        /// ADDR (loopback only). Requires --api-protocol, --api-upstream, and a
+        /// bearer token supplied by --api-token-env or --api-token-file. Env:
+        /// GUARD_API_PROXY.
+        #[arg(long = "api-proxy", value_name = "ADDR")]
+        api_proxy: Option<String>,
+
+        /// Protocol parser for --api-proxy: kubernetes, github, or vercel. Env:
+        /// GUARD_API_PROTOCOL.
+        #[arg(long = "api-protocol", value_name = "NAME")]
+        api_protocol: Option<String>,
+
+        /// Base upstream URL for --api-proxy. Env: GUARD_API_UPSTREAM.
+        #[arg(long = "api-upstream", value_name = "URL")]
+        api_upstream: Option<String>,
+
+        /// Environment variable containing the upstream bearer token. Env:
+        /// GUARD_API_TOKEN_ENV.
+        #[arg(long = "api-token-env", value_name = "VAR")]
+        api_token_env: Option<String>,
+
+        /// File containing the upstream bearer token. Env:
+        /// GUARD_API_TOKEN_FILE.
+        #[arg(long = "api-token-file", value_name = "PATH")]
+        api_token_file: Option<PathBuf>,
+
+        /// Write the proxy CA certificate PEM here for generic API clients.
+        /// Env: GUARD_API_CA_OUT.
+        #[arg(long = "api-ca-out", value_name = "PATH")]
+        api_ca_out: Option<PathBuf>,
+
         /// Front the Kubernetes apiserver with a TLS-terminating proxy on ADDR
         /// (e.g. 127.0.0.1:8443). Each API request from a brokered client (helm,
         /// kubectl, terraform, k9s, client libraries) is gated against

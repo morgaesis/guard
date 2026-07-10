@@ -9,7 +9,7 @@
 //! ([`super::k8s_protocol::KubernetesProtocol`]) as the reference
 //! implementation.
 
-use super::gate::ApiRevert;
+use super::gate::HttpRevert;
 use super::op::ApiOp;
 
 /// Identity of an object a tracked write created. The proxy records it (scoped
@@ -30,7 +30,7 @@ pub struct PlannedRevert {
     /// Human label for the audit log and `guard provisionals`, e.g.
     /// `patch deployments/api in dev`.
     pub label: String,
-    pub revert: ApiRevert,
+    pub revert: HttpRevert,
     /// Set when the write created a new object; the proxy records it for
     /// delete-provenance matching.
     pub created: Option<CreatedIdentity>,
@@ -61,6 +61,18 @@ pub trait ProtocolConfig: Send + Sync {
     /// Redact secret material from a response body, in place. Returns the
     /// number of objects redacted.
     fn redact_response(&self, value: &mut serde_json::Value) -> usize;
+
+    /// Client-facing error body for proxy-generated denials and upstream
+    /// failures. Kubernetes overrides this with a `Status`; other protocols use
+    /// plain JSON.
+    fn error_body(&self, code: u16, message: &str, reason: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "error": message,
+            "reason": reason,
+            "code": code,
+        }))
+        .expect("proxy error JSON serialization is infallible")
+    }
 
     /// Whether a successful write of this operation is wrapped in an
     /// auto-revert envelope when the consequence gate is active.

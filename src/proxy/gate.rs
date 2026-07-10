@@ -3,27 +3,23 @@
 //! When the proxy forwards a recoverable write, it captures what is needed to
 //! undo it (the prior object, or the identity of a created one) and hands it to
 //! a [`GateSink`]. The daemon implements the sink by arming a `Provisional` in
-//! the shared registry with a `kubectl`-based revert, so the existing auto-revert
+//! the shared registry with an API-revert request, so the existing auto-revert
 //! sweeper and `guard confirm`/`guard provisionals` apply unchanged. Keeping the
 //! sink a trait keeps the proxy (lib) free of the daemon's persistence types.
 
 use async_trait::async_trait;
 
-/// How to undo a recoverable API mutation the proxy just forwarded.
-#[derive(Debug, Clone)]
-pub enum ApiRevert {
-    /// Restore a prior object captured before an update/patch. The daemon writes
-    /// the JSON to a file and reverts with `kubectl replace -f <file>`. The proxy
-    /// strips `resourceVersion` first so the replace is unconditional.
-    Restore { object_json: Vec<u8> },
-    /// Delete an object the request created. The daemon reverts with
-    /// `kubectl delete <resource>[.group] <name> [-n <ns>]`.
-    DeleteCreated {
-        group: String,
-        resource: String,
-        name: String,
-        namespace: Option<String>,
-    },
+/// How to undo a recoverable API mutation via an HTTP request through the upstream.
+/// This is protocol-generic; the protocol builds the full request plan including path.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HttpRevert {
+    /// HTTP method (GET, POST, PUT, DELETE, etc.)
+    pub method: String,
+    /// Full request path (protocol-specific; does not include base URL)
+    pub path: String,
+    /// Optional request body
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<Vec<u8>>,
 }
 
 /// A recoverable mutation to wrap in an auto-revert envelope.
@@ -32,7 +28,9 @@ pub struct ApiMutation {
     /// Human label for the audit log and `guard provisionals`, e.g.
     /// `patch deployments/api in dev`.
     pub label: String,
-    pub revert: ApiRevert,
+    /// The HTTP request that undoes the mutation, executed through the
+    /// protocol's upstream with the daemon's credential.
+    pub revert: HttpRevert,
 }
 
 /// Operator decision on a held API request.

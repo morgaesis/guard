@@ -66,9 +66,6 @@ pub struct ApiProxy {
     protocol: Arc<dyn ProtocolConfig>,
     policy: Arc<RwLock<ApiPolicy>>,
     policy_path: Option<PathBuf>,
-    /// The operator's real kubeconfig path, used by the daemon to build the
-    /// `kubectl` revert when an auto-revert envelope fires.
-    real_kubeconfig: PathBuf,
     /// Bridge to the daemon's consequence machinery, attached before serving.
     /// When present, recoverable writes are wrapped in an auto-revert envelope.
     gate: OnceLock<Arc<dyn GateSink>>,
@@ -210,7 +207,6 @@ impl ApiProxy {
         upstream: Upstream,
         policy: ApiPolicy,
         policy_path: Option<PathBuf>,
-        real_kubeconfig: PathBuf,
     ) -> Self {
         Self::with_protocol(
             Arc::new(KubernetesProtocol),
@@ -219,7 +215,6 @@ impl ApiProxy {
             upstream,
             policy,
             policy_path,
-            real_kubeconfig,
         )
     }
 
@@ -233,7 +228,6 @@ impl ApiProxy {
         upstream: Upstream,
         policy: ApiPolicy,
         policy_path: Option<PathBuf>,
-        real_kubeconfig: PathBuf,
     ) -> Self {
         let proxy_url = format!("https://127.0.0.1:{}", listen.port());
         Self {
@@ -244,7 +238,6 @@ impl ApiProxy {
             protocol,
             policy: Arc::new(RwLock::new(policy)),
             policy_path,
-            real_kubeconfig,
             gate: OnceLock::new(),
             created: Mutex::new(CreatedRegistry::default()),
             next_conn: AtomicU64::new(1),
@@ -276,9 +269,12 @@ impl ApiProxy {
         let _ = self.gate.set(sink);
     }
 
-    /// The operator's real kubeconfig path (for building reverts).
-    pub fn real_kubeconfig(&self) -> &std::path::Path {
-        &self.real_kubeconfig
+    pub fn protocol_name(&self) -> &str {
+        self.protocol.name()
+    }
+
+    pub fn upstream(&self) -> &Upstream {
+        &self.upstream
     }
 
     pub fn listen(&self) -> SocketAddr {
@@ -299,12 +295,17 @@ impl ApiProxy {
     /// fatal bind error, so the daemon's listener supervision restarts the
     /// process the same way the gate socket does.
     pub async fn serve(self: Arc<Self>) -> Result<()> {
-        let listener = TcpListener::bind(self.listen)
-            .await
-            .with_context(|| format!("bind kube-proxy listener on {}", self.listen))?;
+        let listener = TcpListener::bind(self.listen).await.with_context(|| {
+            format!(
+                "bind api-proxy listener for {} on {}",
+                self.protocol.name(),
+                self.listen
+            )
+        })?;
         let acceptor = TlsAcceptor::from(self.tls.server_config());
         tracing::info!(
-            "guard kube-proxy listening on https://{} -> {}",
+            "guard api-proxy ({}) listening on https://{} -> {}",
+            self.protocol.name(),
             self.listen,
             self.upstream.base()
         );
@@ -318,7 +319,7 @@ impl ApiProxy {
             let (tcp, _peer) = match listener.accept().await {
                 Ok(pair) => pair,
                 Err(e) => {
-                    tracing::warn!("kube-proxy accept error: {}", e);
+                    tracing::warn!("api-proxy accept error: {}", e);
                     continue;
                 }
             };
@@ -331,7 +332,7 @@ impl ApiProxy {
                 let tls_stream = match acceptor.accept(tcp).await {
                     Ok(s) => s,
                     Err(e) => {
-                        tracing::debug!("kube-proxy TLS handshake failed: {}", e);
+                        tracing::debug!("api-proxy TLS handshake failed: {}", e);
                         return;
                     }
                 };
@@ -344,7 +345,7 @@ impl ApiProxy {
                     .serve_connection(io, svc)
                     .await
                 {
-                    tracing::debug!("kube-proxy connection error: {}", e);
+                    tracing::debug!("api-proxy connection error: {}", e);
                 }
             });
         }
@@ -363,9 +364,9 @@ impl ApiProxy {
         // separators, so such a path would be gated as one request and served
         // as another; reject it before parsing.
         if path_alters_on_forward(&path) {
-            return status_resp(
+            return self.status_resp(
                 StatusCode::FORBIDDEN,
-                "guard kube-proxy: path with dot segments or encoded separators is not forwarded",
+                "guard api-proxy: path with dot segments or encoded separators is not forwarded",
                 "Forbidden",
             );
         }
@@ -376,9 +377,9 @@ impl ApiProxy {
             if method == Method::GET || method == Method::HEAD {
                 return self.forward(req, &path, &query, false, None, conn_id).await;
             }
-            return status_resp(
+            return self.status_resp(
                 StatusCode::FORBIDDEN,
-                "guard kube-proxy: non-resource write blocked",
+                "guard api-proxy: non-resource write blocked",
                 "Forbidden",
             );
         };
@@ -386,7 +387,7 @@ impl ApiProxy {
         // Operations the protocol never forwards regardless of policy: streams
         // the request-level gate cannot inspect or redact per object.
         if let Some(reason) = self.protocol.deny_outright(&op) {
-            return status_resp(StatusCode::FORBIDDEN, &reason, "Forbidden");
+            return self.status_resp(StatusCode::FORBIDDEN, &reason, "Forbidden");
         }
 
         let label = format!("{} {}", op.verb.as_str(), path);
@@ -401,7 +402,7 @@ impl ApiProxy {
         if op.verb == Verb::Delete && op.subresource.is_none() {
             if let Some(handle) = self.take_created_provenance(&op, conn_id) {
                 tracing::info!(
-                    target: "guard::kubeproxy",
+                    target: "guard::apiproxy",
                     "ALLOW {} (contained: guard-created this session, resolving auto-revert {})",
                     label,
                     handle
@@ -409,19 +410,21 @@ impl ApiProxy {
                 if let Some(gate) = self.gate.get() {
                     gate.resolve(&handle).await;
                 }
-                return self
-                    .forward(req, &path, &query, false, Some(op), conn_id)
-                    .await;
+                return self.forward(req, &path, &query, false, None, conn_id).await;
             }
         }
 
         let decision = self.policy.read().await.decide(&op);
         match decision.action {
             ApiAction::Deny => {
-                tracing::info!(target: "guard::kubeproxy", "DENY {} ({})", label, decision.reason);
-                status_resp(
+                tracing::info!(target: "guard::apiproxy", "DENY {} ({})", label, decision.reason);
+                self.status_resp(
                     StatusCode::FORBIDDEN,
-                    &format!("guard kube-proxy denied {label}: {}", decision.reason),
+                    &format!(
+                        "guard api-proxy ({}) denied {label}: {}",
+                        self.protocol.name(),
+                        decision.reason
+                    ),
                     "Forbidden",
                 )
             }
@@ -442,7 +445,7 @@ impl ApiProxy {
                             decision.reason
                         );
                         tracing::info!(
-                            target: "guard::kubeproxy",
+                            target: "guard::apiproxy",
                             "ESCALATE {} (rare shape under an allow rule)",
                             label
                         );
@@ -452,7 +455,7 @@ impl ApiProxy {
                     }
                 }
                 let redact = self.protocol.redactable_read(&op);
-                tracing::info!(target: "guard::kubeproxy", "ALLOW {}{}", label, if redact { " (redacting)" } else { "" });
+                tracing::info!(target: "guard::apiproxy", "ALLOW {}{}", label, if redact { " (redacting)" } else { "" });
                 self.forward(req, &path, &query, redact, Some(op), conn_id)
                     .await
             }
@@ -494,20 +497,21 @@ impl ApiProxy {
         // explicit approval forwards it.
         let Some(gate) = self.gate.get() else {
             tracing::info!(
-                target: "guard::kubeproxy",
+                target: "guard::apiproxy",
                 "HOLD {} denied: no approval queue (--gate consequence is not active)",
                 label
             );
-            return status_resp(
+            return self.status_resp(
                 StatusCode::FORBIDDEN,
                 &format!(
-                    "guard kube-proxy: {label} requires operator approval, but the daemon \
-                     is running without --gate consequence (no approval queue); denied"
+                    "guard api-proxy ({}): {label} requires operator approval, but the daemon \
+                     is running without --gate consequence (no approval queue); denied",
+                    self.protocol.name()
                 ),
                 "Forbidden",
             );
         };
-        tracing::info!(target: "guard::kubeproxy", "HOLD {} ({})", label, reason);
+        tracing::info!(target: "guard::apiproxy", "HOLD {} ({})", label, reason);
         match gate.hold_request(label, reason).await {
             HoldDecision::Approved { handle } => {
                 // Redaction follows the protocol's classification, not the rule
@@ -516,7 +520,7 @@ impl ApiProxy {
                 // leak values.
                 let redact = self.protocol.redactable_read(op);
                 tracing::info!(
-                    target: "guard::kubeproxy",
+                    target: "guard::apiproxy",
                     "ALLOW {} (operator approved hold {}){}",
                     label,
                     handle,
@@ -526,10 +530,13 @@ impl ApiProxy {
                     .await
             }
             HoldDecision::Denied { reason } => {
-                tracing::info!(target: "guard::kubeproxy", "DENY {} (held: {})", label, reason);
-                status_resp(
+                tracing::info!(target: "guard::apiproxy", "DENY {} (held: {})", label, reason);
+                self.status_resp(
                     StatusCode::FORBIDDEN,
-                    &format!("guard kube-proxy: {label} held for operator approval: {reason}"),
+                    &format!(
+                        "guard api-proxy ({}): {label} held for operator approval: {reason}",
+                        self.protocol.name()
+                    ),
                     "Forbidden",
                 )
             }
@@ -551,10 +558,13 @@ impl ApiProxy {
         {
             Ok(resp) => resp,
             Err(e) => {
-                tracing::warn!(target: "guard::kubeproxy", "upstream error for {path}: {e:#}");
-                status_resp(
+                tracing::warn!(target: "guard::apiproxy", "upstream error for {path}: {e:#}");
+                self.status_resp(
                     StatusCode::BAD_GATEWAY,
-                    &format!("guard kube-proxy: upstream error: {e}"),
+                    &format!(
+                        "guard api-proxy ({}): upstream error: {e}",
+                        self.protocol.name()
+                    ),
                     "InternalError",
                 )
             }
@@ -659,9 +669,9 @@ impl ApiProxy {
                     .expect("build Secret error response"));
             }
             if !is_json(&upstream_headers) {
-                return Ok(status_resp(
+                return Ok(self.status_resp(
                     StatusCode::BAD_GATEWAY,
-                    "guard kube-proxy: refusing to stream a non-JSON Secret response unredacted",
+                    "guard api-proxy: refusing to stream a non-JSON Secret response unredacted",
                     "InternalError",
                 ));
             }
@@ -673,15 +683,15 @@ impl ApiProxy {
                 Ok(v) => v,
                 // Fail closed: never pass an unparsed Secret body through.
                 Err(_) => {
-                    return Ok(status_resp(
+                    return Ok(self.status_resp(
                         StatusCode::BAD_GATEWAY,
-                        "guard kube-proxy: could not parse Secret response for redaction",
+                        "guard api-proxy: could not parse Secret response for redaction",
                         "InternalError",
                     ));
                 }
             };
             let n = self.protocol.redact_response(&mut value);
-            tracing::info!(target: "guard::kubeproxy", "redacted {n} Secret object(s) on {path}");
+            tracing::info!(target: "guard::apiproxy", "redacted {n} Secret object(s) on {path}");
             let out = serde_json::to_vec(&value).context("re-serialize redacted Secret")?;
             return Ok(builder
                 .body(full_body(Bytes::from(out)))
@@ -753,7 +763,7 @@ impl ApiProxy {
             Ok(plan) => plan,
             // The write is already live; a failed plan only means no auto-revert.
             Err(reason) => {
-                tracing::warn!(target: "guard::kubeproxy", "{reason}");
+                tracing::warn!(target: "guard::apiproxy", "{reason}");
                 return;
             }
         };
@@ -778,10 +788,10 @@ impl ApiProxy {
                 if let Some(key) = created_key {
                     self.created.lock().unwrap().remember(key, handle.clone());
                 }
-                tracing::info!(target: "guard::kubeproxy", "armed auto-revert {handle} for {label}")
+                tracing::info!(target: "guard::apiproxy", "armed auto-revert {handle} for {label}")
             }
             None => tracing::warn!(
-                target: "guard::kubeproxy",
+                target: "guard::apiproxy",
                 "could not arm auto-revert for {label} (capacity)"
             ),
         }
@@ -802,26 +812,15 @@ impl ApiProxy {
         };
         self.created.lock().unwrap().take(&key)
     }
-}
 
-/// Build a Kubernetes `Status` error body so clients (kubectl/helm) surface a
-/// clean message instead of a transport error.
-fn status_resp(code: StatusCode, message: &str, reason: &str) -> Response<ProxyBody> {
-    let status = serde_json::json!({
-        "kind": "Status",
-        "apiVersion": "v1",
-        "metadata": {},
-        "status": "Failure",
-        "message": message,
-        "reason": reason,
-        "code": code.as_u16(),
-    });
-    let body = full_body(Bytes::from(status.to_string()));
-    Response::builder()
-        .status(code)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(body)
-        .expect("build status response")
+    fn status_resp(&self, code: StatusCode, message: &str, reason: &str) -> Response<ProxyBody> {
+        let body = self.protocol.error_body(code.as_u16(), message, reason);
+        Response::builder()
+            .status(code)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(full_body(Bytes::from(body)))
+            .expect("build status response")
+    }
 }
 
 fn full_body(bytes: Bytes) -> ProxyBody {
@@ -900,11 +899,11 @@ async fn policy_reloader(path: PathBuf, policy: Arc<RwLock<ApiPolicy>>) {
         match ApiPolicy::load_file(&path) {
             Ok(p) => {
                 *policy.write().await = p;
-                tracing::info!(target: "guard::kubeproxy", "reloaded api-policy from {}", path.display());
+                tracing::info!(target: "guard::apiproxy", "reloaded api-policy from {}", path.display());
             }
             Err(e) => {
                 tracing::error!(
-                    target: "guard::kubeproxy",
+                    target: "guard::apiproxy",
                     "api-policy reload failed ({}); keeping previous policy: {e}",
                     path.display()
                 );
@@ -983,7 +982,6 @@ mod tests {
             upstream,
             ApiPolicy::deny_all(),
             None,
-            PathBuf::from("/nonexistent/kubeconfig"),
         )
     }
 

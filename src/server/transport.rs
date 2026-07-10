@@ -29,7 +29,7 @@ use tokio::sync::RwLock;
 
 use super::admin::handle_admin_request;
 use super::execute::{execute_command, execute_command_streaming};
-use super::gate_runtime::{gating_sweeper, now_unix, DaemonGateSink, KUBE_PROXY_SENTINEL_BINARY};
+use super::gate_runtime::{gating_sweeper, now_unix, DaemonGateSink, API_PROXY_SENTINEL_BINARY};
 use super::grants::handle_grant_request;
 #[cfg(unix)]
 use super::grants::{delete_read_grant_row, revoke_read_grant_acls};
@@ -117,10 +117,14 @@ impl Server {
         self.config.extra_child_env = vars;
     }
 
-    /// Attach a Kubernetes API proxy to run alongside the gate socket. Must be
+    /// Attach an API proxy to run alongside the gate socket. Must be
     /// called before `run`.
-    pub fn set_kube_proxy(&mut self, proxy: Arc<guard::proxy::ApiProxy>) {
-        self.config.kube_proxy = Some(proxy);
+    pub async fn register_api_proxy(&mut self, proxy: Arc<guard::proxy::ApiProxy>) {
+        self.config
+            .protocol_registry
+            .write()
+            .await
+            .insert(proxy.protocol_name().to_string(), proxy);
     }
 
     /// Load persisted provisional/approval state and apply startup recovery:
@@ -179,15 +183,20 @@ impl Server {
                         }
                     }
                 }
-                // A kube-proxy hold cannot survive a restart: the parked HTTP
+                // An API-proxy hold cannot survive a restart: the parked HTTP
                 // request died with the old process, so a still-pending row
                 // would offer the operator an approval that releases nothing.
+                // A proxy hold is identified the same way the approve path
+                // identifies one: the sentinel binary AND daemon-principal
+                // ownership (peer credentials assign that principal only to the
+                // daemon's own gate sink).
                 let orphaned: Vec<String> = reg
                     .list()
                     .into_iter()
                     .filter(|a| {
                         a.status == ApprovalStatus::Pending
-                            && a.snapshot.binary == KUBE_PROXY_SENTINEL_BINARY
+                            && a.snapshot.binary == API_PROXY_SENTINEL_BINARY
+                            && matches!(&a.snapshot.principal, Some(p) if self.config.daemon_principal.eq_ci(p))
                     })
                     .map(|a| a.handle)
                     .collect();
@@ -205,7 +214,7 @@ impl Server {
                 }
                 if !orphaned.is_empty() {
                     tracing::warn!(
-                        "[AUDIT] STARTUP_RECOVERY kube_proxy_holds_retired={} handles={:?}",
+                        "[AUDIT] STARTUP_RECOVERY api_proxy_holds_retired={} handles={:?}",
                         orphaned.len(),
                         orphaned
                     );
@@ -304,7 +313,15 @@ impl Server {
             }));
         }
 
-        if let Some(ref proxy) = self.config.kube_proxy {
+        let proxies: Vec<_> = self
+            .config
+            .protocol_registry
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect();
+        for proxy in proxies {
             // The auto-revert envelope needs the consequence sweeper, which only
             // runs under `--gate consequence`. Without it the proxy still gates
             // (allow/deny/hold/redact) but forwards recoverable writes unwrapped.
@@ -314,27 +331,32 @@ impl Server {
                     .state_db_path
                     .as_ref()
                     .and_then(|p| p.parent())
-                    .map(|d| d.join("kube-proxy-reverts"))
-                    .unwrap_or_else(|| std::env::temp_dir().join("guard-kube-proxy-reverts"));
+                    .map(|d| d.join("api-proxy-reverts"))
+                    .unwrap_or_else(|| std::env::temp_dir().join("guard-api-proxy-reverts"));
                 if let Err(e) = std::fs::create_dir_all(&snapshot_dir) {
                     tracing::warn!(
-                        "could not create kube-proxy revert dir {}: {}",
+                        "could not create api-proxy revert dir {}: {}",
                         snapshot_dir.display(),
                         e
                     );
                 }
                 proxy.attach_gate(Arc::new(DaemonGateSink {
                     config: self.config.clone(),
-                    kubeconfig: proxy.real_kubeconfig().to_path_buf(),
+                    protocol: proxy.protocol_name().to_string(),
                     snapshot_dir,
                     window_secs: DEFAULT_CONFIRM_WITHIN_SECS,
                 }));
             } else {
                 tracing::info!(
-                    "kube-proxy: --gate consequence not set; recoverable writes forwarded without auto-revert and policy 'hold' rules deny fail-closed (no approval queue)"
+                    "api-proxy ({}): --gate consequence not set; recoverable writes forwarded without auto-revert and policy 'hold' rules deny fail-closed (no approval queue)",
+                    proxy.protocol_name()
                 );
             }
-            tracing::info!("Starting kube-proxy listener on {}", proxy.listen());
+            tracing::info!(
+                "Starting api-proxy ({}) listener on {}",
+                proxy.protocol_name(),
+                proxy.listen()
+            );
             let proxy = proxy.clone();
             futures.push(tokio::spawn(async move { proxy.serve().await }));
         }

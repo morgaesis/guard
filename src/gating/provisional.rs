@@ -14,6 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use super::GateError;
 use crate::principal::{scope_eq, PrincipalKey};
@@ -88,6 +89,10 @@ pub struct Provisional {
     /// agent-supplied `--revert` that was itself evaluated to APPROVE at arm time.
     pub revert_binary: String,
     pub revert_args: Vec<String>,
+    /// Structured API revert plan for proxy-originated provisionals. Command
+    /// reverts leave this unset and use `revert_binary` / `revert_args`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_revert: Option<ApiRevertPlan>,
     /// Short, caller-facing rationale for the original approval.
     pub reason: String,
     pub created_unix: u64,
@@ -106,12 +111,24 @@ pub struct Provisional {
 
 impl Provisional {
     pub fn revert_command_line(&self) -> String {
+        if let Some(api) = &self.api_revert {
+            return format!("{} {} {}", api.protocol, api.method, api.path);
+        }
         if self.revert_args.is_empty() {
             self.revert_binary.clone()
         } else {
             format!("{} {}", self.revert_binary, self.revert_args.join(" "))
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiRevertPlan {
+    pub protocol: String,
+    pub method: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_file: Option<PathBuf>,
 }
 
 /// In-memory registry of provisional executions. Pure: no clock, no I/O.
@@ -311,6 +328,7 @@ mod tests {
             args: vec!["restart".into(), "app".into()],
             revert_binary: "systemctl".into(),
             revert_args: vec!["stop".into(), "app".into()],
+            api_revert: None,
             reason: "restart".into(),
             created_unix: 100,
             deadline_unix: deadline,

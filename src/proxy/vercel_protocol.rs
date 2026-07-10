@@ -3,11 +3,12 @@
 //! under a `/v{n}/` version prefix parses into the shared [`ApiOp`] (so an
 //! unmodeled write falls to policy default-deny rather than slipping past as a
 //! non-resource path), project environment variables are value-bearing on read
-//! and therefore redacted, deployment log streams are denied outright, and no
-//! revert is constructible (see [`ProtocolConfig::plan_revert`] below).
+//! and therefore redacted, deployment log streams are denied outright, and
+//! env-var deletes can be restored from a pre-delete snapshot.
 
 use serde_json::Value;
 
+use super::gate::HttpRevert;
 use super::op::{ApiOp, Verb};
 use super::protocol::{PlannedRevert, ProtocolConfig};
 
@@ -141,25 +142,48 @@ impl ProtocolConfig for VercelProtocol {
         }
     }
 
-    /// No Vercel write is tracked: `ApiRevert` reverts execute as `kubectl`
-    /// commands in the daemon sink, so no revert is constructible for this
-    /// protocol. Revert synthesis for non-Kubernetes protocols is what a
-    /// daemon-side protocol-generic revert runner unlocks.
-    fn tracks_write(&self, _op: &ApiOp) -> bool {
-        false
+    fn tracks_write(&self, op: &ApiOp) -> bool {
+        op.verb == Verb::Delete
+            && op.resource == "env"
+            && op.subresource.is_none()
+            && op.namespace.is_some()
+            && op.name.is_some()
     }
 
-    fn wants_prior_snapshot(&self, _op: &ApiOp) -> bool {
-        false
+    fn wants_prior_snapshot(&self, op: &ApiOp) -> bool {
+        self.tracks_write(op)
     }
 
     fn plan_revert(
         &self,
-        _op: &ApiOp,
-        _prior_object: Option<&[u8]>,
+        op: &ApiOp,
+        prior_object: Option<&[u8]>,
         _response: &[u8],
     ) -> Result<PlannedRevert, String> {
-        Err("vercel: no constructible revert for this protocol yet (ApiRevert reverts execute as kubectl commands in the daemon sink)".to_string())
+        if !self.tracks_write(op) {
+            return Err("vercel: no faithful API revert for this operation".to_string());
+        }
+        let body = prior_object
+            .and_then(sanitize_env_snapshot)
+            .ok_or_else(|| {
+                "vercel: env-var delete snapshot could not be fetched or parsed; no auto-revert armed"
+                    .to_string()
+            })?;
+        let project = op.namespace.as_deref().ok_or_else(|| {
+            "vercel: env-var delete has no project namespace; no auto-revert armed".to_string()
+        })?;
+        let name = op.name.as_deref().ok_or_else(|| {
+            "vercel: env-var delete has no env id; no auto-revert armed".to_string()
+        })?;
+        Ok(PlannedRevert {
+            label: format!("delete env/{name} in {project}"),
+            revert: HttpRevert {
+                method: "POST".to_string(),
+                path: format!("/{}/projects/{project}/env", op.version),
+                body: Some(body),
+            },
+            created: None,
+        })
     }
 }
 
@@ -179,6 +203,21 @@ fn strip_env_value(obj: &mut Value) -> bool {
         return false;
     };
     map.remove("value").is_some()
+}
+
+fn sanitize_env_snapshot(bytes: &[u8]) -> Option<Vec<u8>> {
+    let value: Value = serde_json::from_slice(bytes).ok()?;
+    let map = value.as_object()?;
+    let mut out = serde_json::Map::new();
+    for field in ["key", "value", "target", "type", "gitBranch", "comment"] {
+        if let Some(v) = map.get(field) {
+            out.insert(field.to_string(), v.clone());
+        }
+    }
+    if !out.contains_key("key") || !out.contains_key("value") {
+        return None;
+    }
+    serde_json::to_vec(&Value::Object(out)).ok()
 }
 
 #[cfg(test)]
@@ -275,11 +314,36 @@ mod tests {
     }
 
     #[test]
-    fn no_write_is_tracked_and_no_revert_is_constructible() {
+    fn only_env_deletes_are_tracked_and_recreated() {
         let p = VercelProtocol;
-        let o = op("PATCH", "/v9/projects/prj_123");
-        assert!(!p.tracks_write(&o));
-        assert!(!p.wants_prior_snapshot(&o));
-        assert!(p.plan_revert(&o, None, b"{}").is_err());
+        let project = op("PATCH", "/v9/projects/prj_123");
+        assert!(!p.tracks_write(&project));
+        assert!(!p.wants_prior_snapshot(&project));
+        assert!(p.plan_revert(&project, None, b"{}").is_err());
+
+        let env = op("DELETE", "/v9/projects/prj_123/env/env_abc");
+        assert!(p.tracks_write(&env));
+        assert!(p.wants_prior_snapshot(&env));
+        let snapshot = serde_json::json!({
+            "id": "env_abc",
+            "key": "DATABASE_URL",
+            "value": "postgres://example",
+            "target": ["production"],
+            "type": "encrypted",
+            "createdAt": 123
+        })
+        .to_string();
+        let plan = p
+            .plan_revert(&env, Some(snapshot.as_bytes()), b"{}")
+            .expect("env restore plan");
+        assert_eq!(plan.label, "delete env/env_abc in prj_123");
+        assert_eq!(plan.revert.method, "POST");
+        assert_eq!(plan.revert.path, "/v9/projects/prj_123/env");
+        let body: Value = serde_json::from_slice(&plan.revert.body.unwrap()).unwrap();
+        assert_eq!(body["key"], "DATABASE_URL");
+        assert_eq!(body["value"], "postgres://example");
+        assert_eq!(body["target"][0], "production");
+        assert!(body.get("id").is_none());
+        assert!(body.get("createdAt").is_none());
     }
 }

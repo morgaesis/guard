@@ -15,15 +15,8 @@ path = "src/lib.rs"
 name = "guard"
 path = "src/main.rs"
 
-[features]
-# Compile the illustrative GitHub/Vercel ProtocolConfig plug-ins and their
-# end-to-end tests. Off by default: they demonstrate the plug-in surface and
-# are not wired to the CLI, so the release binary does not carry them.
-protocol-examples = []
-
 [[test]]
 name = "protocol_examples"
-required-features = ["protocol-examples"]
 
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }

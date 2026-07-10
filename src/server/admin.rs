@@ -15,7 +15,7 @@ use super::execute::{
 };
 use super::gate_runtime::{
     execute_snapshot, finish_revert, forget_proxy_provenance, now_unix, persist_approval,
-    persist_provisional, KUBE_PROXY_SENTINEL_BINARY,
+    persist_provisional, API_PROXY_SENTINEL_BINARY,
 };
 use super::wire::{
     verb_effective_trust, AdminRequest, AdminResponse, ApprovalSummary, CallerIdentity,
@@ -965,7 +965,7 @@ async fn handle_confirm(
     match updated {
         Ok(p) => {
             persist_provisional(config, &p).await;
-            forget_proxy_provenance(config, handle);
+            forget_proxy_provenance(config, handle).await;
             tracing::info!("[AUDIT] CONFIRM handle={} caller={}", handle, caller);
             AdminResponse::GateAction {
                 message: format!("provisional {} confirmed; change kept", handle),
@@ -1024,13 +1024,13 @@ async fn handle_approve(
             }
         }
     };
-    // A kube-proxy hold carries no executable snapshot: approving it releases
+    // An API-proxy hold carries no executable snapshot: approving it releases
     // the API request parked in the proxy (the proxy waiter forwards it), it
     // never spawns a process. A caller cannot steer a real command into this
     // branch by naming the sentinel binary, because the row must also be owned
     // by the daemon principal, which peer credentials assign only to the
     // daemon's own gate sink.
-    if snapshot.binary == KUBE_PROXY_SENTINEL_BINARY
+    if snapshot.binary == API_PROXY_SENTINEL_BINARY
         && matches!(&snapshot.principal, Some(p) if config.daemon_principal.eq_ci(p))
     {
         let now = now_unix();
@@ -1042,7 +1042,7 @@ async fn handle_approve(
             persist_approval(config, &a).await;
         }
         tracing::info!(
-            "[AUDIT] APPROVED handle={} caller={} (kube-proxy request released)",
+            "[AUDIT] APPROVED handle={} caller={} (api-proxy request released)",
             handle,
             caller
         );

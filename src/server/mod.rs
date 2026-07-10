@@ -166,12 +166,12 @@ struct ServerConfig {
     /// generically without per-tool code — e.g. `KUBECONFIG` so brokered
     /// kubectl/helm read a config the agent cannot see.
     pub extra_child_env: Vec<String>,
-    /// Optional Kubernetes API proxy hosted alongside the gate socket. When set,
+    /// Optional API proxies hosted alongside the gate socket. When set,
     /// the daemon terminates brokered clients' TLS, gates each API operation
-    /// against the operator policy, and re-originates to the real apiserver with
-    /// the credentials only the daemon holds. Set by the entrypoint from
-    /// `--kube-proxy`; `None` means no proxy listener.
-    pub kube_proxy: Option<Arc<guard::proxy::ApiProxy>>,
+    /// against the operator policy, and re-originates to the upstream with the
+    /// credentials only the daemon holds.
+    pub protocol_registry:
+        Arc<RwLock<std::collections::HashMap<String, Arc<guard::proxy::ApiProxy>>>>,
     /// Active filesystem read grants (Unix-only). Time-boxed POSIX ACL read
     /// grants issued via `guard grant-read`; the sweeper auto-revokes them at
     /// expiry and startup reconciliation revokes any that expired while the
@@ -237,8 +237,7 @@ impl ServerConfig {
             // No extra child-env passthrough by default; the entrypoint sets
             // this from --child-env / GUARD_CHILD_ENV.
             extra_child_env: Vec::new(),
-            // No API proxy by default; the entrypoint sets this from --kube-proxy.
-            kube_proxy: None,
+            protocol_registry: Arc::new(RwLock::new(std::collections::HashMap::new())),
             read_grants: Arc::new(RwLock::new(GrantReadRegistry::new())),
         }
     }

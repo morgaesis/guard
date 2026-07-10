@@ -91,14 +91,7 @@ async fn proxy_gates_redacts_and_forwards() {
     let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).expect("policy");
     let port = free_port();
     let listen = format!("127.0.0.1:{port}").parse().unwrap();
-    let proxy = Arc::new(ApiProxy::new(
-        listen,
-        tls,
-        upstream,
-        policy,
-        None,
-        std::path::PathBuf::from("unused-in-test-kubeconfig"),
-    ));
+    let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
 
     // The brokered config must point at the proxy and carry no credential.
     let brokered = proxy.brokered_kubeconfig();
@@ -272,14 +265,7 @@ async fn proxy_arms_auto_revert_for_writes() {
     let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).expect("policy");
     let port = free_port();
     let listen = format!("127.0.0.1:{port}").parse().unwrap();
-    let proxy = Arc::new(ApiProxy::new(
-        listen,
-        tls,
-        upstream,
-        policy,
-        None,
-        std::path::PathBuf::from("unused-in-test-kubeconfig"),
-    ));
+    let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
 
     let sink = RecordingSink::default();
     proxy.attach_gate(Arc::new(sink.clone()));
@@ -320,25 +306,21 @@ async fn proxy_arms_auto_revert_for_writes() {
     let calls = sink.calls.lock().unwrap();
     assert_eq!(calls.len(), 2, "both writes armed a revert");
 
-    // The create armed a delete-the-created-object revert with the server name.
-    match &calls[0].revert {
-        guard::proxy::ApiRevert::DeleteCreated { resource, name, .. } => {
-            assert_eq!(resource, "pods");
-            assert_eq!(name, "web-123");
-        }
-        other => panic!("create should arm DeleteCreated, got {other:?}"),
-    }
+    // The create armed a DELETE for the server-assigned object name.
+    assert_eq!(calls[0].revert.method, "DELETE");
+    assert_eq!(calls[0].revert.path, "/api/v1/namespaces/dev/pods/web-123");
+    let body: Value = serde_json::from_slice(calls[0].revert.body.as_ref().unwrap()).unwrap();
+    assert_eq!(body["propagationPolicy"], "Background");
 
     // The patch armed a restore from the snapshotted prior object.
-    match &calls[1].revert {
-        guard::proxy::ApiRevert::Restore { object_json } => {
-            let v: Value = serde_json::from_slice(object_json).unwrap();
-            assert_eq!(v["metadata"]["name"], "api");
-            // resourceVersion is stripped so `kubectl replace` is unconditional.
-            assert!(v["metadata"].get("resourceVersion").is_none());
-        }
-        other => panic!("patch should arm Restore, got {other:?}"),
-    }
+    assert_eq!(calls[1].revert.method, "PUT");
+    assert_eq!(
+        calls[1].revert.path,
+        "/apis/apps/v1/namespaces/dev/deployments/api"
+    );
+    let v: Value = serde_json::from_slice(calls[1].revert.body.as_ref().unwrap()).unwrap();
+    assert_eq!(v["metadata"]["name"], "api");
+    assert!(v["metadata"].get("resourceVersion").is_none());
 }
 
 /// Mock apiserver that echoes the request headers it received back as a JSON
@@ -399,14 +381,7 @@ async fn proxy_denies_subresource_and_strips_identity_headers() {
     let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).expect("policy");
     let port = free_port();
     let listen = format!("127.0.0.1:{port}").parse().unwrap();
-    let proxy = Arc::new(ApiProxy::new(
-        listen,
-        tls,
-        upstream,
-        policy,
-        None,
-        std::path::PathBuf::from("unused-in-test-kubeconfig"),
-    ));
+    let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
 
     tokio::spawn(proxy.clone().serve());
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -490,14 +465,7 @@ async fn proxy_self_access_review_carries_upstream_credential() {
     .expect("policy");
     let port = free_port();
     let listen = format!("127.0.0.1:{port}").parse().unwrap();
-    let proxy = Arc::new(ApiProxy::new(
-        listen,
-        tls,
-        upstream,
-        policy,
-        None,
-        std::path::PathBuf::from("unused-in-test-kubeconfig"),
-    ));
+    let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
 
     tokio::spawn(proxy.clone().serve());
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -595,14 +563,7 @@ async fn proxy_allows_contained_delete_of_created_resource() {
     let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).expect("policy");
     let port = free_port();
     let listen = format!("127.0.0.1:{port}").parse().unwrap();
-    let proxy = Arc::new(ApiProxy::new(
-        listen,
-        tls,
-        upstream,
-        policy,
-        None,
-        std::path::PathBuf::from("unused-in-test-kubeconfig"),
-    ));
+    let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
 
     let sink = RecordingSink::default();
     proxy.attach_gate(Arc::new(sink.clone()));
@@ -637,6 +598,11 @@ async fn proxy_allows_contained_delete_of_created_resource() {
         .unwrap();
     assert_eq!(resp.status(), 201, "create forwarded");
     tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        sink.calls.lock().unwrap().len(),
+        1,
+        "the create armed exactly one revert"
+    );
 
     // Deleting that same resource is now contained cleanup: allowed and forwarded.
     let resp = client
@@ -654,6 +620,11 @@ async fn proxy_allows_contained_delete_of_created_resource() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     let resolved_count = sink.resolved.lock().unwrap().len();
     assert_eq!(resolved_count, 1, "the create's auto-revert was resolved");
+    assert_eq!(
+        sink.calls.lock().unwrap().len(),
+        1,
+        "contained delete forwards without arming a delete-restore revert"
+    );
 
     // Provenance is single-use: a second delete of the same name has no record
     // and falls back to the strict hold.
@@ -723,14 +694,7 @@ async fn proxy_fails_closed_on_non_json_secret_response() {
     let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).expect("policy");
     let port = free_port();
     let listen = format!("127.0.0.1:{port}").parse().unwrap();
-    let proxy = Arc::new(ApiProxy::new(
-        listen,
-        tls,
-        upstream,
-        policy,
-        None,
-        std::path::PathBuf::from("unused-in-test-kubeconfig"),
-    ));
+    let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
 
     tokio::spawn(proxy.clone().serve());
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -832,14 +796,7 @@ rules:
     .expect("policy");
     let port = free_port();
     let listen = format!("127.0.0.1:{port}").parse().unwrap();
-    let proxy = Arc::new(ApiProxy::new(
-        listen,
-        tls,
-        upstream,
-        policy,
-        None,
-        std::path::PathBuf::from("unused-in-test-kubeconfig"),
-    ));
+    let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
 
     let sink = RecordingSink::default();
     proxy.attach_gate(Arc::new(sink.clone()));
@@ -946,14 +903,7 @@ async fn proxy_redacts_helm_release_secret_without_erroring() {
     let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).expect("policy");
     let port = free_port();
     let listen = format!("127.0.0.1:{port}").parse().unwrap();
-    let proxy = Arc::new(ApiProxy::new(
-        listen,
-        tls,
-        upstream,
-        policy,
-        None,
-        std::path::PathBuf::from("unused-in-test-kubeconfig"),
-    ));
+    let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
 
     tokio::spawn(proxy.clone().serve());
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -1032,14 +982,7 @@ rules:
     let policy = ApiPolicy::from_yaml(policy_yaml).expect("policy");
     let port = free_port();
     let listen = format!("127.0.0.1:{port}").parse().unwrap();
-    let proxy = Arc::new(ApiProxy::new(
-        listen,
-        tls,
-        upstream,
-        policy,
-        None,
-        std::path::PathBuf::from("unused-in-test-kubeconfig"),
-    ));
+    let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
     tokio::spawn(proxy.clone().serve());
     tokio::time::sleep(Duration::from_millis(150)).await;
 
@@ -1068,14 +1011,7 @@ rules:
     let policy = ApiPolicy::from_yaml(policy_yaml).expect("policy");
     let port = free_port();
     let listen = format!("127.0.0.1:{port}").parse().unwrap();
-    let proxy = Arc::new(ApiProxy::new(
-        listen,
-        tls,
-        upstream,
-        policy,
-        None,
-        std::path::PathBuf::from("unused-in-test-kubeconfig"),
-    ));
+    let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
     proxy.attach_gate(Arc::new(ApprovingSink));
     tokio::spawn(proxy.clone().serve());
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -1136,17 +1072,8 @@ async fn proxy_rarity_escalation_holds_only_rare_shapes() {
     let port = free_port();
     let listen = format!("127.0.0.1:{port}").parse().unwrap();
     // Threshold 2: the first two occurrences of a shape are escalated.
-    let proxy = Arc::new(
-        ApiProxy::new(
-            listen,
-            tls,
-            upstream,
-            policy,
-            None,
-            std::path::PathBuf::from("unused-in-test-kubeconfig"),
-        )
-        .with_rarity_escalation(2),
-    );
+    let proxy =
+        Arc::new(ApiProxy::new(listen, tls, upstream, policy, None).with_rarity_escalation(2));
     let sink = CountingSink::default();
     proxy.attach_gate(Arc::new(sink.clone()));
     tokio::spawn(proxy.clone().serve());

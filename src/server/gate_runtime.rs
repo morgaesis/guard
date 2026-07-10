@@ -3,7 +3,7 @@
 pub(super) use guard::env::now_unix;
 
 use guard::gating::approval::{Approval, ApprovalSnapshot, ApprovalStatus};
-use guard::gating::provisional::{Provisional, ProvisionalStatus};
+use guard::gating::provisional::{ApiRevertPlan, Provisional, ProvisionalStatus};
 use guard::gating::{decide_gate, Coverage, GateOutcome, Reversibility};
 use guard::principal::PrincipalKey;
 use std::collections::HashMap;
@@ -160,25 +160,32 @@ pub(super) async fn persist_provisional(config: &ServerConfig, p: &Provisional) 
     }
 }
 
-/// Drop any kube-proxy delete-provenance tied to a now-resolved auto-revert
+/// Drop any API-proxy delete-provenance tied to a now-resolved auto-revert
 /// handle. A proxy-armed create records provenance so a later contained delete
 /// of that object cancels the moot create-revert; once the revert itself
 /// resolves (operator confirm, or auto/manual revert), that provenance must not
 /// outlive its window, or a delete of a same-named resource an operator later
 /// recreates outside guard would still match the stale entry and bypass policy.
 /// A no-op when the proxy is not enabled or the handle was not a proxy create.
-pub(super) fn forget_proxy_provenance(config: &ServerConfig, handle: &str) {
-    if let Some(proxy) = &config.kube_proxy {
+pub(super) async fn forget_proxy_provenance(config: &ServerConfig, handle: &str) {
+    let proxies: Vec<_> = config
+        .protocol_registry
+        .read()
+        .await
+        .values()
+        .cloned()
+        .collect();
+    for proxy in proxies {
         proxy.forget_created_by_handle(handle);
     }
 }
 
-/// Sentinel binary naming a kube-proxy-originated row in the provisional and
+/// Sentinel binary naming an API-proxy-originated row in the provisional and
 /// approval registries. Such a row is never executed: approving one releases
 /// the API request parked in the proxy instead of spawning a process.
-pub(super) const KUBE_PROXY_SENTINEL_BINARY: &str = "(kube-proxy)";
+pub(super) const API_PROXY_SENTINEL_BINARY: &str = "(api-proxy)";
 
-/// Retires a kube-proxy hold whose parked request vanished (the brokered
+/// Retires an API-proxy hold whose parked request vanished (the brokered
 /// client disconnected while waiting), so the queue never offers the operator
 /// an approval that releases nothing. Disarmed on a normal decision.
 struct ProxyHoldOrphanGuard {
@@ -213,22 +220,22 @@ impl Drop for ProxyHoldOrphanGuard {
                 persist_approval(&config, &a).await;
             }
             tracing::info!(
-                "[AUDIT] HOLD_ORPHANED handle={} (kube-proxy client disconnected)",
+                "[AUDIT] HOLD_ORPHANED handle={} (api-proxy client disconnected)",
                 handle
             );
         });
     }
 }
 
-/// Bridges the kube-proxy's synthesized reverts into the daemon's consequence
+/// Bridges the API proxy's synthesized reverts into the daemon's consequence
 /// machinery. Holds a clone of the server config (which shares the provisional
-/// registry and state store), the operator kubeconfig for the `kubectl` revert,
-/// and a directory for snapshot files. The proxy acts as the daemon principal,
-/// so the operator manages proxy-armed provisionals with the same
+/// registry and state store), and a directory for stored HTTP revert bodies.
+/// The proxy acts as the daemon principal, so the operator manages
+/// proxy-armed provisionals with the same
 /// `guard confirm` / `guard provisionals` / `guard revert` commands.
 pub(super) struct DaemonGateSink {
     pub(super) config: ServerConfig,
-    pub(super) kubeconfig: PathBuf,
+    pub(super) protocol: String,
     pub(super) snapshot_dir: PathBuf,
     pub(super) window_secs: u64,
 }
@@ -238,66 +245,43 @@ impl guard::proxy::GateSink for DaemonGateSink {
     async fn arm_revert(&self, mutation: guard::proxy::ApiMutation) -> Option<String> {
         let principal = Some(self.config.daemon_principal.clone());
         if let Some(reason) = gate_capacity_reason(&self.config, principal.as_ref()).await {
-            tracing::warn!("kube-proxy auto-revert not armed: {}", reason);
+            tracing::warn!("api-proxy auto-revert not armed: {}", reason);
             return None;
         }
         let handle = new_handle();
         let now = now_unix();
-        let kubeconfig = self.kubeconfig.display().to_string();
-        let (revert_binary, revert_args) = match mutation.revert {
-            guard::proxy::ApiRevert::Restore { object_json } => {
-                let file = self.snapshot_dir.join(format!("revert-{handle}.json"));
-                if let Err(e) = tokio::fs::write(&file, &object_json).await {
-                    tracing::error!(
-                        "kube-proxy: failed to write revert snapshot {}: {}",
-                        file.display(),
-                        e
-                    );
-                    return None;
-                }
-                (
-                    "kubectl".to_string(),
-                    vec![
-                        "--kubeconfig".to_string(),
-                        kubeconfig,
-                        "replace".to_string(),
-                        "-f".to_string(),
-                        file.display().to_string(),
-                    ],
-                )
+        let body_file = if let Some(body) = &mutation.revert.body {
+            let file = self.snapshot_dir.join(format!("api-revert-{handle}.body"));
+            if let Err(e) = tokio::fs::write(&file, body).await {
+                tracing::error!(
+                    "api-proxy: failed to write revert body {}: {}",
+                    file.display(),
+                    e
+                );
+                return None;
             }
-            guard::proxy::ApiRevert::DeleteCreated {
-                group,
-                resource,
-                name,
-                namespace,
-            } => {
-                let target = if group.is_empty() {
-                    resource
-                } else {
-                    format!("{resource}.{group}")
-                };
-                let mut args = vec![
-                    "--kubeconfig".to_string(),
-                    kubeconfig,
-                    "delete".to_string(),
-                    target,
-                    name,
-                ];
-                if let Some(ns) = namespace {
-                    args.push("-n".to_string());
-                    args.push(ns);
-                }
-                ("kubectl".to_string(), args)
-            }
+            Some(file)
+        } else {
+            None
         };
+        let api_revert = ApiRevertPlan {
+            protocol: self.protocol.clone(),
+            method: mutation.revert.method,
+            path: mutation.revert.path,
+            body_file,
+        };
+
         let provisional = Provisional {
             handle: handle.clone(),
             principal,
-            binary: KUBE_PROXY_SENTINEL_BINARY.to_string(),
+            binary: API_PROXY_SENTINEL_BINARY.to_string(),
             args: vec![mutation.label.clone()],
-            revert_binary,
-            revert_args,
+            revert_binary: String::new(),
+            revert_args: vec![
+                api_revert.protocol.clone(),
+                api_revert.method.clone(),
+                api_revert.path.clone(),
+            ],
             reason: mutation.label,
             created_unix: now,
             deadline_unix: now.saturating_add(self.window_secs),
@@ -305,6 +289,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
             status: ProvisionalStatus::Armed,
             revert_exit: None,
             revert_detail: None,
+            api_revert: Some(api_revert),
         };
         persist_provisional(&self.config, &provisional).await;
         self.config.provisional.write().await.insert(provisional);
@@ -324,7 +309,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
         // ever spawned from this row (see the sentinel branch in
         // `handle_approve`).
         let snapshot = ApprovalSnapshot {
-            binary: KUBE_PROXY_SENTINEL_BINARY.to_string(),
+            binary: API_PROXY_SENTINEL_BINARY.to_string(),
             args: vec![label.to_string()],
             env: std::collections::BTreeMap::new(),
             secret_keys: std::collections::BTreeMap::new(),
@@ -358,7 +343,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
             .enqueue(approval.clone());
         persist_approval(&self.config, &approval).await;
         tracing::info!(
-            "[AUDIT] HELD handle={} caller=(kube-proxy) api=\"{}\" ttl={}s",
+            "[AUDIT] HELD handle={} caller=(api-proxy) api=\"{}\" ttl={}s",
             handle,
             label,
             APPROVAL_TTL_SECS
@@ -425,7 +410,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
 
     async fn resolve(&self, handle: &str) {
         // The created object is already gone by the workload's own action, so the
-        // pending create-revert (a `kubectl delete`) is moot. Confirm it to cancel
+        // pending create-revert is moot. Confirm it to cancel
         // the timer; the sweeper then never tries to delete an absent object. A
         // handle that is already terminal is a no-op.
         let updated = {
@@ -436,11 +421,11 @@ impl guard::proxy::GateSink for DaemonGateSink {
             Ok(p) => {
                 persist_provisional(&self.config, &p).await;
                 tracing::info!(
-                    "kube-proxy: resolved auto-revert {} (created object deleted by workload)",
+                    "api-proxy: resolved auto-revert {} (created object deleted by workload)",
                     handle
                 );
             }
-            Err(e) => tracing::debug!("kube-proxy: resolve {} was a no-op: {}", handle, e),
+            Err(e) => tracing::debug!("api-proxy: resolve {} was a no-op: {}", handle, e),
         }
     }
 }
@@ -706,6 +691,7 @@ pub(super) async fn arm_containment<W: AsyncWrite + Unpin>(
         args: request.args.clone(),
         revert_binary: revert.binary.clone(),
         revert_args: revert.args.clone(),
+        api_revert: None,
         reason: reason.clone(),
         created_unix: now,
         deadline_unix: now.saturating_add(window),
@@ -1246,6 +1232,64 @@ async fn run_provisional_revert(config: &ServerConfig, p: &Provisional) -> Execu
     .await
 }
 
+async fn run_api_revert(
+    config: &ServerConfig,
+    p: &Provisional,
+    api: &ApiRevertPlan,
+) -> Result<(), String> {
+    let Some(proxy) = config
+        .protocol_registry
+        .read()
+        .await
+        .get(&api.protocol)
+        .cloned()
+    else {
+        return Err(format!(
+            "missing running api-proxy for protocol '{}'",
+            api.protocol
+        ));
+    };
+    let body = if let Some(path) = &api.body_file {
+        Some(
+            tokio::fs::read(path)
+                .await
+                .map_err(|e| format!("read api revert body {}: {e}", path.display()))?,
+        )
+    } else {
+        None
+    };
+    let method: reqwest::Method = api
+        .method
+        .parse()
+        .map_err(|e| format!("invalid api revert method '{}': {e}", api.method))?;
+    let upstream = proxy.upstream();
+    let url = format!("{}{}", upstream.base(), api.path);
+    let mut rb = upstream
+        .client()
+        .request(method, &url)
+        .header(reqwest::header::ACCEPT, "application/json");
+    if let Some(token) = upstream.bearer() {
+        rb = rb.bearer_auth(token);
+    } else if let Some((user, pass)) = upstream.basic_auth() {
+        rb = rb.basic_auth(user, Some(pass));
+    }
+    if let Some(body) = body {
+        rb = rb
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body);
+    }
+    let resp = rb
+        .send()
+        .await
+        .map_err(|e| format!("send api revert for provisional {}: {e}", p.handle))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("api revert returned HTTP {status}: {text}"));
+    }
+    Ok(())
+}
+
 /// Run a claimed (`Reverting`) provisional's revert and record the outcome.
 /// Returns `(message, exit_code)`.
 pub(super) async fn finish_revert(
@@ -1256,28 +1300,48 @@ pub(super) async fn finish_revert(
 ) -> (String, Option<i32>) {
     // Bound the revert so a hung rollback cannot pin the sweeper (which also
     // drives fail-closed hold expiry). A timeout is recorded as RevertFailed.
-    let (status_ok, exit, detail) = match tokio::time::timeout(
-        std::time::Duration::from_secs(REVERT_EXEC_TIMEOUT_SECS),
-        run_provisional_revert(config, p),
-    )
-    .await
-    {
-        Ok(result) => match &result.exec {
-            ExecOutcome::Completed { exit_code, .. } => {
-                let ok = exit_code.unwrap_or(-1) == 0;
-                (ok, *exit_code, None)
-            }
-            ExecOutcome::Failed { reason, .. } => (false, None, Some(reason.clone())),
-            _ => (false, None, Some("unexpected revert outcome".to_string())),
-        },
-        Err(_) => (
-            false,
-            None,
-            Some(format!(
-                "revert timed out after {}s",
-                REVERT_EXEC_TIMEOUT_SECS
-            )),
-        ),
+    let (status_ok, exit, detail) = if let Some(api) = &p.api_revert {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(REVERT_EXEC_TIMEOUT_SECS),
+            run_api_revert(config, p, api),
+        )
+        .await
+        {
+            Ok(Ok(())) => (true, Some(0), None),
+            Ok(Err(reason)) => (false, None, Some(reason)),
+            Err(_) => (
+                false,
+                None,
+                Some(format!(
+                    "api revert timed out after {}s",
+                    REVERT_EXEC_TIMEOUT_SECS
+                )),
+            ),
+        }
+    } else {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(REVERT_EXEC_TIMEOUT_SECS),
+            run_provisional_revert(config, p),
+        )
+        .await
+        {
+            Ok(result) => match &result.exec {
+                ExecOutcome::Completed { exit_code, .. } => {
+                    let ok = exit_code.unwrap_or(-1) == 0;
+                    (ok, *exit_code, None)
+                }
+                ExecOutcome::Failed { reason, .. } => (false, None, Some(reason.clone())),
+                _ => (false, None, Some("unexpected revert outcome".to_string())),
+            },
+            Err(_) => (
+                false,
+                None,
+                Some(format!(
+                    "revert timed out after {}s",
+                    REVERT_EXEC_TIMEOUT_SECS
+                )),
+            ),
+        }
     };
     let updated = {
         let mut reg = config.provisional.write().await;
@@ -1298,8 +1362,8 @@ pub(super) async fn finish_revert(
         persist_provisional(config, u).await;
     }
     // The create-revert is terminal (whether it succeeded or failed); drop any
-    // kube-proxy provenance tied to it so it cannot outlive its window.
-    forget_proxy_provenance(config, &p.handle);
+    // api-proxy provenance tied to it so it cannot outlive its window.
+    forget_proxy_provenance(config, &p.handle).await;
     if status_ok {
         tracing::info!(
             "[AUDIT] REVERT handle={} caller={} kind={} exit={:?}",

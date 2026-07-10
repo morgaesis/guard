@@ -91,6 +91,12 @@ pub struct Upstream {
     basic: Option<(String, String)>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpstreamAuth {
+    None,
+    Bearer(String),
+}
+
 impl std::fmt::Debug for Upstream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Never expose the operator's credentials in debug output.
@@ -103,6 +109,30 @@ impl std::fmt::Debug for Upstream {
 }
 
 impl Upstream {
+    /// Build a generic upstream with public CA roots, no redirects, and an
+    /// optional bearer token. Non-Kubernetes protocols use this path.
+    pub fn from_base_url(base: &str, auth: UpstreamAuth) -> Result<Self> {
+        let parsed = reqwest::Url::parse(base).context("parse upstream URL")?;
+        match parsed.scheme() {
+            "https" | "http" => {}
+            other => bail!("unsupported upstream URL scheme '{other}'"),
+        }
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .context("build upstream TLS client")?;
+        let bearer = match auth {
+            UpstreamAuth::None => None,
+            UpstreamAuth::Bearer(token) => Some(token),
+        };
+        Ok(Self {
+            base: base.trim_end_matches('/').to_string(),
+            client,
+            bearer,
+            basic: None,
+        })
+    }
+
     /// Build an upstream from a kubeconfig file, selecting `context` (or the
     /// file's `current-context` when `None`).
     pub fn from_kubeconfig_file(path: &Path, context: Option<&str>) -> Result<Self> {
