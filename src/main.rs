@@ -1014,7 +1014,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Log level: RUST_LOG > GUARD_LOG_LEVEL > "info"
+    // Log level: RUST_LOG > GUARD_LOG_LEVEL > "warn"
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         let level = guard_env("LOG_LEVEL").unwrap_or_else(|| "warn".to_string());
         EnvFilter::new(level)

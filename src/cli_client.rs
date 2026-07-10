@@ -73,7 +73,8 @@ pub(crate) async fn run_exec(
 ) -> Result<()> {
     let config = client_config::ClientConfig::load().ok().unwrap_or_default();
 
-    let (socket_path, tcp_port) = resolve_client_endpoint(None, &config);
+    let (socket_path, tcp_port, endpoint_source) =
+        resolve_client_endpoint_with_source(None, &config);
 
     let revert = match gating.revert.as_deref() {
         Some(spec) => Some(parse_revert(spec)?),
@@ -118,7 +119,8 @@ pub(crate) async fn run_exec(
                 }
             }
         })
-        .await?;
+        .await
+        .map_err(|e| describe_connect_failure(e, &client, endpoint_source))?;
 
     // Consequence-gate outcomes: a held command did not run; a provisional ran
     // behind an auto-revert timer.
@@ -212,21 +214,23 @@ pub(crate) async fn run_exec(
 }
 
 /// Resolve the admin endpoint and build a client for a gate-control RPC.
-fn gate_client(socket_override: Option<String>) -> server::Client {
+fn gate_client(socket_override: Option<String>) -> (server::Client, EndpointSource) {
     let config = client_config::ClientConfig::load().ok().unwrap_or_default();
-    let (socket_path, tcp_port) = resolve_client_endpoint(socket_override, &config);
+    let (socket_path, tcp_port, source) =
+        resolve_client_endpoint_with_source(socket_override, &config);
     let mut client = server::Client::new(socket_path, tcp_port);
     if let Some(token) = config.auth_token {
         client = client.with_auth(token);
     }
-    client
+    (client, source)
 }
 
 pub(crate) async fn handle_provisionals(socket: Option<String>) -> Result<()> {
-    let client = gate_client(socket);
+    let (client, source) = gate_client(socket);
     match client
         .send_admin(server::AdminRequest::Provisionals)
-        .await?
+        .await
+        .map_err(|e| describe_connect_failure(e, &client, source))?
     {
         server::AdminResponse::Provisionals { items } => {
             if items.is_empty() {
@@ -267,10 +271,11 @@ pub(crate) async fn handle_approval_note_cmd(
     handle: String,
     text: String,
 ) -> Result<()> {
-    let client = gate_client(socket);
+    let (client, source) = gate_client(socket);
     match client
         .send_admin(server::AdminRequest::ApprovalNote { handle, text })
-        .await?
+        .await
+        .map_err(|e| describe_connect_failure(e, &client, source))?
     {
         server::AdminResponse::ApprovalShow { item } => {
             let color = color_enabled_for_stdout();
@@ -302,12 +307,16 @@ pub(crate) async fn handle_approval_note_cmd(
 }
 
 pub(crate) async fn handle_approvals(socket: Option<String>, handle: Option<String>) -> Result<()> {
-    let client = gate_client(socket);
+    let (client, source) = gate_client(socket);
     let request = match handle {
         Some(h) => server::AdminRequest::ApprovalShow { handle: h },
         None => server::AdminRequest::ApprovalList,
     };
-    match client.send_admin(request).await? {
+    match client
+        .send_admin(request)
+        .await
+        .map_err(|e| describe_connect_failure(e, &client, source))?
+    {
         server::AdminResponse::Approvals { items } => {
             if items.is_empty() {
                 println!("(no approvals)");
@@ -383,8 +392,12 @@ pub(crate) async fn handle_approvals(socket: Option<String>, handle: Option<Stri
 pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
     match subcommand {
         VerbCommands::List { socket } => {
-            let client = gate_client(socket);
-            match client.send_admin(server::AdminRequest::VerbList).await? {
+            let (client, source) = gate_client(socket);
+            match client
+                .send_admin(server::AdminRequest::VerbList)
+                .await
+                .map_err(|e| describe_connect_failure(e, &client, source))?
+            {
                 server::AdminResponse::Verbs { items } => {
                     if items.is_empty() {
                         println!("(no verbs; start the daemon with --verbs <catalog.yaml>)");
@@ -430,7 +443,8 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
             socket,
         } => {
             let config = client_config::ClientConfig::load().ok().unwrap_or_default();
-            let (socket_path, tcp_port) = resolve_client_endpoint(socket, &config);
+            let (socket_path, tcp_port, endpoint_source) =
+                resolve_client_endpoint_with_source(socket, &config);
             let param_map: std::collections::BTreeMap<String, String> =
                 params.into_iter().collect();
             let invocation = server::VerbInvocation {
@@ -470,7 +484,8 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                         }
                     },
                 )
-                .await?;
+                .await
+                .map_err(|e| describe_connect_failure(e, &client, endpoint_source))?;
             render_gated_response(&resp, streamed, &name)
         }
         VerbCommands::Create {
@@ -479,13 +494,17 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
             preview,
             socket,
         } => {
-            let client = gate_client(socket);
+            let (client, source) = gate_client(socket);
             let req = server::AdminRequest::VerbCreate {
                 prose: prompt,
                 binary_hint: binary,
                 preview,
             };
-            match client.send_admin(req).await? {
+            match client
+                .send_admin(req)
+                .await
+                .map_err(|e| describe_connect_failure(e, &client, source))?
+            {
                 server::AdminResponse::VerbCreated { verb, persisted } => {
                     if persisted {
                         println!("Created verb '{}' and added it to the catalog:", verb.name);
@@ -608,7 +627,7 @@ pub(crate) async fn handle_gate_action(
     action: &str,
     handle: String,
 ) -> Result<()> {
-    let client = gate_client(socket);
+    let (client, source) = gate_client(socket);
     let request = match action {
         "confirm" => server::AdminRequest::Confirm { handle },
         "revert" => server::AdminRequest::Revert { handle },
@@ -616,7 +635,11 @@ pub(crate) async fn handle_gate_action(
         "deny" => server::AdminRequest::Deny { handle },
         _ => unreachable!("unknown gate action"),
     };
-    match client.send_admin(request).await? {
+    match client
+        .send_admin(request)
+        .await
+        .map_err(|e| describe_connect_failure(e, &client, source))?
+    {
         server::AdminResponse::GateAction {
             message,
             exit_code,
@@ -691,58 +714,149 @@ pub(crate) async fn run_mcp(subcommand: McpCommands) -> Result<()> {
     }
 }
 
-/// Well-known default socket path. Used when nothing more specific is
-/// configured (no --socket flag, no GUARD_SOCKET env, no client.yaml).
-/// Matches the systemd RuntimeDirectory layout in deployment/systemd/.
+/// Well-known system socket path, matching the systemd RuntimeDirectory
+/// layout in deployment/systemd/. Used as the default endpoint when it
+/// exists; otherwise the default is the home-dir socket a no-flag
+/// `guard server start` binds (~/.guard/guard.sock).
 #[cfg(unix)]
 const DEFAULT_CLIENT_SOCKET: &str = "/run/guard/guard.sock";
 const DEFAULT_CLIENT_TCP_PORT: u16 = 8123;
 
+/// Where the resolved endpoint came from. Decides the remediation hint
+/// attached to connect failures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EndpointSource {
+    Flag,
+    Env,
+    Config,
+    Default,
+}
+
 /// Resolve the client endpoint from explicit override > env var > client
-/// config > well-known default. Returns (socket, tcp_port). At most one
+/// config > platform default. Returns (socket, tcp_port). At most one
 /// of the two will be Some.
 pub(crate) fn resolve_client_endpoint(
     socket_override: Option<String>,
     config: &client_config::ClientConfig,
 ) -> (Option<PathBuf>, Option<u16>) {
+    let (socket, tcp_port, _) = resolve_client_endpoint_with_source(socket_override, config);
+    (socket, tcp_port)
+}
+
+/// `resolve_client_endpoint`, also reporting where the endpoint came from
+/// so connect failures can carry the right remediation hint.
+pub(crate) fn resolve_client_endpoint_with_source(
+    socket_override: Option<String>,
+    config: &client_config::ClientConfig,
+) -> (Option<PathBuf>, Option<u16>, EndpointSource) {
+    resolve_endpoint(
+        socket_override,
+        std::env::var("GUARD_TCP_PORT").ok(),
+        std::env::var("GUARD_SOCKET").ok(),
+        config,
+        default_client_socket_exists(),
+    )
+}
+
+#[cfg(unix)]
+fn default_client_socket_exists() -> bool {
+    std::path::Path::new(DEFAULT_CLIENT_SOCKET).exists()
+}
+
+#[cfg(not(unix))]
+fn default_client_socket_exists() -> bool {
+    false
+}
+
+/// Endpoint resolution core, kept pure (env values and the system-socket
+/// probe are inputs) so the precedence order is unit-testable.
+fn resolve_endpoint(
+    socket_override: Option<String>,
+    env_tcp_port: Option<String>,
+    env_socket: Option<String>,
+    config: &client_config::ClientConfig,
+    default_socket_exists: bool,
+) -> (Option<PathBuf>, Option<u16>, EndpointSource) {
     if let Some(s) = socket_override {
-        return (Some(PathBuf::from(s)), None);
+        return (Some(PathBuf::from(s)), None, EndpointSource::Flag);
     }
-    if let Ok(port) = std::env::var("GUARD_TCP_PORT") {
+    if let Some(port) = env_tcp_port {
         if let Ok(port) = port.parse::<u16>() {
-            return (None, Some(port));
+            return (None, Some(port), EndpointSource::Env);
         }
     }
-    if let Ok(s) = std::env::var("GUARD_SOCKET") {
+    if let Some(s) = env_socket {
         if !s.is_empty() {
             // A named pipe on Windows, a UNIX domain socket on Unix.
-            return (Some(PathBuf::from(s)), None);
+            return (Some(PathBuf::from(s)), None, EndpointSource::Env);
         }
     }
     if let Some(port) = config.server_tcp_port {
-        return (None, Some(port));
+        return (None, Some(port), EndpointSource::Config);
     }
     // A configured socket is a named pipe on Windows, a UNIX domain socket on
     // Unix; either way it takes precedence over the platform default below.
     if let Some(ref s) = config.server_socket {
-        return (Some(PathBuf::from(s)), None);
+        return (Some(PathBuf::from(s)), None, EndpointSource::Config);
     }
     #[cfg(windows)]
     {
-        (None, Some(DEFAULT_CLIENT_TCP_PORT))
+        let _ = default_socket_exists;
+        (None, Some(DEFAULT_CLIENT_TCP_PORT), EndpointSource::Default)
     }
-    // Fall back to the well-known default. If it doesn't exist the
-    // connect will fail with a clear "failed to connect" error, which
-    // is more useful than a plain "No server configured" because
-    // most local installs use the default anyway.
+    // Nothing configured anywhere: prefer the system socket (the systemd
+    // RuntimeDirectory layout) when it exists, else the home-dir socket a
+    // no-flag `guard server start` binds. Existence decides because the
+    // two layouts are indistinguishable client-side any other way.
     #[cfg(unix)]
     {
-        (Some(PathBuf::from(DEFAULT_CLIENT_SOCKET)), None)
+        if default_socket_exists {
+            (
+                Some(PathBuf::from(DEFAULT_CLIENT_SOCKET)),
+                None,
+                EndpointSource::Default,
+            )
+        } else {
+            let socket = dirs::home_dir()
+                .map(|h| h.join(".guard").join("guard.sock"))
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_CLIENT_SOCKET));
+            (Some(socket), None, EndpointSource::Default)
+        }
     }
     #[cfg(not(any(unix, windows)))]
     {
-        (None, Some(DEFAULT_CLIENT_TCP_PORT))
+        let _ = default_socket_exists;
+        (None, Some(DEFAULT_CLIENT_TCP_PORT), EndpointSource::Default)
     }
+}
+
+/// Attach the attempted endpoint and a one-line remediation hint to a
+/// connect failure; every other error passes through untouched.
+/// `endpoint_for_log()` never contains tokens.
+fn describe_connect_failure(
+    err: anyhow::Error,
+    client: &server::Client,
+    source: EndpointSource,
+) -> anyhow::Error {
+    let connect_failed = err
+        .chain()
+        .any(|cause| cause.to_string() == "failed to connect to guard server");
+    if !connect_failed {
+        return err;
+    }
+    let hint = match source {
+        EndpointSource::Default => "is the daemon running? Start it with `guard server start`",
+        EndpointSource::Flag => "check the --socket value against the daemon's listen endpoint",
+        EndpointSource::Env => "check the GUARD_SOCKET/GUARD_TCP_PORT overrides",
+        EndpointSource::Config => {
+            "check `guard config show` or the GUARD_SOCKET/GUARD_TCP_PORT overrides"
+        }
+    };
+    err.context(format!(
+        "cannot reach guard server at {}; {}",
+        client.endpoint_for_log(),
+        hint
+    ))
 }
 
 pub(crate) fn admin_client(
@@ -756,6 +870,32 @@ pub(crate) fn admin_client(
     } else {
         client
     }
+}
+
+/// Normalize a `config set-server` value before persisting it. A TCP
+/// host:port passes through unchanged; a filesystem socket path is
+/// absolutized so a later `guard run` from another directory resolves the
+/// same socket. On Windows the value names a pipe, not a path, and passes
+/// through unchanged.
+fn normalize_server_socket_value(value: String) -> String {
+    if looks_like_tcp_endpoint(&value) {
+        return value;
+    }
+    #[cfg(unix)]
+    {
+        absolute_path(&value)
+    }
+    #[cfg(not(unix))]
+    {
+        value
+    }
+}
+
+/// A host:port endpoint: nonempty host, valid u16 port.
+fn looks_like_tcp_endpoint(value: &str) -> bool {
+    value
+        .rsplit_once(':')
+        .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok())
 }
 
 /// Resolve a possibly-relative path against the client's working directory. The
@@ -793,7 +933,7 @@ pub(crate) async fn handle_grant_read(
     socket: Option<String>,
 ) -> Result<()> {
     let config = client_config::ClientConfig::load().ok().unwrap_or_default();
-    let (socket_path, tcp_port) = resolve_client_endpoint(socket, &config);
+    let (socket_path, tcp_port, source) = resolve_client_endpoint_with_source(socket, &config);
     let client = server::Client::new(socket_path, tcp_port);
     let session_token = std::env::var("GUARD_SESSION")
         .ok()
@@ -804,13 +944,16 @@ pub(crate) async fn handle_grant_read(
         session_token,
         reevaluate,
     };
-    let resp = client.grant(grant).await?;
+    let resp = client
+        .grant(grant)
+        .await
+        .map_err(|e| describe_connect_failure(e, &client, source))?;
     print_grant_response(&resp)
 }
 
 pub(crate) async fn handle_grant_revoke(path: String, socket: Option<String>) -> Result<()> {
     let config = client_config::ClientConfig::load().ok().unwrap_or_default();
-    let (socket_path, tcp_port) = resolve_client_endpoint(socket, &config);
+    let (socket_path, tcp_port, source) = resolve_client_endpoint_with_source(socket, &config);
     let client = server::Client::new(socket_path, tcp_port);
     let session_token = std::env::var("GUARD_SESSION")
         .ok()
@@ -819,13 +962,16 @@ pub(crate) async fn handle_grant_revoke(path: String, socket: Option<String>) ->
         path: absolute_path(&path),
         session_token,
     };
-    let resp = client.grant(grant).await?;
+    let resp = client
+        .grant(grant)
+        .await
+        .map_err(|e| describe_connect_failure(e, &client, source))?;
     print_grant_response(&resp)
 }
 
 pub(crate) async fn handle_status(socket: Option<String>) -> Result<()> {
     let config = client_config::ClientConfig::load().ok().unwrap_or_default();
-    let (socket_path, tcp_port) = resolve_client_endpoint(socket, &config);
+    let (socket_path, tcp_port, source) = resolve_client_endpoint_with_source(socket, &config);
     let client = admin_client(socket_path.clone(), tcp_port, &config);
 
     // Client info first - useful even when the daemon is unreachable.
@@ -860,7 +1006,8 @@ pub(crate) async fn handle_status(socket: Option<String>) -> Result<()> {
             std::process::exit(1);
         }
         Err(e) => {
-            eprintln!("Server: unreachable - {}", e);
+            let e = describe_connect_failure(e, &client, source);
+            eprintln!("Server: unreachable - {:#}", e);
             std::process::exit(1);
         }
     };
@@ -1111,7 +1258,8 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                 *static_only,
             );
 
-            let (socket_path, tcp_port) = resolve_client_endpoint(socket.clone(), &config);
+            let (socket_path, tcp_port, source) =
+                resolve_client_endpoint_with_source(socket.clone(), &config);
             let client = admin_client(socket_path, tcp_port, &config);
             let request = server::AdminRequest::SessionGrant {
                 token: token.clone(),
@@ -1124,7 +1272,11 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                 static_only: *static_only,
                 auto_amend,
             };
-            match client.send_admin(request).await? {
+            match client
+                .send_admin(request)
+                .await
+                .map_err(|e| describe_connect_failure(e, &client, source))?
+            {
                 server::AdminResponse::Ok => {}
                 server::AdminResponse::Error { message } => {
                     eprintln!("error: {}", message);
@@ -1255,10 +1407,15 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
         }
     };
 
-    let (socket_path, tcp_port) = resolve_client_endpoint(socket_override, &config);
+    let (socket_path, tcp_port, source) =
+        resolve_client_endpoint_with_source(socket_override, &config);
     let client = admin_client(socket_path, tcp_port, &config);
 
-    match client.send_admin(request).await? {
+    match client
+        .send_admin(request)
+        .await
+        .map_err(|e| describe_connect_failure(e, &client, source))?
+    {
         server::AdminResponse::Ok => {
             println!("ok");
         }
@@ -1510,10 +1667,11 @@ pub(crate) async fn handle_config(subcommand: ConfigCommands) -> Result<()> {
         ConfigCommands::SetServer { socket } => {
             let mut config =
                 client_config::ClientConfig::load().context("failed to load client config")?;
-            config.server_socket = Some(socket);
+            let socket = normalize_server_socket_value(socket);
+            config.server_socket = Some(socket.clone());
             config.server_tcp_port = None;
             config.save()?;
-            println!("Server socket set");
+            println!("Server socket set to {}", socket);
         }
         ConfigCommands::SetPort { port } => {
             let mut config =
@@ -1551,4 +1709,149 @@ pub(crate) async fn handle_config(subcommand: ConfigCommands) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with(socket: Option<&str>, port: Option<u16>) -> client_config::ClientConfig {
+        client_config::ClientConfig {
+            server_socket: socket.map(str::to_string),
+            server_tcp_port: port,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn endpoint_flag_override_beats_env_config_and_default() {
+        let (socket, port, source) = resolve_endpoint(
+            Some("/tmp/flag.sock".to_string()),
+            Some("9999".to_string()),
+            Some("/tmp/env.sock".to_string()),
+            &config_with(Some("/tmp/cfg.sock"), Some(1234)),
+            true,
+        );
+        assert_eq!(socket, Some(PathBuf::from("/tmp/flag.sock")));
+        assert_eq!(port, None);
+        assert_eq!(source, EndpointSource::Flag);
+    }
+
+    #[test]
+    fn endpoint_env_tcp_port_beats_env_socket_and_config() {
+        let (socket, port, source) = resolve_endpoint(
+            None,
+            Some("9999".to_string()),
+            Some("/tmp/env.sock".to_string()),
+            &config_with(Some("/tmp/cfg.sock"), None),
+            true,
+        );
+        assert_eq!(socket, None);
+        assert_eq!(port, Some(9999));
+        assert_eq!(source, EndpointSource::Env);
+    }
+
+    #[test]
+    fn endpoint_unparsable_env_tcp_port_falls_through_to_env_socket() {
+        let (socket, port, source) = resolve_endpoint(
+            None,
+            Some("not-a-port".to_string()),
+            Some("/tmp/env.sock".to_string()),
+            &config_with(None, None),
+            true,
+        );
+        assert_eq!(socket, Some(PathBuf::from("/tmp/env.sock")));
+        assert_eq!(port, None);
+        assert_eq!(source, EndpointSource::Env);
+    }
+
+    #[test]
+    fn endpoint_empty_env_socket_falls_through_to_config() {
+        let (socket, port, source) = resolve_endpoint(
+            None,
+            None,
+            Some(String::new()),
+            &config_with(Some("/tmp/cfg.sock"), None),
+            true,
+        );
+        assert_eq!(socket, Some(PathBuf::from("/tmp/cfg.sock")));
+        assert_eq!(port, None);
+        assert_eq!(source, EndpointSource::Config);
+    }
+
+    #[test]
+    fn endpoint_config_port_beats_config_socket() {
+        let (socket, port, source) = resolve_endpoint(
+            None,
+            None,
+            None,
+            &config_with(Some("/tmp/cfg.sock"), Some(1234)),
+            true,
+        );
+        assert_eq!(socket, None);
+        assert_eq!(port, Some(1234));
+        assert_eq!(source, EndpointSource::Config);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_default_prefers_system_socket_when_present() {
+        let (socket, port, source) =
+            resolve_endpoint(None, None, None, &config_with(None, None), true);
+        assert_eq!(socket, Some(PathBuf::from(DEFAULT_CLIENT_SOCKET)));
+        assert_eq!(port, None);
+        assert_eq!(source, EndpointSource::Default);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_default_falls_back_to_home_socket_when_system_socket_missing() {
+        let (socket, port, source) =
+            resolve_endpoint(None, None, None, &config_with(None, None), false);
+        let expected = dirs::home_dir()
+            .map(|h| h.join(".guard").join("guard.sock"))
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_CLIENT_SOCKET));
+        assert_eq!(socket, Some(expected));
+        assert_eq!(port, None);
+        assert_eq!(source, EndpointSource::Default);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn endpoint_default_is_loopback_tcp_on_windows() {
+        let (socket, port, source) =
+            resolve_endpoint(None, None, None, &config_with(None, None), false);
+        assert_eq!(socket, None);
+        assert_eq!(port, Some(DEFAULT_CLIENT_TCP_PORT));
+        assert_eq!(source, EndpointSource::Default);
+    }
+
+    #[test]
+    fn set_server_passes_tcp_endpoint_through() {
+        assert_eq!(
+            normalize_server_socket_value("127.0.0.1:8123".to_string()),
+            "127.0.0.1:8123"
+        );
+        assert_eq!(
+            normalize_server_socket_value("localhost:9000".to_string()),
+            "localhost:9000"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_server_absolutizes_relative_socket_path() {
+        let normalized = normalize_server_socket_value("relative/guard.sock".to_string());
+        assert!(std::path::Path::new(&normalized).is_absolute());
+        assert!(normalized.ends_with("relative/guard.sock"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_server_keeps_absolute_socket_path() {
+        assert_eq!(
+            normalize_server_socket_value("/run/guard/guard.sock".to_string()),
+            "/run/guard/guard.sock"
+        );
+    }
 }

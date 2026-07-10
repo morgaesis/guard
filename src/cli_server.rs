@@ -175,10 +175,16 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 }
             }
 
+            // Plain stdout, not tracing: the default log filter is "warn", so
+            // info-level lines are invisible on a plain foreground start and the
+            // operator would otherwise get no confirmation of where the daemon
+            // listens.
             if let Some(ref path) = socket_path {
+                println!("guard server listening on socket {}", path.display());
                 tracing::info!("Socket: {}", path.display());
             }
             if let Some(port) = tcp_port {
+                println!("guard server listening on tcp 127.0.0.1:{}", port);
                 tracing::info!("TCP: 127.0.0.1:{}", port);
             }
             let auth_token = auth_token
