@@ -909,8 +909,8 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                 },
                 {
                     "name": APPROVAL_LIST_TOOL_NAME,
-                    "title": "List Held and Provisional Approvals",
-                    "description": "List the caller's held approvals and provisional (auto-revert) executions, scoped to the caller by the daemon. Use to poll whether an operator has approved a held command or to see provisionals still inside their revert window. Read-only; it does not approve, confirm, or run anything.",
+                    "title": "List Held Approvals",
+                    "description": "List the caller's held approval requests, scoped to the caller by the daemon. Use to poll whether an operator has approved or denied a held command. Read-only; it does not approve, deny, or run anything.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {},
@@ -999,7 +999,7 @@ fn render_verbs_text(items: &[server::VerbSummary]) -> String {
 
 fn render_approvals_text(items: &[server::ApprovalSummary]) -> String {
     if items.is_empty() {
-        return "(no held or provisional approvals)".to_string();
+        return "(no held approvals)".to_string();
     }
     items
         .iter()
@@ -1172,7 +1172,7 @@ fn render_tool_text(result: &Value) -> String {
     match status {
         Some("held") => {
             return format!(
-                "HELD for operator approval (handle {handle}): {reason}\nThe operator must run `guard approve {handle}` for this to execute. Do not retry; wait or proceed with other work.{}",
+                "HELD for operator approval (handle {handle}): {reason}\nThe operator must run `guard approve {handle}` for this to execute. Do not retry; wait or proceed with other work.\nCheck the decision with the guard_approvals tool (handle {handle}) or by running `guard approvals {handle}`; pass waitApproval on guard_run to block for the decision instead.{}",
                 coverage_text(result)
             );
         }
@@ -1487,6 +1487,29 @@ mod tests {
         assert_eq!(value["content"][0]["text"], "DENIED: policy denied");
     }
 
+    #[test]
+    fn held_tool_text_names_polling_surfaces_and_wait_option() {
+        let text = render_tool_text(&json!({
+            "allowed": true,
+            "reason": "operator review required",
+            "exit_code": null,
+            "stdout": null,
+            "stderr": null,
+            "status": "held",
+            "handle": "hold-123",
+            "coverage": {
+                "checked": ["policy"],
+                "not_checked": ["execution"]
+            }
+        }));
+
+        assert!(text.contains("guard_approvals tool (handle hold-123)"));
+        assert!(text.contains("`guard approvals hold-123`"));
+        assert!(text.contains("pass waitApproval on guard_run"));
+        assert!(text.contains("checked: policy"));
+        assert!(text.contains("NOT checked: execution"));
+    }
+
     #[tokio::test]
     async fn request_missing_method_gets_invalid_request_error() {
         let executor = Arc::new(FakeExecutor {
@@ -1552,6 +1575,16 @@ mod tests {
         assert!(names.contains(&DEFAULT_TOOL_NAME));
         assert!(names.contains(&VERB_LIST_TOOL_NAME));
         assert!(names.contains(&APPROVAL_LIST_TOOL_NAME));
+
+        let approval_tool = response["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == APPROVAL_LIST_TOOL_NAME)
+            .unwrap();
+        let description = approval_tool["description"].as_str().unwrap();
+        assert!(description.contains("held approval requests"));
+        assert!(!description.contains("provisional"));
     }
 
     #[tokio::test]
@@ -1644,6 +1677,10 @@ mod tests {
             .as_array()
             .expect("approvals array")
             .is_empty());
+        assert_eq!(
+            response["result"]["content"][0]["text"],
+            "(no held approvals)"
+        );
     }
 
     #[test]

@@ -289,9 +289,9 @@ impl Evaluator {
 
     /// Evaluate `command`. If `prompt_append` is provided, append it to the
     /// system prompt for this single LLM call so the evaluator has the
-    /// session-specific context. The decision cache is bypassed when a
-    /// session prompt is in play, because cached decisions were made under
-    /// the base prompt and may not hold under the extended context.
+    /// additional request context. The decision cache is bypassed when
+    /// non-empty additive context is in play, because cached decisions were
+    /// made under the base prompt and may not hold under the extended context.
     ///
     /// Equivalent to `evaluate_with_reevaluate(command, prompt_append, false)`:
     /// the auto-learned deny-shape fast path (`gating::deny_shape`) is
@@ -319,7 +319,7 @@ impl Evaluator {
         prompt_append: Option<&str>,
         reevaluate: bool,
     ) -> EvalResult {
-        let session_prompt_active = prompt_append.map(|s| !s.trim().is_empty()).unwrap_or(false);
+        let additive_context_active = prompt_append.map(|s| !s.trim().is_empty()).unwrap_or(false);
 
         // Pre-LLM fast-reject: an explicit deny pattern (or deny-decision
         // group rule) rejects without an LLM call. A command that matches
@@ -370,10 +370,10 @@ impl Evaluator {
 
         if self.llm_config.enabled {
             // Cache lookup happens on the LLM path only, and only when no
-            // session-specific prompt is in play. Session prompts change
+            // additive request context is in play. Additive context changes
             // the decision surface, so they bypass the cache to avoid
             // returning a verdict made under the base prompt.
-            if !session_prompt_active {
+            if !additive_context_active {
                 if let Some(ref cache) = self.cache {
                     let hit = {
                         let guard = cache.read().await;
@@ -389,9 +389,9 @@ impl Evaluator {
             let result = self.evaluate_llm(command, prompt_append).await;
 
             // Only insert into cache when the verdict was made under the
-            // base prompt. Decisions reached with a session-specific prompt
-            // are not portable to other sessions.
-            if !session_prompt_active {
+            // base prompt. Decisions reached with additive request context
+            // are not portable to other requests.
+            if !additive_context_active {
                 if let Some(ref cache) = self.cache {
                     match &result {
                         EvalResult::Allow { reason, .. } => {

@@ -256,6 +256,7 @@ pub(super) struct VerbContext {
     pub(super) name: String,
     pub(super) class: Reversibility,
     pub(super) trusted: bool,
+    pub(super) prompt_context: Option<String>,
     pub(super) params: std::collections::BTreeMap<String, String>,
     pub(super) catalog_version: u64,
 }

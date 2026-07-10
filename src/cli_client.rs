@@ -126,17 +126,7 @@ pub(crate) async fn run_exec(
     // behind an auto-revert timer.
     match resp.status {
         Some(server::GateStatus::Held) => {
-            let color = color_enabled_for_stderr();
-            let handle = resp.handle.clone().unwrap_or_default();
-            eprintln!(
-                "{} for daemon-principal approval: {}",
-                paint("HELD", AnsiColor::Yellow, color),
-                resp.reason
-            );
-            eprintln!("  handle:  {}", handle);
-            eprintln!("  approve: guard approve {}", handle);
-            eprintln!("  poll:    guard approvals {}", handle);
-            eprintln!("  result:  not executed until approved");
+            print_held_response(&resp);
             print_coverage(&resp.coverage);
             // Not executed; exit non-zero so callers do not treat it as success.
             std::process::exit(75); // EX_TEMPFAIL: try again after approval
@@ -545,17 +535,7 @@ fn render_gated_response(
 ) -> Result<()> {
     match resp.status {
         Some(server::GateStatus::Held) => {
-            let color = color_enabled_for_stderr();
-            let handle = resp.handle.clone().unwrap_or_default();
-            eprintln!(
-                "{} for daemon-principal approval: {}",
-                paint("HELD", AnsiColor::Yellow, color),
-                resp.reason
-            );
-            eprintln!("  handle:  {}", handle);
-            eprintln!("  approve: guard approve {}", handle);
-            eprintln!("  poll:    guard approvals {}", handle);
-            eprintln!("  result:  not executed until approved");
+            print_held_response(resp);
             print_coverage(&resp.coverage);
             std::process::exit(75);
         }
@@ -620,6 +600,23 @@ fn render_gated_response(
             }
         }
     }
+}
+
+fn print_held_response(resp: &server::ExecuteResponse) {
+    eprintln!("{}", held_response_text(resp, color_enabled_for_stderr()));
+}
+
+fn held_response_text(resp: &server::ExecuteResponse, color: bool) -> String {
+    let handle = resp.handle.as_deref().unwrap_or_default();
+    format!(
+        "{} for operator approval: {}\n  handle: {}\n  The command did not run. It stays queued until the operator decides or the hold expires.\n  Check the decision and result:      guard approvals {}\n  Operator approves (daemon owner):   guard approve {}\n  Operator denies (daemon owner):     guard deny {}\n  Tip: re-run with --wait-approval to block until the decision and get the result inline.",
+        paint("HELD", AnsiColor::Yellow, color),
+        resp.reason,
+        handle,
+        handle,
+        handle,
+        handle
+    )
 }
 
 pub(crate) async fn handle_gate_action(
@@ -1854,6 +1851,25 @@ mod tests {
         assert_eq!(
             normalize_server_socket_value("/run/guard/guard.sock".to_string()),
             "/run/guard/guard.sock"
+        );
+    }
+
+    #[test]
+    fn run_held_response_names_agent_and_operator_commands() {
+        let response = server::ExecuteResponse {
+            allowed: true,
+            reason: "irreversible action".to_string(),
+            exit_code: None,
+            stdout: None,
+            stderr: None,
+            status: Some(server::GateStatus::Held),
+            handle: Some("hold-123".to_string()),
+            coverage: None,
+        };
+
+        assert_eq!(
+            held_response_text(&response, false),
+            "HELD for operator approval: irreversible action\n  handle: hold-123\n  The command did not run. It stays queued until the operator decides or the hold expires.\n  Check the decision and result:      guard approvals hold-123\n  Operator approves (daemon owner):   guard approve hold-123\n  Operator denies (daemon owner):     guard deny hold-123\n  Tip: re-run with --wait-approval to block until the decision and get the result inline."
         );
     }
 }

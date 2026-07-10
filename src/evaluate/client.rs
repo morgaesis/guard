@@ -150,15 +150,15 @@ impl Evaluator {
         let api_url = self.llm_config.api_url();
         let chain = self.llm_config.model_chain();
 
-        // Build the per-call system prompt. Session-supplied context is
+        // Build the per-call system prompt. Additional request context is
         // appended after the base prompt so the static guardrails still
         // anchor the evaluator.
-        // Session context is caller-supplied free text; redact it like the
+        // Additive context may contain caller-supplied free text; redact it like the
         // command itself before it enters the prompt.
         let system_prompt = match prompt_append {
             Some(extra) if !extra.trim().is_empty() => {
                 format!(
-                    "{}\n\nSession context:\n{}",
+                    "{}\n\nAdditional evaluator context:\n{}",
                     self.system_prompt,
                     redact_for_llm(extra)
                 )

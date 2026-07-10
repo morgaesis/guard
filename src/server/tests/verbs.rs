@@ -1,3 +1,4 @@
+use crate::evaluate::{EvalConfig, Evaluator};
 use crate::server::admin::handle_admin_request;
 use crate::server::execute::execute_command;
 use crate::server::wire::{
@@ -7,9 +8,73 @@ use guard::gating::verb::VerbCatalog;
 use guard::gating::GateMode;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 
 use super::make_test_config;
+
+async fn capture_llm_requests(
+    listener: tokio::net::TcpListener,
+    request_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    count: usize,
+) {
+    let response_body = r#"{
+        "choices": [{
+            "message": {
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "decide",
+                        "arguments": "{\"decision\":\"DENY\",\"reason\":\"model denied\",\"risk\":8,\"reversibility\":\"irreversible\"}"
+                    }
+                }]
+            }
+        }]
+    }"#;
+
+    for _ in 0..count {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 2048];
+        loop {
+            let read = stream.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+            let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or_default();
+            if request.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+
+        let request_text = String::from_utf8(request).unwrap();
+        let body = request_text.split_once("\r\n\r\n").unwrap().1.to_string();
+        request_tx.send(body).unwrap();
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        stream.shutdown().await.unwrap();
+    }
+}
 
 /// Trusted-verb + consequence-gate interaction: `trusted` only skips the
 /// LLM evaluator (`bypass: false` in the `GateInputs` built for it, see
@@ -205,6 +270,85 @@ async fn stale_auto_promoted_verb_is_not_trusted() {
              evaluator has the LLM disabled and no static policy): got {:?}",
         response
     );
+    assert!(
+        response.reason.starts_with("verb 'auto-op': "),
+        "a reverse-matched untrusted verb must be named in the returned reason: {}",
+        response.reason
+    );
+}
+
+#[tokio::test]
+async fn verb_prompt_context_reaches_evaluator_for_explicit_and_reverse_match_paths() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mock = tokio::spawn(capture_llm_requests(listener, request_tx, 2));
+
+    let (mut cfg, _buf) = make_test_config();
+    cfg.gate = GateMode::Consequence;
+    cfg.evaluator = Arc::new(
+        Evaluator::new(
+            EvalConfig::default()
+                .llm_api_key("test-key".to_string())
+                .llm_api_url(format!("http://127.0.0.1:{port}"))
+                .llm_retries(0)
+                .cache_enabled(false)
+                .gate_mode(GateMode::Consequence),
+        )
+        .unwrap(),
+    );
+    cfg.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            "verbs:\n  - name: context-op\n    binary: context-command\n    consequence: irreversible\n    prompt_context: verb operator context\n",
+        )
+        .unwrap(),
+    ));
+
+    let explicit = ExecuteRequest {
+        binary: String::new(),
+        args: Vec::new(),
+        auth_token: None,
+        env: HashMap::new(),
+        secrets: HashMap::new(),
+        stream: false,
+        session_token: None,
+        revert: None,
+        confirm_within_secs: None,
+        reevaluate: false,
+        ssh_hostkey: None,
+        require_approval: None,
+        wait_approval_secs: None,
+        verb: Some(VerbInvocation {
+            name: "context-op".to_string(),
+            params: std::collections::BTreeMap::new(),
+        }),
+    };
+    let reverse_match = ExecuteRequest {
+        binary: "context-command".to_string(),
+        verb: None,
+        ..explicit.clone()
+    };
+
+    for request in [explicit, reverse_match] {
+        let result = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+        assert!(!result.policy_allowed());
+        assert!(
+            result.policy_reason().starts_with("verb 'context-op': "),
+            "untrusted verb reason did not name the verb: {}",
+            result.policy_reason()
+        );
+    }
+
+    for _ in 0..2 {
+        let body: serde_json::Value =
+            serde_json::from_str(&request_rx.recv().await.unwrap()).unwrap();
+        let system_prompt = body["messages"][0]["content"].as_str().unwrap();
+        assert!(
+            system_prompt.contains("verb operator context"),
+            "verb prompt_context missing from evaluator request"
+        );
+    }
+    mock.await.unwrap();
 }
 
 /// `guard verb list` must not misrepresent a stale auto-promoted verb as

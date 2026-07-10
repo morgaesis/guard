@@ -107,7 +107,7 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         Err(result) => return result,
     };
 
-    let session_prompt = resolve_session_prompt(config, &request).await;
+    let evaluator_context = resolve_evaluator_context(config, &request, verb_ctx.as_ref()).await;
 
     request =
         match try_trusted_verb_allow(&mut phase, request, &verb_ctx, &command_line, depth).await {
@@ -119,7 +119,7 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         &mut phase,
         request,
         verb_ctx,
-        session_prompt,
+        evaluator_context,
         command_line,
         depth,
     )
@@ -259,6 +259,7 @@ async fn resolve_verb_context<W: AsyncWrite + Unpin>(
                     name: r.name,
                     class: r.consequence,
                     trusted,
+                    prompt_context: r.prompt_context,
                     params: r.params,
                     catalog_version: version,
                 });
@@ -303,6 +304,7 @@ async fn resolve_verb_context<W: AsyncWrite + Unpin>(
                 name: r.name,
                 class: r.consequence,
                 trusted,
+                prompt_context: r.prompt_context,
                 params: r.params,
                 catalog_version: version,
             });
@@ -620,10 +622,13 @@ async fn try_static_fast_allow<W: AsyncWrite + Unpin>(
     Ok(request)
 }
 
-/// Pull the session-scoped additive prompt, if any. The evaluator appends
-/// it to the system prompt for this single call so the LLM has the
-/// session context that the static glob patterns cannot express.
-async fn resolve_session_prompt(config: &ServerConfig, request: &ExecuteRequest) -> Option<String> {
+/// Assemble additive evaluator context from the rollback, verb, and session.
+/// The evaluator appends it to the system prompt for this single call.
+async fn resolve_evaluator_context(
+    config: &ServerConfig,
+    request: &ExecuteRequest,
+    verb_ctx: Option<&VerbContext>,
+) -> Option<String> {
     let session_prompt = if let Some(ref token) = request.session_token {
         let reg = config.sessions.read().await;
         reg.prompt_append_for(token)
@@ -639,6 +644,7 @@ async fn resolve_session_prompt(config: &ServerConfig, request: &ExecuteRequest)
     // request.
     merge_revert_context(
         session_prompt,
+        verb_ctx.and_then(|context| context.prompt_context.clone()),
         config.gate.is_on() && request.revert.is_some(),
     )
 }
@@ -706,7 +712,7 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
     phase: &mut ExecPhase<'_, W>,
     request: ExecuteRequest,
     verb_ctx: Option<VerbContext>,
-    session_prompt: Option<String>,
+    evaluator_context: Option<String>,
     command_line: String,
     depth: u32,
 ) -> ExecuteResult {
@@ -714,7 +720,11 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
     let session_token = phase.session_token.clone();
     let eval_result = config
         .evaluator
-        .evaluate_with_reevaluate(&command_line, session_prompt.as_deref(), request.reevaluate)
+        .evaluate_with_reevaluate(
+            &command_line,
+            evaluator_context.as_deref(),
+            request.reevaluate,
+        )
         .await;
 
     match eval_result {
@@ -723,7 +733,7 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
             source,
             risk,
         } => {
-            let mut reason = reason;
+            let mut reason = verb_reason(reason, verb_ctx.as_ref());
             if matches!(source, crate::evaluate::EvalSource::Llm) {
                 if let Some(notice) = maybe_auto_amend_session_after_llm(
                     config,
@@ -758,7 +768,7 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
         }
         crate::evaluate::EvalResult::Error(e) => {
             tracing::error!("evaluation error: {}", e);
-            let reason = format!("evaluation error: {}", e);
+            let reason = verb_reason(format!("evaluation error: {}", e), verb_ctx.as_ref());
             deny_and_record(
                 phase,
                 &request,
@@ -775,9 +785,9 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
             risk,
             reversibility,
         } => {
-            let mut reason = reason;
+            let mut reason = verb_reason(reason, verb_ctx.as_ref());
             if matches!(source, crate::evaluate::EvalSource::Llm)
-                && session_prompt
+                && evaluator_context
                     .as_deref()
                     .map(|prompt| prompt.trim().is_empty())
                     .unwrap_or(true)
@@ -874,6 +884,13 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
             )
             .await
         }
+    }
+}
+
+fn verb_reason(reason: String, verb_ctx: Option<&VerbContext>) -> String {
+    match verb_ctx {
+        Some(context) => format!("verb '{}': {reason}", context.name),
+        None => reason,
     }
 }
 
@@ -2102,17 +2119,24 @@ it back unattended unless an operator confirms. A constructible rollback may jus
 borderline recoverable action; it never justifies approving an irreversible or high-risk one, and \
 it does not change your reversibility classification duties.";
 
-/// Merge the session prompt with the revert-availability fragment. Returns
-/// `None` only when neither applies, preserving the cache semantics: any
-/// non-empty append bypasses the decision cache.
+/// Merge additive evaluator context in precedence order: rollback fragment,
+/// verb context, then session prompt. Returns `None` only when every source is
+/// absent or empty, preserving the cache invariant that any non-empty append
+/// bypasses the decision cache.
 pub(super) fn merge_revert_context(
     session_prompt: Option<String>,
+    verb_prompt_context: Option<String>,
     revert_supplied: bool,
 ) -> Option<String> {
-    match (session_prompt, revert_supplied) {
-        (sp, false) => sp,
-        (None, true) => Some(REVERT_AVAILABLE_CONTEXT.to_string()),
-        (Some(sp), true) if sp.trim().is_empty() => Some(REVERT_AVAILABLE_CONTEXT.to_string()),
-        (Some(sp), true) => Some(format!("{REVERT_AVAILABLE_CONTEXT}\n\n{sp}")),
+    let mut sections = Vec::with_capacity(3);
+    if revert_supplied {
+        sections.push(REVERT_AVAILABLE_CONTEXT.to_string());
     }
+    sections.extend(
+        [verb_prompt_context, session_prompt]
+            .into_iter()
+            .flatten()
+            .filter(|context| !context.trim().is_empty()),
+    );
+    (!sections.is_empty()).then(|| sections.join("\n\n"))
 }

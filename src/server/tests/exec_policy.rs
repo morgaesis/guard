@@ -650,11 +650,23 @@ async fn extra_child_env_forwards_named_var_to_child() {
 #[test]
 fn revert_context_merges_only_when_supplied() {
     use crate::server::execute::merge_revert_context;
-    assert_eq!(merge_revert_context(None, false), None);
-    let sp = merge_revert_context(Some("session ctx".to_string()), false);
+    assert_eq!(merge_revert_context(None, None, false), None);
+    let sp = merge_revert_context(Some("session ctx".to_string()), None, false);
     assert_eq!(sp.as_deref(), Some("session ctx"));
-    let with = merge_revert_context(None, true).expect("fragment present");
+    let with = merge_revert_context(None, None, true).expect("fragment present");
     assert!(with.contains("REVERSIBILITY CONTEXT"));
-    let both = merge_revert_context(Some("session ctx".to_string()), true).expect("merged");
-    assert!(both.contains("REVERSIBILITY CONTEXT") && both.ends_with("session ctx"));
+    let all = merge_revert_context(
+        Some("session ctx".to_string()),
+        Some("verb ctx".to_string()),
+        true,
+    )
+    .expect("merged");
+    let revert_index = all.find("REVERSIBILITY CONTEXT").unwrap();
+    let verb_index = all.find("verb ctx").unwrap();
+    let session_index = all.find("session ctx").unwrap();
+    assert!(revert_index < verb_index && verb_index < session_index);
+    assert_eq!(
+        merge_revert_context(None, Some("  ".to_string()), false),
+        None
+    );
 }
