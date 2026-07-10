@@ -283,6 +283,19 @@ impl KubeProxy {
         let path = req.uri().path().to_string();
         let query = req.uri().query().unwrap_or("").to_string();
 
+        // The gate must classify exactly the path the upstream will serve.
+        // Re-origination normalizes dot segments (including their
+        // percent-encoded forms) and an upstream router may decode encoded
+        // separators, so such a path would be gated as one request and served
+        // as another; reject it before parsing.
+        if path_alters_on_forward(&path) {
+            return status_resp(
+                StatusCode::FORBIDDEN,
+                "guard kube-proxy: path with dot segments or encoded separators is not forwarded",
+                "Forbidden",
+            );
+        }
+
         let Some(op) = self.protocol.parse_op(method.as_str(), &path, &query) else {
             // Non-resource paths: discovery, /version, /openapi, /healthz. Clients
             // need these. Allow safe reads; block anything else.
@@ -362,7 +375,11 @@ impl KubeProxy {
                 tracing::info!(target: "guard::kubeproxy", "HOLD {} ({})", label, decision.reason);
                 match gate.hold_request(&label, &decision.reason).await {
                     HoldDecision::Approved { handle } => {
-                        let redact = decision.redact_secrets && self.protocol.redactable_read(&op);
+                        // Redaction follows the protocol's classification, not
+                        // the rule flag: a secret-material read that passes the
+                        // gate (allowed or operator-approved) is always
+                        // redacted, so no policy wording can leak values.
+                        let redact = self.protocol.redactable_read(&op);
                         tracing::info!(
                             target: "guard::kubeproxy",
                             "ALLOW {} (operator approved hold {}){}",
@@ -386,7 +403,7 @@ impl KubeProxy {
                 }
             }
             ApiAction::Allow => {
-                let redact = decision.redact_secrets && self.protocol.redactable_read(&op);
+                let redact = self.protocol.redactable_read(&op);
                 tracing::info!(target: "guard::kubeproxy", "ALLOW {}{}", label, if redact { " (redacting)" } else { "" });
                 self.forward(req, &path, &query, redact, Some(op), conn_id)
                     .await
@@ -686,6 +703,24 @@ fn full_body(bytes: Bytes) -> ProxyBody {
     Full::new(bytes).map_err(|never| match never {}).boxed()
 }
 
+/// True when forwarding `path` verbatim could change its meaning between the
+/// gate and the upstream: `.`/`..` segments and their percent-encoded forms
+/// (URL normalization in the forwarding client collapses them), and encoded
+/// path separators or NULs (`%2f`, `%5c`, `%00`, raw `\`) an upstream router
+/// may decode into extra segments the gate never saw.
+fn path_alters_on_forward(path: &str) -> bool {
+    path.split('/').any(|seg| {
+        let s = seg.to_ascii_lowercase();
+        s == "."
+            || s == ".."
+            || s.contains('\\')
+            || s.contains("%2e")
+            || s.contains("%2f")
+            || s.contains("%5c")
+            || s.contains("%00")
+    })
+}
+
 /// RFC 7230 hop-by-hop headers, which must not be forwarded by a proxy.
 fn is_hop_by_hop(name: &header::HeaderName) -> bool {
     matches!(
@@ -858,6 +893,31 @@ mod tests {
             Some("h1".to_string())
         );
         assert_eq!(proxy.take_created_provenance(&op, 1), None);
+    }
+
+    #[test]
+    fn hostile_paths_are_rejected_before_forwarding() {
+        for p in [
+            "/repos/o/r/../../user",
+            "/api/v1/namespaces/p/../../secrets",
+            "/repos/o/r/%2e%2e/%2e%2e/user",
+            "/repos/o/r/%2E%2E/admin",
+            "/repos/o%2Fr/issues",
+            "/v9/projects/prj%5Cx/env",
+            "/a/%00/b",
+            "/a/b\\c",
+            "/.",
+        ] {
+            assert!(path_alters_on_forward(p), "{p} must be rejected");
+        }
+        for p in [
+            "/api/v1/namespaces/prod/configmaps/app.config",
+            "/repos/octo/hello.world/issues/42",
+            "/v9/projects/prj_123/env",
+            "/repos/o/r/contents/docs/...spread.md",
+        ] {
+            assert!(!path_alters_on_forward(p), "{p} must pass");
+        }
     }
 
     #[test]

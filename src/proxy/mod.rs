@@ -17,9 +17,12 @@
 //! generation/validation ([`kubeconfig`]). The TLS-terminating server loop that
 //! wires them to a live apiserver builds on top of these, asking every
 //! protocol-specific question through the [`protocol::ProtocolConfig`] plug-in
-//! surface; [`k8s_protocol`] is the Kubernetes reference implementation.
+//! surface; [`k8s_protocol`] is the Kubernetes reference implementation, and
+//! [`github_protocol`]/[`vercel_protocol`] are example configs proving the
+//! surface generalizes.
 
 pub mod gate;
+pub mod github_protocol;
 pub mod k8s;
 pub mod k8s_protocol;
 pub mod kubeconfig;
@@ -28,8 +31,10 @@ pub mod protocol;
 pub mod server;
 pub mod tls;
 pub mod upstream;
+pub mod vercel_protocol;
 
 pub use gate::{ApiMutation, ApiRevert, GateSink, HoldDecision};
+pub use github_protocol::GithubProtocol;
 pub use k8s::{ApiOp, Verb};
 pub use k8s_protocol::KubernetesProtocol;
 pub use kubeconfig::{brokered_kubeconfig, validate_brokered_kubeconfig, BrokerError};
@@ -38,3 +43,4 @@ pub use protocol::{CreatedIdentity, PlannedRevert, ProtocolConfig};
 pub use server::KubeProxy;
 pub use tls::ProxyTls;
 pub use upstream::Upstream;
+pub use vercel_protocol::VercelProtocol;
