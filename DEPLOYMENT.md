@@ -126,27 +126,26 @@ hosts.
   injection where local privilege escalation is not required.
 - A brokered command (`ansible`, `helm`) that needs to read one specific
   operator-owned config/vars/values file the daemon user does not own does not
-  require a broader trust model for that alone -- see "`grant-read`: scoped
-  file read grants" below, which is the preferred path for exactly this case
-  under the unprivileged model.
+  require a broader trust model for that alone -- see "Scoped file read
+  grants" below, which is the preferred path for exactly this case under the
+  unprivileged model.
 
-### `grant-read`: scoped file read grants
+### Scoped file read grants
 
-`guard grant-read <path> --ttl <seconds>` grants guard's own service account
-(or, under `--exec-as-caller`, the caller's uid) a time-boxed POSIX ACL read
-grant on one caller-named file, so a brokered `ansible`/`helm` command can read
-an operator config/vars/values file the daemon user does not own -- without
-making the daemon root or dropping to `--exec-as-caller`. The request goes
-through the same static credential deny-list, session allow/deny globs, and
-LLM evaluator as any other brokered request, and the grant auto-revokes at its
-TTL (bounded, no unbounded grant). This is the preferred, default path for the
-"brokered command needs to read an operator file" gap under the unprivileged
-policy-gate model above; `--exec-as-caller` remains documented below for its
-own broader per-uid command-execution use cases (not specific to file reads,
-and not affected by this feature).
+When a brokered command fails naming a file it could not read, guard
+automatically evaluates a time-boxed POSIX ACL read grant for that one path so
+the retried `ansible`/`helm` command can read an operator config/vars/values
+file the daemon user does not own. The grant targets guard's own service
+account, or the caller's uid under `--exec-as-caller`. The request goes through
+the same static credential deny-list, session allow/deny globs, and LLM
+evaluator as any other brokered request, and the grant revokes at its bounded
+TTL. This is the preferred, default path for the "brokered command needs to
+read an operator file" gap under the unprivileged policy-gate model above;
+`--exec-as-caller` remains documented below for its own broader per-uid
+command-execution use cases.
 
-Two pieces of host setup are required for `grant-read` to actually work under
-the packaged, unprivileged `guard.service`:
+Two pieces of host setup are required for transparent read grants under the
+packaged, unprivileged `guard.service`:
 
 1. **Capabilities to bypass DAC ownership/traversal checks.** `setfacl`/`getfacl`
    normally require the caller to own the target (or its parent, for adding an
@@ -187,7 +186,7 @@ the packaged, unprivileged `guard.service`:
    clears the ambient *and* inheritable capability sets of every brokered
    (caller-requested) child before it execs, so an approved brokered command
    (`cat`, `ansible-playbook`, `kubectl`, …) never inherits `CAP_DAC_READ_SEARCH`
-   or `CAP_FOWNER` and cannot use them to bypass file DAC or the `grant-read`
+   or `CAP_FOWNER` and cannot use them to bypass file DAC or the read-grant
    deny-list; only the daemon's own ACL operations are privileged.
 
    The unit deliberately sets **no** explicit `CapabilityBoundingSet=`. Narrowing
@@ -227,10 +226,9 @@ the packaged, unprivileged `guard.service`:
    This carve-out only lifts the systemd-level read-only *mount* restriction --
    it grants no DAC/ACL access by itself, and by itself it exposes nothing.
    Actual read access is still gated by the deny-list, the session/evaluator
-   decision, and the per-file ACL grant `grant-read` applies and auto-revokes
-   on approval; a path being writable at the mount-namespace level only makes
-   it *possible* for an approved `grant-read` call to place an ACL entry
-   there.
+   decision, and the per-file ACL grant guard applies and revokes on approval;
+   a path being writable at the mount-namespace level only makes it possible
+   for an approved read grant to place an ACL entry there.
 
 ### Privileged command broker
 
@@ -253,8 +251,8 @@ impersonation. A Unix root daemon started with `--exec-as-caller` over a
 Unix-socket-only listener instead drops each child to the calling uid before
 exec, making it a per-user secret broker. `--exec-as-caller` is Unix-only. If
 the only reason to reach for this model is a brokered command needing to read
-one operator-owned config/vars/values file, use `grant-read` under the
-unprivileged policy-gate model instead (see above) -- it solves that
+one operator-owned config/vars/values file, use transparent read grants under
+the unprivileged policy-gate model instead (see above). That path solves the
 narrower case without the daemon needing root or per-uid command execution.
 `--exec-as-caller` remains the right tool for its own broader per-uid
 command-execution use cases.

@@ -61,6 +61,15 @@ regex per parameter, single-argv rendering, no shell), which is what makes
   envelope, deletes held for operator approval. Hot-reloaded; the proxy is
   default-deny without it. Load with `--api-policy`.
 
+- **[github-policy.yaml](github-policy.yaml)** /
+  **[vercel-policy.yaml](vercel-policy.yaml)** -- API proxy policies for the
+  GitHub and Vercel example protocols (`--api-proxy` with
+  `--api-protocol github|vercel`). Same rule shape as the Kubernetes policy;
+  a repository/organization (GitHub) or project (Vercel) plays the namespace
+  role. Reads allowed with secret-bearing values redacted, scoped writes
+  allowed, deletes and side-effect-only operations held. Load with
+  `--api-policy`.
+
 - **[fallback-models.env](fallback-models.env)** -- Multi-model fallback chain.
   Adds retry-then-failover across multiple LLM providers via
   `GUARD_LLM_MODELS`. Only needed when your uptime requirements exceed a

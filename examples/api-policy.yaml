@@ -19,6 +19,20 @@
 #             apiserver: the client blocks while `guard approvals` lists it,
 #             `guard approve` releases it, `guard deny` or TTL expiry fails it
 #             closed. Requires `--gate consequence`; without it, holds deny.
+#   evaluate -> ask the daemon's LLM evaluator. It judges the operation against
+#             the `intent` prose below using a redacted operation summary and
+#             whether an auto-revert is constructible for it; the verdict still
+#             routes through the consequence gate (recoverable forwards inside
+#             the auto-revert envelope, irreversible or uncertain holds).
+#             Requires a configured LLM; without one, evaluate holds.
+#
+# Top-level `intent` is operator prose describing what this proxy is for; the
+# evaluator weighs every `evaluate`-routed request against it. Example:
+#
+#   intent: >
+#     CI agent maintaining the dev and staging namespaces: deploy and scale
+#     app workloads, inspect anything. It has no business in prod or with
+#     cluster-scoped resources.
 #
 # Verbs: get, list, watch (reads); create, update, patch (writes); delete,
 # deletecollection. A dry-run write is treated as a read.

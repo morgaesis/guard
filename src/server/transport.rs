@@ -29,8 +29,9 @@ use tokio::sync::RwLock;
 
 use super::admin::handle_admin_request;
 use super::execute::{execute_command, execute_command_streaming};
-use super::gate_runtime::{gating_sweeper, now_unix, DaemonGateSink, KUBE_PROXY_SENTINEL_BINARY};
-use super::grants::handle_grant_request;
+#[cfg(unix)]
+use super::gate_runtime::revert_dir_is_owner_only;
+use super::gate_runtime::{gating_sweeper, is_api_proxy_sentinel, now_unix, DaemonGateSink};
 #[cfg(unix)]
 use super::grants::{delete_read_grant_row, revoke_read_grant_acls};
 use super::wire::{
@@ -117,10 +118,14 @@ impl Server {
         self.config.extra_child_env = vars;
     }
 
-    /// Attach a Kubernetes API proxy to run alongside the gate socket. Must be
+    /// Attach an API proxy to run alongside the gate socket. Must be
     /// called before `run`.
-    pub fn set_kube_proxy(&mut self, proxy: Arc<guard::proxy::ApiProxy>) {
-        self.config.kube_proxy = Some(proxy);
+    pub async fn register_api_proxy(&mut self, proxy: Arc<guard::proxy::ApiProxy>) {
+        self.config
+            .protocol_registry
+            .write()
+            .await
+            .insert(proxy.protocol_name().to_string(), proxy);
     }
 
     /// Load persisted provisional/approval state and apply startup recovery:
@@ -179,15 +184,20 @@ impl Server {
                         }
                     }
                 }
-                // A kube-proxy hold cannot survive a restart: the parked HTTP
+                // An API-proxy hold cannot survive a restart: the parked HTTP
                 // request died with the old process, so a still-pending row
                 // would offer the operator an approval that releases nothing.
+                // A proxy hold is identified the same way the approve path
+                // identifies one: the sentinel binary AND daemon-principal
+                // ownership (peer credentials assign that principal only to the
+                // daemon's own gate sink).
                 let orphaned: Vec<String> = reg
                     .list()
                     .into_iter()
                     .filter(|a| {
                         a.status == ApprovalStatus::Pending
-                            && a.snapshot.binary == KUBE_PROXY_SENTINEL_BINARY
+                            && is_api_proxy_sentinel(&a.snapshot.binary)
+                            && matches!(&a.snapshot.principal, Some(p) if self.config.daemon_principal.eq_ci(p))
                     })
                     .map(|a| a.handle)
                     .collect();
@@ -205,7 +215,7 @@ impl Server {
                 }
                 if !orphaned.is_empty() {
                     tracing::warn!(
-                        "[AUDIT] STARTUP_RECOVERY kube_proxy_holds_retired={} handles={:?}",
+                        "[AUDIT] STARTUP_RECOVERY api_proxy_holds_retired={} handles={:?}",
                         orphaned.len(),
                         orphaned
                     );
@@ -304,37 +314,92 @@ impl Server {
             }));
         }
 
-        if let Some(ref proxy) = self.config.kube_proxy {
+        let proxies: Vec<_> = self
+            .config
+            .protocol_registry
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect();
+        for proxy in proxies {
             // The auto-revert envelope needs the consequence sweeper, which only
             // runs under `--gate consequence`. Without it the proxy still gates
             // (allow/deny/hold/redact) but forwards recoverable writes unwrapped.
             if self.config.gate.is_on() {
-                let snapshot_dir = self
+                // With a state DB the revert dir lives beside it (systemd
+                // StateDirectory, 0700). Without one, provisionals are
+                // process-local and not recovered across restart, so a fresh
+                // private directory (unpredictable name, created owner-only) is
+                // both sufficient and immune to a pre-created fixed-name dir a
+                // local attacker could own.
+                let snapshot_dir = match self
                     .config
                     .state_db_path
                     .as_ref()
                     .and_then(|p| p.parent())
-                    .map(|d| d.join("kube-proxy-reverts"))
-                    .unwrap_or_else(|| std::env::temp_dir().join("guard-kube-proxy-reverts"));
-                if let Err(e) = std::fs::create_dir_all(&snapshot_dir) {
-                    tracing::warn!(
-                        "could not create kube-proxy revert dir {}: {}",
-                        snapshot_dir.display(),
-                        e
+                    .map(|d| d.join("api-proxy-reverts"))
+                {
+                    Some(dir) => {
+                        if let Err(e) = std::fs::create_dir_all(&dir) {
+                            tracing::warn!(
+                                "could not create api-proxy revert dir {}: {}",
+                                dir.display(),
+                                e
+                            );
+                        }
+                        dir
+                    }
+                    None => tempfile::Builder::new()
+                        .prefix("guard-api-proxy-reverts-")
+                        .tempdir()
+                        .map(|d| d.keep())
+                        .unwrap_or_else(|e| {
+                            tracing::warn!("could not create private api-proxy revert dir: {}", e);
+                            std::env::temp_dir().join("guard-api-proxy-reverts")
+                        }),
+                };
+                // Revert bodies can carry secret material, so the directory must
+                // be owner-only. Under systemd this sits under StateDirectory
+                // (0700, daemon-owned); a bare-invocation fallback under the
+                // shared temp dir could be pre-created by another local user, so
+                // verify ownership and mode and refuse to arm body-bearing
+                // reverts if the directory is not exclusively the daemon's.
+                #[cfg(unix)]
+                let snapshot_dir_safe = {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(
+                        &snapshot_dir,
+                        std::fs::Permissions::from_mode(0o700),
+                    );
+                    revert_dir_is_owner_only(&snapshot_dir)
+                };
+                #[cfg(not(unix))]
+                let snapshot_dir_safe = true;
+                if !snapshot_dir_safe {
+                    tracing::error!(
+                        "[AUDIT] API_REVERT_DIR_UNSAFE path=\"{}\" (not owner-only; body-bearing auto-reverts are disabled)",
+                        snapshot_dir.display()
                     );
                 }
                 proxy.attach_gate(Arc::new(DaemonGateSink {
                     config: self.config.clone(),
-                    kubeconfig: proxy.real_kubeconfig().to_path_buf(),
+                    protocol: proxy.protocol_name().to_string(),
                     snapshot_dir,
+                    snapshot_dir_safe,
                     window_secs: DEFAULT_CONFIRM_WITHIN_SECS,
                 }));
             } else {
                 tracing::info!(
-                    "kube-proxy: --gate consequence not set; recoverable writes forwarded without auto-revert and policy 'hold' rules deny fail-closed (no approval queue)"
+                    "api-proxy ({}): --gate consequence not set; recoverable writes forwarded without auto-revert and policy 'hold' rules deny fail-closed (no approval queue)",
+                    proxy.protocol_name()
                 );
             }
-            tracing::info!("Starting kube-proxy listener on {}", proxy.listen());
+            tracing::info!(
+                "Starting api-proxy ({}) listener on {}",
+                proxy.protocol_name(),
+                proxy.listen()
+            );
             let proxy = proxy.clone();
             futures.push(tokio::spawn(async move { proxy.serve().await }));
         }
@@ -804,15 +869,6 @@ where
                 writer.write_all(b"\n").await?;
                 continue;
             }
-            IncomingMessage::Grant { grant } => {
-                let result = handle_grant_request(config, &caller, grant).await;
-                let resp = result.into_response();
-                writer
-                    .write_all(serde_json::to_string(&resp)?.as_bytes())
-                    .await?;
-                writer.write_all(b"\n").await?;
-                continue;
-            }
             IncomingMessage::Execute(req) => *req,
         };
 
@@ -958,30 +1014,6 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
                     }
                 };
                 let resp = handle_admin_request(config, &caller, admin).await;
-                writer
-                    .write_all(serde_json::to_string(&resp)?.as_bytes())
-                    .await?;
-                writer.write_all(b"\n").await?;
-                continue;
-            }
-            IncomingMessage::Grant { grant } => {
-                // Read grants apply a POSIX ACL for a kernel-verified local uid;
-                // a bearer-token TCP caller carries no such identity, so it can
-                // never be the grant principal. Refuse rather than guess.
-                let reason = format!(
-                    "read grants require a local Unix socket caller: '{}' cannot be requested over TCP",
-                    grant.path()
-                );
-                let resp = ExecuteResponse {
-                    allowed: false,
-                    reason,
-                    exit_code: None,
-                    stdout: None,
-                    stderr: None,
-                    status: None,
-                    handle: None,
-                    coverage: None,
-                };
                 writer
                     .write_all(serde_json::to_string(&resp)?.as_bytes())
                     .await?;

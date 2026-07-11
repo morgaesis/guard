@@ -7,17 +7,16 @@ use crate::server::gate_runtime::{
 use crate::server::gate_runtime::{arm_containment, finish_revert, DaemonGateSink};
 use crate::server::wire::{
     AdminRequest, AdminResponse, CallerIdentity, ExecOutcome, ExecuteRequest, ExecuteResult,
-    GrantRequest, IncomingMessage, RevertSpec,
+    RevertSpec,
 };
 use crate::server::{ServerConfig, APPROVAL_TTL_SECS};
 use guard::gating::approval::{Approval, ApprovalSnapshot, ApprovalStatus};
 #[cfg(unix)]
-use guard::gating::provisional::ProvisionalStatus;
+use guard::gating::provisional::{ApiRevertPlan, Provisional, ProvisionalStatus};
 use guard::gating::{Coverage, GateMode, Reversibility};
 use guard::principal::PrincipalKey;
 use std::collections::HashMap;
 #[cfg(unix)]
-use std::path::PathBuf;
 #[cfg(unix)]
 use std::sync::Arc;
 #[cfg(unix)]
@@ -374,6 +373,152 @@ async fn contain_then_deadline_triggers_sweeper_autorevert() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn api_revert_without_running_proxy_defers_to_operator() {
+    let (cfg, _operator, _agent) = gating_config(7014, 1000);
+    let handle = "api-missing-proxy".to_string();
+    let now = now_unix();
+    let provisional = Provisional {
+        handle: handle.clone(),
+        principal: Some(cfg.daemon_principal.clone()),
+        binary: "(api-proxy)".to_string(),
+        args: vec!["delete labels/bug in o/r".to_string()],
+        revert_binary: "(api-proxy)".to_string(),
+        revert_args: vec![
+            "github".to_string(),
+            "POST".to_string(),
+            "/repos/o/r/labels".to_string(),
+        ],
+        api_revert: Some(ApiRevertPlan {
+            protocol: "github".to_string(),
+            method: "POST".to_string(),
+            path: "/repos/o/r/labels".to_string(),
+            body_file: None,
+        }),
+        reason: "delete labels/bug in o/r".to_string(),
+        created_unix: now,
+        deadline_unix: now,
+        forward_done: true,
+        status: ProvisionalStatus::Reverting,
+        revert_exit: None,
+        revert_detail: None,
+    };
+    cfg.provisional.write().await.insert(provisional.clone());
+
+    // A missing proxy is recoverable: the change is still live, so the revert
+    // is deferred to the operator (NeedsOperatorDecision) rather than burned as
+    // a terminal RevertFailed.
+    let (message, exit) = finish_revert(&cfg, &provisional, &CallerIdentity::Unknown, "auto").await;
+    assert!(message.contains("deferred"), "got: {message}");
+    assert_eq!(exit, None);
+    let row = cfg.provisional.read().await.get(&handle).cloned().unwrap();
+    assert_eq!(row.status, ProvisionalStatus::NeedsOperatorDecision);
+    assert!(row
+        .revert_detail
+        .as_deref()
+        .unwrap()
+        .contains("no running api-proxy for protocol 'github'"));
+}
+
+/// The sweeper executes a due API revert as an HTTP request through the
+/// registered proxy's upstream, carrying the daemon's bearer credential and
+/// the persisted body. This is the success half of the fail-loud test above.
+#[cfg(unix)]
+#[tokio::test]
+async fn api_revert_executes_through_registered_proxy_upstream() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Minimal recording upstream: capture the one request, answer 200 JSON.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    let captured: Arc<std::sync::Mutex<String>> = Arc::new(std::sync::Mutex::new(String::new()));
+    let captured_in = captured.clone();
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            *captured_in.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).to_string();
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n{}",
+                )
+                .await;
+        }
+    });
+
+    let (cfg, _operator, _agent) = gating_config(7015, 1000);
+    let upstream = guard::proxy::Upstream::from_base_url(
+        &format!("http://{upstream_addr}"),
+        guard::proxy::UpstreamAuth::Bearer("revert-token".to_string()),
+    )
+    .expect("upstream");
+    let proxy = Arc::new(guard::proxy::ApiProxy::with_protocol(
+        Arc::new(guard::proxy::GithubProtocol),
+        "127.0.0.1:0".parse().unwrap(),
+        guard::proxy::ProxyTls::generate().expect("tls"),
+        upstream,
+        guard::proxy::ApiPolicy::deny_all(),
+        None,
+    ));
+    cfg.protocol_registry
+        .write()
+        .await
+        .insert("github".to_string(), proxy);
+
+    let body_file = std::env::temp_dir().join(format!("api-revert-body-{}", std::process::id()));
+    std::fs::write(&body_file, br#"{"name":"bug","color":"d73a4a"}"#).unwrap();
+
+    let handle = "api-live-proxy".to_string();
+    let now = now_unix();
+    let provisional = Provisional {
+        handle: handle.clone(),
+        principal: Some(cfg.daemon_principal.clone()),
+        binary: "(api-proxy)".to_string(),
+        args: vec!["delete labels/bug in o/r".to_string()],
+        revert_binary: "(api-proxy)".to_string(),
+        revert_args: vec![
+            "github".to_string(),
+            "POST".to_string(),
+            "/repos/o/r/labels".to_string(),
+        ],
+        api_revert: Some(ApiRevertPlan {
+            protocol: "github".to_string(),
+            method: "POST".to_string(),
+            path: "/repos/o/r/labels".to_string(),
+            body_file: Some(body_file.clone()),
+        }),
+        reason: "delete labels/bug in o/r".to_string(),
+        created_unix: now,
+        deadline_unix: now,
+        forward_done: true,
+        status: ProvisionalStatus::Reverting,
+        revert_exit: None,
+        revert_detail: None,
+    };
+    cfg.provisional.write().await.insert(provisional.clone());
+
+    let (message, exit) = finish_revert(&cfg, &provisional, &CallerIdentity::Unknown, "auto").await;
+    assert!(message.contains("reverted"), "got: {message}");
+    assert_eq!(exit, Some(0));
+    let row = cfg.provisional.read().await.get(&handle).cloned().unwrap();
+    assert_eq!(row.status, ProvisionalStatus::Reverted);
+
+    let raw = captured.lock().unwrap().clone();
+    assert!(raw.starts_with("POST /repos/o/r/labels HTTP/1.1"), "{raw}");
+    assert!(
+        raw.contains("authorization: Bearer revert-token")
+            || raw.contains("Authorization: Bearer revert-token"),
+        "daemon credential must ride the revert: {raw}"
+    );
+    assert!(raw.contains(r#"{"name":"bug","color":"d73a4a"}"#), "{raw}");
+    // The secret-bearing snapshot body is removed once the revert is terminal.
+    assert!(
+        !body_file.exists(),
+        "revert body file must be unlinked after a terminal revert"
+    );
+}
+
 /// A recoverable command whose free-form `--revert` cannot be affirmed is
 /// HELD for operator review, not armed with an unverified rollback and not
 /// silently denied. Here the rollback binary is structurally invalid, so
@@ -544,8 +689,9 @@ async fn kube_proxy_hold_routes_through_approval_queue() {
     let (cfg, operator, _agent) = gating_config(7013, 1000);
     let sink = Arc::new(DaemonGateSink {
         config: cfg.clone(),
-        kubeconfig: PathBuf::from("unused-in-test"),
+        protocol: "kubernetes".to_string(),
         snapshot_dir: std::env::temp_dir(),
+        snapshot_dir_safe: true,
         window_secs: 60,
     });
 
@@ -1198,26 +1344,4 @@ fn provisional_result_carries_contain_coverage() {
         }
         other => panic!("expected Provisional, got {:?}", other),
     }
-}
-
-// ---- Filesystem read-grant tests ----------------------------------------
-
-#[test]
-fn grant_envelope_routes_to_its_own_variant() {
-    let grant_json = serde_json::to_string(&IncomingMessage::Grant {
-        grant: GrantRequest::Read {
-            path: "/home/op/values.yaml".to_string(),
-            ttl_secs: 300,
-            session_token: None,
-            reevaluate: false,
-        },
-    })
-    .unwrap();
-    let parsed: IncomingMessage = serde_json::from_str(&grant_json).unwrap();
-    assert!(matches!(parsed, IncomingMessage::Grant { .. }));
-
-    // A bare execute request still routes to Execute, not Grant, under the
-    // untagged enum.
-    let exec: IncomingMessage = serde_json::from_str(r#"{"binary":"ls","args":[]}"#).unwrap();
-    assert!(matches!(exec, IncomingMessage::Execute(_)));
 }

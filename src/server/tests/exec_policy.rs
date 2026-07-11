@@ -13,8 +13,13 @@ use crate::server::{
     validate_request_injections,
 };
 use crate::session::SessionGrant;
+use guard::evaluate::{EvalConfig, Evaluator};
+use guard::gating::deny_shape::{DenyLearningConfig, DenyShapeStore};
 use guard::principal::PrincipalKey;
 use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::RwLock;
 
 use super::{args, capture, make_test_config, paranoid_test_config};
 
@@ -313,6 +318,141 @@ async fn invalid_secret_shell_reference_denies_before_policy_evaluation() {
     assert!(result
         .policy_reason()
         .contains("invalid secret environment reference"));
+}
+
+async fn run_denying_llm(listener: tokio::net::TcpListener) {
+    loop {
+        let (mut stream, _) = match listener.accept().await {
+            Ok(stream) => stream,
+            Err(_) => return,
+        };
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 2048];
+            while let Ok(n) = stream.read(&mut tmp).await {
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&buf[..pos]);
+                    let content_length = headers
+                        .split("\r\n")
+                        .find_map(|line| {
+                            line.strip_prefix("Content-Length: ")
+                                .or_else(|| line.strip_prefix("content-length: "))
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= pos + 4 + content_length {
+                        break;
+                    }
+                }
+            }
+            let args = serde_json::json!({
+                "decision": "DENY",
+                "reason": "destructive request",
+                "risk": 9
+            })
+            .to_string();
+            let body = serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "tool_calls": [{
+                            "id": "c1",
+                            "type": "function",
+                            "function": {
+                                "name": "decide",
+                                "arguments": args
+                            }
+                        }]
+                    }
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+    }
+}
+
+fn basic_request(binary: &str, args: Vec<String>) -> ExecuteRequest {
+    ExecuteRequest {
+        binary: binary.to_string(),
+        args,
+        auth_token: None,
+        env: HashMap::new(),
+        secrets: HashMap::new(),
+        stream: false,
+        session_token: None,
+        revert: None,
+        confirm_within_secs: None,
+        reevaluate: false,
+        ssh_hostkey: None,
+        require_approval: None,
+        wait_approval_secs: None,
+        verb: None,
+    }
+}
+
+#[tokio::test]
+async fn repeated_llm_denials_append_count_hint_at_threshold_only() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(run_denying_llm(listener));
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut deny_config = DenyLearningConfig::new(temp.path().join("deny.yaml"));
+    deny_config.min_denials = 2;
+    let deny_store = DenyShapeStore::load(deny_config).unwrap();
+    let evaluator = Evaluator::new(
+        EvalConfig::default()
+            .cache_enabled(false)
+            .llm_api_key("test-key".to_string())
+            .llm_api_url(url)
+            .llm_retries(0)
+            .deny_shapes(Arc::new(RwLock::new(deny_store))),
+    )
+    .unwrap();
+
+    let (mut cfg, _) = make_test_config();
+    cfg.evaluator = Arc::new(evaluator);
+    let caller = CallerIdentity::Unix { uid: 1000 };
+
+    let first = execute_command(
+        basic_request("echo", vec!["delete-prod".to_string()]),
+        &cfg,
+        &caller,
+    )
+    .await;
+    assert!(!first.policy_allowed());
+    assert!(!first.policy_reason().contains("guard has denied"));
+
+    let second = execute_command(
+        basic_request("echo", vec!["delete-prod".to_string()]),
+        &cfg,
+        &caller,
+    )
+    .await;
+    let reason = second.policy_reason();
+    assert!(reason.contains("destructive request"));
+    assert!(reason.contains("guard has denied 2 similar echo commands; if this access is needed, ask your operator to broaden the session grant or add a profile"));
+    for forbidden in ["promoted", "learned", "fast path"] {
+        assert!(
+            !reason.to_ascii_lowercase().contains(forbidden),
+            "client-facing denial reason exposed {forbidden}: {reason}"
+        );
+    }
+
+    let allowed = execute_command(basic_request("id", Vec::new()), &cfg, &caller).await;
+    assert!(allowed.policy_allowed());
+    assert!(!allowed.policy_reason().contains("guard has denied"));
 }
 
 #[test]

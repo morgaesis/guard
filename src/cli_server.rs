@@ -36,6 +36,10 @@ fn default_allow_promotion_state_path() -> Option<PathBuf> {
     default_guard_state_dir().map(|dir| dir.join("learned-allow.yaml"))
 }
 
+fn default_api_promotion_state_path() -> Option<PathBuf> {
+    default_guard_state_dir().map(|dir| dir.join("learned-api.yaml"))
+}
+
 /// Default verb catalog path used only when `--verbs` was not given but
 /// auto-promotion is enabled and needs somewhere to persist a promoted verb.
 /// Unlike `--verbs`, a missing file at this path is not an error (see the
@@ -103,12 +107,23 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             profiles,
             allow_bin,
             child_env,
+            api_proxy,
+            api_protocol,
+            api_upstream,
+            api_token_env,
+            api_token_file,
+            api_ca_out,
             kube_proxy,
             kubeconfig,
             kube_context,
             api_policy,
             brokered_kubeconfig_out,
             api_rarity_escalation,
+            api_promotion,
+            no_api_promotion,
+            api_promotion_state,
+            api_promotion_min_approvals,
+            api_promotion_min_denials,
             // Consumed in `main` (Windows SCM dispatch); irrelevant to the
             // server run itself, which is identical in service and foreground.
             service: _,
@@ -510,6 +525,57 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 eval_config = eval_config.allow_promotion(Arc::new(RwLock::new(store)));
             }
 
+            let api_promotion_enabled = if no_api_promotion {
+                false
+            } else {
+                api_promotion
+                    .or_else(|| guard_env("API_PROMOTION").map(|v| parse_env_bool(&v)))
+                    .unwrap_or(true)
+            };
+            let api_promotion_store = if api_promotion_enabled {
+                let api_promotion_state_path = api_promotion_state
+                    .or_else(|| {
+                        guard_env("API_PROMOTION_STATE")
+                            .filter(|value| !value.is_empty())
+                            .map(PathBuf::from)
+                    })
+                    .or_else(default_api_promotion_state_path)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("could not determine API promotion state path")
+                    })?;
+                let mut api_config = guard::gating::api_promotion::ApiPromotionConfig::new(
+                    api_promotion_state_path.clone(),
+                );
+                api_config.min_approvals = api_promotion_min_approvals
+                    .or_else(|| {
+                        guard_env("API_PROMOTION_MIN_APPROVALS").and_then(|v| v.parse::<u32>().ok())
+                    })
+                    .unwrap_or(api_config.min_approvals)
+                    .max(2);
+                api_config.min_denials = api_promotion_min_denials
+                    .or_else(|| {
+                        guard_env("API_PROMOTION_MIN_DENIALS").and_then(|v| v.parse::<u32>().ok())
+                    })
+                    .unwrap_or(api_config.min_denials)
+                    .max(1);
+                let store = guard::gating::api_promotion::ApiPromotionStore::load(api_config)
+                    .with_context(|| {
+                        format!(
+                            "failed to load API promotion state from {}",
+                            api_promotion_state_path.display()
+                        )
+                    })?;
+                tracing::info!(
+                    "API request-shape learning enabled: path={} min_approvals={} min_denials={}",
+                    store.path().display(),
+                    store.min_approvals(),
+                    store.min_denials()
+                );
+                Some(Arc::new(RwLock::new(store)))
+            } else {
+                None
+            };
+
             // Additive prompt: append to base prompt without replacing it.
             // Priority: --system-prompt-append flag > GUARD_PROMPT_APPEND env var
             let append_path = system_prompt_append.or_else(|| {
@@ -597,6 +663,11 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                     redact_secrets.push(key.clone());
                 }
             }
+
+            let api_judge_llm = eval_config.llm.clone();
+            let api_judge_cache_enabled = cache_enabled;
+            let api_judge_cache_capacity = cache_capacity;
+            let api_judge_cache_ttl = std::time::Duration::from_secs(cache_ttl_secs);
 
             tracing::info!("Creating evaluator...");
             let evaluator =
@@ -813,72 +884,243 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 srv.set_extra_child_env(child_env_vars);
             }
 
-            // Kubernetes API proxy: flag wins, else GUARD_KUBE_PROXY. When set,
-            // the daemon fronts the apiserver and gates each API operation.
-            let kube_proxy_addr = kube_proxy.or_else(|| guard_env("KUBE_PROXY"));
-            if let Some(addr_str) = kube_proxy_addr {
+            let env_api_proxy = guard_env("API_PROXY");
+            let env_kube_proxy = guard_env("KUBE_PROXY");
+            let env_api_protocol = guard_env("API_PROTOCOL");
+            let env_api_upstream = guard_env("API_UPSTREAM");
+            let env_api_token_env = guard_env("API_TOKEN_ENV");
+            let env_api_token_file = guard_env("API_TOKEN_FILE").map(PathBuf::from);
+            let env_api_ca_out = guard_env("API_CA_OUT").map(PathBuf::from);
+            let env_api_policy = guard_env("API_POLICY").map(PathBuf::from);
+            let env_api_rarity_escalation = guard_env("API_RARITY_ESCALATION");
+
+            let api_proxy_flag_set = api_proxy.is_some();
+            let kube_proxy_flag_set = kube_proxy.is_some();
+            let api_companion_configured = api_protocol.is_some()
+                || api_upstream.is_some()
+                || api_token_env.is_some()
+                || api_token_file.is_some()
+                || api_ca_out.is_some()
+                || env_api_protocol.is_some()
+                || env_api_upstream.is_some()
+                || env_api_token_env.is_some()
+                || env_api_token_file.is_some()
+                || env_api_ca_out.is_some();
+
+            let generic_api_proxy_addr = if api_proxy_flag_set {
+                api_proxy
+            } else if kube_proxy_flag_set {
+                None
+            } else {
+                env_api_proxy
+            };
+            let kube_proxy_addr = if kube_proxy_flag_set {
+                kube_proxy
+            } else if api_proxy_flag_set {
+                None
+            } else {
+                env_kube_proxy
+            };
+            if generic_api_proxy_addr.is_some() && kube_proxy_addr.is_some() {
+                anyhow::bail!("--api-proxy and --kube-proxy cannot both be set");
+            }
+            if generic_api_proxy_addr.is_none()
+                && kube_proxy_addr.is_none()
+                && api_companion_configured
+            {
+                anyhow::bail!("API proxy companion options require --api-proxy or --kube-proxy");
+            }
+            let using_kube_sugar = kube_proxy_addr.is_some();
+            let api_policy_path = api_policy.or(env_api_policy);
+
+            if let Some(addr_str) = generic_api_proxy_addr.or(kube_proxy_addr) {
                 if exec_as_caller {
                     anyhow::bail!(
-                        "--kube-proxy is incompatible with --exec-as-caller: a child running as the caller could read the caller's own kubeconfig and reach the apiserver around the proxy"
+                        "--api-proxy is incompatible with --exec-as-caller: a child running as the caller could read caller-owned credentials and reach the upstream around the proxy"
                     );
                 }
                 let listen: std::net::SocketAddr = addr_str
                     .parse()
-                    .with_context(|| format!("invalid --kube-proxy address '{addr_str}'"))?;
+                    .with_context(|| format!("invalid API proxy address '{addr_str}'"))?;
                 if !listen.ip().is_loopback() {
                     anyhow::bail!(
-                        "--kube-proxy must bind a loopback address (got {listen}): the proxy \
+                        "--api-proxy must bind a loopback address (got {listen}): the proxy \
                          authenticates nothing itself, so a non-loopback bind would offer the \
-                         daemon's cluster credential to anything that can reach the port"
+                         daemon's upstream credential to anything that can reach the port"
                     );
                 }
-                let kubeconfig_path = kubeconfig
-                    .or_else(|| guard_env("KUBE_PROXY_KUBECONFIG").map(PathBuf::from))
-                    .context(
-                        "--kube-proxy requires --kubeconfig (the operator's real kubeconfig)",
+
+                let protocol_name = api_protocol
+                    .or(env_api_protocol)
+                    .unwrap_or_else(|| "kubernetes".to_string())
+                    .to_ascii_lowercase();
+                if using_kube_sugar && !matches!(protocol_name.as_str(), "kubernetes" | "k8s") {
+                    anyhow::bail!("--kube-proxy is sugar for --api-protocol kubernetes");
+                }
+                let resolved_api_upstream = api_upstream.or(env_api_upstream);
+                let resolved_token_env = api_token_env.or(env_api_token_env);
+                let resolved_token_file = api_token_file.or(env_api_token_file);
+                let is_kubernetes = matches!(protocol_name.as_str(), "kubernetes" | "k8s");
+
+                let protocol: Arc<dyn guard::proxy::ProtocolConfig> = match protocol_name.as_str()
+                {
+                    "kubernetes" | "k8s" => Arc::new(guard::proxy::KubernetesProtocol),
+                    "github" => Arc::new(guard::proxy::GithubProtocol),
+                    "vercel" => Arc::new(guard::proxy::VercelProtocol),
+                    other => anyhow::bail!(
+                        "unsupported --api-protocol '{other}' (expected kubernetes, github, or vercel)"
+                    ),
+                };
+                let upstream = if is_kubernetes {
+                    if resolved_api_upstream.is_some()
+                        || resolved_token_env.is_some()
+                        || resolved_token_file.is_some()
+                    {
+                        anyhow::bail!(
+                            "--api-protocol kubernetes rejects --api-upstream and --api-token-*; use --kubeconfig"
+                        );
+                    }
+                    let kubeconfig_path = kubeconfig
+                        .or_else(|| guard_env("KUBE_PROXY_KUBECONFIG").map(PathBuf::from))
+                        .context(
+                            "--api-protocol kubernetes requires --kubeconfig (the operator's real kubeconfig)",
+                        )?;
+                    let context = kube_context.or_else(|| guard_env("KUBE_CONTEXT"));
+                    guard::proxy::Upstream::from_kubeconfig_file(
+                        &kubeconfig_path,
+                        context.as_deref(),
+                    )
+                    .context("load upstream kubeconfig for API proxy")?
+                } else {
+                    let upstream_url = resolved_api_upstream.context(
+                        "--api-proxy with a non-kubernetes protocol requires --api-upstream",
                     )?;
-                let context = kube_context.or_else(|| guard_env("KUBE_CONTEXT"));
-                let upstream = guard::proxy::Upstream::from_kubeconfig_file(
-                    &kubeconfig_path,
-                    context.as_deref(),
-                )
-                .context("load upstream kubeconfig for --kube-proxy")?;
+                    let token = match (resolved_token_env, resolved_token_file) {
+                        (Some(var), None) => {
+                            if !is_valid_env_name(&var) {
+                                anyhow::bail!("--api-token-env must be a valid environment variable name");
+                            }
+                            std::env::var(&var).with_context(|| {
+                                format!("read upstream bearer token from ${var}")
+                            })?
+                        }
+                        (None, Some(path)) => std::fs::read_to_string(&path)
+                            .with_context(|| {
+                                format!("read upstream bearer token file {}", path.display())
+                            })?
+                            .trim()
+                            .to_string(),
+                        (Some(_), Some(_)) => {
+                            anyhow::bail!("--api-token-env and --api-token-file cannot both be set")
+                        }
+                        (None, None) => anyhow::bail!(
+                            "--api-proxy with a non-kubernetes protocol requires --api-token-env or --api-token-file"
+                        ),
+                    };
+                    if token.is_empty() {
+                        anyhow::bail!("upstream bearer token is empty");
+                    }
+                    guard::proxy::Upstream::from_base_url(
+                        &upstream_url,
+                        guard::proxy::UpstreamAuth::Bearer(token),
+                    )
+                    .context("build generic API upstream")?
+                };
                 let tls =
                     guard::proxy::ProxyTls::generate().context("generate proxy TLS material")?;
-                let api_policy_path =
-                    api_policy.or_else(|| guard_env("API_POLICY").map(PathBuf::from));
                 let policy = match &api_policy_path {
                     Some(p) => guard::proxy::ApiPolicy::load_file(p)
                         .with_context(|| format!("load --api-policy {}", p.display()))?,
                     None => {
                         tracing::warn!(
-                            "--kube-proxy started without --api-policy: default-deny (no API requests pass)"
+                            "--api-proxy started without --api-policy: default-deny (no API requests pass)"
                         );
                         guard::proxy::ApiPolicy::deny_all()
                     }
                 };
+                let policy_contains_evaluate = policy.contains_evaluate();
+                let policy_intent = policy.intent.clone();
                 let rarity_threshold = api_rarity_escalation
-                    .or_else(|| guard_env("API_RARITY_ESCALATION").and_then(|v| v.parse().ok()))
+                    .map(Ok)
+                    .or_else(|| {
+                        env_api_rarity_escalation.map(|v| {
+                            v.parse::<u64>()
+                                .context("parse GUARD_API_RARITY_ESCALATION")
+                        })
+                    })
+                    .transpose()?
                     .unwrap_or(0);
-                let mut proxy = guard::proxy::ApiProxy::new(
+                let ca_pem = tls.ca_pem().to_string();
+                let mut proxy = guard::proxy::ApiProxy::with_protocol(
+                    protocol,
                     listen,
                     tls,
                     upstream,
                     policy,
                     api_policy_path,
-                    kubeconfig_path.clone(),
                 );
                 if rarity_threshold > 0 {
                     proxy = proxy.with_rarity_escalation(rarity_threshold);
                     tracing::info!(
-                        "kube-proxy rarity escalation on: shapes seen < {} times this run are held for review",
+                        "api-proxy rarity escalation on: shapes seen < {} times this run are held for review",
                         rarity_threshold
                     );
                 }
                 let proxy = Arc::new(proxy);
+                let mut api_judge_attached = false;
+                if api_judge_llm.enabled
+                    && api_judge_llm
+                        .api_key
+                        .as_ref()
+                        .is_some_and(|key| !key.is_empty())
+                {
+                    let llm = api_judge_llm.clone();
+                    let api_promotion_store = api_promotion_store.clone();
+                    let builder =
+                        Arc::new(
+                            move |intent: Option<String>| match server::DaemonApiJudge::build(
+                                llm.clone(),
+                                api_judge_cache_enabled,
+                                api_judge_cache_capacity,
+                                api_judge_cache_ttl,
+                                intent,
+                                api_promotion_store.clone(),
+                            ) {
+                                Ok(judge) => Some(judge),
+                                Err(e) => {
+                                    tracing::error!("failed to build API evaluator judge: {e:#}");
+                                    None
+                                }
+                            },
+                        );
+                    proxy.attach_judge_builder(builder.clone());
+                    if let Some(judge) = builder(policy_intent) {
+                        proxy.attach_judge(judge);
+                        api_judge_attached = true;
+                        tracing::info!(
+                            "API proxy evaluator attached for {}",
+                            proxy.protocol_name()
+                        );
+                    }
+                }
+                if policy_contains_evaluate && !api_judge_attached {
+                    tracing::warn!(
+                        "API policy contains evaluate actions but no API evaluator judge is attached; those requests will hold, and deny without an approval queue"
+                    );
+                }
+                if let Some(out) = api_ca_out.or(env_api_ca_out) {
+                    std::fs::write(&out, ca_pem)
+                        .with_context(|| format!("write API proxy CA to {}", out.display()))?;
+                    tracing::info!("Wrote API proxy CA to {}", out.display());
+                }
                 if let Some(out) = brokered_kubeconfig_out
                     .or_else(|| guard_env("BROKERED_KUBECONFIG_OUT").map(PathBuf::from))
                 {
+                    if !is_kubernetes {
+                        anyhow::bail!(
+                            "--brokered-kubeconfig-out is only valid for the Kubernetes API proxy"
+                        );
+                    }
                     let yaml = proxy.brokered_kubeconfig();
                     // The generator is credential-free by construction; assert it
                     // before handing the file to an agent.
@@ -890,8 +1132,12 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                     })?;
                     tracing::info!("Wrote brokered kubeconfig to {}", out.display());
                 }
-                tracing::info!("Kube-proxy enabled on {}", proxy.listen());
-                srv.set_kube_proxy(proxy);
+                tracing::info!(
+                    "API proxy enabled for {} on {}",
+                    proxy.protocol_name(),
+                    proxy.listen()
+                );
+                srv.register_api_proxy(proxy).await;
             }
 
             // Plain stdout, not tracing: the default log filter is "warn", so

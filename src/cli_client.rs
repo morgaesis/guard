@@ -900,6 +900,7 @@ fn looks_like_tcp_endpoint(value: &str) -> bool {
 /// Resolve a possibly-relative path against the client's working directory. The
 /// daemon canonicalizes again server-side; making it absolute here ensures the
 /// server resolves the file the caller meant, not one relative to the daemon CWD.
+#[cfg(unix)]
 fn absolute_path(path: &str) -> String {
     let p = PathBuf::from(path);
     if p.is_absolute() {
@@ -909,63 +910,6 @@ fn absolute_path(path: &str) -> String {
         Ok(cwd) => cwd.join(p).display().to_string(),
         Err(_) => path.to_string(),
     }
-}
-
-fn print_grant_response(resp: &server::ExecuteResponse) -> Result<()> {
-    if resp.allowed {
-        if let Some(out) = &resp.stdout {
-            print!("{}", out);
-            let _ = std::io::stdout().flush();
-        }
-        Ok(())
-    } else {
-        let color = color_enabled_for_stderr();
-        eprintln!("{} {}", paint("DENIED", AnsiColor::Red, color), resp.reason);
-        std::process::exit(1);
-    }
-}
-
-pub(crate) async fn handle_grant_read(
-    path: String,
-    ttl: u64,
-    reevaluate: bool,
-    socket: Option<String>,
-) -> Result<()> {
-    let config = client_config::ClientConfig::load().ok().unwrap_or_default();
-    let (socket_path, tcp_port, source) = resolve_client_endpoint_with_source(socket, &config);
-    let client = daemon_client::Client::new(socket_path, tcp_port);
-    let session_token = std::env::var("GUARD_SESSION")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let grant = server::GrantRequest::Read {
-        path: absolute_path(&path),
-        ttl_secs: ttl,
-        session_token,
-        reevaluate,
-    };
-    let resp = client
-        .grant(grant)
-        .await
-        .map_err(|e| describe_connect_failure(e, &client, source))?;
-    print_grant_response(&resp)
-}
-
-pub(crate) async fn handle_grant_revoke(path: String, socket: Option<String>) -> Result<()> {
-    let config = client_config::ClientConfig::load().ok().unwrap_or_default();
-    let (socket_path, tcp_port, source) = resolve_client_endpoint_with_source(socket, &config);
-    let client = daemon_client::Client::new(socket_path, tcp_port);
-    let session_token = std::env::var("GUARD_SESSION")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let grant = server::GrantRequest::Revoke {
-        path: absolute_path(&path),
-        session_token,
-    };
-    let resp = client
-        .grant(grant)
-        .await
-        .map_err(|e| describe_connect_failure(e, &client, source))?;
-    print_grant_response(&resp)
 }
 
 pub(crate) async fn handle_status(socket: Option<String>) -> Result<()> {

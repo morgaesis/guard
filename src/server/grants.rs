@@ -13,60 +13,23 @@ use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
 #[cfg(unix)]
-use super::execute::resolve_exec_caller_context;
+use super::execute::{resolve_exec_caller_context, AUTO_READ_GRANT_TTL_SECS};
 #[cfg(unix)]
 use super::gate_runtime::{new_handle, now_unix};
-use super::wire::{CallerIdentity, ExecuteResult, GrantRequest};
+#[cfg(unix)]
+use super::wire::{CallerIdentity, ExecuteResult};
 use super::ServerConfig;
 
 /// Label used for the binary field of a read-grant request's audit records, so
-/// `[AUDIT] ALLOWED`/`DENIED` grep patterns and session allow/deny globs treat a
-/// grant request the same shape as `grant-read <path> --ttl <ttl>`.
-const GRANT_READ_LABEL: &str = "grant-read";
+/// `[AUDIT] ALLOWED`/`DENIED` grep patterns and session allow/deny globs match a
+/// read grant under a stable name. Kept as `grant-read` so an operator session
+/// grant that allow-lists this shape keeps matching the transparent path.
+#[cfg(unix)]
+const AUTO_READ_GRANT_LABEL: &str = "grant-read";
 
 #[cfg(unix)]
 fn grant_read_audit_args(path: &str, ttl: u64) -> Vec<String> {
     vec![path.to_string(), "--ttl".to_string(), ttl.to_string()]
-}
-
-/// Handle a filesystem read-grant request. Platform-gated to Unix (POSIX ACLs);
-/// on any other platform it fails clearly and immediately, mirroring the
-/// `--exec-as-caller` platform gate.
-pub(super) async fn handle_grant_request(
-    config: &ServerConfig,
-    caller: &CallerIdentity,
-    grant: GrantRequest,
-) -> ExecuteResult {
-    #[cfg(not(unix))]
-    {
-        let reason = format!(
-            "read grants are not supported on this platform (POSIX ACLs are Unix-only): '{}'",
-            grant.path()
-        );
-        config.log_audit_policy(
-            caller,
-            GRANT_READ_LABEL,
-            &[grant.path().to_string()],
-            false,
-            &reason,
-        );
-        ExecuteResult::denied(reason)
-    }
-    #[cfg(unix)]
-    {
-        match grant {
-            GrantRequest::Read {
-                path,
-                ttl_secs,
-                session_token,
-                reevaluate,
-            } => handle_grant_read(config, caller, path, ttl_secs, session_token, reevaluate).await,
-            GrantRequest::Revoke {
-                path,
-                session_token,
-            } => handle_grant_revoke(config, caller, path, session_token).await,
-        }
-    }
 }
 
 /// Issue a scoped, time-boxed POSIX ACL read grant, routed through the same
@@ -78,11 +41,9 @@ pub(super) async fn handle_grant_read(
     config: &ServerConfig,
     caller: &CallerIdentity,
     path: String,
-    ttl_secs: u64,
     session_token: Option<String>,
-    reevaluate: bool,
 ) -> ExecuteResult {
-    let ttl = clamp_ttl(ttl_secs);
+    let ttl = clamp_ttl(AUTO_READ_GRANT_TTL_SECS);
 
     // A read grant applies an ACL for a kernel-verified local uid; only a local
     // Unix peer carries one.
@@ -92,7 +53,7 @@ pub(super) async fn handle_grant_read(
             let reason = "read grants require a local Unix socket caller".to_string();
             config.log_audit_policy(
                 caller,
-                GRANT_READ_LABEL,
+                AUTO_READ_GRANT_LABEL,
                 &grant_read_audit_args(&path, ttl),
                 false,
                 &reason,
@@ -110,7 +71,7 @@ pub(super) async fn handle_grant_read(
             let reason = format!("read-grant denied: cannot resolve '{path}': {e}");
             config.log_audit_policy(
                 caller,
-                GRANT_READ_LABEL,
+                AUTO_READ_GRANT_LABEL,
                 &grant_read_audit_args(&path, ttl),
                 false,
                 &reason,
@@ -123,7 +84,7 @@ pub(super) async fn handle_grant_read(
 
     // 1. Hard static credential deny-list, BEFORE the evaluator.
     if let Some(reason) = credential_path_deny_reason(&canonical_str) {
-        config.log_audit_policy(caller, GRANT_READ_LABEL, &audit_args, false, &reason);
+        config.log_audit_policy(caller, AUTO_READ_GRANT_LABEL, &audit_args, false, &reason);
         return ExecuteResult::denied(reason);
     }
 
@@ -134,7 +95,7 @@ pub(super) async fn handle_grant_read(
         let (decision, exists, static_only) = {
             let reg = config.sessions.read().await;
             (
-                reg.check(token, GRANT_READ_LABEL, &audit_args),
+                reg.check(token, AUTO_READ_GRANT_LABEL, &audit_args),
                 reg.has(token),
                 reg.static_only_for(token),
             )
@@ -142,18 +103,18 @@ pub(super) async fn handle_grant_read(
         if !exists {
             let reason =
                 format!("unknown session token: '{token}' is revoked, expired, or never existed");
-            config.log_audit_policy(caller, GRANT_READ_LABEL, &audit_args, false, &reason);
+            config.log_audit_policy(caller, AUTO_READ_GRANT_LABEL, &audit_args, false, &reason);
             return ExecuteResult::denied(reason);
         }
         match decision {
             Some((SessionDecision::Deny, reason)) => {
-                config.log_audit_policy(caller, GRANT_READ_LABEL, &audit_args, false, &reason);
+                config.log_audit_policy(caller, AUTO_READ_GRANT_LABEL, &audit_args, false, &reason);
                 return ExecuteResult::denied(reason);
             }
             Some((SessionDecision::Allow, reason)) => allow_reason = Some(reason),
             None if static_only => {
                 let reason = "session static-only: no matching session allow rule".to_string();
-                config.log_audit_policy(caller, GRANT_READ_LABEL, &audit_args, false, &reason);
+                config.log_audit_policy(caller, AUTO_READ_GRANT_LABEL, &audit_args, false, &reason);
                 return ExecuteResult::denied(reason);
             }
             None => {}
@@ -190,17 +151,17 @@ pub(super) async fn handle_grant_read(
         };
         match config
             .evaluator
-            .evaluate_with_reevaluate(&command_line, Some(&prompt_append), reevaluate)
+            .evaluate_with_reevaluate(&command_line, Some(&prompt_append), false)
             .await
         {
             crate::evaluate::EvalResult::Allow { reason, .. } => allow_reason = Some(reason),
             crate::evaluate::EvalResult::Deny { reason, .. } => {
-                config.log_audit_policy(caller, GRANT_READ_LABEL, &audit_args, false, &reason);
+                config.log_audit_policy(caller, AUTO_READ_GRANT_LABEL, &audit_args, false, &reason);
                 return ExecuteResult::denied(reason);
             }
             crate::evaluate::EvalResult::Error(e) => {
                 let reason = format!("evaluation error: {e}");
-                config.log_audit_policy(caller, GRANT_READ_LABEL, &audit_args, false, &reason);
+                config.log_audit_policy(caller, AUTO_READ_GRANT_LABEL, &audit_args, false, &reason);
                 return ExecuteResult::denied(reason);
             }
         }
@@ -208,7 +169,7 @@ pub(super) async fn handle_grant_read(
     let reason = allow_reason.unwrap_or_default();
 
     if config.dry_run {
-        config.log_audit_policy(caller, GRANT_READ_LABEL, &audit_args, true, &reason);
+        config.log_audit_policy(caller, AUTO_READ_GRANT_LABEL, &audit_args, true, &reason);
         return ExecuteResult::completed(
             reason,
             Some(0),
@@ -231,7 +192,7 @@ pub(super) async fn handle_grant_read(
         Ok(ctx) => ctx.gid,
         Err(e) => {
             let reason = format!("grantee uid {grantee_uid} could not be resolved: {e}");
-            config.log_audit_policy(caller, GRANT_READ_LABEL, &audit_args, true, &reason);
+            config.log_audit_policy(caller, AUTO_READ_GRANT_LABEL, &audit_args, true, &reason);
             return ExecuteResult::exec_failed(reason.clone(), reason);
         }
     };
@@ -243,7 +204,7 @@ pub(super) async fn handle_grant_read(
         Ok(home) => home,
         Err(e) => {
             let reason = format!("read-grant denied: {e}");
-            config.log_audit_policy(caller, GRANT_READ_LABEL, &audit_args, false, &reason);
+            config.log_audit_policy(caller, AUTO_READ_GRANT_LABEL, &audit_args, false, &reason);
             return ExecuteResult::denied(reason);
         }
     };
@@ -256,7 +217,7 @@ pub(super) async fn handle_grant_read(
         Ok(planned) => planned,
         Err(e) => {
             let reason = format!("read-grant denied: {e}");
-            config.log_audit_policy(caller, GRANT_READ_LABEL, &audit_args, false, &reason);
+            config.log_audit_policy(caller, AUTO_READ_GRANT_LABEL, &audit_args, false, &reason);
             return ExecuteResult::denied(reason);
         }
     };
@@ -281,15 +242,15 @@ pub(super) async fn handle_grant_read(
         // Nothing survived the in-apply rollback, so drop the committed row too.
         delete_read_grant_row(config, &grant.target_path).await;
         let exec_reason = format!("failed to apply read grant: {e}");
-        config.log_audit_policy(caller, GRANT_READ_LABEL, &audit_args, true, &reason);
-        config.log_audit_exec_failed(caller, GRANT_READ_LABEL, &audit_args, &exec_reason);
+        config.log_audit_policy(caller, AUTO_READ_GRANT_LABEL, &audit_args, true, &reason);
+        config.log_audit_exec_failed(caller, AUTO_READ_GRANT_LABEL, &audit_args, &exec_reason);
         return ExecuteResult::exec_failed(reason, exec_reason);
     }
 
     let traverse_count = grant.entries.len().saturating_sub(1);
     config.read_grants.write().await.insert(grant.clone());
 
-    config.log_audit_policy(caller, GRANT_READ_LABEL, &audit_args, true, &reason);
+    config.log_audit_policy(caller, AUTO_READ_GRANT_LABEL, &audit_args, true, &reason);
     tracing::info!(
         "[AUDIT] READ_GRANT_ISSUED caller={} handle={} path=\"{}\" grantee_uid={} ttl={} traverse_grants={} session={}",
         caller,
@@ -310,47 +271,6 @@ pub(super) async fn handle_grant_read(
         traverse_count,
         grant.expires_unix,
     );
-    ExecuteResult::completed(reason, Some(0), Some(stdout), None)
-}
-
-/// Early revoke of an active read grant. Revocation only removes access, so it
-/// is a de-escalation and is not routed through the evaluator; it is still
-/// audited.
-#[cfg(unix)]
-pub(super) async fn handle_grant_revoke(
-    config: &ServerConfig,
-    caller: &CallerIdentity,
-    path: String,
-    // Revocation is deliberately NOT scoped to the requesting caller's own
-    // grants: any allowed local caller may revoke any read grant by path. This
-    // is intentional, not an oversight (hence the unused `_session_token`).
-    // Revoking is always safe and monotonic -- it only removes access an
-    // evaluator/operator previously approved and never grants anything -- so
-    // there is no benefit to restricting who may run it, and an operator or a
-    // sibling worker must be able to tear down a grant unattended. See the
-    // ReadGrantStatus lifecycle note in `guard::gating::read_grant`.
-    _session_token: Option<String>,
-) -> ExecuteResult {
-    // Match on the canonical path when it still resolves, else fall back to the
-    // literal path so a grant whose target was since deleted can still be
-    // revoked by the name it was granted under.
-    let key = std::fs::canonicalize(&path)
-        .map(|p| p.display().to_string())
-        .unwrap_or(path);
-    let audit_args = vec![key.clone()];
-
-    let claimed = config.read_grants.write().await.begin_revert(&key);
-    let Some(grant) = claimed else {
-        let reason = format!("no active read grant for '{key}'");
-        config.log_audit_policy(caller, GRANT_READ_LABEL, &audit_args, false, &reason);
-        return ExecuteResult::denied(reason);
-    };
-    persist_read_grant(config, &grant).await;
-    finish_read_grant_revert(config, &grant, "manual").await;
-
-    let reason = format!("revoked read grant on {key}");
-    config.log_audit_policy(caller, GRANT_READ_LABEL, &audit_args, true, &reason);
-    let stdout = format!("{reason}\n");
     ExecuteResult::completed(reason, Some(0), Some(stdout), None)
 }
 

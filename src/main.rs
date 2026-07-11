@@ -41,9 +41,8 @@ use tracing_subscriber::{fmt as tracing_fmt, EnvFilter};
 
 use cli_client::{
     handle_approval_note_cmd, handle_approvals, handle_config, handle_gate_action,
-    handle_grant_read, handle_grant_revoke, handle_provisionals, handle_session, handle_status,
-    handle_verb, run_exec, run_mcp, top_level_grant_to_session_command, GatingOptions,
-    SshHostKeyCliMode,
+    handle_provisionals, handle_session, handle_status, handle_verb, run_exec, run_mcp,
+    top_level_grant_to_session_command, GatingOptions, SshHostKeyCliMode,
 };
 use cli_secrets::handle_secrets;
 use cli_server::run_server;
@@ -279,36 +278,6 @@ enum MainArgs {
     /// Run or list operator-defined verbs (the typed, least-expressive interface).
     #[clap(subcommand)]
     Verb(VerbCommands),
-    /// Grant guard's brokering identity a time-boxed POSIX ACL read grant on a
-    /// specific operator-owned file (Unix only), so a brokered ansible/helm
-    /// command can read a config/vars/values file guard's service account
-    /// otherwise cannot. Evaluated through the same policy pipeline as any
-    /// brokered command (credential deny-list, session globs, LLM evaluator),
-    /// and auto-revoked when the TTL expires.
-    #[clap(name = "grant-read")]
-    GrantRead {
-        /// Path to the single file to grant read access on.
-        path: String,
-        /// Time-to-live in seconds (required; bounded to 24h). No unbounded grant.
-        #[arg(long, value_name = "SECONDS")]
-        ttl: u64,
-        /// Skip the auto-learned deny-shape fast path and force a fresh LLM look.
-        #[arg(long = "reevaluate", action = ArgAction::SetTrue)]
-        reevaluate: bool,
-        /// Server socket path (defaults to configured)
-        #[arg(long, value_name = "PATH")]
-        socket: Option<String>,
-    },
-    /// Revoke an active read grant early (Unix only). De-escalation; not
-    /// re-evaluated by the LLM, but audited.
-    #[clap(name = "grant-revoke")]
-    GrantRevoke {
-        /// Path the grant was issued on.
-        path: String,
-        /// Server socket path (defaults to configured)
-        #[arg(long, value_name = "PATH")]
-        socket: Option<String>,
-    },
 }
 
 #[derive(Subcommand)]
@@ -816,6 +785,38 @@ enum ServerCommands {
         #[arg(long = "child-env", value_name = "VAR[,VAR]", value_delimiter = ',')]
         child_env: Option<Vec<String>>,
 
+        /// Front an HTTP API with a TLS-terminating, protocol-aware proxy on
+        /// ADDR (loopback only). --api-protocol selects the protocol (default
+        /// kubernetes, which takes its upstream and credentials from
+        /// --kubeconfig); github and vercel require --api-upstream and a bearer
+        /// token via --api-token-env or --api-token-file. Env: GUARD_API_PROXY.
+        #[arg(long = "api-proxy", value_name = "ADDR")]
+        api_proxy: Option<String>,
+
+        /// Protocol parser for --api-proxy: kubernetes, github, or vercel. Env:
+        /// GUARD_API_PROTOCOL.
+        #[arg(long = "api-protocol", value_name = "NAME")]
+        api_protocol: Option<String>,
+
+        /// Base upstream URL for --api-proxy. Env: GUARD_API_UPSTREAM.
+        #[arg(long = "api-upstream", value_name = "URL")]
+        api_upstream: Option<String>,
+
+        /// Environment variable containing the upstream bearer token. Env:
+        /// GUARD_API_TOKEN_ENV.
+        #[arg(long = "api-token-env", value_name = "VAR")]
+        api_token_env: Option<String>,
+
+        /// File containing the upstream bearer token. Env:
+        /// GUARD_API_TOKEN_FILE.
+        #[arg(long = "api-token-file", value_name = "PATH")]
+        api_token_file: Option<PathBuf>,
+
+        /// Write the proxy CA certificate PEM here for generic API clients.
+        /// Env: GUARD_API_CA_OUT.
+        #[arg(long = "api-ca-out", value_name = "PATH")]
+        api_ca_out: Option<PathBuf>,
+
         /// Front the Kubernetes apiserver with a TLS-terminating proxy on ADDR
         /// (e.g. 127.0.0.1:8443). Each API request from a brokered client (helm,
         /// kubectl, terraform, k9s, client libraries) is gated against
@@ -855,6 +856,40 @@ enum ServerCommands {
         /// Env: GUARD_API_RARITY_ESCALATION.
         #[arg(long = "api-rarity-escalation", value_name = "N")]
         api_rarity_escalation: Option<u64>,
+
+        /// Auto-learn exact API request shapes from repeated evaluator verdicts
+        /// on proxied evaluate traffic. On by default. Learned denies
+        /// fast-reject the same tuple; learned allows reuse the stored
+        /// risk/reversibility and still pass through consequence gating. Env:
+        /// GUARD_API_PROMOTION.
+        #[arg(
+            long = "api-promotion",
+            action = ArgAction::Set,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            value_name = "BOOL",
+            overrides_with = "no_api_promotion"
+        )]
+        api_promotion: Option<bool>,
+
+        /// Disable API request shape learning.
+        #[arg(long = "no-api-promotion", action = ArgAction::SetTrue, overrides_with = "api_promotion")]
+        no_api_promotion: bool,
+
+        /// Path to the API request shape learning state YAML.
+        /// Env: GUARD_API_PROMOTION_STATE.
+        #[arg(long = "api-promotion-state", value_name = "PATH")]
+        api_promotion_state: Option<PathBuf>,
+
+        /// Evaluator approvals of the same API shape required before a learned
+        /// allow fast path is active. Env: GUARD_API_PROMOTION_MIN_APPROVALS.
+        #[arg(long = "api-promotion-min-approvals", value_name = "N")]
+        api_promotion_min_approvals: Option<u32>,
+
+        /// Evaluator denials of the same API shape required before a learned
+        /// deny fast path is active. Env: GUARD_API_PROMOTION_MIN_DENIALS.
+        #[arg(long = "api-promotion-min-denials", value_name = "N")]
+        api_promotion_min_denials: Option<u32>,
 
         /// Internal marker: launched under the Windows Service Control Manager.
         /// The Windows installer sets this in the service binPath so startup
@@ -1096,13 +1131,6 @@ async fn main() -> Result<()> {
             socket,
         }) => handle_approval_note_cmd(socket, handle, text).await,
         Ok(MainArgs::Verb(subcommand)) => handle_verb(subcommand).await,
-        Ok(MainArgs::GrantRead {
-            path,
-            ttl,
-            reevaluate,
-            socket,
-        }) => handle_grant_read(path, ttl, reevaluate, socket).await,
-        Ok(MainArgs::GrantRevoke { path, socket }) => handle_grant_revoke(path, socket).await,
         Ok(MainArgs::Secrets(subcommand)) => handle_secrets(subcommand).await,
         Ok(MainArgs::Shim {
             tools,
@@ -1417,8 +1445,6 @@ fn print_help_tree(admin: bool) {
     println!("    secrets|secret add|remove|list");
     println!("    verb list");
     println!("    verb run <name> --param key=value");
-    println!("    grant-read <path> --ttl <secs>");
-    println!("    grant-revoke <path>");
     println!("    session list [--history] [--since duration] [--full]");
     println!("    session show [token]  (defaults to $GUARD_SESSION)");
     println!("    session new");

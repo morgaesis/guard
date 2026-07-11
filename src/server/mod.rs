@@ -71,6 +71,7 @@ const MAX_PENDING_GLOBAL: usize = 256;
 const GATING_RETENTION_SECS: u64 = 24 * 60 * 60;
 
 mod admin;
+mod api_judge;
 mod execute;
 mod gate_runtime;
 mod grants;
@@ -82,12 +83,13 @@ mod wire;
 // The named public surface of the server module: the daemon entrypoint
 // (`Server`, `resolve_daemon_principal`) and the wire types shared with the
 // CLI, the MCP server, and `daemon_client`. Everything else stays internal.
+pub(crate) use api_judge::DaemonApiJudge;
 #[cfg(windows)]
 pub(crate) use transport::winplat;
 pub use transport::Server;
 pub use wire::{
     AdminRequest, AdminResponse, ApprovalSummary, ExecuteRequest, ExecuteResponse, GateStatus,
-    GrantRequest, OutputStream, RevertSpec, SshHostKeyMode, VerbInvocation, VerbSummary,
+    OutputStream, RevertSpec, SshHostKeyMode, VerbInvocation, VerbSummary,
 };
 pub(crate) use wire::{ExecuteStreamMessage, IncomingMessage};
 
@@ -166,14 +168,14 @@ struct ServerConfig {
     /// generically without per-tool code — e.g. `KUBECONFIG` so brokered
     /// kubectl/helm read a config the agent cannot see.
     pub extra_child_env: Vec<String>,
-    /// Optional Kubernetes API proxy hosted alongside the gate socket. When set,
+    /// Optional API proxies hosted alongside the gate socket. When set,
     /// the daemon terminates brokered clients' TLS, gates each API operation
-    /// against the operator policy, and re-originates to the real apiserver with
-    /// the credentials only the daemon holds. Set by the entrypoint from
-    /// `--kube-proxy`; `None` means no proxy listener.
-    pub kube_proxy: Option<Arc<guard::proxy::ApiProxy>>,
+    /// against the operator policy, and re-originates to the upstream with the
+    /// credentials only the daemon holds.
+    pub protocol_registry:
+        Arc<RwLock<std::collections::HashMap<String, Arc<guard::proxy::ApiProxy>>>>,
     /// Active filesystem read grants (Unix-only). Time-boxed POSIX ACL read
-    /// grants issued via `guard grant-read`; the sweeper auto-revokes them at
+    /// grants issued by the automatic retry path; the sweeper revokes them at
     /// expiry and startup reconciliation revokes any that expired while the
     /// daemon was down.
     pub read_grants: Arc<RwLock<GrantReadRegistry>>,
@@ -237,8 +239,7 @@ impl ServerConfig {
             // No extra child-env passthrough by default; the entrypoint sets
             // this from --child-env / GUARD_CHILD_ENV.
             extra_child_env: Vec::new(),
-            // No API proxy by default; the entrypoint sets this from --kube-proxy.
-            kube_proxy: None,
+            protocol_registry: Arc::new(RwLock::new(std::collections::HashMap::new())),
             read_grants: Arc::new(RwLock::new(GrantReadRegistry::new())),
         }
     }

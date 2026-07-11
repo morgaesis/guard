@@ -2,11 +2,12 @@
 //! the shared proxy loop, proving the plug-in surface generalizes past
 //! Kubernetes. Illustrative, not a production integration: repository- and
 //! organization-scoped collections parse into the shared [`ApiOp`], credential
-//! stores are write-denied outright, secrets-like reads are redacted, and no
-//! revert is constructible (see [`ProtocolConfig::plan_revert`] below).
+//! stores are write-denied outright, secrets-like reads are redacted, and label
+//! deletes can be restored from a pre-delete snapshot.
 
 use serde_json::Value;
 
+use super::gate::HttpRevert;
 use super::op::{ApiOp, Verb};
 use super::protocol::{PlannedRevert, ProtocolConfig};
 
@@ -195,25 +196,48 @@ impl ProtocolConfig for GithubProtocol {
         }
     }
 
-    /// No GitHub write is tracked: `ApiRevert` reverts execute as `kubectl`
-    /// commands in the daemon sink, so no revert is constructible for this
-    /// protocol. Revert synthesis for non-Kubernetes protocols is what a
-    /// daemon-side protocol-generic revert runner unlocks.
-    fn tracks_write(&self, _op: &ApiOp) -> bool {
-        false
+    fn tracks_write(&self, op: &ApiOp) -> bool {
+        op.verb == Verb::Delete
+            && op.resource == "labels"
+            && op.subresource.is_none()
+            && op.namespace.is_some()
+            && op.name.is_some()
     }
 
-    fn wants_prior_snapshot(&self, _op: &ApiOp) -> bool {
-        false
+    fn wants_prior_snapshot(&self, op: &ApiOp) -> bool {
+        self.tracks_write(op)
     }
 
     fn plan_revert(
         &self,
-        _op: &ApiOp,
-        _prior_object: Option<&[u8]>,
+        op: &ApiOp,
+        prior_object: Option<&[u8]>,
         _response: &[u8],
     ) -> Result<PlannedRevert, String> {
-        Err("github: no constructible revert for this protocol yet (ApiRevert reverts execute as kubectl commands in the daemon sink)".to_string())
+        if !self.tracks_write(op) {
+            return Err("github: no faithful API revert for this operation".to_string());
+        }
+        let body = prior_object
+            .and_then(sanitize_label_snapshot)
+            .ok_or_else(|| {
+                "github: label delete snapshot could not be fetched or parsed; no auto-revert armed"
+                    .to_string()
+            })?;
+        let namespace = op.namespace.as_deref().ok_or_else(|| {
+            "github: label delete has no repository namespace; no auto-revert armed".to_string()
+        })?;
+        let name = op.name.as_deref().ok_or_else(|| {
+            "github: label delete has no label name; no auto-revert armed".to_string()
+        })?;
+        Ok(PlannedRevert {
+            label: format!("delete labels/{name} in {namespace}"),
+            revert: HttpRevert {
+                method: "POST".to_string(),
+                path: format!("/repos/{namespace}/labels"),
+                body: Some(body),
+            },
+            created: None,
+        })
     }
 }
 
@@ -239,6 +263,19 @@ fn strip_value_fields(obj: &mut Value) -> bool {
         hit |= map.remove(f).is_some();
     }
     hit
+}
+
+fn sanitize_label_snapshot(bytes: &[u8]) -> Option<Vec<u8>> {
+    let value: Value = serde_json::from_slice(bytes).ok()?;
+    let name = value.get("name")?.clone();
+    let color = value.get("color")?.clone();
+    let mut out = serde_json::Map::new();
+    out.insert("name".to_string(), name);
+    out.insert("color".to_string(), color);
+    if let Some(description) = value.get("description") {
+        out.insert("description".to_string(), description.clone());
+    }
+    serde_json::to_vec(&Value::Object(out)).ok()
 }
 
 #[cfg(test)]
@@ -363,11 +400,34 @@ mod tests {
     }
 
     #[test]
-    fn no_write_is_tracked_and_no_revert_is_constructible() {
+    fn only_label_deletes_are_tracked_and_recreated() {
         let p = GithubProtocol;
-        let o = op("PATCH", "/repos/o/r/issues/42");
-        assert!(!p.tracks_write(&o));
-        assert!(!p.wants_prior_snapshot(&o));
-        assert!(p.plan_revert(&o, None, b"{}").is_err());
+        let issue = op("PATCH", "/repos/o/r/issues/42");
+        assert!(!p.tracks_write(&issue));
+        assert!(!p.wants_prior_snapshot(&issue));
+        assert!(p.plan_revert(&issue, None, b"{}").is_err());
+
+        let label = op("DELETE", "/repos/o/r/labels/bug");
+        assert!(p.tracks_write(&label));
+        assert!(p.wants_prior_snapshot(&label));
+        let snapshot = serde_json::json!({
+            "id": 1,
+            "url": "https://api.github.com/repos/o/r/labels/bug",
+            "name": "bug",
+            "color": "d73a4a",
+            "description": "Something is not working"
+        })
+        .to_string();
+        let plan = p
+            .plan_revert(&label, Some(snapshot.as_bytes()), b"{}")
+            .expect("label restore plan");
+        assert_eq!(plan.label, "delete labels/bug in o/r");
+        assert_eq!(plan.revert.method, "POST");
+        assert_eq!(plan.revert.path, "/repos/o/r/labels");
+        let body: Value = serde_json::from_slice(&plan.revert.body.unwrap()).unwrap();
+        assert_eq!(body["name"], "bug");
+        assert_eq!(body["color"], "d73a4a");
+        assert_eq!(body["description"], "Something is not working");
+        assert!(body.get("id").is_none());
     }
 }

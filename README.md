@@ -233,20 +233,23 @@ pattern. `guard verb list` shows what has been promoted (`auto_promoted: true`);
 edit or delete the catalog file to revoke. See [DEPLOYMENT.md](DEPLOYMENT.md#auto-verb-promotion)
 for the full design rationale.
 
-## Kubernetes API proxy
+## API proxy
 
-The command gate sees a command's argv, but tools that drive the Kubernetes API
+The command gate sees a command's argv, but tools that drive an HTTP API
 in-process never spawn a gated command: `helm upgrade` renders templates locally
 then performs many create/update/delete calls against the apiserver via client-go,
-and terraform's k8s provider, k9s, and client libraries are the same. The gate
-sees one opaque invocation.
+and terraform providers, k9s, client libraries, and SDK calls are the same. The
+gate sees one opaque invocation.
 
-`--kube-proxy` moves the gate to the API boundary. The daemon fronts the apiserver
-with a TLS-terminating proxy, parses each request into a typed operation, matches
-it against an operator policy, and re-originates allowed requests to the real
-apiserver with the credentials only the daemon holds:
+`--api-proxy` moves the gate to the API boundary. The daemon fronts the upstream
+API with a TLS-terminating proxy, parses each request into a typed operation
+through a protocol plug-in, matches it against an operator policy, and
+re-originates allowed requests to the real upstream with the credentials only
+the daemon holds. Kubernetes is the reference protocol (`--kube-proxy ADDR` is
+shorthand for it); GitHub and Vercel ship as example protocols:
 
 ```bash
+# Kubernetes: credentials come from the operator kubeconfig.
 guard server start --gate consequence --socket /run/guard/guard.sock \
     --kube-proxy 127.0.0.1:8443 \
     --kubeconfig /etc/guard/kubeconfig \
@@ -255,31 +258,75 @@ guard server start --gate consequence --socket /run/guard/guard.sock \
 
 # The agent uses the brokered config, which carries no credential:
 KUBECONFIG=/run/guard/brokered.kubeconfig helm upgrade --install app ./chart
+
+# GitHub: the daemon reads the token from its own environment; the agent
+# talks to the proxy and never sees it.
+guard server start --gate consequence --socket /run/guard/guard.sock \
+    --api-proxy 127.0.0.1:8444 --api-protocol github \
+    --api-upstream https://api.github.com \
+    --api-token-env GH_BROKER_TOKEN \
+    --api-policy /etc/guard/github-policy.yaml \
+    --api-ca-out /run/guard/api-proxy-ca.pem
 ```
 
-The daemon reads the real bearer token or client certificate from its kubeconfig
-(`exec`/`auth-provider` plugins are rejected) and emits a brokered kubeconfig that
-points only at the proxy and is validated to carry no credential, so the proxy is
-the sole path to the cluster. `--kube-proxy` refuses to start with
-`--exec-as-caller` and binds loopback addresses only, since the proxy
-authenticates nothing itself. Policy actions are `allow`, `deny`, and `hold`; an
-allowed Secret read has its `data`/`stringData` redacted from the response
-(something the cluster's admission control cannot do, since admission fires only
-on writes). A `hold` parks the request in the same operator queue as held
+For Kubernetes the daemon reads the real bearer token or client certificate from
+its kubeconfig (`exec`/`auth-provider` plugins are rejected) and emits a brokered
+kubeconfig that points only at the proxy and is validated to carry no credential,
+so the proxy is the sole path to the cluster. For other protocols the bearer
+token comes from an environment variable (`--api-token-env`) or a file
+(`--api-token-file`), never a command-line value, and `--api-ca-out` writes the
+proxy CA so generic HTTP clients can trust the TLS termination. `--api-proxy`
+refuses to start with `--exec-as-caller` and binds loopback addresses only, since
+the proxy authenticates nothing itself. Policy actions are `allow`, `deny`,
+`hold`, and `evaluate`; an allowed read of secret-bearing material is redacted
+by the protocol's own classification (Kubernetes Secret `data`/`stringData`,
+GitHub secret stores, Vercel env-var values), something upstream admission
+control cannot do. A `hold` parks the request in the same operator queue as held
 commands: the client blocks while `guard approvals` shows the operation, `guard
-approve` releases it to the apiserver, and `guard deny` or TTL expiry fails it
-closed (holds require `--gate consequence`; without it they deny). Interactive
-subresources (`exec`/`attach`/`portforward`/`proxy`) and
-`pods/ephemeralcontainers` are denied outright (they tunnel code execution or
-an arbitrary request into a running workload), as are Secret `watch`es.
+approve` releases it, and `guard deny` or TTL expiry fails it closed (holds
+require `--gate consequence`; without it they deny). An `evaluate` rule (or
+`default: evaluate`) sends the request to the LLM evaluator, which judges it
+against the policy's `intent` prose using a redacted summary of the operation
+(body values never leave the proxy, only a key skeleton) and whether an
+auto-revert is constructible for it: a constructible revert can make a
+borderline recoverable operation approvable, and the verdict still routes
+through the deterministic consequence gate, so recoverable verdicts forward
+only inside the auto-revert envelope and irreversible or uncertain ones are
+held. A policy that routes to `evaluate` without a configured LLM holds those
+requests fail-closed. Uninspectable streams are denied outright per protocol:
+Kubernetes `exec`/`attach`/`portforward`/`proxy` and `pods/ephemeralcontainers`
+(they tunnel code execution or an arbitrary request into a running workload),
+Secret `watch`es, GitHub repository archives, Vercel deployment log streams.
 Under `--gate consequence`, a recoverable write is wrapped in the auto-revert
-envelope: the proxy snapshots the prior object and synthesizes a `kubectl`-based
-revert armed in the provisional registry, so `guard confirm` keeps it and the
-sweeper rolls it back otherwise. `--api-rarity-escalation N` optionally holds a
-policy-allowed request for operator review while its shape (verb, resource, and
-namespace, ignoring the object name) has been seen fewer than N times this run,
-so a broad allow rule fails toward scrutiny on a rare or first-seen shape. See
-[`examples/api-policy.yaml`](examples/api-policy.yaml).
+envelope: the proxy snapshots the prior object and plans a plain HTTP revert
+(restore the prior object, delete the created one, or recreate a faithfully
+snapshottable deleted one), armed in the provisional registry; `guard confirm`
+keeps the change and the sweeper otherwise executes the revert through the
+proxy's own upstream credential. `--api-rarity-escalation N` fails a broad allow
+rule toward scrutiny on a rare or first-seen shape (verb, resource, and
+namespace, ignoring the object name) that has been seen fewer than N times this
+run: with the evaluator attached the rare request is judged rather than
+fast-pathed, and otherwise it is held for the operator. See
+[`examples/api-policy.yaml`](examples/api-policy.yaml),
+[`examples/github-policy.yaml`](examples/github-policy.yaml), and
+[`examples/vercel-policy.yaml`](examples/vercel-policy.yaml).
+
+API request-shape learning is evidence-only and exact-tuple based: repeated
+evaluator allows or denies for the same `(protocol, verb, group, version,
+resource, subresource, namespace, body-shape)` tuple, with the object name
+excluded and the body reduced to a value-free key skeleton, populate a bounded
+YAML store, so a learned rule matches only requests structurally identical to
+the ones the evaluator judged. Dry-run requests never feed it, an over-risk or
+irreversible allow permanently disqualifies its shape, and each learned verdict
+is invalidated when the evaluator model or the policy intent changes. Learned
+denies reject the same tuple before another evaluator call; learned allows reuse
+the stored risk and reversibility, skip only non-rare requests, and still route
+through `decide_gate`, so the consequence floor is unchanged. Promotion and
+fast-path hits are operator-audit-only, and a learned deny reads to the client
+exactly like a fresh evaluator denial. Command denials may include the caller's
+own repeated-denial count once the deny-shape
+threshold is reached, but clients never receive promotion state or a signal
+that an API shape skipped evaluation.
 
 ## Configuration
 
@@ -345,6 +392,10 @@ Unless marked "(client)", a variable is read by the daemon at startup; setting i
 | `GUARD_LEARN_ALLOW` | `true` | Auto-promote trusted verbs from repeated low-risk LLM approvals (requires `--gate consequence`). On by default; needs no operator step, unlike `GUARD_LEARN_RULES` -- restricted to reversible/recoverable-with-a-validated-revert shapes, never irreversible. |
 | `GUARD_LEARN_ALLOW_STATE` | `<state dir>/learned-allow.yaml` | Path to the auto-verb-promotion observation state YAML (bookkeeping only; promoted verbs land in `GUARD_VERBS`). |
 | `GUARD_LEARN_ALLOW_MIN_APPROVALS` | `5` | LLM approvals of the same shape required before attempting to promote a trusted verb. |
+| `GUARD_API_PROMOTION` | `true` | Auto-learn exact API request shapes from repeated evaluator allows and denies on proxied `evaluate` traffic. |
+| `GUARD_API_PROMOTION_STATE` | `<state dir>/learned-api.yaml` | Path to the API request-shape learning state YAML. |
+| `GUARD_API_PROMOTION_MIN_APPROVALS` | `5` | Evaluator approvals of the same API tuple required before a learned allow is active. |
+| `GUARD_API_PROMOTION_MIN_DENIALS` | `3` | Evaluator denials of the same API tuple required before a learned deny is active. |
 | `GUARD_PROMPT_APPEND` | (none) | Path to additive prompt file (appended to base prompt) |
 | `GUARD_GPG_RECIPIENT` | (none) | GPG recipient for the `local` secret backend |
 | `GUARD_BACKEND` | (auto) | Secret backend: `pass`, `env`, `local`, `vault`, or `infisical`. Auto prefers `pass`; otherwise it falls back to non-persistent `env` and logs a warning. `vault` uses `VAULT_ADDR` with `VAULT_TOKEN` or `VAULT_ROLE_ID`+`VAULT_SECRET_ID` (KV v2, mount `VAULT_KV_MOUNT`, default `secret`); `infisical` uses `INFISICAL_CLIENT_ID`/`INFISICAL_CLIENT_SECRET`/`INFISICAL_PROJECT_ID` (Universal Auth, env `INFISICAL_ENVIRONMENT`). |
@@ -360,8 +411,9 @@ Unless marked "(client)", a variable is read by the daemon at startup; setting i
 | `GUARD_STATE_DB` | XDG state dir | Path to the SQLite state database (sessions, holds, provisionals, read grants). |
 | `GUARD_CHILD_ENV` | (none) | Comma-separated daemon env vars forwarded to brokered children (e.g. a `KUBECONFIG` only the daemon can read). Values come from the daemon's environment, never the caller's. |
 | `GUARD_EXEC_AS_CALLER` | `false` | Run brokered children as the calling uid instead of the daemon account (Unix). |
-| `GUARD_KUBE_PROXY` | (none) | Kubernetes API proxy listen address (loopback only); see the kube-proxy section. Companions: `GUARD_KUBE_PROXY_KUBECONFIG`, `GUARD_KUBE_CONTEXT`, `GUARD_API_POLICY`, `GUARD_BROKERED_KUBECONFIG_OUT`. |
-| `GUARD_API_RARITY_ESCALATION` | `0` | Escalate a policy-allowed proxy request to the operator hold queue while its shape (verb x resource x namespace) has been seen fewer than N times this run. 0 disables it; requires `--gate consequence`. Flag: `--api-rarity-escalation`. |
+| `GUARD_API_PROXY` | (none) | API proxy listen address (loopback only); see the API proxy section. Companions: `GUARD_API_PROTOCOL`, `GUARD_API_UPSTREAM`, `GUARD_API_TOKEN_ENV`, `GUARD_API_TOKEN_FILE`, `GUARD_API_CA_OUT`, `GUARD_API_POLICY`. |
+| `GUARD_KUBE_PROXY` | (none) | Kubernetes API proxy listen address, shorthand for the kubernetes protocol. Companions: `GUARD_KUBE_PROXY_KUBECONFIG`, `GUARD_KUBE_CONTEXT`, `GUARD_API_POLICY`, `GUARD_BROKERED_KUBECONFIG_OUT`. |
+| `GUARD_API_RARITY_ESCALATION` | `0` | Escalate a policy-allowed proxy request whose shape (verb x resource x namespace) has been seen fewer than N times this run: to the evaluator when one is attached, otherwise to the operator hold queue. 0 disables it; requires `--gate consequence`. Flag: `--api-rarity-escalation`. |
 | `GUARD_LOG_LEVEL` | `warn` | Log level (`error`, `warn`, `info`, `debug`, `trace`) when `RUST_LOG` is unset. Read by every guard process, daemon and client alike. |
 | `GUARD_MCP_TOKEN` | (none) | (client) Bearer token required by the HTTP MCP transport (`guard mcp serve --http`); `--http-token` overrides it. |
 
@@ -633,28 +685,23 @@ For forensics, `guard session show <token>` prints prompt context, generated not
 
 Brokered tools routinely need to read operator-owned files (ansible vars,
 helm values) that guard's low-privilege service account cannot open. A read
-grant adds a time-boxed POSIX ACL for exactly one file (Unix only):
+grant adds a time-boxed POSIX ACL for exactly one file (Unix only) through the
+transparent retry path.
 
-```bash
-guard grant-read ~/ops/values.yaml --ttl 600
-guard grant-revoke ~/ops/values.yaml   # early teardown; auto-revokes at TTL anyway
-```
-
-The request runs through the same pipeline as any command: a hard
+When a brokered command fails naming a file it could not read, the daemon runs
+the read-grant pipeline on that path automatically. The pipeline applies a hard
 credential-path deny-list (key material, kubeconfigs, env files) before the
-evaluator ever sees it, then session allow/deny rules, then the LLM. Ancestor
-directories get traverse-only entries, never above the file owner's home. The
-apply is pinned to the inode vetted at evaluation time (multi-hardlink
+evaluator sees the request, then session allow/deny rules, then the LLM. On an
+allow, guard applies a short-TTL ACL grant to its brokering account (or the
+caller account under `--exec-as-caller`) and retries the original command.
+
+Ancestor directories get traverse-only entries, never above the file owner's
+home. The apply is pinned to the inode vetted at evaluation time (multi-hardlink
 targets are refused, and a path swapped for a symlink in between aborts the
 grant), grants persist in the state database, and the sweeper revokes them at
-TTL or on startup if the daemon was down when one expired.
-
-Agents normally never need the command: when a brokered command fails naming
-a file it could not read, the daemon runs the same grant pipeline on that
-path automatically and, on an allow, applies a short-TTL grant and retries
-the command. A denied path (credential file, session deny, evaluator deny)
-returns the command's own failure unchanged, and every grant and retry is
-audited.
+TTL or on startup if the daemon was down when one expired. A denied path
+(credential file, session deny, evaluator deny) returns the command's own
+failure unchanged, and every grant and retry is audited.
 
 ## Per-run secret injection
 

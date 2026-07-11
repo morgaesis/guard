@@ -1,7 +1,7 @@
 //! Operator-authored policy over Kubernetes API operations — the proxy's "slow
 //! clock", analogous to the verb catalog. Only the operator edits it; agents
 //! cannot. Rules match an [`ApiOp`] by verb/resource/namespace/subresource and
-//! yield an action (allow, deny, hold) plus, for allowed reads, whether to
+//! yield an action (allow, deny, hold, evaluate) plus, for allowed reads, whether to
 //! redact secret values from the response. A write to a subresource is
 //! authorized only by a rule that names it. Default is fail-safe deny.
 
@@ -18,6 +18,9 @@ pub enum ApiAction {
     Deny,
     /// Hold for operator approval before the request reaches the apiserver.
     Hold,
+    /// Ask the daemon's LLM evaluator, then route the allow verdict through the
+    /// consequence gate before the request reaches the upstream.
+    Evaluate,
 }
 
 fn any_glob() -> Vec<String> {
@@ -85,6 +88,10 @@ impl ApiRule {
 /// The full operator policy.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ApiPolicy {
+    /// Operator prose describing what this proxy is intended to access. Used by
+    /// the API evaluator when a request is routed through `evaluate`.
+    #[serde(default)]
+    pub intent: Option<String>,
     #[serde(default)]
     pub rules: Vec<ApiRule>,
     /// Action for a request that no rule matches. Fail-safe deny by default.
@@ -104,6 +111,7 @@ impl ApiPolicy {
     /// An empty, fail-safe (default-deny) policy.
     pub fn deny_all() -> Self {
         Self {
+            intent: None,
             rules: Vec::new(),
             default: ApiAction::Deny,
         }
@@ -144,6 +152,15 @@ impl ApiPolicy {
             redact_secrets: redact,
             reason,
         }
+    }
+
+    /// Whether any rule or default action routes to the evaluator.
+    pub fn contains_evaluate(&self) -> bool {
+        matches!(self.default, ApiAction::Evaluate)
+            || self
+                .rules
+                .iter()
+                .any(|rule| matches!(rule.action, ApiAction::Evaluate))
     }
 }
 
@@ -399,5 +416,28 @@ rules:
         let d = p.decide(&op("DELETE", "/api/v1/namespaces/prod"));
         assert_eq!(d.action, ApiAction::Hold);
         assert_eq!(d.reason, "namespace deletion needs sign-off");
+    }
+
+    #[test]
+    fn intent_and_evaluate_action_parse() {
+        let p = policy(
+            r#"
+intent: "let CI manage dev workloads"
+default: evaluate
+rules:
+  - verbs: [patch]
+    resources: [deployments]
+    namespaces: [dev]
+    action: evaluate
+"#,
+        );
+        assert_eq!(p.intent.as_deref(), Some("let CI manage dev workloads"));
+        assert_eq!(p.default, ApiAction::Evaluate);
+        assert!(p.contains_evaluate());
+        assert_eq!(
+            p.decide(&op("PATCH", "/apis/apps/v1/namespaces/dev/deployments/api"))
+                .action,
+            ApiAction::Evaluate
+        );
     }
 }
