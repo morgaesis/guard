@@ -71,6 +71,7 @@ const MAX_PENDING_GLOBAL: usize = 256;
 const GATING_RETENTION_SECS: u64 = 24 * 60 * 60;
 
 mod admin;
+mod api_judge;
 mod execute;
 mod gate_runtime;
 mod grants;
@@ -82,6 +83,7 @@ mod wire;
 // The named public surface of the server module: the daemon entrypoint
 // (`Server`, `resolve_daemon_principal`) and the wire types shared with the
 // CLI, the MCP server, and `daemon_client`. Everything else stays internal.
+pub(crate) use api_judge::DaemonApiJudge;
 #[cfg(windows)]
 pub(crate) use transport::winplat;
 pub use transport::Server;

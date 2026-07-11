@@ -34,7 +34,10 @@ pub mod tls;
 pub mod upstream;
 pub mod vercel_protocol;
 
-pub use gate::{ApiMutation, GateSink, HoldDecision, HttpRevert};
+pub use gate::{
+    ApiJudge, ApiJudgeVerdict, ApiMutation, ApiRequestSummary, GateSink, HoldDecision, HttpRevert,
+    RevertConstructible,
+};
 pub use github_protocol::GithubProtocol;
 pub use k8s_protocol::KubernetesProtocol;
 pub use kubeconfig::{brokered_kubeconfig, validate_brokered_kubeconfig, BrokerError};

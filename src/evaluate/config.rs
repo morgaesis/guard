@@ -93,6 +93,9 @@ pub struct EvalConfig {
     pub llm: LlmConfig,
     /// Path to a custom system prompt file. If set, overrides the compiled-in prompt.
     pub system_prompt_path: Option<PathBuf>,
+    /// Literal system prompt supplied by code. Used for daemon-owned evaluator
+    /// specializations that are not command-line command judges.
+    pub system_prompt_literal: Option<String>,
     /// Path to an additive prompt file. Contents are appended to the base prompt
     /// (whether compiled-in or custom), letting operators add environment-specific
     /// instructions without replacing the built-in prompts.
@@ -126,6 +129,7 @@ impl Default for EvalConfig {
             mode: None,
             llm: LlmConfig::default(),
             system_prompt_path: None,
+            system_prompt_literal: None,
             system_prompt_append_path: None,
             cache_enabled: true,
             cache_capacity: DEFAULT_CACHE_CAPACITY,
@@ -186,6 +190,13 @@ impl EvalConfig {
 
     pub fn system_prompt_path(mut self, path: PathBuf) -> Self {
         self.system_prompt_path = Some(path);
+        self.system_prompt_literal = None;
+        self
+    }
+
+    pub fn system_prompt_literal(mut self, prompt: String) -> Self {
+        self.system_prompt_literal = Some(prompt);
+        self.system_prompt_path = None;
         self
     }
 

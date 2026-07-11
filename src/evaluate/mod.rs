@@ -80,10 +80,13 @@ impl Evaluator {
         }
 
         // Load system prompt. Priority:
-        // 1. --system-prompt <path> (explicit override)
-        // 2. ~/.config/guard/system-prompt.txt (user customization)
-        // 3. Mode-specific compiled prompt (readonly/safe/paranoid)
-        let system_prompt = if let Some(ref path) = config.system_prompt_path {
+        // 1. code-supplied literal prompt for specialized daemon evaluators
+        // 2. --system-prompt <path> (explicit override)
+        // 3. ~/.config/guard/system-prompt.txt (user customization)
+        // 4. Mode-specific compiled prompt (readonly/safe/paranoid)
+        let system_prompt = if let Some(ref prompt) = config.system_prompt_literal {
+            prompt.clone()
+        } else if let Some(ref path) = config.system_prompt_path {
             std::fs::read_to_string(path)
                 .with_context(|| format!("failed to read system prompt from {}", path.display()))?
         } else {

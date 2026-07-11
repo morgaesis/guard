@@ -277,14 +277,23 @@ token comes from an environment variable (`--api-token-env`) or a file
 (`--api-token-file`), never a command-line value, and `--api-ca-out` writes the
 proxy CA so generic HTTP clients can trust the TLS termination. `--api-proxy`
 refuses to start with `--exec-as-caller` and binds loopback addresses only, since
-the proxy authenticates nothing itself. Policy actions are `allow`, `deny`, and
-`hold`; an allowed read of secret-bearing material is redacted by the protocol's
-own classification (Kubernetes Secret `data`/`stringData`, GitHub secret stores,
-Vercel env-var values), something upstream admission control cannot do. A `hold`
-parks the request in the same operator queue as held commands: the client blocks
-while `guard approvals` shows the operation, `guard approve` releases it, and
-`guard deny` or TTL expiry fails it closed (holds require `--gate consequence`;
-without it they deny). Uninspectable streams are denied outright per protocol:
+the proxy authenticates nothing itself. Policy actions are `allow`, `deny`,
+`hold`, and `evaluate`; an allowed read of secret-bearing material is redacted
+by the protocol's own classification (Kubernetes Secret `data`/`stringData`,
+GitHub secret stores, Vercel env-var values), something upstream admission
+control cannot do. A `hold` parks the request in the same operator queue as held
+commands: the client blocks while `guard approvals` shows the operation, `guard
+approve` releases it, and `guard deny` or TTL expiry fails it closed (holds
+require `--gate consequence`; without it they deny). An `evaluate` rule (or
+`default: evaluate`) sends the request to the LLM evaluator, which judges it
+against the policy's `intent` prose using a redacted summary of the operation
+(body values never leave the proxy, only a key skeleton) and whether an
+auto-revert is constructible for it: a constructible revert can make a
+borderline recoverable operation approvable, and the verdict still routes
+through the deterministic consequence gate, so recoverable verdicts forward
+only inside the auto-revert envelope and irreversible or uncertain ones are
+held. A policy that routes to `evaluate` without a configured LLM holds those
+requests fail-closed. Uninspectable streams are denied outright per protocol:
 Kubernetes `exec`/`attach`/`portforward`/`proxy` and `pods/ephemeralcontainers`
 (they tunnel code execution or an arbitrary request into a running workload),
 Secret `watch`es, GitHub repository archives, Vercel deployment log streams.

@@ -21,13 +21,14 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock as StdRwLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use futures::TryStreamExt;
 use http_body_util::{combinators::BoxBody, BodyExt, Full, Limited, StreamBody};
 use hyper::body::{Bytes, Frame, Incoming};
+use hyper::http::request::Parts;
 use hyper::service::service_fn;
 use hyper::{header, HeaderMap, Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -36,13 +37,17 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio_rustls::TlsAcceptor;
 
-use super::gate::{ApiMutation, GateSink, HoldDecision};
+use super::gate::{
+    ApiJudge, ApiJudgeVerdict, ApiMutation, ApiRequestSummary, GateSink, HoldDecision,
+    RevertConstructible,
+};
 use super::k8s_protocol::KubernetesProtocol;
 use super::op::{ApiOp, Verb};
 use super::policy::{ApiAction, ApiPolicy};
 use super::protocol::ProtocolConfig;
 use super::tls::ProxyTls;
 use super::upstream::Upstream;
+use crate::gating::{decide_gate, GateOutcome};
 
 /// Cap on a forwarded request body. Manifests are small; this bounds memory and
 /// denies an oversized body from a misbehaving client.
@@ -52,6 +57,7 @@ const MAX_REQ_BODY: usize = 16 * 1024 * 1024;
 const POLICY_RELOAD_SECS: u64 = 5;
 
 type ProxyBody = BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
+type JudgeBuilder = dyn Fn(Option<String>) -> Option<Arc<dyn ApiJudge>> + Send + Sync;
 
 /// A configured API proxy: TLS identity, upstream connection, the attached
 /// protocol plug-in, and the hot-reloaded operator policy. Hosted by the daemon
@@ -69,6 +75,11 @@ pub struct ApiProxy {
     /// Bridge to the daemon's consequence machinery, attached before serving.
     /// When present, recoverable writes are wrapped in an auto-revert envelope.
     gate: OnceLock<Arc<dyn GateSink>>,
+    /// LLM-backed API judge for `evaluate` policy actions and rarity reroutes.
+    /// Swappable so policy intent hot-reload can rebuild the evaluator and its
+    /// cache under the new base prompt.
+    judge: StdRwLock<Option<Arc<dyn ApiJudge>>>,
+    judge_builder: OnceLock<Arc<JudgeBuilder>>,
     /// Resources this proxy forwarded a create for (and armed an auto-revert on),
     /// mapped to the revert handle. This is evidence-based provenance: a later
     /// delete of a resource in this set is guard's own creation being cleaned up
@@ -140,6 +151,11 @@ impl RarityTracker {
         *count = count.saturating_add(1);
         rare
     }
+}
+
+struct PreparedRevert {
+    marker: RevertConstructible,
+    snapshot: Option<Vec<u8>>,
 }
 
 /// Identity of a resource the proxy tracks as guard-created, for delete
@@ -239,6 +255,8 @@ impl ApiProxy {
             policy: Arc::new(RwLock::new(policy)),
             policy_path,
             gate: OnceLock::new(),
+            judge: StdRwLock::new(None),
+            judge_builder: OnceLock::new(),
             created: Mutex::new(CreatedRegistry::default()),
             next_conn: AtomicU64::new(1),
             rarity: RarityTracker::new(0),
@@ -267,6 +285,23 @@ impl ApiProxy {
     /// second call is ignored.
     pub fn attach_gate(&self, sink: Arc<dyn GateSink>) {
         let _ = self.gate.set(sink);
+    }
+
+    /// Attach an API judge. Later calls replace the active judge, which lets a
+    /// policy intent reload swap in a fresh evaluator and fresh cache.
+    pub fn attach_judge(&self, judge: Arc<dyn ApiJudge>) {
+        *self.judge.write().unwrap() = Some(judge);
+    }
+
+    /// Attach a builder used by the policy reloader to rebuild the judge when
+    /// the policy intent changes. The daemon supplies this when LLM evaluation
+    /// is configured for the proxy.
+    pub fn attach_judge_builder(&self, builder: Arc<JudgeBuilder>) {
+        let _ = self.judge_builder.set(builder);
+    }
+
+    pub fn has_judge(&self) -> bool {
+        self.judge.read().unwrap().is_some()
     }
 
     pub fn protocol_name(&self) -> &str {
@@ -311,8 +346,8 @@ impl ApiProxy {
         );
 
         if let Some(path) = self.policy_path.clone() {
-            let policy = self.policy.clone();
-            tokio::spawn(async move { policy_reloader(path, policy).await });
+            let me = self.clone();
+            tokio::spawn(async move { policy_reloader(path, me).await });
         }
 
         loop {
@@ -432,32 +467,201 @@ impl ApiProxy {
                 self.route_hold(req, &path, &query, &op, &decision.reason, conn_id)
                     .await
             }
+            ApiAction::Evaluate => {
+                self.route_evaluate(req, &path, &query, &op, false, conn_id)
+                    .await
+            }
             ApiAction::Allow => {
                 // Rarity escalation: a broad allow rule fails toward scrutiny on
                 // a shape it covers that the proxy has rarely (or never) seen.
-                // The check is a no-op unless the operator enabled it and a hold
-                // queue is attached, so the default allow path is unchanged.
-                if self.rarity.enabled() && self.gate.get().is_some() {
+                // With a judge attached, the rare shape is evaluated with an
+                // explicit rarity flag; without one it follows the existing hold
+                // path and fails closed when no queue is attached.
+                if self.rarity.enabled() {
                     let key = self.shape_key(&op);
                     if self.rarity.observe_is_rare(key) {
-                        let reason = format!(
-                            "{} (rare request shape escalated for review)",
-                            decision.reason
-                        );
-                        tracing::info!(
-                            target: "guard::apiproxy",
-                            "ESCALATE {} (rare shape under an allow rule)",
-                            label
-                        );
-                        return self
-                            .route_hold(req, &path, &query, &op, &reason, conn_id)
-                            .await;
+                        if self.has_judge() {
+                            tracing::info!(
+                                target: "guard::apiproxy",
+                                "EVALUATE {} (rare shape under an allow rule)",
+                                label
+                            );
+                            return self
+                                .route_evaluate(req, &path, &query, &op, true, conn_id)
+                                .await;
+                        } else {
+                            let reason = format!(
+                                "{} (rare request shape escalated for review)",
+                                decision.reason
+                            );
+                            tracing::info!(
+                                target: "guard::apiproxy",
+                                "ESCALATE {} (rare shape under an allow rule)",
+                                label
+                            );
+                            return self
+                                .route_hold(req, &path, &query, &op, &reason, conn_id)
+                                .await;
+                        }
                     }
                 }
                 let redact = self.protocol.redactable_read(&op);
                 tracing::info!(target: "guard::apiproxy", "ALLOW {}{}", label, if redact { " (redacting)" } else { "" });
                 self.forward(req, &path, &query, redact, Some(op), conn_id)
                     .await
+            }
+        }
+    }
+
+    async fn route_evaluate(
+        &self,
+        req: Request<Incoming>,
+        path: &str,
+        query: &str,
+        op: &ApiOp,
+        rarity: bool,
+        conn_id: u64,
+    ) -> Response<ProxyBody> {
+        let label = format!("{} {}", op.verb.as_str(), path);
+        let Some(judge) = self.judge.read().unwrap().clone() else {
+            return self
+                .route_hold(
+                    req,
+                    path,
+                    query,
+                    op,
+                    "api-policy evaluate requested but no evaluator is attached",
+                    conn_id,
+                )
+                .await;
+        };
+
+        let (parts, body) = match collect_request_body(req).await {
+            Ok(buffered) => buffered,
+            Err(e) => {
+                return self.status_resp(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    &format!("guard api-proxy: request body could not be buffered: {e}"),
+                    "RequestEntityTooLarge",
+                );
+            }
+        };
+        let body_shape = redacted_body_shape(&body);
+        let prepared = self.prepare_revert(op, path).await;
+        let summary = ApiRequestSummary {
+            protocol: self.protocol.name().to_string(),
+            verb: op.verb.as_str().to_string(),
+            path: path.to_string(),
+            redacted_query: crate::evaluate::redact_for_llm(query),
+            group: op.group.clone(),
+            version: op.version.clone(),
+            resource: op.resource.clone(),
+            subresource: op.subresource.clone(),
+            namespace: op.namespace.clone(),
+            name: op.name.clone(),
+            dry_run: op.dry_run,
+            redacted_body_shape: body_shape,
+            revert_constructible: prepared.marker,
+            rarity,
+        };
+
+        match judge.judge(&summary).await {
+            ApiJudgeVerdict::Deny { reason } => {
+                tracing::info!(
+                    target: "guard::apiproxy",
+                    "[AUDIT] EVALUATE decision=deny risk=none reversibility=none reason={} label={}",
+                    reason,
+                    label
+                );
+                self.status_resp(
+                    StatusCode::FORBIDDEN,
+                    &format!(
+                        "guard api-proxy ({}) evaluator denied {label}: {reason}",
+                        self.protocol.name()
+                    ),
+                    "Forbidden",
+                )
+            }
+            ApiJudgeVerdict::Error(error) => {
+                tracing::info!(
+                    target: "guard::apiproxy",
+                    "[AUDIT] EVALUATE decision=error risk=none reversibility=none reason={} label={}",
+                    error,
+                    label
+                );
+                self.route_hold_buffered(
+                    parts,
+                    body,
+                    path,
+                    query,
+                    op,
+                    &format!("api evaluator error: {error}"),
+                    conn_id,
+                )
+                .await
+            }
+            ApiJudgeVerdict::Allow {
+                reason,
+                risk,
+                reversibility,
+            } => {
+                tracing::info!(
+                    target: "guard::apiproxy",
+                    "[AUDIT] EVALUATE decision=allow risk={:?} reversibility={:?} reason={} label={}",
+                    risk,
+                    reversibility,
+                    reason,
+                    label
+                );
+                match decide_gate(
+                    reversibility,
+                    risk,
+                    prepared.marker.is_constructible(),
+                    false,
+                ) {
+                    GateOutcome::ExecuteNow => {
+                        let redact = self.protocol.redactable_read(op);
+                        tracing::info!(target: "guard::apiproxy", "ALLOW {} (evaluator){}", label, if redact { " (redacting)" } else { "" });
+                        self.forward_buffered(
+                            parts,
+                            body,
+                            path,
+                            query,
+                            redact,
+                            Some(op.clone()),
+                            conn_id,
+                            Some(prepared.snapshot),
+                        )
+                        .await
+                    }
+                    GateOutcome::Contain if prepared.marker.is_constructible() => {
+                        let redact = self.protocol.redactable_read(op);
+                        tracing::info!(target: "guard::apiproxy", "ALLOW {} (evaluator contained){}", label, if redact { " (redacting)" } else { "" });
+                        self.forward_buffered(
+                            parts,
+                            body,
+                            path,
+                            query,
+                            redact,
+                            Some(op.clone()),
+                            conn_id,
+                            Some(prepared.snapshot),
+                        )
+                        .await
+                    }
+                    GateOutcome::Contain | GateOutcome::Hold => {
+                        self.route_hold_buffered(
+                            parts,
+                            body,
+                            path,
+                            query,
+                            op,
+                            &format!("api evaluator allowed but consequence gate held: {reason}"),
+                            conn_id,
+                        )
+                        .await
+                    }
+                }
             }
         }
     }
@@ -543,6 +747,72 @@ impl ApiProxy {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn route_hold_buffered(
+        &self,
+        parts: Parts,
+        body: Bytes,
+        path: &str,
+        query: &str,
+        op: &ApiOp,
+        reason: &str,
+        conn_id: u64,
+    ) -> Response<ProxyBody> {
+        let label = format!("{} {}", op.verb.as_str(), path);
+        let label = label.as_str();
+        let Some(gate) = self.gate.get() else {
+            tracing::info!(
+                target: "guard::apiproxy",
+                "HOLD {} denied: no approval queue (--gate consequence is not active)",
+                label
+            );
+            return self.status_resp(
+                StatusCode::FORBIDDEN,
+                &format!(
+                    "guard api-proxy ({}): {label} requires operator approval, but the daemon \
+                     is running without --gate consequence (no approval queue); denied",
+                    self.protocol.name()
+                ),
+                "Forbidden",
+            );
+        };
+        tracing::info!(target: "guard::apiproxy", "HOLD {} ({})", label, reason);
+        match gate.hold_request(label, reason).await {
+            HoldDecision::Approved { handle } => {
+                let redact = self.protocol.redactable_read(op);
+                tracing::info!(
+                    target: "guard::apiproxy",
+                    "ALLOW {} (operator approved hold {}){}",
+                    label,
+                    handle,
+                    if redact { " (redacting)" } else { "" }
+                );
+                self.forward_buffered(
+                    parts,
+                    body,
+                    path,
+                    query,
+                    redact,
+                    Some(op.clone()),
+                    conn_id,
+                    None,
+                )
+                .await
+            }
+            HoldDecision::Denied { reason } => {
+                tracing::info!(target: "guard::apiproxy", "DENY {} (held: {})", label, reason);
+                self.status_resp(
+                    StatusCode::FORBIDDEN,
+                    &format!(
+                        "guard api-proxy ({}): {label} held for operator approval: {reason}",
+                        self.protocol.name()
+                    ),
+                    "Forbidden",
+                )
+            }
+        }
+    }
+
     async fn forward(
         &self,
         req: Request<Incoming>,
@@ -552,8 +822,47 @@ impl ApiProxy {
         op: Option<ApiOp>,
         conn_id: u64,
     ) -> Response<ProxyBody> {
+        let (parts, body) = match collect_request_body(req).await {
+            Ok(buffered) => buffered,
+            Err(e) => {
+                tracing::warn!(target: "guard::apiproxy", "request body error for {path}: {e:#}");
+                return self.status_resp(
+                    StatusCode::BAD_GATEWAY,
+                    &format!(
+                        "guard api-proxy ({}): request body error: {e}",
+                        self.protocol.name()
+                    ),
+                    "InternalError",
+                );
+            }
+        };
+        self.forward_buffered(parts, body, path, query, redact, op, conn_id, None)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_buffered(
+        &self,
+        parts: Parts,
+        body: Bytes,
+        path: &str,
+        query: &str,
+        redact: bool,
+        op: Option<ApiOp>,
+        conn_id: u64,
+        prepared_snapshot: Option<Option<Vec<u8>>>,
+    ) -> Response<ProxyBody> {
         match self
-            .forward_inner(req, path, query, redact, op, conn_id)
+            .forward_inner(
+                parts,
+                body,
+                path,
+                query,
+                redact,
+                op,
+                conn_id,
+                prepared_snapshot,
+            )
             .await
         {
             Ok(resp) => resp,
@@ -571,30 +880,27 @@ impl ApiProxy {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn forward_inner(
         &self,
-        req: Request<Incoming>,
+        parts: Parts,
+        body: Bytes,
         path: &str,
         query: &str,
         redact: bool,
         op: Option<ApiOp>,
         conn_id: u64,
+        prepared_snapshot: Option<Option<Vec<u8>>>,
     ) -> Result<Response<ProxyBody>> {
-        let (parts, body) = req.into_parts();
-
-        let collected = Limited::new(body, MAX_REQ_BODY)
-            .collect()
-            .await
-            .map_err(|e| anyhow!("read request body (limit {MAX_REQ_BODY}): {e}"))?
-            .to_bytes();
-
         // A recoverable write we will wrap in an auto-revert envelope: fetch
         // the prior object first (when the protocol wants a restore-style
         // revert), then forward, then arm.
         let track_write = op
             .as_ref()
             .is_some_and(|o| self.gate.get().is_some() && self.protocol.tracks_write(o));
-        let snapshot = if track_write && self.protocol.wants_prior_snapshot(op.as_ref().unwrap()) {
+        let snapshot = if let Some(snapshot) = prepared_snapshot {
+            snapshot
+        } else if track_write && self.protocol.wants_prior_snapshot(op.as_ref().unwrap()) {
             self.fetch_prior_object(path).await
         } else {
             None
@@ -632,8 +938,8 @@ impl ApiProxy {
         } else if let Some((user, pass)) = self.upstream.basic_auth() {
             rb = rb.basic_auth(user, Some(pass));
         }
-        if !collected.is_empty() {
-            rb = rb.body(collected);
+        if !body.is_empty() {
+            rb = rb.body(body);
         }
 
         let upstream_resp = rb.send().await.context("forward to apiserver")?;
@@ -744,6 +1050,36 @@ impl ApiProxy {
         resp.bytes().await.ok().map(|b| b.to_vec())
     }
 
+    async fn prepare_revert(&self, op: &ApiOp, path: &str) -> PreparedRevert {
+        let track_write = self.gate.get().is_some() && self.protocol.tracks_write(op);
+        if !track_write {
+            return PreparedRevert {
+                marker: RevertConstructible::None,
+                snapshot: None,
+            };
+        }
+        if self.protocol.wants_prior_snapshot(op) {
+            let Some(snapshot) = self.fetch_prior_object(path).await else {
+                return PreparedRevert {
+                    marker: RevertConstructible::None,
+                    snapshot: None,
+                };
+            };
+            let marker = match op.verb {
+                Verb::Delete => RevertConstructible::RecreateFromSnapshot,
+                _ => RevertConstructible::RestorePriorState,
+            };
+            return PreparedRevert {
+                marker,
+                snapshot: Some(snapshot),
+            };
+        }
+        PreparedRevert {
+            marker: RevertConstructible::DeleteCreated,
+            snapshot: None,
+        }
+    }
+
     /// Arm an auto-revert envelope for a tracked write the proxy just
     /// forwarded, using the protocol's revert plan.
     async fn arm_write_revert(
@@ -821,6 +1157,25 @@ impl ApiProxy {
             .body(full_body(Bytes::from(body)))
             .expect("build status response")
     }
+
+    fn rebuild_judge_for_intent(&self, intent: Option<String>) {
+        let Some(builder) = self.judge_builder.get() else {
+            return;
+        };
+        let judge = builder(intent);
+        *self.judge.write().unwrap() = judge;
+        tracing::info!(target: "guard::apiproxy", "rebuilt api evaluator for policy intent change");
+    }
+}
+
+async fn collect_request_body(req: Request<Incoming>) -> Result<(Parts, Bytes)> {
+    let (parts, body) = req.into_parts();
+    let collected = Limited::new(body, MAX_REQ_BODY)
+        .collect()
+        .await
+        .map_err(|e| anyhow!("read request body (limit {MAX_REQ_BODY}): {e}"))?
+        .to_bytes();
+    Ok((parts, collected))
 }
 
 fn full_body(bytes: Bytes) -> ProxyBody {
@@ -885,9 +1240,45 @@ fn is_json(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
+fn redacted_body_shape(body: &[u8]) -> String {
+    if body.is_empty() {
+        return "(no body)".to_string();
+    }
+    match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(value) => json_shape(&value),
+        Err(_) => format!("(non-JSON body, {} bytes)", body.len()),
+    }
+}
+
+fn json_shape(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "<null>".to_string(),
+        serde_json::Value::Bool(_) => "<bool>".to_string(),
+        serde_json::Value::Number(_) => "<number>".to_string(),
+        serde_json::Value::String(_) => "<string>".to_string(),
+        serde_json::Value::Array(items) => {
+            let first = items
+                .first()
+                .map(json_shape)
+                .unwrap_or_else(|| "(empty)".to_string());
+            format!("[{} x {}]", first, items.len())
+        }
+        serde_json::Value::Object(map) => {
+            let mut keys = map.keys().collect::<Vec<_>>();
+            keys.sort();
+            let fields = keys
+                .into_iter()
+                .map(|key| format!("\"{}\":{}", key, json_shape(&map[key])))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{fields}}}")
+        }
+    }
+}
+
 /// Reload the policy file when its mtime changes (the operator slow clock). A
 /// parse error keeps the last good policy in force and is logged.
-async fn policy_reloader(path: PathBuf, policy: Arc<RwLock<ApiPolicy>>) {
+async fn policy_reloader(path: PathBuf, proxy: Arc<ApiProxy>) {
     let mut last = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
     loop {
         tokio::time::sleep(Duration::from_secs(POLICY_RELOAD_SECS)).await;
@@ -898,7 +1289,12 @@ async fn policy_reloader(path: PathBuf, policy: Arc<RwLock<ApiPolicy>>) {
         last = modified;
         match ApiPolicy::load_file(&path) {
             Ok(p) => {
-                *policy.write().await = p;
+                let old_intent = proxy.policy.read().await.intent.clone();
+                let new_intent = p.intent.clone();
+                *proxy.policy.write().await = p;
+                if old_intent != new_intent {
+                    proxy.rebuild_judge_for_intent(new_intent);
+                }
                 tracing::info!(target: "guard::apiproxy", "reloaded api-policy from {}", path.display());
             }
             Err(e) => {

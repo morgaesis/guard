@@ -7,6 +7,7 @@
 //! sweeper and `guard confirm`/`guard provisionals` apply unchanged. Keeping the
 //! sink a trait keeps the proxy (lib) free of the daemon's persistence types.
 
+use crate::gating::Reversibility;
 use async_trait::async_trait;
 
 /// How to undo a recoverable API mutation via an HTTP request through the upstream.
@@ -72,4 +73,123 @@ pub trait GateSink: Send + Sync {
             reason: "no operator-approval queue is attached to this proxy".to_string(),
         }
     }
+}
+
+/// Whether the proxy can construct an auto-revert for this exact request before
+/// asking the evaluator. This is an input to judgment, not a model output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RevertConstructible {
+    /// A prior object was fetched and can be PUT-restored after update/patch.
+    RestorePriorState,
+    /// A successful create response should identify the object to delete.
+    DeleteCreated,
+    /// A prior object was fetched and can be POST-recreated after delete.
+    RecreateFromSnapshot,
+    /// No faithful auto-revert is available for this operation.
+    None,
+}
+
+impl RevertConstructible {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RestorePriorState => "restore_prior_state",
+            Self::DeleteCreated => "delete_created",
+            Self::RecreateFromSnapshot => "recreate_from_snapshot",
+            Self::None => "none",
+        }
+    }
+
+    pub fn is_constructible(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+/// Stable, redacted request facts sent to an API judge. Values that may carry
+/// secrets are summarized or redacted before this struct is built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiRequestSummary {
+    pub protocol: String,
+    pub verb: String,
+    pub path: String,
+    pub redacted_query: String,
+    pub group: String,
+    pub version: String,
+    pub resource: String,
+    pub subresource: Option<String>,
+    pub namespace: Option<String>,
+    pub name: Option<String>,
+    pub dry_run: bool,
+    pub redacted_body_shape: String,
+    pub revert_constructible: RevertConstructible,
+    pub rarity: bool,
+}
+
+impl ApiRequestSummary {
+    /// Stable text used as the evaluator command string. Do not pass these
+    /// fields via a per-request prompt append, because the evaluator cache keys
+    /// on this exact string.
+    pub fn stable_text(&self) -> String {
+        format!(
+            concat!(
+                "API operation request\n",
+                "protocol: {}\n",
+                "verb: {}\n",
+                "path: {}\n",
+                "query: {}\n",
+                "group: {}\n",
+                "version: {}\n",
+                "resource: {}\n",
+                "subresource: {}\n",
+                "namespace: {}\n",
+                "name: {}\n",
+                "dry_run: {}\n",
+                "body_shape: {}\n",
+                "revert_constructible: {}\n",
+                "rarity: {}"
+            ),
+            self.protocol,
+            self.verb,
+            self.path,
+            if self.redacted_query.is_empty() {
+                "(none)"
+            } else {
+                &self.redacted_query
+            },
+            if self.group.is_empty() {
+                "(core)"
+            } else {
+                &self.group
+            },
+            self.version,
+            self.resource,
+            self.subresource.as_deref().unwrap_or("(none)"),
+            self.namespace.as_deref().unwrap_or("(cluster)"),
+            self.name.as_deref().unwrap_or("(none)"),
+            self.dry_run,
+            self.redacted_body_shape,
+            self.revert_constructible.as_str(),
+            self.rarity
+        )
+    }
+}
+
+/// API evaluator verdict. An allow is still routed through `decide_gate`; it is
+/// never a direct bypass of the deterministic consequence floor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApiJudgeVerdict {
+    Allow {
+        reason: String,
+        risk: Option<i32>,
+        reversibility: Option<Reversibility>,
+    },
+    Deny {
+        reason: String,
+    },
+    Error(String),
+}
+
+#[async_trait]
+pub trait ApiJudge: Send + Sync {
+    async fn judge(&self, summary: &ApiRequestSummary) -> ApiJudgeVerdict;
 }

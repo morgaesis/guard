@@ -604,6 +604,11 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 }
             }
 
+            let api_judge_llm = eval_config.llm.clone();
+            let api_judge_cache_enabled = cache_enabled;
+            let api_judge_cache_capacity = cache_capacity;
+            let api_judge_cache_ttl = std::time::Duration::from_secs(cache_ttl_secs);
+
             tracing::info!("Creating evaluator...");
             let evaluator =
                 evaluate::Evaluator::new(eval_config).context("Failed to create evaluator")?;
@@ -973,6 +978,8 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                         guard::proxy::ApiPolicy::deny_all()
                     }
                 };
+                let policy_contains_evaluate = policy.contains_evaluate();
+                let policy_intent = policy.intent.clone();
                 let rarity_threshold = api_rarity_escalation
                     .map(Ok)
                     .or_else(|| {
@@ -1000,6 +1007,45 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                     );
                 }
                 let proxy = Arc::new(proxy);
+                let mut api_judge_attached = false;
+                if api_judge_llm.enabled
+                    && api_judge_llm
+                        .api_key
+                        .as_ref()
+                        .is_some_and(|key| !key.is_empty())
+                {
+                    let llm = api_judge_llm.clone();
+                    let builder =
+                        Arc::new(
+                            move |intent: Option<String>| match server::DaemonApiJudge::build(
+                                llm.clone(),
+                                api_judge_cache_enabled,
+                                api_judge_cache_capacity,
+                                api_judge_cache_ttl,
+                                intent,
+                            ) {
+                                Ok(judge) => Some(judge),
+                                Err(e) => {
+                                    tracing::error!("failed to build API evaluator judge: {e:#}");
+                                    None
+                                }
+                            },
+                        );
+                    proxy.attach_judge_builder(builder.clone());
+                    if let Some(judge) = builder(policy_intent) {
+                        proxy.attach_judge(judge);
+                        api_judge_attached = true;
+                        tracing::info!(
+                            "API proxy evaluator attached for {}",
+                            proxy.protocol_name()
+                        );
+                    }
+                }
+                if policy_contains_evaluate && !api_judge_attached {
+                    tracing::warn!(
+                        "API policy contains evaluate actions but no API evaluator judge is attached; those requests will hold, and deny without an approval queue"
+                    );
+                }
                 if let Some(out) = api_ca_out.or(env_api_ca_out) {
                     std::fs::write(&out, ca_pem)
                         .with_context(|| format!("write API proxy CA to {}", out.display()))?;

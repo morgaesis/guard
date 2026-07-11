@@ -7,6 +7,7 @@
 //! proxy's ephemeral CA and connects over TLS, exactly as a brokered client
 //! would.
 
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,7 +19,10 @@ use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
 
-use guard::proxy::{ApiPolicy, ApiProxy, ProxyTls, Upstream};
+use guard::gating::Reversibility;
+use guard::proxy::{
+    ApiJudge, ApiJudgeVerdict, ApiPolicy, ApiProxy, ApiRequestSummary, GateSink, ProxyTls, Upstream,
+};
 
 /// Mock apiserver: returns a Secret (with data), a ConfigMap (with data), or a
 /// generic OK for everything else. Records nothing; the proxy is what we test.
@@ -74,6 +78,81 @@ fn free_port() -> u16 {
         .local_addr()
         .unwrap()
         .port()
+}
+
+fn kubeconfig_for(mock_base: &str) -> String {
+    format!(
+        "apiVersion: v1\nkind: Config\ncurrent-context: ctx\nclusters:\n  - name: c\n    cluster: {{server: \"{mock_base}\"}}\ncontexts:\n  - name: ctx\n    context: {{cluster: c, user: u}}\nusers:\n  - name: u\n    user: {{}}\n"
+    )
+}
+
+async fn start_proxy_with(
+    mock_base: String,
+    policy_yaml: &str,
+    judge: Option<Arc<dyn ApiJudge>>,
+    gate: Option<Arc<dyn GateSink>>,
+    rarity_threshold: u64,
+) -> (String, reqwest::Client) {
+    let kubeconfig = kubeconfig_for(&mock_base);
+    let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
+    let tls = ProxyTls::generate().expect("tls");
+    let ca_pem = tls.ca_pem().to_string();
+    let policy = ApiPolicy::from_yaml(policy_yaml).expect("policy");
+    let port = free_port();
+    let listen = format!("127.0.0.1:{port}").parse().unwrap();
+    let mut proxy = ApiProxy::new(listen, tls, upstream, policy, None);
+    if rarity_threshold > 0 {
+        proxy = proxy.with_rarity_escalation(rarity_threshold);
+    }
+    let proxy = Arc::new(proxy);
+    if let Some(gate) = gate {
+        proxy.attach_gate(gate);
+    }
+    if let Some(judge) = judge {
+        proxy.attach_judge(judge);
+    }
+    tokio::spawn(proxy.clone().serve());
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    (format!("https://127.0.0.1:{port}"), client)
+}
+
+#[derive(Clone)]
+struct RecordingJudge {
+    verdicts: Arc<std::sync::Mutex<VecDeque<ApiJudgeVerdict>>>,
+    summaries: Arc<std::sync::Mutex<Vec<ApiRequestSummary>>>,
+}
+
+impl RecordingJudge {
+    fn new(verdicts: Vec<ApiJudgeVerdict>) -> Self {
+        Self {
+            verdicts: Arc::new(std::sync::Mutex::new(verdicts.into())),
+            summaries: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ApiJudge for RecordingJudge {
+    async fn judge(&self, summary: &ApiRequestSummary) -> ApiJudgeVerdict {
+        self.summaries.lock().unwrap().push(summary.clone());
+        self.verdicts
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| ApiJudgeVerdict::Error("no mock verdict queued".to_string()))
+    }
+}
+
+fn judge_allow(risk: Option<i32>, reversibility: Option<Reversibility>) -> ApiJudgeVerdict {
+    ApiJudgeVerdict::Allow {
+        reason: "mock allow".to_string(),
+        risk,
+        reversibility,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1109,5 +1188,377 @@ async fn proxy_rarity_escalation_holds_only_rare_shapes() {
     assert_eq!(
         holds, 3,
         "2 holds for the first shape's rare window + 1 for the new-namespace shape"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_evaluate_allow_and_deny_verdicts_route_correctly() {
+    let policy = r#"
+default: deny
+rules:
+  - verbs: [get]
+    resources: [configmaps]
+    namespaces: [dev]
+    action: evaluate
+  - verbs: [patch]
+    resources: [deployments]
+    namespaces: [dev]
+    action: evaluate
+"#;
+
+    let judge = RecordingJudge::new(vec![judge_allow(Some(1), Some(Reversibility::Reversible))]);
+    let (base, client) = start_proxy_with(
+        spawn_mock_upstream().await,
+        policy,
+        Some(Arc::new(judge)),
+        None,
+        0,
+    )
+    .await;
+    let resp = client
+        .get(format!("{base}/api/v1/namespaces/dev/configmaps/cm"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "low-risk reversible allow forwards");
+
+    let judge = RecordingJudge::new(vec![ApiJudgeVerdict::Deny {
+        reason: "not in scope".to_string(),
+    }]);
+    let (base, client) = start_proxy_with(
+        spawn_mock_upstream().await,
+        policy,
+        Some(Arc::new(judge)),
+        None,
+        0,
+    )
+    .await;
+    let resp = client
+        .get(format!("{base}/api/v1/namespaces/dev/configmaps/cm"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "judge deny is a proxy 403");
+
+    let judge = RecordingJudge::new(vec![ApiJudgeVerdict::Error("transport down".to_string())]);
+    let (base, client) = start_proxy_with(
+        spawn_mock_upstream().await,
+        policy,
+        Some(Arc::new(judge)),
+        None,
+        0,
+    )
+    .await;
+    let resp = client
+        .get(format!("{base}/api/v1/namespaces/dev/configmaps/cm"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "judge error routes to hold and fails closed"
+    );
+
+    let (base, client) = start_proxy_with(spawn_mock_upstream().await, policy, None, None, 0).await;
+    let resp = client
+        .get(format!("{base}/api/v1/namespaces/dev/configmaps/cm"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "evaluate without a judge routes to hold"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_evaluate_respects_decide_gate_floor_and_constructibility() {
+    let policy = r#"
+default: deny
+rules:
+  - verbs: [get]
+    resources: [configmaps]
+    namespaces: [dev]
+    action: evaluate
+  - verbs: [patch]
+    resources: [deployments]
+    namespaces: [dev]
+    action: evaluate
+"#;
+
+    for verdict in [
+        judge_allow(Some(1), None),
+        judge_allow(None, Some(Reversibility::Reversible)),
+        judge_allow(Some(1), Some(Reversibility::Irreversible)),
+    ] {
+        let judge = RecordingJudge::new(vec![verdict]);
+        let (base, client) = start_proxy_with(
+            spawn_mock_upstream().await,
+            policy,
+            Some(Arc::new(judge)),
+            None,
+            0,
+        )
+        .await;
+        let resp = client
+            .get(format!("{base}/api/v1/namespaces/dev/configmaps/cm"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            403,
+            "missing class, missing risk, and irreversible allows all hold"
+        );
+    }
+
+    let sink = RecordingSink::default();
+    let judge = RecordingJudge::new(vec![judge_allow(Some(4), Some(Reversibility::Recoverable))]);
+    let (base, client) = start_proxy_with(
+        spawn_write_mock().await,
+        policy,
+        Some(Arc::new(judge)),
+        Some(Arc::new(sink.clone())),
+        0,
+    )
+    .await;
+    let resp = client
+        .patch(format!(
+            "{base}/apis/apps/v1/namespaces/dev/deployments/api"
+        ))
+        .header("content-type", "application/merge-patch+json")
+        .body(r#"{"spec":{"replicas":5}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "recoverable with snapshot forwards");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        sink.calls.lock().unwrap().len(),
+        1,
+        "recoverable evaluate allow arms containment revert"
+    );
+
+    let judge = RecordingJudge::new(vec![judge_allow(Some(4), Some(Reversibility::Recoverable))]);
+    let (base, client) = start_proxy_with(
+        spawn_write_mock().await,
+        policy,
+        Some(Arc::new(judge)),
+        None,
+        0,
+    )
+    .await;
+    let resp = client
+        .patch(format!(
+            "{base}/apis/apps/v1/namespaces/dev/deployments/api"
+        ))
+        .header("content-type", "application/merge-patch+json")
+        .body(r#"{"spec":{"replicas":5}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "recoverable without a constructible revert holds"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_evaluate_rarity_uses_judge_when_available() {
+    let policy = r#"
+default: deny
+rules:
+  - verbs: [get]
+    resources: ["*"]
+    namespaces: ["*"]
+    action: allow
+"#;
+
+    let judge = RecordingJudge::new(vec![judge_allow(Some(1), Some(Reversibility::Reversible))]);
+    let summaries = judge.summaries.clone();
+    let (base, client) = start_proxy_with(
+        spawn_mock_upstream().await,
+        policy,
+        Some(Arc::new(judge)),
+        None,
+        1,
+    )
+    .await;
+    let resp = client
+        .get(format!("{base}/api/v1/namespaces/dev/configmaps/cm"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "rare allow is judged and forwarded");
+    assert!(
+        summaries.lock().unwrap()[0].rarity,
+        "judge receives rarity=true for rare allow shape"
+    );
+
+    let (base, client) = start_proxy_with(spawn_mock_upstream().await, policy, None, None, 1).await;
+    let resp = client
+        .get(format!("{base}/api/v1/namespaces/dev/configmaps/cm"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "rare allow without judge is held");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_evaluate_body_shape_never_includes_leaf_values() {
+    let policy = r#"
+default: deny
+rules:
+  - verbs: [create]
+    resources: [configmaps]
+    namespaces: [dev]
+    action: evaluate
+"#;
+    let judge = RecordingJudge::new(vec![
+        ApiJudgeVerdict::Deny {
+            reason: "stop".to_string(),
+        },
+        ApiJudgeVerdict::Deny {
+            reason: "stop".to_string(),
+        },
+        ApiJudgeVerdict::Deny {
+            reason: "stop".to_string(),
+        },
+    ]);
+    let summaries = judge.summaries.clone();
+    let (base, client) = start_proxy_with(
+        spawn_mock_upstream().await,
+        policy,
+        Some(Arc::new(judge)),
+        None,
+        0,
+    )
+    .await;
+
+    let secret_value = "super-secret-value";
+    let resp = client
+        .post(format!("{base}/api/v1/namespaces/dev/configmaps"))
+        .header("content-type", "application/json")
+        .body(
+            json!({
+                "metadata": {"name": "cm"},
+                "data": {"password": secret_value, "replicas": 3, "enabled": true, "none": null},
+                "items": [{"key": "value"}]
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    let resp = client
+        .post(format!("{base}/api/v1/namespaces/dev/configmaps"))
+        .body("not-json-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    let resp = client
+        .post(format!("{base}/api/v1/namespaces/dev/configmaps"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    let summaries = summaries.lock().unwrap();
+    assert_eq!(summaries.len(), 3);
+    assert!(
+        !summaries[0].redacted_body_shape.contains(secret_value),
+        "JSON leaf values must not enter the judge summary: {}",
+        summaries[0].redacted_body_shape
+    );
+    assert!(summaries[0].redacted_body_shape.contains("<string>"));
+    assert!(summaries[0].redacted_body_shape.contains("<number>"));
+    assert!(summaries[0].redacted_body_shape.contains("<bool>"));
+    assert!(summaries[0].redacted_body_shape.contains("<null>"));
+    assert_eq!(
+        summaries[1].redacted_body_shape,
+        "(non-JSON body, 15 bytes)"
+    );
+    assert_eq!(summaries[2].redacted_body_shape, "(no body)");
+}
+
+async fn counting_snapshot_handler(
+    req: Request<Incoming>,
+    gets: Arc<std::sync::atomic::AtomicUsize>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    if req.method() == hyper::Method::GET {
+        gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    write_mock_handler(req).await
+}
+
+async fn spawn_counting_snapshot_mock() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    let gets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let gets_for_task = gets.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let gets = gets_for_task.clone();
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        io,
+                        service_fn(move |req| counting_snapshot_handler(req, gets.clone())),
+                    )
+                    .await;
+            });
+        }
+    });
+    (format!("http://{addr}"), gets)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_evaluate_reuses_prior_snapshot_for_arming() {
+    let policy = r#"
+default: deny
+rules:
+  - verbs: [patch]
+    resources: [deployments]
+    namespaces: [dev]
+    action: evaluate
+"#;
+    let (mock_base, gets) = spawn_counting_snapshot_mock().await;
+    let sink = RecordingSink::default();
+    let judge = RecordingJudge::new(vec![judge_allow(Some(4), Some(Reversibility::Recoverable))]);
+    let (base, client) = start_proxy_with(
+        mock_base,
+        policy,
+        Some(Arc::new(judge)),
+        Some(Arc::new(sink)),
+        0,
+    )
+    .await;
+    let resp = client
+        .patch(format!(
+            "{base}/apis/apps/v1/namespaces/dev/deployments/api"
+        ))
+        .header("content-type", "application/merge-patch+json")
+        .body(r#"{"spec":{"replicas":5}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        gets.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "evaluate path fetches the prior object once and reuses it for arming"
     );
 }
