@@ -8,9 +8,17 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
+/// Bumped when the API judge system prompt or the learning semantics change, so
+/// a binary upgrade that alters the evaluator regime distrusts prior learned
+/// shapes without a manual file edit.
+const API_JUDGE_PROMPT_VERSION: u32 = 1;
+
 pub(crate) struct DaemonApiJudge {
     evaluator: Evaluator,
     api_promotion: Option<Arc<RwLock<ApiPromotionStore>>>,
+    /// Fingerprint of the evaluator regime (prompt version, model, intent). A
+    /// learned shape stamped with a different regime is not trusted.
+    stamp: String,
 }
 
 impl DaemonApiJudge {
@@ -22,6 +30,7 @@ impl DaemonApiJudge {
         intent: Option<String>,
         api_promotion: Option<Arc<RwLock<ApiPromotionStore>>>,
     ) -> Result<Arc<dyn ApiJudge>> {
+        let stamp = regime_stamp(&llm, intent.as_deref());
         let mut config = EvalConfig::default()
             .cache_enabled(cache_enabled)
             .cache_capacity(cache_capacity)
@@ -32,8 +41,32 @@ impl DaemonApiJudge {
         Ok(Arc::new(Self {
             evaluator: Evaluator::new(config)?,
             api_promotion,
+            stamp,
         }))
     }
+}
+
+/// A stable fingerprint of the evaluator regime: the prompt version, the model,
+/// and the policy intent. Any change means prior learned shapes were produced
+/// under different judgment and must be re-earned.
+fn regime_stamp(llm: &LlmConfig, intent: Option<&str>) -> String {
+    use sha2::{Digest, Sha256};
+    let model = llm
+        .model
+        .clone()
+        .or_else(|| llm.models.first().cloned())
+        .unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(API_JUDGE_PROMPT_VERSION.to_le_bytes());
+    hasher.update([0u8]);
+    hasher.update(model.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(intent.unwrap_or("").as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 #[async_trait]
@@ -42,7 +75,7 @@ impl ApiJudge for DaemonApiJudge {
         if let Some(store) = &self.api_promotion {
             let hit = {
                 let guard = store.read().await;
-                guard.learned_deny(summary)
+                guard.learned_deny(summary, &self.stamp)
             };
             if let Some(hit) = hit {
                 tracing::info!(
@@ -51,16 +84,17 @@ impl ApiJudge for DaemonApiJudge {
                     hit.shape.audit_label(),
                     hit.denials
                 );
-                return ApiJudgeVerdict::Deny {
-                    reason: "API evaluator audit trail repeatedly denied this request shape"
-                        .to_string(),
-                };
+                // Return the original denial reason verbatim so the client sees
+                // exactly what a fresh evaluator denial would say. Disclosing
+                // that this shape now skips the evaluator would tell an
+                // adversarial client which requests bypass the model.
+                return ApiJudgeVerdict::Deny { reason: hit.reason };
             }
 
             if !summary.rarity {
                 let hit = {
                     let guard = store.read().await;
-                    guard.learned_allow(summary)
+                    guard.learned_allow(summary, &self.stamp)
                 };
                 if let Some(hit) = hit {
                     tracing::info!(
@@ -122,7 +156,7 @@ impl DaemonApiJudge {
         };
         let outcome = {
             let mut guard = store.write().await;
-            guard.record_allow(summary, risk, reversibility, reason)
+            guard.record_allow(summary, risk, reversibility, reason, &self.stamp)
         };
         match outcome {
             Ok(Some(ApiPromotionOutcome::AllowPromoted {
@@ -152,7 +186,7 @@ impl DaemonApiJudge {
         };
         let outcome = {
             let mut guard = store.write().await;
-            guard.record_deny(summary, reason)
+            guard.record_deny(summary, reason, &self.stamp)
         };
         match outcome {
             Ok(Some(ApiPromotionOutcome::DenyLearned { shape, denials })) => {

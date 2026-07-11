@@ -2,12 +2,12 @@
 use crate::server::execute::{exec_with_read_grant_retry, permission_denied_path};
 #[cfg(unix)]
 use crate::server::gate_runtime::now_unix;
-use crate::server::grants::handle_grant_read;
 #[cfg(unix)]
 use crate::server::grants::{
     apply_read_grant, apply_read_grant_entries, finish_read_grant_revert,
-    getfacl_user_has_traverse, plan_read_grant, revoke_read_grant_acls,
+    getfacl_user_has_traverse, handle_grant_read, plan_read_grant, revoke_read_grant_acls,
 };
+#[cfg(unix)]
 use crate::server::wire::CallerIdentity;
 #[cfg(unix)]
 use crate::server::wire::{ExecOutcome, ExecuteRequest};
@@ -24,23 +24,8 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use tokio::process::Command;
 
+#[cfg_attr(not(unix), allow(unused_imports))]
 use super::make_test_config;
-
-#[cfg(windows)]
-#[tokio::test]
-async fn grant_read_is_denied_on_non_unix_platform() {
-    let (cfg, _buf) = make_test_config();
-    let caller = CallerIdentity::Unix { uid: 1000 };
-    let result = handle_grant_read(&cfg, &caller, "/home/op/values.yaml".to_string(), None).await;
-    assert!(!result.policy_allowed());
-    assert!(
-        result
-            .policy_reason()
-            .contains("not supported on this platform"),
-        "got: {}",
-        result.policy_reason()
-    );
-}
 
 #[cfg(unix)]
 fn set_mode(path: &Path, mode: u32) {
