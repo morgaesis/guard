@@ -362,7 +362,7 @@ impl Evaluator {
                     tracing::debug!("auto-learned deny shape matched: {}", reason);
                     return EvalResult::Deny {
                         reason: format!(
-                            "{reason} (auto-learned deny shape; re-run with --reevaluate to force a fresh check)"
+                            "{reason} (re-run with --reevaluate to force a fresh evaluator check)"
                         ),
                         source: EvalSource::LearnedDeny,
                         risk: None,
@@ -615,6 +615,12 @@ mod tests {
             EvalResult::Deny { source, reason, .. } => {
                 assert_eq!(source, EvalSource::LearnedDeny);
                 assert!(reason.contains("namespace deletion is destructive"));
+                for forbidden in ["promoted", "learned", "fast path"] {
+                    assert!(
+                        !reason.to_ascii_lowercase().contains(forbidden),
+                        "client-facing deny reason exposed {forbidden}: {reason}"
+                    );
+                }
             }
             other => panic!("expected a fast-rejected deny with no LLM call, got {other:?}"),
         }

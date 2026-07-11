@@ -36,6 +36,10 @@ fn default_allow_promotion_state_path() -> Option<PathBuf> {
     default_guard_state_dir().map(|dir| dir.join("learned-allow.yaml"))
 }
 
+fn default_api_promotion_state_path() -> Option<PathBuf> {
+    default_guard_state_dir().map(|dir| dir.join("learned-api.yaml"))
+}
+
 /// Default verb catalog path used only when `--verbs` was not given but
 /// auto-promotion is enabled and needs somewhere to persist a promoted verb.
 /// Unlike `--verbs`, a missing file at this path is not an error (see the
@@ -115,6 +119,11 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             api_policy,
             brokered_kubeconfig_out,
             api_rarity_escalation,
+            api_promotion,
+            no_api_promotion,
+            api_promotion_state,
+            api_promotion_min_approvals,
+            api_promotion_min_denials,
             // Consumed in `main` (Windows SCM dispatch); irrelevant to the
             // server run itself, which is identical in service and foreground.
             service: _,
@@ -515,6 +524,57 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 );
                 eval_config = eval_config.allow_promotion(Arc::new(RwLock::new(store)));
             }
+
+            let api_promotion_enabled = if no_api_promotion {
+                false
+            } else {
+                api_promotion
+                    .or_else(|| guard_env("API_PROMOTION").map(|v| parse_env_bool(&v)))
+                    .unwrap_or(true)
+            };
+            let api_promotion_store = if api_promotion_enabled {
+                let api_promotion_state_path = api_promotion_state
+                    .or_else(|| {
+                        guard_env("API_PROMOTION_STATE")
+                            .filter(|value| !value.is_empty())
+                            .map(PathBuf::from)
+                    })
+                    .or_else(default_api_promotion_state_path)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("could not determine API promotion state path")
+                    })?;
+                let mut api_config = guard::gating::api_promotion::ApiPromotionConfig::new(
+                    api_promotion_state_path.clone(),
+                );
+                api_config.min_approvals = api_promotion_min_approvals
+                    .or_else(|| {
+                        guard_env("API_PROMOTION_MIN_APPROVALS").and_then(|v| v.parse::<u32>().ok())
+                    })
+                    .unwrap_or(api_config.min_approvals)
+                    .max(2);
+                api_config.min_denials = api_promotion_min_denials
+                    .or_else(|| {
+                        guard_env("API_PROMOTION_MIN_DENIALS").and_then(|v| v.parse::<u32>().ok())
+                    })
+                    .unwrap_or(api_config.min_denials)
+                    .max(1);
+                let store = guard::gating::api_promotion::ApiPromotionStore::load(api_config)
+                    .with_context(|| {
+                        format!(
+                            "failed to load API promotion state from {}",
+                            api_promotion_state_path.display()
+                        )
+                    })?;
+                tracing::info!(
+                    "API request-shape learning enabled: path={} min_approvals={} min_denials={}",
+                    store.path().display(),
+                    store.min_approvals(),
+                    store.min_denials()
+                );
+                Some(Arc::new(RwLock::new(store)))
+            } else {
+                None
+            };
 
             // Additive prompt: append to base prompt without replacing it.
             // Priority: --system-prompt-append flag > GUARD_PROMPT_APPEND env var
@@ -1015,6 +1075,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                         .is_some_and(|key| !key.is_empty())
                 {
                     let llm = api_judge_llm.clone();
+                    let api_promotion_store = api_promotion_store.clone();
                     let builder =
                         Arc::new(
                             move |intent: Option<String>| match server::DaemonApiJudge::build(
@@ -1023,6 +1084,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                                 api_judge_cache_capacity,
                                 api_judge_cache_ttl,
                                 intent,
+                                api_promotion_store.clone(),
                             ) {
                                 Ok(judge) => Some(judge),
                                 Err(e) => {

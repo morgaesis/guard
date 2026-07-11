@@ -856,6 +856,40 @@ enum ServerCommands {
         #[arg(long = "api-rarity-escalation", value_name = "N")]
         api_rarity_escalation: Option<u64>,
 
+        /// Auto-learn exact API request shapes from repeated evaluator verdicts
+        /// on proxied evaluate traffic. On by default. Learned denies
+        /// fast-reject the same tuple; learned allows reuse the stored
+        /// risk/reversibility and still pass through consequence gating. Env:
+        /// GUARD_API_PROMOTION.
+        #[arg(
+            long = "api-promotion",
+            action = ArgAction::Set,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            value_name = "BOOL",
+            overrides_with = "no_api_promotion"
+        )]
+        api_promotion: Option<bool>,
+
+        /// Disable API request shape learning.
+        #[arg(long = "no-api-promotion", action = ArgAction::SetTrue, overrides_with = "api_promotion")]
+        no_api_promotion: bool,
+
+        /// Path to the API request shape learning state YAML.
+        /// Env: GUARD_API_PROMOTION_STATE.
+        #[arg(long = "api-promotion-state", value_name = "PATH")]
+        api_promotion_state: Option<PathBuf>,
+
+        /// Evaluator approvals of the same API shape required before a learned
+        /// allow fast path is active. Env: GUARD_API_PROMOTION_MIN_APPROVALS.
+        #[arg(long = "api-promotion-min-approvals", value_name = "N")]
+        api_promotion_min_approvals: Option<u32>,
+
+        /// Evaluator denials of the same API shape required before a learned
+        /// deny fast path is active. Env: GUARD_API_PROMOTION_MIN_DENIALS.
+        #[arg(long = "api-promotion-min-denials", value_name = "N")]
+        api_promotion_min_denials: Option<u32>,
+
         /// Internal marker: launched under the Windows Service Control Manager.
         /// The Windows installer sets this in the service binPath so startup
         /// answers the SCM start/stop handshake instead of running in the

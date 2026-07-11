@@ -1,13 +1,16 @@
-use crate::evaluate::{redact_for_llm, EvalConfig, EvalResult, Evaluator, LlmConfig};
+use crate::evaluate::{redact_for_llm, EvalConfig, EvalResult, EvalSource, Evaluator, LlmConfig};
 use anyhow::Result;
 use async_trait::async_trait;
+use guard::gating::api_promotion::{ApiPromotionOutcome, ApiPromotionStore};
 use guard::gating::GateMode;
 use guard::proxy::{ApiJudge, ApiJudgeVerdict, ApiRequestSummary};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::RwLock;
 
 pub(crate) struct DaemonApiJudge {
     evaluator: Evaluator,
+    api_promotion: Option<Arc<RwLock<ApiPromotionStore>>>,
 }
 
 impl DaemonApiJudge {
@@ -17,6 +20,7 @@ impl DaemonApiJudge {
         cache_capacity: usize,
         cache_ttl: Duration,
         intent: Option<String>,
+        api_promotion: Option<Arc<RwLock<ApiPromotionStore>>>,
     ) -> Result<Arc<dyn ApiJudge>> {
         let mut config = EvalConfig::default()
             .cache_enabled(cache_enabled)
@@ -27,6 +31,7 @@ impl DaemonApiJudge {
         config.llm = llm;
         Ok(Arc::new(Self {
             evaluator: Evaluator::new(config)?,
+            api_promotion,
         }))
     }
 }
@@ -34,19 +39,133 @@ impl DaemonApiJudge {
 #[async_trait]
 impl ApiJudge for DaemonApiJudge {
     async fn judge(&self, summary: &ApiRequestSummary) -> ApiJudgeVerdict {
+        if let Some(store) = &self.api_promotion {
+            let hit = {
+                let guard = store.read().await;
+                guard.learned_deny(summary)
+            };
+            if let Some(hit) = hit {
+                tracing::info!(
+                    target: "guard::apiproxy",
+                    "[AUDIT] API_LEARNED_DENY {} denials={}",
+                    hit.shape.audit_label(),
+                    hit.denials
+                );
+                return ApiJudgeVerdict::Deny {
+                    reason: "API evaluator audit trail repeatedly denied this request shape"
+                        .to_string(),
+                };
+            }
+
+            if !summary.rarity {
+                let hit = {
+                    let guard = store.read().await;
+                    guard.learned_allow(summary)
+                };
+                if let Some(hit) = hit {
+                    tracing::info!(
+                        target: "guard::apiproxy",
+                        "[AUDIT] API_LEARNED_ALLOW {} approvals={} risk={} reversibility={}",
+                        hit.shape.audit_label(),
+                        hit.approvals,
+                        hit.risk,
+                        hit.reversibility
+                    );
+                    return ApiJudgeVerdict::Allow {
+                        reason: "API evaluator approved request".to_string(),
+                        risk: Some(hit.risk),
+                        reversibility: Some(hit.reversibility),
+                    };
+                }
+            }
+        }
+
         match self.evaluator.evaluate(&summary.stable_text()).await {
             EvalResult::Allow {
                 reason,
+                source,
                 risk,
                 reversibility,
                 ..
-            } => ApiJudgeVerdict::Allow {
-                reason,
+            } => {
+                if source == EvalSource::Llm {
+                    self.record_allow(summary, risk, reversibility, &reason)
+                        .await;
+                }
+                ApiJudgeVerdict::Allow {
+                    reason,
+                    risk,
+                    reversibility,
+                }
+            }
+            EvalResult::Deny { reason, source, .. } => {
+                if source == EvalSource::Llm {
+                    self.record_deny(summary, &reason).await;
+                }
+                ApiJudgeVerdict::Deny { reason }
+            }
+            EvalResult::Error(error) => ApiJudgeVerdict::Error(error),
+        }
+    }
+}
+
+impl DaemonApiJudge {
+    async fn record_allow(
+        &self,
+        summary: &ApiRequestSummary,
+        risk: Option<i32>,
+        reversibility: Option<guard::gating::Reversibility>,
+        reason: &str,
+    ) {
+        let Some(store) = &self.api_promotion else {
+            return;
+        };
+        let outcome = {
+            let mut guard = store.write().await;
+            guard.record_allow(summary, risk, reversibility, reason)
+        };
+        match outcome {
+            Ok(Some(ApiPromotionOutcome::AllowPromoted {
+                shape,
+                approvals,
                 risk,
                 reversibility,
-            },
-            EvalResult::Deny { reason, .. } => ApiJudgeVerdict::Deny { reason },
-            EvalResult::Error(error) => ApiJudgeVerdict::Error(error),
+            })) => {
+                tracing::info!(
+                    target: "guard::apiproxy",
+                    "[AUDIT] API_SHAPE_PROMOTED decision=allow {} approvals={} risk={} reversibility={}",
+                    shape.audit_label(),
+                    approvals,
+                    risk,
+                    reversibility
+                );
+            }
+            Ok(Some(ApiPromotionOutcome::DenyLearned { .. })) => {}
+            Ok(None) => {}
+            Err(err) => tracing::warn!("failed to record API allow-shape observation: {}", err),
+        }
+    }
+
+    async fn record_deny(&self, summary: &ApiRequestSummary, reason: &str) {
+        let Some(store) = &self.api_promotion else {
+            return;
+        };
+        let outcome = {
+            let mut guard = store.write().await;
+            guard.record_deny(summary, reason)
+        };
+        match outcome {
+            Ok(Some(ApiPromotionOutcome::DenyLearned { shape, denials })) => {
+                tracing::info!(
+                    target: "guard::apiproxy",
+                    "[AUDIT] API_SHAPE_PROMOTED decision=deny {} denials={}",
+                    shape.audit_label(),
+                    denials
+                );
+            }
+            Ok(Some(ApiPromotionOutcome::AllowPromoted { .. })) => {}
+            Ok(None) => {}
+            Err(err) => tracing::warn!("failed to record API deny-shape observation: {}", err),
         }
     }
 }
@@ -120,7 +239,14 @@ mod tests {
             .contains("revert_constructible: restore_prior_state"));
     }
 
-    async fn run_llm_capture(listener: tokio::net::TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
+    async fn run_llm_capture(
+        listener: tokio::net::TcpListener,
+        bodies: Arc<Mutex<Vec<String>>>,
+        decision: &'static str,
+        reason: &'static str,
+        risk: i32,
+        reversibility: Option<&'static str>,
+    ) {
         loop {
             let (mut stream, _) = match listener.accept().await {
                 Ok(stream) => stream,
@@ -156,13 +282,15 @@ mod tests {
                         }
                     }
                 }
-                let args = serde_json::json!({
-                    "decision": "APPROVE",
-                    "reason": "ok",
-                    "risk": 1,
-                    "reversibility": "reversible"
-                })
-                .to_string();
+                let mut args = serde_json::json!({
+                    "decision": decision,
+                    "reason": reason,
+                    "risk": risk
+                });
+                if let Some(reversibility) = reversibility {
+                    args["reversibility"] = serde_json::json!(reversibility);
+                }
+                let args = args.to_string();
                 let body = serde_json::json!({
                     "choices": [{
                         "message": {
@@ -199,7 +327,14 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let bodies = Arc::new(Mutex::new(Vec::new()));
-        tokio::spawn(run_llm_capture(listener, bodies.clone()));
+        tokio::spawn(run_llm_capture(
+            listener,
+            bodies.clone(),
+            "APPROVE",
+            "ok",
+            1,
+            Some("reversible"),
+        ));
 
         let llm = LlmConfig {
             enabled: true,
@@ -216,6 +351,7 @@ mod tests {
             16,
             Duration::from_secs(60),
             Some("manage dev deployments".to_string()),
+            None,
         )
         .expect("judge");
         let summary = ApiRequestSummary {
@@ -255,5 +391,164 @@ mod tests {
         let user = request["messages"][1]["content"].as_str().unwrap();
         assert!(system.contains("manage dev deployments"));
         assert!(user.contains("revert_constructible: restore_prior_state"));
+    }
+
+    fn promotion_store(
+        path: std::path::PathBuf,
+        min_approvals: u32,
+        min_denials: u32,
+    ) -> Arc<RwLock<ApiPromotionStore>> {
+        let mut config = guard::gating::api_promotion::ApiPromotionConfig::new(path);
+        config.min_approvals = min_approvals;
+        config.min_denials = min_denials;
+        Arc::new(RwLock::new(ApiPromotionStore::load(config).unwrap()))
+    }
+
+    fn llm_config(url: String) -> LlmConfig {
+        LlmConfig {
+            enabled: true,
+            api_key: Some("test-key".to_string()),
+            api_url: Some(url),
+            model: Some("test-model".to_string()),
+            models: Vec::new(),
+            timeout_secs: 5,
+            retries: 0,
+        }
+    }
+
+    fn api_summary(name: &str, rarity: bool) -> ApiRequestSummary {
+        ApiRequestSummary {
+            protocol: "kubernetes".to_string(),
+            verb: "patch".to_string(),
+            path: format!("/apis/apps/v1/namespaces/dev/deployments/{name}"),
+            redacted_query: String::new(),
+            group: "apps".to_string(),
+            version: "v1".to_string(),
+            resource: "deployments".to_string(),
+            subresource: None,
+            namespace: Some("dev".to_string()),
+            name: Some(name.to_string()),
+            dry_run: false,
+            redacted_body_shape: "{\"spec\":{\"replicas\":<number>}}".to_string(),
+            revert_constructible: RevertConstructible::RestorePriorState,
+            rarity,
+        }
+    }
+
+    #[tokio::test]
+    async fn api_shape_allow_promotes_and_skips_llm_except_rarity() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        tokio::spawn(run_llm_capture(
+            listener,
+            bodies.clone(),
+            "APPROVE",
+            "recoverable with snapshot",
+            6,
+            Some("recoverable"),
+        ));
+        let temp = tempfile::tempdir().unwrap();
+        let store = promotion_store(temp.path().join("api.yaml"), 5, 3);
+        let judge = DaemonApiJudge::build(
+            llm_config(url),
+            false,
+            16,
+            Duration::from_secs(60),
+            Some("manage dev deployments".to_string()),
+            Some(store),
+        )
+        .expect("judge");
+
+        for i in 0..5 {
+            assert!(matches!(
+                judge.judge(&api_summary(&format!("api-{i}"), false)).await,
+                ApiJudgeVerdict::Allow {
+                    risk: Some(6),
+                    reversibility: Some(guard::gating::Reversibility::Recoverable),
+                    ..
+                }
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(bodies.lock().unwrap().len(), 5);
+
+        assert!(matches!(
+            judge.judge(&api_summary("api-sixth", false)).await,
+            ApiJudgeVerdict::Allow {
+                risk: Some(6),
+                reversibility: Some(guard::gating::Reversibility::Recoverable),
+                ..
+            }
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            bodies.lock().unwrap().len(),
+            5,
+            "sixth non-rare request should use the learned allow"
+        );
+
+        assert!(matches!(
+            judge.judge(&api_summary("api-rare", true)).await,
+            ApiJudgeVerdict::Allow { .. }
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            bodies.lock().unwrap().len(),
+            6,
+            "rarity=true must force a real evaluator call"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_shape_deny_learns_and_skips_llm_without_client_signal() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        tokio::spawn(run_llm_capture(
+            listener,
+            bodies.clone(),
+            "DENY",
+            "outside proxy intent",
+            8,
+            None,
+        ));
+        let temp = tempfile::tempdir().unwrap();
+        let store = promotion_store(temp.path().join("api.yaml"), 5, 3);
+        let judge = DaemonApiJudge::build(
+            llm_config(url),
+            false,
+            16,
+            Duration::from_secs(60),
+            Some("manage dev deployments".to_string()),
+            Some(store),
+        )
+        .expect("judge");
+
+        for i in 0..3 {
+            assert!(matches!(
+                judge.judge(&api_summary(&format!("api-{i}"), false)).await,
+                ApiJudgeVerdict::Deny { .. }
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(bodies.lock().unwrap().len(), 3);
+
+        let verdict = judge.judge(&api_summary("api-fourth", false)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            bodies.lock().unwrap().len(),
+            3,
+            "learned deny should skip the LLM"
+        );
+        let ApiJudgeVerdict::Deny { reason } = verdict else {
+            panic!("expected deny");
+        };
+        for forbidden in ["promoted", "learned", "fast path"] {
+            assert!(
+                !reason.to_ascii_lowercase().contains(forbidden),
+                "client-facing API denial exposed {forbidden}: {reason}"
+            );
+        }
     }
 }

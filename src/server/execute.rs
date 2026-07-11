@@ -737,14 +737,17 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
                 {
                     reason = format!("{reason} {notice}");
                 }
-                maybe_promote_deny_shape(
+                if let Some(hint) = maybe_promote_deny_shape(
                     config,
                     &request.binary,
                     &request.args,
                     &command_line,
                     &reason,
                 )
-                .await;
+                .await
+                {
+                    reason = format!("{reason}\n{hint}");
+                }
             }
             deny_and_record(
                 phase,
@@ -1074,21 +1077,27 @@ async fn maybe_promote_deny_shape(
     args: &[String],
     command_line: &str,
     reason: &str,
-) {
+) -> Option<String> {
     let outcome = match config
         .evaluator
         .record_learned_denial(binary, args, command_line, reason)
         .await
     {
         Ok(Some(outcome)) => outcome,
-        Ok(None) => return,
+        Ok(None) => return None,
         Err(err) => {
             tracing::warn!("failed to record deny-shape observation: {}", err);
-            return;
+            return None;
         }
     };
+    let hint = (outcome.denials >= outcome.required_denials).then(|| {
+        format!(
+            "guard has denied {} similar {} commands; if this access is needed, ask your operator to broaden the session grant or add a profile",
+            outcome.denials, binary
+        )
+    });
     if !outcome.ready_to_synthesize {
-        return;
+        return hint;
     }
     let evaluator = config.evaluator.clone();
     tokio::spawn(async move {
@@ -1112,6 +1121,7 @@ async fn maybe_promote_deny_shape(
             }
         }
     });
+    hint
 }
 
 /// Record one fresh LLM approval against the auto-verb-promotion observation

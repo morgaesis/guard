@@ -310,6 +310,17 @@ so a broad allow rule fails toward scrutiny on a rare or first-seen shape. See
 [`examples/github-policy.yaml`](examples/github-policy.yaml), and
 [`examples/vercel-policy.yaml`](examples/vercel-policy.yaml).
 
+API request-shape learning is evidence-only and exact-tuple based: repeated
+evaluator allows or denies for the same `(protocol, verb, group, resource,
+subresource, namespace)` tuple, with object name excluded, populate a bounded
+YAML store. Learned denies reject the same tuple before another evaluator call;
+learned allows reuse the stored risk and reversibility, skip only non-rare
+requests, and still route through `decide_gate`, so the consequence floor is
+unchanged. Promotion and fast-path hits are operator-audit-only. Command
+denials may include the caller's own repeated-denial count once the deny-shape
+threshold is reached, but clients never receive promotion state or a signal
+that an API shape skipped evaluation.
+
 ## Configuration
 
 ### Defaults vs. opt-ins
@@ -374,6 +385,10 @@ Unless marked "(client)", a variable is read by the daemon at startup; setting i
 | `GUARD_LEARN_ALLOW` | `true` | Auto-promote trusted verbs from repeated low-risk LLM approvals (requires `--gate consequence`). On by default; needs no operator step, unlike `GUARD_LEARN_RULES` -- restricted to reversible/recoverable-with-a-validated-revert shapes, never irreversible. |
 | `GUARD_LEARN_ALLOW_STATE` | `<state dir>/learned-allow.yaml` | Path to the auto-verb-promotion observation state YAML (bookkeeping only; promoted verbs land in `GUARD_VERBS`). |
 | `GUARD_LEARN_ALLOW_MIN_APPROVALS` | `5` | LLM approvals of the same shape required before attempting to promote a trusted verb. |
+| `GUARD_API_PROMOTION` | `true` | Auto-learn exact API request shapes from repeated evaluator allows and denies on proxied `evaluate` traffic. |
+| `GUARD_API_PROMOTION_STATE` | `<state dir>/learned-api.yaml` | Path to the API request-shape learning state YAML. |
+| `GUARD_API_PROMOTION_MIN_APPROVALS` | `5` | Evaluator approvals of the same API tuple required before a learned allow is active. |
+| `GUARD_API_PROMOTION_MIN_DENIALS` | `3` | Evaluator denials of the same API tuple required before a learned deny is active. |
 | `GUARD_PROMPT_APPEND` | (none) | Path to additive prompt file (appended to base prompt) |
 | `GUARD_GPG_RECIPIENT` | (none) | GPG recipient for the `local` secret backend |
 | `GUARD_BACKEND` | (auto) | Secret backend: `pass`, `env`, `local`, `vault`, or `infisical`. Auto prefers `pass`; otherwise it falls back to non-persistent `env` and logs a warning. `vault` uses `VAULT_ADDR` with `VAULT_TOKEN` or `VAULT_ROLE_ID`+`VAULT_SECRET_ID` (KV v2, mount `VAULT_KV_MOUNT`, default `secret`); `infisical` uses `INFISICAL_CLIENT_ID`/`INFISICAL_CLIENT_SECRET`/`INFISICAL_PROJECT_ID` (Universal Auth, env `INFISICAL_ENVIRONMENT`). |

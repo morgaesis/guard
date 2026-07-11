@@ -59,6 +59,11 @@ fn parse_start(args: &[&str]) -> ServerCommands {
             api_policy,
             brokered_kubeconfig_out,
             api_rarity_escalation,
+            api_promotion,
+            no_api_promotion,
+            api_promotion_state,
+            api_promotion_min_approvals,
+            api_promotion_min_denials,
             service,
         }) => ServerCommands::Start {
             socket,
@@ -117,6 +122,11 @@ fn parse_start(args: &[&str]) -> ServerCommands {
             api_policy,
             brokered_kubeconfig_out,
             api_rarity_escalation,
+            api_promotion,
+            no_api_promotion,
+            api_promotion_state,
+            api_promotion_min_approvals,
+            api_promotion_min_denials,
             service,
         },
         _ => panic!("expected server start args"),
@@ -273,6 +283,79 @@ fn test_server_start_learn_allow_state_flag() {
         panic!("expected start");
     };
     assert_eq!(learn_allow_state, Some(PathBuf::from("/tmp/allow.yaml")));
+}
+
+fn resolved_api_promotion(args: &[&str]) -> bool {
+    let ServerCommands::Start {
+        api_promotion,
+        no_api_promotion,
+        ..
+    } = parse_start(args)
+    else {
+        panic!("expected start");
+    };
+    resolve_bool_flag(api_promotion, no_api_promotion, true)
+}
+
+#[test]
+fn test_server_start_api_promotion_defaults_true() {
+    assert!(resolved_api_promotion(&["guard", "server", "start"]));
+}
+
+#[test]
+fn test_server_start_api_promotion_can_be_disabled() {
+    assert!(!resolved_api_promotion(&[
+        "guard",
+        "server",
+        "start",
+        "--no-api-promotion"
+    ]));
+    assert!(!resolved_api_promotion(&[
+        "guard",
+        "server",
+        "start",
+        "--api-promotion=false"
+    ]));
+}
+
+#[test]
+fn test_server_start_api_promotion_threshold_flags() {
+    let ServerCommands::Start {
+        api_promotion_min_approvals,
+        api_promotion_min_denials,
+        ..
+    } = parse_start(&[
+        "guard",
+        "server",
+        "start",
+        "--api-promotion-min-approvals",
+        "7",
+        "--api-promotion-min-denials",
+        "4",
+    ])
+    else {
+        panic!("expected start");
+    };
+    assert_eq!(api_promotion_min_approvals, Some(7));
+    assert_eq!(api_promotion_min_denials, Some(4));
+}
+
+#[test]
+fn test_server_start_api_promotion_state_flag() {
+    let ServerCommands::Start {
+        api_promotion_state,
+        ..
+    } = parse_start(&[
+        "guard",
+        "server",
+        "start",
+        "--api-promotion-state",
+        "/tmp/api.yaml",
+    ])
+    else {
+        panic!("expected start");
+    };
+    assert_eq!(api_promotion_state, Some(PathBuf::from("/tmp/api.yaml")));
 }
 
 #[test]
