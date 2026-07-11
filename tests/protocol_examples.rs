@@ -3,10 +3,10 @@
 //!
 //! Each mock records every request that reaches it, so a denial can be
 //! asserted as "the upstream was never contacted", not just as a 403. The
-//! mocks are deliberately hostile where it matters: the GitHub secrets mock
+//! mocks deliberately overshare where it matters: the GitHub secrets mock
 //! returns plaintext `value` fields the real API would never send, proving the
 //! proxy redacts on its own classification rather than trusting the upstream
-//! shape. Adversarial requests that a normalizing HTTP client cannot express
+//! shape. Malformed requests that a normalizing HTTP client cannot express
 //! (dot-segment traversal) are sent over a raw TLS connection.
 
 use std::convert::Infallible;
@@ -320,7 +320,7 @@ async fn github_credential_writes_and_archives_never_reach_upstream() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn github_hostile_paths_are_rejected_before_upstream() {
+async fn github_paths_that_alter_on_forward_are_rejected_before_upstream() {
     let p = spawn_proxy(Arc::new(GithubProtocol), github_body, ALLOW_ALL).await;
 
     // Dot-segment traversal, raw and percent-encoded: a conforming client
@@ -355,7 +355,7 @@ async fn github_hostile_paths_are_rejected_before_upstream() {
         assert_eq!(resp.status(), 403, "{path} must be rejected");
     }
 
-    assert_eq!(p.hit_count(), 0, "no hostile path reached the upstream");
+    assert_eq!(p.hit_count(), 0, "no rejected path reached the upstream");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -594,7 +594,7 @@ rules:
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn vercel_hostile_paths_and_query_smuggling_are_contained() {
+async fn vercel_altering_paths_and_query_params_are_contained() {
     let p = spawn_proxy(Arc::new(VercelProtocol), vercel_body, VERCEL_READS).await;
 
     // Traversal out of the versioned tree (raw request line).
@@ -614,7 +614,7 @@ async fn vercel_hostile_paths_and_query_smuggling_are_contained() {
         .unwrap();
     assert_eq!(resp.status(), 403);
 
-    // Query-string smuggling: `decrypt=true` and a path-shaped value change
+    // Query-string parameters: `decrypt=true` and a path-shaped value change
     // neither the classification nor the redaction.
     let resp = p
         .client
