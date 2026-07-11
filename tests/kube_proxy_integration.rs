@@ -656,17 +656,24 @@ async fn proxy_allows_contained_delete_of_created_resource() {
         .build()
         .unwrap();
 
+    // This test's assertions depend on all four requests landing on the same
+    // proxy connection (provenance is connection-scoped by design). reqwest is
+    // built without the http2 feature, so these negotiate HTTP/1.1, and hyper
+    // only returns a connection to the client's pool once its response body has
+    // been fully read; leaving a body unread lets the next request race a
+    // background drain and, under a loaded scheduler, open a fresh connection
+    // instead of reusing the idle one. Reading each body with `.bytes()` before
+    // issuing the next request forces that handoff to complete synchronously.
+
     // A delete with no creation record is held for operator approval (strict).
     let resp = client
         .delete(format!("{base}/api/v1/namespaces/dev/pods/other-pod"))
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        resp.status(),
-        403,
-        "delete of an unrecorded resource stays held"
-    );
+    let status = resp.status();
+    resp.bytes().await.unwrap();
+    assert_eq!(status, 403, "delete of an unrecorded resource stays held");
 
     // Create a resource through the proxy; guard records its provenance.
     let resp = client
@@ -675,7 +682,9 @@ async fn proxy_allows_contained_delete_of_created_resource() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 201, "create forwarded");
+    let status = resp.status();
+    resp.bytes().await.unwrap();
+    assert_eq!(status, 201, "create forwarded");
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
         sink.calls.lock().unwrap().len(),
@@ -689,9 +698,10 @@ async fn proxy_allows_contained_delete_of_created_resource() {
         .send()
         .await
         .unwrap();
+    let status = resp.status();
+    resp.bytes().await.unwrap();
     assert_eq!(
-        resp.status(),
-        200,
+        status, 200,
         "delete of a guard-created resource is contained and allowed"
     );
 
