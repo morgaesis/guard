@@ -302,22 +302,29 @@ envelope: the proxy snapshots the prior object and plans a plain HTTP revert
 (restore the prior object, delete the created one, or recreate a faithfully
 snapshottable deleted one), armed in the provisional registry; `guard confirm`
 keeps the change and the sweeper otherwise executes the revert through the
-proxy's own upstream credential. `--api-rarity-escalation N` optionally holds a
-policy-allowed request for operator review while its shape (verb, resource, and
-namespace, ignoring the object name) has been seen fewer than N times this run,
-so a broad allow rule fails toward scrutiny on a rare or first-seen shape. See
+proxy's own upstream credential. `--api-rarity-escalation N` fails a broad allow
+rule toward scrutiny on a rare or first-seen shape (verb, resource, and
+namespace, ignoring the object name) that has been seen fewer than N times this
+run: with the evaluator attached the rare request is judged rather than
+fast-pathed, and otherwise it is held for the operator. See
 [`examples/api-policy.yaml`](examples/api-policy.yaml),
 [`examples/github-policy.yaml`](examples/github-policy.yaml), and
 [`examples/vercel-policy.yaml`](examples/vercel-policy.yaml).
 
 API request-shape learning is evidence-only and exact-tuple based: repeated
-evaluator allows or denies for the same `(protocol, verb, group, resource,
-subresource, namespace)` tuple, with object name excluded, populate a bounded
-YAML store. Learned denies reject the same tuple before another evaluator call;
-learned allows reuse the stored risk and reversibility, skip only non-rare
-requests, and still route through `decide_gate`, so the consequence floor is
-unchanged. Promotion and fast-path hits are operator-audit-only. Command
-denials may include the caller's own repeated-denial count once the deny-shape
+evaluator allows or denies for the same `(protocol, verb, group, version,
+resource, subresource, namespace, body-shape)` tuple, with the object name
+excluded and the body reduced to a value-free key skeleton, populate a bounded
+YAML store, so a learned rule matches only requests structurally identical to
+the ones the evaluator judged. Dry-run requests never feed it, an over-risk or
+irreversible allow permanently disqualifies its shape, and each learned verdict
+is invalidated when the evaluator model or the policy intent changes. Learned
+denies reject the same tuple before another evaluator call; learned allows reuse
+the stored risk and reversibility, skip only non-rare requests, and still route
+through `decide_gate`, so the consequence floor is unchanged. Promotion and
+fast-path hits are operator-audit-only, and a learned deny reads to the client
+exactly like a fresh evaluator denial. Command denials may include the caller's
+own repeated-denial count once the deny-shape
 threshold is reached, but clients never receive promotion state or a signal
 that an API shape skipped evaluation.
 
@@ -406,7 +413,7 @@ Unless marked "(client)", a variable is read by the daemon at startup; setting i
 | `GUARD_EXEC_AS_CALLER` | `false` | Run brokered children as the calling uid instead of the daemon account (Unix). |
 | `GUARD_API_PROXY` | (none) | API proxy listen address (loopback only); see the API proxy section. Companions: `GUARD_API_PROTOCOL`, `GUARD_API_UPSTREAM`, `GUARD_API_TOKEN_ENV`, `GUARD_API_TOKEN_FILE`, `GUARD_API_CA_OUT`, `GUARD_API_POLICY`. |
 | `GUARD_KUBE_PROXY` | (none) | Kubernetes API proxy listen address, shorthand for the kubernetes protocol. Companions: `GUARD_KUBE_PROXY_KUBECONFIG`, `GUARD_KUBE_CONTEXT`, `GUARD_API_POLICY`, `GUARD_BROKERED_KUBECONFIG_OUT`. |
-| `GUARD_API_RARITY_ESCALATION` | `0` | Escalate a policy-allowed proxy request to the operator hold queue while its shape (verb x resource x namespace) has been seen fewer than N times this run. 0 disables it; requires `--gate consequence`. Flag: `--api-rarity-escalation`. |
+| `GUARD_API_RARITY_ESCALATION` | `0` | Escalate a policy-allowed proxy request whose shape (verb x resource x namespace) has been seen fewer than N times this run: to the evaluator when one is attached, otherwise to the operator hold queue. 0 disables it; requires `--gate consequence`. Flag: `--api-rarity-escalation`. |
 | `GUARD_LOG_LEVEL` | `warn` | Log level (`error`, `warn`, `info`, `debug`, `trace`) when `RUST_LOG` is unset. Read by every guard process, daemon and client alike. |
 | `GUARD_MCP_TOKEN` | (none) | (client) Bearer token required by the HTTP MCP transport (`guard mcp serve --http`); `--http-token` overrides it. |
 

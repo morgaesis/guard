@@ -786,9 +786,10 @@ enum ServerCommands {
         child_env: Option<Vec<String>>,
 
         /// Front an HTTP API with a TLS-terminating, protocol-aware proxy on
-        /// ADDR (loopback only). Requires --api-protocol, --api-upstream, and a
-        /// bearer token supplied by --api-token-env or --api-token-file. Env:
-        /// GUARD_API_PROXY.
+        /// ADDR (loopback only). --api-protocol selects the protocol (default
+        /// kubernetes, which takes its upstream and credentials from
+        /// --kubeconfig); github and vercel require --api-upstream and a bearer
+        /// token via --api-token-env or --api-token-file. Env: GUARD_API_PROXY.
         #[arg(long = "api-proxy", value_name = "ADDR")]
         api_proxy: Option<String>,
 

@@ -20,9 +20,9 @@ ExecStart=/usr/local/bin/guard server start --socket /run/guard/guard.sock --sta
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
-# `guard grant-read` needs to run `setfacl`/`getfacl` against files and
+# The transparent read-grant path runs `setfacl`/`getfacl` against files and
 # directories owned by the operator, not by the guard user -- that is the
-# whole point of the feature (see DEPLOYMENT.md's "grant-read" section). Two
+# whole point of the feature (see DEPLOYMENT.md's read-grant section). Two
 # capabilities cover exactly that, without making guard root or setuid:
 #   CAP_FOWNER          bypasses the "caller must own the file" check that
 #                        chmod/setfacl otherwise enforce (capabilities(7):
