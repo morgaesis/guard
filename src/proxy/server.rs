@@ -643,6 +643,28 @@ impl ApiProxy {
                     // mutation. The validated snapshot is threaded to the forward
                     // so arming uses exactly what was checked (no third fetch).
                     GateOutcome::Contain if prepared.is_constructible() => {
+                        // Contain was chosen over Hold only because a revert was
+                        // promised, so the sink must actually be able to arm one
+                        // right now (capacity, and a safe revert store). If not,
+                        // hold rather than forward a write that cannot be
+                        // contained.
+                        let can_arm = match self.gate.get() {
+                            Some(gate) => gate.can_arm_revert().await,
+                            None => false,
+                        };
+                        if !can_arm {
+                            return self
+                                .route_hold_buffered(
+                                    parts,
+                                    body,
+                                    path,
+                                    query,
+                                    op,
+                                    "evaluator allowed a contained write but no auto-revert can be armed right now",
+                                    conn_id,
+                                )
+                                .await;
+                        }
                         let snapshot = if self.protocol.wants_prior_snapshot(op) {
                             match self.fetch_validated_snapshot(op, path).await {
                                 Some(s) => Some(Some(s)),

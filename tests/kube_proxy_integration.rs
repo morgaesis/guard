@@ -1560,11 +1560,20 @@ rules:
     let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (mock_base, _) = spawn_flaky_snapshot_mock(gets.clone(), writes.clone()).await;
     // Recoverable + mid risk: decide_gate returns Contain only because a revert
-    // is promised. The forward-time snapshot re-fetch 404s, so containment
-    // cannot be re-established.
+    // is promised. A gate is attached (so the write is tracked and the marker is
+    // constructible at judge time), can_arm_revert is true, but the forward-time
+    // snapshot re-fetch 404s, so containment cannot be re-established and the
+    // write must be held (RecordingSink's default hold denies → 403).
     let judge = RecordingJudge::new(vec![judge_allow(Some(5), Some(Reversibility::Recoverable))]);
-    // No gate/queue attached, so a fail-closed hold surfaces as a 403.
-    let (base, client) = start_proxy_with(mock_base, policy, Some(Arc::new(judge)), None, 0).await;
+    let sink = RecordingSink::default();
+    let (base, client) = start_proxy_with(
+        mock_base,
+        policy,
+        Some(Arc::new(judge)),
+        Some(Arc::new(sink)),
+        0,
+    )
+    .await;
     let resp = client
         .patch(format!(
             "{base}/apis/apps/v1/namespaces/dev/deployments/api"
@@ -1585,6 +1594,74 @@ rules:
         0,
         "the uncontained mutation must never reach the upstream"
     );
+}
+
+/// A gate that can never arm a revert (e.g. capacity exhausted, or an unsafe
+/// revert directory), and denies any hold.
+#[derive(Default)]
+struct CannotArmSink {
+    writes_armed: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl guard::proxy::GateSink for CannotArmSink {
+    async fn can_arm_revert(&self) -> bool {
+        false
+    }
+    async fn arm_revert(&self, _mutation: guard::proxy::ApiMutation) -> Option<String> {
+        self.writes_armed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        None
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_evaluate_holds_when_sink_cannot_arm() {
+    let policy = r#"
+default: deny
+rules:
+  - verbs: [patch]
+    resources: [deployments]
+    namespaces: [dev]
+    action: evaluate
+"#;
+    let (mock_base, gets) = spawn_counting_snapshot_mock().await;
+    let judge = RecordingJudge::new(vec![judge_allow(Some(5), Some(Reversibility::Recoverable))]);
+    let armed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sink = CannotArmSink {
+        writes_armed: armed.clone(),
+    };
+    let (base, client) = start_proxy_with(
+        mock_base,
+        policy,
+        Some(Arc::new(judge)),
+        Some(Arc::new(sink)),
+        0,
+    )
+    .await;
+    let resp = client
+        .patch(format!(
+            "{base}/apis/apps/v1/namespaces/dev/deployments/api"
+        ))
+        .header("content-type", "application/merge-patch+json")
+        .body(r#"{"spec":{"replicas":9}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "a contained write must be held when the sink cannot arm a revert"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        armed.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no revert arming should be attempted for a held write"
+    );
+    // Only the pre-judge constructibility GET ran; no forward-time fetch and no
+    // write, since the request was held before forwarding.
+    assert_eq!(gets.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 async fn spawn_flaky_snapshot_mock(

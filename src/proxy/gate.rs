@@ -55,6 +55,18 @@ pub trait GateSink: Send + Sync {
     /// the mutation is already live; `None` only means it will not auto-revert.
     async fn arm_revert(&self, mutation: ApiMutation) -> Option<String>;
 
+    /// Whether the sink could arm a revert right now (capacity available, and a
+    /// body-bearing revert can be persisted safely). The proxy consults this on
+    /// the evaluate path before forwarding a write it would only forward
+    /// *because* a revert was promised, so it can hold rather than forward a
+    /// write it cannot contain. Default: assume it can, for sinks that always
+    /// accept a revert. Best-effort: a race between this check and `arm_revert`
+    /// is possible, but this closes the common deterministic gaps (no capacity,
+    /// no safe revert directory).
+    async fn can_arm_revert(&self) -> bool {
+        true
+    }
+
     /// Resolve an auto-revert armed under `handle` because the object it would
     /// undo is already gone by the workload's own action — a resource guard
     /// created earlier in the session that the workload has now deleted (e.g. a

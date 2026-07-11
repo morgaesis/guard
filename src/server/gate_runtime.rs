@@ -309,6 +309,19 @@ pub(super) fn revert_dir_is_owner_only(dir: &std::path::Path) -> bool {
 
 #[async_trait::async_trait]
 impl guard::proxy::GateSink for DaemonGateSink {
+    async fn can_arm_revert(&self) -> bool {
+        // A body-bearing revert cannot be persisted into a directory that is not
+        // exclusively the daemon's, and no revert can be armed when the
+        // provisional queue is full. The evaluate path consults this before
+        // forwarding a write it would only forward because a revert was
+        // promised, so it holds rather than forward an uncontainable write.
+        let principal = Some(self.config.daemon_principal.clone());
+        self.snapshot_dir_safe
+            && gate_capacity_reason(&self.config, principal.as_ref())
+                .await
+                .is_none()
+    }
+
     async fn arm_revert(&self, mutation: guard::proxy::ApiMutation) -> Option<String> {
         let principal = Some(self.config.daemon_principal.clone());
         if let Some(reason) = gate_capacity_reason(&self.config, principal.as_ref()).await {

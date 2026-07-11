@@ -327,20 +327,38 @@ impl Server {
             // runs under `--gate consequence`. Without it the proxy still gates
             // (allow/deny/hold/redact) but forwards recoverable writes unwrapped.
             if self.config.gate.is_on() {
-                let snapshot_dir = self
+                // With a state DB the revert dir lives beside it (systemd
+                // StateDirectory, 0700). Without one, provisionals are
+                // process-local and not recovered across restart, so a fresh
+                // private directory (unpredictable name, created owner-only) is
+                // both sufficient and immune to a pre-created fixed-name dir a
+                // local attacker could own.
+                let snapshot_dir = match self
                     .config
                     .state_db_path
                     .as_ref()
                     .and_then(|p| p.parent())
                     .map(|d| d.join("api-proxy-reverts"))
-                    .unwrap_or_else(|| std::env::temp_dir().join("guard-api-proxy-reverts"));
-                if let Err(e) = std::fs::create_dir_all(&snapshot_dir) {
-                    tracing::warn!(
-                        "could not create api-proxy revert dir {}: {}",
-                        snapshot_dir.display(),
-                        e
-                    );
-                }
+                {
+                    Some(dir) => {
+                        if let Err(e) = std::fs::create_dir_all(&dir) {
+                            tracing::warn!(
+                                "could not create api-proxy revert dir {}: {}",
+                                dir.display(),
+                                e
+                            );
+                        }
+                        dir
+                    }
+                    None => tempfile::Builder::new()
+                        .prefix("guard-api-proxy-reverts-")
+                        .tempdir()
+                        .map(|d| d.keep())
+                        .unwrap_or_else(|e| {
+                            tracing::warn!("could not create private api-proxy revert dir: {}", e);
+                            std::env::temp_dir().join("guard-api-proxy-reverts")
+                        }),
+                };
                 // Revert bodies can carry secret material, so the directory must
                 // be owner-only. Under systemd this sits under StateDirectory
                 // (0700, daemon-owned); a bare-invocation fallback under the
