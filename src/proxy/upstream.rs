@@ -1,9 +1,11 @@
-//! Upstream connection to the real apiserver, built from the operator's
-//! kubeconfig. The daemon holds these credentials; the brokered config the agent
-//! receives carries none, so the proxy is the sole path to the cluster. Supports
-//! bearer-token and client-certificate auth. `exec` and `auth-provider`
-//! credential plugins are rejected: the proxy cannot run them, and a brokered
-//! client that could would reach the apiserver around the gate.
+//! Upstream connection to the real API. For Kubernetes it is built from the
+//! operator's kubeconfig, resolving a single auth method by precedence
+//! (bearer-token, then client-certificate, then HTTP basic); `exec` and
+//! `auth-provider` credential plugins are rejected because the proxy cannot run
+//! them and a brokered client that could would reach the apiserver around the
+//! gate. Other protocols build from a base URL plus an optional bearer token.
+//! The daemon holds these credentials; the brokered config the agent receives
+//! carries none, so the proxy is the sole path to the upstream.
 
 use std::path::Path;
 

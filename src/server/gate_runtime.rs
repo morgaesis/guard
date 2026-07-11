@@ -198,7 +198,8 @@ pub(super) fn is_api_proxy_sentinel(binary: &str) -> bool {
 
 /// Write a file readable and writable only by the daemon account. On Unix the
 /// mode is set atomically at create so the secret-bearing body is never briefly
-/// world-readable; other platforms fall back to a plain write.
+/// world-readable, and `O_NOFOLLOW` refuses to follow a symlink planted at the
+/// target path; other platforms fall back to a plain write.
 async fn write_owner_only(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -208,6 +209,7 @@ async fn write_owner_only(path: &std::path::Path, bytes: &[u8]) -> std::io::Resu
             .create(true)
             .truncate(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(path)
             .await?;
         file.write_all(bytes).await?;
@@ -281,7 +283,28 @@ pub(super) struct DaemonGateSink {
     pub(super) config: ServerConfig,
     pub(super) protocol: String,
     pub(super) snapshot_dir: PathBuf,
+    /// Whether `snapshot_dir` is exclusively the daemon's. When false, a
+    /// body-bearing revert is not armed rather than risk writing a
+    /// secret-bearing snapshot into a directory another local user controls.
+    pub(super) snapshot_dir_safe: bool,
     pub(super) window_secs: u64,
+}
+
+/// Whether a revert directory is a real directory owned by the current process
+/// with no group/other access, so a secret-bearing body written into it cannot
+/// be read or substituted by another local user.
+#[cfg(unix)]
+pub(super) fn revert_dir_is_owner_only(dir: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) => {
+            meta.is_dir()
+                && meta.uid() == unsafe { libc::geteuid() }
+                && meta.permissions().mode() & 0o077 == 0
+        }
+        Err(_) => false,
+    }
 }
 
 #[async_trait::async_trait]
@@ -295,6 +318,12 @@ impl guard::proxy::GateSink for DaemonGateSink {
         let handle = new_handle();
         let now = now_unix();
         let body_file = if let Some(body) = &mutation.revert.body {
+            if !self.snapshot_dir_safe {
+                tracing::error!(
+                    "api-proxy: refusing to arm a body-bearing revert because the revert directory is not owner-only; the change is live but will not auto-revert"
+                );
+                return None;
+            }
             let file = self.snapshot_dir.join(format!("api-revert-{handle}.body"));
             // The snapshot can carry secret material (e.g. a Secret captured
             // before a delete-restore), so the file is owner-only.

@@ -1524,6 +1524,99 @@ async fn spawn_counting_snapshot_mock() -> (String, Arc<std::sync::atomic::Atomi
     (format!("http://{addr}"), gets)
 }
 
+/// Snapshot mock whose GET succeeds once (the pre-judge constructibility check)
+/// then fails (the forward-time re-fetch), while writes always succeed. Models a
+/// mutation of the prior object during the evaluator round trip.
+async fn flaky_snapshot_handler(
+    req: Request<Incoming>,
+    gets: Arc<std::sync::atomic::AtomicUsize>,
+    writes: Arc<std::sync::atomic::AtomicUsize>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    if req.method() == hyper::Method::GET {
+        let n = gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if n >= 1 {
+            return Ok(Response::builder()
+                .status(404)
+                .body(Full::new(Bytes::from("gone")))
+                .unwrap());
+        }
+        return write_mock_handler(req).await;
+    }
+    writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    write_mock_handler(req).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_evaluate_holds_when_contained_revert_cannot_be_reestablished() {
+    let policy = r#"
+default: deny
+rules:
+  - verbs: [patch]
+    resources: [deployments]
+    namespaces: [dev]
+    action: evaluate
+"#;
+    let gets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (mock_base, _) = spawn_flaky_snapshot_mock(gets.clone(), writes.clone()).await;
+    // Recoverable + mid risk: decide_gate returns Contain only because a revert
+    // is promised. The forward-time snapshot re-fetch 404s, so containment
+    // cannot be re-established.
+    let judge = RecordingJudge::new(vec![judge_allow(Some(5), Some(Reversibility::Recoverable))]);
+    // No gate/queue attached, so a fail-closed hold surfaces as a 403.
+    let (base, client) = start_proxy_with(mock_base, policy, Some(Arc::new(judge)), None, 0).await;
+    let resp = client
+        .patch(format!(
+            "{base}/apis/apps/v1/namespaces/dev/deployments/api"
+        ))
+        .header("content-type", "application/merge-patch+json")
+        .body(r#"{"spec":{"replicas":9}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "a contained write whose revert cannot be re-established must be held, not forwarded"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        writes.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the uncontained mutation must never reach the upstream"
+    );
+}
+
+async fn spawn_flaky_snapshot_mock(
+    gets: Arc<std::sync::atomic::AtomicUsize>,
+    writes: Arc<std::sync::atomic::AtomicUsize>,
+) -> (String, ()) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let gets = gets.clone();
+            let writes = writes.clone();
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        io,
+                        service_fn(move |req| {
+                            flaky_snapshot_handler(req, gets.clone(), writes.clone())
+                        }),
+                    )
+                    .await;
+            });
+        }
+    });
+    (format!("http://{addr}"), ())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proxy_evaluate_reuses_prior_snapshot_for_arming() {
     let policy = r#"

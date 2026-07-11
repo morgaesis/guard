@@ -512,7 +512,11 @@ async fn api_revert_executes_through_registered_proxy_upstream() {
         "daemon credential must ride the revert: {raw}"
     );
     assert!(raw.contains(r#"{"name":"bug","color":"d73a4a"}"#), "{raw}");
-    std::fs::remove_file(&body_file).ok();
+    // The secret-bearing snapshot body is removed once the revert is terminal.
+    assert!(
+        !body_file.exists(),
+        "revert body file must be unlinked after a terminal revert"
+    );
 }
 
 /// A recoverable command whose free-form `--revert` cannot be affirmed is
@@ -687,6 +691,7 @@ async fn kube_proxy_hold_routes_through_approval_queue() {
         config: cfg.clone(),
         protocol: "kubernetes".to_string(),
         snapshot_dir: std::env::temp_dir(),
+        snapshot_dir_safe: true,
         window_secs: 60,
     });
 

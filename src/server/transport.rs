@@ -29,6 +29,8 @@ use tokio::sync::RwLock;
 
 use super::admin::handle_admin_request;
 use super::execute::{execute_command, execute_command_streaming};
+#[cfg(unix)]
+use super::gate_runtime::revert_dir_is_owner_only;
 use super::gate_runtime::{gating_sweeper, is_api_proxy_sentinel, now_unix, DaemonGateSink};
 #[cfg(unix)]
 use super::grants::{delete_read_grant_row, revoke_read_grant_acls};
@@ -339,20 +341,34 @@ impl Server {
                         e
                     );
                 }
-                // Revert bodies can carry secret material, so the directory is
-                // owner-only.
+                // Revert bodies can carry secret material, so the directory must
+                // be owner-only. Under systemd this sits under StateDirectory
+                // (0700, daemon-owned); a bare-invocation fallback under the
+                // shared temp dir could be pre-created by another local user, so
+                // verify ownership and mode and refuse to arm body-bearing
+                // reverts if the directory is not exclusively the daemon's.
                 #[cfg(unix)]
-                {
+                let snapshot_dir_safe = {
                     use std::os::unix::fs::PermissionsExt;
                     let _ = std::fs::set_permissions(
                         &snapshot_dir,
                         std::fs::Permissions::from_mode(0o700),
+                    );
+                    revert_dir_is_owner_only(&snapshot_dir)
+                };
+                #[cfg(not(unix))]
+                let snapshot_dir_safe = true;
+                if !snapshot_dir_safe {
+                    tracing::error!(
+                        "[AUDIT] API_REVERT_DIR_UNSAFE path=\"{}\" (not owner-only; body-bearing auto-reverts are disabled)",
+                        snapshot_dir.display()
                     );
                 }
                 proxy.attach_gate(Arc::new(DaemonGateSink {
                     config: self.config.clone(),
                     protocol: proxy.protocol_name().to_string(),
                     snapshot_dir,
+                    snapshot_dir_safe,
                     window_secs: DEFAULT_CONFIRM_WITHIN_SECS,
                 }));
             } else {
