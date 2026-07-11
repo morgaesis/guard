@@ -153,9 +153,12 @@ impl RarityTracker {
     }
 }
 
+/// The outcome of pre-judging revert feasibility: which revert (if any) the
+/// proxy could construct for this operation. The prior object is not carried
+/// forward; the forward path re-fetches it so the armed revert reflects state
+/// at write time, not at judge time.
 struct PreparedRevert {
     marker: RevertConstructible,
-    snapshot: Option<Vec<u8>>,
 }
 
 /// Identity of a resource the proxy tracks as guard-created, for delete
@@ -583,22 +586,25 @@ impl ApiProxy {
                 )
             }
             ApiJudgeVerdict::Error(error) => {
+                // Deny on an evaluator error, matching the command path. An
+                // evaluator outage would otherwise park a buffered request per
+                // failed call in the operator queue with no decision an operator
+                // could usefully make, so denying fails closed without flooding
+                // the queue.
                 tracing::info!(
                     target: "guard::apiproxy",
                     "[AUDIT] EVALUATE decision=error risk=none reversibility=none reason={} label={}",
                     error,
                     label
                 );
-                self.route_hold_buffered(
-                    parts,
-                    body,
-                    path,
-                    query,
-                    op,
-                    &format!("api evaluator error: {error}"),
-                    conn_id,
+                self.status_resp(
+                    StatusCode::FORBIDDEN,
+                    &format!(
+                        "guard api-proxy ({}) denied {label}: evaluator error: {error}",
+                        self.protocol.name()
+                    ),
+                    "Forbidden",
                 )
-                .await
             }
             ApiJudgeVerdict::Allow {
                 reason,
@@ -613,54 +619,53 @@ impl ApiProxy {
                     reason,
                     label
                 );
-                match decide_gate(
+                let outcome = decide_gate(
                     reversibility,
                     risk,
                     prepared.marker.is_constructible(),
                     false,
-                ) {
-                    GateOutcome::ExecuteNow => {
-                        let redact = self.protocol.redactable_read(op);
-                        tracing::info!(target: "guard::apiproxy", "ALLOW {} (evaluator){}", label, if redact { " (redacting)" } else { "" });
-                        self.forward_buffered(
-                            parts,
-                            body,
-                            path,
-                            query,
-                            redact,
-                            Some(op.clone()),
-                            conn_id,
-                            Some(prepared.snapshot),
-                        )
-                        .await
-                    }
-                    GateOutcome::Contain if prepared.marker.is_constructible() => {
-                        let redact = self.protocol.redactable_read(op);
-                        tracing::info!(target: "guard::apiproxy", "ALLOW {} (evaluator contained){}", label, if redact { " (redacting)" } else { "" });
-                        self.forward_buffered(
-                            parts,
-                            body,
-                            path,
-                            query,
-                            redact,
-                            Some(op.clone()),
-                            conn_id,
-                            Some(prepared.snapshot),
-                        )
-                        .await
-                    }
-                    GateOutcome::Contain | GateOutcome::Hold => {
-                        self.route_hold_buffered(
-                            parts,
-                            body,
-                            path,
-                            query,
-                            op,
-                            &format!("api evaluator allowed but consequence gate held: {reason}"),
-                            conn_id,
-                        )
-                        .await
-                    }
+                );
+                // ExecuteNow forwards with no envelope; Contain forwards inside
+                // one, but only when a revert is genuinely constructible (the
+                // gate can otherwise return Contain on risk alone). Both re-fetch
+                // the prior object at forward time rather than reusing the
+                // pre-judge snapshot, so a mutation during the evaluator round
+                // trip cannot make the armed revert restore stale state.
+                let forward = matches!(outcome, GateOutcome::ExecuteNow)
+                    || (matches!(outcome, GateOutcome::Contain)
+                        && prepared.marker.is_constructible());
+                if forward {
+                    let redact = self.protocol.redactable_read(op);
+                    let contained = matches!(outcome, GateOutcome::Contain);
+                    tracing::info!(
+                        target: "guard::apiproxy",
+                        "ALLOW {} (evaluator{}){}",
+                        label,
+                        if contained { " contained" } else { "" },
+                        if redact { " (redacting)" } else { "" }
+                    );
+                    self.forward_buffered(
+                        parts,
+                        body,
+                        path,
+                        query,
+                        redact,
+                        Some(op.clone()),
+                        conn_id,
+                        None,
+                    )
+                    .await
+                } else {
+                    self.route_hold_buffered(
+                        parts,
+                        body,
+                        path,
+                        query,
+                        op,
+                        &format!("api evaluator allowed but consequence gate held: {reason}"),
+                        conn_id,
+                    )
+                    .await
                 }
             }
         }
@@ -1055,28 +1060,31 @@ impl ApiProxy {
         if !track_write {
             return PreparedRevert {
                 marker: RevertConstructible::None,
-                snapshot: None,
             };
         }
         if self.protocol.wants_prior_snapshot(op) {
             let Some(snapshot) = self.fetch_prior_object(path).await else {
                 return PreparedRevert {
                     marker: RevertConstructible::None,
-                    snapshot: None,
                 };
             };
+            // The marker is an input the evaluator trusts, so it must not claim a
+            // revert the protocol cannot actually build from this snapshot (e.g.
+            // an encrypted value the sanitizer drops). Validate by planning the
+            // snapshot-based revert; the response body is unused for these verbs.
+            if self.protocol.plan_revert(op, Some(&snapshot), &[]).is_err() {
+                return PreparedRevert {
+                    marker: RevertConstructible::None,
+                };
+            }
             let marker = match op.verb {
                 Verb::Delete => RevertConstructible::RecreateFromSnapshot,
                 _ => RevertConstructible::RestorePriorState,
             };
-            return PreparedRevert {
-                marker,
-                snapshot: Some(snapshot),
-            };
+            return PreparedRevert { marker };
         }
         PreparedRevert {
             marker: RevertConstructible::DeleteCreated,
-            snapshot: None,
         }
     }
 

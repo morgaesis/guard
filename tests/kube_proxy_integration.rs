@@ -1257,7 +1257,7 @@ rules:
     assert_eq!(
         resp.status(),
         403,
-        "judge error routes to hold and fails closed"
+        "judge error denies and fails closed, matching the command path"
     );
 
     let (base, client) = start_proxy_with(spawn_mock_upstream().await, policy, None, None, 0).await;
@@ -1556,9 +1556,13 @@ rules:
         .unwrap();
     assert_eq!(resp.status(), 200);
     tokio::time::sleep(Duration::from_millis(100)).await;
+    // The prior object is fetched twice on the evaluate path: once before the
+    // judge to decide whether a revert is constructible (an input to the
+    // verdict), and again at forward time so the armed revert restores state as
+    // it was at the write, not as it was before the evaluator round trip.
     assert_eq!(
         gets.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "evaluate path fetches the prior object once and reuses it for arming"
+        2,
+        "evaluate path validates constructibility, then re-fetches fresh for arming"
     );
 }

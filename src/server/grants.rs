@@ -21,10 +21,11 @@ use super::wire::{CallerIdentity, ExecuteResult};
 use super::ServerConfig;
 
 /// Label used for the binary field of a read-grant request's audit records, so
-/// `[AUDIT] ALLOWED`/`DENIED` grep patterns and session allow/deny globs have a
-/// stable command-shaped name for automatic read grants.
+/// `[AUDIT] ALLOWED`/`DENIED` grep patterns and session allow/deny globs match a
+/// read grant under a stable name. Kept as `grant-read` so an operator session
+/// grant that allow-lists this shape keeps matching the transparent path.
 #[cfg(unix)]
-const AUTO_READ_GRANT_LABEL: &str = "auto-read-grant";
+const AUTO_READ_GRANT_LABEL: &str = "grant-read";
 
 #[cfg(unix)]
 fn grant_read_audit_args(path: &str, ttl: u64) -> Vec<String> {

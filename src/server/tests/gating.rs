@@ -375,7 +375,7 @@ async fn contain_then_deadline_triggers_sweeper_autorevert() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn api_revert_without_running_proxy_marks_failed() {
+async fn api_revert_without_running_proxy_defers_to_operator() {
     let (cfg, _operator, _agent) = gating_config(7014, 1000);
     let handle = "api-missing-proxy".to_string();
     let now = now_unix();
@@ -406,16 +406,19 @@ async fn api_revert_without_running_proxy_marks_failed() {
     };
     cfg.provisional.write().await.insert(provisional.clone());
 
+    // A missing proxy is recoverable: the change is still live, so the revert
+    // is deferred to the operator (NeedsOperatorDecision) rather than burned as
+    // a terminal RevertFailed.
     let (message, exit) = finish_revert(&cfg, &provisional, &CallerIdentity::Unknown, "auto").await;
-    assert!(message.contains("REVERT FAILED"));
+    assert!(message.contains("deferred"), "got: {message}");
     assert_eq!(exit, None);
     let row = cfg.provisional.read().await.get(&handle).cloned().unwrap();
-    assert_eq!(row.status, ProvisionalStatus::RevertFailed);
+    assert_eq!(row.status, ProvisionalStatus::NeedsOperatorDecision);
     assert!(row
         .revert_detail
         .as_deref()
         .unwrap()
-        .contains("missing running api-proxy for protocol 'github'"));
+        .contains("no running api-proxy for protocol 'github'"));
 }
 
 /// The sweeper executes a due API revert as an HTTP request through the

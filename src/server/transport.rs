@@ -29,7 +29,7 @@ use tokio::sync::RwLock;
 
 use super::admin::handle_admin_request;
 use super::execute::{execute_command, execute_command_streaming};
-use super::gate_runtime::{gating_sweeper, now_unix, DaemonGateSink, API_PROXY_SENTINEL_BINARY};
+use super::gate_runtime::{gating_sweeper, is_api_proxy_sentinel, now_unix, DaemonGateSink};
 #[cfg(unix)]
 use super::grants::{delete_read_grant_row, revoke_read_grant_acls};
 use super::wire::{
@@ -194,7 +194,7 @@ impl Server {
                     .into_iter()
                     .filter(|a| {
                         a.status == ApprovalStatus::Pending
-                            && a.snapshot.binary == API_PROXY_SENTINEL_BINARY
+                            && is_api_proxy_sentinel(&a.snapshot.binary)
                             && matches!(&a.snapshot.principal, Some(p) if self.config.daemon_principal.eq_ci(p))
                     })
                     .map(|a| a.handle)
@@ -337,6 +337,16 @@ impl Server {
                         "could not create api-proxy revert dir {}: {}",
                         snapshot_dir.display(),
                         e
+                    );
+                }
+                // Revert bodies can carry secret material, so the directory is
+                // owner-only.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(
+                        &snapshot_dir,
+                        std::fs::Permissions::from_mode(0o700),
                     );
                 }
                 proxy.attach_gate(Arc::new(DaemonGateSink {

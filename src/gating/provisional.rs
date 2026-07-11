@@ -298,6 +298,17 @@ impl ProvisionalRegistry {
         }
     }
 
+    /// Route a revert that could not run for a recoverable reason (for example
+    /// the proxy that would execute an API revert is not currently running) to
+    /// `NeedsOperatorDecision` rather than terminal `RevertFailed`, so the live
+    /// mutation is surfaced to the operator instead of silently abandoned.
+    pub fn set_needs_operator_decision(&mut self, handle: &str, detail: String) {
+        if let Some(p) = self.items.get_mut(handle) {
+            p.status = ProvisionalStatus::NeedsOperatorDecision;
+            p.revert_detail = Some(detail);
+        }
+    }
+
     /// Drop terminal rows older than `retention_secs` so the table stays bounded.
     /// Outstanding rows are never pruned.
     pub fn prune_terminal(&mut self, now: u64, retention_secs: u64) -> Vec<String> {

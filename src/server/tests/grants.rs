@@ -270,7 +270,7 @@ async fn read_grant_retry_grants_and_reruns_after_permission_denied() {
     cfg.sessions.write().await.grant(
         "sess-retry".to_string(),
         SessionGrant {
-            allow: vec!["auto-read-grant*".to_string()],
+            allow: vec!["grant-read*".to_string()],
             deny: Vec::new(),
             allow_exact: Vec::new(),
             deny_exact: Vec::new(),

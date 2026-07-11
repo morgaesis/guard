@@ -185,6 +185,50 @@ pub(super) async fn forget_proxy_provenance(config: &ServerConfig, handle: &str)
 /// the API request parked in the proxy instead of spawning a process.
 pub(super) const API_PROXY_SENTINEL_BINARY: &str = "(api-proxy)";
 
+/// The sentinel this proxy used before it was generalized past Kubernetes.
+/// Recognized on read so rows persisted by an older binary are still identified
+/// as proxy-originated across an upgrade.
+pub(super) const LEGACY_KUBE_PROXY_SENTINEL_BINARY: &str = "(kube-proxy)";
+
+/// Whether a persisted row's binary marks it as API-proxy-originated, matching
+/// both the current and the pre-generalization sentinel.
+pub(super) fn is_api_proxy_sentinel(binary: &str) -> bool {
+    binary == API_PROXY_SENTINEL_BINARY || binary == LEGACY_KUBE_PROXY_SENTINEL_BINARY
+}
+
+/// Write a file readable and writable only by the daemon account. On Unix the
+/// mode is set atomically at create so the secret-bearing body is never briefly
+/// world-readable; other platforms fall back to a plain write.
+async fn write_owner_only(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .await?;
+        file.write_all(bytes).await?;
+        file.flush().await
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::fs::write(path, bytes).await
+    }
+}
+
+/// Remove a revert's persisted body file once its provisional reaches a terminal
+/// state, so secret-bearing snapshots do not accumulate on disk.
+pub(super) fn remove_revert_body(p: &Provisional) {
+    if let Some(api) = &p.api_revert {
+        if let Some(body_file) = &api.body_file {
+            let _ = std::fs::remove_file(body_file);
+        }
+    }
+}
+
 /// Retires an API-proxy hold whose parked request vanished (the brokered
 /// client disconnected while waiting), so the queue never offers the operator
 /// an approval that releases nothing. Disarmed on a normal decision.
@@ -252,7 +296,9 @@ impl guard::proxy::GateSink for DaemonGateSink {
         let now = now_unix();
         let body_file = if let Some(body) = &mutation.revert.body {
             let file = self.snapshot_dir.join(format!("api-revert-{handle}.body"));
-            if let Err(e) = tokio::fs::write(&file, body).await {
+            // The snapshot can carry secret material (e.g. a Secret captured
+            // before a delete-restore), so the file is owner-only.
+            if let Err(e) = write_owner_only(&file, body).await {
                 tracing::error!(
                     "api-proxy: failed to write revert body {}: {}",
                     file.display(),
@@ -276,12 +322,10 @@ impl guard::proxy::GateSink for DaemonGateSink {
             principal,
             binary: API_PROXY_SENTINEL_BINARY.to_string(),
             args: vec![mutation.label.clone()],
+            // An API revert is executed from `api_revert`, not the command-shaped
+            // revert_binary/revert_args of a shell provisional.
             revert_binary: String::new(),
-            revert_args: vec![
-                api_revert.protocol.clone(),
-                api_revert.method.clone(),
-                api_revert.path.clone(),
-            ],
+            revert_args: Vec::new(),
             reason: mutation.label,
             created_unix: now,
             deadline_unix: now.saturating_add(self.window_secs),
@@ -1236,7 +1280,7 @@ async fn run_api_revert(
     config: &ServerConfig,
     p: &Provisional,
     api: &ApiRevertPlan,
-) -> Result<(), String> {
+) -> Result<(), RevertError> {
     let Some(proxy) = config
         .protocol_registry
         .read()
@@ -1244,24 +1288,24 @@ async fn run_api_revert(
         .get(&api.protocol)
         .cloned()
     else {
-        return Err(format!(
-            "missing running api-proxy for protocol '{}'",
+        // The mutation is still live; the proxy that would carry the revert is
+        // just not running now (a restart without the flag, a protocol change).
+        // Surface it for an operator decision rather than burning the revert.
+        return Err(RevertError::Retryable(format!(
+            "no running api-proxy for protocol '{}'; the change is still live and needs an operator decision",
             api.protocol
-        ));
+        )));
     };
     let body = if let Some(path) = &api.body_file {
-        Some(
-            tokio::fs::read(path)
-                .await
-                .map_err(|e| format!("read api revert body {}: {e}", path.display()))?,
-        )
+        Some(tokio::fs::read(path).await.map_err(|e| {
+            RevertError::Failed(format!("read api revert body {}: {e}", path.display()))
+        })?)
     } else {
         None
     };
-    let method: reqwest::Method = api
-        .method
-        .parse()
-        .map_err(|e| format!("invalid api revert method '{}': {e}", api.method))?;
+    let method: reqwest::Method = api.method.parse().map_err(|e| {
+        RevertError::Failed(format!("invalid api revert method '{}': {e}", api.method))
+    })?;
     let upstream = proxy.upstream();
     let url = format!("{}{}", upstream.base(), api.path);
     let mut rb = upstream
@@ -1278,16 +1322,24 @@ async fn run_api_revert(
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body);
     }
-    let resp = rb
-        .send()
-        .await
-        .map_err(|e| format!("send api revert for provisional {}: {e}", p.handle))?;
+    let resp = rb.send().await.map_err(|e| {
+        RevertError::Failed(format!("send api revert for provisional {}: {e}", p.handle))
+    })?;
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        return Err(format!("api revert returned HTTP {status}: {text}"));
+        return Err(RevertError::Failed(format!(
+            "api revert returned HTTP {status}: {text}"
+        )));
     }
     Ok(())
+}
+
+/// Why an API revert did not complete. A retryable failure leaves the live
+/// mutation for an operator decision; a hard failure is terminal.
+enum RevertError {
+    Retryable(String),
+    Failed(String),
 }
 
 /// Run a claimed (`Reverting`) provisional's revert and record the outcome.
@@ -1308,7 +1360,31 @@ pub(super) async fn finish_revert(
         .await
         {
             Ok(Ok(())) => (true, Some(0), None),
-            Ok(Err(reason)) => (false, None, Some(reason)),
+            // Recoverable (no proxy for the protocol right now): route to the
+            // operator instead of terminal-failing, so a restart or flag change
+            // does not silently strand a live mutation.
+            Ok(Err(RevertError::Retryable(detail))) => {
+                let updated = {
+                    let mut reg = config.provisional.write().await;
+                    reg.set_needs_operator_decision(&p.handle, detail.clone());
+                    reg.get(&p.handle).cloned()
+                };
+                if let Some(u) = &updated {
+                    persist_provisional(config, u).await;
+                }
+                tracing::error!(
+                    "[AUDIT] REVERT_DEFERRED handle={} caller={} kind={} reason={}",
+                    p.handle,
+                    caller,
+                    kind,
+                    detail
+                );
+                return (
+                    format!("provisional {} revert deferred: {}", p.handle, detail),
+                    None,
+                );
+            }
+            Ok(Err(RevertError::Failed(reason))) => (false, None, Some(reason)),
             Err(_) => (
                 false,
                 None,
@@ -1361,9 +1437,12 @@ pub(super) async fn finish_revert(
     if let Some(u) = &updated {
         persist_provisional(config, u).await;
     }
-    // The create-revert is terminal (whether it succeeded or failed); drop any
-    // api-proxy provenance tied to it so it cannot outlive its window.
+    // The revert is terminal (whether it succeeded or failed); drop any
+    // api-proxy provenance tied to it so it cannot outlive its window, and
+    // remove the persisted revert body so secret-bearing snapshots do not
+    // accumulate on disk.
     forget_proxy_provenance(config, &p.handle).await;
+    remove_revert_body(p);
     if status_ok {
         tracing::info!(
             "[AUDIT] REVERT handle={} caller={} kind={} exit={:?}",

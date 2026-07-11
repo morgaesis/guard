@@ -14,8 +14,8 @@ use super::execute::{
     validate_session_exact_rule_candidate,
 };
 use super::gate_runtime::{
-    execute_snapshot, finish_revert, forget_proxy_provenance, now_unix, persist_approval,
-    persist_provisional, API_PROXY_SENTINEL_BINARY,
+    execute_snapshot, finish_revert, forget_proxy_provenance, is_api_proxy_sentinel, now_unix,
+    persist_approval, persist_provisional, remove_revert_body,
 };
 use super::wire::{
     verb_effective_trust, AdminRequest, AdminResponse, ApprovalSummary, CallerIdentity,
@@ -966,6 +966,9 @@ async fn handle_confirm(
         Ok(p) => {
             persist_provisional(config, &p).await;
             forget_proxy_provenance(config, handle).await;
+            // The change is kept and the revert will never fire; drop its
+            // persisted body so a secret-bearing snapshot is not left on disk.
+            remove_revert_body(&p);
             tracing::info!("[AUDIT] CONFIRM handle={} caller={}", handle, caller);
             AdminResponse::GateAction {
                 message: format!("provisional {} confirmed; change kept", handle),
@@ -1030,7 +1033,7 @@ async fn handle_approve(
     // branch by naming the sentinel binary, because the row must also be owned
     // by the daemon principal, which peer credentials assign only to the
     // daemon's own gate sink.
-    if snapshot.binary == API_PROXY_SENTINEL_BINARY
+    if is_api_proxy_sentinel(&snapshot.binary)
         && matches!(&snapshot.principal, Some(p) if config.daemon_principal.eq_ci(p))
     {
         let now = now_unix();

@@ -329,6 +329,23 @@ mod tests {
     }
 
     #[test]
+    fn update_with_no_prior_snapshot_has_no_revert() {
+        // A PUT/PATCH whose prior object could not be read (a create-shaped PUT,
+        // or a transient GET failure) has no faithful revert: deleting the
+        // object could destroy state that existed before the write. plan_revert
+        // returns Err rather than synthesizing an unsafe delete, so the write
+        // is judged as not-constructible and forwards only under an explicit
+        // policy allow, never inside a bogus containment envelope.
+        let p = KubernetesProtocol;
+        let put = op("PUT", "/api/v1/namespaces/dev/configmaps/new");
+        assert!(p
+            .plan_revert(&put, None, b"{\"metadata\":{\"name\":\"new\"}}")
+            .is_err());
+        let patch = op("PATCH", "/apis/apps/v1/namespaces/dev/deployments/api");
+        assert!(p.plan_revert(&patch, None, b"{}").is_err());
+    }
+
+    #[test]
     fn delete_restore_recreates_sanitized_prior_object_with_post() {
         let p = KubernetesProtocol;
         let o = op("DELETE", "/apis/apps/v1/namespaces/dev/deployments/api");
