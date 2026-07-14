@@ -184,7 +184,7 @@ impl Client {
         env: HashMap<String, String>,
         secrets: HashMap<String, String>,
     ) -> Result<ExecuteResponse> {
-        let request = self.build_execute_request(binary, args, env, secrets, false);
+        let mut request = self.build_execute_request(binary, args, env, secrets, false);
 
         tracing::debug!(
             binary = %binary,
@@ -194,6 +194,7 @@ impl Client {
         );
 
         if let Some(ref socket_path) = self.socket_path {
+            request.cwd = std::env::current_dir().ok();
             self.send_local(socket_path, &request).await
         } else if let Some(port) = self.tcp_port {
             self.send_tcp(port, &request).await
@@ -213,7 +214,7 @@ impl Client {
     where
         F: FnMut(OutputStream, &str),
     {
-        let request = self.build_execute_request(binary, args, env, secrets, true);
+        let mut request = self.build_execute_request(binary, args, env, secrets, true);
 
         tracing::debug!(
             binary = %binary,
@@ -223,6 +224,7 @@ impl Client {
         );
 
         if let Some(ref socket_path) = self.socket_path {
+            request.cwd = std::env::current_dir().ok();
             self.send_local_streaming(socket_path, &request, &mut on_output)
                 .await
         } else if let Some(port) = self.tcp_port {
@@ -260,6 +262,7 @@ impl Client {
             verb: self.verb.clone(),
             reevaluate: self.reevaluate,
             ssh_hostkey: self.ssh_hostkey,
+            cwd: None,
         }
     }
 
@@ -539,7 +542,8 @@ async fn connect_local(path: &Path) -> Result<tokio::net::windows::named_pipe::N
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_admin_response_line, AdminResponse};
+    use super::{parse_admin_response_line, AdminResponse, Client};
+    use std::collections::HashMap;
 
     #[test]
     fn parse_admin_response_line_accepts_admin_response() {
@@ -573,5 +577,13 @@ mod tests {
             }
             other => panic!("expected admin error, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn tcp_execute_request_does_not_carry_cwd() {
+        let client = Client::new(None, Some(8123));
+        let request =
+            client.build_execute_request("id", &[], HashMap::new(), HashMap::new(), false);
+        assert!(request.cwd.is_none());
     }
 }

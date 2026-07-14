@@ -322,7 +322,41 @@ impl Evaluator {
         prompt_append: Option<&str>,
         reevaluate: bool,
     ) -> EvalResult {
+        self.evaluate_with_reevaluate_inner(command, prompt_append, reevaluate, false)
+            .await
+    }
+
+    /// Same as `evaluate_with_reevaluate`, but a non-empty prompt can still be
+    /// cached under a prompt-qualified key. This is for daemon-supplied
+    /// execution metadata such as cwd, not caller/session authorization prose.
+    pub async fn evaluate_with_cacheable_context(
+        &self,
+        command: &str,
+        prompt_append: Option<&str>,
+        reevaluate: bool,
+    ) -> EvalResult {
+        self.evaluate_with_reevaluate_inner(command, prompt_append, reevaluate, true)
+            .await
+    }
+
+    async fn evaluate_with_reevaluate_inner(
+        &self,
+        command: &str,
+        prompt_append: Option<&str>,
+        reevaluate: bool,
+        cache_prompt_context: bool,
+    ) -> EvalResult {
         let session_prompt_active = prompt_append.map(|s| !s.trim().is_empty()).unwrap_or(false);
+        let cache_blocked_by_prompt = session_prompt_active && !cache_prompt_context;
+        let cache_key = if session_prompt_active && cache_prompt_context {
+            format!(
+                "{}\n\n[GUARD EVALUATION CONTEXT]\n{}",
+                command,
+                prompt_append.unwrap_or_default()
+            )
+        } else {
+            command.to_string()
+        };
 
         // Pre-LLM fast-reject: an explicit deny pattern (or deny-decision
         // group rule) rejects without an LLM call. A command that matches
@@ -376,11 +410,11 @@ impl Evaluator {
             // session-specific prompt is in play. Session prompts change
             // the decision surface, so they bypass the cache to avoid
             // returning a verdict made under the base prompt.
-            if !session_prompt_active {
+            if !cache_blocked_by_prompt {
                 if let Some(ref cache) = self.cache {
                     let hit = {
                         let guard = cache.read().await;
-                        guard.get(command)
+                        guard.get(&cache_key)
                     };
                     if let Some(result) = hit {
                         tracing::debug!("cache hit for command");
@@ -394,13 +428,13 @@ impl Evaluator {
             // Only insert into cache when the verdict was made under the
             // base prompt. Decisions reached with a session-specific prompt
             // are not portable to other sessions.
-            if !session_prompt_active {
+            if !cache_blocked_by_prompt {
                 if let Some(ref cache) = self.cache {
                     match &result {
                         EvalResult::Allow { reason, .. } => {
                             let mut guard = cache.write().await;
                             guard.insert(
-                                command.to_string(),
+                                cache_key.clone(),
                                 CachedResult::Allow {
                                     reason: reason.clone(),
                                     risk: result.risk(),
@@ -411,7 +445,7 @@ impl Evaluator {
                         EvalResult::Deny { reason, .. } => {
                             let mut guard = cache.write().await;
                             guard.insert(
-                                command.to_string(),
+                                cache_key.clone(),
                                 CachedResult::Deny {
                                     reason: reason.clone(),
                                     risk: result.risk(),

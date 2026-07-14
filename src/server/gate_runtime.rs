@@ -364,6 +364,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
             principal,
             binary: API_PROXY_SENTINEL_BINARY.to_string(),
             args: vec![mutation.label.clone()],
+            cwd: None,
             // An API revert is executed from `api_revert`, not the command-shaped
             // revert_binary/revert_args of a shell provisional.
             revert_binary: String::new(),
@@ -397,6 +398,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
         let snapshot = ApprovalSnapshot {
             binary: API_PROXY_SENTINEL_BINARY.to_string(),
             args: vec![label.to_string()],
+            cwd: None,
             env: std::collections::BTreeMap::new(),
             secret_keys: std::collections::BTreeMap::new(),
             verb_name: None,
@@ -775,6 +777,7 @@ pub(super) async fn arm_containment<W: AsyncWrite + Unpin>(
         principal: caller_principal,
         binary: request.binary.clone(),
         args: request.args.clone(),
+        cwd: request.cwd.clone(),
         revert_binary: revert.binary.clone(),
         revert_args: revert.args.clone(),
         api_revert: None,
@@ -923,6 +926,7 @@ pub(super) async fn hold_for_approval<W: AsyncWrite + Unpin>(
     let snapshot = ApprovalSnapshot {
         binary: request.binary.clone(),
         args: request.args.clone(),
+        cwd: request.cwd.clone(),
         env: request
             .env
             .iter()
@@ -1093,6 +1097,16 @@ pub(super) async fn execute_snapshot(
     snapshot: &ApprovalSnapshot,
     reason: &str,
 ) -> ExecuteResult {
+    if !binary_allowed(&config.allowed_binaries, &snapshot.binary) {
+        return ExecuteResult::exec_failed(
+            reason.to_string(),
+            format!(
+                "approval rejected: binary '{}' is not in the server allow-list",
+                snapshot.binary
+            ),
+        );
+    }
+
     // Verify the secret-value binding captured at hold time. A same-principal
     // caller must not have swapped its mapped secret values since the operator
     // reviewed the hold. Fail closed (exec_failed, command not started) on any
@@ -1154,6 +1168,7 @@ pub(super) async fn execute_snapshot(
     let request = ExecuteRequest {
         binary: snapshot.binary.clone(),
         args: snapshot.args.clone(),
+        cwd: snapshot.cwd.clone(),
         auth_token: None,
         env: snapshot
             .env
@@ -1292,6 +1307,7 @@ async fn run_provisional_revert(config: &ServerConfig, p: &Provisional) -> Execu
     let request = ExecuteRequest {
         binary: p.revert_binary.clone(),
         args: p.revert_args.clone(),
+        cwd: p.cwd.clone(),
         auth_token: None,
         env: HashMap::new(),
         secrets: HashMap::new(),

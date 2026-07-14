@@ -74,6 +74,7 @@ fn contain_request(binary: &str, args: &[&str], revert: RevertSpec) -> ExecuteRe
         confirm_within_secs: None,
         reevaluate: false,
         ssh_hostkey: None,
+        cwd: None,
         require_approval: None,
         wait_approval_secs: None,
         verb: None,
@@ -384,6 +385,7 @@ async fn api_revert_without_running_proxy_defers_to_operator() {
         principal: Some(cfg.daemon_principal.clone()),
         binary: "(api-proxy)".to_string(),
         args: vec!["delete labels/bug in o/r".to_string()],
+        cwd: None,
         revert_binary: "(api-proxy)".to_string(),
         revert_args: vec![
             "github".to_string(),
@@ -476,6 +478,7 @@ async fn api_revert_executes_through_registered_proxy_upstream() {
         principal: Some(cfg.daemon_principal.clone()),
         binary: "(api-proxy)".to_string(),
         args: vec!["delete labels/bug in o/r".to_string()],
+        cwd: None,
         revert_binary: "(api-proxy)".to_string(),
         revert_args: vec![
             "github".to_string(),
@@ -590,6 +593,7 @@ async fn hold_then_operator_approve_executes_snapshot_nonoperator_refused() {
         confirm_within_secs: None,
         reevaluate: false,
         ssh_hostkey: None,
+        cwd: None,
         require_approval: None,
         wait_approval_secs: None,
         verb: None,
@@ -801,6 +805,7 @@ async fn nonstreaming_wait_approval_returns_promptly_on_decision() {
         confirm_within_secs: None,
         reevaluate: false,
         ssh_hostkey: None,
+        cwd: None,
         require_approval: None,
         wait_approval_secs: Some(30),
         verb: None,
@@ -862,6 +867,7 @@ async fn hold_then_ttl_expiry_denies_fail_closed() {
         confirm_within_secs: None,
         reevaluate: false,
         ssh_hostkey: None,
+        cwd: None,
         require_approval: None,
         wait_approval_secs: None,
         verb: None,
@@ -944,6 +950,7 @@ async fn approve_rejected_when_bound_secret_value_changed() {
         confirm_within_secs: None,
         reevaluate: false,
         ssh_hostkey: None,
+        cwd: None,
         require_approval: None,
         wait_approval_secs: None,
         verb: None,
@@ -1025,6 +1032,7 @@ async fn approve_passes_binding_when_secret_value_unchanged() {
         confirm_within_secs: None,
         reevaluate: false,
         ssh_hostkey: None,
+        cwd: None,
         require_approval: None,
         wait_approval_secs: None,
         verb: None,
@@ -1098,6 +1106,7 @@ async fn approve_rejected_when_unresolved_secret_appears_after_hold() {
         confirm_within_secs: None,
         reevaluate: false,
         ssh_hostkey: None,
+        cwd: None,
         require_approval: None,
         wait_approval_secs: None,
         verb: None,
@@ -1175,6 +1184,7 @@ async fn approval_note_operator_and_owner_post_others_refused() {
         confirm_within_secs: None,
         reevaluate: false,
         ssh_hostkey: None,
+        cwd: None,
         require_approval: None,
         wait_approval_secs: None,
         verb: None,
@@ -1264,6 +1274,7 @@ async fn approve_voided_when_verb_catalog_version_changed() {
     let snapshot = ApprovalSnapshot {
         binary: "true".to_string(),
         args: Vec::new(),
+        cwd: None,
         env: BTreeMap::new(),
         secret_keys: BTreeMap::new(),
         verb_name: Some("restart-service".to_string()),
@@ -1318,6 +1329,138 @@ async fn approve_voided_when_verb_catalog_version_changed() {
     assert_eq!(
         cfg.approvals.read().await.get(&handle).unwrap().status,
         ApprovalStatus::ExecFailed
+    );
+}
+
+#[tokio::test]
+async fn approved_snapshot_rechecks_binary_floor_before_exec() {
+    let (mut cfg, _, agent) = gating_config(7015, 1000);
+    cfg.allowed_binaries = Some(vec!["echo".to_string()]);
+    let snapshot = ApprovalSnapshot {
+        binary: "sh".to_string(),
+        args: vec!["-c".to_string(), "true".to_string()],
+        cwd: None,
+        env: BTreeMap::new(),
+        secret_keys: BTreeMap::new(),
+        verb_name: None,
+        verb_params: BTreeMap::new(),
+        catalog_version: None,
+        principal: agent.principal(),
+        secret_binding: None,
+    };
+
+    let result = execute_snapshot(&cfg, &snapshot, "operator approved").await;
+
+    assert!(matches!(
+        result.exec,
+        ExecOutcome::Failed { started: false, .. }
+    ));
+    assert_eq!(result.policy_reason(), "operator approved");
+    if let ExecOutcome::Failed { reason, .. } = result.exec {
+        assert!(reason.contains("not in the server allow-list"));
+    }
+}
+
+#[tokio::test]
+async fn approved_snapshot_rejects_dangerous_request_env_before_exec() {
+    let (cfg, _, agent) = gating_config(7018, 1000);
+    let snapshot = ApprovalSnapshot {
+        binary: "sh".to_string(),
+        args: vec!["-c".to_string(), "printf should-not-run".to_string()],
+        cwd: None,
+        env: BTreeMap::from([(
+            "SSH_AUTH_SOCK".to_string(),
+            "/tmp/caller-agent.sock".to_string(),
+        )]),
+        secret_keys: BTreeMap::new(),
+        verb_name: None,
+        verb_params: BTreeMap::new(),
+        catalog_version: None,
+        principal: agent.principal(),
+        secret_binding: None,
+    };
+
+    let result = execute_snapshot(&cfg, &snapshot, "operator approved").await;
+
+    assert!(matches!(
+        result.exec,
+        ExecOutcome::Failed { started: false, .. }
+    ));
+    assert_eq!(result.policy_reason(), "operator approved");
+    if let ExecOutcome::Failed { reason, .. } = result.exec {
+        assert!(reason.contains("dangerous injected environment variable name: 'SSH_AUTH_SOCK'"));
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn approved_snapshot_executes_in_snapshotted_cwd() {
+    let (cfg, _, agent) = gating_config(7016, 1000);
+    let temp = tempfile::tempdir().unwrap();
+    let snapshot = ApprovalSnapshot {
+        binary: "sh".to_string(),
+        args: vec![
+            "-c".to_string(),
+            "printf approved > approval-cwd.txt".to_string(),
+        ],
+        cwd: Some(temp.path().to_path_buf()),
+        env: BTreeMap::new(),
+        secret_keys: BTreeMap::new(),
+        verb_name: None,
+        verb_params: BTreeMap::new(),
+        catalog_version: None,
+        principal: agent.principal(),
+        secret_binding: None,
+    };
+
+    let result = execute_snapshot(&cfg, &snapshot, "operator approved").await;
+
+    assert!(matches!(
+        result.exec,
+        ExecOutcome::Completed {
+            exit_code: Some(0),
+            ..
+        }
+    ));
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("approval-cwd.txt")).unwrap(),
+        "approved"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn provisional_revert_executes_in_snapshotted_cwd() {
+    let (cfg, _operator, agent) = gating_config(7017, 1000);
+    let temp = tempfile::tempdir().unwrap();
+    let provisional = Provisional {
+        handle: "cwd-revert".to_string(),
+        principal: agent.principal(),
+        binary: "true".to_string(),
+        args: Vec::new(),
+        cwd: Some(temp.path().to_path_buf()),
+        revert_binary: "sh".to_string(),
+        revert_args: vec![
+            "-c".to_string(),
+            "printf reverted > provisional-cwd.txt".to_string(),
+        ],
+        api_revert: None,
+        reason: "cwd revert".to_string(),
+        created_unix: now_unix(),
+        deadline_unix: now_unix(),
+        forward_done: true,
+        status: ProvisionalStatus::Reverting,
+        revert_exit: None,
+        revert_detail: None,
+    };
+    cfg.provisional.write().await.insert(provisional.clone());
+
+    let (_message, exit) = finish_revert(&cfg, &provisional, &agent, "test").await;
+
+    assert_eq!(exit, Some(0));
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("provisional-cwd.txt")).unwrap(),
+        "reverted"
     );
 }
 

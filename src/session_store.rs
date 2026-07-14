@@ -875,11 +875,11 @@ mod tests {
         assert!(loaded.static_only_for("tok"));
         assert!(loaded.auto_amend_for("tok"));
         assert!(loaded
-            .check("tok", "kubectl", &["get".into(), "pods".into()])
+            .check("tok", "kubectl", &["get".into(), "pods".into()], None)
             .is_some());
         assert!(matches!(
             loaded
-                .check("tok", "kubectl", &["get".into(), "secrets".into()])
+                .check("tok", "kubectl", &["get".into(), "secrets".into()], None)
                 .map(|hit| hit.0),
             Some(crate::session::SessionDecision::Deny)
         ));

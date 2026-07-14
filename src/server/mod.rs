@@ -408,7 +408,6 @@ fn child_env_allowlist() -> &'static [&'static str] {
         "SHELL",
         "LOGNAME",
         "XDG_RUNTIME_DIR",
-        "SSH_AUTH_SOCK",
     ]
 }
 

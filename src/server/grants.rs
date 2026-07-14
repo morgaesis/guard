@@ -95,7 +95,7 @@ pub(super) async fn handle_grant_read(
         let (decision, exists, static_only) = {
             let reg = config.sessions.read().await;
             (
-                reg.check(token, AUTO_READ_GRANT_LABEL, &audit_args),
+                reg.check(token, AUTO_READ_GRANT_LABEL, &audit_args, None),
                 reg.has(token),
                 reg.static_only_for(token),
             )

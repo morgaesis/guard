@@ -85,6 +85,10 @@ pub struct Provisional {
     pub principal: Option<PrincipalKey>,
     pub binary: String,
     pub args: Vec<String>,
+    /// Canonical working directory used by the forward command and its
+    /// command-shaped revert. Absent on older rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
     /// The structured revert command (no shell). Operator-authored (verb) or an
     /// agent-supplied `--revert` that was itself evaluated to APPROVE at arm time.
     pub revert_binary: String,
@@ -337,6 +341,7 @@ mod tests {
             principal,
             binary: "systemctl".into(),
             args: vec!["restart".into(), "app".into()],
+            cwd: None,
             revert_binary: "systemctl".into(),
             revert_args: vec!["stop".into(), "app".into()],
             api_revert: None,

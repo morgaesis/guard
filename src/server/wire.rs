@@ -5,6 +5,7 @@ use guard::gating::{Coverage, Reversibility};
 use guard::principal::PrincipalKey;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use super::execute::audit_token;
 
@@ -174,6 +175,11 @@ pub struct ExecuteRequest {
     /// existing strict host-key checking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_hostkey: Option<SshHostKeyMode>,
+    /// Caller working directory, captured by the authenticated client and
+    /// canonicalized by the daemon before evaluation or execution. This is
+    /// structured protocol metadata, never accepted through caller environment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
 }
 
 impl ExecuteRequest {

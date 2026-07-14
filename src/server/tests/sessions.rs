@@ -4,14 +4,189 @@ use crate::server::execute::{
     allow_session_auto_amend_candidate, deny_session_auto_amend_candidate, execute_command,
     session_source_from_eval,
 };
+use crate::server::wire::ExecOutcome;
 use crate::server::wire::{AdminRequest, AdminResponse, CallerIdentity, ExecuteRequest};
 use crate::session::{
-    SessionDecision, SessionDecisionSource, SessionExecStatus, SessionGrant, SessionInteraction,
+    SessionDecision, SessionDecisionSource, SessionExactRule, SessionExecStatus, SessionGrant,
+    SessionInteraction,
 };
+use guard::gating::GateMode;
 use guard::principal::PrincipalKey;
 use std::collections::HashMap;
 
 use super::make_test_config;
+
+fn granted_session(allow: Vec<String>, allow_exact: Vec<SessionExactRule>) -> SessionGrant {
+    SessionGrant {
+        allow,
+        deny: Vec::new(),
+        allow_exact,
+        deny_exact: Vec::new(),
+        expires_at: None,
+        prompt_append: None,
+        generated_notes: Vec::new(),
+        static_only: true,
+        auto_amend: false,
+        granted_at: 0,
+    }
+}
+
+fn request_with_session(binary: &str, args: Vec<String>, token: String) -> ExecuteRequest {
+    ExecuteRequest {
+        binary: binary.to_string(),
+        args,
+        auth_token: None,
+        env: HashMap::new(),
+        secrets: HashMap::new(),
+        stream: false,
+        session_token: Some(token),
+        revert: None,
+        confirm_within_secs: None,
+        reevaluate: false,
+        ssh_hostkey: None,
+        cwd: None,
+        require_approval: None,
+        wait_approval_secs: None,
+        verb: None,
+    }
+}
+
+#[tokio::test]
+async fn session_allow_cannot_bypass_binary_floor() {
+    let (mut cfg, _) = make_test_config();
+    cfg.allowed_binaries = Some(vec!["echo".to_string()]);
+    let token = format!("binary-floor-glob-{}", std::process::id());
+    cfg.sessions.write().await.grant(
+        token.clone(),
+        granted_session(vec!["sh *".to_string()], Vec::new()),
+    );
+
+    let result = execute_command(
+        request_with_session("sh", vec!["-c".to_string(), "true".to_string()], token),
+        &cfg,
+        &CallerIdentity::Unix { uid: 1000 },
+    )
+    .await;
+
+    assert!(!result.policy_allowed());
+    assert!(result
+        .policy_reason()
+        .contains("not in the server allow-list"));
+}
+
+#[tokio::test]
+async fn session_exact_allow_cannot_bypass_binary_floor() {
+    let (mut cfg, _) = make_test_config();
+    cfg.allowed_binaries = Some(vec!["echo".to_string()]);
+    let token = format!("binary-floor-exact-{}", std::process::id());
+    cfg.sessions.write().await.grant(
+        token.clone(),
+        granted_session(
+            Vec::new(),
+            vec![SessionExactRule::new(
+                "sh",
+                vec!["-c".to_string(), "true".to_string()],
+            )],
+        ),
+    );
+
+    let result = execute_command(
+        request_with_session("sh", vec!["-c".to_string(), "true".to_string()], token),
+        &cfg,
+        &CallerIdentity::Unix { uid: 1000 },
+    )
+    .await;
+
+    assert!(!result.policy_allowed());
+    assert!(result
+        .policy_reason()
+        .contains("not in the server allow-list"));
+}
+
+#[tokio::test]
+async fn session_allow_routes_through_consequence_gate() {
+    let (mut cfg, _) = make_test_config();
+    cfg.gate = GateMode::Consequence;
+    let token = format!("session-gate-{}", std::process::id());
+    cfg.sessions.write().await.grant(
+        token.clone(),
+        granted_session(vec!["true".to_string()], Vec::new()),
+    );
+
+    let result = execute_command(
+        request_with_session("true", Vec::new(), token),
+        &cfg,
+        &CallerIdentity::Unix { uid: 1000 },
+    )
+    .await;
+
+    assert!(result.policy_allowed(), "session allow is policy approval");
+    assert!(
+        matches!(result.exec, ExecOutcome::Held { .. }),
+        "unclassified consequence-mode session allow must hold, got {:?}",
+        result.exec
+    );
+}
+
+#[tokio::test]
+async fn cwd_request_does_not_match_legacy_session_allow_glob() {
+    let (cfg, _) = make_test_config();
+    let temp = tempfile::tempdir().unwrap();
+    let token = format!("cwd-legacy-glob-{}", std::process::id());
+    cfg.sessions.write().await.grant(
+        token.clone(),
+        granted_session(vec!["pwd".to_string()], Vec::new()),
+    );
+
+    let mut req = request_with_session("pwd", Vec::new(), token);
+    req.cwd = Some(temp.path().canonicalize().unwrap());
+
+    let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+    assert!(!result.policy_allowed());
+    assert!(
+        result.policy_reason().contains("session static-only"),
+        "expected cwd-bearing legacy allow to miss, got {}",
+        result.policy_reason()
+    );
+}
+
+#[tokio::test]
+async fn cwd_request_matches_cwd_bound_exact_session_allow_only() {
+    let (cfg, _) = make_test_config();
+    let allowed = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let allowed_cwd = allowed.path().canonicalize().unwrap();
+    let token = format!("cwd-exact-{}", std::process::id());
+    cfg.sessions.write().await.grant(
+        token.clone(),
+        granted_session(
+            Vec::new(),
+            vec![SessionExactRule::with_cwd(
+                "pwd",
+                Vec::new(),
+                allowed_cwd.clone(),
+            )],
+        ),
+    );
+
+    let mut req = request_with_session("pwd", Vec::new(), token.clone());
+    req.cwd = Some(allowed_cwd.clone());
+    let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+    match result.exec {
+        ExecOutcome::Completed { stdout, .. } => {
+            assert_eq!(
+                stdout.as_deref().map(str::trim),
+                Some(allowed_cwd.to_str().unwrap())
+            );
+        }
+        other => panic!("expected cwd-bound exact allow to execute, got {:?}", other),
+    }
+
+    let mut req = request_with_session("pwd", Vec::new(), token);
+    req.cwd = Some(other.path().canonicalize().unwrap());
+    let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+    assert!(!result.policy_allowed());
+}
 
 #[tokio::test]
 async fn static_only_session_miss_denies_before_evaluator() {
@@ -48,6 +223,7 @@ async fn static_only_session_miss_denies_before_evaluator() {
         confirm_within_secs: None,
         reevaluate: false,
         ssh_hostkey: None,
+        cwd: None,
         require_approval: None,
         wait_approval_secs: None,
         verb: None,
@@ -572,17 +748,17 @@ async fn profile_grant_still_deny_short_circuits_and_falls_through() {
     // A profile-derived grant behaves exactly like any other grant: its deny
     // glob short-circuits to Deny...
     assert!(matches!(
-        reg.check(&token, "kubectl", &["delete".into(), "pod".into()]),
+        reg.check(&token, "kubectl", &["delete".into(), "pod".into()], None),
         Some((SessionDecision::Deny, _))
     ));
     // ...its allow glob short-circuits to Allow...
     assert!(matches!(
-        reg.check(&token, "kubectl", &["get".into(), "pods".into()]),
+        reg.check(&token, "kubectl", &["get".into(), "pods".into()], None),
         Some((SessionDecision::Allow, _))
     ));
     // ...and a command matching neither falls through to normal evaluation.
     assert!(
-        reg.check(&token, "helm", &["list".into()]).is_none(),
+        reg.check(&token, "helm", &["list".into()], None).is_none(),
         "an unmatched command must fall through to the evaluator"
     );
 }
