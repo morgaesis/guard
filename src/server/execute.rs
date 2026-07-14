@@ -576,6 +576,10 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
                             format!("client stream error: {}", e),
                         ));
                     }
+                    // Session allows skip only the evaluator. They do not
+                    // bypass the consequence gate or any spawn-time invariant:
+                    // absent a matched verb class, consequence mode holds
+                    // fail-closed as unclassified.
                     let inputs = GateInputs {
                         reason,
                         risk: Some(0),

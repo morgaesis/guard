@@ -2,11 +2,12 @@
 //!
 //! A session is an opaque token the caller includes in `ExecuteRequest`.
 //! Grants attach extra allow/deny glob patterns to that token. Session
-//! denies short-circuit to DENY before the evaluator. Session allows
-//! short-circuit to ALLOW before the evaluator, letting an operator
-//! hand a specific agent narrow extra permissions (e.g. "mkdir
-//! /tmp/work/*", "rm /tmp/work/scratch.txt") without relaxing the
-//! global mode.
+//! denies short-circuit to DENY before the evaluator. Session allows skip only
+//! the evaluator: the command still stays inside the server binary floor,
+//! consequence routing, held-command snapshot binding, audit logging, and
+//! session recording. This lets an operator hand a specific agent narrow extra
+//! permissions (e.g. "mkdir /tmp/work/*", "rm /tmp/work/scratch.txt") without
+//! relaxing the global mode.
 //!
 //! The daemon keeps a live in-memory registry for fast decision checks,
 //! while `session_store.rs` persists grants and bounded interaction

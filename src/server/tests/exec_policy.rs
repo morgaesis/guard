@@ -15,7 +15,9 @@ use crate::server::{
     deterministic_safe_allow_reason, invalid_shell_secret_reference, is_valid_secret_key,
     validate_request_injections,
 };
-use crate::session::{SessionExactRule, SessionGrant};
+#[cfg(unix)]
+use crate::session::SessionExactRule;
+use crate::session::SessionGrant;
 use guard::evaluate::{EvalConfig, Evaluator};
 use guard::gating::deny_shape::{DenyLearningConfig, DenyShapeStore};
 use guard::principal::PrincipalKey;
