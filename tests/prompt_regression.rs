@@ -25,7 +25,7 @@ struct Case {
 
 fn load_cases() -> Vec<Case> {
     let yaml = include_str!("prompt_regression_corpus.yaml");
-    serde_yaml::from_str(yaml).expect("failed to parse prompt_regression_corpus.yaml")
+    serde_yaml_ng::from_str(yaml).expect("failed to parse prompt_regression_corpus.yaml")
 }
 
 fn resolve_api_key() -> Option<String> {

@@ -1,9 +1,3 @@
-use crate::redact::redact_output;
-use anyhow::Result;
-use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
-
 /// SSH options that take a separate argument value.
 const OPTS_WITH_ARG: &[&str] = &[
     "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-p", "-Q",
@@ -93,65 +87,6 @@ pub fn extract_destination(args: &[String]) -> Option<String> {
     None
 }
 
-/// Execute SSH with the given arguments, optionally redacting output.
-pub async fn exec_ssh(ssh_bin: &str, args: &[String], redact: bool) -> Result<i32> {
-    if redact {
-        let mut child = Command::new(ssh_bin)
-            .args(args)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-
-        let stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take().unwrap();
-
-        let stdout_task = tokio::spawn(async move {
-            let reader = BufReader::new(stdout);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let redacted = redact_output(&line);
-                println!("{}", redacted);
-            }
-        });
-
-        let stderr_task = tokio::spawn(async move {
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let redacted = redact_output(&line);
-                eprintln!("{}", redacted);
-            }
-        });
-
-        let status = child.wait().await?;
-        let _ = tokio::join!(stdout_task, stderr_task);
-
-        Ok(status.code().unwrap_or(1))
-    } else {
-        let status = Command::new(ssh_bin)
-            .args(args)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .await?;
-
-        Ok(status.code().unwrap_or(1))
-    }
-}
-
-/// Check if a command is in the passthrough list.
-pub fn is_passthrough(cmd: &str, passthrough: &[String]) -> bool {
-    if passthrough.is_empty() {
-        return false;
-    }
-
-    let base_cmd = cmd.split_whitespace().next().unwrap_or("");
-
-    passthrough.iter().any(|allowed| base_cmd == allowed)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,23 +163,5 @@ mod tests {
     #[test]
     fn test_extract_destination_none() {
         assert_eq!(extract_destination(&args(&["-v", "-A"])), None);
-    }
-
-    #[test]
-    fn test_is_passthrough_match() {
-        let pt = vec!["ls".to_string(), "uptime".to_string()];
-        assert!(is_passthrough("ls -la", &pt));
-        assert!(is_passthrough("uptime", &pt));
-    }
-
-    #[test]
-    fn test_is_passthrough_no_match() {
-        let pt = vec!["ls".to_string()];
-        assert!(!is_passthrough("rm -rf /", &pt));
-    }
-
-    #[test]
-    fn test_is_passthrough_empty() {
-        assert!(!is_passthrough("ls", &[]));
     }
 }

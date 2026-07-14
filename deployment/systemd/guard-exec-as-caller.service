@@ -1,0 +1,36 @@
+[Unit]
+Description=guard server (executes approved commands as the connecting caller)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# No User= line. --exec-as-caller drops each approved command to the connecting
+# client's UID, so the daemon itself must start as root and switch per request.
+WorkingDirectory=/var/lib/guard
+Environment=HOME=/var/lib/guard
+EnvironmentFile=-/etc/default/guard
+RuntimeDirectory=guard
+RuntimeDirectoryMode=0755
+StateDirectory=guard
+StateDirectoryMode=0700
+# --users is the allow-list of local UIDs permitted to execute; set it to the
+# operator and service accounts on this host. --exec-as-caller then runs each
+# approved command as that connecting UID and requires a Unix socket (it is
+# incompatible with a TCP listener, which carries no trusted local UID).
+ExecStart=/usr/local/bin/guard server start --socket /run/guard/guard.sock --state-db /var/lib/guard/state.db --users 1000 --exec-as-caller
+Restart=on-failure
+RestartSec=5
+PrivateTmp=true
+ProtectSystem=strict
+# Approved commands run as the connecting user, so their home directories must
+# stay writable -- host keys accepted via `--hostkey accept-new` are recorded
+# in the caller's own ~/.ssh, not the daemon's. Keep ProtectHome off and list
+# every caller home root here; add any that live outside /home. ProtectSystem
+# above keeps everything else read-only, so widen ReadWritePaths if the approved
+# command set legitimately writes outside these paths (e.g. /srv, /opt).
+ProtectHome=false
+ReadWritePaths=/run/guard /var/lib/guard /home
+
+[Install]
+WantedBy=multi-user.target

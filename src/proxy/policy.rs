@@ -1,10 +1,11 @@
 //! Operator-authored policy over Kubernetes API operations — the proxy's "slow
 //! clock", analogous to the verb catalog. Only the operator edits it; agents
-//! cannot. Rules match an [`ApiOp`] by verb/resource/namespace and yield an
-//! action (allow, deny, hold) plus, for allowed reads, whether to redact secret
-//! values from the response. Default is fail-safe deny.
+//! cannot. Rules match an [`ApiOp`] by verb/resource/namespace/subresource and
+//! yield an action (allow, deny, hold, evaluate) plus, for allowed reads, whether to
+//! redact secret values from the response. A write to a subresource is
+//! authorized only by a rule that names it. Default is fail-safe deny.
 
-use super::k8s::ApiOp;
+use super::op::ApiOp;
 use serde::{Deserialize, Serialize};
 
 /// What to do with a matched request.
@@ -17,6 +18,9 @@ pub enum ApiAction {
     Deny,
     /// Hold for operator approval before the request reaches the apiserver.
     Hold,
+    /// Ask the daemon's LLM evaluator, then route the allow verdict through the
+    /// consequence gate before the request reaches the upstream.
+    Evaluate,
 }
 
 fn any_glob() -> Vec<String> {
@@ -40,6 +44,16 @@ pub struct ApiRule {
     /// Namespaces matched, or `*`. A cluster-scoped request matches only `*`.
     #[serde(default = "any_glob")]
     pub namespaces: Vec<String>,
+    /// Write subresources this rule authorizes, e.g. `scale`, `eviction`,
+    /// `status`. Empty (the default) means the rule covers only the bare
+    /// resource: a write to a subresource is never authorized by a plain
+    /// resource rule, because a write subresource can carry effects the parent
+    /// verb does not model (evicting a pod, adding an ephemeral container,
+    /// issuing a token). Read subresources (`log`, a `status` GET) are always
+    /// covered by a matching read rule and do not need listing here. `*` allows
+    /// any write subresource on the matched resource.
+    #[serde(default)]
+    pub subresources: Vec<String>,
     pub action: ApiAction,
     /// For an allowed read of a Secret, strip `data`/`stringData` from the
     /// response so values never reach the client.
@@ -55,12 +69,29 @@ impl ApiRule {
         glob_any(&self.verbs, op.verb.as_str())
             && glob_any(&self.resources, &op.resource)
             && namespace_matches(&self.namespaces, op.namespace.as_deref())
+            && self.subresource_matches(op)
+    }
+
+    /// A write to a subresource is authorized only when the rule names that
+    /// subresource, so a bare `pods`/`patch` rule cannot silently cover
+    /// `pods/ephemeralcontainers` or `pods/eviction`. Bare-resource requests and
+    /// read subresources are unaffected.
+    fn subresource_matches(&self, op: &ApiOp) -> bool {
+        match op.subresource.as_deref() {
+            None => true,
+            Some(_) if op.is_read() => true,
+            Some(sub) => glob_any(&self.subresources, sub),
+        }
     }
 }
 
 /// The full operator policy.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ApiPolicy {
+    /// Operator prose describing what this proxy is intended to access. Used by
+    /// the API evaluator when a request is routed through `evaluate`.
+    #[serde(default)]
+    pub intent: Option<String>,
     #[serde(default)]
     pub rules: Vec<ApiRule>,
     /// Action for a request that no rule matches. Fail-safe deny by default.
@@ -80,13 +111,14 @@ impl ApiPolicy {
     /// An empty, fail-safe (default-deny) policy.
     pub fn deny_all() -> Self {
         Self {
+            intent: None,
             rules: Vec::new(),
             default: ApiAction::Deny,
         }
     }
 
-    pub fn from_yaml(yaml: &str) -> Result<Self, serde_yaml::Error> {
-        serde_yaml::from_str(yaml)
+    pub fn from_yaml(yaml: &str) -> Result<Self, serde_yaml_ng::Error> {
+        serde_yaml_ng::from_str(yaml)
     }
 
     pub fn load_file(path: &std::path::Path) -> std::io::Result<Self> {
@@ -120,6 +152,15 @@ impl ApiPolicy {
             redact_secrets: redact,
             reason,
         }
+    }
+
+    /// Whether any rule or default action routes to the evaluator.
+    pub fn contains_evaluate(&self) -> bool {
+        matches!(self.default, ApiAction::Evaluate)
+            || self
+                .rules
+                .iter()
+                .any(|rule| matches!(rule.action, ApiAction::Evaluate))
     }
 }
 
@@ -184,6 +225,100 @@ rules:
             p.decide(&op("POST", "/api/v1/namespaces/d/pods")).action,
             ApiAction::Deny,
             "unmatched create falls to default deny"
+        );
+    }
+
+    #[test]
+    fn write_subresource_not_covered_by_bare_resource_rule() {
+        // A plain pods write rule must not authorize ephemeralcontainers (code
+        // execution) or eviction (pod termination) writes.
+        let p = policy(
+            r#"
+default: deny
+rules:
+  - verbs: [create, update, patch]
+    resources: [pods]
+    namespaces: [dev]
+    action: allow
+"#,
+        );
+        assert_eq!(
+            p.decide(&op(
+                "PATCH",
+                "/api/v1/namespaces/dev/pods/web-0/ephemeralcontainers"
+            ))
+            .action,
+            ApiAction::Deny,
+            "ephemeralcontainers write is not covered by a pods write rule"
+        );
+        assert_eq!(
+            p.decide(&op("POST", "/api/v1/namespaces/dev/pods/web-0/eviction"))
+                .action,
+            ApiAction::Deny,
+            "eviction write is not covered by a pods write rule"
+        );
+        // The bare pods write still works.
+        assert_eq!(
+            p.decide(&op("POST", "/api/v1/namespaces/dev/pods")).action,
+            ApiAction::Allow
+        );
+    }
+
+    #[test]
+    fn read_subresource_covered_by_resource_read_rule() {
+        // Reading logs/status under a resource read rule keeps working; only
+        // write subresources need an explicit grant.
+        let p = policy(
+            r#"
+default: deny
+rules:
+  - verbs: [get, list, watch]
+    resources: [pods]
+    namespaces: [dev]
+    action: allow
+"#,
+        );
+        assert_eq!(
+            p.decide(&op("GET", "/api/v1/namespaces/dev/pods/web-0/log"))
+                .action,
+            ApiAction::Allow
+        );
+        assert_eq!(
+            p.decide(&op("GET", "/api/v1/namespaces/dev/pods/web-0/status"))
+                .action,
+            ApiAction::Allow
+        );
+    }
+
+    #[test]
+    fn write_subresource_allowed_when_named() {
+        let p = policy(
+            r#"
+default: deny
+rules:
+  - verbs: [update, patch]
+    resources: [deployments]
+    namespaces: [dev]
+    subresources: [scale]
+    action: allow
+"#,
+        );
+        assert_eq!(
+            p.decide(&op(
+                "PATCH",
+                "/apis/apps/v1/namespaces/dev/deployments/api/scale"
+            ))
+            .action,
+            ApiAction::Allow
+        );
+        // A different subresource is still not covered.
+        assert_eq!(
+            p.decide(&op(
+                "PATCH",
+                "/apis/apps/v1/namespaces/dev/deployments/api/status"
+            ))
+            .action,
+            ApiAction::Deny
         );
     }
 
@@ -281,5 +416,28 @@ rules:
         let d = p.decide(&op("DELETE", "/api/v1/namespaces/prod"));
         assert_eq!(d.action, ApiAction::Hold);
         assert_eq!(d.reason, "namespace deletion needs sign-off");
+    }
+
+    #[test]
+    fn intent_and_evaluate_action_parse() {
+        let p = policy(
+            r#"
+intent: "let CI manage dev workloads"
+default: evaluate
+rules:
+  - verbs: [patch]
+    resources: [deployments]
+    namespaces: [dev]
+    action: evaluate
+"#,
+        );
+        assert_eq!(p.intent.as_deref(), Some("let CI manage dev workloads"));
+        assert_eq!(p.default, ApiAction::Evaluate);
+        assert!(p.contains_evaluate());
+        assert_eq!(
+            p.decide(&op("PATCH", "/apis/apps/v1/namespaces/dev/deployments/api"))
+                .action,
+            ApiAction::Evaluate
+        );
     }
 }

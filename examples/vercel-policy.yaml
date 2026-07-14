@@ -1,0 +1,52 @@
+# Vercel API policy: gated access for brokered Vercel REST clients.
+#
+# When the daemon fronts the Vercel API (`guard server start
+# --api-proxy 127.0.0.1:8445 --api-protocol vercel --api-upstream
+# https://api.vercel.com --api-token-file /etc/guard/vercel-token`), every
+# request is parsed into a typed operation and matched against this policy.
+# The daemon holds the real token; the brokered client talks only to the proxy.
+#
+# The Vercel mapping: a project is the namespace
+# (`/v{n}/projects/{project}/{resource}`), so rules scope per project the way
+# Kubernetes rules scope per namespace. Project environment variables are
+# value-bearing on read and always redacted; deployment log streams are denied
+# outright. Deeper path segments are subresources: a write to one is
+# authorized only by a rule naming it.
+#
+# With `--gate consequence`, an env-var delete is wrapped in an auto-revert
+# envelope (the proxy snapshots the variable and recreates it unless the
+# operator confirms). A deployment trigger has no revert and stays held.
+
+default: deny
+
+rules:
+  # Read-only inspection, env-var values redacted.
+  - verbs: [get, list]
+    resources: ["*"]
+    namespaces: ["*"]
+    action: allow
+    redact_secrets: true
+    description: "read-only inspection (env values redacted)"
+
+  # Environment-variable management in a named project.
+  - verbs: [create, update, patch]
+    resources: [env]
+    namespaces: [my-preview-app]
+    action: allow
+    description: "env-var writes in the preview project"
+
+  # Triggering a deployment is a pure side effect with no constructible
+  # revert: hold for approval.
+  - verbs: [create]
+    resources: [deployments]
+    namespaces: ["*"]
+    action: hold
+    description: "deployment triggers need operator sign-off"
+
+  # Deletes are held for an operator decision. A held env-var delete that the
+  # operator approves still gets the auto-revert envelope.
+  - verbs: [delete, deletecollection]
+    resources: ["*"]
+    namespaces: ["*"]
+    action: hold
+    description: "deletions need operator sign-off"

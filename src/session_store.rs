@@ -5,6 +5,7 @@ use crate::session::{
 use anyhow::{Context, Result};
 use guard::gating::approval::Approval;
 use guard::gating::provisional::Provisional;
+use guard::gating::read_grant::ReadGrant;
 use rusqlite::{params, Connection};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -14,6 +15,13 @@ use std::time::Duration;
 pub struct SessionStore {
     path: PathBuf,
     history_retention_secs: u64,
+    /// Serializes session-registry writes and records the revision of the last
+    /// snapshot written. The registry is persisted as a full-table rewrite, so
+    /// two concurrent persists completing out of order would let a stale
+    /// snapshot clobber a newer one on disk; the writer holds this lock across
+    /// the rewrite and drops any snapshot older than what already landed.
+    /// Shared across clones so every handle to the same store agrees.
+    registry_write_gate: std::sync::Arc<tokio::sync::Mutex<u64>>,
 }
 
 impl SessionStore {
@@ -35,23 +43,29 @@ impl SessionStore {
     pub async fn persist_registry(&self, registry: &SessionRegistry) -> Result<()> {
         let path = self.path.clone();
         let retention = self.history_retention_secs;
+        let revision = registry.revision();
         let mut snapshot = registry.clone();
+        let mut last_written = self.registry_write_gate.lock().await;
+        if revision < *last_written {
+            // A newer snapshot already landed; a full-table rewrite from this
+            // one would roll the on-disk state back.
+            return Ok(());
+        }
         tokio::task::spawn_blocking(move || {
             snapshot.purge_expired();
             Self::persist_registry_sync(&path, retention, &snapshot)
         })
         .await
-        .context("session store persist task failed")?
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
+        .context("session store persist task failed")??;
+        *last_written = revision;
+        Ok(())
     }
 
     fn open_sync(path: PathBuf, history_retention_secs: u64) -> Result<Self> {
         let store = Self {
             path,
             history_retention_secs,
+            registry_write_gate: std::sync::Arc::new(tokio::sync::Mutex::new(0)),
         };
         let registry = Self::load_registry_sync(&store.path, history_retention_secs)?;
         Self::persist_registry_sync(&store.path, history_retention_secs, &registry)?;
@@ -65,7 +79,7 @@ impl SessionStore {
         let mut grants = HashMap::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT token, allow_json, deny_json, allow_exact_json, deny_exact_json, expires_at, prompt_append, granted_at, static_only, auto_amend
+                "SELECT token, allow_json, deny_json, allow_exact_json, deny_exact_json, expires_at, prompt_append, generated_notes_json, granted_at, static_only, auto_amend
                  FROM session_grants",
             )?;
             let rows = stmt.query_map([], |row| {
@@ -83,9 +97,10 @@ impl SessionStore {
                         deny_exact: decode_exact_vec(&deny_exact_json)?,
                         expires_at: decode_optional_u64(row.get(5)?)?,
                         prompt_append: row.get(6)?,
-                        granted_at: decode_u64(row.get(7)?)?,
-                        static_only: decode_bool(row.get(8)?)?,
-                        auto_amend: decode_bool(row.get(9)?)?,
+                        generated_notes: decode_vec(&row.get::<_, String>(7)?)?,
+                        granted_at: decode_u64(row.get(8)?)?,
+                        static_only: decode_bool(row.get(9)?)?,
+                        auto_amend: decode_bool(row.get(10)?)?,
                     },
                 ))
             })?;
@@ -98,7 +113,7 @@ impl SessionStore {
         let mut history = Vec::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT token, allow_json, deny_json, allow_exact_json, deny_exact_json, granted_at, expires_at, ended_at, status, prompt_append, static_only, auto_amend
+                "SELECT token, allow_json, deny_json, allow_exact_json, deny_exact_json, granted_at, expires_at, ended_at, status, prompt_append, generated_notes_json, static_only, auto_amend
                  FROM session_history
                  ORDER BY ended_at ASC, id ASC",
             )?;
@@ -119,8 +134,9 @@ impl SessionStore {
                     ended_at: decode_u64(row.get(7)?)?,
                     status: decode_historical_status(&status)?,
                     prompt_append: row.get(9)?,
-                    static_only: decode_bool(row.get(10)?)?,
-                    auto_amend: decode_bool(row.get(11)?)?,
+                    generated_notes: decode_vec(&row.get::<_, String>(10)?)?,
+                    static_only: decode_bool(row.get(11)?)?,
+                    auto_amend: decode_bool(row.get(12)?)?,
                 })
             })?;
             for row in rows {
@@ -183,8 +199,8 @@ impl SessionStore {
         for (token, grant) in snapshot.grants_snapshot() {
             tx.execute(
                 "INSERT INTO session_grants
-                 (token, allow_json, deny_json, allow_exact_json, deny_exact_json, expires_at, prompt_append, granted_at, static_only, auto_amend)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 (token, allow_json, deny_json, allow_exact_json, deny_exact_json, expires_at, prompt_append, generated_notes_json, granted_at, static_only, auto_amend)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     token,
                     encode_vec(&grant.allow)?,
@@ -193,6 +209,7 @@ impl SessionStore {
                     encode_exact_vec(&grant.deny_exact)?,
                     encode_optional_u64(grant.expires_at)?,
                     grant.prompt_append,
+                    encode_vec(&grant.generated_notes)?,
                     encode_u64(grant.granted_at)?,
                     encode_bool(grant.static_only),
                     encode_bool(grant.auto_amend)
@@ -203,8 +220,8 @@ impl SessionStore {
         for grant in snapshot.history_snapshot() {
             tx.execute(
                 "INSERT INTO session_history
-                 (token, allow_json, deny_json, allow_exact_json, deny_exact_json, granted_at, expires_at, ended_at, status, prompt_append, static_only, auto_amend)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 (token, allow_json, deny_json, allow_exact_json, deny_exact_json, granted_at, expires_at, ended_at, status, prompt_append, generated_notes_json, static_only, auto_amend)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     grant.token,
                     encode_vec(&grant.allow)?,
@@ -216,6 +233,7 @@ impl SessionStore {
                     encode_u64(grant.ended_at)?,
                     encode_historical_status(grant.status),
                     grant.prompt_append,
+                    encode_vec(&grant.generated_notes)?,
                     encode_bool(grant.static_only),
                     encode_bool(grant.auto_amend)
                 ],
@@ -265,6 +283,7 @@ impl SessionStore {
                 deny_exact_json TEXT NOT NULL DEFAULT '[]',
                 expires_at INTEGER,
                 prompt_append TEXT,
+                generated_notes_json TEXT NOT NULL DEFAULT '[]',
                 granted_at INTEGER NOT NULL,
                 static_only INTEGER NOT NULL DEFAULT 0,
                 auto_amend INTEGER NOT NULL DEFAULT 0
@@ -281,6 +300,7 @@ impl SessionStore {
                 ended_at INTEGER NOT NULL,
                 status TEXT NOT NULL,
                 prompt_append TEXT,
+                generated_notes_json TEXT NOT NULL DEFAULT '[]',
                 static_only INTEGER NOT NULL DEFAULT 0,
                 auto_amend INTEGER NOT NULL DEFAULT 0
             );
@@ -310,7 +330,19 @@ impl SessionStore {
                 json TEXT NOT NULL,
                 status TEXT NOT NULL,
                 created_unix INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS read_grants (
+                target_path TEXT PRIMARY KEY,
+                json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                expires_unix INTEGER NOT NULL
             );",
+        )?;
+        ensure_column(
+            conn,
+            "session_grants",
+            "generated_notes_json",
+            "TEXT NOT NULL DEFAULT '[]'",
         )?;
         ensure_column(
             conn,
@@ -334,6 +366,12 @@ impl SessionStore {
             conn,
             "session_grants",
             "deny_exact_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
+        ensure_column(
+            conn,
+            "session_history",
+            "generated_notes_json",
             "TEXT NOT NULL DEFAULT '[]'",
         )?;
         ensure_column(
@@ -483,6 +521,70 @@ impl SessionStore {
         })
         .await
         .context("load_approvals task failed")?
+    }
+
+    // --- Filesystem read grants. Persisted incrementally per-row (keyed by
+    // target path) and committed before the ACLs are applied, so a crash after
+    // granting still leaves a row the reconciler can revoke on restart.
+
+    pub async fn save_read_grant(&self, g: ReadGrant) -> Result<()> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = Self::open_connection(&path)?;
+            Self::init_schema(&conn)?;
+            let json = serde_json::to_string(&g).context("encode read grant")?;
+            conn.execute(
+                "INSERT OR REPLACE INTO read_grants (target_path, json, status, expires_unix)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    g.target_path,
+                    json,
+                    g.status.as_str(),
+                    encode_u64(g.expires_unix)?
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("save_read_grant task failed")?
+    }
+
+    pub async fn delete_read_grant(&self, target_path: String) -> Result<()> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = Self::open_connection(&path)?;
+            Self::init_schema(&conn)?;
+            conn.execute(
+                "DELETE FROM read_grants WHERE target_path = ?1",
+                params![target_path],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("delete_read_grant task failed")?
+    }
+
+    /// Read grants are a POSIX-ACL primitive; only the Unix startup path loads them.
+    #[cfg(unix)]
+    pub async fn load_read_grants(&self) -> Result<Vec<ReadGrant>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = Self::open_connection(&path)?;
+            Self::init_schema(&conn)?;
+            let mut stmt = conn.prepare("SELECT json FROM read_grants")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for row in rows {
+                let json = row?;
+                match serde_json::from_str::<ReadGrant>(&json) {
+                    Ok(g) => out.push(g),
+                    Err(e) => tracing::warn!("skipping unreadable read-grant row: {}", e),
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .context("load_read_grants task failed")?
     }
 }
 
@@ -643,16 +745,57 @@ fn decode_exec_status(value: &str) -> rusqlite::Result<SessionExecStatus> {
 mod tests {
     use super::*;
 
+    /// A stale snapshot (cloned before a later mutation) must never clobber a
+    /// newer snapshot that already landed: the registry is persisted as a
+    /// full-table rewrite, so out-of-order completion would silently roll the
+    /// on-disk state back.
+    #[tokio::test]
+    async fn stale_snapshot_does_not_overwrite_newer_persisted_state() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::open(tmp.path().join("state.db"), 24 * 60 * 60)
+            .await
+            .expect("open store");
+
+        let grant = SessionGrant {
+            allow: vec!["echo*".into()],
+            deny: Vec::new(),
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            expires_at: None,
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            granted_at: 0,
+            static_only: false,
+            auto_amend: false,
+        };
+
+        let mut registry = SessionRegistry::new();
+        registry.grant("first".to_string(), grant.clone());
+        let stale = registry.clone();
+        registry.grant("second".to_string(), grant);
+        let fresh = registry.clone();
+        assert!(fresh.revision() > stale.revision());
+
+        // The newer snapshot lands first; the stale one arrives late (the
+        // out-of-order completion this guards against) and must be dropped.
+        store.persist_registry(&fresh).await.expect("persist fresh");
+        store.persist_registry(&stale).await.expect("persist stale");
+
+        let loaded = store.load_registry().await.expect("load registry");
+        assert!(loaded.has("first"));
+        assert!(
+            loaded.has("second"),
+            "the stale snapshot must not roll back the newer grant"
+        );
+    }
+
     #[tokio::test]
     async fn session_store_round_trips_registry() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let store = SessionStore::open(tmp.path().join("state.db"), 24 * 60 * 60)
             .await
             .expect("open store");
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_secs())
-            .unwrap_or(0);
+        let now = guard::env::now_unix();
 
         let mut grants = HashMap::new();
         grants.insert(
@@ -670,6 +813,7 @@ mod tests {
                 )],
                 expires_at: None,
                 prompt_append: Some("persistent".into()),
+                generated_notes: vec!["generated note".into()],
                 granted_at: now.saturating_sub(2),
                 static_only: true,
                 auto_amend: true,
@@ -688,6 +832,7 @@ mod tests {
                 ended_at: now.saturating_sub(5),
                 status: HistoricalStatus::Revoked,
                 prompt_append: None,
+                generated_notes: Vec::new(),
                 static_only: false,
                 auto_amend: false,
             }],
@@ -719,6 +864,13 @@ mod tests {
         assert_eq!(
             report.active.and_then(|grant| grant.prompt_append),
             Some("persistent".into())
+        );
+        let report = loaded.show("tok", 10).expect("session report");
+        assert_eq!(
+            report
+                .active
+                .and_then(|grant| grant.generated_notes.into_iter().next()),
+            Some("generated note".into())
         );
         assert!(loaded.static_only_for("tok"));
         assert!(loaded.auto_amend_for("tok"));

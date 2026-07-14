@@ -24,8 +24,8 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::env::now_unix;
 use crate::learned_rules::infer_service_from_binary;
 
 /// Canary strings a synthesized args pattern must NOT match. Each canary
@@ -134,7 +134,7 @@ impl DenyShape {
 }
 
 /// Binary-name match consistent with `server::binary_allowed`: a path-qualified
-/// binary (containing `/` or `\`) requires an exact match (so `/tmp/evil/kubectl`
+/// binary (containing `/` or `\`) requires an exact match (so `/tmp/other/kubectl`
 /// cannot fast-deny under a shape learned from bare `kubectl` denials, or vice
 /// versa); a bare name matches case-insensitively by basename with a stripped
 /// `.exe` suffix.
@@ -186,7 +186,7 @@ impl DenyShapeStore {
             if content.trim().is_empty() {
                 DenyShapeFile::default()
             } else {
-                serde_yaml::from_str(&content)
+                serde_yaml_ng::from_str(&content)
                     .with_context(|| format!("failed to parse {}", config.path.display()))?
             }
         } else {
@@ -372,15 +372,15 @@ impl DenyShapeStore {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        let content = serde_yaml::to_string(&self.data)?;
+        let content = serde_yaml_ng::to_string(&self.data)?;
         std::fs::write(&self.config.path, content)
             .with_context(|| format!("failed to write {}", self.config.path.display()))
     }
 }
 
 /// Reject a synthesized args pattern that isn't anchored, doesn't compile,
-/// doesn't match its own evidence, or is loose enough to match
-/// shell-injection-shaped content regardless of the shape it claims to
+/// doesn't match its own evidence, or is loose enough to match content
+/// shaped like a chained shell command regardless of the shape it claims to
 /// represent.
 pub fn validate_deny_shape_safety(args_pattern: &str, evidence: &[String]) -> Result<()> {
     if !args_pattern.starts_with('^') || !args_pattern.ends_with('$') {
@@ -425,13 +425,6 @@ pub fn split_command_line(command: &str) -> (&str, &str) {
         Some(idx) => (&command[..idx], command[idx..].trim_start()),
         None => (command, ""),
     }
-}
-
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -520,9 +513,10 @@ mod tests {
     #[test]
     fn matches_rejects_path_qualified_spoof_like_binary_allowed_does() {
         // Consistent with server::binary_allowed: a shape learned against the
-        // bare binary name must not match a path-qualified spoof, and vice
-        // versa -- deny-only, so this isn't an exploitable bypass, but it
-        // should behave the same way the codebase's other binary matching does.
+        // bare binary name must not match a binary reached via a different,
+        // path-qualified location, and vice versa -- deny-only, so this isn't
+        // a bypass that could be misused, but it should behave the same way
+        // the codebase's other binary matching does.
         let temp = tempfile::tempdir().unwrap();
         let mut store = DenyShapeStore::load(config(temp.path().join("deny.yaml"), 2)).unwrap();
         store
@@ -548,9 +542,9 @@ mod tests {
     #[test]
     fn promote_shape_rejects_degenerate_short_wildcard_pattern() {
         // A pattern like `^.{0,20}$` is anchored, compiles, and (being short)
-        // never matches the long shell-injection canary -- but it would still
-        // match almost any short evidence string. Multiple canary lengths
-        // close this gap.
+        // never matches the long shell-command-chain canary -- but it would
+        // still match almost any short evidence string. Multiple canary
+        // lengths close this gap.
         let temp = tempfile::tempdir().unwrap();
         let mut store = DenyShapeStore::load(config(temp.path().join("deny.yaml"), 2)).unwrap();
         let err = store

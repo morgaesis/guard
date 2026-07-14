@@ -13,7 +13,7 @@ struct TestCase {
 fn load_tests() -> Vec<TestCase> {
     let yaml = include_str!("guard_tests.yaml");
     let tests: Vec<TestCase> =
-        serde_yaml::from_str(yaml).expect("failed to parse guard_tests.yaml");
+        serde_yaml_ng::from_str(yaml).expect("failed to parse guard_tests.yaml");
     tests
 }
 
@@ -27,7 +27,7 @@ struct CtfScenario {
 
 fn load_ctf_scenarios() -> Vec<CtfScenario> {
     let yaml = include_str!("ctf_scenarios.yaml");
-    serde_yaml::from_str(yaml).expect("failed to parse ctf_scenarios.yaml")
+    serde_yaml_ng::from_str(yaml).expect("failed to parse ctf_scenarios.yaml")
 }
 
 /// Load the example deny policy from examples/deny-policy.yaml.

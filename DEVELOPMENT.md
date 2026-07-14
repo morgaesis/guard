@@ -81,9 +81,10 @@ dpkg -i vhs.deb
 vhs /demo.tape
 ```
 
-### Writing a tape file
+### The tape file
 
-Create `demo.tape` in the repo root:
+The tracked `demo.tape` in the repo root drives the recording; edit it to
+change the demo. Its structure:
 
 ```tape
 Output docs/demo.svg

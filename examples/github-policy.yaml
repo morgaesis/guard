@@ -1,0 +1,51 @@
+# GitHub API policy: gated access for brokered GitHub REST clients.
+#
+# When the daemon fronts the GitHub API (`guard server start
+# --api-proxy 127.0.0.1:8444 --api-protocol github --api-upstream
+# https://api.github.com --api-token-env GH_BROKER_TOKEN`), every request is
+# parsed into a typed operation and matched against this policy. The daemon
+# holds the real token; the brokered client talks only to the proxy.
+#
+# The GitHub mapping: a repository (`owner/repo`) or an organization is the
+# namespace, so rules scope per repo/org the way Kubernetes rules scope per
+# namespace. Actions/Dependabot/Codespaces secret stores all collapse to
+# resource `secrets`; writes to them are denied outright regardless of policy,
+# and secret reads are redacted. Deeper path segments are subresources: a write
+# to one is authorized only by a rule naming it.
+#
+# With `--gate consequence`, a label delete is wrapped in an auto-revert
+# envelope (the proxy snapshots the label and recreates it unless the operator
+# confirms). Other deletes have no faithful recreation and stay held.
+
+default: deny
+
+rules:
+  # Read-only inspection of everything the token can see.
+  - verbs: [get, list]
+    resources: ["*"]
+    namespaces: ["*"]
+    action: allow
+    redact_secrets: true
+    description: "read-only inspection (secret values redacted)"
+
+  # Issue and label workflows in named repositories.
+  - verbs: [create, update, patch]
+    resources: [issues, labels, comments, milestones]
+    namespaces: [octo-org/sandbox]
+    action: allow
+    description: "issue and label writes in the sandbox repository"
+
+  # Repository content writes are durable state: hold for approval.
+  - verbs: [create, update, patch]
+    resources: [contents]
+    namespaces: ["*"]
+    action: hold
+    description: "file writes need operator sign-off"
+
+  # Deletes are held for an operator decision. A held label delete that the
+  # operator approves still gets the auto-revert envelope.
+  - verbs: [delete]
+    resources: ["*"]
+    namespaces: ["*"]
+    action: hold
+    description: "deletions need operator sign-off"

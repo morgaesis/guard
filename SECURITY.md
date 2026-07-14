@@ -22,6 +22,12 @@ In scope:
 - The MCP transport (`guard mcp serve`)
 - The systemd unit and example deployment under `deployment/`
 
+Client-facing denials may include the count of similar commands the same
+deny-shape bucket has denied once the configured threshold is reached. Learned
+rule, verb, deny-shape, and API-shape promotion state is operator-only audit
+state because advertising which shapes skip evaluation invites mimicry against
+the fast path.
+
 Out of scope:
 
 - Compromise of the LLM provider or model itself

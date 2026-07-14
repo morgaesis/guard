@@ -21,7 +21,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::env::now_unix;
 
 #[derive(Debug, Clone)]
 pub struct LearningConfig {
@@ -158,7 +159,7 @@ impl LearnedRuleStore {
             if content.trim().is_empty() {
                 LearnedRulesFile::default()
             } else {
-                serde_yaml::from_str(&content)
+                serde_yaml_ng::from_str(&content)
                     .with_context(|| format!("failed to parse {}", config.path.display()))?
             }
         } else {
@@ -298,7 +299,7 @@ impl LearnedRuleStore {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        let content = serde_yaml::to_string(&self.data)?;
+        let content = serde_yaml_ng::to_string(&self.data)?;
         std::fs::write(&self.config.path, content)
             .with_context(|| format!("failed to write {}", self.config.path.display()))
     }
@@ -515,7 +516,10 @@ fn is_valid_shim_name(name: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
 }
 
-fn looks_dangerous_for_learned_allow(command: &str) -> bool {
+/// Also used by `gating::allow_promotion`: both modules trust a repeated LLM
+/// approval only up to the same floor of "obviously not something to ever
+/// auto-trust regardless of how many times it was approved."
+pub(crate) fn looks_dangerous_for_learned_allow(command: &str) -> bool {
     let lower = command.to_ascii_lowercase();
     let first_token = lower.split_whitespace().next().unwrap_or_default();
     if matches!(first_token, "sudo" | "su" | "reboot" | "shutdown" | "halt") {
@@ -551,13 +555,6 @@ fn looks_dangerous_for_learned_allow(command: &str) -> bool {
     dangerous_substrings
         .iter()
         .any(|needle| lower.contains(needle))
-}
-
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

@@ -1,0 +1,38 @@
+#include <tunables/global>
+
+# AppArmor profile for the guard daemon. Set the executable path and data
+# directory to match the deployment before loading the profile.
+profile guard /usr/local/bin/guard flags=(attach_disconnected) {
+  #include <abstractions/base>
+  #include <abstractions/nameservice>
+  #include <abstractions/ssl_certs>
+
+  /usr/local/bin/guard mr,
+
+  /var/lib/guard/ rw,
+  /var/lib/guard/** rwkl,
+
+  /usr/bin/* rix,
+  /usr/local/bin/* rix,
+  /bin/* rix,
+  /sbin/* rix,
+  /usr/lib/git-core/* rix,
+  /usr/libexec/** rix,
+
+  /etc/** r,
+  /usr/lib/** mr,
+  /lib/** mr,
+  /lib64/** mr,
+
+  deny capability sys_admin,
+  deny capability sys_module,
+  deny capability sys_ptrace,
+  deny capability sys_boot,
+  deny @{PROC}/*/mem rwklx,
+  deny @{PROC}/sysrq-trigger rwklx,
+  deny /sys/kernel/** wklx,
+  deny /boot/** rwklx,
+  deny mount,
+  deny umount,
+  deny ptrace (readby, tracedby),
+}

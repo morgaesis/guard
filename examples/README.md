@@ -46,6 +46,30 @@ regex per parameter, single-argv rendering, no shell), which is what makes
   above) for the commands you also want to skip the LLM on. Still an opt-in;
   the default is LLM-only.
 
+- **[session-profiles.yaml](session-profiles.yaml)** -- Named session-grant
+  profiles. Pre-authors reusable `{ttl, allow, deny, prompt}` bundles so an
+  operator can mint a bounded session for an agent in one round trip
+  (`guard session new --profile <name>`) instead of hand-writing prose, globs,
+  and a ttl each time. A profile is a convenience for authoring a grant ahead
+  of time, not a new bypass: the minted session takes the identical path as a
+  hand-authored one. Load with `--profiles`.
+
+- **[api-policy.yaml](api-policy.yaml)** -- Kubernetes API proxy policy.
+  First-match-wins rules over typed API operations (verb, resource, namespace,
+  subresource) for `guard server start --kube-proxy`: reads allowed with
+  Secret values redacted, non-production writes allowed behind the auto-revert
+  envelope, deletes held for operator approval. Hot-reloaded; the proxy is
+  default-deny without it. Load with `--api-policy`.
+
+- **[github-policy.yaml](github-policy.yaml)** /
+  **[vercel-policy.yaml](vercel-policy.yaml)** -- API proxy policies for the
+  GitHub and Vercel example protocols (`--api-proxy` with
+  `--api-protocol github|vercel`). Same rule shape as the Kubernetes policy;
+  a repository/organization (GitHub) or project (Vercel) plays the namespace
+  role. Reads allowed with secret-bearing values redacted, scoped writes
+  allowed, deletes and side-effect-only operations held. Load with
+  `--api-policy`.
+
 - **[fallback-models.env](fallback-models.env)** -- Multi-model fallback chain.
   Adds retry-then-failover across multiple LLM providers via
   `GUARD_LLM_MODELS`. Only needed when your uptime requirements exceed a

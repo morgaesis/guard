@@ -36,10 +36,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy lint
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Run tests
-        run: cargo test
+        run: cargo test --all-features
 
   # Branch protection requires a status check literally named "Test & Lint".
   # The matrix job above reports as "Test & Lint (ubuntu-latest)" / "Test &

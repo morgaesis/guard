@@ -5,30 +5,46 @@
 //! the Kubernetes API in-process (helm via client-go, terraform's k8s provider,
 //! k9s, any client library) never spawn a gated command — the command gate sees
 //! one opaque invocation. This subsystem lets the daemon terminate the client's
-//! TLS connection, parse each API request into a typed [`k8s::ApiOp`], apply
+//! TLS connection, parse each API request into a typed [`op::ApiOp`], apply
 //! operator-authored [`policy`], redact Secret values from responses, and
 //! re-originate the request to the real apiserver with the real credentials the
 //! daemon holds. The agent's brokered kubeconfig (see [`kubeconfig`]) carries no
 //! credential and points only at the proxy, so the proxy is the sole path to the
 //! cluster.
 //!
-//! The modules here are pure and unit-tested: request parsing/classification
-//! ([`k8s`]), the operator policy model ([`policy`]), and brokered-kubeconfig
-//! generation/validation ([`kubeconfig`]). The TLS-terminating server loop that
-//! wires them to a live apiserver builds on top of these.
+//! The modules here are pure and unit-tested: the protocol-neutral operation
+//! vocabulary ([`op`]), request parsing/classification ([`k8s`]), the operator
+//! policy model ([`policy`]), and brokered-kubeconfig generation/validation
+//! ([`kubeconfig`]). The TLS-terminating server loop that wires them to a live
+//! apiserver builds on top of these, asking every protocol-specific question
+//! through the [`protocol::ProtocolConfig`] plug-in surface; [`k8s_protocol`]
+//! is the Kubernetes reference implementation, and `github_protocol`/
+//! `vercel_protocol` are example configs proving the surface generalizes.
 
 pub mod gate;
+pub mod github_protocol;
 pub mod k8s;
+pub mod k8s_protocol;
 pub mod kubeconfig;
+pub mod op;
 pub mod policy;
+pub mod protocol;
 pub mod server;
 pub mod tls;
 pub mod upstream;
+pub mod vercel_protocol;
 
-pub use gate::{ApiMutation, ApiRevert, GateSink};
-pub use k8s::{ApiOp, Verb};
+pub use gate::{
+    ApiJudge, ApiJudgeVerdict, ApiMutation, ApiRequestSummary, GateSink, HoldDecision, HttpRevert,
+    RevertConstructible,
+};
+pub use github_protocol::GithubProtocol;
+pub use k8s_protocol::KubernetesProtocol;
 pub use kubeconfig::{brokered_kubeconfig, validate_brokered_kubeconfig, BrokerError};
+pub use op::{ApiOp, Verb};
 pub use policy::{ApiAction, ApiPolicy, ApiRule};
-pub use server::KubeProxy;
+pub use protocol::{CreatedIdentity, PlannedRevert, ProtocolConfig};
+pub use server::ApiProxy;
 pub use tls::ProxyTls;
-pub use upstream::Upstream;
+pub use upstream::{Upstream, UpstreamAuth};
+pub use vercel_protocol::VercelProtocol;

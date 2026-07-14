@@ -3,9 +3,10 @@
 //!
 //! A verb names a fixed binary and an argv template with typed, pattern-validated
 //! parameters. Rendering substitutes each `{param}` as exactly one argv element
-//! (no shell, no word-splitting), so parameter injection is structurally
-//! impossible. A verb declares its own reversibility class (which drives the
-//! consequence gate) and, for recoverable verbs, a structured rollback template.
+//! (no shell, no word-splitting), so a parameter value can never expand into
+//! extra, unintended arguments. A verb declares its own reversibility class
+//! (which drives the consequence gate) and, for recoverable verbs, a
+//! structured rollback template.
 //!
 //! The catalog is the "slow clock": it is a file only the operator (daemon UID)
 //! controls; agents cannot add or change verbs at runtime. A trusted verb may
@@ -27,14 +28,14 @@ use std::time::SystemTime;
 pub struct ParamSpec {
     /// Fully-anchored regex (`^...$`) the value must match. Rejected at load if
     /// not anchored, so a permissive pattern cannot silently allow a substring
-    /// with shell metacharacters or flag-injection.
+    /// with shell metacharacters or a value that gets reinterpreted as a flag.
     pub pattern: String,
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub required: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<String>,
     /// Allow a rendered value to begin with `-`. Off by default so a value can
-    /// never be smuggled in as an option flag (e.g. `-o ProxyCommand=...`).
+    /// never pass itself off as an option flag (e.g. `-o ProxyCommand=...`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_dash: bool,
 }
@@ -89,6 +90,20 @@ pub struct Verb {
     /// params, patterns, and class). Metadata only; never used in rendering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<String>,
+    /// True for a verb appended automatically by `gating::allow_promotion` from
+    /// repeated low-risk approvals, rather than authored or reviewed by an
+    /// operator. Metadata only; never used in rendering. Drives the staleness
+    /// check below: an operator-authored verb has no such expiry.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub auto_promoted: bool,
+    /// For an auto-promoted verb, a hash of the model + prompts that produced
+    /// it. If the daemon's current stamp (`Evaluator::verb_promotion_stamp`)
+    /// no longer matches, the trust that led to promotion no longer applies --
+    /// the caller downgrades `trusted` to `false` rather than trusting a
+    /// judgment made under a since-changed model or prompt. Ignored for a
+    /// verb that isn't `auto_promoted`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promotion_stamp: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,6 +124,12 @@ pub struct RenderedVerb {
     pub prompt_context: Option<String>,
     /// Validated params, recorded into the approval snapshot for the binding.
     pub params: BTreeMap<String, String>,
+    /// Mirrors `Verb::auto_promoted` / `Verb::promotion_stamp`. The caller
+    /// (`server::execute_command_inner`) downgrades `trusted` to `false` when
+    /// `auto_promoted` is true and `promotion_stamp` no longer matches the
+    /// daemon's current model/prompt stamp.
+    pub auto_promoted: bool,
+    pub promotion_stamp: Option<String>,
 }
 
 /// An operator-authored catalog of verbs plus a content version used to void
@@ -151,7 +172,7 @@ impl VerbCatalog {
     /// template placeholders that reference an undeclared param.
     pub fn from_yaml(text: &str) -> Result<Self> {
         let file: CatalogFile =
-            serde_yaml::from_str(text).context("failed to parse verb catalog")?;
+            serde_yaml_ng::from_str(text).context("failed to parse verb catalog")?;
         let mut verbs = BTreeMap::new();
         for verb in file.verbs {
             validate_verb(&verb)?;
@@ -262,12 +283,41 @@ impl VerbCatalog {
             trusted: verb.trusted,
             prompt_context: verb.prompt_context.clone(),
             params: resolved,
+            auto_promoted: verb.auto_promoted,
+            promotion_stamp: verb.promotion_stamp.clone(),
         })
     }
 
     /// The backing catalog file, if this catalog was loaded from one.
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
+    }
+
+    /// Reverse-match a raw `(binary, args)` command against the catalog: does
+    /// any verb's template unify with these concrete args? This lets a caller
+    /// that runs a tool directly (`kubectl get pods -n foo`) pick up a
+    /// matching verb's declared consequence class and trust the same way an
+    /// explicit `--verb` invocation would, without naming the verb -- the
+    /// mechanism that makes a catalog (hand-authored or auto-promoted) useful
+    /// for transparently gating a high-volume tool a caller invokes normally.
+    ///
+    /// Verbs are tried in name order (deterministic, since names are unique)
+    /// and the first template that both unifies with `args` AND passes full
+    /// parameter validation (`render`) wins; a shape that unifies but fails a
+    /// param's pattern is skipped, not treated as a match.
+    pub fn match_command(&self, binary: &str, args: &[String]) -> Option<RenderedVerb> {
+        for verb in self.verbs.values() {
+            if !binary_names_match(binary, &verb.binary) {
+                continue;
+            }
+            let Some(captured) = match_args_template(&verb.args, args) else {
+                continue;
+            };
+            if let Ok(rendered) = self.render(&verb.name, &captured) {
+                return Some(rendered);
+            }
+        }
+        None
     }
 
     /// Validate a candidate verb against this catalog: it must pass the same
@@ -320,36 +370,36 @@ impl VerbCatalog {
 /// not preserved across an append; the prose/evidence are stored in-band.)
 fn compose_appended_catalog(existing: &str, verb: &Verb) -> Result<String> {
     let body = existing.strip_prefix('\u{feff}').unwrap_or(existing);
-    let verb_value = serde_yaml::to_value(verb).context("failed to serialize verb")?;
+    let verb_value = serde_yaml_ng::to_value(verb).context("failed to serialize verb")?;
 
     if body.trim().is_empty() {
-        let mut map = serde_yaml::Mapping::new();
+        let mut map = serde_yaml_ng::Mapping::new();
         map.insert(
-            serde_yaml::Value::String("verbs".to_string()),
-            serde_yaml::Value::Sequence(vec![verb_value]),
+            serde_yaml_ng::Value::String("verbs".to_string()),
+            serde_yaml_ng::Value::Sequence(vec![verb_value]),
         );
-        return serde_yaml::to_string(&serde_yaml::Value::Mapping(map))
+        return serde_yaml_ng::to_string(&serde_yaml_ng::Value::Mapping(map))
             .context("failed to serialize the new catalog");
     }
 
-    let mut doc: serde_yaml::Value =
-        serde_yaml::from_str(body).context("the existing verb catalog is not valid YAML")?;
+    let mut doc: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(body).context("the existing verb catalog is not valid YAML")?;
     let map = doc
         .as_mapping_mut()
         .ok_or_else(|| anyhow::anyhow!("verb catalog is not a YAML mapping"))?;
-    let key = serde_yaml::Value::String("verbs".to_string());
-    let is_seq = matches!(map.get(&key), Some(serde_yaml::Value::Sequence(_)));
-    let is_null_or_absent = matches!(map.get(&key), None | Some(serde_yaml::Value::Null));
+    let key = serde_yaml_ng::Value::String("verbs".to_string());
+    let is_seq = matches!(map.get(&key), Some(serde_yaml_ng::Value::Sequence(_)));
+    let is_null_or_absent = matches!(map.get(&key), None | Some(serde_yaml_ng::Value::Null));
     if is_seq {
-        if let Some(serde_yaml::Value::Sequence(seq)) = map.get_mut(&key) {
+        if let Some(serde_yaml_ng::Value::Sequence(seq)) = map.get_mut(&key) {
             seq.push(verb_value);
         }
     } else if is_null_or_absent {
-        map.insert(key, serde_yaml::Value::Sequence(vec![verb_value]));
+        map.insert(key, serde_yaml_ng::Value::Sequence(vec![verb_value]));
     } else {
         bail!("the catalog's `verbs` key is not a sequence");
     }
-    serde_yaml::to_string(&doc).context("failed to serialize the updated catalog")
+    serde_yaml_ng::to_string(&doc).context("failed to serialize the updated catalog")
 }
 
 /// Binaries a synthesized verb may not use: shells and interpreters where a
@@ -410,8 +460,10 @@ const OVERBROAD_CANARIES: &[&str] = &[
 ];
 
 /// True if `name` is kebab-case (`^[a-z0-9][a-z0-9-]*$`), so it is unambiguously
-/// invokable on the `guard verb run <name>` command line.
-fn is_kebab_name(name: &str) -> bool {
+/// invokable on the `guard verb run <name>` command line. `pub(crate)`: also
+/// used by `gating::allow_promotion` to validate a model-proposed name before
+/// falling back to a deterministic one.
+pub(crate) fn is_kebab_name(name: &str) -> bool {
     let b = name.as_bytes();
     !b.is_empty()
         && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
@@ -427,6 +479,55 @@ fn binary_match_key(binary: &str) -> String {
         .or_else(|| base.strip_suffix(".EXE"))
         .unwrap_or(base);
     base.to_ascii_lowercase()
+}
+
+/// Binary-name match consistent with `gating::deny_shape::binary_matches` and
+/// `server::binary_allowed`: a path-qualified binary (either side) requires an
+/// exact match, so a binary reached via a different, path-qualified location
+/// (e.g. `/tmp/other/kubectl`) can never reverse-match a verb authored for the
+/// bare name, or vice versa; a bare name matches case-insensitively by
+/// basename with a stripped `.exe` suffix.
+fn binary_names_match(observed: &str, verb_binary: &str) -> bool {
+    if observed.contains('/')
+        || observed.contains('\\')
+        || verb_binary.contains('/')
+        || verb_binary.contains('\\')
+    {
+        return observed == verb_binary;
+    }
+    binary_match_key(observed) == binary_match_key(verb_binary)
+}
+
+/// Reject a shell/interpreter binary (see `SYNTH_BINARY_DENYLIST`): one
+/// argument to these could carry an arbitrary command, defeating the
+/// catalog's "no shell" guarantee. Shared by both synthesis paths below.
+fn validate_binary_not_shell(binary: &str, context: &str) -> Result<()> {
+    let key = binary_match_key(binary);
+    if SYNTH_BINARY_DENYLIST.contains(&key.as_str()) {
+        bail!(
+            "{context} binary '{}' is a shell/interpreter and is not allowed (one argument could \
+             carry an arbitrary command); author such a verb by hand if you truly need it",
+            binary
+        );
+    }
+    Ok(())
+}
+
+/// Reject a parameter pattern broad enough to admit whitespace or shell
+/// metacharacters (see `OVERBROAD_CANARIES`). Shared by both synthesis paths.
+fn validate_param_not_overbroad(pname: &str, spec: &ParamSpec, context: &str) -> Result<()> {
+    let re =
+        compile_anchored(&spec.pattern).with_context(|| format!("param '{}' pattern", pname))?;
+    if let Some(canary) = OVERBROAD_CANARIES.iter().find(|c| re.is_match(c)) {
+        bail!(
+            "{context} parameter '{}' pattern {:?} is too permissive (it matches {:?}); a verb \
+             parameter must be narrowly pinned and must not admit whitespace or shell metacharacters",
+            pname,
+            spec.pattern,
+            canary
+        );
+    }
+    Ok(())
 }
 
 /// Extra safety gate for verbs produced by `guard verb create --prompt`. The LLM
@@ -448,29 +549,91 @@ pub fn validate_synthesized_safety(verb: &Verb) -> Result<()> {
             verb.name
         );
     }
-    let key = binary_match_key(&verb.binary);
-    if SYNTH_BINARY_DENYLIST.contains(&key.as_str()) {
+    validate_binary_not_shell(&verb.binary, "synthesized verb")?;
+    for (pname, spec) in &verb.params {
+        validate_param_not_overbroad(pname, spec, "synthesized verb")?;
+    }
+    Ok(())
+}
+
+/// Safety gate for a verb `gating::allow_promotion` wants to append to the
+/// catalog automatically, with no operator review, from repeated low-risk LLM
+/// approvals. Deliberately stricter than `validate_synthesized_safety`, whose
+/// output a human still reviews before it becomes `trusted`:
+///
+/// - `trusted` MUST be true (that is the entire point of promotion) and
+///   `consequence` must not be `Irreversible` -- an irreversible verb holds
+///   for operator approval regardless of `trusted`, so promoting one buys no
+///   latency and only discards the per-instance LLM reasoning a human would
+///   otherwise see in the hold queue.
+/// - A `Recoverable` verb must carry a `revert`, and the revert's binary is
+///   held to the same shell/interpreter denylist as the forward command --
+///   the auto-revert envelope is what makes trusting a recoverable shape
+///   defensible, so an unverified or shell-based revert defeats the point.
+/// - Every parameter pattern must be a plain alternation of the exact,
+///   regex-escaped values observed in `evidence` (never a model-authored
+///   regex) and every evidence sample must re-match its own template -- this
+///   is enforced by the caller building the pattern this way in the first
+///   place, verified here from scratch rather than trusted.
+pub fn validate_auto_promoted_verb_safety(verb: &Verb, evidence: &[Vec<String>]) -> Result<()> {
+    if !verb.trusted {
+        bail!("an auto-promoted verb must be trusted (that is the point of promoting it)");
+    }
+    if verb.consequence == Reversibility::Irreversible {
         bail!(
-            "synthesized verb binary '{}' is a shell/interpreter and is not allowed (one argument \
-             could carry an arbitrary command); author such a verb by hand if you truly need it",
-            verb.binary
+            "an irreversible verb may never be auto-promoted: it always holds for operator \
+             approval regardless of `trusted`, so promoting it only discards the per-instance \
+             LLM reasoning a human reviewer would otherwise see"
         );
     }
+    if !is_kebab_name(&verb.name) {
+        bail!(
+            "auto-promoted verb name '{}' must be kebab-case (^[a-z0-9][a-z0-9-]*$)",
+            verb.name
+        );
+    }
+    validate_binary_not_shell(&verb.binary, "auto-promoted verb")?;
     for (pname, spec) in &verb.params {
-        let re = compile_anchored(&spec.pattern)
-            .with_context(|| format!("param '{}' pattern", pname))?;
-        if let Some(canary) = OVERBROAD_CANARIES.iter().find(|c| re.is_match(c)) {
+        validate_param_not_overbroad(pname, spec, "auto-promoted verb")?;
+    }
+    match verb.consequence {
+        Reversibility::Recoverable => {
+            let Some(revert) = &verb.revert else {
+                bail!("a recoverable verb may not be auto-promoted without a validated revert");
+            };
+            validate_binary_not_shell(&revert.binary, "auto-promoted verb revert")?;
+        }
+        Reversibility::Reversible => {}
+        Reversibility::Irreversible => unreachable!("rejected above"),
+    }
+    // Re-render every evidence sample against the verb's own template and
+    // confirm it reproduces exactly that sample -- never trust that the
+    // caller-supplied template and params actually correspond to the
+    // evidence they were derived from.
+    for sample in evidence {
+        let rendered = render_args(&verb.args, &render_map_for(verb, sample)?, &verb.name)?;
+        if &rendered != sample {
             bail!(
-                "synthesized verb parameter '{}' pattern {:?} is too permissive (it matches {:?}); \
-                 a verb parameter must be narrowly pinned and must not admit whitespace or shell \
-                 metacharacters",
-                pname,
-                spec.pattern,
-                canary
+                "auto-promoted verb '{}' template does not reproduce its own evidence {:?} \
+                 (rendered {:?}); refusing to promote",
+                verb.name,
+                sample,
+                rendered
             );
         }
     }
     Ok(())
+}
+
+/// Re-derive the param map that would render `verb.args` back into `sample`,
+/// by matching `sample` against the verb's own binary/args template. Used
+/// only by `validate_auto_promoted_verb_safety` to prove the template it is
+/// about to trust actually round-trips its own evidence.
+fn render_map_for(verb: &Verb, sample: &[String]) -> Result<BTreeMap<String, String>> {
+    let rendered = match_args_template(&verb.args, sample).ok_or_else(|| {
+        anyhow::anyhow!("evidence sample {:?} does not match the template", sample)
+    })?;
+    Ok(rendered)
 }
 
 /// Validate a verb at load time. A param pattern must be fully anchored and
@@ -523,8 +686,8 @@ fn validate_verb(verb: &Verb) -> Result<()> {
 
 /// Compile a parameter pattern as a fully-anchored, full-string regex. The
 /// operator's own outer `^`/`$` are stripped and the pattern is wrapped in
-/// `^(?:...)$`, so a top-level alternation (e.g. `^[a-z]+$|x`) cannot smuggle an
-/// unanchored branch that `is_match` would satisfy on a substring.
+/// `^(?:...)$`, so a top-level alternation (e.g. `^[a-z]+$|x`) cannot introduce
+/// an unanchored branch that `is_match` would satisfy on a substring.
 fn compile_anchored(pattern: &str) -> Result<Regex> {
     let inner = pattern.strip_prefix('^').unwrap_or(pattern);
     let inner = inner.strip_suffix('$').unwrap_or(inner);
@@ -588,6 +751,59 @@ fn render_args(
         .iter()
         .map(|t| render_token(t, params, verb))
         .collect()
+}
+
+/// Reverse-match a concrete argv against a verb's template tokens, extracting
+/// parameter values. Requires the exact same arity (no variadic templates): a
+/// template token with no placeholder must equal the observed token exactly;
+/// one with a single placeholder yields a value by stripping the template's
+/// literal prefix/suffix from the observed token. A token with more than one
+/// placeholder is not reverse-matchable and always fails the match (it
+/// remains invocable normally via an explicit `--verb` call, which resolves
+/// params by name rather than by position). The same parameter name appearing
+/// in more than one token must extract the same value everywhere, or the
+/// match fails.
+fn match_args_template(
+    templates: &[String],
+    observed: &[String],
+) -> Option<BTreeMap<String, String>> {
+    if templates.len() != observed.len() {
+        return None;
+    }
+    let mut params: BTreeMap<String, String> = BTreeMap::new();
+    for (template, value) in templates.iter().zip(observed.iter()) {
+        let names = placeholders(template);
+        match names.len() {
+            0 => {
+                if template != value {
+                    return None;
+                }
+            }
+            1 => {
+                let name = &names[0];
+                let marker = format!("{{{name}}}");
+                let idx = template.find(marker.as_str())?;
+                let prefix = &template[..idx];
+                let suffix = &template[idx + marker.len()..];
+                if value.len() < prefix.len() + suffix.len() {
+                    return None;
+                }
+                if !value.starts_with(prefix) || !value.ends_with(suffix) {
+                    return None;
+                }
+                let extracted = &value[prefix.len()..value.len() - suffix.len()];
+                match params.get(name) {
+                    Some(existing) if existing != extracted => return None,
+                    Some(_) => {}
+                    None => {
+                        params.insert(name.clone(), extracted.to_string());
+                    }
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(params)
 }
 
 #[cfg(test)]
@@ -654,7 +870,7 @@ verbs:
 
     #[test]
     fn flag_injection_is_rejected() {
-        // A value beginning with '-' must be refused (argv/flag injection).
+        // A value beginning with '-' must be refused (would be read as an argv flag).
         let yaml = r#"
 verbs:
   - name: ping-host
@@ -818,6 +1034,8 @@ verbs:
             prompt_context: None,
             source_prose: Some("read-only cmk listing of zones, networks, vms".to_string()),
             evidence: Some("read-only; resource pinned to an allow-list; reversible".to_string()),
+            auto_promoted: false,
+            promotion_stamp: None,
         };
         cat.append_verb(&verb).unwrap();
 
@@ -876,6 +1094,8 @@ verbs:
                 prompt_context: None,
                 source_prose: None,
                 evidence: None,
+                auto_promoted: false,
+                promotion_stamp: None,
             }
         };
 
@@ -910,6 +1130,8 @@ verbs:
             prompt_context: None,
             source_prose: None,
             evidence: None,
+            auto_promoted: false,
+            promotion_stamp: None,
         };
         cat.append_verb(&v).unwrap();
 
@@ -955,6 +1177,8 @@ verbs:
             prompt_context: None,
             source_prose: None,
             evidence: None,
+            auto_promoted: false,
+            promotion_stamp: None,
         }
     }
 
@@ -1057,5 +1281,132 @@ verbs:
                 "seed {seed:?} should gain the verb"
             );
         }
+    }
+
+    #[test]
+    fn match_command_reverse_matches_a_raw_command_against_a_template() {
+        let cat = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: k-get-pods
+    binary: kubectl
+    args: ["get", "pods", "-n", "{namespace}"]
+    params:
+      namespace: { pattern: "^(foo|bar)$" }
+    consequence: reversible
+    trusted: true
+"#,
+        )
+        .unwrap();
+
+        let r = cat
+            .match_command("kubectl", &args_vec(&["get", "pods", "-n", "foo"]))
+            .expect("should reverse-match");
+        assert_eq!(r.name, "k-get-pods");
+        assert_eq!(r.params.get("namespace").map(String::as_str), Some("foo"));
+        assert!(r.trusted);
+
+        // An enumerated-out-of-range value unifies positionally but fails
+        // the param's pattern at render time -- `match_command` must treat
+        // that as no match, not a match with an invalid binding.
+        assert!(cat
+            .match_command("kubectl", &args_vec(&["get", "pods", "-n", "prod"]))
+            .is_none());
+
+        // Wrong arity, wrong literal token, and wrong binary all fail to
+        // unify at all.
+        assert!(cat
+            .match_command("kubectl", &args_vec(&["get", "pods"]))
+            .is_none());
+        assert!(cat
+            .match_command("kubectl", &args_vec(&["delete", "pods", "-n", "foo"]))
+            .is_none());
+        assert!(cat
+            .match_command("helm", &args_vec(&["get", "pods", "-n", "foo"]))
+            .is_none());
+    }
+
+    #[test]
+    fn match_command_tries_verbs_in_name_order_and_skips_non_matching_ones() {
+        let cat = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: a-unrelated
+    binary: kubectl
+    args: ["delete", "pods"]
+    consequence: irreversible
+  - name: b-get-pods
+    binary: kubectl
+    args: ["get", "pods"]
+    consequence: reversible
+    trusted: true
+"#,
+        )
+        .unwrap();
+        let r = cat
+            .match_command("kubectl", &args_vec(&["get", "pods"]))
+            .expect("should match the second verb, not the first");
+        assert_eq!(r.name, "b-get-pods");
+    }
+
+    #[test]
+    fn match_command_rejects_path_qualified_spoof_like_binary_matching_does() {
+        let cat = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: k-get-pods
+    binary: kubectl
+    args: ["get", "pods"]
+    consequence: reversible
+    trusted: true
+"#,
+        )
+        .unwrap();
+        assert!(cat
+            .match_command("kubectl", &args_vec(&["get", "pods"]))
+            .is_some());
+        assert!(cat
+            .match_command("/tmp/evil/kubectl", &args_vec(&["get", "pods"]))
+            .is_none());
+        assert!(cat
+            .match_command("KUBECTL.EXE", &args_vec(&["get", "pods"]))
+            .is_some());
+    }
+
+    #[test]
+    fn match_args_template_extracts_single_placeholder_with_prefix_and_suffix() {
+        let templates = vec!["café-{n}-suffix".to_string()];
+        let observed = args_vec(&["café-7-suffix"]);
+        let captured = match_args_template(&templates, &observed).unwrap();
+        assert_eq!(captured.get("n").map(String::as_str), Some("7"));
+
+        // A value not honoring the literal prefix/suffix does not unify.
+        assert!(match_args_template(&templates, &args_vec(&["nope"])).is_none());
+    }
+
+    #[test]
+    fn match_args_template_requires_consistent_value_for_a_repeated_name() {
+        let templates = vec!["{x}".to_string(), "{x}".to_string()];
+        assert!(match_args_template(&templates, &args_vec(&["a", "a"])).is_some());
+        assert!(match_args_template(&templates, &args_vec(&["a", "b"])).is_none());
+    }
+
+    #[test]
+    fn match_args_template_declines_a_token_with_multiple_placeholders() {
+        let templates = vec!["{a}-{b}".to_string()];
+        // Ambiguous split point: not reverse-matchable, even though it would
+        // still be invocable via an explicit `--verb` call.
+        assert!(match_args_template(&templates, &args_vec(&["x-y"])).is_none());
+    }
+
+    #[test]
+    fn match_args_template_requires_exact_arity() {
+        let templates = vec!["a".to_string(), "b".to_string()];
+        assert!(match_args_template(&templates, &args_vec(&["a"])).is_none());
+        assert!(match_args_template(&templates, &args_vec(&["a", "b", "c"])).is_none());
+    }
+
+    fn args_vec(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
     }
 }

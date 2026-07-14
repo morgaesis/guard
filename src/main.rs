@@ -1,12 +1,17 @@
 //! guard - LLM-evaluated command gate for AI agents
 //!
-#![allow(unused)]
 
+mod cli_client;
+mod cli_secrets;
+mod cli_server;
+mod cli_shim;
 mod client_config;
+mod daemon_client;
+mod defaults;
+mod grant_profile;
 mod grant_rules;
 mod injection;
 mod mcp;
-mod redact;
 mod secrets;
 mod server;
 mod session;
@@ -19,6 +24,7 @@ mod winsvc;
 
 use guard::evaluate;
 use guard::learned_rules::{AutoShimMode, LearnedRuleStore, LearningConfig};
+use guard::redact;
 
 use anyhow::{Context, Result};
 use clap::{ArgAction, CommandFactory, Parser, Subcommand};
@@ -29,9 +35,25 @@ use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::fmt::format::Writer;
+use tracing_subscriber::fmt::time::FormatTime;
+use tracing_subscriber::{fmt as tracing_fmt, EnvFilter};
+
+use cli_client::{
+    handle_approval_note_cmd, handle_approvals, handle_config, handle_gate_action,
+    handle_provisionals, handle_session, handle_status, handle_verb, run_exec, run_mcp,
+    top_level_grant_to_session_command, GatingOptions, SshHostKeyCliMode,
+};
+use cli_secrets::handle_secrets;
+use cli_server::run_server;
+use cli_shim::handle_shim;
 
 #[derive(Parser)]
+#[command(
+    name = "guard",
+    about = "LLM-evaluated command gate for AI agents",
+    after_help = "Access model:\n  Non-admin local callers can run commands, manage their own secret namespace, read liveness status, list sessions with redaction, show a known session token, list/run verbs, inspect their own held approvals/provisionals, and manage local client setup.\n  Daemon-principal callers or TCP admin-token callers can grant/revoke/appeal sessions, approve/deny/confirm/revert gates, create verbs, read full daemon status, and inspect detailed secret ownership.\n\nUse `guard help-tree` for a categorized access summary."
+)]
 #[allow(clippy::large_enum_variant)]
 enum MainArgs {
     /// Execute a command through the guard server
@@ -74,6 +96,13 @@ enum MainArgs {
         /// should be allowed.
         #[arg(long = "reevaluate", action = ArgAction::SetTrue)]
         reevaluate: bool,
+        /// SSH host-key policy for a guarded `ssh` command. `only-existing`
+        /// (default) keeps ssh's strict checking; `accept-new` trusts a new
+        /// host on first contact but still rejects a changed key; `accept-all`
+        /// gives up host verification and never rides the deterministic fast
+        /// path. Only affects `ssh`.
+        #[arg(long = "hostkey", value_enum, default_value = "only-existing")]
+        hostkey: SshHostKeyCliMode,
         /// Binary to execute
         binary: String,
         /// Arguments to pass to the binary
@@ -84,15 +113,14 @@ enum MainArgs {
     #[clap(subcommand)]
     Server(ServerCommands),
 
-    /// Generate a container hardening profile (seccomp or AppArmor) to stdout.
-    #[clap(subcommand)]
-    Profile(ProfileCommands),
     /// Manage secrets
     #[clap(subcommand, alias = "secret")]
     Secrets(SecretCommands),
-    /// Install shim scripts for command interposition
+    /// Manage shim scripts for command interposition. Naming tools installs
+    /// their shims; bare `guard shim` lists what is installed.
     Shim {
-        /// Comma-separated list of tools to shim (e.g. ssh,kubectl,helm)
+        /// Comma-separated list of tools to shim (e.g. ssh,kubectl,helm);
+        /// required to install, omit to list installed shims
         #[arg(value_delimiter = ',')]
         tools: Option<Vec<String>>,
         /// List installed shims
@@ -123,7 +151,8 @@ enum MainArgs {
     /// Manage session grants (extra allow/deny for a specific session token)
     #[clap(subcommand)]
     Session(SessionCommands),
-    /// Shorthand for `guard session new <prose>` or `guard session grant <token> ...`
+    /// Shorthand for `guard session new <prose>` or `guard session grant <token> ...`.
+    /// Daemon-principal or TCP admin-token only when it installs or updates a grant.
     Grant {
         /// Opaque session token to update, or quoted prose to create a fresh session.
         token: Option<String>,
@@ -161,7 +190,12 @@ enum MainArgs {
         #[arg(long, value_name = "PATH")]
         socket: Option<String>,
     },
-    /// Ask the evaluator to amend or deny a session grant without executing the command
+    /// Ask the evaluator to amend or deny a session grant without executing the command.
+    /// Daemon-principal or TCP admin-token only.
+    //
+    // `disable_help_flag` so `guard appeal <binary> -h` forwards `-h` to the
+    // appealed command rather than printing this subcommand's help. Bare help
+    // (before a binary is named) is recovered by `passthrough_command_help_requested`.
     #[clap(
         disable_help_flag = true,
         after_help = "Use `guard appeal --session <token> <binary> --help` to pass --help to the appealed command."
@@ -186,6 +220,13 @@ enum MainArgs {
         #[arg(long)]
         socket: Option<String>,
     },
+    /// Print a categorized command tree with access markers.
+    #[clap(name = "help-tree")]
+    HelpTree {
+        /// Include daemon-principal/admin-token commands.
+        #[arg(long, action = ArgAction::SetTrue)]
+        admin: bool,
+    },
     /// List provisional (containment-envelope) executions awaiting confirmation.
     Provisionals {
         #[arg(long)]
@@ -198,7 +239,7 @@ enum MainArgs {
         #[arg(long)]
         socket: Option<String>,
     },
-    /// Revert a provisional now (manual rollback). Daemon-UID only.
+    /// Revert a provisional immediately (manual rollback). Daemon-UID only.
     Revert {
         handle: String,
         #[arg(long)]
@@ -281,23 +322,30 @@ enum VerbCommands {
 
 #[derive(Subcommand)]
 enum SessionCommands {
-    /// Mint a fresh session token (UUID-shaped). With any of --prompt /
-    /// --allow / --deny / --ttl, also installs the grant in one round
-    /// trip. Prints `export GUARD_SESSION=<token>` on stdout so you can
-    /// `eval $(guard session new ...)` to set it for the current shell.
+    /// Mint a fresh session token (32 lowercase hex chars). With grant prose or any
+    /// grant flags, also installs the grant in one round trip and requires
+    /// the daemon principal or TCP admin token. Prints `export
+    /// GUARD_SESSION=<token>` on stdout so you can `eval $(guard session
+    /// new ...)` to set it for the current shell.
     New {
         /// Prose describing the intended access. Known domains are compiled to
         /// static session rules; misses fall through to the LLM unless
         /// --static-only is set.
         #[arg(value_name = "PROSE")]
         prose: Option<String>,
+        /// Mint this grant from an operator-defined profile (see --profiles on
+        /// `guard server start`): a named {ttl, allow, deny, prompt} bundle.
+        /// Works standalone; an unknown name is rejected by the daemon.
+        #[arg(long, value_name = "NAME")]
+        profile: Option<String>,
         /// Glob pattern to allow in this session (repeatable)
         #[arg(long = "allow", value_name = "GLOB")]
         allow: Vec<String>,
         /// Glob pattern to deny in this session (repeatable, beats allow)
         #[arg(long = "deny", value_name = "GLOB")]
         deny: Vec<String>,
-        /// Time-to-live in seconds; omit for no expiry (cleared on daemon restart)
+        /// Time-to-live in seconds; omit for no expiry (grants persist in the
+        /// state DB and are reloaded on daemon restart)
         #[arg(long, value_name = "SECONDS")]
         ttl: Option<u64>,
         /// Free-form context appended to the LLM system prompt for this session.
@@ -319,7 +367,8 @@ enum SessionCommands {
         #[arg(long, value_name = "PATH")]
         socket: Option<String>,
     },
-    /// Grant a session token extra allow/deny patterns
+    /// Grant a session token extra allow/deny patterns.
+    /// Daemon-principal or TCP admin-token only.
     Grant {
         /// Opaque session token; the agent passes this as GUARD_SESSION or --session
         token: String,
@@ -334,7 +383,8 @@ enum SessionCommands {
         /// Glob pattern to deny in this session (repeatable, beats allow)
         #[arg(long = "deny", value_name = "GLOB")]
         deny: Vec<String>,
-        /// Time-to-live in seconds; omit for no expiry (cleared on daemon restart)
+        /// Time-to-live in seconds; omit for no expiry (grants persist in the
+        /// state DB and are reloaded on daemon restart)
         #[arg(long, value_name = "SECONDS")]
         ttl: Option<u64>,
         /// Free-form context appended to the LLM system prompt for evaluator
@@ -360,6 +410,11 @@ enum SessionCommands {
         socket: Option<String>,
     },
     /// Ask the evaluator to amend or deny a session grant without executing the command.
+    /// Daemon-principal or TCP admin-token only.
+    //
+    // `disable_help_flag`: same rationale as the top-level `Appeal` variant --
+    // `-h`/`--help` after the binary must reach the appealed command. Bare help is
+    // recovered by `passthrough_command_help_requested`.
     #[clap(
         disable_help_flag = true,
         after_help = "Use `guard session appeal <token> <binary> --help` to pass --help to the appealed command."
@@ -376,7 +431,7 @@ enum SessionCommands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Revoke a session grant
+    /// Revoke a session grant. Daemon-principal or TCP admin-token only.
     Revoke {
         /// Session token to revoke.
         token: String,
@@ -384,10 +439,12 @@ enum SessionCommands {
         #[arg(long, value_name = "PATH")]
         socket: Option<String>,
     },
-    /// Show one session in detail, including prompt, aggregate stats, and recent interactions.
+    /// Show one session in detail, including prompt, aggregate stats, and recent
+    /// interactions. With no token, defaults to the caller's own `$GUARD_SESSION`.
+    /// A non-daemon caller may only inspect the grant on its own token.
     Show {
-        /// Session token to inspect.
-        token: String,
+        /// Session token to inspect. Defaults to $GUARD_SESSION when omitted.
+        token: Option<String>,
         /// Number of recent interactions to print.
         #[arg(long, value_name = "N", default_value_t = 20)]
         limit: usize,
@@ -466,27 +523,6 @@ fn parse_env_bool(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
     )
-}
-
-#[derive(Subcommand)]
-enum ProfileCommands {
-    /// Emit a seccomp profile (use via `--security-opt seccomp=<file>` on
-    /// Docker/Podman). Default-allow with container-escape and host-tampering
-    /// syscalls denied.
-    Seccomp,
-    /// Emit an AppArmor profile confining the daemon to its binary, data
-    /// directory, and child-command execution, denying host tampering.
-    Apparmor {
-        /// AppArmor profile name.
-        #[arg(long, default_value = "guard")]
-        name: String,
-        /// Absolute path to the guard binary the profile attaches to.
-        #[arg(long, default_value = "/usr/local/bin/guard")]
-        exe: String,
-        /// Data directory (state + brokered credentials) guard may read/write.
-        #[arg(long = "data-dir", default_value = "/var/lib/guard")]
-        data_dir: String,
-    },
 }
 
 #[derive(Subcommand)]
@@ -654,6 +690,40 @@ enum ServerCommands {
         #[arg(long, value_name = "N")]
         learn_deny_min_denials: Option<u32>,
 
+        /// Auto-promote trusted verbs from repeated low-risk LLM approvals
+        /// (requires --gate consequence: promotion is keyed on the
+        /// reversibility class the gate produces). On by default. Unlike
+        /// --learn-rules, this needs no operator step: a qualifying shape is
+        /// appended straight to the verb catalog as `trusted`, restricted to
+        /// reversible/recoverable-with-a-validated-revert shapes -- an
+        /// irreversible command is never eligible, since it always holds for
+        /// operator approval regardless of `trusted`. See
+        /// `gating::allow_promotion` for the full safety rationale.
+        /// Env: GUARD_LEARN_ALLOW.
+        #[arg(
+            long,
+            action = ArgAction::Set,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            value_name = "BOOL",
+            overrides_with = "no_learn_allow"
+        )]
+        learn_allow: Option<bool>,
+
+        /// Disable auto-promotion of trusted verbs.
+        #[arg(long = "no-learn-allow", action = ArgAction::SetTrue, overrides_with = "learn_allow")]
+        no_learn_allow: bool,
+
+        /// Path to the auto-verb-promotion observation state YAML (bookkeeping
+        /// only; promoted verbs themselves land in --verbs). Env: GUARD_LEARN_ALLOW_STATE.
+        #[arg(long, value_name = "PATH")]
+        learn_allow_state: Option<PathBuf>,
+
+        /// LLM approvals of the same shape required before attempting to
+        /// promote a trusted verb. Env: GUARD_LEARN_ALLOW_MIN_APPROVALS.
+        #[arg(long, value_name = "N")]
+        learn_allow_min_approvals: Option<u32>,
+
         /// Evaluate policy but do not execute approved commands.
         /// Env: GUARD_DRY_RUN.
         #[arg(long = "dry-run", action = ArgAction::SetTrue)]
@@ -678,7 +748,7 @@ enum ServerCommands {
         system_prompt_append: Option<PathBuf>,
 
         /// Consequence gating: `off` (default) or `consequence`. When enabled,
-        /// LLM-approved commands are routed by reversibility — reversible runs
+        /// LLM-approved commands are routed by reversibility - reversible runs
         /// immediately, recoverable runs behind an auto-revert envelope, and
         /// irreversible is held for operator approval. Requires a Unix-socket
         /// listener (incompatible with --tcp-port). Env: GUARD_GATE.
@@ -690,6 +760,13 @@ enum ServerCommands {
         /// Env: GUARD_VERBS.
         #[arg(long, value_name = "PATH")]
         verbs: Option<PathBuf>,
+
+        /// Path to the session-grant profile catalog YAML: operator-authored,
+        /// named {ttl, allow, deny, prompt} bundles that `guard session new
+        /// --profile <name>` mints a grant from. Read once at startup.
+        /// Env: GUARD_PROFILES.
+        #[arg(long, value_name = "PATH")]
+        profiles: Option<PathBuf>,
 
         /// Restrict which binaries the server may execute, regardless of the LLM
         /// decision. Repeat or comma-separate (e.g. `--allow-bin kubectl,git`).
@@ -707,6 +784,38 @@ enum ServerCommands {
         /// comma-separate. Env: GUARD_CHILD_ENV (comma-separated).
         #[arg(long = "child-env", value_name = "VAR[,VAR]", value_delimiter = ',')]
         child_env: Option<Vec<String>>,
+
+        /// Front an HTTP API with a TLS-terminating, protocol-aware proxy on
+        /// ADDR (loopback only). --api-protocol selects the protocol (default
+        /// kubernetes, which takes its upstream and credentials from
+        /// --kubeconfig); github and vercel require --api-upstream and a bearer
+        /// token via --api-token-env or --api-token-file. Env: GUARD_API_PROXY.
+        #[arg(long = "api-proxy", value_name = "ADDR")]
+        api_proxy: Option<String>,
+
+        /// Protocol parser for --api-proxy: kubernetes, github, or vercel. Env:
+        /// GUARD_API_PROTOCOL.
+        #[arg(long = "api-protocol", value_name = "NAME")]
+        api_protocol: Option<String>,
+
+        /// Base upstream URL for --api-proxy. Env: GUARD_API_UPSTREAM.
+        #[arg(long = "api-upstream", value_name = "URL")]
+        api_upstream: Option<String>,
+
+        /// Environment variable containing the upstream bearer token. Env:
+        /// GUARD_API_TOKEN_ENV.
+        #[arg(long = "api-token-env", value_name = "VAR")]
+        api_token_env: Option<String>,
+
+        /// File containing the upstream bearer token. Env:
+        /// GUARD_API_TOKEN_FILE.
+        #[arg(long = "api-token-file", value_name = "PATH")]
+        api_token_file: Option<PathBuf>,
+
+        /// Write the proxy CA certificate PEM here for generic API clients.
+        /// Env: GUARD_API_CA_OUT.
+        #[arg(long = "api-ca-out", value_name = "PATH")]
+        api_ca_out: Option<PathBuf>,
 
         /// Front the Kubernetes apiserver with a TLS-terminating proxy on ADDR
         /// (e.g. 127.0.0.1:8443). Each API request from a brokered client (helm,
@@ -738,6 +847,49 @@ enum ServerCommands {
         /// Env: GUARD_BROKERED_KUBECONFIG_OUT.
         #[arg(long = "brokered-kubeconfig-out", value_name = "PATH")]
         brokered_kubeconfig_out: Option<PathBuf>,
+
+        /// Escalate a policy-allowed proxy request to the operator hold queue
+        /// when its shape (verb x resource x namespace, object name excluded)
+        /// has been seen fewer than N times this run, so a broad allow rule
+        /// fails toward review on a rare or first-seen shape. Requires
+        /// --gate consequence (the hold queue). 0 (default) disables it.
+        /// Env: GUARD_API_RARITY_ESCALATION.
+        #[arg(long = "api-rarity-escalation", value_name = "N")]
+        api_rarity_escalation: Option<u64>,
+
+        /// Auto-learn exact API request shapes from repeated evaluator verdicts
+        /// on proxied evaluate traffic. On by default. Learned denies
+        /// fast-reject the same tuple; learned allows reuse the stored
+        /// risk/reversibility and still pass through consequence gating. Env:
+        /// GUARD_API_PROMOTION.
+        #[arg(
+            long = "api-promotion",
+            action = ArgAction::Set,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            value_name = "BOOL",
+            overrides_with = "no_api_promotion"
+        )]
+        api_promotion: Option<bool>,
+
+        /// Disable API request shape learning.
+        #[arg(long = "no-api-promotion", action = ArgAction::SetTrue, overrides_with = "api_promotion")]
+        no_api_promotion: bool,
+
+        /// Path to the API request shape learning state YAML.
+        /// Env: GUARD_API_PROMOTION_STATE.
+        #[arg(long = "api-promotion-state", value_name = "PATH")]
+        api_promotion_state: Option<PathBuf>,
+
+        /// Evaluator approvals of the same API shape required before a learned
+        /// allow fast path is active. Env: GUARD_API_PROMOTION_MIN_APPROVALS.
+        #[arg(long = "api-promotion-min-approvals", value_name = "N")]
+        api_promotion_min_approvals: Option<u32>,
+
+        /// Evaluator denials of the same API shape required before a learned
+        /// deny fast path is active. Env: GUARD_API_PROMOTION_MIN_DENIALS.
+        #[arg(long = "api-promotion-min-denials", value_name = "N")]
+        api_promotion_min_denials: Option<u32>,
 
         /// Internal marker: launched under the Windows Service Control Manager.
         /// The Windows installer sets this in the service binPath so startup
@@ -901,12 +1053,18 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Log level: RUST_LOG > GUARD_LOG_LEVEL > "info"
+    // Log level: RUST_LOG > GUARD_LOG_LEVEL > "warn"
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         let level = guard_env("LOG_LEVEL").unwrap_or_else(|| "warn".to_string());
         EnvFilter::new(level)
     });
-    fmt().with_env_filter(filter).with_target(true).init();
+    tracing_fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .with_timer(UtcTimestamp)
+        .with_ansi(color_enabled_for_stderr())
+        .with_writer(std::io::stderr)
+        .init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -924,8 +1082,8 @@ async fn main() -> Result<()> {
         );
         return Ok(());
     }
-    if run_help_requested(&args) {
-        return print_run_help();
+    if let Some((path, bin_name)) = passthrough_command_help_requested(&args) {
+        return print_nested_help(&path, bin_name);
     }
 
     let result = MainArgs::try_parse_from(std::env::args());
@@ -939,6 +1097,7 @@ async fn main() -> Result<()> {
             require_approval,
             wait_approval,
             reevaluate,
+            hostkey,
             binary,
             args,
         }) => {
@@ -951,10 +1110,9 @@ async fn main() -> Result<()> {
                 wait_approval,
                 reevaluate,
             };
-            run_exec(binary, args, env_vars, secret_vars, gating).await
+            run_exec(binary, args, env_vars, secret_vars, gating, hostkey.into()).await
         }
         Ok(MainArgs::Server(cmd)) => run_server(cmd).await,
-        Ok(MainArgs::Profile(cmd)) => handle_profile(cmd),
         Ok(MainArgs::Provisionals { socket }) => handle_provisionals(socket).await,
         Ok(MainArgs::Confirm { handle, socket }) => {
             handle_gate_action(socket, "confirm", handle).await
@@ -1035,6 +1193,10 @@ async fn main() -> Result<()> {
             .await
         }
         Ok(MainArgs::Status { socket }) => handle_status(socket).await,
+        Ok(MainArgs::HelpTree { admin }) => {
+            print_help_tree(admin);
+            Ok(())
+        }
         Err(ref e)
             if e.kind() == clap::error::ErrorKind::DisplayHelp
                 || e.kind() == clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
@@ -1044,6 +1206,7 @@ async fn main() -> Result<()> {
             e.exit();
         }
         Err(e) => {
+            log_cli_usage_error(&args, &e);
             eprintln!("{}", e);
             std::process::exit(1);
         }
@@ -1060,3259 +1223,270 @@ fn top_level_version_requested(args: &[String]) -> bool {
     }
 }
 
-fn run_help_requested(args: &[String]) -> bool {
-    matches!(args.first().map(String::as_str), Some("run" | "exec"))
-        && matches!(args.get(1).map(String::as_str), Some("--help" | "-h"))
-        && args.len() == 2
-}
-
-fn print_run_help() -> Result<()> {
-    let command = MainArgs::command();
-    let mut run = command
-        .find_subcommand("run")
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("internal error: run help is unavailable"))?;
-    run = run.bin_name("guard run");
-    run.print_help()?;
-    println!();
-    Ok(())
-}
-
-#[cfg(unix)]
-fn current_uid() -> u32 {
-    unsafe { libc::geteuid() as u32 }
-}
-
-fn default_state_db_path() -> Option<PathBuf> {
-    default_guard_state_dir().map(|dir| dir.join("state.db"))
-}
-
-fn default_learned_rules_path() -> Option<PathBuf> {
-    default_guard_state_dir().map(|dir| dir.join("learned-rules.yaml"))
-}
-
-fn default_deny_shapes_path() -> Option<PathBuf> {
-    default_guard_state_dir().map(|dir| dir.join("learned-deny.yaml"))
-}
-
-fn default_guard_state_dir() -> Option<PathBuf> {
-    if let Some(dir) = dirs::state_dir() {
-        return Some(dir.join("guard"));
-    }
-    if let Some(dir) = dirs::data_local_dir() {
-        return Some(dir.join("guard"));
-    }
-    dirs::home_dir().map(|dir| dir.join(".guard"))
-}
-
-fn handle_profile(cmd: ProfileCommands) -> Result<()> {
-    match cmd {
-        ProfileCommands::Seccomp => {
-            println!("{}", guard::profile::seccomp_json());
-        }
-        ProfileCommands::Apparmor {
-            name,
-            exe,
-            data_dir,
-        } => {
-            print!(
-                "{}",
-                guard::profile::apparmor_profile(&name, &exe, &data_dir)
-            );
-        }
-    }
-    Ok(())
-}
-
-async fn run_server(cmd: ServerCommands) -> Result<()> {
-    match cmd {
-        ServerCommands::Start {
-            socket,
-            tcp_port,
-            auth_token,
-            admin_token,
-            socket_group,
-            users,
-            policy,
-            shim_dir,
-            llm_api_key,
-            llm_api_url,
-            llm_model,
-            llm_timeout,
-            llm_retries,
-            llm_models,
-            llm,
-            no_llm,
-            no_redact,
-            preflight,
-            no_cache,
-            cache_capacity,
-            cache_ttl,
-            learn_rules,
-            learned_rules,
-            learn_min_approvals,
-            learn_max_risk,
-            learn_shims,
-            learn_deny,
-            no_learn_deny,
-            deny_shapes,
-            learn_deny_min_denials,
-            dry_run,
-            state_db,
-            exec_as_caller,
-            system_prompt,
-            system_prompt_append,
-            gate,
-            verbs,
-            allow_bin,
-            child_env,
-            kube_proxy,
-            kubeconfig,
-            kube_context,
-            api_policy,
-            brokered_kubeconfig_out,
-            // Consumed in `main` (Windows SCM dispatch); irrelevant to the
-            // server run itself, which is identical in service and foreground.
-            service: _,
-        } => {
-            tracing::info!("Starting guard server...");
-
-            // Resolve consequence-gating mode: flag > GUARD_GATE env > off.
-            let gate_mode: guard::gating::GateMode = gate
-                .or_else(|| guard_env("GATE").filter(|v| !v.is_empty()))
-                .map(|v| v.parse())
-                .transpose()
-                .map_err(anyhow::Error::msg)
-                .context("invalid --gate value (expected 'off' or 'consequence')")?
-                .unwrap_or_default();
-            if gate_mode.is_on() {
-                tracing::info!("Consequence gating enabled (mode: {})", gate_mode);
-            }
-
-            // --users is a Unix-uid allow-list enforced via SO_PEERCRED. The
-            // Windows named-pipe transport authenticates peers by SID, so the
-            // flag has no effect there; fail fast rather than silently ignore a
-            // security control.
-            #[cfg(windows)]
-            if users.as_deref().is_some_and(|s| !s.trim().is_empty()) {
-                anyhow::bail!(
-                    "--users is not supported on Windows (the named-pipe transport authenticates peers by SID, not Unix uid); restrict access via the pipe ACL instead"
-                );
-            }
-
-            let configured_socket = socket.map(PathBuf::from).or_else(|| {
-                let config = client_config::ClientConfig::load().ok()?;
-                config.server_socket.map(PathBuf::from)
-            });
-            // Local transport: a Unix-domain socket on Unix, a named pipe on
-            // Windows (winplat::pipe_name maps `--socket <name>` to
-            // \\.\pipe\<name>). On Unix it also falls back to a home-dir default.
-            #[cfg(unix)]
-            let socket_path = configured_socket
-                .or_else(|| dirs::home_dir().map(|h| h.join(".guard").join("guard.sock")));
-            #[cfg(windows)]
-            let socket_path = configured_socket;
-
-            // TCP loopback is the Windows no-flag default, but only when no named
-            // pipe was selected; an explicit --socket chooses the pipe instead.
-            let tcp_port = tcp_port
-                .or_else(|| guard_env("TCP_PORT").and_then(|v| v.parse::<u16>().ok()))
-                .or({
-                    #[cfg(windows)]
-                    {
-                        if socket_path.is_none() {
-                            Some(8123)
-                        } else {
-                            None
-                        }
-                    }
-                    #[cfg(not(windows))]
-                    {
-                        None
-                    }
-                });
-
-            // Consequence gating is principal-scoped: only a kernel-verified
-            // local peer (a Unix-socket uid or a Windows named-pipe SID) can be
-            // the operator. A TCP listener carries only a bearer token, so it
-            // both cannot reach the operator gate and needlessly widens the exec
-            // surface. Enforce on the FINAL resolved transport — after --tcp-port,
-            // GUARD_TCP_PORT, and the platform default — so an env-set TCP
-            // port cannot slip a listener in beside the gate.
-            if gate_mode.is_on() {
-                if tcp_port.is_some() {
-                    anyhow::bail!(
-                        "--gate consequence is incompatible with a TCP listener (--tcp-port or GUARD_TCP_PORT); the operator approval gate is principal-scoped and unreachable over TCP. Use a local socket via --socket."
-                    );
-                }
-                if socket_path.is_none() {
-                    anyhow::bail!(
-                        "--gate consequence requires a local listener: pass --socket (a Unix-domain socket on Unix, a named pipe on Windows). TCP carries no peer identity and cannot reach the operator approval gate."
-                    );
-                }
-            }
-
-            if let Some(ref path) = socket_path {
-                tracing::info!("Socket: {}", path.display());
-            }
-            if let Some(port) = tcp_port {
-                tracing::info!("TCP: 127.0.0.1:{}", port);
-            }
-            let auth_token = auth_token
-                .filter(|token| !token.is_empty())
-                .or_else(|| guard_env("AUTH_TOKEN").filter(|token| !token.is_empty()));
-            if tcp_port.is_some() && auth_token.is_none() {
-                anyhow::bail!(
-                    "TCP server requires --auth-token or GUARD_AUTH_TOKEN; configure clients with `guard config set-token`"
-                );
-            }
-            let admin_token = admin_token
-                .filter(|token| !token.is_empty())
-                .or_else(|| guard_env("ADMIN_TOKEN").filter(|token| !token.is_empty()));
-            if tcp_port.is_some() && admin_token.is_none() {
-                tracing::warn!(
-                    "TCP admin RPCs other than ping are disabled; set --admin-token or GUARD_ADMIN_TOKEN to use guard grant/status over TCP"
-                );
-            }
-
-            let shim_dir =
-                shim_dir.or_else(|| dirs::home_dir().map(|h| h.join(".guard").join("shims")));
-
-            if let Some(ref dir) = shim_dir {
-                tracing::info!("Shim dir (nested evaluation): {}", dir.display());
-            }
-
-            let allowed_uids: Option<Vec<u32>> =
-                users.map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect());
-            tracing::info!("Allowed UIDs: {:?}", allowed_uids);
-
-            let dry_run = dry_run
-                || guard_env("DRY_RUN")
-                    .as_deref()
-                    .map(parse_env_bool)
-                    .unwrap_or(false);
-            if dry_run {
-                tracing::warn!("Dry-run mode enabled: approved commands will not be executed");
-            }
-
-            let state_db_path = state_db
-                .or_else(|| {
-                    guard_env("STATE_DB")
-                        .filter(|value| !value.is_empty())
-                        .map(PathBuf::from)
-                })
-                .or_else(default_state_db_path);
-            if let Some(ref path) = state_db_path {
-                tracing::info!("State DB: {}", path.display());
-            }
-
-            let exec_as_caller = exec_as_caller
-                || guard_env("EXEC_AS_CALLER")
-                    .as_deref()
-                    .map(parse_env_bool)
-                    .unwrap_or(false);
-            if exec_as_caller {
-                #[cfg(windows)]
-                anyhow::bail!(
-                    "--exec-as-caller is not supported on Windows; the daemon executes approved commands as its own service account"
-                );
-                #[cfg(unix)]
-                {
-                    let daemon_uid = current_uid();
-                    if daemon_uid != 0 {
-                        anyhow::bail!("--exec-as-caller requires the daemon to start as root");
-                    }
-                    if tcp_port.is_some() {
-                        anyhow::bail!(
-                            "--exec-as-caller requires a unix socket only; TCP callers do not carry a trusted local UID"
-                        );
-                    }
-                    tracing::info!("Approved commands will execute as the connecting unix uid");
-                }
-            }
-
-            let llm_enabled = resolve_bool_flag(llm, no_llm, true);
-            if !llm_enabled {
-                tracing::info!("LLM evaluation disabled (static policy only)");
-            }
-
-            let api_key = llm_api_key
-                .or_else(|| guard_env("LLM_API_KEY"))
-                .or_else(|| std::env::var("OPENROUTER_API_KEY").ok());
-
-            if llm_enabled && api_key.is_none() {
-                tracing::warn!("No LLM API key provided (set GUARD_LLM_API_KEY, OPENROUTER_API_KEY, or --llm-api-key)");
-            }
-
-            let resolved_timeout = llm_timeout
-                .or_else(|| guard_env("LLM_TIMEOUT").and_then(|v| v.parse::<u64>().ok()))
-                .unwrap_or(30);
-            let mut eval_config = evaluate::EvalConfig::default()
-                .llm_enabled(llm_enabled)
-                .gate_mode(gate_mode)
-                .llm_timeout_secs(resolved_timeout);
-
-            if let Some(api_key) = api_key.filter(|value| !value.is_empty()) {
-                eval_config = eval_config.llm_api_key(api_key);
-            }
-
-            let resolved_api_url = llm_api_url
-                .filter(|value| !value.is_empty())
-                .or_else(|| guard_env("LLM_API_URL").filter(|value| !value.is_empty()));
-            if let Some(api_url) = resolved_api_url {
-                eval_config = eval_config.llm_api_url(api_url);
-            }
-
-            // Model resolution precedence (single primary model):
-            //   1. --llm-model CLI flag
-            //   2. GUARD_LLM_MODEL env var (singular — primary model)
-            //   3. evaluate::EvalConfig default (DEFAULT_MODEL in evaluate.rs)
-            //
-            // The fallback chain (GUARD_LLM_MODELS / --llm-models) is
-            // resolved separately below and, when set, takes precedence over
-            // the single-model value above because a chain is an explicit
-            // opt-in to multi-model evaluation.
-            let resolved_single_model = llm_model
-                .filter(|value| !value.is_empty())
-                .or_else(|| guard_env("LLM_MODEL").filter(|v| !v.is_empty()));
-            if let Some(model) = resolved_single_model {
-                eval_config = eval_config.llm_model(model);
-            }
-
-            // Retries: flag > env var > default.
-            let retries = llm_retries
-                .or_else(|| guard_env("LLM_RETRIES").and_then(|v| v.parse::<u32>().ok()))
-                .unwrap_or(2);
-            eval_config = eval_config.llm_retries(retries);
-            tracing::info!("LLM retries per model: {}", retries);
-
-            // Fallback chain: flag > env var > empty (no chain, single model).
-            // When non-empty this supersedes the single-model value above.
-            let models_chain: Vec<String> = llm_models
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|s| !s.is_empty())
-                .collect::<Vec<_>>();
-            let models_chain = if models_chain.is_empty() {
-                guard_env("LLM_MODELS")
-                    .map(|v| {
-                        v.split(',')
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default()
-            } else {
-                models_chain
-            };
-            if !models_chain.is_empty() {
-                tracing::info!("LLM model fallback chain: {:?}", models_chain);
-                eval_config = eval_config.llm_models(models_chain);
-            }
-
-            let mode = guard_env("MODE")
-                .and_then(|value| PolicyMode::parse(&value))
-                .unwrap_or(PolicyMode::Readonly);
-
-            tracing::info!("Using built-in {} policy mode", mode.as_str());
-            eval_config = eval_config.mode(mode);
-
-            if let Some(ref policy_path) = policy {
-                tracing::info!("Loading static policy from: {}", policy_path);
-                eval_config = eval_config.policy_path(PathBuf::from(policy_path));
-            }
-
-            if let Some(ref prompt_path) = system_prompt {
-                tracing::info!("Loading system prompt from: {}", prompt_path.display());
-                eval_config = eval_config.system_prompt_path(prompt_path.clone());
-            }
-
-            // Cache: flag disable wins, else env GUARD_CACHE=false disables.
-            // Capacity and TTL: flag > env > default.
-            let cache_env_enabled = guard_env("CACHE")
-                .as_deref()
-                .map(parse_env_bool)
-                .unwrap_or(true);
-            let cache_enabled = !no_cache && cache_env_enabled;
-            let cache_capacity = cache_capacity
-                .or_else(|| guard_env("CACHE_CAPACITY").and_then(|v| v.parse::<usize>().ok()))
-                .unwrap_or(evaluate::DEFAULT_CACHE_CAPACITY);
-            let cache_ttl_secs = cache_ttl
-                .or_else(|| guard_env("CACHE_TTL").and_then(|v| v.parse::<u64>().ok()))
-                .unwrap_or(evaluate::DEFAULT_CACHE_TTL_SECS);
-            eval_config = eval_config
-                .cache_enabled(cache_enabled)
-                .cache_capacity(cache_capacity)
-                .cache_ttl(std::time::Duration::from_secs(cache_ttl_secs));
-            if !cache_enabled {
-                tracing::info!("LLM decision cache disabled");
-            }
-
-            let learning_enabled = learn_rules
-                || guard_env("LEARN_RULES")
-                    .as_deref()
-                    .map(parse_env_bool)
-                    .unwrap_or(false);
-            if learning_enabled {
-                let learned_rules_path = learned_rules
-                    .or_else(|| {
-                        guard_env("LEARNED_RULES")
-                            .filter(|value| !value.is_empty())
-                            .map(PathBuf::from)
-                    })
-                    .or_else(default_learned_rules_path)
-                    .ok_or_else(|| anyhow::anyhow!("could not determine learned rules path"))?;
-                let mut learning_config = LearningConfig::new(learned_rules_path.clone());
-                learning_config.min_approvals = learn_min_approvals
-                    .or_else(|| {
-                        guard_env("LEARN_MIN_APPROVALS").and_then(|v| v.parse::<u32>().ok())
-                    })
-                    .unwrap_or(learning_config.min_approvals)
-                    .max(1);
-                learning_config.max_risk = learn_max_risk
-                    .or_else(|| guard_env("LEARN_MAX_RISK").and_then(|v| v.parse::<i32>().ok()))
-                    .unwrap_or(learning_config.max_risk)
-                    .clamp(0, 10);
-                let shim_mode = learn_shims
-                    .or_else(|| guard_env("LEARN_SHIMS"))
-                    .and_then(|value| AutoShimMode::parse(&value))
-                    .unwrap_or(learning_config.auto_shim);
-                learning_config.auto_shim = shim_mode;
-                let store = LearnedRuleStore::load(learning_config).with_context(|| {
-                    format!(
-                        "failed to load learned rules from {}",
-                        learned_rules_path.display()
-                    )
-                })?;
-                tracing::info!(
-                    "Learned-rule candidate detection enabled: path={} min_approvals={} max_risk={} shims={}",
-                    store.path().display(),
-                    store.min_approvals(),
-                    store.max_risk(),
-                    store.auto_shim().as_str()
-                );
-                eval_config = eval_config.learned_rules(Arc::new(RwLock::new(store)));
-            }
-
-            let deny_learning_enabled = if no_learn_deny {
-                false
-            } else {
-                learn_deny
-                    .or_else(|| guard_env("LEARN_DENY").map(|v| parse_env_bool(&v)))
-                    .unwrap_or(true)
-            };
-            if deny_learning_enabled {
-                let deny_shapes_path = deny_shapes
-                    .or_else(|| {
-                        guard_env("DENY_SHAPES")
-                            .filter(|value| !value.is_empty())
-                            .map(PathBuf::from)
-                    })
-                    .or_else(default_deny_shapes_path)
-                    .ok_or_else(|| anyhow::anyhow!("could not determine deny-shapes path"))?;
-                let mut deny_config =
-                    guard::gating::deny_shape::DenyLearningConfig::new(deny_shapes_path.clone());
-                deny_config.min_denials = learn_deny_min_denials
-                    .or_else(|| {
-                        guard_env("LEARN_DENY_MIN_DENIALS").and_then(|v| v.parse::<u32>().ok())
-                    })
-                    .unwrap_or(deny_config.min_denials)
-                    .max(1);
-                let store = guard::gating::deny_shape::DenyShapeStore::load(deny_config)
-                    .with_context(|| {
-                        format!(
-                            "failed to load deny shapes from {}",
-                            deny_shapes_path.display()
-                        )
-                    })?;
-                tracing::info!(
-                    "Auto-learned deny shapes enabled: path={} min_denials={}",
-                    store.path().display(),
-                    store.min_denials()
-                );
-                eval_config = eval_config.deny_shapes(Arc::new(RwLock::new(store)));
-            }
-
-            // Additive prompt: append to base prompt without replacing it.
-            // Priority: --system-prompt-append flag > GUARD_PROMPT_APPEND env var
-            let append_path = system_prompt_append.or_else(|| {
-                guard_env("PROMPT_APPEND")
-                    .filter(|v| !v.is_empty())
-                    .map(PathBuf::from)
-            });
-            if let Some(ref path) = append_path {
-                tracing::info!("Appending additive prompt from: {}", path.display());
-                eval_config = eval_config.system_prompt_append_path(path.clone());
-            }
-
-            // Secret backend is built BEFORE the evaluator so the daemon can
-            // source its own LLM key from the backend when none was supplied by
-            // flag or env (see the unified-startup-secret block below).
-            tracing::info!("Initializing secret backend...");
-            let backend_type = match guard_env("BACKEND") {
-                Some(value) => value
-                    .parse::<secrets::BackendType>()
-                    .map_err(anyhow::Error::msg)
-                    .context("invalid secret backend")?,
-                None => secrets::detect_backend(),
-            };
-            tracing::info!("Using {} secret backend", backend_type.as_str());
-            if guard_env("BACKEND").is_none() && backend_type == secrets::BackendType::Env {
-                tracing::warn!(
-                    "auto-selected env secret backend; secrets are process-local and will disappear on daemon restart"
-                );
-            }
-            let backend = backend_type
-                .build()
-                .context("Failed to create secret backend")?;
-            let secrets = secrets::SecretManager::new(backend);
-            tracing::info!("Secret backend ready");
-
-            // Unify the daemon's own startup secret onto the secret backend: when
-            // no LLM key was supplied via --llm-api-key or env, read it from the
-            // backend as a secret owned by the server principal (GUARD_SERVER_UID,
-            // else the daemon's own principal). This reuses the same fetch / cache
-            // / redaction path as any brokered secret, so the daemon can source
-            // its key from pass/vault/infisical without an external `vault agent`
-            // or `infisical run` wrapper around `guard server start`.
-            if llm_enabled
-                && eval_config
-                    .llm
-                    .api_key
-                    .as_ref()
-                    .map(|k| k.is_empty())
-                    .unwrap_or(true)
-            {
-                let server_principal = match guard_env("SERVER_UID") {
-                    Some(uid_str) => match uid_str.trim().parse::<u32>() {
-                        Ok(uid) => guard::principal::PrincipalKey::from_uid(uid),
-                        Err(_) => {
-                            tracing::warn!(
-                                "GUARD_SERVER_UID is not a valid uid; using the daemon principal"
-                            );
-                            server::resolve_daemon_principal()
-                        }
-                    },
-                    None => server::resolve_daemon_principal(),
-                };
-                match secrets.get(&server_principal, "LLM_API_KEY").await {
-                    Ok(Some(key)) if !key.is_empty() => {
-                        tracing::info!(
-                            "Loaded LLM API key from the {} secret backend (owner {})",
-                            secrets.backend_name(),
-                            server_principal.as_str()
-                        );
-                        eval_config = eval_config.llm_api_key(key);
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::warn!("Could not read LLM API key from the secret backend: {}", e)
-                    }
-                }
-            }
-
-            // Collect known secret values for exact-match output redaction BEFORE
-            // moving eval_config into the evaluator. This includes a backend-
-            // sourced daemon key resolved just above.
-            let mut redact_secrets: Vec<String> = Vec::new();
-            if let Some(ref key) = eval_config.llm.api_key {
-                if !key.is_empty() {
-                    redact_secrets.push(key.clone());
-                }
-            }
-
-            tracing::info!("Creating evaluator...");
-            let evaluator =
-                evaluate::Evaluator::new(eval_config).context("Failed to create evaluator")?;
-            tracing::info!("Evaluator created successfully");
-
-            // Redaction is server-side only, controlled by CLI flag.
-            // NOT readable from child env (prevents GUARD_REDACT=false bypass).
-            let redact = !no_redact;
-
-            let preflight = preflight
-                || guard_env("PREFLIGHT")
-                    .as_deref()
-                    .map(parse_env_bool)
-                    .unwrap_or(false);
-            if preflight {
-                tracing::info!(
-                    "Preflight checks enabled (executable validation, credential pattern deny)"
-                );
-            }
-
-            tracing::info!("Admin RPCs restricted to daemon UID");
-
-            let tool_registry = tool_config::ToolRegistry::load_default().unwrap_or_else(|e| {
-                tracing::warn!("Could not load tool config: {}", e);
-                tool_config::ToolRegistry::empty()
-            });
-            let tool_count = tool_registry.list().count();
-            if tool_count > 0 {
-                tracing::info!("Loaded {} tool config(s)", tool_count);
-            }
-            if let Some(ref token) = auth_token {
-                redact_secrets.push(token.clone());
-            }
-
-            let (sessions, session_store) = if let Some(ref path) = state_db_path {
-                let store = session_store::SessionStore::open(
-                    path.clone(),
-                    session::DEFAULT_HISTORY_RETENTION_SECS,
-                )
-                .await
-                .with_context(|| format!("failed to open state db {}", path.display()))?;
-                let sessions = store
-                    .load_registry()
-                    .await
-                    .with_context(|| format!("failed to load state db {}", path.display()))?;
-                (sessions, Some(store))
-            } else {
-                (session::SessionRegistry::new(), None)
-            };
-
-            tracing::info!("Creating server instance...");
-            let mut srv = server::Server::new(
-                socket_path,
-                tcp_port,
-                evaluator,
-                secrets,
-                redact,
-                auth_token,
-                admin_token,
-                socket_group,
-                allowed_uids,
-                shim_dir,
-                dry_run,
-                tool_registry,
-                redact_secrets,
-                preflight,
-                sessions,
-                session_store,
-                exec_as_caller,
-                state_db_path,
-            );
-            srv.set_gate(gate_mode);
-
-            let verbs_path = verbs.or_else(|| {
-                guard_env("VERBS")
-                    .filter(|v| !v.is_empty())
-                    .map(PathBuf::from)
-            });
-            if let Some(path) = verbs_path {
-                let catalog = guard::gating::verb::VerbCatalog::load(&path)
-                    .with_context(|| format!("failed to load verb catalog {}", path.display()))?;
-                tracing::info!(
-                    "Loaded verb catalog from {} ({} verb(s), version {})",
-                    path.display(),
-                    catalog.names().len(),
-                    catalog.version()
-                );
-                srv.set_verbs(catalog);
-            }
-
-            // Binary allow-list: flag wins, else GUARD_ALLOW_BIN (comma-separated).
-            // Entries are trimmed; an all-empty value is treated as no restriction.
-            let allowed_binaries = allow_bin
-                .or_else(|| {
-                    guard_env("ALLOW_BIN").map(|v| {
-                        v.split(',')
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .map(|list| {
-                    list.into_iter()
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect::<Vec<_>>()
-                })
-                .filter(|list| !list.is_empty());
-            if let Some(ref list) = allowed_binaries {
-                tracing::info!("Binary allow-list active: {:?}", list);
-                srv.set_allowed_binaries(Some(list.clone()));
-            }
-
-            // Extra child-env passthrough: flag wins, else GUARD_CHILD_ENV
-            // (comma-separated). Forwards named daemon env vars to children.
-            let child_env_vars = child_env
-                .or_else(|| {
-                    guard_env("CHILD_ENV").map(|v| {
-                        v.split(',')
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .map(|list| {
-                    list.into_iter()
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            if !child_env_vars.is_empty() {
-                tracing::info!("Child-env passthrough: {:?}", child_env_vars);
-                srv.set_extra_child_env(child_env_vars);
-            }
-
-            // Kubernetes API proxy: flag wins, else GUARD_KUBE_PROXY. When set,
-            // the daemon fronts the apiserver and gates each API operation.
-            let kube_proxy_addr = kube_proxy.or_else(|| guard_env("KUBE_PROXY"));
-            if let Some(addr_str) = kube_proxy_addr {
-                if exec_as_caller {
-                    anyhow::bail!(
-                        "--kube-proxy is incompatible with --exec-as-caller: a child running as the caller could read the caller's own kubeconfig and reach the apiserver around the proxy"
-                    );
-                }
-                let listen: std::net::SocketAddr = addr_str
-                    .parse()
-                    .with_context(|| format!("invalid --kube-proxy address '{addr_str}'"))?;
-                let kubeconfig_path = kubeconfig
-                    .or_else(|| guard_env("KUBE_PROXY_KUBECONFIG").map(PathBuf::from))
-                    .context(
-                        "--kube-proxy requires --kubeconfig (the operator's real kubeconfig)",
-                    )?;
-                let context = kube_context.or_else(|| guard_env("KUBE_CONTEXT"));
-                let upstream = guard::proxy::Upstream::from_kubeconfig_file(
-                    &kubeconfig_path,
-                    context.as_deref(),
-                )
-                .context("load upstream kubeconfig for --kube-proxy")?;
-                let tls =
-                    guard::proxy::ProxyTls::generate().context("generate proxy TLS material")?;
-                let api_policy_path =
-                    api_policy.or_else(|| guard_env("API_POLICY").map(PathBuf::from));
-                let policy = match &api_policy_path {
-                    Some(p) => guard::proxy::ApiPolicy::load_file(p)
-                        .with_context(|| format!("load --api-policy {}", p.display()))?,
-                    None => {
-                        tracing::warn!(
-                            "--kube-proxy started without --api-policy: default-deny (no API requests pass)"
-                        );
-                        guard::proxy::ApiPolicy::deny_all()
-                    }
-                };
-                let proxy = Arc::new(guard::proxy::KubeProxy::new(
-                    listen,
-                    tls,
-                    upstream,
-                    policy,
-                    api_policy_path,
-                    kubeconfig_path.clone(),
-                ));
-                if let Some(out) = brokered_kubeconfig_out
-                    .or_else(|| guard_env("BROKERED_KUBECONFIG_OUT").map(PathBuf::from))
-                {
-                    let yaml = proxy.brokered_kubeconfig();
-                    // The generator is credential-free by construction; assert it
-                    // before handing the file to an agent.
-                    guard::proxy::validate_brokered_kubeconfig(&yaml).map_err(|e| {
-                        anyhow::anyhow!("generated brokered kubeconfig is not credential-free: {e}")
-                    })?;
-                    std::fs::write(&out, yaml).with_context(|| {
-                        format!("write brokered kubeconfig to {}", out.display())
-                    })?;
-                    tracing::info!("Wrote brokered kubeconfig to {}", out.display());
-                }
-                tracing::info!("Kube-proxy enabled on {}", proxy.listen());
-                srv.set_kube_proxy(proxy);
-            }
-
-            srv.run().await
-        }
-        ServerCommands::Connect {
-            socket,
-            tcp_port,
-            token,
-            env_vars,
-            secret_vars,
-            binary,
-            args,
-        } => {
-            let env_vars = env_pairs_to_map(env_vars).map_err(anyhow::Error::msg)?;
-            let secret_vars = secret_pairs_to_map(secret_vars).map_err(anyhow::Error::msg)?;
-            let socket_path = socket.map(PathBuf::from);
-            let mut client = server::Client::new(socket_path, tcp_port);
-            if let Some(token) = token {
-                client = client.with_auth(token);
-            }
-            if let Ok(session) = std::env::var("GUARD_SESSION") {
-                if !session.is_empty() {
-                    client = client.with_session(session);
-                }
-            }
-
-            tracing::info!(
-                binary = %binary,
-                endpoint = %client.endpoint_for_log(),
-                "REQUEST"
-            );
-            let mut streamed_output = false;
-            let resp = client
-                .execute_streaming_with_injections(
-                    &binary,
-                    &args,
-                    env_vars,
-                    secret_vars,
-                    |stream, data| {
-                        streamed_output = true;
-                        match stream {
-                            server::OutputStream::Stdout => {
-                                print!("{}", data);
-                                let _ = std::io::stdout().flush();
-                            }
-                            server::OutputStream::Stderr => {
-                                eprint!("{}", data);
-                                let _ = std::io::stderr().flush();
-                            }
-                        }
-                    },
-                )
-                .await?;
-
-            if resp.allowed {
-                if !streamed_output {
-                    if let Some(stdout) = &resp.stdout {
-                        print!("{}", stdout);
-                    }
-                    if let Some(stderr) = &resp.stderr {
-                        eprint!("{}", stderr);
-                    }
-                }
-                if let Some(code) = resp.exit_code {
-                    std::process::exit(code);
-                }
-                Ok(())
-            } else {
-                eprintln!("DENIED: {}", resp.reason);
-                std::process::exit(1);
-            }
-        }
-        ServerCommands::Status { socket } => handle_status(socket).await,
-    }
-}
-
-/// Consequence-gating options parsed from `guard run` flags.
-struct GatingOptions {
-    revert: Option<String>,
-    confirm_within: Option<u64>,
-    require_approval: bool,
-    wait_approval: Option<u64>,
-    reevaluate: bool,
-}
-
-/// Parse a `--revert "binary arg1 arg2"` string into a structured RevertSpec
-/// (no shell is ever run; this only splits the operator's command into argv).
-fn parse_revert(spec: &str) -> Result<server::RevertSpec> {
-    let parts =
-        shell_words::split(spec).map_err(|e| anyhow::anyhow!("invalid --revert command: {}", e))?;
-    let mut it = parts.into_iter();
-    let binary = it
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("--revert command is empty"))?;
-    Ok(server::RevertSpec {
-        binary,
-        args: it.collect(),
-    })
-}
-
-fn print_coverage(coverage: &Option<guard::gating::Coverage>) {
-    if let Some(c) = coverage {
-        for line in &c.checked {
-            eprintln!("  checked:     {}", line);
-        }
-        for line in &c.not_checked {
-            eprintln!("  NOT checked: {}", line);
-        }
-    }
-}
-
-async fn run_exec(
-    binary: String,
-    args: Vec<String>,
-    env_vars: HashMap<String, String>,
-    secret_vars: HashMap<String, String>,
-    gating: GatingOptions,
-) -> Result<()> {
-    let config = client_config::ClientConfig::load().ok().unwrap_or_default();
-
-    let (socket_path, tcp_port) = resolve_client_endpoint(None, &config);
-
-    let revert = match gating.revert.as_deref() {
-        Some(spec) => Some(parse_revert(spec)?),
-        None => None,
-    };
-
-    let mut client = server::Client::new(socket_path, tcp_port)
-        .with_gating(
-            revert,
-            gating.confirm_within,
-            gating.require_approval,
-            gating.wait_approval,
-        )
-        .with_reevaluate(gating.reevaluate);
-    if let Some(token) = config.auth_token {
-        client = client.with_auth(token);
-    }
-    if let Ok(session) = std::env::var("GUARD_SESSION") {
-        if !session.is_empty() {
-            client = client.with_session(session);
-        }
-    }
-
-    tracing::info!(
-        binary = %binary,
-        endpoint = %client.endpoint_for_log(),
-        "REQUEST"
-    );
-    let mut streamed_output = false;
-    let resp = client
-        .execute_streaming_with_injections(&binary, &args, env_vars, secret_vars, |stream, data| {
-            streamed_output = true;
-            match stream {
-                server::OutputStream::Stdout => {
-                    print!("{}", data);
-                    let _ = std::io::stdout().flush();
-                }
-                server::OutputStream::Stderr => {
-                    eprint!("{}", data);
-                    let _ = std::io::stderr().flush();
-                }
-            }
-        })
-        .await?;
-
-    // Consequence-gate outcomes: a held command did not run; a provisional ran
-    // behind an auto-revert timer.
-    match resp.status {
-        Some(server::GateStatus::Held) => {
-            let handle = resp.handle.clone().unwrap_or_default();
-            eprintln!("HELD for operator approval: {}", resp.reason);
-            eprintln!("  handle:  {}", handle);
-            eprintln!("  approve: guard approve {}", handle);
-            eprintln!("  poll:    guard approvals {}", handle);
-            print_coverage(&resp.coverage);
-            // Not executed; exit non-zero so callers do not treat it as success.
-            std::process::exit(75); // EX_TEMPFAIL: try again after approval
-        }
-        Some(server::GateStatus::Provisional) => {
-            if !streamed_output {
-                if let Some(stdout) = &resp.stdout {
-                    print!("{}", stdout);
-                }
-                if let Some(stderr) = &resp.stderr {
-                    eprint!("{}", stderr);
-                }
-            }
-            let handle = resp.handle.clone().unwrap_or_default();
-            eprintln!("PROVISIONAL (containment envelope): {}", resp.reason);
-            eprintln!("  handle:  {}", handle);
-            eprintln!("  confirm: guard confirm {}  (else auto-reverts)", handle);
-            print_coverage(&resp.coverage);
-            if let Some(code) = resp.exit_code {
-                std::process::exit(code);
-            }
-            return Ok(());
-        }
-        Some(server::GateStatus::DryRun) => {
-            println!("[DRY-RUN] {}", resp.reason);
-            print_coverage(&resp.coverage);
-            return Ok(());
-        }
-        _ => {}
-    }
-
-    if resp.allowed {
-        tracing::info!(
-            binary = %binary,
-            reason = %resp.reason,
-            "ALLOWED"
-        );
-        if !streamed_output {
-            if let Some(stdout) = &resp.stdout {
-                print!("{}", stdout);
-            }
-            if let Some(stderr) = &resp.stderr {
-                eprint!("{}", stderr);
-            }
-        }
-        if let Some(code) = resp.exit_code {
-            std::process::exit(code);
-        }
-        Ok(())
-    } else {
-        tracing::warn!(
-            binary = %binary,
-            reason = %resp.reason,
-            "DENIED"
-        );
-        eprintln!("DENIED: {}", resp.reason);
-        std::process::exit(1);
-    }
-}
-
-/// Resolve the admin endpoint and build a client for a gate-control RPC.
-fn gate_client(socket_override: Option<String>) -> server::Client {
-    let config = client_config::ClientConfig::load().ok().unwrap_or_default();
-    let (socket_path, tcp_port) = resolve_client_endpoint(socket_override, &config);
-    let mut client = server::Client::new(socket_path, tcp_port);
-    if let Some(token) = config.auth_token {
-        client = client.with_auth(token);
-    }
-    client
-}
-
-async fn handle_provisionals(socket: Option<String>) -> Result<()> {
-    let client = gate_client(socket);
-    match client
-        .send_admin(server::AdminRequest::Provisionals)
-        .await?
-    {
-        server::AdminResponse::Provisionals { items } => {
-            if items.is_empty() {
-                println!("(no provisional executions)");
-            }
-            for p in &items {
-                println!(
-                    "[{}] handle={} cmd={:?} revert={:?} deadline={} reason={:?}{}",
-                    p.status,
-                    p.handle,
-                    p.command,
-                    p.revert_command,
-                    p.deadline_unix,
-                    p.reason,
-                    p.revert_detail
-                        .as_ref()
-                        .map(|d| format!(" revert_detail={:?}", d))
-                        .unwrap_or_default(),
-                );
-            }
-            Ok(())
-        }
-        server::AdminResponse::Error { message } => {
-            eprintln!("error: {}", message);
-            std::process::exit(1);
-        }
-        _ => {
-            eprintln!("unexpected response");
-            std::process::exit(1);
-        }
-    }
-}
-
-async fn handle_approval_note_cmd(
-    socket: Option<String>,
-    handle: String,
-    text: String,
-) -> Result<()> {
-    let client = gate_client(socket);
-    match client
-        .send_admin(server::AdminRequest::ApprovalNote { handle, text })
-        .await?
-    {
-        server::AdminResponse::ApprovalShow { item } => {
-            println!(
-                "[{}] handle={} cmd={:?}",
-                item.status, item.handle, item.command
-            );
-            for n in &item.notes {
-                println!("  note [{}] {}: {}", n.at_unix, n.author, n.text);
-            }
-            Ok(())
-        }
-        server::AdminResponse::Error { message } => {
-            eprintln!("error: {}", message);
-            std::process::exit(1);
-        }
-        other => {
-            eprintln!("unexpected response: {:?}", other);
-            std::process::exit(1);
-        }
-    }
-}
-
-async fn handle_approvals(socket: Option<String>, handle: Option<String>) -> Result<()> {
-    let client = gate_client(socket);
-    let request = match handle {
-        Some(h) => server::AdminRequest::ApprovalShow { handle: h },
-        None => server::AdminRequest::ApprovalList,
-    };
-    match client.send_admin(request).await? {
-        server::AdminResponse::Approvals { items } => {
-            if items.is_empty() {
-                println!("(no approvals)");
-            }
-            for a in &items {
-                println!(
-                    "[{}] handle={} risk={:?} class={:?} cmd={:?} fp={} reason={:?}",
-                    a.status, a.handle, a.risk, a.reversibility, a.command, a.fingerprint, a.reason
-                );
-            }
-            Ok(())
-        }
-        server::AdminResponse::ApprovalShow { item } => {
-            println!(
-                "[{}] handle={} risk={:?} class={:?} cmd={:?} fp={}",
-                item.status,
-                item.handle,
-                item.risk,
-                item.reversibility,
-                item.command,
-                item.fingerprint
-            );
-            if let Some(code) = item.exit_code {
-                println!("exit_code={}", code);
-            }
-            if let Some(out) = &item.stdout {
-                print!("{}", out);
-            }
-            if let Some(err) = &item.stderr {
-                eprint!("{}", err);
-            }
-            if let Some(reason) = &item.decided_reason {
-                println!("decision: {}", reason);
-            }
-            for n in &item.notes {
-                println!("  note [{}] {}: {}", n.at_unix, n.author, n.text);
-            }
-            Ok(())
-        }
-        server::AdminResponse::Error { message } => {
-            eprintln!("error: {}", message);
-            std::process::exit(1);
-        }
-        _ => {
-            eprintln!("unexpected response");
-            std::process::exit(1);
-        }
-    }
-}
-
-async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
-    match subcommand {
-        VerbCommands::List { socket } => {
-            let client = gate_client(socket);
-            match client.send_admin(server::AdminRequest::VerbList).await? {
-                server::AdminResponse::Verbs { items } => {
-                    if items.is_empty() {
-                        println!("(no verbs; start the daemon with --verbs <catalog.yaml>)");
-                    }
-                    for v in &items {
-                        println!(
-                            "{} [{}]{}{} — {}",
-                            v.name,
-                            v.consequence,
-                            if v.trusted { " trusted" } else { "" },
-                            if v.has_revert { " revertable" } else { "" },
-                            v.description
-                        );
-                        for (p, pattern) in &v.params {
-                            println!("    --param {}=<{}>", p, pattern);
-                        }
-                    }
-                    Ok(())
-                }
-                server::AdminResponse::Error { message } => {
-                    eprintln!("error: {}", message);
-                    std::process::exit(1);
-                }
-                _ => {
-                    eprintln!("unexpected response");
-                    std::process::exit(1);
-                }
-            }
-        }
-        VerbCommands::Run {
-            name,
-            params,
-            confirm_within,
-            wait_approval,
-            socket,
-        } => {
-            let config = client_config::ClientConfig::load().ok().unwrap_or_default();
-            let (socket_path, tcp_port) = resolve_client_endpoint(socket, &config);
-            let param_map: std::collections::BTreeMap<String, String> =
-                params.into_iter().collect();
-            let invocation = server::VerbInvocation {
-                name: name.clone(),
-                params: param_map,
-            };
-            let mut client = server::Client::new(socket_path, tcp_port)
-                .with_verb(invocation)
-                .with_gating(None, confirm_within, false, wait_approval);
-            if let Some(token) = config.auth_token {
-                client = client.with_auth(token);
-            }
-            if let Ok(session) = std::env::var("GUARD_SESSION") {
-                if !session.is_empty() {
-                    client = client.with_session(session);
-                }
-            }
-            // Verb binary/args are rendered server-side; the client sends empty.
-            let mut streamed = false;
-            let resp = client
-                .execute_streaming_with_injections(
-                    "",
-                    &[],
-                    HashMap::new(),
-                    HashMap::new(),
-                    |stream, data| {
-                        streamed = true;
-                        match stream {
-                            server::OutputStream::Stdout => {
-                                print!("{}", data);
-                                let _ = std::io::stdout().flush();
-                            }
-                            server::OutputStream::Stderr => {
-                                eprint!("{}", data);
-                                let _ = std::io::stderr().flush();
-                            }
-                        }
-                    },
-                )
-                .await?;
-            render_gated_response(&resp, streamed, &name)
-        }
-        VerbCommands::Create {
-            prompt,
-            binary,
-            preview,
-            socket,
-        } => {
-            let client = gate_client(socket);
-            let req = server::AdminRequest::VerbCreate {
-                prose: prompt,
-                binary_hint: binary,
-                preview,
-            };
-            match client.send_admin(req).await? {
-                server::AdminResponse::VerbCreated { verb, persisted } => {
-                    if persisted {
-                        println!("Created verb '{}' and added it to the catalog:", verb.name);
-                    } else {
-                        println!(
-                            "Preview of verb '{}' (NOT written). Creating synthesizes again and may differ; every created verb is non-trusted and re-validated by the safety gate.",
-                            verb.name
-                        );
-                    }
-                    if let Some(ev) = &verb.evidence {
-                        println!("  evidence: {}", ev);
-                    }
-                    println!();
-                    match serde_yaml::to_string(&verb) {
-                        Ok(y) => print!("{}", y),
-                        Err(_) => println!("{:#?}", verb),
-                    }
-                    Ok(())
-                }
-                server::AdminResponse::Error { message } => {
-                    eprintln!("error: {}", message);
-                    std::process::exit(1);
-                }
-                _ => {
-                    eprintln!("unexpected response");
-                    std::process::exit(1);
-                }
-            }
-        }
-    }
-}
-
-/// Print a gated response (shared by `guard run` and `guard verb run`).
-fn render_gated_response(
-    resp: &server::ExecuteResponse,
-    streamed: bool,
-    label: &str,
-) -> Result<()> {
-    match resp.status {
-        Some(server::GateStatus::Held) => {
-            let handle = resp.handle.clone().unwrap_or_default();
-            eprintln!("HELD for operator approval: {}", resp.reason);
-            eprintln!("  handle:  {}", handle);
-            eprintln!("  approve: guard approve {}", handle);
-            eprintln!("  poll:    guard approvals {}", handle);
-            print_coverage(&resp.coverage);
-            std::process::exit(75);
-        }
-        Some(server::GateStatus::Provisional) => {
-            if !streamed {
-                if let Some(out) = &resp.stdout {
-                    print!("{}", out);
-                }
-                if let Some(err) = &resp.stderr {
-                    eprint!("{}", err);
-                }
-            }
-            let handle = resp.handle.clone().unwrap_or_default();
-            eprintln!("PROVISIONAL (containment envelope): {}", resp.reason);
-            eprintln!("  handle:  {}", handle);
-            eprintln!("  confirm: guard confirm {}  (else auto-reverts)", handle);
-            print_coverage(&resp.coverage);
-            if let Some(code) = resp.exit_code {
-                std::process::exit(code);
-            }
-            Ok(())
-        }
-        Some(server::GateStatus::DryRun) => {
-            println!("[DRY-RUN] {}", resp.reason);
-            print_coverage(&resp.coverage);
-            Ok(())
-        }
-        _ => {
-            if resp.allowed {
-                if !streamed {
-                    if let Some(out) = &resp.stdout {
-                        print!("{}", out);
-                    }
-                    if let Some(err) = &resp.stderr {
-                        eprint!("{}", err);
-                    }
-                }
-                if let Some(code) = resp.exit_code {
-                    std::process::exit(code);
-                }
-                Ok(())
-            } else {
-                eprintln!("DENIED ({}): {}", label, resp.reason);
-                std::process::exit(1);
-            }
-        }
-    }
-}
-
-async fn handle_gate_action(socket: Option<String>, action: &str, handle: String) -> Result<()> {
-    let client = gate_client(socket);
-    let request = match action {
-        "confirm" => server::AdminRequest::Confirm { handle },
-        "revert" => server::AdminRequest::Revert { handle },
-        "approve" => server::AdminRequest::Approve { handle },
-        "deny" => server::AdminRequest::Deny { handle },
-        _ => unreachable!("unknown gate action"),
-    };
-    match client.send_admin(request).await? {
-        server::AdminResponse::GateAction {
-            message,
-            exit_code,
-            stdout,
-            stderr,
-        } => {
-            println!("{}", message);
-            if let Some(out) = &stdout {
-                print!("{}", out);
-            }
-            if let Some(err) = &stderr {
-                eprint!("{}", err);
-            }
-            if let Some(code) = exit_code {
-                std::process::exit(code);
-            }
-            Ok(())
-        }
-        server::AdminResponse::Error { message } => {
-            eprintln!("error: {}", message);
-            std::process::exit(1);
-        }
-        _ => {
-            eprintln!("unexpected response");
-            std::process::exit(1);
-        }
-    }
-}
-
-async fn run_mcp(subcommand: McpCommands) -> Result<()> {
-    match subcommand {
-        McpCommands::Serve {
-            socket,
-            tcp_port,
-            token,
-            tool_name,
-            http,
-            http_token,
-        } => {
-            let config = client_config::ClientConfig::load().ok().unwrap_or_default();
-            let (mut socket_path, mut resolved_tcp_port) = resolve_client_endpoint(socket, &config);
-            if let Some(port) = tcp_port {
-                socket_path = None;
-                resolved_tcp_port = Some(port);
-            }
-            let auth_token = token.or(config.auth_token);
-
-            let http_addr = match http {
-                Some(addr) => Some(
-                    addr.parse::<std::net::SocketAddr>()
-                        .with_context(|| format!("invalid --http address '{addr}'"))?,
-                ),
-                None => None,
-            };
-            // Bearer source: --http-token wins, else GUARD_MCP_TOKEN. Only
-            // meaningful with --http; validate() rejects --http without a token.
-            let http_token = http_token
-                .filter(|t| !t.is_empty())
-                .or_else(|| guard_env("MCP_TOKEN").filter(|t| !t.is_empty()));
-
-            let mcp_config = mcp::McpConfig {
-                socket_path,
-                tcp_port: resolved_tcp_port,
-                auth_token,
-                tool_name,
-                http_addr,
-                http_token,
-            };
-
-            mcp::serve(mcp_config).await
-        }
-    }
-}
-
-/// Well-known default socket path. Used when nothing more specific is
-/// configured (no --socket flag, no GUARD_SOCKET env, no client.yaml).
-/// Matches the systemd RuntimeDirectory layout in deployment/systemd/.
-#[cfg(unix)]
-const DEFAULT_CLIENT_SOCKET: &str = "/run/guard/guard.sock";
-const DEFAULT_CLIENT_TCP_PORT: u16 = 8123;
-
-/// Resolve the client endpoint from explicit override > env var > client
-/// config > well-known default. Returns (socket, tcp_port). At most one
-/// of the two will be Some.
-fn resolve_client_endpoint(
-    socket_override: Option<String>,
-    config: &client_config::ClientConfig,
-) -> (Option<PathBuf>, Option<u16>) {
-    if let Some(s) = socket_override {
-        return (Some(PathBuf::from(s)), None);
-    }
-    if let Ok(port) = std::env::var("GUARD_TCP_PORT") {
-        if let Ok(port) = port.parse::<u16>() {
-            return (None, Some(port));
-        }
-    }
-    if let Ok(s) = std::env::var("GUARD_SOCKET") {
-        if !s.is_empty() {
-            // A named pipe on Windows, a UNIX domain socket on Unix.
-            return (Some(PathBuf::from(s)), None);
-        }
-    }
-    if let Some(port) = config.server_tcp_port {
-        return (None, Some(port));
-    }
-    // A configured socket is a named pipe on Windows, a UNIX domain socket on
-    // Unix; either way it takes precedence over the platform default below.
-    if let Some(ref s) = config.server_socket {
-        return (Some(PathBuf::from(s)), None);
-    }
-    #[cfg(windows)]
-    {
-        (None, Some(DEFAULT_CLIENT_TCP_PORT))
-    }
-    // Fall back to the well-known default. If it doesn't exist the
-    // connect will fail with a clear "failed to connect" error, which
-    // is more useful than the previous "No server configured" since
-    // most local installs use the default anyway.
-    #[cfg(unix)]
-    {
-        (Some(PathBuf::from(DEFAULT_CLIENT_SOCKET)), None)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        (None, Some(DEFAULT_CLIENT_TCP_PORT))
-    }
-}
-
-fn admin_client(
-    socket_path: Option<PathBuf>,
-    tcp_port: Option<u16>,
-    config: &client_config::ClientConfig,
-) -> server::Client {
-    let client = server::Client::new(socket_path, tcp_port);
-    if let Some(token) = config.admin_token.clone() {
-        client.with_admin_token(token)
-    } else {
-        client
-    }
-}
-
-async fn handle_status(socket: Option<String>) -> Result<()> {
-    let config = client_config::ClientConfig::load().ok().unwrap_or_default();
-    let (socket_path, tcp_port) = resolve_client_endpoint(socket, &config);
-    let client = admin_client(socket_path.clone(), tcp_port, &config);
-
-    // Client info first — useful even when the daemon is unreachable.
-    println!("Client:");
-    println!(
-        "  version        {} ({}, {}{})",
-        env!("CARGO_PKG_VERSION"),
-        env!("GUARD_GIT_COMMIT"),
-        env!("GUARD_GIT_BRANCH"),
-        option_env!("GUARD_GIT_TAG")
-            .map(|t| format!(", tag {t}"))
-            .unwrap_or_default()
-    );
-    println!("  endpoint       {}", client.endpoint_for_log());
-    println!();
-
-    // Ping is the public liveness probe. Always permitted to any
-    // exec-allowed UID; reveals only version/uptime/mode/dry_run.
-    let ping = match client.send_admin(server::AdminRequest::Ping).await {
-        Ok(server::AdminResponse::Ping {
-            version,
-            uptime_secs,
-            mode,
-            dry_run,
-        }) => (version, uptime_secs, mode, dry_run),
-        Ok(server::AdminResponse::Error { message }) => {
-            eprintln!("Server: ping refused — {}", message);
-            std::process::exit(1);
-        }
-        Ok(other) => {
-            eprintln!("Server: unexpected ping response: {:?}", other);
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("Server: unreachable — {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    let (version, uptime, mode, dry_run) = ping;
-    println!("Server:");
-    println!("  version        {}", version);
-    println!("  uptime         {}s", uptime);
-    println!("  mode           {}", mode);
-    println!("  dry_run        {}", dry_run);
-
-    // Try the full Status RPC. Succeeds for daemon-UID Unix callers or
-    // TCP callers with the configured admin token.
-    match client.send_admin(server::AdminRequest::Status).await {
-        Ok(server::AdminResponse::Status { status }) => {
-            if let Some(ref s) = status.socket_path {
-                println!("  socket         {}", s);
-            }
-            if let Some(p) = status.tcp_port {
-                println!("  tcp_port       {}", p);
-            }
-            println!("  llm_enabled    {}", status.llm_enabled);
-            if status.llm_enabled {
-                println!("  llm_models     {:?}", status.llm_model_chain);
-            }
-            println!("  static_policy  {}", status.static_policy);
-            println!("  preflight      {}", status.preflight);
-            println!("  redact         {}", status.redact);
-            if !status.secret_backend.is_empty() {
-                println!("  secret_backend {}", status.secret_backend);
-            }
-            println!(
-                "  cache          enabled={} size={}",
-                status.cache_enabled, status.cache_size
-            );
-            println!(
-                "  learning       enabled={} candidates={}",
-                status.learning_enabled, status.learned_rule_count
-            );
-            println!(
-                "  learn_deny     enabled={} shapes={}",
-                status.deny_learning_enabled, status.deny_shape_count
-            );
-            println!("  sessions       {}", status.session_count);
-            println!("  daemon_uid     {}", status.daemon_uid);
-            println!("  exec_identity  {}", status.exec_identity);
-            if let Some(ref path) = status.state_db_path {
-                println!("  state_db       {}", path);
-            }
-            Ok(())
-        }
-        Ok(server::AdminResponse::Error { .. }) => {
-            // Expected when caller is not the daemon UID. Hide the rest.
-            println!();
-            println!("(full server config is restricted to the daemon UID)");
-            Ok(())
-        }
-        Ok(other) => {
-            eprintln!("Server: unexpected status response: {:?}", other);
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("Server: status RPC failed: {}", e);
-            std::process::exit(1);
-        }
-    }
-}
-
-/// Format a session prompt for `guard session list` output. Without
-/// `full`, prompts longer than 60 chars are ellipsized so the listing
-/// stays terminal-readable; `--full` prints the entire prompt.
-fn format_prompt(prompt: Option<&str>, full: bool) -> String {
-    match prompt {
-        None => "(none)".to_string(),
-        Some(s) if full => format!("\"{}\"", s),
-        Some(s) => {
-            let preview: String = s.chars().take(60).collect();
-            if s.chars().count() > 60 {
-                format!("\"{}…\"", preview)
-            } else {
-                format!("\"{}\"", preview)
-            }
-        }
-    }
-}
-
-fn read_grant_prompt(
-    prompt: Option<String>,
-    prompt_file: Option<&PathBuf>,
-) -> Result<Option<String>> {
-    match prompt_file {
-        Some(path) => Ok(Some(std::fs::read_to_string(path).with_context(|| {
-            format!("failed to read --prompt-file {}", path.display())
-        })?)),
-        None => Ok(prompt),
-    }
-}
-
-/// Parse a `--since` value into an absolute unix-seconds threshold.
-/// Accepts plain integer seconds or simple suffixes: `s`, `m`, `h`, `d`.
-fn parse_since_to_unix(value: &str) -> Result<u64> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!("--since must not be empty");
-    }
-    let (num_part, multiplier) = if let Some(stripped) = trimmed.strip_suffix('s') {
-        (stripped, 1u64)
-    } else if let Some(stripped) = trimmed.strip_suffix('m') {
-        (stripped, 60u64)
-    } else if let Some(stripped) = trimmed.strip_suffix('h') {
-        (stripped, 3600u64)
-    } else if let Some(stripped) = trimmed.strip_suffix('d') {
-        (stripped, 86400u64)
-    } else {
-        (trimmed, 1u64)
-    };
-    let n: u64 = num_part
-        .parse()
-        .with_context(|| format!("invalid --since value: '{}'", value))?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    Ok(now.saturating_sub(n.saturating_mul(multiplier)))
-}
-
-/// Mint a 128-bit hex session token. Uniqueness collision is the only
-/// failure mode and is statistically irrelevant for in-memory grants
-/// that clear on daemon restart.
-fn generate_session_token() -> String {
-    use rand::Rng;
-    let mut bytes = [0u8; 16];
-    rand::rng().fill_bytes(&mut bytes);
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
-#[allow(clippy::too_many_arguments)]
-fn top_level_grant_to_session_command(
-    token_or_prose: Option<String>,
-    prose: Option<String>,
-    allow: Vec<String>,
-    deny: Vec<String>,
-    ttl: Option<u64>,
-    prompt: Option<String>,
-    prompt_file: Option<PathBuf>,
-    static_only: bool,
-    auto_amend: bool,
-    no_auto_amend: bool,
-    socket: Option<String>,
-) -> SessionCommands {
-    let single_positional_prose = prose.is_none()
-        && token_or_prose
-            .as_deref()
-            .is_some_and(looks_like_quoted_grant_prose);
-
-    // A positional that is not quoted-grant prose is a session token (Grant);
-    // otherwise (absent, or prose-shaped) it starts a New session.
-    match token_or_prose {
-        Some(token) if !single_positional_prose => SessionCommands::Grant {
-            token,
-            prose,
-            allow,
-            deny,
-            ttl,
-            prompt,
-            prompt_file,
-            static_only,
-            auto_amend,
-            no_auto_amend,
-            socket,
-        },
-        other => {
-            let prose = prose.or(other);
-            SessionCommands::New {
-                prose,
-                allow,
-                deny,
-                ttl,
-                prompt,
-                prompt_file,
-                static_only,
-                auto_amend,
-                no_auto_amend,
-                socket,
-            }
-        }
-    }
-}
-
-fn resolve_session_auto_amend(
-    prose: Option<&str>,
-    auto_amend: bool,
-    no_auto_amend: bool,
-    static_only: bool,
-) -> bool {
-    if static_only || no_auto_amend {
-        false
-    } else {
-        auto_amend || prose.map(|value| !value.trim().is_empty()).unwrap_or(false)
-    }
-}
-
-fn looks_like_quoted_grant_prose(value: &str) -> bool {
-    value.split_whitespace().nth(1).is_some()
-}
-
-async fn handle_session(subcommand: SessionCommands) -> Result<()> {
-    let config = client_config::ClientConfig::load().ok().unwrap_or_default();
-
-    // `session new` is special: it mints a token before deciding what to
-    // send. If no grant flags are present we just print and exit; otherwise
-    // we send a SessionGrant for the freshly-minted token.
-    if let SessionCommands::New {
-        prose,
-        allow,
-        deny,
-        ttl,
-        prompt,
-        prompt_file,
-        static_only,
-        auto_amend,
-        no_auto_amend,
-        socket,
-    } = &subcommand
-    {
-        let token = generate_session_token();
-        let has_grant = prose.is_some()
-            || !allow.is_empty()
-            || !deny.is_empty()
-            || ttl.is_some()
-            || prompt.is_some()
-            || prompt_file.is_some()
-            || *static_only;
-
-        if has_grant {
-            let prompt_append = read_grant_prompt(prompt.clone(), prompt_file.as_ref())?;
-            let auto_amend = resolve_session_auto_amend(
-                prose.as_deref(),
-                *auto_amend,
-                *no_auto_amend,
-                *static_only,
-            );
-
-            let (socket_path, tcp_port) = resolve_client_endpoint(socket.clone(), &config);
-            let client = admin_client(socket_path, tcp_port, &config);
-            let request = server::AdminRequest::SessionGrant {
-                token: token.clone(),
-                allow: allow.clone(),
-                deny: deny.clone(),
-                ttl_secs: *ttl,
-                prompt_append,
-                prose: prose.clone(),
-                static_only: *static_only,
-                auto_amend,
-            };
-            match client.send_admin(request).await? {
-                server::AdminResponse::Ok => {}
-                server::AdminResponse::Error { message } => {
-                    eprintln!("error: {}", message);
-                    std::process::exit(1);
-                }
-                other => {
-                    eprintln!("unexpected admin response: {:?}", other);
-                    std::process::exit(1);
-                }
-            }
-        }
-
-        // Eval-friendly export line on stdout; status on stderr so it does
-        // not pollute the captured value.
-        println!("export GUARD_SESSION={}", token);
-        if has_grant {
-            eprintln!("granted session {}", token);
-        } else {
-            eprintln!(
-                "minted session {} (no grant installed; run `guard session grant {} ...` to attach rules)",
-                token, token
-            );
-        }
-        return Ok(());
-    }
-
-    let mut print_full_prompt = false;
-
-    let (socket_override, request) = match subcommand {
-        SessionCommands::New { .. } => unreachable!("handled above"),
-        SessionCommands::Grant {
-            token,
-            prose,
-            allow,
-            deny,
-            ttl,
-            prompt,
-            prompt_file,
-            static_only,
-            auto_amend,
-            no_auto_amend,
-            socket,
-        } => {
-            let prompt_append = read_grant_prompt(prompt, prompt_file.as_ref())?;
-            let auto_amend = resolve_session_auto_amend(
-                prose.as_deref(),
-                auto_amend,
-                no_auto_amend,
-                static_only,
-            );
-            (
-                socket,
-                server::AdminRequest::SessionGrant {
-                    token,
-                    allow,
-                    deny,
-                    ttl_secs: ttl,
-                    prompt_append,
-                    prose,
-                    static_only,
-                    auto_amend,
-                },
-            )
-        }
-        SessionCommands::Appeal {
-            token,
-            socket,
-            binary,
-            args,
-        } => (
-            socket,
-            server::AdminRequest::SessionAppeal {
-                token,
-                binary,
-                args,
-            },
-        ),
-        SessionCommands::Revoke { token, socket } => {
-            (socket, server::AdminRequest::SessionRevoke { token })
-        }
-        SessionCommands::Show {
-            token,
-            limit,
-            socket,
-        } => (
-            socket,
-            server::AdminRequest::SessionShow {
-                token,
-                limit: Some(limit),
-            },
-        ),
-        SessionCommands::List {
-            history,
-            since,
-            full,
-            socket,
-        } => {
-            let since_unix = match since.as_deref() {
-                Some(s) => Some(parse_since_to_unix(s)?),
-                None => None,
-            };
-            // --since implies --history; pure --history with no
-            // since shows the entire retention window.
-            let include_history = history || since_unix.is_some();
-            print_full_prompt = full;
-            (
-                socket,
-                server::AdminRequest::SessionList {
-                    include_history,
-                    since_unix,
-                },
-            )
-        }
-    };
-
-    let (socket_path, tcp_port) = resolve_client_endpoint(socket_override, &config);
-    let client = admin_client(socket_path, tcp_port, &config);
-
-    match client.send_admin(request).await? {
-        server::AdminResponse::Ok => {
-            println!("ok");
-        }
-        server::AdminResponse::Error { message } => {
-            eprintln!("error: {}", message);
-            std::process::exit(1);
-        }
-        server::AdminResponse::SessionList { grants, history } => {
-            if grants.is_empty() && history.is_empty() {
-                println!("(no session grants)");
-            } else {
-                for g in &grants {
-                    println!(
-                        "[active]  token={} allow={:?} deny={:?} allow_exact={:?} deny_exact={:?} static_only={} auto_amend={} granted_at={} expires_at={} prompt={}",
-                        g.token,
-                        g.allow,
-                        g.deny,
-                        g.allow_exact,
-                        g.deny_exact,
-                        g.static_only,
-                        g.auto_amend,
-                        g.granted_at,
-                        g.expires_at
-                            .map(|t| t.to_string())
-                            .unwrap_or_else(|| "(never)".to_string()),
-                        format_prompt(g.prompt_append.as_deref(), print_full_prompt),
-                    );
-                }
-                for h in &history {
-                    let label = match h.status {
-                        server::HistoricalStatus::Revoked => "[revoked]",
-                        server::HistoricalStatus::Expired => "[expired]",
-                    };
-                    println!(
-                        "{} token={} allow={:?} deny={:?} allow_exact={:?} deny_exact={:?} static_only={} auto_amend={} granted_at={} ended_at={} prompt={}",
-                        label,
-                        h.token,
-                        h.allow,
-                        h.deny,
-                        h.allow_exact,
-                        h.deny_exact,
-                        h.static_only,
-                        h.auto_amend,
-                        h.granted_at,
-                        h.ended_at,
-                        format_prompt(h.prompt_append.as_deref(), print_full_prompt),
-                    );
-                }
-            }
-        }
-        server::AdminResponse::SessionShow { report } => {
-            if let Some(active) = report.active {
-                println!(
-                    "token={} status=active static_only={} auto_amend={} granted_at={} expires_at={} allow={:?} deny={:?} allow_exact={:?} deny_exact={:?}",
-                    active.token,
-                    active.static_only,
-                    active.auto_amend,
-                    active.granted_at,
-                    active
-                        .expires_at
-                        .map(|t| t.to_string())
-                        .unwrap_or_else(|| "(never)".to_string()),
-                    active.allow,
-                    active.deny,
-                    active.allow_exact,
-                    active.deny_exact,
-                );
-                println!(
-                    "prompt={}",
-                    format_prompt(active.prompt_append.as_deref(), true)
-                );
-            } else {
-                println!("status=inactive");
-            }
-
-            for entry in &report.history {
-                let label = match entry.status {
-                    server::HistoricalStatus::Revoked => "revoked",
-                    server::HistoricalStatus::Expired => "expired",
-                };
-                println!(
-                    "history status={} static_only={} auto_amend={} granted_at={} ended_at={} expires_at={} allow={:?} deny={:?} allow_exact={:?} deny_exact={:?} prompt={}",
-                    label,
-                    entry.static_only,
-                    entry.auto_amend,
-                    entry.granted_at,
-                    entry.ended_at,
-                    entry
-                        .expires_at
-                        .map(|t| t.to_string())
-                        .unwrap_or_else(|| "(never)".to_string()),
-                    entry.allow,
-                    entry.deny,
-                    entry.allow_exact,
-                    entry.deny_exact,
-                    format_prompt(entry.prompt_append.as_deref(), true),
-                );
-            }
-
-            println!(
-                "stats total={} allowed={} denied={} completed={} exec_failed={} dry_run={} not_attempted={}",
-                report.stats.total,
-                report.stats.allowed,
-                report.stats.denied,
-                report.stats.completed,
-                report.stats.exec_failed,
-                report.stats.dry_run,
-                report.stats.not_attempted,
-            );
-            if !report.stats.source_counts.is_empty() {
-                let sources = report
-                    .stats
-                    .source_counts
-                    .iter()
-                    .map(|(source, count)| format!("{source}={count}"))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                println!("sources {}", sources);
-            }
-            let histogram = report
-                .stats
-                .risk_histogram
-                .iter()
-                .enumerate()
-                .filter(|(_, count)| **count > 0)
-                .map(|(risk, count)| format!("{risk}={count}"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            println!(
-                "risk_histogram {}",
-                if histogram.is_empty() {
-                    "(none)".to_string()
-                } else {
-                    histogram
-                }
-            );
-            if report.recent.is_empty() {
-                println!("recent (none)");
-            } else {
-                for interaction in &report.recent {
-                    let exec = match interaction.exec_status {
-                        session::SessionExecStatus::NotAttempted => "not_attempted",
-                        session::SessionExecStatus::Completed => "completed",
-                        session::SessionExecStatus::Failed => "failed",
-                        session::SessionExecStatus::DryRun => "dry_run",
-                        session::SessionExecStatus::Held => "held",
-                        session::SessionExecStatus::Provisional => "provisional",
-                    };
-                    println!(
-                        "recent at={} allowed={} source={:?} risk={} exec={} cmd={:?} reason={:?}",
-                        interaction.at_unix,
-                        interaction.allowed,
-                        interaction.source,
-                        interaction
-                            .risk
-                            .map(|risk| risk.to_string())
-                            .unwrap_or_else(|| "-".to_string()),
-                        exec,
-                        interaction.command,
-                        interaction.reason,
-                    );
-                }
-            }
-        }
-        server::AdminResponse::SessionAppeal {
-            allowed,
-            amended,
-            pattern,
-            reason,
-            risk,
-        } => {
-            println!(
-                "allowed={} amended={} risk={} pattern={} reason={}",
-                allowed,
-                amended,
-                risk.map(|value| value.to_string())
-                    .unwrap_or_else(|| "(none)".to_string()),
-                pattern.unwrap_or_else(|| "(none)".to_string()),
-                reason
-            );
-            if !allowed {
-                std::process::exit(1);
-            }
-        }
-        server::AdminResponse::Status { .. }
-        | server::AdminResponse::Ping { .. }
-        | server::AdminResponse::SecretExists { .. }
-        | server::AdminResponse::SecretList { .. }
-        | server::AdminResponse::SecretListDetailed { .. }
-        | server::AdminResponse::GateAction { .. }
-        | server::AdminResponse::Provisionals { .. }
-        | server::AdminResponse::Approvals { .. }
-        | server::AdminResponse::ApprovalShow { .. }
-        | server::AdminResponse::Verbs { .. }
-        | server::AdminResponse::VerbCreated { .. } => {
-            // session subcommands never request these response variants.
-            eprintln!("unexpected response from session admin call");
-            std::process::exit(1);
-        }
-    }
-
-    Ok(())
-}
-
-async fn handle_config(subcommand: ConfigCommands) -> Result<()> {
-    // Surface load errors loudly for every subcommand — this catches the
-    // relative-XDG_CONFIG_HOME case that previously fell through silently
-    // and risked writing to the default path instead of the intended one.
-    match subcommand {
-        ConfigCommands::Show => {
-            let config =
-                client_config::ClientConfig::load().context("failed to load client config")?;
-            println!("socket: {:?}", config.server_socket.unwrap_or_default());
-            println!(
-                "port: {:?}",
-                config
-                    .server_tcp_port
-                    .map(|p| p.to_string())
-                    .unwrap_or_default()
-            );
-            println!("user: {:?}", config.default_user.unwrap_or_default());
-            println!(
-                "token: {}",
-                if config.auth_token.is_some() {
-                    "***"
-                } else {
-                    "(none)"
-                }
-            );
-            println!(
-                "admin_token: {}",
-                if config.admin_token.is_some() {
-                    "***"
-                } else {
-                    "(none)"
-                }
-            );
-        }
-        ConfigCommands::SetServer { socket } => {
-            let mut config =
-                client_config::ClientConfig::load().context("failed to load client config")?;
-            config.server_socket = Some(socket);
-            config.server_tcp_port = None;
-            config.save()?;
-            println!("Server socket set");
-        }
-        ConfigCommands::SetPort { port } => {
-            let mut config =
-                client_config::ClientConfig::load().context("failed to load client config")?;
-            config.server_tcp_port = Some(port);
-            config.server_socket = None;
-            config.save()?;
-            println!("Server port set");
-        }
-        ConfigCommands::SetToken { token } => {
-            let mut config =
-                client_config::ClientConfig::load().context("failed to load client config")?;
-            config.auth_token = Some(token);
-            config.save()?;
-            println!("Token set");
-        }
-        ConfigCommands::SetAdminToken { token } => {
-            let mut config =
-                client_config::ClientConfig::load().context("failed to load client config")?;
-            config.admin_token = Some(token);
-            config.save()?;
-            println!("Admin token set");
-        }
-        ConfigCommands::SetUser { user } => {
-            let mut config =
-                client_config::ClientConfig::load().context("failed to load client config")?;
-            config.default_user = Some(user);
-            config.save()?;
-            println!("Default user set");
-        }
-        ConfigCommands::Clear => {
-            let config = client_config::ClientConfig::default();
-            config.save()?;
-            println!("Configuration cleared");
-        }
-    }
-    Ok(())
-}
-
-async fn handle_secrets(subcommand: SecretCommands) -> Result<()> {
-    let config = client_config::ClientConfig::load().ok().unwrap_or_default();
-    let (socket_path, tcp_port) = resolve_client_endpoint(None, &config);
-    let client = admin_client(socket_path, tcp_port, &config);
-
-    match subcommand {
-        SecretCommands::Add { key, value } => {
-            let existed = match client
-                .send_admin(server::AdminRequest::SecretExists { key: key.clone() })
-                .await
-            {
-                Ok(server::AdminResponse::SecretExists { exists }) => exists,
-                Ok(server::AdminResponse::Error { .. }) | Err(_) => {
-                    match client.send_admin(server::AdminRequest::SecretList).await? {
-                        server::AdminResponse::SecretList { keys } => {
-                            keys.iter().any(|k| k == &key)
-                        }
-                        server::AdminResponse::Error { message } => anyhow::bail!("{}", message),
-                        other => anyhow::bail!("unexpected admin response: {:?}", other),
-                    }
-                }
-                Ok(other) => anyhow::bail!("unexpected admin response: {:?}", other),
-            };
-            let secret_value = if let Some(v) = value {
-                v
-            } else if !std::io::stdin().is_terminal() {
-                let mut value = String::new();
-                std::io::stdin()
-                    .read_to_string(&mut value)
-                    .context("failed to read secret value from stdin")?;
-                if value.ends_with('\n') {
-                    value.pop();
-                    if value.ends_with('\r') {
-                        value.pop();
-                    }
-                }
-                value
-            } else {
-                rpassword::prompt_password("Secret value: ")?
-            };
-            match client
-                .send_admin(server::AdminRequest::SecretSet {
-                    key: key.clone(),
-                    value: secret_value,
-                })
-                .await?
-            {
-                server::AdminResponse::Ok => {
-                    if existed {
-                        eprintln!(
-                            "warning: secret '{}' already existed and was overwritten",
-                            key
-                        );
-                    }
-                    println!("Secret '{}' stored", key);
-                    Ok(())
-                }
-                server::AdminResponse::Error { message } => {
-                    anyhow::bail!("{}", message);
-                }
-                other => anyhow::bail!("unexpected admin response: {:?}", other),
-            }
-        }
-        SecretCommands::List { detailed } => {
-            let request = if detailed {
-                server::AdminRequest::SecretListDetailed
-            } else {
-                server::AdminRequest::SecretList
-            };
-            match client.send_admin(request).await? {
-                server::AdminResponse::SecretList { keys } => {
-                    if keys.is_empty() {
-                        println!("No secrets stored");
-                    } else {
-                        for key in keys {
-                            println!("  - {}", key);
-                        }
-                    }
-                    Ok(())
-                }
-                server::AdminResponse::SecretListDetailed { items } => {
-                    if items.is_empty() {
-                        println!("No secrets stored");
-                    } else {
-                        for item in items {
-                            if item.legacy {
-                                println!("  - {}  origin=legacy", item.key);
-                            } else if let Some(uid) = item.uid {
-                                println!("  - {}  uid={}", item.key, uid);
-                            } else if let Some(principal) = &item.principal {
-                                println!("  - {}  principal={}", item.key, principal);
-                            } else {
-                                println!("  - {}", item.key);
-                            }
-                        }
-                    }
-                    Ok(())
-                }
-                server::AdminResponse::Error { message } => {
-                    anyhow::bail!("{}", message);
-                }
-                other => anyhow::bail!("unexpected admin response: {:?}", other),
-            }
-        }
-        SecretCommands::Remove { key } => {
-            match client
-                .send_admin(server::AdminRequest::SecretDelete { key: key.clone() })
-                .await?
-            {
-                server::AdminResponse::Ok => {
-                    println!("Secret '{}' removed", key);
-                    Ok(())
-                }
-                server::AdminResponse::Error { message } => {
-                    anyhow::bail!("{}", message);
-                }
-                server::AdminResponse::SecretExists { .. } => {
-                    anyhow::bail!("unexpected admin response: secret_exists")
-                }
-                other => anyhow::bail!("unexpected admin response: {:?}", other),
-            }
-        }
-    }
-}
-
-async fn handle_shim(
-    tools: Option<Vec<String>>,
-    list: bool,
-    remove: bool,
-    path: Option<PathBuf>,
-    env_vars: Vec<(String, String)>,
-    secret_vars: Vec<(String, String)>,
-    user: Option<String>,
-) -> Result<()> {
-    let env_vars = env_pairs_to_map(env_vars).map_err(anyhow::Error::msg)?;
-    let secret_vars = env_pairs_to_map(secret_vars).map_err(anyhow::Error::msg)?;
-    let shim_dir = path.unwrap_or_else(|| {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".guard/shims")
-    });
-
-    if list {
-        let generator = shim::ShimGenerator::new(std::env::current_exe()?, shim_dir);
-        let installed = generator.list_installed()?;
-        if installed.is_empty() {
-            println!("No shims installed");
-        } else {
-            let registry = tool_config::ToolRegistry::load_default()
-                .unwrap_or_else(|_| tool_config::ToolRegistry::empty());
-            for s in installed {
-                print!("  - {}", s);
-                if let Some(tc) = registry.get(&s) {
-                    let parts: Vec<String> = tc
-                        .env
-                        .iter()
-                        .map(|(k, v)| format!("{k}={v}"))
-                        .chain(tc.secrets.iter().map(|(k, v)| format!("{k}=<secret:{v}>")))
-                        .collect();
-                    if !parts.is_empty() {
-                        print!("  [{}]", parts.join(", "));
-                    }
-                    for (uid, user_override) in &tc.users {
-                        let user_parts: Vec<String> = user_override
-                            .env
-                            .iter()
-                            .map(|(k, v)| format!("{k}={v}"))
-                            .chain(
-                                user_override
-                                    .secrets
-                                    .iter()
-                                    .map(|(k, v)| format!("{k}=<secret:{v}>")),
-                            )
-                            .collect();
-                        if !user_parts.is_empty() {
-                            print!("  user({uid}): [{}]", user_parts.join(", "));
-                        }
-                    }
-                }
-                println!();
-            }
-        }
-        return Ok(());
-    }
-
-    if remove {
-        let generator = shim::ShimGenerator::new(std::env::current_exe()?, shim_dir);
-        if let Some(tools) = tools {
-            let tools_refs: Vec<&str> = tools.iter().map(|s| s.as_str()).collect();
-            generator.remove(&tools_refs)?;
-            // Also remove tool configs
-            if let Ok(mut registry) = tool_config::ToolRegistry::load_default() {
-                for t in &tools_refs {
-                    let _ = registry.remove(t);
-                }
-            }
-        } else {
-            generator.remove_all()?;
-        }
-        println!("Removed shims");
-        return Ok(());
-    }
-
-    // Default: install shims
-    let tools_to_install = tools.unwrap_or_else(|| vec!["ssh".to_string(), "scp".to_string()]);
-    let generator = shim::ShimGenerator::new(std::env::current_exe()?, shim_dir.clone());
-    let tools_refs: Vec<&str> = tools_to_install.iter().map(|s| s.as_str()).collect();
-    generator.generate(&tools_refs)?;
-    println!("Installed shims to: {}", shim_dir.display());
-
-    // Register tool configs if env/secret flags were provided
-    if !env_vars.is_empty() || !secret_vars.is_empty() {
-        let mut registry = tool_config::ToolRegistry::load_default()
-            .unwrap_or_else(|_| tool_config::ToolRegistry::empty());
-
-        for tool_name in &tools_to_install {
-            let mut existing = registry.get(tool_name).cloned().unwrap_or_default();
-
-            if let Some(ref user_key) = user {
-                // Per-user override: store under users.<user_key>
-                let user_override = existing.users.entry(user_key.clone()).or_default();
-
-                for (k, v) in &env_vars {
-                    user_override.env.insert(k.clone(), v.clone());
-                }
-                for (k, v) in &secret_vars {
-                    user_override.secrets.insert(k.clone(), v.clone());
-                }
-                println!(
-                    "Registered per-user ({}) config for: {}",
-                    user_key, tool_name
-                );
-            } else {
-                // Base tool config
-                for (k, v) in &env_vars {
-                    existing.env.insert(k.clone(), v.clone());
-                }
-                for (k, v) in &secret_vars {
-                    existing.secrets.insert(k.clone(), v.clone());
-                }
-                println!("Registered tool config for: {}", tool_name);
-            }
-
-            registry.set(tool_name, existing)?;
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn parse_start(args: &[&str]) -> ServerCommands {
-        match MainArgs::parse_from(args) {
-            MainArgs::Server(ServerCommands::Start {
-                socket,
-                tcp_port,
-                auth_token,
-                admin_token,
-                socket_group,
-                users,
-                policy,
-                shim_dir,
-                llm_api_key,
-                llm_api_url,
-                llm_model,
-                llm_timeout,
-                llm_retries,
-                llm_models,
-                llm,
-                no_llm,
-                no_redact,
-                preflight,
-                no_cache,
-                cache_capacity,
-                cache_ttl,
-                learn_rules,
-                learned_rules,
-                learn_min_approvals,
-                learn_max_risk,
-                learn_shims,
-                learn_deny,
-                no_learn_deny,
-                deny_shapes,
-                learn_deny_min_denials,
-                dry_run,
-                state_db,
-                exec_as_caller,
-                system_prompt,
-                system_prompt_append,
-                gate,
-                verbs,
-                allow_bin,
-                child_env,
-                kube_proxy,
-                kubeconfig,
-                kube_context,
-                api_policy,
-                brokered_kubeconfig_out,
-                service,
-            }) => ServerCommands::Start {
-                socket,
-                tcp_port,
-                auth_token,
-                admin_token,
-                socket_group,
-                users,
-                policy,
-                shim_dir,
-                llm_api_key,
-                llm_api_url,
-                llm_model,
-                llm_timeout,
-                llm_retries,
-                llm_models,
-                llm,
-                no_llm,
-                no_redact,
-                preflight,
-                no_cache,
-                cache_capacity,
-                cache_ttl,
-                learn_rules,
-                learned_rules,
-                learn_min_approvals,
-                learn_max_risk,
-                learn_shims,
-                learn_deny,
-                no_learn_deny,
-                deny_shapes,
-                learn_deny_min_denials,
-                dry_run,
-                state_db,
-                exec_as_caller,
-                system_prompt,
-                system_prompt_append,
-                gate,
-                verbs,
-                allow_bin,
-                child_env,
-                kube_proxy,
-                kubeconfig,
-                kube_context,
-                api_policy,
-                brokered_kubeconfig_out,
-                service,
-            },
-            _ => panic!("expected server start args"),
-        }
-    }
-
-    fn resolved_llm(args: &[&str]) -> bool {
-        let ServerCommands::Start { llm, no_llm, .. } = parse_start(args) else {
-            panic!("expected start");
-        };
-
-        resolve_bool_flag(llm, no_llm, true)
-    }
-
-    #[test]
-    fn test_server_start_llm_defaults_true() {
-        assert!(resolved_llm(&["guard", "server", "start"]));
-    }
-
-    #[test]
-    fn test_server_start_llm_positive_forms() {
-        assert!(resolved_llm(&["guard", "server", "start", "--llm"]));
-        assert!(resolved_llm(&["guard", "server", "start", "--llm=true"]));
-        assert!(resolved_llm(&["guard", "server", "start", "--llm", "true"]));
-    }
-
-    #[test]
-    fn test_server_start_llm_negative_forms() {
-        assert!(!resolved_llm(&["guard", "server", "start", "--no-llm"]));
-        assert!(!resolved_llm(&["guard", "server", "start", "--llm=false"]));
-        assert!(!resolved_llm(&[
-            "guard", "server", "start", "--llm", "false"
-        ]));
-    }
-
-    #[test]
-    fn test_server_start_llm_retries_flag() {
-        let ServerCommands::Start { llm_retries, .. } =
-            parse_start(&["guard", "server", "start", "--llm-retries", "1"])
-        else {
-            panic!("expected start");
-        };
-        assert_eq!(llm_retries, Some(1));
-    }
-
-    fn resolved_learn_deny(args: &[&str]) -> bool {
-        let ServerCommands::Start {
-            learn_deny,
-            no_learn_deny,
-            ..
-        } = parse_start(args)
-        else {
-            panic!("expected start");
-        };
-        resolve_bool_flag(learn_deny, no_learn_deny, true)
-    }
-
-    #[test]
-    fn test_server_start_learn_deny_defaults_true() {
-        assert!(resolved_learn_deny(&["guard", "server", "start"]));
-    }
-
-    #[test]
-    fn test_server_start_learn_deny_can_be_disabled() {
-        assert!(!resolved_learn_deny(&[
-            "guard",
-            "server",
-            "start",
-            "--no-learn-deny"
-        ]));
-        assert!(!resolved_learn_deny(&[
-            "guard",
-            "server",
-            "start",
-            "--learn-deny=false"
-        ]));
-    }
-
-    #[test]
-    fn test_server_start_learn_deny_min_denials_flag() {
-        let ServerCommands::Start {
-            learn_deny_min_denials,
-            ..
-        } = parse_start(&["guard", "server", "start", "--learn-deny-min-denials", "5"])
-        else {
-            panic!("expected start");
-        };
-        assert_eq!(learn_deny_min_denials, Some(5));
-    }
-
-    #[test]
-    fn test_run_reevaluate_flag() {
-        match MainArgs::try_parse_from(["guard", "run", "--reevaluate", "kubectl", "get", "pods"]) {
-            Ok(MainArgs::Run { reevaluate, .. }) => assert!(reevaluate),
-            Ok(_) => panic!("expected Run variant"),
-            Err(e) => panic!("parser rejected --reevaluate: {}", e),
-        }
-        match MainArgs::try_parse_from(["guard", "run", "kubectl", "get", "pods"]) {
-            Ok(MainArgs::Run { reevaluate, .. }) => assert!(!reevaluate),
-            Ok(_) => panic!("expected Run variant"),
-            Err(e) => panic!("parser rejected plain run: {}", e),
-        }
-    }
-
-    #[test]
-    fn test_server_start_exec_as_caller_flag() {
-        let ServerCommands::Start { exec_as_caller, .. } =
-            parse_start(&["guard", "server", "start", "--exec-as-caller"])
-        else {
-            panic!("expected start");
-        };
-        assert!(exec_as_caller);
-    }
-
-    #[test]
-    fn test_server_start_state_db_flag() {
-        let ServerCommands::Start { state_db, .. } = parse_start(&[
-            "guard",
-            "server",
-            "start",
-            "--state-db",
-            "/var/lib/guard/state.db",
-        ]) else {
-            panic!("expected start");
-        };
-        assert_eq!(state_db, Some(PathBuf::from("/var/lib/guard/state.db")));
-    }
-
-    #[test]
-    fn test_server_start_admin_token_flag() {
-        let ServerCommands::Start { admin_token, .. } =
-            parse_start(&["guard", "server", "start", "--admin-token", "adm"])
-        else {
-            panic!("expected start");
-        };
-        assert_eq!(admin_token.as_deref(), Some("adm"));
-    }
-
-    #[test]
-    fn top_level_grant_parses_prose_and_static_only() {
-        match MainArgs::try_parse_from([
-            "guard",
-            "grant",
-            "tok",
-            "--static-only",
-            "readonly nextcloud kube access",
-        ]) {
-            Ok(MainArgs::Grant {
-                token,
-                prose,
-                static_only,
-                ..
-            }) => {
-                assert_eq!(token.as_deref(), Some("tok"));
-                assert_eq!(prose.as_deref(), Some("readonly nextcloud kube access"));
-                assert!(static_only);
-            }
-            Ok(_) => panic!("expected top-level grant"),
-            Err(err) => panic!("expected grant parse, got {err}"),
-        }
-    }
-
-    #[test]
-    fn top_level_grant_bare_prose_mints_session() {
-        let command = top_level_grant_to_session_command(
-            Some("readonly nextcloud kube access".to_string()),
-            None,
-            Vec::new(),
-            Vec::new(),
-            Some(120),
-            None,
-            None,
-            true,
-            false,
-            false,
-            None,
-        );
-
-        match command {
-            SessionCommands::New {
-                prose,
-                ttl,
-                static_only,
-                ..
-            } => {
-                assert_eq!(prose.as_deref(), Some("readonly nextcloud kube access"));
-                assert_eq!(ttl, Some(120));
-                assert!(static_only);
-            }
-            _ => panic!("expected top-level prose grant to mint a session"),
-        }
-    }
-
-    #[test]
-    fn top_level_grant_single_word_keeps_token_path() {
-        let command = top_level_grant_to_session_command(
-            Some("tok".to_string()),
-            None,
-            vec!["whoami".to_string()],
-            Vec::new(),
-            None,
-            None,
-            None,
-            false,
-            false,
-            false,
-            None,
-        );
-
-        match command {
-            SessionCommands::Grant { token, allow, .. } => {
-                assert_eq!(token, "tok");
-                assert_eq!(allow, vec!["whoami"]);
-            }
-            _ => panic!("expected single-word top-level grant to update a session"),
-        }
-    }
-
-    #[test]
-    fn session_grant_parses_prose_and_static_only_alias() {
-        match MainArgs::try_parse_from([
-            "guard",
-            "session",
-            "grant",
-            "tok",
-            "--no-llm-fallback",
-            "readonly nextcloud kube access",
-        ]) {
-            Ok(MainArgs::Session(SessionCommands::Grant {
-                token,
-                prose,
-                static_only,
-                ..
-            })) => {
-                assert_eq!(token, "tok");
-                assert_eq!(prose.as_deref(), Some("readonly nextcloud kube access"));
-                assert!(static_only);
-            }
-            Ok(_) => panic!("expected session grant"),
-            Err(err) => panic!("expected session grant parse, got {err}"),
-        }
-    }
-
-    #[test]
-    fn session_grant_parses_auto_amend_flags() {
-        match MainArgs::try_parse_from([
-            "guard",
-            "session",
-            "grant",
-            "tok",
-            "--auto-amend",
-            "--no-auto-amend",
-            "readonly nextcloud kube access",
-        ]) {
-            Ok(MainArgs::Session(SessionCommands::Grant {
-                auto_amend,
-                no_auto_amend,
-                ..
-            })) => {
-                assert!(auto_amend);
-                assert!(no_auto_amend);
-            }
-            Ok(_) => panic!("expected session grant"),
-            Err(err) => panic!("expected session grant parse, got {err}"),
-        }
-    }
-
-    #[test]
-    fn session_appeal_forwards_hyphen_args() {
-        match MainArgs::try_parse_from([
-            "guard", "session", "appeal", "tok", "df", "-h", "--output",
-        ]) {
-            Ok(MainArgs::Session(SessionCommands::Appeal {
-                token,
-                binary,
-                args,
-                ..
-            })) => {
-                assert_eq!(token, "tok");
-                assert_eq!(binary, "df");
-                assert_eq!(args, vec!["-h", "--output"]);
-            }
-            Ok(_) => panic!("expected session appeal"),
-            Err(err) => panic!("expected session appeal parse, got {err}"),
-        }
-    }
-
-    #[test]
-    fn top_level_appeal_parses_session_and_command() {
-        match MainArgs::try_parse_from([
-            "guard",
-            "appeal",
-            "--session",
-            "tok",
-            "kubectl",
-            "get",
-            "pods",
-            "-n",
-            "nextcloud",
-        ]) {
-            Ok(MainArgs::Appeal {
-                session,
-                binary,
-                args,
-                ..
-            }) => {
-                assert_eq!(session.as_deref(), Some("tok"));
-                assert_eq!(binary, "kubectl");
-                assert_eq!(args, vec!["get", "pods", "-n", "nextcloud"]);
-            }
-            Ok(_) => panic!("expected top-level appeal"),
-            Err(err) => panic!("expected top-level appeal parse, got {err}"),
-        }
-    }
-
-    /// Shared guard for tests that mutate `GUARD_LLM_MODEL*` environment
-    /// variables. Rust's test runner executes tests in parallel by default, and
-    /// `std::env::{set,remove}_var` mutates shared process state, so concurrent
-    /// readers/writers must be serialized with a mutex.
-    static MODEL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Mirror of the resolution logic in `run_server` so we can exercise the
-    /// precedence ladder without spinning up an actual server. Uses the same
-    /// `guard_env` helper as `run_server`, so it honors the canonical `GUARD_`
-    /// prefix. Must stay in sync with the block under the "Model resolution
-    /// precedence" comment in `run_server`.
-    fn resolve_single_model_for_test(cli_flag: Option<String>) -> Option<String> {
-        cli_flag
-            .filter(|value| !value.is_empty())
-            .or_else(|| guard::env::guard_env("LLM_MODEL").filter(|v| !v.is_empty()))
-    }
-
-    fn resolve_chain_for_test(cli_flag: Option<Vec<String>>) -> Vec<String> {
-        let models_chain: Vec<String> = cli_flag
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>();
-        if models_chain.is_empty() {
-            guard::env::guard_env("LLM_MODELS")
-                .map(|v| {
-                    v.split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default()
-        } else {
-            models_chain
-        }
-    }
-
-    /// Regression guard for silent-ignore of `GUARD_LLM_MODEL`. Exercises the
-    /// full precedence ladder:
-    ///
-    ///   1. `--llm-model` CLI flag
-    ///   2. `GUARD_LLM_MODEL` env var (singular)
-    ///   3. default (`None` here; EvalConfig falls back to `DEFAULT_MODEL`)
-    ///
-    /// and verifies that `GUARD_LLM_MODELS` (plural, chain) still parses
-    /// correctly alongside the singular. The test is sequential within a single
-    /// function body because splitting into multiple `#[test]` functions would
-    /// allow parallel process-env races even with a mutex (one test could
-    /// observe another test's cleared state).
-    #[test]
-    fn test_llm_model_env_resolution_chain() {
-        // SAFETY: serialize all process-env mutations in this test suite.
-        let _guard = MODEL_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        // Snapshot existing values (both prefixes) so we restore the shell's
-        // environment on exit even if the harness inherited one of these vars.
-        let prev = ["GUARD_LLM_MODEL", "GUARD_LLM_MODELS"].map(|k| (k, std::env::var(k).ok()));
-
-        // Env mutations are serialized across tests via MODEL_ENV_LOCK above.
-        for (k, _) in &prev {
-            std::env::remove_var(k);
-        }
-
-        // 1. Clean slate: no flag, no env -> None (caller falls back to
-        //    evaluate::DEFAULT_MODEL which is "openai/gpt-5.4-mini").
-        assert_eq!(
-            resolve_single_model_for_test(None),
-            None,
-            "with no flag and no env, single-model resolution must be None so \
-             EvalConfig picks DEFAULT_MODEL"
-        );
-        assert_eq!(resolve_chain_for_test(None), Vec::<String>::new());
-
-        // 2. GUARD_LLM_MODEL set -> picked up as primary.
-        std::env::set_var("GUARD_LLM_MODEL", "alt/model-x");
-        assert_eq!(
-            resolve_single_model_for_test(None),
-            Some("alt/model-x".to_string()),
-            "GUARD_LLM_MODEL must be honored when no CLI flag is supplied"
-        );
-
-        // 3. CLI flag wins over the singular env var.
-        assert_eq!(
-            resolve_single_model_for_test(Some("flag/model-y".to_string())),
-            Some("flag/model-y".to_string()),
-            "--llm-model must take precedence over GUARD_LLM_MODEL"
-        );
-
-        // 4. Empty CLI flag falls through to env var.
-        assert_eq!(
-            resolve_single_model_for_test(Some(String::new())),
-            Some("alt/model-x".to_string()),
-            "empty --llm-model value must fall through to the env var"
-        );
-
-        // 5. Chain env var still parses independently of the singular var.
-        std::env::set_var("GUARD_LLM_MODELS", "a,b,c");
-        let chain = resolve_chain_for_test(None);
-        assert_eq!(
-            chain,
-            vec!["a".to_string(), "b".to_string(), "c".to_string()],
-            "GUARD_LLM_MODELS must parse into an ordered chain"
-        );
-        // The singular resolver is orthogonal and still returns the singular
-        // value; the call site in run_server applies the precedence rule
-        // ("chain wins when non-empty") when wiring EvalConfig.
-        assert_eq!(
-            resolve_single_model_for_test(None),
-            Some("alt/model-x".to_string())
-        );
-
-        // Cleanup: restore prior values so other tests see the original env.
-        for (k, v) in &prev {
-            match v {
-                Some(val) => std::env::set_var(k, val),
-                None => std::env::remove_var(k),
-            }
-        }
-    }
-
-    #[test]
-    fn test_server_start_llm_models_flag() {
-        let ServerCommands::Start { llm_models, .. } = parse_start(&[
-            "guard",
-            "server",
-            "start",
-            "--llm-models",
-            "openai/gpt-5.4-mini,meta-llama/llama-4-maverick",
-        ]) else {
-            panic!("expected start");
-        };
-        assert_eq!(
-            llm_models,
-            Some(vec![
-                "openai/gpt-5.4-mini".to_string(),
-                "meta-llama/llama-4-maverick".to_string()
-            ])
-        );
-    }
-
-    #[test]
-    fn test_resolve_bool_flag() {
-        assert!(resolve_bool_flag(None, false, true));
-        assert!(!resolve_bool_flag(None, true, true));
-        assert!(resolve_bool_flag(Some(true), false, false));
-        assert!(!resolve_bool_flag(Some(false), false, true));
-    }
-
-    /// `guard run df -h` must forward `-h` to df. Earlier a pre-clap argv
-    /// scan consumed `-h` before clap could see that it was a positional
-    /// arg to the subcommand. We verify at the parser level: clap must
-    /// parse `run echo -h` into the `Run` variant with `-h` in args.
-    #[test]
-    fn run_forwards_short_help_flag_to_child() {
-        match MainArgs::try_parse_from(["guard", "run", "echo", "-h"]) {
-            Ok(MainArgs::Run { binary, args, .. }) => {
-                assert_eq!(binary, "echo");
-                assert_eq!(args, vec!["-h".to_string()]);
-            }
-            Ok(other) => panic!(
-                "expected Run variant, got {:?}",
-                std::mem::discriminant(&other)
-            ),
-            Err(e) => panic!("parser must not intercept -h: {}", e),
-        }
-    }
-
-    /// Same story for `--help` — must be forwarded, not caught by clap's
-    /// subcommand help handler.
-    #[test]
-    fn run_forwards_long_help_flag_to_child() {
-        match MainArgs::try_parse_from(["guard", "run", "df", "--help"]) {
-            Ok(MainArgs::Run { binary, args, .. }) => {
-                assert_eq!(binary, "df");
-                assert_eq!(args, vec!["--help".to_string()]);
-            }
-            Ok(_) => panic!("expected Run variant"),
-            Err(e) => panic!("parser must not intercept --help: {}", e),
-        }
-    }
-
-    /// Mixed flags after the binary should all be forwarded intact.
-    #[test]
-    fn run_forwards_multiple_trailing_flags() {
-        match MainArgs::try_parse_from(["guard", "run", "df", "-h", "/"]) {
-            Ok(MainArgs::Run { binary, args, .. }) => {
-                assert_eq!(binary, "df");
-                assert_eq!(args, vec!["-h".to_string(), "/".to_string()]);
-            }
-            Ok(_) => panic!("expected Run variant"),
-            Err(e) => panic!("parser rejected valid run args: {}", e),
-        }
-    }
-
-    #[test]
-    fn run_accepts_transient_secret_injection() {
-        match MainArgs::try_parse_from([
-            "guard",
-            "run",
-            "--secret",
-            "OPNSENSE_API_KEY",
-            "--secret",
-            "OPNSENSE_API_SECRET=atlas/opnsense-api-secret",
-            "ssh",
-            "fw",
-            "configctl",
-            "system",
-            "status",
-        ]) {
-            Ok(MainArgs::Run {
-                secret_vars,
-                binary,
-                args,
-                ..
-            }) => {
-                assert_eq!(binary, "ssh");
-                assert_eq!(
-                    secret_vars,
-                    vec![
-                        (
-                            "OPNSENSE_API_KEY".to_string(),
-                            "OPNSENSE_API_KEY".to_string()
-                        ),
-                        (
-                            "OPNSENSE_API_SECRET".to_string(),
-                            "atlas/opnsense-api-secret".to_string()
-                        )
-                    ]
-                );
-                assert_eq!(
-                    args,
-                    vec![
-                        "fw".to_string(),
-                        "configctl".to_string(),
-                        "system".to_string(),
-                        "status".to_string()
-                    ]
-                );
-            }
-            Ok(_) => panic!("expected Run variant"),
-            Err(e) => panic!("parser rejected valid run secret injection: {}", e),
-        }
-    }
-
-    #[test]
-    fn run_accepts_comma_separated_bare_secret_names() {
-        match MainArgs::try_parse_from(["guard", "run", "--secret", "foo,bar", "sh", "-c", "true"])
+// The `run`/`exec` and `appeal` commands disable clap's help flag so that
+// `-h`/`--help` after the target binary forward to that binary instead of
+// printing guard's own help. The cost is that a help flag meant for guard
+// (before any binary is named) would otherwise error, so it is recovered here
+// and redirected to the subcommand's own help.
+fn passthrough_command_help_requested(
+    args: &[String],
+) -> Option<(Vec<&'static str>, &'static str)> {
+    let is_help = |idx| matches!(args.get(idx).map(String::as_str), Some("--help" | "-h"));
+    match args.first().map(String::as_str) {
+        Some("run" | "exec") if is_help(1) && args.len() == 2 => Some((vec!["run"], "guard run")),
+        // `guard appeal [--session T] [--socket P] <binary> ...`: the binary is
+        // the first positional. Help before it is guard's; after it forwards.
+        Some("appeal") if appeal_self_help_requested(&args[1..], &["--session", "--socket"], 0) => {
+            Some((vec!["appeal"], "guard appeal"))
+        }
+        // `guard session appeal [--socket P] <token> <binary> ...`: the binary is
+        // the second positional (token is the first).
+        Some("session")
+            if matches!(args.get(1).map(String::as_str), Some("appeal"))
+                && appeal_self_help_requested(&args[2..], &["--socket"], 1) =>
         {
-            Ok(MainArgs::Run {
-                secret_vars,
-                binary,
-                args,
-                ..
-            }) => {
-                assert_eq!(binary, "sh");
-                assert_eq!(args, vec!["-c".to_string(), "true".to_string()]);
-                assert_eq!(
-                    secret_vars,
-                    vec![
-                        ("FOO".to_string(), "foo".to_string()),
-                        ("BAR".to_string(), "bar".to_string())
-                    ]
-                );
+            Some((vec!["session", "appeal"], "guard session appeal"))
+        }
+        _ => None,
+    }
+}
+
+/// True if `-h`/`--help` in an appeal invocation is meant for guard rather than
+/// the appealed command: it appears before the `<binary>` positional has been
+/// consumed. `value_flags` are the guard options that take a separate value (so
+/// their value is not miscounted as a positional); `leading_positionals` is how
+/// many positionals precede `<binary>` (0 for top-level appeal, 1 for `session
+/// appeal`, whose first positional is the token).
+fn appeal_self_help_requested(
+    args: &[String],
+    value_flags: &[&str],
+    leading_positionals: usize,
+) -> bool {
+    let mut positionals = 0usize;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "--help" || arg == "-h" {
+            // `<binary>` is the positional at index `leading_positionals`; it is
+            // consumed once `positionals` exceeds that count.
+            return positionals <= leading_positionals;
+        }
+        if arg.starts_with('-') && arg != "-" {
+            if value_flags.contains(&arg) && !arg.contains('=') {
+                i += 2;
+            } else {
+                i += 1;
             }
-            Ok(_) => panic!("expected Run variant"),
-            Err(e) => panic!("parser rejected comma-separated bare secrets: {}", e),
+        } else {
+            positionals += 1;
+            if positionals > leading_positionals {
+                // The binary has been named; everything after belongs to it.
+                return false;
+            }
+            i += 1;
         }
     }
+    false
+}
 
-    #[test]
-    fn bare_secret_name_derives_shell_safe_env_name() {
-        let parsed = parse_secret_mapping("opnsense-apikey-secret").unwrap();
-        assert_eq!(
-            parsed,
-            (
-                "OPNSENSE_APIKEY_SECRET".to_string(),
-                "opnsense-apikey-secret".to_string()
+fn print_nested_help(path: &[&str], bin_name: &str) -> Result<()> {
+    let mut command = MainArgs::command();
+    for name in path {
+        command = command.find_subcommand(name).cloned().ok_or_else(|| {
+            anyhow::anyhow!("internal error: help for `{}` is unavailable", bin_name)
+        })?;
+    }
+    command = command.bin_name(bin_name);
+    command.print_help()?;
+    println!();
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum AnsiColor {
+    Red,
+    Green,
+    Yellow,
+    Cyan,
+    Bold,
+}
+
+fn color_enabled_for_stdout() -> bool {
+    color_enabled(std::io::stdout().is_terminal())
+}
+
+fn color_enabled_for_stderr() -> bool {
+    color_enabled(std::io::stderr().is_terminal())
+}
+
+fn color_enabled(is_terminal: bool) -> bool {
+    is_terminal
+        && std::env::var_os("NO_COLOR").is_none()
+        && std::env::var("TERM")
+            .map(|term| term != "dumb")
+            .unwrap_or(true)
+}
+
+fn paint(text: impl AsRef<str>, color: AnsiColor, enabled: bool) -> String {
+    if !enabled {
+        return text.as_ref().to_string();
+    }
+    let code = match color {
+        AnsiColor::Red => "31",
+        AnsiColor::Green => "32",
+        AnsiColor::Yellow => "33",
+        AnsiColor::Cyan => "36",
+        AnsiColor::Bold => "1",
+    };
+    format!("\x1b[{code}m{}\x1b[0m", text.as_ref())
+}
+
+struct UtcTimestamp;
+
+impl FormatTime for UtcTimestamp {
+    fn format_time(&self, writer: &mut Writer<'_>) -> std::fmt::Result {
+        let now = guard::env::now_unix();
+        write!(writer, "{}", unix_seconds_to_utc(now))
+    }
+}
+
+fn unix_seconds_to_utc(ts: u64) -> String {
+    let days = (ts / 86_400) as i64;
+    let seconds = ts % 86_400;
+    let hour = seconds / 3_600;
+    let minute = (seconds % 3_600) / 60;
+    let second = seconds % 60;
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i64, u64, u64) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    (year, month as u64, day as u64)
+}
+
+fn format_timestamp(ts: u64) -> String {
+    format!("{} ({ts})", unix_seconds_to_utc(ts))
+}
+
+fn format_optional_timestamp(ts: Option<u64>) -> String {
+    ts.map(format_timestamp)
+        .unwrap_or_else(|| "(never)".to_string())
+}
+
+fn log_cli_usage_error(args: &[String], error: &clap::Error) {
+    let command_path = cli_command_path(args);
+    tracing::warn!(
+        "[AUDIT] CLI_USAGE_ERROR command={} kind={:?} argc={}",
+        command_path,
+        error.kind(),
+        args.len()
+    );
+}
+
+fn cli_command_path(args: &[String]) -> String {
+    let mut parts = args
+        .iter()
+        .filter(|arg| !arg.starts_with('-'))
+        .map(String::as_str);
+    let Some(first) = parts.next() else {
+        return "(top-level)".to_string();
+    };
+    let Some(second) = parts.next() else {
+        return first.to_string();
+    };
+    let allowed_second = match first {
+        "server" => matches!(second, "start" | "connect" | "status"),
+        "secrets" | "secret" => matches!(second, "add" | "list" | "remove"),
+        "config" => matches!(
+            second,
+            "show"
+                | "set-server"
+                | "set-port"
+                | "set-token"
+                | "set-admin-token"
+                | "set-user"
+                | "clear"
+        ),
+        "mcp" => matches!(second, "serve"),
+        "session" => matches!(
+            second,
+            "new" | "grant" | "appeal" | "revoke" | "show" | "list"
+        ),
+        "verb" => matches!(second, "list" | "run" | "create"),
+        _ => false,
+    };
+    if allowed_second {
+        format!("{first} {second}")
+    } else {
+        first.to_string()
+    }
+}
+
+fn print_help_tree(admin: bool) {
+    let color = color_enabled_for_stdout();
+    println!("{}", paint("guard access summary", AnsiColor::Bold, color));
+    println!("  user");
+    println!("    run|exec <binary> [args...]");
+    println!("    server connect <binary> [args...]");
+    println!("    status");
+    println!("    server status");
+    println!("    secrets|secret add|remove|list");
+    println!("    verb list");
+    println!("    verb run <name> --param key=value");
+    println!("    session list [--history] [--since duration] [--full]");
+    println!("    session show [token]  (defaults to $GUARD_SESSION)");
+    println!("    session new");
+    println!("    provisionals");
+    println!("    approvals [handle]");
+    println!("    approval-note <handle> <text>");
+    println!("    mcp serve");
+    println!();
+    println!("  local setup");
+    println!("    shim [tools] [--list|--remove]");
+    println!("    config show|set-server|set-port|set-token|set-admin-token|set-user|clear");
+    if admin {
+        println!();
+        println!("{}", paint("  admin", AnsiColor::Yellow, color));
+        println!("    server start");
+        println!("    session new [prose] [--allow glob] [--deny glob]");
+        println!("    session grant <token> [prose] [--allow glob] [--deny glob]");
+        println!("    session appeal <token> <binary> [args...]");
+        println!("    session revoke <token>");
+        println!("    grant [token] [prose]");
+        println!("    appeal --session <token> <binary> [args...]");
+        println!("    secrets list --detailed");
+        println!("    approve|deny <handle>");
+        println!("    confirm|revert <handle>");
+        println!("    verb create --prompt <text>");
+    } else {
+        println!();
+        println!(
+            "{}",
+            paint(
+                "Run `guard help-tree --admin` to include daemon-principal/admin-token commands.",
+                AnsiColor::Cyan,
+                color,
             )
         );
     }
-
-    #[test]
-    fn secret_mapping_rejects_invalid_env_name() {
-        let err = parse_secret_mapping("bad-name=secret").expect_err("must reject invalid env");
-        assert!(err.contains("invalid environment variable name"));
-    }
-
-    #[test]
-    fn run_help_requested_only_when_help_is_the_run_command() {
-        assert!(run_help_requested(&[
-            "run".to_string(),
-            "--help".to_string()
-        ]));
-        assert!(run_help_requested(&["exec".to_string(), "-h".to_string()]));
-        assert!(!run_help_requested(&[
-            "run".to_string(),
-            "df".to_string(),
-            "--help".to_string()
-        ]));
-    }
-
-    #[test]
-    fn server_connect_accepts_command_args_without_separator() {
-        match MainArgs::try_parse_from([
-            "guard",
-            "server",
-            "connect",
-            "--socket",
-            ".cache/guard.sock",
-            "cp",
-            "README.md",
-            ".cache/copy",
-        ]) {
-            Ok(MainArgs::Server(ServerCommands::Connect {
-                socket,
-                binary,
-                args,
-                ..
-            })) => {
-                assert_eq!(socket, Some(".cache/guard.sock".to_string()));
-                assert_eq!(binary, "cp");
-                assert_eq!(
-                    args,
-                    vec!["README.md".to_string(), ".cache/copy".to_string()]
-                );
-            }
-            Ok(_) => panic!("expected server connect variant"),
-            Err(e) => panic!("parser rejected valid server connect args: {}", e),
-        }
-    }
-
-    #[test]
-    fn server_connect_forwards_hyphen_args_without_separator() {
-        match MainArgs::try_parse_from([
-            "guard",
-            "server",
-            "connect",
-            "--socket",
-            ".cache/guard.sock",
-            "bash",
-            "-lc",
-            "id",
-        ]) {
-            Ok(MainArgs::Server(ServerCommands::Connect { binary, args, .. })) => {
-                assert_eq!(binary, "bash");
-                assert_eq!(args, vec!["-lc".to_string(), "id".to_string()]);
-            }
-            Ok(_) => panic!("expected server connect variant"),
-            Err(e) => panic!("parser rejected valid server connect args: {}", e),
-        }
-    }
-
-    /// Top-level `--help` must still work (clap handles it natively after
-    /// we removed the argv pre-scan).
-    #[test]
-    fn top_level_help_still_triggers_clap_display_help() {
-        match MainArgs::try_parse_from(["guard", "--help"]) {
-            Ok(_) => panic!("expected clap to return DisplayHelp error"),
-            Err(e) => assert_eq!(e.kind(), clap::error::ErrorKind::DisplayHelp),
-        }
-    }
-
-    /// `guard help run` should show the subcommand help via clap. Note:
-    /// because `Run` disables its own help flag, `guard run --help` would
-    /// forward `--help` to the child instead — users get run help via
-    /// `guard help run`. The instructions explicitly permit this tradeoff.
-    #[test]
-    fn help_run_shows_subcommand_help() {
-        match MainArgs::try_parse_from(["guard", "help", "run"]) {
-            Ok(_) => panic!("expected clap to return DisplayHelp for `help run`"),
-            Err(e) => assert_eq!(e.kind(), clap::error::ErrorKind::DisplayHelp),
-        }
-    }
-
-    #[test]
-    fn top_level_version_requested_matches_first_arg_only() {
-        assert!(top_level_version_requested(&["--version".to_string()]));
-        assert!(top_level_version_requested(&["-V".to_string()]));
-        assert!(!top_level_version_requested(&[
-            "run".to_string(),
-            "-V".to_string()
-        ]));
-        assert!(!top_level_version_requested(&[]));
-    }
-
-    #[test]
-    fn env_pairs_to_map_rejects_conflicting_duplicate_values() {
-        let err = env_pairs_to_map(vec![
-            ("FOO".to_string(), "one".to_string()),
-            ("FOO".to_string(), "two".to_string()),
-        ])
-        .unwrap_err();
-        assert!(err.contains("conflicting duplicate environment variable injection"));
-    }
-
-    #[test]
-    fn secret_pairs_to_map_allows_idempotent_repeats() {
-        let map = secret_pairs_to_map(vec![
-            ("AWS_TOKEN".to_string(), "aws/token".to_string()),
-            ("AWS_TOKEN".to_string(), "aws/token".to_string()),
-        ])
-        .unwrap();
-        assert_eq!(map.get("AWS_TOKEN").map(String::as_str), Some("aws/token"));
-    }
-
-    #[test]
-    fn singular_secret_alias_parses_as_secrets_subcommand() {
-        let args = MainArgs::try_parse_from(["guard", "secret", "list"]).unwrap();
-        assert!(matches!(
-            args,
-            MainArgs::Secrets(SecretCommands::List { detailed: false })
-        ));
-    }
-
-    #[test]
-    fn unknown_top_level_command_does_not_execute_implicitly() {
-        let err = MainArgs::try_parse_from(["guard", "ssh", "host"])
-            .err()
-            .unwrap();
-        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
-    }
+    println!();
+    println!("Access markers:");
+    println!("  user commands are available to allowed local callers.");
+    println!("  local setup commands edit client-side files for the invoking account.");
+    println!("  session show reveals a full grant only to the daemon or the token's own holder; list hides raw tokens for non-admin callers.");
+    println!("  admin commands require the daemon principal or the TCP admin token.");
 }
+#[cfg(test)]
+mod tests;

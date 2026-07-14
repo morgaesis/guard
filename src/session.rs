@@ -12,10 +12,10 @@
 //! while `session_store.rs` persists grants and bounded interaction
 //! history across daemon restarts.
 
+use guard::env::now_unix;
 use guard::policy::{Decision, PolicyRule};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Default daemon-side history retention. Anything older than this is
 /// dropped on the next opportunistic purge. 24h matches the "I want
@@ -40,6 +40,11 @@ pub struct SessionGrant {
     /// related psql copy commands as expected".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_append: Option<String>,
+    /// Notes produced by static grant synthesis. These explain generated
+    /// allow/deny rules for display, but are not appended to the evaluator
+    /// prompt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub generated_notes: Vec<String>,
     /// If true, commands that miss the grant's static allow/deny rules are
     /// denied instead of falling through to the normal evaluator.
     #[serde(default)]
@@ -107,6 +112,8 @@ pub struct HistoricalGrant {
     pub status: HistoricalStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_append: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub generated_notes: Vec<String>,
     #[serde(default)]
     pub static_only: bool,
     #[serde(default)]
@@ -139,6 +146,8 @@ pub struct SessionGrantSummary {
     pub granted_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_append: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub generated_notes: Vec<String>,
     #[serde(default)]
     pub static_only: bool,
     #[serde(default)]
@@ -255,6 +264,15 @@ pub struct SessionRegistry {
     history: Vec<HistoricalGrant>,
     interactions: Vec<StoredSessionInteraction>,
     history_retention_secs: u64,
+    /// Monotonic mutation counter, bumped by every state-changing operation
+    /// (all of which run under the registry's write lock). A snapshot clone
+    /// carries the revision of the state it represents, so the store can
+    /// refuse to overwrite newer on-disk state with a stale snapshot when
+    /// concurrent persists complete out of order. `purge_expired` does not
+    /// bump: it derives no new state (expiry and retention are re-derived at
+    /// every load), so two same-revision snapshots differ at most in purge
+    /// progress and are interchangeable on disk.
+    revision: u64,
 }
 
 impl Default for SessionRegistry {
@@ -264,6 +282,7 @@ impl Default for SessionRegistry {
             history: Vec::new(),
             interactions: Vec::new(),
             history_retention_secs: DEFAULT_HISTORY_RETENTION_SECS,
+            revision: 0,
         }
     }
 }
@@ -292,7 +311,13 @@ impl SessionRegistry {
                 .map(|(token, interaction)| StoredSessionInteraction { token, interaction })
                 .collect(),
             history_retention_secs,
+            revision: 0,
         }
+    }
+
+    /// The revision of the state this registry (or snapshot clone) represents.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub fn grants_snapshot(&self) -> HashMap<String, SessionGrant> {
@@ -311,8 +336,9 @@ impl SessionRegistry {
     }
 
     pub fn grant(&mut self, token: String, mut grant: SessionGrant) {
+        self.revision += 1;
         if grant.granted_at == 0 {
-            grant.granted_at = current_unix_secs();
+            grant.granted_at = now_unix();
         }
         // If we are overwriting an active grant, archive the previous
         // version so the audit trail still shows what was in effect.
@@ -320,7 +346,7 @@ impl SessionRegistry {
             self.history.push(historical(
                 &token,
                 prev,
-                current_unix_secs(),
+                now_unix(),
                 HistoricalStatus::Revoked,
             ));
         }
@@ -331,10 +357,11 @@ impl SessionRegistry {
         let Some(grant) = self.grants.remove(token) else {
             return false;
         };
+        self.revision += 1;
         self.history.push(historical(
             token,
             grant,
-            current_unix_secs(),
+            now_unix(),
             HistoricalStatus::Revoked,
         ));
         true
@@ -345,11 +372,11 @@ impl SessionRegistry {
         let Some(grant) = self.grants.get(token) else {
             return false;
         };
-        !grant.is_expired(current_unix_secs())
+        !grant.is_expired(now_unix())
     }
 
     pub fn list(&self) -> Vec<SessionGrantSummary> {
-        let now = current_unix_secs();
+        let now = now_unix();
         self.grants
             .iter()
             .filter(|(_, g)| !g.is_expired(now))
@@ -362,6 +389,7 @@ impl SessionRegistry {
                 expires_at: g.expires_at,
                 granted_at: g.granted_at,
                 prompt_append: g.prompt_append.clone(),
+                generated_notes: g.generated_notes.clone(),
                 static_only: g.static_only,
                 auto_amend: g.auto_amend,
             })
@@ -382,8 +410,9 @@ impl SessionRegistry {
     }
 
     pub fn record_interaction(&mut self, token: &str, mut interaction: SessionInteraction) {
+        self.revision += 1;
         if interaction.at_unix == 0 {
-            interaction.at_unix = current_unix_secs();
+            interaction.at_unix = now_unix();
         }
         self.interactions.push(StoredSessionInteraction {
             token: token.to_string(),
@@ -393,7 +422,7 @@ impl SessionRegistry {
 
     pub fn show(&self, token: &str, limit: usize) -> Option<SessionReport> {
         let active = self.grants.get(token).and_then(|grant| {
-            if grant.is_expired(current_unix_secs()) {
+            if grant.is_expired(now_unix()) {
                 None
             } else {
                 Some(SessionGrantSummary {
@@ -405,6 +434,7 @@ impl SessionRegistry {
                     expires_at: grant.expires_at,
                     granted_at: grant.granted_at,
                     prompt_append: grant.prompt_append.clone(),
+                    generated_notes: grant.generated_notes.clone(),
                     static_only: grant.static_only,
                     auto_amend: grant.auto_amend,
                 })
@@ -477,7 +507,7 @@ impl SessionRegistry {
     /// has not expired, and has a prompt attached.
     pub fn prompt_append_for(&self, token: &str) -> Option<String> {
         let grant = self.grants.get(token)?;
-        if grant.is_expired(current_unix_secs()) {
+        if grant.is_expired(now_unix()) {
             return None;
         }
         grant.prompt_append.clone()
@@ -487,14 +517,14 @@ impl SessionRegistry {
         let Some(grant) = self.grants.get(token) else {
             return false;
         };
-        !grant.is_expired(current_unix_secs()) && grant.static_only
+        !grant.is_expired(now_unix()) && grant.static_only
     }
 
     pub fn auto_amend_for(&self, token: &str) -> bool {
         let Some(grant) = self.grants.get(token) else {
             return false;
         };
-        !grant.is_expired(current_unix_secs()) && grant.auto_amend
+        !grant.is_expired(now_unix()) && grant.auto_amend
     }
 
     pub fn amend_exact(
@@ -504,10 +534,17 @@ impl SessionRegistry {
         binary: String,
         args: Vec<String>,
     ) -> Option<bool> {
-        let grant = self.grants.get_mut(token)?;
-        if grant.is_expired(current_unix_secs()) {
+        if self
+            .grants
+            .get(token)
+            .is_none_or(|g| g.is_expired(now_unix()))
+        {
             return None;
         }
+        // Bump even on a Some(false) outcome: the opposite-side retain below
+        // can still have removed a rule.
+        self.revision += 1;
+        let grant = self.grants.get_mut(token).expect("presence checked above");
 
         let rule = SessionExactRule::new(binary, args);
         match decision {
@@ -535,7 +572,7 @@ impl SessionRegistry {
     /// Remove expired entries (move them to history) and trim history
     /// older than the retention window. Called opportunistically.
     pub fn purge_expired(&mut self) {
-        let now = current_unix_secs();
+        let now = now_unix();
         let retention_cutoff = now.saturating_sub(self.history_retention_secs);
 
         let expired_tokens: Vec<String> = self
@@ -570,7 +607,7 @@ impl SessionRegistry {
         args: &[String],
     ) -> Option<(SessionDecision, String)> {
         let grant = self.grants.get(token)?;
-        if grant.is_expired(current_unix_secs()) {
+        if grant.is_expired(now_unix()) {
             return None;
         }
 
@@ -671,6 +708,7 @@ fn historical(
         ended_at,
         status,
         prompt_append: grant.prompt_append,
+        generated_notes: grant.generated_notes,
         static_only: grant.static_only,
         auto_amend: grant.auto_amend,
     }
@@ -682,13 +720,6 @@ fn command_line(cmd: &str, args: &[String]) -> String {
     } else {
         format!("{} {}", cmd, args.join(" "))
     }
-}
-
-fn current_unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -707,6 +738,7 @@ mod tests {
                 expires_at: None,
                 granted_at: 0,
                 prompt_append: None,
+                generated_notes: Vec::new(),
                 static_only: false,
                 auto_amend: false,
             },
@@ -814,6 +846,7 @@ mod tests {
                 expires_at: Some(1),
                 granted_at: 0, // 1970-01-01 +1s
                 prompt_append: None,
+                generated_notes: Vec::new(),
                 static_only: false,
                 auto_amend: false,
             },
@@ -842,6 +875,7 @@ mod tests {
                 expires_at: None,
                 granted_at: 0,
                 prompt_append: Some("session is restoring a backup".to_string()),
+                generated_notes: Vec::new(),
                 static_only: false,
                 auto_amend: false,
             },
@@ -866,6 +900,7 @@ mod tests {
                 expires_at: Some(1),
                 granted_at: 0,
                 prompt_append: Some("ignored".to_string()),
+                generated_notes: Vec::new(),
                 static_only: false,
                 auto_amend: false,
             },
@@ -886,6 +921,7 @@ mod tests {
                 expires_at: None,
                 granted_at: 0,
                 prompt_append: None,
+                generated_notes: Vec::new(),
                 static_only: false,
                 auto_amend: false,
             },
@@ -900,6 +936,7 @@ mod tests {
                 expires_at: Some(1),
                 granted_at: 0,
                 prompt_append: None,
+                generated_notes: Vec::new(),
                 static_only: false,
                 auto_amend: false,
             },
@@ -929,6 +966,7 @@ mod tests {
                 expires_at: None,
                 granted_at: 0,
                 prompt_append: None,
+                generated_notes: Vec::new(),
                 static_only: true,
                 auto_amend: true,
             },
@@ -963,6 +1001,7 @@ mod tests {
                 expires_at: Some(1),
                 granted_at: 0,
                 prompt_append: None,
+                generated_notes: Vec::new(),
                 static_only: false,
                 auto_amend: false,
             },
@@ -987,13 +1026,14 @@ mod tests {
                 expires_at: None,
                 granted_at: 0,
                 prompt_append: None,
+                generated_notes: Vec::new(),
                 static_only: false,
                 auto_amend: false,
             },
         );
         reg.revoke("a");
-        let after = current_unix_secs() + 1;
-        let before = current_unix_secs().saturating_sub(60);
+        let after = now_unix() + 1;
+        let before = now_unix().saturating_sub(60);
         assert_eq!(reg.list_history(Some(after)).len(), 0);
         assert_eq!(reg.list_history(Some(before)).len(), 1);
     }

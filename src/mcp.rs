@@ -1,3 +1,4 @@
+use crate::daemon_client;
 use crate::injection::{collect_unique_pairs, derive_env_name};
 use crate::server;
 use anyhow::{bail, Context, Result};
@@ -84,6 +85,24 @@ struct GuardVerbArgs {
     params: std::collections::BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum McpSshHostKeyMode {
+    OnlyExisting,
+    AcceptNew,
+    AcceptAll,
+}
+
+impl From<McpSshHostKeyMode> for server::SshHostKeyMode {
+    fn from(value: McpSshHostKeyMode) -> Self {
+        match value {
+            McpSshHostKeyMode::OnlyExisting => Self::OnlyExisting,
+            McpSshHostKeyMode::AcceptNew => Self::AcceptNew,
+            McpSshHostKeyMode::AcceptAll => Self::AcceptAll,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 struct GuardToolArgs {
     #[serde(default)]
@@ -115,6 +134,10 @@ struct GuardToolArgs {
     /// that should be allowed.
     #[serde(default)]
     reevaluate: bool,
+    /// SSH host-key policy for a guarded `ssh` command. Defaults to
+    /// only-existing (ssh's strict checking) when omitted.
+    #[serde(default)]
+    hostkey: Option<McpSshHostKeyMode>,
 }
 
 #[derive(Debug, Clone)]
@@ -181,8 +204,8 @@ impl ClientExecutor {
     /// Build a bare daemon client carrying only the connection details and the
     /// optional TCP auth token. Used for read-only admin RPCs that the catalog
     /// and approval tools proxy.
-    fn admin_client(&self) -> server::Client {
-        let mut client = server::Client::new(self.socket_path.clone(), self.tcp_port);
+    fn admin_client(&self) -> daemon_client::Client {
+        let mut client = daemon_client::Client::new(self.socket_path.clone(), self.tcp_port);
         if let Some(token) = &self.auth_token {
             client = client.with_auth(token.clone());
         }
@@ -223,7 +246,7 @@ impl GuardExecutor for ClientExecutor {
             None => None,
         };
 
-        let mut client = server::Client::new(self.socket_path.clone(), self.tcp_port)
+        let mut client = daemon_client::Client::new(self.socket_path.clone(), self.tcp_port)
             .with_gating(
                 revert,
                 args.confirm_within,
@@ -231,6 +254,9 @@ impl GuardExecutor for ClientExecutor {
                 args.wait_approval,
             )
             .with_reevaluate(args.reevaluate);
+        if let Some(mode) = args.hostkey {
+            client = client.with_hostkey(mode.into());
+        }
         if let Some(token) = &self.auth_token {
             client = client.with_auth(token.clone());
         }
@@ -792,6 +818,11 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                                 "items": { "type": "string" },
                                 "description": "Arguments to pass to the binary."
                             },
+                            "hostkey": {
+                                "type": "string",
+                                "enum": ["only-existing", "accept-new", "accept-all"],
+                                "description": "SSH host-key policy for guarded ssh commands. only-existing (default) keeps ssh's strict checking; accept-new trusts a new host on first contact but rejects a changed key; accept-all gives up host verification."
+                            },
                             "env": {
                                 "type": "object",
                                 "additionalProperties": { "type": "string" },
@@ -1302,6 +1333,29 @@ mod tests {
             response["result"]["tools"][0]["inputSchema"]["required"],
             json!(["binary", "args"])
         );
+        assert_eq!(
+            response["result"]["tools"][0]["inputSchema"]["properties"]["hostkey"]["enum"],
+            json!(["only-existing", "accept-new", "accept-all"])
+        );
+    }
+
+    #[test]
+    fn guard_tool_args_accepts_hostkey_mode() {
+        let parsed: GuardToolArgs = serde_json::from_value(json!({
+            "binary": "ssh",
+            "args": ["host01", "id"],
+            "hostkey": "accept-new"
+        }))
+        .unwrap();
+        assert_eq!(parsed.hostkey, Some(McpSshHostKeyMode::AcceptNew));
+
+        // Omitting it defaults to None (only-existing behavior server-side).
+        let without: GuardToolArgs = serde_json::from_value(json!({
+            "binary": "ssh",
+            "args": ["host01", "id"]
+        }))
+        .unwrap();
+        assert_eq!(without.hostkey, None);
     }
 
     #[tokio::test]
@@ -1524,6 +1578,8 @@ mod tests {
                     trusted: true,
                     has_revert: true,
                     params: std::collections::BTreeMap::new(),
+                    auto_promoted: false,
+                    evidence: None,
                 }],
             },
         });
