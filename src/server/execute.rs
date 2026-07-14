@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
 use tokio::process::Command;
@@ -242,6 +242,37 @@ async fn canonicalize_request_cwd<W: AsyncWrite + Unpin>(
         .await);
     }
     request.cwd = Some(canonical);
+    Ok(())
+}
+
+async fn revalidate_exec_cwd(cwd: &Path) -> std::result::Result<(), String> {
+    let canonical = tokio::fs::canonicalize(cwd).await.map_err(|e| {
+        format!(
+            "working directory '{}' changed before exec: cannot canonicalize: {}",
+            cwd.display(),
+            e
+        )
+    })?;
+    if canonical != cwd {
+        return Err(format!(
+            "working directory '{}' changed before exec: canonical path is now '{}'",
+            cwd.display(),
+            canonical.display()
+        ));
+    }
+    let meta = tokio::fs::metadata(&canonical).await.map_err(|e| {
+        format!(
+            "working directory '{}' changed before exec: cannot stat: {}",
+            canonical.display(),
+            e
+        )
+    })?;
+    if !meta.is_dir() {
+        return Err(format!(
+            "working directory '{}' changed before exec: not a directory",
+            canonical.display()
+        ));
+    }
     Ok(())
 }
 
@@ -2024,6 +2055,9 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
     cmd.args(&request.args);
     cmd.stdin(Stdio::null());
     if let Some(cwd) = &request.cwd {
+        if let Err(reason) = revalidate_exec_cwd(cwd).await {
+            return ExecuteResult::exec_failed(allow_reason, reason);
+        }
         cmd.current_dir(cwd);
     }
 

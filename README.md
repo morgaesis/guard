@@ -113,9 +113,10 @@ With gating on, the LLM keeps deciding APPROVE/DENY exactly as before (the deny
 rules are unchanged) and additionally classifies the reversibility of commands it
 approves. The daemon routes on that class. Classification is **fail-safe**:
 reversibility can only *raise* the gate, never lower it, and a missing or
-uncertain class is held, never run. LLM approvals, session allows, and trusted
-verbs all route through the consequence gate; static policy in the `--no-llm`
-fallback mode is the deterministic direct-exec path.
+uncertain class is held, never run. LLM approvals route on the evaluator's
+class, trusted verbs route on their declared class, and session allows without a
+matched verb are unclassified and held. Static policy in the `--no-llm` fallback
+mode is the deterministic direct-exec path.
 
 Gating is meaningful only where the daemon's principal differs from the agent's
 (so the agent cannot approve its own held command). The principal is a Unix uid
