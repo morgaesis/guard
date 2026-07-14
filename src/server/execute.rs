@@ -980,9 +980,9 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
             // overrides the model's, and a verb's revert is pre-authorized
             // (operator-reviewed); a free-form --revert is not.
             let effective_class = verb_ctx.as_ref().map(|v| v.class).or(reversibility);
-            // A static-policy allow (operator-authored, deterministic) bypasses
-            // the gate. A verb invocation never bypasses — its declared class
-            // routes it. The LLM path is gated.
+            // Only an evaluator-owned global static-policy allow uses the
+            // direct-exec fallback path here. Session grants route earlier with
+            // `bypass: false`, and verb invocations route by declared class.
             let bypass =
                 matches!(source, crate::evaluate::EvalSource::StaticPolicy) && verb_ctx.is_none();
             let inputs = GateInputs {
