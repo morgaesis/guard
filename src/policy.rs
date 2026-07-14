@@ -1,7 +1,22 @@
-//! Policy engine for command authorization.
+//! Static policy: a pre-LLM, glob-based DENY fast path.
 //!
-//! Provides a declarative, rule-based policy system with default-deny semantics.
-//! Policies can be loaded from YAML configuration or built programmatically.
+//! `PolicyEngine` exists to fast-reject deterministically-bad commands
+//! (`check_deny_fast_path`) before paying for an LLM round-trip, and as a
+//! standalone allow/deny gate when the LLM is disabled entirely
+//! (`check`/`check_command`, used by `Evaluator::evaluate_with_context`'s
+//! LLM-disabled fallback). It is NOT a mechanism for a deterministic,
+//! LLM-skipping ALLOW while the LLM is enabled: glob patterns over a flat
+//! command string cannot parse shell quoting or operators (see
+//! `from_mode`'s docs), so granting a bypass from one would be unsafe. The
+//! `guard verb` catalog (`crate::gating::verb`) is the supported mechanism
+//! for that -- its parameters are structurally validated (anchored regex,
+//! single-argv rendering) rather than pattern-matched after the fact.
+//!
+//! `commands.allow` / `PolicyEngine::add_allow` are still parsed and
+//! evaluated by `check`/`check_command` for backward compatibility and for
+//! the LLM-disabled fallback path. They are deliberately NOT consulted by
+//! `check_deny_fast_path`, the only entry point used while the LLM is
+//! enabled.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -19,12 +34,6 @@ impl PolicyMode {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "readonly" => Some(Self::Readonly),
-            "default" => {
-                tracing::warn!(
-                    "SSH_GUARD_MODE=\"default\" is deprecated, use \"readonly\" instead"
-                );
-                Some(Self::Readonly)
-            }
             "paranoid" => Some(Self::Paranoid),
             "safe" => Some(Self::Safe),
             _ => None,
@@ -97,9 +106,23 @@ pub struct PolicyRule {
 }
 
 impl PolicyRule {
-    /// Check if a command matches any of this rule's patterns.
-    pub fn matches(&self, cmd: &str) -> bool {
-        self.patterns.iter().any(|p| match_glob(p, cmd))
+    /// Check if a command matches any of this rule's patterns, using the same
+    /// prefix+boundary semantics a top-level allow/deny pattern gets
+    /// (`pattern_matches`): a non-glob pattern like `"systemctl"` matches the
+    /// bare binary AND `systemctl restart nginx`, and all three command
+    /// variants (full command, command+first-arg, bare binary) are checked,
+    /// not just the first two. Without this, a group rule with a simple
+    /// (non-wildcard) pattern silently behaves narrower than the identical
+    /// pattern written as a top-level `commands.allow`/`commands.deny` entry.
+    pub fn matches_command(
+        &self,
+        full_cmd: &str,
+        cmd_with_first_arg: &str,
+        cmd_only: &str,
+    ) -> bool {
+        self.patterns
+            .iter()
+            .any(|p| pattern_matches(p, full_cmd, cmd_with_first_arg, cmd_only))
     }
 }
 
@@ -198,7 +221,7 @@ impl PolicyEngine {
 
     /// Load configuration from a YAML string.
     pub fn load_yaml(yaml: &str) -> Result<Self> {
-        let config: PolicyConfig = serde_yaml::from_str(yaml)?;
+        let config: PolicyConfig = serde_yaml_ng::from_str(yaml)?;
         Self::from_config(&config.policy)
     }
 
@@ -321,7 +344,7 @@ impl PolicyEngine {
 
         for group in &sorted_groups {
             for rule in &group.rules {
-                if rule.matches(&full_cmd) || rule.matches(&cmd_with_first_arg) {
+                if rule.matches_command(&full_cmd, &cmd_with_first_arg, &cmd_only) {
                     let reason = if let Some(ref desc) = rule.description {
                         format!("[{}] {}", group.name, desc)
                     } else {
@@ -342,6 +365,75 @@ impl PolicyEngine {
 
         // 4. Default-deny: anything not explicitly allowed is denied
         PolicyResult::deny("default-deny: no matching allow rule".to_string())
+    }
+
+    /// Pre-LLM fast-reject check: returns `Some(reason)` only when `cmd`
+    /// explicitly matches a deny pattern or a deny-decision group rule.
+    /// Returns `None` on anything else, INCLUDING a command that would fall
+    /// through to `check_command`'s step-4 default-deny.
+    ///
+    /// This is deliberately a different question than `check_command` asks.
+    /// `check_command` answers "is this command allowed by static policy
+    /// alone" (used when the LLM is disabled, where default-deny is the
+    /// correct fail-closed answer). This method answers "does static policy
+    /// have an explicit objection to this command before the LLM ever sees
+    /// it" -- a deny-only, default-deny-only policy file with no matching
+    /// rule must fall through to the LLM, not hard-deny, or a deny-only
+    /// config (the documented "fast-reject known-bad, LLM decides the rest"
+    /// use case) would silently deny everything.
+    ///
+    /// Allow patterns and allow-decision group rules are NOT consulted here.
+    /// A static "allow" cannot skip the LLM evaluator; `guard verb` (a
+    /// `trusted` verb) is the supported mechanism for a deterministic,
+    /// LLM-skipping allow, because verb parameters are structurally
+    /// validated (anchored regex, single-argv rendering) where a glob
+    /// pattern over a flat command string is not (see the module docs on
+    /// `PolicyEngine::from_mode`).
+    pub fn check_deny_fast_path(&self, command: &str) -> Option<String> {
+        let parts = parse_command(command);
+        let cmd = parts[0].as_str();
+        let args = &parts[1..];
+
+        let full_cmd = if args.is_empty() {
+            cmd.to_string()
+        } else {
+            format!("{} {}", cmd, args.join(" "))
+        };
+        let cmd_only = cmd.to_string();
+        let cmd_with_first_arg = if !args.is_empty() {
+            format!("{} {}", cmd, args[0])
+        } else {
+            cmd_only.clone()
+        };
+
+        for pattern in &self.deny_patterns {
+            if pattern_matches(pattern, &full_cmd, &cmd_with_first_arg, &cmd_only) {
+                return Some(format!("matched deny pattern: {}", pattern));
+            }
+        }
+
+        let mut sorted_groups = self.groups.clone();
+        sorted_groups.sort_by_key(|g| std::cmp::Reverse(g.priority));
+        for group in &sorted_groups {
+            for rule in &group.rules {
+                if rule.decision == Decision::Deny
+                    && rule.matches_command(&full_cmd, &cmd_with_first_arg, &cmd_only)
+                {
+                    let reason = if let Some(ref desc) = rule.description {
+                        format!("[{}] {}", group.name, desc)
+                    } else {
+                        format!(
+                            "[{}] matched rule with patterns: {}",
+                            group.name,
+                            rule.patterns.join(", ")
+                        )
+                    };
+                    return Some(reason);
+                }
+            }
+        }
+
+        None
     }
 
     /// Check a command string (auto-parsed into cmd + args).
@@ -888,6 +980,38 @@ policy:
     }
 
     #[test]
+    fn test_group_rule_non_glob_pattern_matches_like_top_level() {
+        // A non-glob group-rule pattern ("systemctl") must behave exactly
+        // like the identical top-level commands.allow/deny entry: matching
+        // the bare binary AND `<binary> <args...>` via the prefix+boundary
+        // rule, not just an exact string match.
+        let yaml = r#"
+policy:
+  groups:
+    - name: restrict-systemctl
+      priority: 10
+      rules:
+        - patterns: ["systemctl"]
+          action: deny
+"#;
+        let engine = PolicyEngine::load_yaml(yaml).unwrap();
+        assert!(
+            engine.check("systemctl").is_denied(),
+            "bare binary should match the group rule"
+        );
+        assert!(
+            engine.check("systemctl restart nginx").is_denied(),
+            "binary with args should match the group rule, same as a top-level pattern would"
+        );
+        let other = engine.check("systemctl-helper");
+        assert!(
+            other.is_denied() && other.reason.contains("default-deny"),
+            "a different binary that merely shares a prefix must not match the group rule \
+             (it should fall through to default-deny, not be caught by the rule itself), got: {other:?}"
+        );
+    }
+
+    #[test]
     fn test_policy_engine_builder_pattern() {
         let engine = PolicyEngine::new()
             .add_allow("ssh")
@@ -906,9 +1030,8 @@ policy:
         assert_eq!(PolicyMode::parse("Paranoid"), Some(PolicyMode::Paranoid));
         assert_eq!(PolicyMode::parse("SAFE"), Some(PolicyMode::Safe));
         assert_eq!(PolicyMode::parse("invalid"), None);
-        // "default" is a deprecated alias for Readonly
-        assert_eq!(PolicyMode::parse("default"), Some(PolicyMode::Readonly));
-        assert_eq!(PolicyMode::parse("Default"), Some(PolicyMode::Readonly));
+        // "default" is no longer recognized (was a deprecated alias for readonly).
+        assert_eq!(PolicyMode::parse("default"), None);
     }
 
     #[test]

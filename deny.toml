@@ -1,6 +1,18 @@
 # cargo-deny configuration
 # See https://github.com/EmbarkStudios/cargo-deny
 
+[advisories]
+# Deny crates with known RUSTSEC vulnerabilities. CI runs
+# `cargo deny check advisories bans licenses sources`; without this table
+# cargo-deny falls back to its own defaults rather than this project's.
+yanked = "deny"
+
+[sources]
+# Only allow dependencies from crates.io; deny unregistered git/registry
+# sources, which are a supply-chain risk (no review, no yank mechanism).
+unknown-registry = "deny"
+unknown-git = "deny"
+
 [licenses]
 allow = [
     "Apache-2.0",
@@ -14,6 +26,10 @@ allow = [
     "Unicode-3.0",
     "Zlib",
     "Unlicense",
+    # Mozilla's CA root certificate bundle license (webpki-roots, pulled in
+    # transitively via reqwest/hyper-rustls for TLS root trust). Data-license,
+    # not a code license; standard for this crate across the rustls ecosystem.
+    "CDLA-Permissive-2.0",
 ]
 
 [bans]

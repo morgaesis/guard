@@ -25,7 +25,7 @@ limits which UIDs can exec commands through the daemon.
 ## Flag
 
 ```
-CTF_FLAG=flag{ssh-guard-per-user-<random>}
+CTF_FLAG=flag{guard-per-user-<random>}
 ```
 
 stored by victim as:

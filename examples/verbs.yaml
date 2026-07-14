@@ -1,0 +1,83 @@
+# Verb catalog: the operator-authored, typed interface agents call via
+# `guard verb`, instead of raw shell. Load with:
+#
+#   guard server start --gate consequence --socket /run/guard/guard.sock \
+#       --verbs /etc/guard/verbs.yaml
+#
+# The catalog is the "slow clock": only the operator (daemon UID) edits this
+# file, and it is hot-reloaded on change. Agents cannot add or alter verbs.
+#
+# Each verb names a fixed binary and an argv template. `{param}` placeholders are
+# substituted as exactly one argv element (no shell, no word-splitting), so
+# parameter injection is structurally impossible. Every param has a fully
+# anchored (^...$) validation pattern; a value may not begin with `-` unless the
+# spec sets `allow_dash: true`, which blocks argument/flag injection.
+#
+# `consequence` declares the reversibility class that drives the gate:
+#   reversible   -> runs immediately
+#   recoverable  -> runs behind an auto-revert envelope (must declare `revert`)
+#   irreversible -> held for operator approval
+#
+# `trusted: true` skips the LLM evaluator -- the only supported way to get a
+# deterministic, LLM-skipping allow (a static-policy `allow` pattern does NOT
+# skip the LLM; see examples/deny-policy.yaml). The declared class still
+# drives the gate. Leave `trusted` false (default) to keep the LLM as a
+# backstop on the rendered command.
+
+verbs:
+  # Read-only inspection: runs immediately.
+  - name: service-status
+    description: Show a systemd unit's status (read-only)
+    binary: systemctl
+    args: ["status", "{unit}", "--no-pager"]
+    params:
+      unit: { pattern: "^[a-zA-Z0-9@._-]+$", required: true }
+    consequence: reversible
+    trusted: true
+
+  - name: tail-log
+    description: Tail the last N lines of a log under /var/log
+    binary: tail
+    args: ["-n", "{lines}", "{path}"]
+    params:
+      lines: { pattern: "^[0-9]{1,5}$", required: true }
+      path: { pattern: "^/var/log/[a-zA-Z0-9._/-]+$", required: true }
+    consequence: reversible
+    trusted: true
+
+  # Recoverable mutation: applies, then auto-reverts unless the operator
+  # confirms within the window. The revert is operator-authored, so it is not
+  # re-evaluated.
+  - name: restart-service
+    description: Restart a systemd unit; auto-reverts to stopped unless confirmed
+    binary: systemctl
+    args: ["restart", "{unit}"]
+    params:
+      unit: { pattern: "^[a-zA-Z0-9@._-]+$", required: true }
+    consequence: recoverable
+    revert: { binary: systemctl, args: ["stop", "{unit}"] }
+    trusted: true
+
+  - name: scale-deployment
+    description: Scale a Kubernetes deployment; reverts to one replica unless confirmed
+    binary: kubectl
+    args: ["scale", "deployment/{name}", "--replicas={replicas}", "-n", "{namespace}"]
+    params:
+      name: { pattern: "^[a-z0-9-]{1,63}$", required: true }
+      namespace: { pattern: "^[a-z0-9-]{1,63}$", required: true }
+      replicas: { pattern: "^[0-9]{1,3}$", required: true }
+    consequence: recoverable
+    revert:
+      binary: kubectl
+      args: ["scale", "deployment/{name}", "--replicas=1", "-n", "{namespace}"]
+    trusted: true
+
+  # Irreversible action: always held for operator approval before it runs.
+  - name: delete-namespace
+    description: Delete a Kubernetes namespace (irreversible)
+    binary: kubectl
+    args: ["delete", "namespace", "{namespace}"]
+    params:
+      namespace: { pattern: "^[a-z0-9-]{1,63}$", required: true }
+    consequence: irreversible
+    trusted: true

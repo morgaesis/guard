@@ -1,4 +1,5 @@
 //! End-to-end MCP integration test.
+#![cfg(unix)]
 //!
 //! Spins up a real guard daemon with a static (no-LLM) policy on a temp socket,
 //! spawns `guard mcp serve` as a child with piped stdio, and exercises the full
@@ -69,7 +70,7 @@ async fn start_daemon(tmp: &TempDir) -> (DaemonGuard, std::path::PathBuf) {
         .arg(&socket_path)
         .env("HOME", tmp.path())
         .env("XDG_CONFIG_HOME", tmp.path())
-        .env("SSH_GUARD_BACKEND", "env")
+        .env("GUARD_BACKEND", "env")
         .env(&test_secret_env, "test-value")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -188,10 +189,23 @@ async fn mcp_end_to_end_initialize_list_call() {
     // 2. tools/list
     let list = mcp.rpc(2, "tools/list", json!({})).await;
     let tools = list["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 1);
-    assert_eq!(tools[0]["name"], "guard_run");
+    let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    // guard_run (gated execution) plus the read-only proxy tools.
     assert_eq!(
-        tools[0]["inputSchema"]["required"],
+        tools.len(),
+        3,
+        "expected guard_run, guard_verbs, guard_approvals; got {:?}",
+        names
+    );
+    assert!(names.contains(&"guard_run"), "got {:?}", names);
+    assert!(names.contains(&"guard_verbs"), "got {:?}", names);
+    assert!(names.contains(&"guard_approvals"), "got {:?}", names);
+    let guard_run = tools
+        .iter()
+        .find(|t| t["name"] == "guard_run")
+        .expect("guard_run tool present");
+    assert_eq!(
+        guard_run["inputSchema"]["required"],
         json!(["binary", "args"])
     );
 

@@ -1,0 +1,139 @@
+# Verb catalog: gated kubectl access for autonomous agents.
+#
+#   guard server start --gate consequence --socket guard \
+#       --verbs examples/verbs-kubectl.yaml          # Windows (named pipe)
+#   guard server start --gate consequence --socket /run/guard/guard.sock \
+#       --verbs /etc/guard/verbs-kubectl.yaml        # Linux (unix socket)
+#
+# Agents call these via `guard verb <name> <param>=<value>` instead of raw
+# kubectl. Each verb pins a fixed argv; `{param}` values are substituted as
+# exactly one argv element (no shell), and every param has an anchored (^...$)
+# validation pattern, so flag/command injection is structurally impossible.
+#
+# Cluster safety: the `context` param is validated against an explicit ALLOWLIST
+# of non-production clusters. A production context (e.g. prod) is not in
+# the alternation, so the pattern REJECTS it — an agent cannot target prod through
+# any verb, regardless of what the model decides. For a single-cluster deployment,
+# drop the param and hardcode `--context <cluster>` directly in `args` (strongest).
+#
+# Consequence classes drive the gate:
+#   reversible   -> runs immediately (read-only inspection)
+#   recoverable  -> runs behind an auto-revert envelope (must declare `revert`)
+#   irreversible -> held for operator approval before it runs
+#
+# `trusted: true` skips the LLM evaluator (deterministic allow); the declared
+# class still drives the gate. Only the operator (daemon principal) edits this
+# file; it is hot-reloaded. Agents cannot add or alter verbs.
+
+verbs:
+  # ---- Reversible: read-only inspection, runs immediately ----
+  - name: k-get
+    description: List a resource type in a namespace (read-only)
+    binary: kubectl
+    args: ["--context", "{context}", "get", "{resource}", "-n", "{namespace}", "-o", "wide"]
+    params:
+      context: { pattern: "^(dev|staging|sandbox)$", required: true }
+      resource: { pattern: "^[a-z][a-z0-9.-]{0,40}$", required: true }
+      namespace: { pattern: "^[a-z0-9-]{1,63}$", required: true }
+    consequence: reversible
+    trusted: true
+
+  - name: k-describe
+    description: Describe a named resource (read-only)
+    binary: kubectl
+    args: ["--context", "{context}", "describe", "{resource}", "{name}", "-n", "{namespace}"]
+    params:
+      context: { pattern: "^(dev|staging|sandbox)$", required: true }
+      resource: { pattern: "^[a-z][a-z0-9.-]{0,40}$", required: true }
+      name: { pattern: "^[a-z0-9.-]{1,253}$", required: true }
+      namespace: { pattern: "^[a-z0-9-]{1,63}$", required: true }
+    consequence: reversible
+    trusted: true
+
+  - name: k-logs
+    description: Tail a pod's logs (read-only)
+    binary: kubectl
+    args: ["--context", "{context}", "logs", "{pod}", "-n", "{namespace}", "--tail", "{lines}"]
+    params:
+      context: { pattern: "^(dev|staging|sandbox)$", required: true }
+      pod: { pattern: "^[a-z0-9.-]{1,253}$", required: true }
+      namespace: { pattern: "^[a-z0-9-]{1,63}$", required: true }
+      lines: { pattern: "^[0-9]{1,5}$", required: true }
+    consequence: reversible
+    trusted: true
+
+  - name: k-nodes
+    description: List cluster nodes (read-only)
+    binary: kubectl
+    args: ["--context", "{context}", "get", "nodes", "-o", "wide"]
+    params:
+      context: { pattern: "^(dev|staging|sandbox)$", required: true }
+    consequence: reversible
+    trusted: true
+
+  # ---- Recoverable: applies, then auto-reverts unless the operator confirms ----
+  - name: k-cordon
+    description: Cordon a node (mark unschedulable); auto-uncordons unless confirmed
+    binary: kubectl
+    args: ["--context", "{context}", "cordon", "{node}"]
+    params:
+      context: { pattern: "^(dev|staging|sandbox)$", required: true }
+      node: { pattern: "^[a-z0-9.-]{1,253}$", required: true }
+    consequence: recoverable
+    revert:
+      binary: kubectl
+      args: ["--context", "{context}", "uncordon", "{node}"]
+    trusted: true
+
+  # ---- Irreversible: held for operator approval before it runs ----
+  - name: k-delete-pod
+    description: Delete a pod (irreversible; held for approval)
+    binary: kubectl
+    args: ["--context", "{context}", "delete", "pod", "{name}", "-n", "{namespace}"]
+    params:
+      context: { pattern: "^(dev|staging|sandbox)$", required: true }
+      name: { pattern: "^[a-z0-9.-]{1,253}$", required: true }
+      namespace: { pattern: "^[a-z0-9-]{1,63}$", required: true }
+    consequence: irreversible
+    trusted: true
+
+  - name: k-delete-deployment
+    description: Delete a deployment (irreversible; held for approval)
+    binary: kubectl
+    args: ["--context", "{context}", "delete", "deployment", "{name}", "-n", "{namespace}"]
+    params:
+      context: { pattern: "^(dev|staging|sandbox)$", required: true }
+      name: { pattern: "^[a-z0-9.-]{1,253}$", required: true }
+      namespace: { pattern: "^[a-z0-9-]{1,63}$", required: true }
+    consequence: irreversible
+    trusted: true
+
+  - name: k-delete-namespace
+    description: Delete a namespace and everything in it (irreversible; held for approval)
+    binary: kubectl
+    args: ["--context", "{context}", "delete", "namespace", "{namespace}"]
+    params:
+      context: { pattern: "^(dev|staging|sandbox)$", required: true }
+      namespace: { pattern: "^[a-z0-9-]{1,63}$", required: true }
+    consequence: irreversible
+    trusted: true
+
+  - name: k-drain
+    description: Drain a node (evict pods; irreversible; held for approval)
+    binary: kubectl
+    args: ["--context", "{context}", "drain", "{node}", "--ignore-daemonsets", "--delete-emptydir-data"]
+    params:
+      context: { pattern: "^(dev|staging|sandbox)$", required: true }
+      node: { pattern: "^[a-z0-9.-]{1,253}$", required: true }
+    consequence: irreversible
+    trusted: true
+
+  - name: k-apply
+    description: Apply a manifest file (irreversible; held for approval)
+    binary: kubectl
+    args: ["--context", "{context}", "apply", "-f", "{path}"]
+    params:
+      context: { pattern: "^(dev|staging|sandbox)$", required: true }
+      path: { pattern: "^[A-Za-z0-9._/\\\\:-]{1,255}$", required: true }
+    consequence: irreversible
+    trusted: true

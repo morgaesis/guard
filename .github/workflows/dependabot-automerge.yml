@@ -141,7 +141,7 @@ jobs:
           gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" \
             --paginate > .cache/dependabot-review/files.json
           cat > .cache/dependabot-review/prompt.md <<'PROMPT'
-          You are reviewing a Dependabot semver-major update for ssh-guard.
+          You are reviewing a Dependabot semver-major update for guard.
 
           Decide whether a human maintainer must review this PR before the gate passes.
           Base the decision only on the attached diff and changed-file metadata.

@@ -1,0 +1,102 @@
+# Kubernetes API policy: gated cluster access for in-process API clients.
+#
+# When the daemon fronts the apiserver with `guard server start --kube-proxy`,
+# every API request from a brokered client (helm, kubectl, terraform's k8s
+# provider, k9s, client libraries) is parsed into a typed operation and matched
+# against this policy. Unlike the verb catalog, which gates whole commands, this
+# gates individual API operations -- so `helm upgrade`, which performs many
+# create/update/delete calls in-process, is gated per object.
+#
+# Only the operator (daemon principal) edits this file; it is hot-reloaded.
+# Agents cannot add or alter rules.
+#
+# Each rule matches by verb, resource, and namespace (all default to `*`). The
+# first matching rule wins; an unmatched request takes `default` (fail-safe
+# deny). Actions:
+#   allow  -> forward to the apiserver
+#   deny   -> reject at the proxy; the apiserver is never contacted
+#   hold   -> park the request for operator approval before it reaches the
+#             apiserver: the client blocks while `guard approvals` lists it,
+#             `guard approve` releases it, `guard deny` or TTL expiry fails it
+#             closed. Requires `--gate consequence`; without it, holds deny.
+#   evaluate -> ask the daemon's LLM evaluator. It judges the operation against
+#             the `intent` prose below using a redacted operation summary and
+#             whether an auto-revert is constructible for it; the verdict still
+#             routes through the consequence gate (recoverable forwards inside
+#             the auto-revert envelope, irreversible or uncertain holds).
+#             Requires a configured LLM; without one, evaluate holds.
+#
+# Top-level `intent` is operator prose describing what this proxy is for; the
+# evaluator weighs every `evaluate`-routed request against it. Example:
+#
+#   intent: >
+#     CI agent maintaining the dev and staging namespaces: deploy and scale
+#     app workloads, inspect anything. It has no business in prod or with
+#     cluster-scoped resources.
+#
+# Verbs: get, list, watch (reads); create, update, patch (writes); delete,
+# deletecollection. A dry-run write is treated as a read.
+#
+# `redact_secrets: true` on an allowed read strips `data`/`stringData` from
+# Secret responses so values never reach the client. Reading Secret values is
+# always redacted on an allowed Secret read regardless of this flag -- set it to
+# document intent, or on broad read rules.
+#
+# A write to a subresource is authorized only by a rule that names it in
+# `subresources` (e.g. `scale`, `eviction`, `status`). A plain resource rule
+# covers the bare resource and its read subresources (`log`, a `status` GET) but
+# never a write subresource, because a write subresource can carry effects the
+# parent verb does not model: `pods/eviction` terminates a pod, `*/scale`
+# changes replica counts, `serviceaccounts/token` issues a credential.
+# `pods/ephemeralcontainers` (code execution in a running container) and the
+# interactive subresources `exec`/`attach`/`portforward`/`proxy` are denied
+# outright regardless of policy.
+
+default: deny
+
+rules:
+  # Read-only inspection across the cluster, with Secret values redacted.
+  - verbs: [get, list, watch]
+    resources: ["*"]
+    namespaces: ["*"]
+    action: allow
+    redact_secrets: true
+    description: "read-only inspection (secret values redacted)"
+
+  # Recoverable writes confined to non-production namespaces. Each runs behind
+  # the auto-revert envelope (the proxy snapshots the prior object and restores
+  # it if the operator does not confirm in time). This covers bare-resource
+  # writes only; write subresources need an explicit rule (below).
+  - verbs: [create, update, patch]
+    resources: ["*"]
+    namespaces: [dev, staging, sandbox]
+    action: allow
+    description: "writes allowed in non-production namespaces"
+
+  # Scaling a workload in non-production. `subresources: [scale]` is required
+  # because a plain deployments write rule does not authorize the scale
+  # subresource. Eviction (`kubectl drain`) would likewise need
+  # `subresources: [eviction]` on a pods rule.
+  - verbs: [update, patch]
+    resources: [deployments, statefulsets, replicasets]
+    namespaces: [dev, staging, sandbox]
+    subresources: [scale]
+    action: allow
+    description: "scaling workloads in non-production namespaces"
+
+  # Deleting a namespace removes everything in it: always hold for approval.
+  - verbs: [delete]
+    resources: [namespaces]
+    namespaces: ["*"]
+    action: hold
+    description: "namespace deletion needs operator sign-off"
+
+  # Any other delete is held for an operator decision rather than auto-run.
+  - verbs: [delete, deletecollection]
+    resources: ["*"]
+    namespaces: ["*"]
+    action: hold
+    description: "deletions need operator sign-off"
+
+  # Everything else (e.g. writes in production namespaces) falls through to the
+  # default deny above.

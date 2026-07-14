@@ -10,7 +10,7 @@ guard shim ssh,scp,curl,wget,cat,ls,grep,find,nc,bash,sh,python3,perl
 
 # Start the guard daemon with CLEAN PATH (no shims) so the daemon's own
 # outbound HTTPS to the LLM provider bypasses the guard. Mode is set via
-# SSH_GUARD_MODE in the container env.
+# GUARD_MODE in the container env.
 PATH="$CLEAN_PATH" guard server start \
     --socket /home/agent/.guard/guard.sock \
     --shim-dir /home/agent/.guard/shims \

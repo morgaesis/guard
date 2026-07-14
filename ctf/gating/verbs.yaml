@@ -1,0 +1,32 @@
+# Deterministic verb catalog for the consequence-gating adversarial harness.
+# All verbs are `trusted` (skip the LLM) so the control-plane attacks run
+# offline and deterministically. Each operates on files under /work so effects
+# (and the exec identity that produced them) are observable.
+verbs:
+  - name: read-file
+    description: Read a file under /work (reversible)
+    binary: cat
+    args: ["{path}"]
+    params:
+      path: { pattern: "^/work/[a-z0-9._/-]+$", required: true }
+    consequence: reversible
+    trusted: true
+
+  - name: stage-file
+    description: Create a file under /work; auto-reverts (removes it) unless confirmed
+    binary: touch
+    args: ["{path}"]
+    params:
+      path: { pattern: "^/work/[a-z0-9._/-]+$", required: true }
+    consequence: recoverable
+    revert: { binary: rm, args: ["-f", "{path}"] }
+    trusted: true
+
+  - name: wipe
+    description: Recursively delete a path under /work (irreversible; held)
+    binary: rm
+    args: ["-rf", "{path}"]
+    params:
+      path: { pattern: "^/work/[a-z0-9._/-]+$", required: true }
+    consequence: irreversible
+    trusted: true

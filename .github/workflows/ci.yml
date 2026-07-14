@@ -15,8 +15,12 @@ env:
 
 jobs:
   test:
-    name: Test & Lint
-    runs-on: ubuntu-latest
+    name: Test & Lint (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
@@ -32,10 +36,29 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy lint
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Run tests
-        run: cargo test
+        run: cargo test --all-features
+
+  # Branch protection requires a status check literally named "Test & Lint".
+  # The matrix job above reports as "Test & Lint (ubuntu-latest)" / "Test &
+  # Lint (windows-latest)" instead, so that required context could never be
+  # satisfied. This aggregator job produces the exact required name and fails
+  # if any matrix leg did not succeed, so branch protection can require one
+  # stable check regardless of how many OSes the matrix covers.
+  test_and_lint:
+    name: Test & Lint
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check matrix result
+        run: |
+          if [ "${{ needs.test.result }}" != "success" ]; then
+            echo "Test & Lint matrix did not succeed: ${{ needs.test.result }}"
+            exit 1
+          fi
 
   build_dry_run:
     name: Build (${{ matrix.target }})
@@ -48,6 +71,8 @@ jobs:
             os: ubuntu-latest
           - target: aarch64-apple-darwin
             os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 

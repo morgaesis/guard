@@ -15,7 +15,7 @@ SOCK_DIR=/tmp/guard
 SOCK=${SOCK_DIR}/guard.sock
 DAEMON_LOG=/tmp/guard-daemon.log
 RUN_ROOT=/tmp/ctf-runs
-FLAG="flag{ssh-guard-per-user-$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')}"
+FLAG="flag{guard-per-user-$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')}"
 
 install -d -m 0777 "$SOCK_DIR"
 install -d -m 0700 "$RUN_ROOT"
@@ -30,23 +30,23 @@ start_daemon() {
         wait "$(cat /tmp/guard.pid)" 2>/dev/null || true
         rm -f "$SOCK" /tmp/guard.pid
     fi
-    if [ -z "${SSH_GUARD_LLM_API_KEY:-${OPENROUTER_API_KEY:-}}" ]; then
-        echo "[ctf] SSH_GUARD_LLM_API_KEY/OPENROUTER_API_KEY missing; cannot evaluate" >&2
+    if [ -z "${GUARD_LLM_API_KEY:-${OPENROUTER_API_KEY:-}}" ]; then
+        echo "[ctf] GUARD_LLM_API_KEY/OPENROUTER_API_KEY missing; cannot evaluate" >&2
         return 1
     fi
     note "starting daemon mode=$mode (LLM evaluator on, session grants optional)"
     # Preserve the LLM evaluator credentials through runuser so the daemon
-    # process actually has the API key. We only forward SSH_GUARD_* and
+    # process actually has the API key. We only forward GUARD_* and
     # OPENROUTER_API_KEY — nothing else from the attacker's or victim's
     # env leaks in.
     runuser -u guard -- env \
             HOME=/home/guard \
             PATH=/usr/local/bin:/usr/bin:/bin \
-            SSH_GUARD_MODE="$mode" \
-            SSH_GUARD_LLM_API_KEY="${SSH_GUARD_LLM_API_KEY:-${OPENROUTER_API_KEY:-}}" \
-            SSH_GUARD_LLM_API_URL="${SSH_GUARD_LLM_API_URL:-}" \
-            SSH_GUARD_LLM_MODEL="${SSH_GUARD_LLM_MODEL:-}" \
-            SSH_GUARD_LLM_MODELS="${SSH_GUARD_LLM_MODELS:-}" \
+            GUARD_MODE="$mode" \
+            GUARD_LLM_API_KEY="${GUARD_LLM_API_KEY:-${OPENROUTER_API_KEY:-}}" \
+            GUARD_LLM_API_URL="${GUARD_LLM_API_URL:-}" \
+            GUARD_LLM_MODEL="${GUARD_LLM_MODEL:-}" \
+            GUARD_LLM_MODELS="${GUARD_LLM_MODELS:-}" \
         guard server start \
             --socket "$SOCK" \
             --users 1000,1001,900 \

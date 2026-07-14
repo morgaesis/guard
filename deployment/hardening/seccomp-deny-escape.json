@@ -1,0 +1,48 @@
+{
+  "defaultAction": "SCMP_ACT_ALLOW",
+  "comment": "guard hardening profile: default-allow with container-escape and host-tampering syscalls denied. Adapt to the target host before use.",
+  "syscalls": [
+    {
+      "names": [
+        "mount",
+        "umount",
+        "umount2",
+        "pivot_root",
+        "chroot",
+        "setns",
+        "unshare",
+        "ptrace",
+        "process_vm_readv",
+        "process_vm_writev",
+        "kexec_load",
+        "kexec_file_load",
+        "init_module",
+        "finit_module",
+        "delete_module",
+        "create_module",
+        "get_kernel_syms",
+        "query_module",
+        "bpf",
+        "perf_event_open",
+        "swapon",
+        "swapoff",
+        "reboot",
+        "settimeofday",
+        "clock_settime",
+        "clock_adjtime",
+        "adjtimex",
+        "acct",
+        "quotactl",
+        "nfsservctl",
+        "add_key",
+        "request_key",
+        "keyctl",
+        "open_by_handle_at",
+        "name_to_handle_at"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1,
+      "comment": "denied for guard: escape, kernel, and host-reconfiguration primitives"
+    }
+  ]
+}

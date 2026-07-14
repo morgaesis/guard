@@ -1,8 +1,9 @@
 use crate::secrets::SecretManager;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
+use guard::principal::PrincipalKey;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::SystemTime;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -21,12 +22,6 @@ pub struct ToolConfig {
     pub secrets: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub users: HashMap<String, UserToolOverride>,
-}
-
-impl ToolConfig {
-    pub fn is_empty(&self) -> bool {
-        self.env.is_empty() && self.secrets.is_empty() && self.users.is_empty()
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -59,7 +54,7 @@ impl ToolRegistry {
         let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let config: ToolConfigFile = serde_yaml::from_str(&content)
+        let config: ToolConfigFile = serde_yaml_ng::from_str(&content)
             .with_context(|| format!("failed to parse {}", path.display()))?;
 
         Ok(Self {
@@ -77,6 +72,27 @@ impl ToolRegistry {
 
     pub fn empty() -> Self {
         let path = Self::config_path().unwrap_or_else(|| PathBuf::from("tools.yaml"));
+        Self {
+            config: ToolConfigFile::default(),
+            path,
+            last_modified: None,
+        }
+    }
+
+    /// An empty registry watching a path that can never be a real operator
+    /// config file. `empty()` deliberately watches the real
+    /// `dirs::config_dir()` path (so a daemon that starts with a missing or
+    /// broken config can still hot-reload once an operator fixes it), which
+    /// makes it unsafe for tests: any test that reaches `reload_if_stale()`
+    /// with a registry built via `empty()` reads the machine's real
+    /// `~/.config/guard/tools.yaml` if one happens to exist, making the test
+    /// depend on host state instead of its own fixtures.
+    #[cfg(test)]
+    pub(crate) fn isolated_for_tests() -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "guard-test-tools-registry-{}-nonexistent.yaml",
+            std::process::id()
+        ));
         Self {
             config: ToolConfigFile::default(),
             path,
@@ -124,7 +140,7 @@ impl ToolRegistry {
         }
 
         let content = std::fs::read_to_string(&self.path)?;
-        self.config = serde_yaml::from_str(&content)?;
+        self.config = serde_yaml_ng::from_str(&content)?;
         self.last_modified = current_mtime;
         Ok(true)
     }
@@ -133,15 +149,15 @@ impl ToolRegistry {
     /// Returns an empty map if the tool is not registered.
     /// Fails if a referenced secret key is not found in the store.
     ///
-    /// `caller_uid` is the identity whose secret namespace the resolver
-    /// reads from. `user_key` (typically the same UID as a string, or a
-    /// TCP token label) picks per-user overrides out of the tool config
-    /// file.
+    /// `principal` is the identity whose secret namespace the resolver reads
+    /// from (a Unix uid or a Windows SID). `user_key` (typically the same uid
+    /// as a string, the SID string, or a TCP token label) picks per-user
+    /// overrides out of the tool config file.
     pub async fn resolve_env(
         &self,
         tool: &str,
         secrets: &SecretManager,
-        caller_uid: Option<u32>,
+        principal: Option<&PrincipalKey>,
         user_key: Option<&str>,
     ) -> Result<HashMap<String, String>> {
         let Some(tool_config) = self.get(tool) else {
@@ -151,11 +167,13 @@ impl ToolRegistry {
         let mut env = tool_config.env.clone();
 
         for (env_var, secret_key) in &tool_config.secrets {
-            let caller_uid = caller_uid.ok_or_else(|| {
-                anyhow::anyhow!("tool config secret injection requires a unix socket caller")
+            let principal = principal.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "tool config secret injection requires an authenticated local caller"
+                )
             })?;
             let value = secrets
-                .get(caller_uid, secret_key)
+                .get(principal, secret_key)
                 .await
                 .with_context(|| format!("failed to read secret '{secret_key}'"))?
                 .ok_or_else(|| {
@@ -174,13 +192,13 @@ impl ToolRegistry {
                     env.insert(k.clone(), v.clone());
                 }
                 for (env_var, secret_key) in &user_override.secrets {
-                    let caller_uid = caller_uid.ok_or_else(|| {
+                    let principal = principal.ok_or_else(|| {
                         anyhow::anyhow!(
-                            "tool config secret injection requires a unix socket caller"
+                            "tool config secret injection requires an authenticated local caller"
                         )
                     })?;
                     let value = secrets
-                        .get(caller_uid, secret_key)
+                        .get(principal, secret_key)
                         .await
                         .with_context(|| format!("failed to read secret '{secret_key}'"))?
                         .ok_or_else(|| {
@@ -203,7 +221,7 @@ impl ToolRegistry {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let content = serde_yaml::to_string(&self.config)?;
+        let content = serde_yaml_ng::to_string(&self.config)?;
         std::fs::write(&self.path, content)?;
         Ok(())
     }
@@ -212,7 +230,6 @@ impl ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
     use tempfile::NamedTempFile;
 
     #[test]
@@ -227,6 +244,21 @@ mod tests {
     fn load_missing_file() {
         let reg = ToolRegistry::load("/tmp/nonexistent-guard-test.yaml").unwrap();
         assert!(reg.get("aws").is_none());
+    }
+
+    #[test]
+    fn isolated_for_tests_never_watches_the_real_config_path() {
+        let reg = ToolRegistry::isolated_for_tests();
+        if let Some(real_path) = ToolRegistry::config_path() {
+            assert_ne!(
+                reg.path, real_path,
+                "a test registry must never watch the operator's real tools.yaml"
+            );
+        }
+        assert!(
+            !reg.path.exists(),
+            "the isolated path must not coincide with a file that actually exists"
+        );
     }
 
     #[test]

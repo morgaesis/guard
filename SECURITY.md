@@ -3,7 +3,7 @@
 ## Reporting a vulnerability
 
 Please report security issues privately via GitHub's
-["Report a vulnerability"](https://github.com/morgaesis/ssh-guard/security/advisories/new)
+["Report a vulnerability"](https://github.com/morgaesis/guard/security/advisories/new)
 flow rather than opening a public issue.
 
 If you cannot use the GitHub flow, email the maintainer at
@@ -21,6 +21,12 @@ In scope:
 - The `guard` daemon and CLI in this repository
 - The MCP transport (`guard mcp serve`)
 - The systemd unit and example deployment under `deployment/`
+
+Client-facing denials may include the count of similar commands the same
+deny-shape bucket has denied once the configured threshold is reached. Learned
+rule, verb, deny-shape, and API-shape promotion state is operator-only audit
+state because advertising which shapes skip evaluation invites mimicry against
+the fast path.
 
 Out of scope:
 

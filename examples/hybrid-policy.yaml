@@ -1,73 +1,46 @@
-# EXAMPLE hybrid (allow + deny + LLM fallback) policy for guard. NOT the default.
+# EXAMPLE hybrid (deny fast path + verb allow + LLM fallback) for guard.
+# NOT the default.
 #
-# Guard's default is LLM-only evaluation (single call to openai/gpt-5.4-nano
+# Guard's default is LLM-only evaluation (single call to openai/gpt-5.4-mini
 # via OpenRouter, function-calling, with retries). This file is the opt-in
-# "production hardened" pattern for latency-sensitive deployments: a narrow
-# allowlist short-circuits safe inspection commands, a broad denylist fast-
-# rejects known-bad patterns, and everything else falls through to the LLM.
+# "production hardened" pattern for latency-sensitive deployments: a broad
+# denylist fast-rejects known-bad patterns before any LLM call, and
+# everything else falls through to the LLM.
 #
 # Load with: guard server start --policy examples/hybrid-policy.yaml
 # Or place at: ~/.config/guard/policy.yaml
 #
 # EVALUATION ORDER (per src/policy.rs):
-#   1. Deny patterns  -- matched first; matching commands are rejected with
-#                        no LLM call.
-#   2. Allow patterns -- matched next; matching commands execute with no LLM
-#                        call.
-#   3. LLM evaluator  -- authoritative decision for everything else.
+#   1. Deny patterns -- matched first; matching commands are rejected with
+#                       no LLM call. A command matching nothing here falls
+#                       through to the LLM, exactly as if no policy were
+#                       loaded.
+#   2. LLM evaluator -- authoritative decision for everything else.
+#
+# THIS FILE DOES NOT DEFINE AN ALLOWLIST. A glob `allow` pattern cannot skip
+# the LLM evaluator while it is enabled (glob matching over a flat command
+# string cannot parse shell quoting or operators, so it cannot be trusted
+# with a bypass -- see examples/deny-policy.yaml for the detailed caveats).
+# For the latency win a hand-rolled allowlist used to promise, pair this file
+# with a verb catalog instead:
+#
+#   guard server start --policy examples/hybrid-policy.yaml \
+#       --verbs examples/verbs-readonly.yaml
+#
+# A verb's parameters are structurally validated (anchored regex per
+# parameter, single-argv rendering, no shell), which is what makes a verb
+# safe to mark `trusted: true` (a real, LLM-skipping allow) in a way a glob
+# pattern is not.
 #
 # WHEN TO USE: read-heavy agent workloads where dozens of identical `ls`,
-# `ps`, or `kubectl get` calls would each incur a 0.5-2s LLM round-trip. The
-# allowlist cuts that latency to zero for deterministic cases while the
-# denylist keeps obvious footguns off the LLM's plate. Everything ambiguous
+# `ps`, or `kubectl get` calls would each incur a 0.5-2s LLM round-trip --
+# pointed at verbs-readonly.yaml for the allow side. The denylist keeps
+# obvious footguns off the LLM's plate even before that. Everything ambiguous
 # still reaches the LLM, so novel attacks and obfuscated payloads remain
 # covered.
-#
-# LIMITATIONS: static glob patterns cannot parse shell operators, quoting, or
-# semantics. See examples/deny-policy.yaml for the detailed caveats. Keep the
-# allowlist narrow and fully-qualified; never allow patterns that could be
-# chained with `;`, `&&`, `||`, or `|`.
 
 policy:
   commands:
-    allow:
-      # Identity / host state (deterministic, no args)
-      - "id"
-      - "whoami"
-      - "hostname"
-      - "uname -a"
-      - "uptime"
-      - "date"
-
-      # Resource inspection
-      - "ps aux"
-      - "df -h"
-      - "free -h"
-
-      # Filesystem listing (safe roots only)
-      - "ls"
-      - "ls -la"
-      - "pwd"
-
-      # Fixed safe file reads
-      - "cat /etc/hosts"
-      - "cat /etc/os-release"
-
-      # Kubernetes read-only
-      - "kubectl get *"
-      - "kubectl describe *"
-      - "kubectl logs *"
-
-      # Git read-only
-      - "git status"
-      - "git log --oneline -20"
-      - "git branch"
-      - "git diff"
-
-      # Systemd read-only
-      - "systemctl status *"
-      - "journalctl -u * --no-pager -n 100"
-
     deny:
       # Privilege escalation
       - "sudo su*"
