@@ -335,6 +335,24 @@ impl ApiProxy {
                 self.listen
             )
         })?;
+        self.serve_on(listener).await
+    }
+
+    /// Serve on an already-bound listener whose address matches this proxy's
+    /// configured address. Callers that need an atomic port reservation can
+    /// bind first, construct the proxy with `listener.local_addr()`, and pass
+    /// the listener here without a release-and-rebind race.
+    pub async fn serve_on(self: Arc<Self>, listener: TcpListener) -> Result<()> {
+        let actual = listener
+            .local_addr()
+            .context("read pre-bound api-proxy listener address")?;
+        if actual != self.listen {
+            return Err(anyhow!(
+                "pre-bound api-proxy listener address {} does not match configured address {}",
+                actual,
+                self.listen
+            ));
+        }
         let acceptor = TlsAcceptor::from(self.tls.server_config());
         tracing::info!(
             "guard api-proxy ({}) listening on https://{} -> {}",
@@ -1595,6 +1613,26 @@ mod tests {
         assert_eq!(
             proxy.shape_key(&delete_op("a")),
             proxy.shape_key(&delete_op("b"))
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_on_rejects_a_listener_for_another_address() {
+        let proxy = Arc::new(test_proxy());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+
+        let error = proxy
+            .serve_on(listener)
+            .await
+            .expect_err("configured and bound addresses differ");
+
+        assert!(
+            error
+                .to_string()
+                .contains("does not match configured address"),
+            "unexpected error: {error}"
         );
     }
 

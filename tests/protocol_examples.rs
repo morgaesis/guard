@@ -30,10 +30,13 @@ use guard::proxy::{
 /// Requests the mock upstream actually served: (method, path?query).
 type Hits = Arc<Mutex<Vec<(String, String)>>>;
 
-async fn spawn_recording_upstream(hits: Hits, body_for: fn(&str) -> Value) -> String {
+async fn spawn_recording_upstream(
+    hits: Hits,
+    body_for: fn(&str) -> Value,
+) -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         loop {
             let (stream, _) = match listener.accept().await {
                 Ok(p) => p,
@@ -68,15 +71,7 @@ async fn spawn_recording_upstream(hits: Hits, body_for: fn(&str) -> Value) -> St
             });
         }
     });
-    format!("http://{addr}")
-}
-
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    (format!("http://{addr}"), task)
 }
 
 struct TestProxy {
@@ -85,6 +80,7 @@ struct TestProxy {
     port: u16,
     ca_pem: String,
     hits: Hits,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl TestProxy {
@@ -97,6 +93,14 @@ impl TestProxy {
     }
 }
 
+impl Drop for TestProxy {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
 /// Stand up mock upstream + proxy for one protocol and policy; return a client
 /// trusting the proxy's ephemeral CA.
 async fn spawn_proxy(
@@ -105,7 +109,7 @@ async fn spawn_proxy(
     policy_yaml: &str,
 ) -> TestProxy {
     let hits: Hits = Arc::new(Mutex::new(Vec::new()));
-    let mock_base = spawn_recording_upstream(hits.clone(), body_for).await;
+    let (mock_base, upstream_task) = spawn_recording_upstream(hits.clone(), body_for).await;
     let kubeconfig = format!(
         "apiVersion: v1\nkind: Config\ncurrent-context: ctx\nclusters:\n  - name: c\n    cluster: {{server: \"{mock_base}\"}}\ncontexts:\n  - name: ctx\n    context: {{cluster: c, user: u}}\nusers:\n  - name: u\n    user: {{}}\n"
     );
@@ -113,15 +117,24 @@ async fn spawn_proxy(
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(policy_yaml).expect("policy");
-    let port = free_port();
-    let listen = format!("127.0.0.1:{port}").parse().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind proxy test listener");
+    let listen = listener.local_addr().expect("proxy test listener address");
+    let port = listen.port();
     let proxy = Arc::new(ApiProxy::with_protocol(
         protocol, listen, tls, upstream, policy, None,
     ));
-    tokio::spawn(proxy.serve());
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    let proxy_task = tokio::spawn(async move {
+        proxy
+            .serve_on(listener)
+            .await
+            .expect("serve proxy test listener");
+    });
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(5))
         .build()
         .unwrap();
     TestProxy {
@@ -130,6 +143,7 @@ async fn spawn_proxy(
         port,
         ca_pem,
         hits,
+        tasks: vec![upstream_task, proxy_task],
     }
 }
 
@@ -419,6 +433,7 @@ rules:
         .await
         .unwrap();
     assert_eq!(ok.status(), 200);
+    ok.bytes().await.expect("consume allowed response body");
 
     // Another repository is outside the namespace grant. Case variation on
     // the route literals does not create a third namespace either.
@@ -430,8 +445,51 @@ rules:
             .await
             .unwrap();
         assert_eq!(denied.status(), 403, "{path} is outside octo/hello");
+        denied.bytes().await.expect("consume denied response body");
     }
     assert_eq!(p.hit_count(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn github_policy_mixed_responses_reuse_connections_reliably() {
+    let policy = r#"
+default: deny
+rules:
+  - verbs: [get, list]
+    resources: ["*"]
+    namespaces: ["octo/hello"]
+    action: allow
+"#;
+    let p = spawn_proxy(Arc::new(GithubProtocol), github_body, policy).await;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for _ in 0..32 {
+            let allowed = p
+                .client
+                .get(format!("{}/repos/octo/hello/issues/42", p.base))
+                .send()
+                .await
+                .expect("allowed request");
+            assert_eq!(allowed.status(), 200);
+            allowed
+                .bytes()
+                .await
+                .expect("consume allowed response body");
+
+            let denied = p
+                .client
+                .get(format!("{}/repos/evil/repo/issues/1", p.base))
+                .send()
+                .await
+                .expect("denied request");
+            assert_eq!(denied.status(), 403);
+            denied.bytes().await.expect("consume denied response body");
+        }
+    })
+    .await
+    .expect("mixed responses complete within the harness bound");
+
+    assert_eq!(p.hit_count(), 32, "only allowed requests reach upstream");
 }
 
 // ---------------------------------------------------------------------------

@@ -1714,6 +1714,7 @@ async fn provisional_revert_executes_in_snapshotted_cwd() {
         binary: "true".to_string(),
         args: Vec::new(),
         cwd: Some(temp.path().to_path_buf()),
+        secret_keys: BTreeMap::new(),
         revert_binary: "sh".to_string(),
         revert_args: vec![
             "-c".to_string(),
