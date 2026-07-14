@@ -1468,6 +1468,50 @@ async fn approved_snapshot_rejects_missing_snapshotted_cwd_before_exec() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn approved_snapshot_rejects_retargeted_snapshotted_cwd_before_exec() {
+    let (cfg, _, agent) = gating_config(7018, 1000);
+    let parent = tempfile::tempdir().unwrap();
+    let approved = parent.path().join("approved");
+    let retargeted = parent.path().join("retargeted");
+    std::fs::create_dir(&approved).unwrap();
+    std::fs::create_dir(&retargeted).unwrap();
+    let cwd = approved.canonicalize().unwrap();
+    let snapshot = ApprovalSnapshot {
+        binary: "sh".to_string(),
+        args: vec!["-c".to_string(), "printf approved".to_string()],
+        cwd: Some(cwd.clone()),
+        env: BTreeMap::new(),
+        secret_keys: BTreeMap::new(),
+        verb_name: None,
+        verb_params: BTreeMap::new(),
+        catalog_version: None,
+        principal: agent.principal(),
+        secret_binding: None,
+    };
+
+    std::fs::remove_dir(&approved).unwrap();
+    std::os::unix::fs::symlink(&retargeted, &approved).unwrap();
+
+    let result = execute_snapshot(&cfg, &snapshot, "operator approved").await;
+
+    match result.exec {
+        ExecOutcome::Failed {
+            started, reason, ..
+        } => {
+            assert!(!started);
+            assert!(
+                reason.contains("working directory")
+                    && reason.contains("changed before exec")
+                    && reason.contains(cwd.to_str().unwrap()),
+                "unexpected reason: {reason}"
+            );
+        }
+        other => panic!("expected retargeted cwd rejection, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn provisional_revert_executes_in_snapshotted_cwd() {
     let (cfg, _operator, agent) = gating_config(7017, 1000);
     let temp = tempfile::tempdir().unwrap();
