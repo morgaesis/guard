@@ -1,7 +1,7 @@
 # Self-contained adversarial harness for consequence gating.
 # Builds guard for Linux, sets up an unprivileged daemon (uid 1000) and agent (uid 1001),
-# and runs the attack script. No Claude OAuth, no external service credentials
-# (trusted verbs make classification deterministic and offline).
+# and runs the attack script. The harness uses deterministic local fixtures and
+# makes no external service calls.
 #
 # Build context is the repo root. `.dockerignore` restricts the context to the
 # source and fixture paths this harness copies.
