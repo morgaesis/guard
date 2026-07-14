@@ -763,7 +763,7 @@ pub(super) async fn arm_containment<W: AsyncWrite + Unpin>(
     if !request.env.is_empty() {
         return ExecuteResult::exec_failed(
             reason,
-            "containment cannot persist plain --env values; store them in the daemon secret backend and pass them with --secret"
+            "command was not run: containment cannot persist plain --env values; store them in the daemon secret backend and pass them with --secret"
                 .to_string(),
         );
     }
