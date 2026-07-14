@@ -186,9 +186,13 @@ async fn cwd_request_matches_cwd_bound_exact_session_allow_only() {
         ExecOutcome::Completed {
             exit_code: Some(0), ..
         } => {
-            assert_eq!(
-                std::fs::read_to_string(allowed.path().join("cwd-exact-sentinel.txt")).unwrap(),
-                "ok"
+            let sentinel = allowed_cwd.join("cwd-exact-sentinel.txt");
+            let content = std::fs::read_to_string(&sentinel);
+            assert!(
+                matches!(content.as_deref(), Ok("ok")),
+                "sentinel content at {}: {:?}",
+                sentinel.display(),
+                content
             );
         }
         other => panic!("expected cwd-bound exact allow to execute, got {:?}", other),
