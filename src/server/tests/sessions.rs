@@ -162,27 +162,46 @@ async fn cwd_request_matches_cwd_bound_exact_session_allow_only() {
         granted_session(
             Vec::new(),
             vec![SessionExactRule::with_cwd(
-                "pwd",
-                Vec::new(),
+                "sh",
+                vec![
+                    "-c".to_string(),
+                    "printf ok > cwd-exact-sentinel.txt".to_string(),
+                ],
                 allowed_cwd.clone(),
             )],
         ),
     );
 
-    let mut req = request_with_session("pwd", Vec::new(), token.clone());
+    let mut req = request_with_session(
+        "sh",
+        vec![
+            "-c".to_string(),
+            "printf ok > cwd-exact-sentinel.txt".to_string(),
+        ],
+        token.clone(),
+    );
     req.cwd = Some(allowed_cwd.clone());
     let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
     match result.exec {
-        ExecOutcome::Completed { stdout, .. } => {
+        ExecOutcome::Completed {
+            exit_code: Some(0), ..
+        } => {
             assert_eq!(
-                stdout.as_deref().map(str::trim),
-                Some(allowed_cwd.to_str().unwrap())
+                std::fs::read_to_string(allowed.path().join("cwd-exact-sentinel.txt")).unwrap(),
+                "ok"
             );
         }
         other => panic!("expected cwd-bound exact allow to execute, got {:?}", other),
     }
 
-    let mut req = request_with_session("pwd", Vec::new(), token);
+    let mut req = request_with_session(
+        "sh",
+        vec![
+            "-c".to_string(),
+            "printf ok > cwd-exact-sentinel.txt".to_string(),
+        ],
+        token,
+    );
     req.cwd = Some(other.path().canonicalize().unwrap());
     let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
     assert!(!result.policy_allowed());

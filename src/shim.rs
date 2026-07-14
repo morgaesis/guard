@@ -571,14 +571,23 @@ mod tests {
         #[cfg(not(windows))]
         {
             assert!(content.contains("#!/bin/sh"));
+            assert!(content.contains("exec"));
+            assert!(content.contains("guard"));
+            assert!(content.contains("run"));
+            assert!(content.contains("ssh"));
+            assert!(content.contains("\"$@\""));
         }
         #[cfg(windows)]
         {
+            assert_eq!(path.extension().and_then(|ext| ext.to_str()), Some("cmd"));
             assert!(content.starts_with("@echo off"));
+            assert!(content.contains("set \"__guard_fixed_argc=3\""));
+            assert!(content.contains("set \"__guard_fixed_1=/usr/local/bin/guard\""));
+            assert!(content.contains("set \"__guard_fixed_2=run\""));
+            assert!(content.contains("set \"__guard_fixed_3=ssh\""));
+            assert!(content.contains("powershell.exe -NoProfile -ExecutionPolicy Bypass"));
+            assert!(!content.contains("exec "));
         }
-        assert!(content.contains("exec"));
-        assert!(content.contains("guard"));
-        assert!(content.contains("ssh"));
 
         // Verify it's executable (Unix mode bit only; no equivalent on Windows).
         #[cfg(unix)]
