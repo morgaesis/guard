@@ -1,7 +1,10 @@
 use crate::server::admin::handle_admin_request;
 #[cfg(windows)]
 use crate::server::binary_path_candidates;
-use crate::server::execute::{audit_command_line, audit_token, execute_command};
+use crate::server::execute::{
+    audit_command_line, audit_token, evaluation_context_prompt, execute_command,
+    log_audit_policy_for_request,
+};
 use crate::server::gate_runtime::binary_allowed;
 use crate::server::transport::emit_audit_events;
 use crate::server::wire::{
@@ -12,16 +15,46 @@ use crate::server::{
     deterministic_safe_allow_reason, invalid_shell_secret_reference, is_valid_secret_key,
     validate_request_injections,
 };
+#[cfg(unix)]
+use crate::session::SessionExactRule;
 use crate::session::SessionGrant;
 use guard::evaluate::{EvalConfig, Evaluator};
 use guard::gating::deny_shape::{DenyLearningConfig, DenyShapeStore};
 use guard::principal::PrincipalKey;
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::ffi::OsString;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 
 use super::{args, capture, make_test_config, paranoid_test_config};
+
+#[cfg(unix)]
+struct EnvRestore {
+    key: &'static str,
+    value: Option<OsString>,
+}
+
+#[cfg(unix)]
+impl EnvRestore {
+    fn capture(key: &'static str) -> Self {
+        Self {
+            key,
+            value: std::env::var_os(key),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EnvRestore {
+    fn drop(&mut self) {
+        match &self.value {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
 
 #[test]
 fn audit_command_line_masks_inline_credentials() {
@@ -58,6 +91,37 @@ fn audit_token_truncates_and_is_char_safe() {
     let t = audit_token("éééééééééé");
     assert!(t.starts_with("éééé"), "got: {t}");
     assert!(!t.contains("éééééééééé"), "full value never appears: {t}");
+}
+
+#[test]
+fn cwd_is_included_in_audit_and_evaluation_context() {
+    let (cfg, buf) = make_test_config();
+    let cwd = std::env::current_dir().unwrap();
+    let mut req = basic_request("pwd", Vec::new());
+    req.cwd = Some(cwd.clone());
+
+    let prompt = evaluation_context_prompt(&req, Some("SESSION CONTEXT".to_string()))
+        .expect("cwd/session prompt");
+    assert!(prompt.contains("CALLER WORKING DIRECTORY:"));
+    assert!(prompt.contains(&cwd.display().to_string()));
+    assert!(prompt.contains("SESSION CONTEXT"));
+
+    let logs = capture(&buf, || {
+        log_audit_policy_for_request(
+            &cfg,
+            &CallerIdentity::Unix { uid: 1000 },
+            &req,
+            true,
+            "approved for test",
+        );
+    });
+    assert!(logs.contains("[AUDIT] ALLOWED"), "logs={logs}");
+    assert!(logs.contains("caller=uid=1000"), "logs={logs}");
+    assert!(
+        logs.contains(&format!("cwd=\"{}\"", cwd.display())),
+        "logs={logs}"
+    );
+    assert!(logs.contains("cmd=\"pwd\""), "logs={logs}");
 }
 
 // ---- ExecuteResult result-shape tests -----------------------------------
@@ -184,6 +248,7 @@ async fn env_and_secret_injections_cannot_target_same_env_var() {
         confirm_within_secs: None,
         reevaluate: false,
         ssh_hostkey: None,
+        cwd: None,
         require_approval: None,
         wait_approval_secs: None,
         verb: None,
@@ -216,6 +281,7 @@ async fn injection_refuses_non_local_tcp_caller() {
         confirm_within_secs: None,
         reevaluate: false,
         ssh_hostkey: None,
+        cwd: None,
         require_approval: None,
         wait_approval_secs: None,
         verb: None,
@@ -272,6 +338,7 @@ async fn missing_requested_secret_denies_before_policy_evaluation() {
         confirm_within_secs: None,
         reevaluate: false,
         ssh_hostkey: None,
+        cwd: None,
         require_approval: None,
         wait_approval_secs: None,
         verb: None,
@@ -308,6 +375,7 @@ async fn invalid_secret_shell_reference_denies_before_policy_evaluation() {
         confirm_within_secs: None,
         reevaluate: false,
         ssh_hostkey: None,
+        cwd: None,
         require_approval: None,
         wait_approval_secs: None,
         verb: None,
@@ -395,6 +463,7 @@ fn basic_request(binary: &str, args: Vec<String>) -> ExecuteRequest {
         confirm_within_secs: None,
         reevaluate: false,
         ssh_hostkey: None,
+        cwd: None,
         require_approval: None,
         wait_approval_secs: None,
         verb: None,
@@ -691,6 +760,7 @@ async fn exec_secret_injection_is_isolated_per_uid() {
         confirm_within_secs: None,
         reevaluate: false,
         ssh_hostkey: None,
+        cwd: None,
         require_approval: None,
         wait_approval_secs: None,
         verb: None,
@@ -765,6 +835,7 @@ async fn extra_child_env_forwards_named_var_to_child() {
         confirm_within_secs: None,
         reevaluate: false,
         ssh_hostkey: None,
+        cwd: None,
         require_approval: None,
         wait_approval_secs: None,
         verb: None,
@@ -782,6 +853,611 @@ async fn extra_child_env_forwards_named_var_to_child() {
         other => panic!("expected Completed, got {:?}", other),
     }
     std::env::remove_var("GUARD_CHILD_TEST_PT");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn local_caller_cwd_is_canonicalized_and_used_for_execution() {
+    let (cfg, _) = make_test_config();
+    let temp = tempfile::tempdir().unwrap();
+    let real = temp.path().join("real");
+    let link = temp.path().join("link");
+    std::fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let token = format!("cwd-session-{}", std::process::id());
+    cfg.sessions.write().await.grant(
+        token.clone(),
+        SessionGrant {
+            allow: Vec::new(),
+            deny: Vec::new(),
+            allow_exact: vec![SessionExactRule::with_cwd(
+                "pwd",
+                Vec::new(),
+                real.canonicalize().unwrap(),
+            )],
+            deny_exact: Vec::new(),
+            expires_at: None,
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            static_only: true,
+            auto_amend: false,
+            granted_at: 0,
+        },
+    );
+
+    let mut req = basic_request("pwd", Vec::new());
+    req.session_token = Some(token);
+    req.cwd = Some(link);
+
+    let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+    match result.exec {
+        ExecOutcome::Completed { stdout, .. } => {
+            assert_eq!(
+                stdout.as_deref().map(str::trim),
+                Some(real.to_str().unwrap())
+            );
+        }
+        other => panic!("expected cwd-backed execution, got {:?}", other),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn default_service_execution_does_not_forward_ssh_auth_sock() {
+    let (cfg, _) = make_test_config();
+    let _restore = EnvRestore::capture("SSH_AUTH_SOCK");
+    std::env::set_var("SSH_AUTH_SOCK", "/tmp/fake-caller-agent.sock");
+
+    let token = format!("ssh-auth-sock-{}", std::process::id());
+    cfg.sessions.write().await.grant(
+        token.clone(),
+        SessionGrant {
+            allow: vec!["sh *".into()],
+            deny: Vec::new(),
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            expires_at: None,
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            static_only: true,
+            auto_amend: false,
+            granted_at: 0,
+        },
+    );
+
+    let mut req = basic_request(
+        "sh",
+        vec![
+            "-c".to_string(),
+            "test -z \"${SSH_AUTH_SOCK:-}\" && printf clean".to_string(),
+        ],
+    );
+    req.session_token = Some(token);
+
+    let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+    match result.exec {
+        ExecOutcome::Completed { stdout, .. } => {
+            assert_eq!(stdout.as_deref(), Some("clean"));
+        }
+        other => panic!("expected child without SSH_AUTH_SOCK, got {:?}", other),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn caller_env_cannot_supply_ssh_auth_sock() {
+    let (cfg, _) = make_test_config();
+    let token = format!("caller-ssh-auth-sock-{}", std::process::id());
+    cfg.sessions.write().await.grant(
+        token.clone(),
+        SessionGrant {
+            allow: vec!["sh *".into()],
+            deny: Vec::new(),
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            expires_at: None,
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            static_only: true,
+            auto_amend: false,
+            granted_at: 0,
+        },
+    );
+
+    let mut req = basic_request(
+        "sh",
+        vec!["-c".to_string(), "printf should-not-run".to_string()],
+    );
+    req.session_token = Some(token);
+    req.env.insert(
+        "SSH_AUTH_SOCK".to_string(),
+        "/tmp/caller-agent.sock".to_string(),
+    );
+
+    let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+    assert!(!result.policy_allowed());
+    assert!(result
+        .policy_reason()
+        .contains("dangerous injected environment variable name: 'SSH_AUTH_SOCK'"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn guard_configured_ssh_auth_sock_is_forwarded_to_child() {
+    let (cfg, _) = make_test_config();
+    let _restore = EnvRestore::capture("SSH_AUTH_SOCK");
+    std::env::set_var("SSH_AUTH_SOCK", "/tmp/caller-agent.sock");
+    let tools = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        tools.path(),
+        "tools:\n  sh:\n    env:\n      SSH_AUTH_SOCK: /run/guard/broker-agent.sock\n",
+    )
+    .unwrap();
+    *cfg.tool_registry.write().await =
+        crate::tool_config::ToolRegistry::load(tools.path()).unwrap();
+
+    let token = format!("trusted-ssh-auth-sock-{}", std::process::id());
+    cfg.sessions.write().await.grant(
+        token.clone(),
+        SessionGrant {
+            allow: vec!["sh *".into()],
+            deny: Vec::new(),
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            expires_at: None,
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            static_only: true,
+            auto_amend: false,
+            granted_at: 0,
+        },
+    );
+
+    let mut req = basic_request(
+        "sh",
+        vec![
+            "-c".to_string(),
+            "printf '%s' \"$SSH_AUTH_SOCK\"".to_string(),
+        ],
+    );
+    req.session_token = Some(token);
+
+    let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+    match result.exec {
+        ExecOutcome::Completed { stdout, .. } => {
+            assert_eq!(stdout.as_deref(), Some("/run/guard/broker-agent.sock"));
+        }
+        other => panic!(
+            "expected broker-owned SSH_AUTH_SOCK in child, got {:?}",
+            other
+        ),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn caller_env_cannot_override_guard_tool_env() {
+    let (cfg, _) = make_test_config();
+    let tools = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        tools.path(),
+        "tools:\n  sh:\n    env:\n      BROKER_ENDPOINT: guard-owned\n",
+    )
+    .unwrap();
+    *cfg.tool_registry.write().await =
+        crate::tool_config::ToolRegistry::load(tools.path()).unwrap();
+
+    let token = format!("tool-env-collision-{}", std::process::id());
+    cfg.sessions.write().await.grant(
+        token.clone(),
+        SessionGrant {
+            allow: vec!["sh *".into()],
+            deny: Vec::new(),
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            expires_at: None,
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            static_only: true,
+            auto_amend: false,
+            granted_at: 0,
+        },
+    );
+
+    let mut req = basic_request(
+        "sh",
+        vec![
+            "-c".to_string(),
+            "printf '%s' \"$BROKER_ENDPOINT\"".to_string(),
+        ],
+    );
+    req.session_token = Some(token);
+    req.env
+        .insert("BROKER_ENDPOINT".to_string(), "caller-owned".to_string());
+
+    let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+    match result.exec {
+        ExecOutcome::Failed { reason, started } => {
+            assert!(!started);
+            assert!(reason.contains(
+                "injected environment variable 'BROKER_ENDPOINT' conflicts with Guard tool configuration"
+            ));
+        }
+        other => panic!("expected collision to fail before exec, got {:?}", other),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn caller_secret_cannot_override_guard_tool_env() {
+    let (cfg, _) = make_test_config();
+    let tools = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        tools.path(),
+        "tools:\n  sh:\n    env:\n      BROKER_TOKEN: guard-owned\n",
+    )
+    .unwrap();
+    *cfg.tool_registry.write().await =
+        crate::tool_config::ToolRegistry::load(tools.path()).unwrap();
+    cfg.secrets
+        .set(
+            &PrincipalKey::from_uid(1000),
+            "CALLER_TOKEN",
+            "caller-owned",
+        )
+        .await
+        .unwrap();
+
+    let token = format!("tool-secret-collision-{}", std::process::id());
+    cfg.sessions.write().await.grant(
+        token.clone(),
+        SessionGrant {
+            allow: vec!["sh *".into()],
+            deny: Vec::new(),
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            expires_at: None,
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            static_only: true,
+            auto_amend: false,
+            granted_at: 0,
+        },
+    );
+
+    let mut req = basic_request(
+        "sh",
+        vec![
+            "-c".to_string(),
+            "printf '%s' \"$BROKER_TOKEN\"".to_string(),
+        ],
+    );
+    req.session_token = Some(token);
+    req.secrets
+        .insert("BROKER_TOKEN".to_string(), "CALLER_TOKEN".to_string());
+
+    let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+    match result.exec {
+        ExecOutcome::Failed { reason, started } => {
+            assert!(!started);
+            assert!(reason.contains(
+                "injected environment variable 'BROKER_TOKEN' conflicts with Guard tool configuration"
+            ));
+        }
+        other => panic!(
+            "expected secret collision to fail before exec, got {:?}",
+            other
+        ),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn caller_env_cannot_override_daemon_child_env() {
+    let (mut cfg, _) = make_test_config();
+    let _restore = EnvRestore::capture("GUARD_CHILD_ENDPOINT");
+    std::env::set_var("GUARD_CHILD_ENDPOINT", "daemon-owned");
+    cfg.extra_child_env = vec!["GUARD_CHILD_ENDPOINT".to_string()];
+
+    let token = format!("child-env-collision-{}", std::process::id());
+    cfg.sessions.write().await.grant(
+        token.clone(),
+        SessionGrant {
+            allow: vec!["sh *".into()],
+            deny: Vec::new(),
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            expires_at: None,
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            static_only: true,
+            auto_amend: false,
+            granted_at: 0,
+        },
+    );
+
+    let mut req = basic_request(
+        "sh",
+        vec![
+            "-c".to_string(),
+            "printf '%s' \"$GUARD_CHILD_ENDPOINT\"".to_string(),
+        ],
+    );
+    req.session_token = Some(token);
+    req.env.insert(
+        "GUARD_CHILD_ENDPOINT".to_string(),
+        "caller-owned".to_string(),
+    );
+
+    let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+    match result.exec {
+        ExecOutcome::Failed { reason, started } => {
+            assert!(!started);
+            assert!(reason.contains(
+                "injected environment variable 'GUARD_CHILD_ENDPOINT' conflicts with Guard daemon child environment"
+            ));
+        }
+        other => panic!(
+            "expected daemon child env collision to fail before exec, got {:?}",
+            other
+        ),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn redaction_covers_effective_tool_child_and_request_env_values() {
+    let (mut cfg, _) = make_test_config();
+    cfg.redact = true;
+    let _restore = EnvRestore::capture("GUARD_CHILD_SECRET");
+    std::env::set_var("GUARD_CHILD_SECRET", "daemon-child-secret-value");
+    cfg.extra_child_env = vec!["GUARD_CHILD_SECRET".to_string()];
+    let tools = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        tools.path(),
+        "tools:\n  sh:\n    env:\n      TOOL_SECRET: guard-tool-secret-value\n",
+    )
+    .unwrap();
+    *cfg.tool_registry.write().await =
+        crate::tool_config::ToolRegistry::load(tools.path()).unwrap();
+
+    let token = format!("env-redaction-{}", std::process::id());
+    cfg.sessions.write().await.grant(
+        token.clone(),
+        SessionGrant {
+            allow: vec!["sh *".into()],
+            deny: Vec::new(),
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            expires_at: None,
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            static_only: true,
+            auto_amend: false,
+            granted_at: 0,
+        },
+    );
+
+    let mut req = basic_request(
+        "sh",
+        vec![
+            "-c".to_string(),
+            "printf '%s %s %s' \"$TOOL_SECRET\" \"$GUARD_CHILD_SECRET\" \"$REQUEST_SECRET\""
+                .to_string(),
+        ],
+    );
+    req.session_token = Some(token);
+    req.env.insert(
+        "REQUEST_SECRET".to_string(),
+        "request-secret-value".to_string(),
+    );
+
+    let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+    match result.exec {
+        ExecOutcome::Completed { stdout, .. } => {
+            let stdout = stdout.unwrap_or_default();
+            assert!(
+                !stdout.contains("guard-tool-secret-value"),
+                "stdout={stdout}"
+            );
+            assert!(
+                !stdout.contains("daemon-child-secret-value"),
+                "stdout={stdout}"
+            );
+            assert!(!stdout.contains("request-secret-value"), "stdout={stdout}");
+            assert!(stdout.contains("[REDACTED]"), "stdout={stdout}");
+        }
+        other => panic!("expected redacted env output, got {:?}", other),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn ansible_discovers_config_from_cwd_without_inherited_ansible_config() {
+    let (cfg, _) = make_test_config();
+    let temp = tempfile::tempdir().unwrap();
+    let bin_dir = temp.path().join("bin");
+    let project = temp.path().join("project");
+    std::fs::create_dir(&bin_dir).unwrap();
+    std::fs::create_dir(&project).unwrap();
+    std::fs::write(
+        project.join("ansible.cfg"),
+        "[defaults]\ninventory = inventory\n",
+    )
+    .unwrap();
+    std::fs::write(project.join("inventory"), "all\n").unwrap();
+    let ansible = bin_dir.join("ansible");
+    std::fs::write(
+        &ansible,
+        "#!/bin/sh\n\
+         test \"$*\" = '-m ping all' || exit 2\n\
+         test -z \"${ANSIBLE_CONFIG:-}\" || exit 3\n\
+         test -f ansible.cfg || exit 4\n\
+         test -f inventory || exit 5\n\
+         grep -q '^inventory *= *inventory$' ansible.cfg || exit 6\n\
+         grep -q '^all$' inventory || exit 7\n\
+         printf 'ansible-cwd-ok:%s' \"$(pwd)\"\n",
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&ansible).unwrap().permissions();
+    use std::os::unix::fs::PermissionsExt;
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&ansible, perms).unwrap();
+
+    let _path_restore = EnvRestore::capture("PATH");
+    let _ansible_config_restore = EnvRestore::capture("ANSIBLE_CONFIG");
+    std::env::set_var("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()));
+    std::env::set_var("ANSIBLE_CONFIG", "/tmp/caller-ansible.cfg");
+
+    let project_cwd = project.canonicalize().unwrap();
+    let token = format!("ansible-cwd-{}", std::process::id());
+    cfg.sessions.write().await.grant(
+        token.clone(),
+        SessionGrant {
+            allow: Vec::new(),
+            deny: Vec::new(),
+            allow_exact: vec![SessionExactRule::with_cwd(
+                "ansible",
+                vec!["-m".into(), "ping".into(), "all".into()],
+                project_cwd.clone(),
+            )],
+            deny_exact: Vec::new(),
+            expires_at: None,
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            static_only: true,
+            auto_amend: false,
+            granted_at: 0,
+        },
+    );
+
+    let mut req = basic_request("ansible", vec!["-m".into(), "ping".into(), "all".into()]);
+    req.session_token = Some(token);
+    req.cwd = Some(project_cwd.clone());
+
+    let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+    match result.exec {
+        ExecOutcome::Completed { stdout, .. } => {
+            let expected = format!("ansible-cwd-ok:{}", project_cwd.display());
+            assert_eq!(stdout.as_deref(), Some(expected.as_str()));
+        }
+        other => panic!(
+            "expected fake ansible to discover cwd config/inventory without ANSIBLE_CONFIG, got {:?}",
+            other
+        ),
+    }
+}
+
+#[tokio::test]
+async fn tcp_caller_cannot_assert_working_directory() {
+    let (cfg, _) = make_test_config();
+    let mut req = basic_request("echo", vec!["ok".to_string()]);
+    req.cwd = Some(std::env::current_dir().unwrap());
+
+    let result = execute_command(
+        req,
+        &cfg,
+        &CallerIdentity::Tcp {
+            token: "exec-token".into(),
+        },
+    )
+    .await;
+
+    assert!(!result.policy_allowed());
+    assert!(result
+        .policy_reason()
+        .contains("authenticated local caller"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shim_dir_only_path_fails_without_recursing_into_primary_shim() {
+    let (mut cfg, _) = make_test_config();
+    let shim_dir = tempfile::tempdir().unwrap();
+    let shim_path = shim_dir.path().join("missing-tool");
+    std::fs::write(&shim_path, "#!/bin/sh\nexit 99\n").unwrap();
+    let mut perms = std::fs::metadata(&shim_path).unwrap().permissions();
+    use std::os::unix::fs::PermissionsExt;
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&shim_path, perms).unwrap();
+    cfg.shim_dir = Some(shim_dir.path().to_path_buf());
+    let _path_restore = EnvRestore::capture("PATH");
+    std::env::set_var("PATH", shim_dir.path());
+
+    let token = format!("shim-recursion-{}", std::process::id());
+    cfg.sessions.write().await.grant(
+        token.clone(),
+        SessionGrant {
+            allow: vec!["missing-tool".into()],
+            deny: Vec::new(),
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            expires_at: None,
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            static_only: true,
+            auto_amend: false,
+            granted_at: 0,
+        },
+    );
+
+    let mut req = basic_request("missing-tool", Vec::new());
+    req.session_token = Some(token);
+    let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+
+    match result.exec {
+        ExecOutcome::Failed { reason, started } => {
+            assert!(!started);
+            assert!(reason.contains("outside shim directory"), "got: {reason}");
+        }
+        other => panic!("expected pre-start exec failure, got {:?}", other),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn allowed_binary_floor_does_not_permit_shim_dir_recursion() {
+    let (mut cfg, _) = make_test_config();
+    let shim_dir = tempfile::tempdir().unwrap();
+    let shim_path = shim_dir.path().join("allowed-tool");
+    std::fs::write(&shim_path, "#!/bin/sh\nexit 99\n").unwrap();
+    let mut perms = std::fs::metadata(&shim_path).unwrap().permissions();
+    use std::os::unix::fs::PermissionsExt;
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&shim_path, perms).unwrap();
+    cfg.shim_dir = Some(shim_dir.path().to_path_buf());
+    cfg.allowed_binaries = Some(vec!["allowed-tool".to_string()]);
+    let _path_restore = EnvRestore::capture("PATH");
+    std::env::set_var("PATH", shim_dir.path());
+
+    let token = format!("shim-allow-bin-{}", std::process::id());
+    cfg.sessions.write().await.grant(
+        token.clone(),
+        SessionGrant {
+            allow: vec!["allowed-tool".into()],
+            deny: Vec::new(),
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            expires_at: None,
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            static_only: true,
+            auto_amend: false,
+            granted_at: 0,
+        },
+    );
+
+    let mut req = basic_request("allowed-tool", Vec::new());
+    req.session_token = Some(token);
+    let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+
+    match result.exec {
+        ExecOutcome::Failed { reason, started } => {
+            assert!(!started);
+            assert!(reason.contains("outside shim directory"), "got: {reason}");
+        }
+        other => panic!("expected pre-start exec failure, got {:?}", other),
+    }
 }
 
 /// The revert-availability fragment reaches the evaluator prompt only when a

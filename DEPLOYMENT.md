@@ -83,10 +83,11 @@ beyond their reach. This holds identically on Unix (uid separation) and Windows
 ### Session-grant profiles
 
 A session-grant profile is an operator-authored, named bundle of the same fields
-the foreman would otherwise type into `guard session new`: a ttl, allow/deny
-globs, and evaluator prompt context. It pre-authors a recurring, bounded box of
-access (for example, cert-manager certificate rotation) once, so a session does
-not have to be re-authored per worker or per operator round-trip.
+the foreman would otherwise type into `guard session new`: a ttl, legacy
+allow/deny globs, and evaluator prompt context. It pre-authors a recurring,
+bounded box of access (for example, cert-manager certificate rotation) once, so
+a session does not have to be re-authored per worker or per operator round-trip.
+Profiles do not form a separate authority model; they mint ordinary sessions.
 
 The daemon loads a profile catalog from `--profiles <path>` (or the
 `GUARD_PROFILES` environment variable) at `guard server start`. The catalog is a
@@ -103,10 +104,15 @@ The foreman mints a session from a profile in one round trip with
 hand to a worker. An unknown name is rejected by the daemon. A profile is a no
 new trust boundary: the session it mints takes the identical install and
 validation path as a hand-authored `guard session new`, so it can express nothing
-an operator could not type directly. A session allow-glob short-circuits to allow
-before the evaluator, a deny-glob short-circuits to deny, and anything the globs
-do not cover still falls through to the per-command evaluator with the profile's
-prompt appended as context.
+an operator could not type directly. A session allow-glob short-circuits past
+the evaluator only for requests without structured cwd, while staying inside
+the server binary allow-list, consequence routing, read-grant retry path,
+held-command snapshot binding, audit log, and session history. A deny-glob
+short-circuits to deny, and anything the globs do not cover still falls through
+to the per-command evaluator with the profile's prompt appended as context. New
+structured constraints are authored as typed verbs and reverse-matched
+capabilities; profiles are the compatibility wrapper that can select those
+capabilities as the grant model evolves.
 
 ## Recommended deployment
 

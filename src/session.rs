@@ -2,11 +2,12 @@
 //!
 //! A session is an opaque token the caller includes in `ExecuteRequest`.
 //! Grants attach extra allow/deny glob patterns to that token. Session
-//! denies short-circuit to DENY before the evaluator. Session allows
-//! short-circuit to ALLOW before the evaluator, letting an operator
-//! hand a specific agent narrow extra permissions (e.g. "mkdir
-//! /tmp/work/*", "rm /tmp/work/scratch.txt") without relaxing the
-//! global mode.
+//! denies short-circuit to DENY before the evaluator. Session allows skip only
+//! the evaluator: the command still stays inside the server binary floor,
+//! consequence routing, held-command snapshot binding, audit logging, and
+//! session recording. This lets an operator hand a specific agent narrow extra
+//! permissions (e.g. "mkdir /tmp/work/*", "rm /tmp/work/scratch.txt") without
+//! relaxing the global mode.
 //!
 //! The daemon keeps a live in-memory registry for fast decision checks,
 //! while `session_store.rs` persists grants and bounded interaction
@@ -16,6 +17,7 @@ use guard::env::now_unix;
 use guard::policy::{Decision, PolicyRule};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 
 /// Default daemon-side history retention. Anything older than this is
 /// dropped on the next opportunistic purge. 24h matches the "I want
@@ -70,13 +72,26 @@ pub struct SessionExactRule {
     pub binary: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
 }
 
 impl SessionExactRule {
+    #[allow(dead_code)]
     pub fn new(binary: impl Into<String>, args: Vec<String>) -> Self {
         Self {
             binary: binary.into(),
             args,
+            cwd: None,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn with_cwd(binary: impl Into<String>, args: Vec<String>, cwd: PathBuf) -> Self {
+        Self {
+            binary: binary.into(),
+            args,
+            cwd: Some(cwd),
         }
     }
 
@@ -84,8 +99,20 @@ impl SessionExactRule {
         command_line(&self.binary, &self.args)
     }
 
-    fn matches(&self, cmd: &str, args: &[String]) -> bool {
+    fn matches_base(&self, cmd: &str, args: &[String]) -> bool {
         self.binary == cmd && self.args == args
+    }
+
+    fn matches_deny(&self, cmd: &str, args: &[String], cwd: Option<&Path>) -> bool {
+        self.matches_base(cmd, args)
+            && self
+                .cwd
+                .as_deref()
+                .is_none_or(|rule_cwd| cwd.is_some_and(|cwd| cwd == rule_cwd))
+    }
+
+    fn matches_allow(&self, cmd: &str, args: &[String], cwd: Option<&Path>) -> bool {
+        self.matches_base(cmd, args) && self.cwd.as_deref() == cwd
     }
 }
 
@@ -533,6 +560,7 @@ impl SessionRegistry {
         decision: SessionAmendment,
         binary: String,
         args: Vec<String>,
+        cwd: Option<PathBuf>,
     ) -> Option<bool> {
         if self
             .grants
@@ -546,7 +574,7 @@ impl SessionRegistry {
         self.revision += 1;
         let grant = self.grants.get_mut(token).expect("presence checked above");
 
-        let rule = SessionExactRule::new(binary, args);
+        let rule = SessionExactRule { binary, args, cwd };
         match decision {
             SessionAmendment::Allow => {
                 grant.deny_exact.retain(|existing| existing != &rule);
@@ -605,6 +633,7 @@ impl SessionRegistry {
         token: &str,
         cmd: &str,
         args: &[String],
+        cwd: Option<&Path>,
     ) -> Option<(SessionDecision, String)> {
         let grant = self.grants.get(token)?;
         if grant.is_expired(now_unix()) {
@@ -619,7 +648,11 @@ impl SessionRegistry {
             cmd_only.clone()
         };
 
-        if let Some(rule) = grant.deny_exact.iter().find(|rule| rule.matches(cmd, args)) {
+        if let Some(rule) = grant
+            .deny_exact
+            .iter()
+            .find(|rule| rule.matches_deny(cmd, args, cwd))
+        {
             return Some((
                 SessionDecision::Deny,
                 format!("session exact deny: {}", rule.command_line()),
@@ -654,7 +687,7 @@ impl SessionRegistry {
         if let Some(rule) = grant
             .allow_exact
             .iter()
-            .find(|rule| rule.matches(cmd, args))
+            .find(|rule| rule.matches_allow(cmd, args, cwd))
         {
             return Some((
                 SessionDecision::Allow,
@@ -667,7 +700,7 @@ impl SessionRegistry {
             decision: Decision::Allow,
             description: None,
         };
-        if allow_rule.matches_command(&full_cmd, &cmd_with_first_arg, &cmd_only) {
+        if cwd.is_none() && allow_rule.matches_command(&full_cmd, &cmd_with_first_arg, &cmd_only) {
             let which = grant
                 .allow
                 .iter()
@@ -749,14 +782,16 @@ mod tests {
     #[test]
     fn unknown_token_returns_none() {
         let reg = reg_with("tok", &["mkdir*"], &[]);
-        assert!(reg.check("other", "mkdir", &["/tmp/x".into()]).is_none());
+        assert!(reg
+            .check("other", "mkdir", &["/tmp/x".into()], None)
+            .is_none());
     }
 
     #[test]
     fn allow_pattern_matches() {
         let reg = reg_with("tok", &["mkdir /tmp/work/*"], &[]);
         let hit = reg
-            .check("tok", "mkdir", &["/tmp/work/out".into()])
+            .check("tok", "mkdir", &["/tmp/work/out".into()], None)
             .expect("allow should match");
         assert_eq!(hit.0, SessionDecision::Allow);
     }
@@ -765,7 +800,7 @@ mod tests {
     fn deny_wins_over_allow() {
         let reg = reg_with("tok", &["rm*"], &["rm -rf /*"]);
         let hit = reg
-            .check("tok", "rm", &["-rf".into(), "/".into()])
+            .check("tok", "rm", &["-rf".into(), "/".into()], None)
             .expect("deny should match");
         assert_eq!(hit.0, SessionDecision::Deny);
     }
@@ -773,7 +808,7 @@ mod tests {
     #[test]
     fn no_match_returns_none_even_with_grants() {
         let reg = reg_with("tok", &["mkdir*"], &["rm*"]);
-        assert!(reg.check("tok", "ls", &["-la".into()]).is_none());
+        assert!(reg.check("tok", "ls", &["-la".into()], None).is_none());
     }
 
     #[test]
@@ -784,15 +819,50 @@ mod tests {
                 "tok",
                 SessionAmendment::Allow,
                 "echo".into(),
-                vec!["literal*".into()]
+                vec!["literal*".into()],
+                None
             ),
             Some(true)
         );
 
         assert!(reg
-            .check("tok", "echo", &["literal*".into()])
+            .check("tok", "echo", &["literal*".into()], None)
             .is_some_and(|hit| hit.0 == SessionDecision::Allow));
-        assert!(reg.check("tok", "echo", &["literal123".into()]).is_none());
+        assert!(reg
+            .check("tok", "echo", &["literal123".into()], None)
+            .is_none());
+    }
+
+    #[test]
+    fn cwd_binds_exact_allows_and_disables_legacy_allow_globs() {
+        let mut reg = reg_with("tok", &["make deploy"], &[]);
+        let cwd = PathBuf::from("/srv/app");
+        let other = PathBuf::from("/srv/other");
+
+        assert!(reg
+            .check("tok", "make", &["deploy".into()], Some(&cwd))
+            .is_none());
+        assert!(reg
+            .check("tok", "make", &["deploy".into()], None)
+            .is_some_and(|hit| hit.0 == SessionDecision::Allow));
+
+        assert_eq!(
+            reg.amend_exact(
+                "tok",
+                SessionAmendment::Allow,
+                "make".into(),
+                vec!["deploy".into()],
+                Some(cwd.clone()),
+            ),
+            Some(true)
+        );
+
+        assert!(reg
+            .check("tok", "make", &["deploy".into()], Some(&cwd))
+            .is_some_and(|hit| hit.0 == SessionDecision::Allow));
+        assert!(reg
+            .check("tok", "make", &["deploy".into()], Some(&other))
+            .is_none());
     }
 
     #[test]
@@ -803,7 +873,8 @@ mod tests {
                 "tok",
                 SessionAmendment::Allow,
                 "kubectl".into(),
-                vec!["get".into(), "pods".into()]
+                vec!["get".into(), "pods".into()],
+                None
             ),
             Some(true)
         );
@@ -812,7 +883,8 @@ mod tests {
                 "tok",
                 SessionAmendment::Deny,
                 "kubectl".into(),
-                vec!["get".into(), "pods".into()]
+                vec!["get".into(), "pods".into()],
+                None
             ),
             Some(true)
         );
@@ -821,13 +893,14 @@ mod tests {
                 "tok",
                 SessionAmendment::Deny,
                 "kubectl".into(),
-                vec!["get".into(), "pods".into()]
+                vec!["get".into(), "pods".into()],
+                None
             ),
             Some(false)
         );
 
         let hit = reg
-            .check("tok", "kubectl", &["get".into(), "pods".into()])
+            .check("tok", "kubectl", &["get".into(), "pods".into()], None)
             .expect("exact deny should match");
         assert_eq!(hit.0, SessionDecision::Deny);
         assert!(reg.list_history(None).is_empty());
@@ -851,14 +924,14 @@ mod tests {
                 auto_amend: false,
             },
         );
-        assert!(reg.check("tok", "mkdir", &["/tmp".into()]).is_none());
+        assert!(reg.check("tok", "mkdir", &["/tmp".into()], None).is_none());
     }
 
     #[test]
     fn revoke_removes_grant() {
         let mut reg = reg_with("tok", &["mkdir*"], &[]);
         assert!(reg.revoke("tok"));
-        assert!(reg.check("tok", "mkdir", &["/tmp".into()]).is_none());
+        assert!(reg.check("tok", "mkdir", &["/tmp".into()], None).is_none());
         assert!(!reg.revoke("tok"));
     }
 

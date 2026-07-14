@@ -17,7 +17,9 @@ use guard::learned_rules::{AutoShimMode, LearningOutcome};
 use std::collections::HashMap;
 #[cfg(unix)]
 use std::ffi::CString;
-use std::path::PathBuf;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
 use tokio::process::Command;
@@ -38,11 +40,34 @@ use super::wire::{
     OutputStream, RevertSpec, SshHostKeyMode, VerbContext,
 };
 use super::{
-    binary_exists_on_path, child_env_allowlist, deterministic_credential_deny_reason,
-    deterministic_safe_allow_reason, validate_request_injections, ServerConfig, MAX_GUARD_DEPTH,
-    MAX_OUTPUT_BYTES, SESSION_AUTO_AMEND_MAX_ALLOW_RISK, SESSION_AUTO_AMEND_MIN_DENY_RISK,
+    binary_exists_on_path, child_env_allowlist, dangerous_env_name,
+    deterministic_credential_deny_reason, deterministic_safe_allow_reason,
+    validate_request_injections, ServerConfig, MAX_GUARD_DEPTH, MAX_OUTPUT_BYTES,
+    SESSION_AUTO_AMEND_MAX_ALLOW_RISK, SESSION_AUTO_AMEND_MIN_DENY_RISK,
     SESSION_EXACT_RULE_MAX_ARGS, SESSION_EXACT_RULE_MAX_ARG_LEN,
 };
+
+pub(super) fn log_audit_policy_for_request(
+    config: &ServerConfig,
+    caller: &CallerIdentity,
+    request: &ExecuteRequest,
+    allowed: bool,
+    reason: &str,
+) {
+    if let Some(cwd) = &request.cwd {
+        let action = if allowed { "ALLOWED" } else { "DENIED" };
+        tracing::info!(
+            "[AUDIT] {} caller={} cwd=\"{}\" cmd=\"{}\" reason=\"{}\"",
+            action,
+            caller,
+            cwd.display(),
+            audit_command_line(&request.binary, &request.args),
+            reason
+        );
+    } else {
+        config.log_audit_policy(caller, &request.binary, &request.args, allowed, reason);
+    }
+}
 
 pub(super) async fn execute_command(
     request: ExecuteRequest,
@@ -88,19 +113,24 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
     // record, and the spawned process all act on the same command.
     request.apply_ssh_hostkey_options();
 
+    if let Err(result) = canonicalize_request_cwd(&mut phase, &mut request).await {
+        return result;
+    }
+
     let (depth, command_line) = match validate_exec_request(&mut phase, &request).await {
         Ok(validated) => validated,
-        Err(result) => return result,
-    };
-
-    request = match apply_session_rules(&mut phase, request, &command_line, depth).await {
-        Ok(request) => request,
         Err(result) => return result,
     };
 
     if let Err(result) = enforce_binary_policy(&mut phase, &request, &command_line).await {
         return result;
     }
+
+    request = match apply_session_rules(&mut phase, request, &verb_ctx, &command_line, depth).await
+    {
+        Ok(request) => request,
+        Err(result) => return result,
+    };
 
     request = match try_static_fast_allow(&mut phase, request, &command_line, depth).await {
         Ok(request) => request,
@@ -124,6 +154,126 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         depth,
     )
     .await
+}
+
+async fn canonicalize_request_cwd<W: AsyncWrite + Unpin>(
+    phase: &mut ExecPhase<'_, W>,
+    request: &mut ExecuteRequest,
+) -> Result<(), ExecuteResult> {
+    let Some(cwd) = request.cwd.clone() else {
+        return Ok(());
+    };
+    if !phase.caller.is_local_peer() {
+        let reason =
+            "working directory propagation requires an authenticated local caller".to_string();
+        return Err(deny_and_record(
+            phase,
+            request,
+            command_line(&request.binary, &request.args),
+            SessionDecisionSource::Validation,
+            None,
+            reason,
+        )
+        .await);
+    }
+    if cwd.as_os_str().is_empty() || !cwd.is_absolute() {
+        let reason = format!("invalid working directory: '{}'", cwd.display());
+        return Err(deny_and_record(
+            phase,
+            request,
+            command_line(&request.binary, &request.args),
+            SessionDecisionSource::Validation,
+            None,
+            reason,
+        )
+        .await);
+    }
+    let canonical = match tokio::fs::canonicalize(&cwd).await {
+        Ok(path) => path,
+        Err(e) => {
+            let reason = format!(
+                "invalid working directory '{}': cannot canonicalize: {}",
+                cwd.display(),
+                e
+            );
+            return Err(deny_and_record(
+                phase,
+                request,
+                command_line(&request.binary, &request.args),
+                SessionDecisionSource::Validation,
+                None,
+                reason,
+            )
+            .await);
+        }
+    };
+    let meta = match tokio::fs::metadata(&canonical).await {
+        Ok(meta) => meta,
+        Err(e) => {
+            let reason = format!(
+                "invalid working directory '{}': cannot stat canonical path: {}",
+                canonical.display(),
+                e
+            );
+            return Err(deny_and_record(
+                phase,
+                request,
+                command_line(&request.binary, &request.args),
+                SessionDecisionSource::Validation,
+                None,
+                reason,
+            )
+            .await);
+        }
+    };
+    if !meta.is_dir() {
+        let reason = format!(
+            "invalid working directory '{}': not a directory",
+            canonical.display()
+        );
+        return Err(deny_and_record(
+            phase,
+            request,
+            command_line(&request.binary, &request.args),
+            SessionDecisionSource::Validation,
+            None,
+            reason,
+        )
+        .await);
+    }
+    request.cwd = Some(canonical);
+    Ok(())
+}
+
+async fn revalidate_exec_cwd(cwd: &Path) -> std::result::Result<(), String> {
+    let canonical = tokio::fs::canonicalize(cwd).await.map_err(|e| {
+        format!(
+            "working directory '{}' changed before exec: cannot canonicalize: {}",
+            cwd.display(),
+            e
+        )
+    })?;
+    if canonical != cwd {
+        return Err(format!(
+            "working directory '{}' changed before exec: canonical path is now '{}'",
+            cwd.display(),
+            canonical.display()
+        ));
+    }
+    let meta = tokio::fs::metadata(&canonical).await.map_err(|e| {
+        format!(
+            "working directory '{}' changed before exec: cannot stat: {}",
+            canonical.display(),
+            e
+        )
+    })?;
+    if !meta.is_dir() {
+        return Err(format!(
+            "working directory '{}' changed before exec: not a directory",
+            canonical.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Shared state threaded through the policy phases of one execute request.
@@ -150,9 +300,7 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
     risk: Option<i32>,
     reason: String,
 ) -> ExecuteResult {
-    phase
-        .config
-        .log_audit_policy(phase.caller, &request.binary, &request.args, false, &reason);
+    log_audit_policy_for_request(phase.config, phase.caller, request, false, &reason);
     let _ = write_policy_decision(
         phase.stream_output,
         &mut *phase.stream_writer,
@@ -400,6 +548,7 @@ async fn validate_exec_request<W: AsyncWrite + Unpin>(
 async fn apply_session_rules<W: AsyncWrite + Unpin>(
     phase: &mut ExecPhase<'_, W>,
     request: ExecuteRequest,
+    verb_ctx: &Option<VerbContext>,
     command_line: &str,
     depth: u32,
 ) -> Result<ExecuteRequest, ExecuteResult> {
@@ -407,7 +556,12 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
     if let Some(ref token) = request.session_token {
         let (decision, exists, static_only) = {
             let reg = config.sessions.read().await;
-            let decision = reg.check(token, &request.binary, &request.args);
+            let decision = reg.check(
+                token,
+                &request.binary,
+                &request.args,
+                request.cwd.as_deref(),
+            );
             (decision, reg.has(token), reg.static_only_for(token))
         };
         if !exists {
@@ -439,13 +593,7 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
                     .await);
                 }
                 SessionDecision::Allow => {
-                    config.log_audit_policy(
-                        phase.caller,
-                        &request.binary,
-                        &request.args,
-                        true,
-                        &reason,
-                    );
+                    log_audit_policy_for_request(config, phase.caller, &request, true, &reason);
                     if let Err(e) = write_policy_decision(
                         phase.stream_output,
                         &mut *phase.stream_writer,
@@ -459,28 +607,25 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
                             format!("client stream error: {}", e),
                         ));
                     }
-                    let result = exec_with_read_grant_retry(
+                    // Session allows skip only the evaluator. They do not
+                    // bypass the consequence gate or any spawn-time invariant:
+                    // absent a matched verb class, consequence mode holds
+                    // fail-closed as unclassified.
+                    let inputs = GateInputs {
+                        reason,
+                        risk: Some(0),
+                        reversibility: verb_ctx.as_ref().map(|v| v.class),
+                        revert_preauthorized: verb_ctx.is_some(),
+                        verb: verb_ctx.clone(),
+                        bypass: false,
+                    };
+                    let result = route_allow_and_record(
+                        phase,
                         request,
-                        config,
-                        phase.caller,
-                        reason.clone(),
+                        inputs,
+                        command_line.to_string(),
+                        SessionDecisionSource::SessionAllow,
                         depth,
-                        phase.stream_output,
-                        &mut *phase.stream_writer,
-                    )
-                    .await;
-                    record_live_session_interaction(
-                        config,
-                        phase.session_token.as_deref(),
-                        SessionInteraction {
-                            at_unix: 0,
-                            command: command_line.to_string(),
-                            allowed: true,
-                            source: SessionDecisionSource::SessionAllow,
-                            reason,
-                            risk: None,
-                            exec_status: result.session_exec_status(),
-                        },
                     )
                     .await;
                     return Err(result);
@@ -584,7 +729,7 @@ async fn try_static_fast_allow<W: AsyncWrite + Unpin>(
         if let Some(reason) =
             deterministic_safe_allow_reason(config, &request.binary, &request.args)
         {
-            config.log_audit_policy(phase.caller, &request.binary, &request.args, true, &reason);
+            log_audit_policy_for_request(config, phase.caller, &request, true, &reason);
             if let Err(e) = write_policy_decision(
                 phase.stream_output,
                 &mut *phase.stream_writer,
@@ -656,13 +801,7 @@ async fn try_trusted_verb_allow<W: AsyncWrite + Unpin>(
     if let Some(vc) = verb_ctx.clone() {
         if vc.trusted {
             let reason = format!("trusted verb '{}'", vc.name);
-            phase.config.log_audit_policy(
-                phase.caller,
-                &request.binary,
-                &request.args,
-                true,
-                &reason,
-            );
+            log_audit_policy_for_request(phase.config, phase.caller, &request, true, &reason);
             if let Err(e) = write_policy_decision(
                 phase.stream_output,
                 &mut *phase.stream_writer,
@@ -712,10 +851,30 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
 ) -> ExecuteResult {
     let config = phase.config;
     let session_token = phase.session_token.clone();
-    let eval_result = config
-        .evaluator
-        .evaluate_with_reevaluate(&command_line, session_prompt.as_deref(), request.reevaluate)
-        .await;
+    let session_prompt_active = session_prompt
+        .as_deref()
+        .map(|prompt| !prompt.trim().is_empty())
+        .unwrap_or(false);
+    let evaluation_prompt = evaluation_context_prompt(&request, session_prompt);
+    let eval_result = if evaluation_prompt.is_some() && !session_prompt_active {
+        config
+            .evaluator
+            .evaluate_with_cacheable_context(
+                &command_line,
+                evaluation_prompt.as_deref(),
+                request.reevaluate,
+            )
+            .await
+    } else {
+        config
+            .evaluator
+            .evaluate_with_reevaluate(
+                &command_line,
+                evaluation_prompt.as_deref(),
+                request.reevaluate,
+            )
+            .await
+    };
 
     match eval_result {
         crate::evaluate::EvalResult::Deny {
@@ -731,6 +890,7 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
                     SessionAmendment::Deny,
                     &request.binary,
                     &request.args,
+                    request.cwd.as_ref(),
                     risk,
                 )
                 .await
@@ -780,10 +940,7 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
         } => {
             let mut reason = reason;
             if matches!(source, crate::evaluate::EvalSource::Llm)
-                && session_prompt
-                    .as_deref()
-                    .map(|prompt| prompt.trim().is_empty())
-                    .unwrap_or(true)
+                && !session_prompt_active
                 && session_token.is_none()
             {
                 match config
@@ -825,6 +982,7 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
                     SessionAmendment::Allow,
                     &request.binary,
                     &request.args,
+                    request.cwd.as_ref(),
                     risk,
                 )
                 .await
@@ -833,7 +991,7 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
                 }
             }
             tracing::debug!("command allowed: {}", reason);
-            config.log_audit_policy(phase.caller, &request.binary, &request.args, true, &reason);
+            log_audit_policy_for_request(config, phase.caller, &request, true, &reason);
             if let Err(e) = write_policy_decision(
                 phase.stream_output,
                 &mut *phase.stream_writer,
@@ -847,16 +1005,12 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
                     format!("client stream error: {}", e),
                 );
             }
-            // Consequence gate: when enabled, route this LLM-approved command by
+            // Consequence gate: when enabled, route this approved command by
             // reversibility (execute / contain / hold). When off, this is a
-            // straight exec, byte-identical to before. Operator-authored allows
-            // (session-allow above, static-policy) deliberately bypass the gate.
-            // A verb's declared class overrides the model's, and a verb's revert
-            // is pre-authorized (operator-reviewed); a free-form --revert is not.
+            // straight exec, byte-identical to before. A verb's declared class
+            // overrides the model's, and a verb's revert is pre-authorized
+            // (operator-reviewed); a free-form --revert is not.
             let effective_class = verb_ctx.as_ref().map(|v| v.class).or(reversibility);
-            // A static-policy allow (operator-authored, deterministic) bypasses
-            // the gate. A verb invocation never bypasses — its declared class
-            // routes it. The LLM path is gated.
             let bypass =
                 matches!(source, crate::evaluate::EvalSource::StaticPolicy) && verb_ctx.is_none();
             let inputs = GateInputs {
@@ -896,6 +1050,21 @@ pub(super) fn command_line(binary: &str, args: &[String]) -> String {
         binary.to_string()
     } else {
         format!("{} {}", binary, args.join(" "))
+    }
+}
+
+pub(super) fn evaluation_context_prompt(
+    request: &ExecuteRequest,
+    session_prompt: Option<String>,
+) -> Option<String> {
+    match (&request.cwd, session_prompt) {
+        (Some(cwd), Some(prompt)) => Some(format!(
+            "CALLER WORKING DIRECTORY: {}\n{}",
+            cwd.display(),
+            prompt
+        )),
+        (Some(cwd), None) => Some(format!("CALLER WORKING DIRECTORY: {}", cwd.display())),
+        (None, prompt) => prompt,
     }
 }
 
@@ -1003,12 +1172,13 @@ pub(super) async fn amend_session_exact_rule(
     decision: SessionAmendment,
     binary: String,
     args: Vec<String>,
+    cwd: Option<PathBuf>,
 ) -> Result<bool> {
     let (amended, before, after) = {
         let mut reg = config.sessions.write().await;
         let before = reg.clone();
         let amended = reg
-            .amend_exact(token, decision, binary, args)
+            .amend_exact(token, decision, binary, args, cwd)
             .ok_or_else(|| anyhow::anyhow!("session token is revoked, expired, or unknown"))?;
         (amended, before, reg.clone())
     };
@@ -1025,6 +1195,7 @@ async fn maybe_auto_amend_session_after_llm(
     decision: SessionAmendment,
     binary: &str,
     args: &[String],
+    cwd: Option<&PathBuf>,
     risk: Option<i32>,
 ) -> Option<String> {
     let token = token?;
@@ -1044,7 +1215,15 @@ async fn maybe_auto_amend_session_after_llm(
         return Some(format!("Session auto-amend skipped: {reason}."));
     }
 
-    match amend_session_exact_rule(config, token, decision, binary.to_string(), args.to_vec()).await
+    match amend_session_exact_rule(
+        config,
+        token,
+        decision,
+        binary.to_string(),
+        args.to_vec(),
+        cwd.cloned(),
+    )
+    .await
     {
         Ok(true) => {
             let rule = command_line(binary, args);
@@ -1524,6 +1703,47 @@ fn drop_brokered_child_capabilities(cmd: &mut Command) {
     }
 }
 
+#[cfg(unix)]
+fn executable_file(path: &std::path::Path) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn resolve_primary_binary(config: &ServerConfig, binary: &str) -> Result<PathBuf> {
+    let Some(shim_dir) = &config.shim_dir else {
+        return Ok(PathBuf::from(binary));
+    };
+    let shim_dir = shim_dir.canonicalize().unwrap_or_else(|_| shim_dir.clone());
+    let Some(path) = std::env::var_os("PATH") else {
+        return Ok(PathBuf::from(binary));
+    };
+    for dir in std::env::split_paths(&path) {
+        if dir.as_os_str().is_empty() || !dir.is_absolute() {
+            continue;
+        }
+        let canonical_dir = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+        if canonical_dir == shim_dir {
+            continue;
+        }
+        let candidate = dir.join(binary);
+        if executable_file(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    bail!(
+        "failed to resolve '{}' outside shim directory {}",
+        binary,
+        shim_dir.display()
+    )
+}
+
+#[cfg(not(unix))]
+fn resolve_primary_binary(_config: &ServerConfig, binary: &str) -> Result<PathBuf> {
+    Ok(PathBuf::from(binary))
+}
+
 /// Execute a command the policy layer has already approved.
 ///
 /// Entered from either the LLM evaluator path or a session-grant allow
@@ -1715,13 +1935,20 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
             return ExecuteResult::exec_failed(allow_reason, format!("tool config error: {}", e));
         }
     };
-    let mut tool_env = tool_env;
+    let trusted_tool_env = tool_env;
+    let mut request_env = HashMap::new();
 
     for key in request.env.keys().chain(request.secrets.keys()) {
         if !is_valid_env_name(key) {
             return ExecuteResult::exec_failed(
                 allow_reason,
                 format!("invalid injected environment variable name: '{}'", key),
+            );
+        }
+        if dangerous_env_name(key) {
+            return ExecuteResult::exec_failed(
+                allow_reason,
+                format!("dangerous injected environment variable name: '{}'", key),
             );
         }
     }
@@ -1738,7 +1965,7 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
         );
     }
     for (key, value) in &request.env {
-        tool_env.insert(key.clone(), value.clone());
+        request_env.insert(key.clone(), value.clone());
     }
 
     // Per-run --secret injection is honored for any authenticated local caller
@@ -1775,20 +2002,64 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
                     );
                 }
             };
-            tool_env.insert(env_var.clone(), value);
+            request_env.insert(env_var.clone(), value);
         }
     }
 
+    let daemon_child_env: HashMap<String, String> = config
+        .extra_child_env
+        .iter()
+        .filter_map(|var| std::env::var(var).ok().map(|value| (var.clone(), value)))
+        .collect();
+    for key in request_env.keys() {
+        if trusted_tool_env.contains_key(key) {
+            return ExecuteResult::exec_failed(
+                allow_reason,
+                format!(
+                    "injected environment variable '{}' conflicts with Guard tool configuration",
+                    key
+                ),
+            );
+        }
+        if daemon_child_env.contains_key(key) {
+            return ExecuteResult::exec_failed(
+                allow_reason,
+                format!(
+                    "injected environment variable '{}' conflicts with Guard daemon child environment",
+                    key
+                ),
+            );
+        }
+    }
+    let mut redaction_env = daemon_child_env.clone();
+    redaction_env.extend(request_env.clone());
+    redaction_env.extend(trusted_tool_env.clone());
+
     tracing::info!(
-        "Executing: {} {:?} ({})",
+        "Executing: {} {:?} ({}) cwd={}",
         request.binary,
         request.args,
-        caller
+        caller,
+        request
+            .cwd
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(daemon-default)".to_string())
     );
 
-    let mut cmd = Command::new(&request.binary);
+    let exec_binary = match resolve_primary_binary(config, &request.binary) {
+        Ok(binary) => binary,
+        Err(e) => return ExecuteResult::exec_failed(allow_reason, e.to_string()),
+    };
+    let mut cmd = Command::new(&exec_binary);
     cmd.args(&request.args);
     cmd.stdin(Stdio::null());
+    if let Some(cwd) = &request.cwd {
+        if let Err(reason) = revalidate_exec_cwd(cwd).await {
+            return ExecuteResult::exec_failed(allow_reason, reason);
+        }
+        cmd.current_dir(cwd);
+    }
 
     // SECURITY: Clear ALL inherited env vars. The child process gets only what we
     // explicitly allow. This prevents leaking the guard's own secrets (API keys,
@@ -1806,10 +2077,8 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
     // The value comes from the DAEMON's environment (not the caller), so an
     // agent cannot introduce one here; e.g. KUBECONFIG points kubectl at a config
     // only the daemon can read.
-    for var in &config.extra_child_env {
-        if let Ok(val) = std::env::var(var) {
-            cmd.env(var, val);
-        }
+    for (key, value) in &daemon_child_env {
+        cmd.env(key, value);
     }
 
     let exec_caller = match apply_exec_identity(&mut cmd, config, caller) {
@@ -1825,7 +2094,10 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
     #[cfg(unix)]
     drop_brokered_child_capabilities(&mut cmd);
 
-    for (key, value) in &tool_env {
+    for (key, value) in &trusted_tool_env {
+        cmd.env(key, value);
+    }
+    for (key, value) in &request_env {
         cmd.env(key, value);
     }
 
@@ -1833,7 +2105,6 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
         cmd.env("HOME", &context.home_dir);
         cmd.env("USER", &context.username);
         cmd.env("LOGNAME", &context.username);
-        cmd.env_remove("SSH_AUTH_SOCK");
         cmd.env_remove("XDG_RUNTIME_DIR");
         #[cfg(unix)]
         {
@@ -1861,8 +2132,10 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
     // order, removing a path by which a planted executable could shadow the
     // intended binary.
     #[cfg(windows)]
-    if let Some(sysroot) = std::env::var_os("SystemRoot") {
-        cmd.current_dir(sysroot);
+    if request.cwd.is_none() {
+        if let Some(sysroot) = std::env::var_os("SystemRoot") {
+            cmd.current_dir(sysroot);
+        }
     }
 
     if stream_output {
@@ -1871,7 +2144,7 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
             &request.binary,
             allow_reason,
             config,
-            &tool_env,
+            &redaction_env,
             stream_writer,
         )
         .await;
@@ -1892,7 +2165,7 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
     } else {
         let raw = &output.stdout[..output.stdout.len().min(MAX_OUTPUT_BYTES)];
         let s = String::from_utf8_lossy(raw).to_string();
-        Some(redact_command_text(config, &tool_env, s))
+        Some(redact_command_text(config, &redaction_env, s))
     };
 
     let stderr = if output.stderr.is_empty() {
@@ -1900,7 +2173,7 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
     } else {
         let raw = &output.stderr[..output.stderr.len().min(MAX_OUTPUT_BYTES)];
         let s = String::from_utf8_lossy(raw).to_string();
-        Some(redact_command_text(config, &tool_env, s))
+        Some(redact_command_text(config, &redaction_env, s))
     };
 
     ExecuteResult::completed(allow_reason, output.status.code(), stdout, stderr)

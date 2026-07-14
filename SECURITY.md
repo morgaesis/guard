@@ -28,9 +28,19 @@ rule, verb, deny-shape, and API-shape promotion state is operator-only audit
 state because advertising which shapes skip evaluation invites mimicry against
 the fast path.
 
+Opaque carrier tools such as Ansible, Helm, and generic plug-ins are gated as
+commands unless they use a protocol proxy. In readonly and safe modes, opaque
+file-driven execution is denied or held unless an operator grants it
+deliberately. Guard does not inspect playbook, chart, inventory, or values-file
+contents in the command gate, and cooperative requirements such as check/diff
+flags are accident controls for trusted grants rather than containment against a
+malicious granted runner.
+
 Out of scope:
 
 - Compromise of the LLM provider or model itself
 - Operator misconfiguration that disables documented guardrails (e.g.
   running with `--no-llm` and no static policy)
 - Third-party tools invoked by approved commands
+- SSH transport brokering, scoped or ephemeral SSH endpoints, file staging, and
+  file-content inspection outside the protocol proxy model

@@ -145,7 +145,9 @@ async fn handle_session_appeal(
         let reg = config.sessions.read().await;
         (
             reg.has(&token),
-            reg.check(&token, &binary, &args),
+            // Appeals are command-shape requests and do not carry authenticated
+            // caller cwd authority. Cwd-bound grants are checked on ExecuteRequest.
+            reg.check(&token, &binary, &args, None),
             reg.prompt_append_for(&token),
         )
     };
@@ -236,6 +238,7 @@ async fn handle_session_appeal(
                 SessionAmendment::Allow,
                 binary.clone(),
                 args.clone(),
+                None,
             )
             .await
             {
@@ -297,6 +300,7 @@ async fn handle_session_appeal(
                     SessionAmendment::Deny,
                     binary.clone(),
                     args.clone(),
+                    None,
                 )
                 .await
                 {

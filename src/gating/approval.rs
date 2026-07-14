@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Notify;
 
@@ -51,6 +52,10 @@ pub struct SecretBinding {
 pub struct ApprovalSnapshot {
     pub binary: String,
     pub args: Vec<String>,
+    /// Canonical working directory for execution. Absent on rows written before
+    /// cwd propagation existed, which replays under the daemon's default cwd.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
     /// Plain per-run env injections.
     pub env: BTreeMap<String, String>,
     /// env-var -> secret-key mapping (keys only; values resolved at exec).
@@ -416,6 +421,7 @@ mod tests {
         ApprovalSnapshot {
             binary: binary.to_string(),
             args: vec!["-rf".into(), "/data".into()],
+            cwd: None,
             env: BTreeMap::new(),
             secret_keys: BTreeMap::new(),
             verb_name: None,

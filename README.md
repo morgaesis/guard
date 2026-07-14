@@ -113,10 +113,10 @@ With gating on, the LLM keeps deciding APPROVE/DENY exactly as before (the deny
 rules are unchanged) and additionally classifies the reversibility of commands it
 approves. The daemon routes on that class. Classification is **fail-safe**:
 reversibility can only *raise* the gate, never lower it, and a missing or
-uncertain class is held, never run. Operator-authored allows (trusted verbs,
-and static policy in the `--no-llm` fallback mode) and the LLM-uncertain path
-are separated: the open-ended LLM path is gated; the operator-vetted surface
-is not.
+uncertain class is held, never run. LLM approvals route on the evaluator's
+class, trusted verbs route on their declared class, and session allows without a
+matched verb are unclassified and held. Static policy in the `--no-llm` fallback
+mode is the deterministic direct-exec path.
 
 Gating is meaningful only where the daemon's principal differs from the agent's
 (so the agent cannot approve its own held command). The principal is a Unix uid
@@ -345,9 +345,11 @@ Two opt-in features exist for deployments with specific constraints:
   `hybrid-policy.yaml`. `commands.allow` is also parsed (for the
   `--no-llm` fallback mode and backward compatibility) but, while the LLM is
   enabled, an allow pattern never skips it. Static and session policy patterns
-  are shell-style globs over a flat reconstructed command line, while verb
-  parameters are anchored regexes rendered as single argv elements. Use `guard verb` for a
-  deterministic, LLM-skipping allow.
+  are shell-style globs over a flat reconstructed command line. They remain for
+  compatibility, while typed verbs are the structured path: verb parameters are
+  anchored regexes rendered as single argv elements, and reverse matching lets
+  normal tool invocations pick up a verb's consequence class. Use `guard verb`
+  for a deterministic, LLM-skipping allow.
 - **Fallback model chain** via `GUARD_LLM_MODELS`. Fails over to
   alternate providers after the primary exhausts its retries. See
   [`examples/fallback-models.env`](examples/fallback-models.env).
@@ -555,6 +557,17 @@ such as session grant/revoke/appeal, grant-installing session creation, gate
 decisions, detailed secret ownership inspection, verb creation, and full daemon
 status.
 
+`guard shim ssh,kubectl,helm,ansible,ansible-playbook` installs generic command
+wrappers that call `guard run <tool> "$@"`. The wrappers preserve argv and the
+client cwd; the daemon canonicalizes that cwd, includes it in evaluation and
+audit, and executes approved commands there. Shims are convenience entry points,
+not separate policy commands. Tools such as Ansible discover `ansible.cfg` and
+inventory from that cwd. Guard does not inherit caller credential/configuration
+environment such as `SSH_AUTH_SOCK` or `ANSIBLE_CONFIG`; use cwd discovery or an
+explicit approved argv flag such as `-i`/`--inventory` for a non-default path.
+A broker-owned socket can be supplied through Guard tool configuration or daemon
+`--child-env SSH_AUTH_SOCK`; caller `--env SSH_AUTH_SOCK=...` is rejected.
+
 ### Learned static rules
 
 For services with repetitive low-risk calls, enable learned rules:
@@ -620,7 +633,7 @@ The additive prompt is appended to whichever base prompt is active (readonly, sa
 
 ## Session grants
 
-Session grants hand a specific agent narrow extra permissions for a specific run, without relaxing the global mode. The agent identifies its session by the `GUARD_SESSION` env var; every `guard run` (and `guard server connect`) reads that env var and forwards it as the session token in the request. Operators attach allow/deny patterns, prose intent, and optional evaluator context to that token. The token is a bearer credential; treat it like access to the scoped session itself.
+Session grants hand a specific agent narrow extra permissions for a specific run, without relaxing the global mode. The agent identifies its session by the `GUARD_SESSION` env var; every `guard run` (and `guard server connect`) reads that env var and forwards it as the session token in the request. Operators can attach legacy allow/deny patterns, prose intent, and optional evaluator context to that token. The token is a bearer credential; treat it like access to the scoped session itself.
 
 The simplest flow is `guard session new`, which mints a token and (optionally) grants it in one round trip, printing an eval-friendly export line:
 
@@ -661,9 +674,9 @@ guard grant <token> "readonly access to grafana resources in the staging kube cl
 
 Prose grants are compiled at grant time into conservative static rules when guard recognizes the domain. The first compiler handles Kubernetes: it infers namespaces such as `grafana`, optional contexts such as `staging`, adds hard denies for shell-control, secret access, token creation, raw kubeconfig reads, `exec`, `cp`, `port-forward`, and deletes, then adds namespace-scoped read, scale, and ingress/reverse-proxy rules implied by the prose. Safe command examples in backticks are added as exact static allows. Unrecognized prose is still stored as session LLM context, but does not create broad static globs. Generated static-grant notes are stored and displayed separately from the evaluator prompt so operators can audit which compiler output explains the generated rules without expanding the model context.
 
-Session allow/deny patterns use guard's shell-style glob matcher, not regex. `*`, `?`, and bracket classes are supported, but the match is against the flat reconstructed command line; it does not understand shell quoting, Kubernetes resource schemas, or argument semantics. Generated rules therefore use broad globs sparingly: for example, Kubernetes prose grants may add namespace-bounded `get * -n grafana` and `describe * -n grafana` read globs, backed by explicit secret and mutating-resource denies. Automatic amendments do not add globs at all; they add exact `binary + argv` rules, so literal `*` or `[` characters in an appealed command do not become wildcards.
+Session allow/deny patterns use guard's shell-style glob matcher, not regex. `*`, `?`, and bracket classes are supported, but the match is against the flat reconstructed command line; it does not understand shell quoting, Kubernetes resource schemas, or argument semantics. Generated rules therefore use broad globs sparingly: for example, Kubernetes prose grants may add namespace-bounded `get * -n grafana` and `describe * -n grafana` read globs, backed by explicit secret and mutating-resource denies. Automatic amendments do not add globs at all; they add exact `binary + argv` rules, so literal `*` or `[` characters in an appealed command do not become wildcards. New structured constraints belong on typed verbs and capability coverage, with sessions or named profiles selecting those capabilities rather than growing another glob language.
 
-Matching deny patterns win over allow patterns, and by default everything that does not match a session rule falls through to the normal evaluator with the session prose and optional `--prompt` context appended. Prose grants enable `auto_amend` by default so fresh low-risk LLM fallback approvals can add exact session allows, and fresh high-risk LLM denials can add exact session denies. Use `--no-auto-amend` to keep fallback non-mutating, or `--auto-amend` to opt a manual `--allow`/`--deny` grant into the same behavior. Cache hits, static policy hits, and learned-rule hits never amend a session; session fallback also does not promote global learned rules. Add `--static-only` (alias `--no-llm-fallback`) to `guard grant`, `guard session grant`, or `guard session new` to deny any session-rule miss instead of falling through to the LLM; static-only grants disable auto-amend.
+Matching deny patterns win over allow patterns, and by default everything that does not match a session rule falls through to the normal evaluator with the session prose and optional `--prompt` context appended. A matching session allow skips the evaluator only; it still stays inside the server binary allow-list, consequence routing, held-command snapshot binding, read-grant retry path, audit log, and session history. Legacy allow globs do not short-circuit cwd-bearing requests, because relative files and tool discovery can change meaning by directory; use a typed verb or a cwd-bound exact session allow for those commands. Prose grants enable `auto_amend` by default so fresh low-risk LLM fallback approvals can add exact session allows bound to the canonical cwd when one is present, and fresh high-risk LLM denials can add exact session denies. Use `--no-auto-amend` to keep fallback non-mutating, or `--auto-amend` to opt a manual `--allow`/`--deny` grant into the same behavior. Cache hits, static policy hits, and learned-rule hits never amend a session; session fallback also does not promote global learned rules. Add `--static-only` (alias `--no-llm-fallback`) to `guard grant`, `guard session grant`, or `guard session new` to deny any session-rule miss instead of falling through to the LLM; static-only grants disable auto-amend.
 
 To ask for a one-off amendment without executing the command, appeal it:
 
@@ -708,6 +721,11 @@ failure unchanged, and every grant and retry is audited.
 `guard run` can request stored secrets for one approved command without requiring a shim or persistent tool config. The daemon resolves the secret values immediately before exec, injects them into the child environment, and includes those values in exact-match output redaction.
 
 `guard secrets add/list/remove` and `--secret`/`--env` injection are local-caller operations on both platforms. They require an authenticated local peer - a Unix-socket uid or a Windows named-pipe SID - and the secret namespace is keyed from that principal. A bearer-token TCP caller is refused, because a token is not a trustworthy local identity. Any local caller can manage its own secret namespace. When the daemon principal runs `guard secrets list`, it gets an aggregate names-only view across every principal's namespace; duplicate key names can appear more than once and are intentionally not annotated with ownership in the default list output.
+
+Per-run `--env` and `--secret` values cannot replace Guard-owned execution
+context. If a requested env var collides with tool configuration or daemon
+`--child-env`, the command fails before exec instead of silently overriding a
+brokered endpoint or credential.
 
 For daemon-side migration and cleanup, use `guard secrets list --detailed` as the daemon principal. That view annotates the owning principal for namespaced entries and `origin=legacy` for pre-namespace flat secrets that still need operator migration.
 
@@ -757,7 +775,7 @@ The non-privileged `guard status` (run as your normal user or any other exec-all
 
 The `--prompt` / `--prompt-file` flags attach a free-form context fragment that is appended to the LLM system prompt under a `Session context:` heading for evaluator calls made under that token. Prose grants use the same context path after static rule synthesis. Use prompt/prose for guidance the static glob patterns cannot express. The decision cache is bypassed when a session prompt is in play, because cached verdicts were made under the base prompt and may not hold under the extended context.
 
-Durable grants deserve the same care as any other persistent authorization state. Prefer explicit TTLs for elevated sessions, and treat `allow=["*"]` as an operator override that must be revoked intentionally rather than something a daemon restart clears. Generated prose rules intentionally stay narrow; if guard cannot infer a safe static rule, it relies on LLM fallback or denies under `--static-only`.
+Durable grants deserve the same care as any other persistent authorization state. Prefer explicit TTLs for elevated sessions, and treat `allow=["*"]` as a legacy operator override that must be revoked intentionally rather than something a daemon restart clears. Generated prose rules intentionally stay narrow; if guard cannot infer a safe static rule, it relies on LLM fallback or denies under `--static-only`.
 
 ## Execution identity
 

@@ -1327,6 +1327,95 @@ verbs:
     }
 
     #[test]
+    fn match_command_rejects_duplicate_option_and_flag_bypass_attempts() {
+        let cat = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: checked-helm-upgrade
+    binary: helm
+    args: ["upgrade", "--install", "{release}", "{chart}", "--namespace", "{namespace}", "--dry-run", "--diff"]
+    params:
+      release: { pattern: "^[a-z0-9-]+$" }
+      chart: { pattern: "^[a-z0-9./-]+$" }
+      namespace: { pattern: "^staging$" }
+    consequence: reversible
+    trusted: true
+"#,
+        )
+        .unwrap();
+
+        assert!(cat
+            .match_command(
+                "helm",
+                &args_vec(&[
+                    "upgrade",
+                    "--install",
+                    "grafana",
+                    "./charts/grafana",
+                    "--namespace",
+                    "staging",
+                    "--dry-run",
+                    "--diff",
+                ]),
+            )
+            .is_some());
+
+        assert!(
+            cat.match_command(
+                "helm",
+                &args_vec(&[
+                    "upgrade",
+                    "--install",
+                    "grafana",
+                    "./charts/grafana",
+                    "--namespace",
+                    "staging",
+                    "--dry-run",
+                    "--dry-run=false",
+                    "--diff",
+                ]),
+            )
+            .is_none(),
+            "the typed argv template must not accept duplicate/equivalent option overrides"
+        );
+        assert!(
+            cat.match_command(
+                "helm",
+                &args_vec(&[
+                    "upgrade",
+                    "--install",
+                    "--atomic",
+                    "grafana",
+                    "./charts/grafana",
+                    "--namespace",
+                    "staging",
+                    "--dry-run",
+                    "--diff",
+                ]),
+            )
+            .is_none(),
+            "a flag inserted where a parameter belongs must fail the parameter schema"
+        );
+        assert!(
+            cat.match_command(
+                "helm",
+                &args_vec(&[
+                    "upgrade",
+                    "--install",
+                    "grafana",
+                    "./charts/grafana",
+                    "--namespace",
+                    "prod",
+                    "--dry-run",
+                    "--diff",
+                ]),
+            )
+            .is_none(),
+            "target limits belong in the verb parameter pattern"
+        );
+    }
+
+    #[test]
     fn match_command_tries_verbs_in_name_order_and_skips_non_matching_ones() {
         let cat = VerbCatalog::from_yaml(
             r#"

@@ -30,3 +30,45 @@ verbs:
       path: { pattern: "^/work/[a-z0-9._/-]+$", required: true }
     consequence: irreversible
     trusted: true
+
+  - name: ssh-safe-host
+    description: Exercise transparent ssh shim without caller SSH_AUTH_SOCK
+    binary: ssh
+    args: ["safe-host"]
+    consequence: reversible
+    trusted: true
+
+  - name: kubectl-version
+    description: Exercise transparent kubectl shim
+    binary: kubectl
+    args: ["version", "--client"]
+    consequence: reversible
+    trusted: true
+
+  - name: helm-checked-upgrade
+    description: Exercise a typed Helm command with cooperative dry-run/diff/target limits
+    binary: helm
+    args: ["upgrade", "--install", "demo", "./chart", "--namespace", "staging", "--dry-run", "--diff"]
+    consequence: reversible
+    trusted: true
+
+  - name: ansible-ping-check
+    description: Exercise a typed Ansible command with check mode
+    binary: ansible
+    args: ["web", "-m", "ping", "--check"]
+    consequence: reversible
+    trusted: true
+
+  - name: ansible-ping-all-cwd
+    description: Exercise Ansible inventory discovery from the caller cwd under a valid session
+    binary: ansible
+    args: ["-m", "ping", "all"]
+    consequence: reversible
+    trusted: true
+
+  - name: ansible-playbook-check-diff
+    description: Exercise an opaque playbook carrier only with check/diff/limit controls
+    binary: ansible-playbook
+    args: ["site.yml", "--check", "--diff", "--limit", "web"]
+    consequence: reversible
+    trusted: true

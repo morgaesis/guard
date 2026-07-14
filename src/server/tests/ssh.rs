@@ -30,6 +30,7 @@ fn ssh_request(mode: Option<SshHostKeyMode>, argv: &[&str]) -> ExecuteRequest {
         verb: None,
         reevaluate: false,
         ssh_hostkey: mode,
+        cwd: None,
     }
 }
 

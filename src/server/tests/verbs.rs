@@ -39,6 +39,7 @@ async fn trusted_verb_irreversible_still_holds_for_approval() {
         confirm_within_secs: None,
         reevaluate: false,
         ssh_hostkey: None,
+        cwd: None,
         require_approval: None,
         wait_approval_secs: None,
         verb: Some(VerbInvocation {
@@ -88,6 +89,7 @@ async fn trusted_verb_reversible_executes_now() {
         confirm_within_secs: None,
         reevaluate: false,
         ssh_hostkey: None,
+        cwd: None,
         require_approval: None,
         wait_approval_secs: None,
         verb: Some(VerbInvocation {
@@ -139,6 +141,7 @@ async fn raw_command_reverse_matches_trusted_verb_and_executes_now() {
         confirm_within_secs: None,
         reevaluate: false,
         ssh_hostkey: None,
+        cwd: None,
         require_approval: None,
         wait_approval_secs: None,
         verb: None,
@@ -192,6 +195,7 @@ async fn stale_auto_promoted_verb_is_not_trusted() {
         confirm_within_secs: None,
         reevaluate: false,
         ssh_hostkey: None,
+        cwd: None,
         require_approval: None,
         wait_approval_secs: None,
         verb: None,
