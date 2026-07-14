@@ -523,7 +523,11 @@ async fn provisional_revert_reresolves_secret_after_restart() {
 async fn containment_refuses_plain_env_before_forward_exec() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let marker = tmp.path().join("forward-ran");
-    let (cfg, _operator, agent) = gating_config(7_017, 1_000);
+    let store = SessionStore::open(tmp.path().join("state.db"), 24 * 60 * 60)
+        .await
+        .expect("open store");
+    let (mut cfg, _operator, agent) = gating_config(7_017, 1_000);
+    cfg.session_store = Some(store.clone());
     let mut request = contain_request(
         "sh",
         &["-c", &format!("touch '{}'", marker.display())],
@@ -561,6 +565,14 @@ async fn containment_refuses_plain_env_before_forward_exec() {
     assert!(!marker.exists(), "forward command must not have run");
     assert!(
         cfg.provisional.read().await.list().is_empty(),
+        "plain env must not reach the provisional registry"
+    );
+    assert!(
+        store
+            .load_provisionals()
+            .await
+            .expect("read persisted provisionals")
+            .is_empty(),
         "plain env must not reach persisted provisional state"
     );
 }

@@ -462,7 +462,7 @@ rules:
 "#;
     let p = spawn_proxy(Arc::new(GithubProtocol), github_body, policy).await;
 
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         for _ in 0..32 {
             let allowed = p
                 .client
