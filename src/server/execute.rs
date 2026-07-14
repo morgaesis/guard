@@ -1974,8 +1974,35 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
             request_env.insert(env_var.clone(), value);
         }
     }
-    let mut redaction_env = trusted_tool_env.clone();
+
+    let daemon_child_env: HashMap<String, String> = config
+        .extra_child_env
+        .iter()
+        .filter_map(|var| std::env::var(var).ok().map(|value| (var.clone(), value)))
+        .collect();
+    for key in request_env.keys() {
+        if trusted_tool_env.contains_key(key) {
+            return ExecuteResult::exec_failed(
+                allow_reason,
+                format!(
+                    "injected environment variable '{}' conflicts with Guard tool configuration",
+                    key
+                ),
+            );
+        }
+        if daemon_child_env.contains_key(key) {
+            return ExecuteResult::exec_failed(
+                allow_reason,
+                format!(
+                    "injected environment variable '{}' conflicts with Guard daemon child environment",
+                    key
+                ),
+            );
+        }
+    }
+    let mut redaction_env = daemon_child_env.clone();
     redaction_env.extend(request_env.clone());
+    redaction_env.extend(trusted_tool_env.clone());
 
     tracing::info!(
         "Executing: {} {:?} ({}) cwd={}",
@@ -2016,10 +2043,8 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
     // The value comes from the DAEMON's environment (not the caller), so an
     // agent cannot introduce one here; e.g. KUBECONFIG points kubectl at a config
     // only the daemon can read.
-    for var in &config.extra_child_env {
-        if let Ok(val) = std::env::var(var) {
-            cmd.env(var, val);
-        }
+    for (key, value) in &daemon_child_env {
+        cmd.env(key, value);
     }
 
     let exec_caller = match apply_exec_identity(&mut cmd, config, caller) {

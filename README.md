@@ -721,6 +721,11 @@ failure unchanged, and every grant and retry is audited.
 
 `guard secrets add/list/remove` and `--secret`/`--env` injection are local-caller operations on both platforms. They require an authenticated local peer - a Unix-socket uid or a Windows named-pipe SID - and the secret namespace is keyed from that principal. A bearer-token TCP caller is refused, because a token is not a trustworthy local identity. Any local caller can manage its own secret namespace. When the daemon principal runs `guard secrets list`, it gets an aggregate names-only view across every principal's namespace; duplicate key names can appear more than once and are intentionally not annotated with ownership in the default list output.
 
+Per-run `--env` and `--secret` values cannot replace Guard-owned execution
+context. If a requested env var collides with tool configuration or daemon
+`--child-env`, the command fails before exec instead of silently overriding a
+brokered endpoint or credential.
+
 For daemon-side migration and cleanup, use `guard secrets list --detailed` as the daemon principal. That view annotates the owning principal for namespaced entries and `origin=legacy` for pre-namespace flat secrets that still need operator migration.
 
 Pre-namespace flat secrets are excluded from normal per-user `guard secrets list` / `guard run --secret` paths. Migrate them before rollout:

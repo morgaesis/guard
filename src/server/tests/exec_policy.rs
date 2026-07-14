@@ -1036,6 +1036,243 @@ async fn guard_configured_ssh_auth_sock_is_forwarded_to_child() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn caller_env_cannot_override_guard_tool_env() {
+    let (cfg, _) = make_test_config();
+    let tools = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        tools.path(),
+        "tools:\n  sh:\n    env:\n      BROKER_ENDPOINT: guard-owned\n",
+    )
+    .unwrap();
+    *cfg.tool_registry.write().await =
+        crate::tool_config::ToolRegistry::load(tools.path()).unwrap();
+
+    let token = format!("tool-env-collision-{}", std::process::id());
+    cfg.sessions.write().await.grant(
+        token.clone(),
+        SessionGrant {
+            allow: vec!["sh *".into()],
+            deny: Vec::new(),
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            expires_at: None,
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            static_only: true,
+            auto_amend: false,
+            granted_at: 0,
+        },
+    );
+
+    let mut req = basic_request(
+        "sh",
+        vec![
+            "-c".to_string(),
+            "printf '%s' \"$BROKER_ENDPOINT\"".to_string(),
+        ],
+    );
+    req.session_token = Some(token);
+    req.env
+        .insert("BROKER_ENDPOINT".to_string(), "caller-owned".to_string());
+
+    let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+    match result.exec {
+        ExecOutcome::Failed { reason, started } => {
+            assert!(!started);
+            assert!(reason.contains(
+                "injected environment variable 'BROKER_ENDPOINT' conflicts with Guard tool configuration"
+            ));
+        }
+        other => panic!("expected collision to fail before exec, got {:?}", other),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn caller_secret_cannot_override_guard_tool_env() {
+    let (cfg, _) = make_test_config();
+    let tools = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        tools.path(),
+        "tools:\n  sh:\n    env:\n      BROKER_TOKEN: guard-owned\n",
+    )
+    .unwrap();
+    *cfg.tool_registry.write().await =
+        crate::tool_config::ToolRegistry::load(tools.path()).unwrap();
+    cfg.secrets
+        .set(
+            &PrincipalKey::from_uid(1000),
+            "CALLER_TOKEN",
+            "caller-owned",
+        )
+        .await
+        .unwrap();
+
+    let token = format!("tool-secret-collision-{}", std::process::id());
+    cfg.sessions.write().await.grant(
+        token.clone(),
+        SessionGrant {
+            allow: vec!["sh *".into()],
+            deny: Vec::new(),
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            expires_at: None,
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            static_only: true,
+            auto_amend: false,
+            granted_at: 0,
+        },
+    );
+
+    let mut req = basic_request(
+        "sh",
+        vec![
+            "-c".to_string(),
+            "printf '%s' \"$BROKER_TOKEN\"".to_string(),
+        ],
+    );
+    req.session_token = Some(token);
+    req.secrets
+        .insert("BROKER_TOKEN".to_string(), "CALLER_TOKEN".to_string());
+
+    let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+    match result.exec {
+        ExecOutcome::Failed { reason, started } => {
+            assert!(!started);
+            assert!(reason.contains(
+                "injected environment variable 'BROKER_TOKEN' conflicts with Guard tool configuration"
+            ));
+        }
+        other => panic!(
+            "expected secret collision to fail before exec, got {:?}",
+            other
+        ),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn caller_env_cannot_override_daemon_child_env() {
+    let (mut cfg, _) = make_test_config();
+    let _restore = EnvRestore::capture("GUARD_CHILD_ENDPOINT");
+    std::env::set_var("GUARD_CHILD_ENDPOINT", "daemon-owned");
+    cfg.extra_child_env = vec!["GUARD_CHILD_ENDPOINT".to_string()];
+
+    let token = format!("child-env-collision-{}", std::process::id());
+    cfg.sessions.write().await.grant(
+        token.clone(),
+        SessionGrant {
+            allow: vec!["sh *".into()],
+            deny: Vec::new(),
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            expires_at: None,
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            static_only: true,
+            auto_amend: false,
+            granted_at: 0,
+        },
+    );
+
+    let mut req = basic_request(
+        "sh",
+        vec![
+            "-c".to_string(),
+            "printf '%s' \"$GUARD_CHILD_ENDPOINT\"".to_string(),
+        ],
+    );
+    req.session_token = Some(token);
+    req.env.insert(
+        "GUARD_CHILD_ENDPOINT".to_string(),
+        "caller-owned".to_string(),
+    );
+
+    let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+    match result.exec {
+        ExecOutcome::Failed { reason, started } => {
+            assert!(!started);
+            assert!(reason.contains(
+                "injected environment variable 'GUARD_CHILD_ENDPOINT' conflicts with Guard daemon child environment"
+            ));
+        }
+        other => panic!(
+            "expected daemon child env collision to fail before exec, got {:?}",
+            other
+        ),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn redaction_covers_effective_tool_child_and_request_env_values() {
+    let (mut cfg, _) = make_test_config();
+    cfg.redact = true;
+    let _restore = EnvRestore::capture("GUARD_CHILD_SECRET");
+    std::env::set_var("GUARD_CHILD_SECRET", "daemon-child-secret-value");
+    cfg.extra_child_env = vec!["GUARD_CHILD_SECRET".to_string()];
+    let tools = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        tools.path(),
+        "tools:\n  sh:\n    env:\n      TOOL_SECRET: guard-tool-secret-value\n",
+    )
+    .unwrap();
+    *cfg.tool_registry.write().await =
+        crate::tool_config::ToolRegistry::load(tools.path()).unwrap();
+
+    let token = format!("env-redaction-{}", std::process::id());
+    cfg.sessions.write().await.grant(
+        token.clone(),
+        SessionGrant {
+            allow: vec!["sh *".into()],
+            deny: Vec::new(),
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            expires_at: None,
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            static_only: true,
+            auto_amend: false,
+            granted_at: 0,
+        },
+    );
+
+    let mut req = basic_request(
+        "sh",
+        vec![
+            "-c".to_string(),
+            "printf '%s %s %s' \"$TOOL_SECRET\" \"$GUARD_CHILD_SECRET\" \"$REQUEST_SECRET\""
+                .to_string(),
+        ],
+    );
+    req.session_token = Some(token);
+    req.env.insert(
+        "REQUEST_SECRET".to_string(),
+        "request-secret-value".to_string(),
+    );
+
+    let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+    match result.exec {
+        ExecOutcome::Completed { stdout, .. } => {
+            let stdout = stdout.unwrap_or_default();
+            assert!(
+                !stdout.contains("guard-tool-secret-value"),
+                "stdout={stdout}"
+            );
+            assert!(
+                !stdout.contains("daemon-child-secret-value"),
+                "stdout={stdout}"
+            );
+            assert!(!stdout.contains("request-secret-value"), "stdout={stdout}");
+            assert!(stdout.contains("[REDACTED]"), "stdout={stdout}");
+        }
+        other => panic!("expected redacted env output, got {:?}", other),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn ansible_discovers_config_from_cwd_without_inherited_ansible_config() {
     let (cfg, _) = make_test_config();
     let temp = tempfile::tempdir().unwrap();
