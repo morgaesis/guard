@@ -98,9 +98,21 @@ enum MainArgs {
         secret_file_vars: Vec<(String, String)>,
         /// Rollback command for a recoverable action under consequence gating,
         /// as a single string (e.g. --revert "systemctl stop nginx"). It is
-        /// itself policy-evaluated; if denied, the whole request is denied.
+        /// assessed with the full envelope; an uncertain chain is held.
         #[arg(long = "revert", value_name = "COMMAND")]
         revert: Option<String>,
+        /// Independent command run at the deadline. Exit zero confirms the
+        /// change; any other result runs the rollback.
+        #[arg(long = "confirm-check", value_name = "COMMAND", requires = "revert")]
+        confirm_check: Option<String>,
+        /// Authority and transport required to run the confirmation check and
+        /// rollback, such as "brokered SSH to firewall-a".
+        #[arg(
+            long = "revert-control-path",
+            value_name = "DESCRIPTION",
+            requires = "revert"
+        )]
+        revert_control_path: Option<String>,
         /// Auto-revert window in seconds for the containment envelope.
         #[arg(long = "confirm-within", value_name = "SECONDS")]
         confirm_within: Option<u64>,
@@ -966,6 +978,42 @@ enum ServerCommands {
         #[arg(long = "api-promotion-min-denials", value_name = "N")]
         api_promotion_min_denials: Option<u32>,
 
+        /// Fire an operator command for gate lifecycle events. The command is
+        /// parsed into argv, receives one JSON event on stdin, and is killed at
+        /// the bounded timeout. Off by default. Env: GUARD_NOTIFY_CMD.
+        #[arg(long = "notify-cmd", value_name = "COMMAND")]
+        notify_cmd: Option<String>,
+
+        /// Notify command timeout in seconds (1-60). Env:
+        /// GUARD_NOTIFY_TIMEOUT_SECS.
+        #[arg(long = "notify-timeout", value_name = "SECONDS")]
+        notify_timeout: Option<u64>,
+
+        /// Rolling window for session behavioral circuit breakers. Env:
+        /// GUARD_SESSION_BEHAVIOR_WINDOW_SECS.
+        #[arg(long = "session-behavior-window", value_name = "SECONDS")]
+        session_behavior_window: Option<u64>,
+
+        /// Suspend a session after this many denials in the rolling window.
+        /// Env: GUARD_SESSION_MAX_DENIALS.
+        #[arg(long = "session-max-denials", value_name = "N")]
+        session_max_denials: Option<u64>,
+
+        /// Suspend a session after this many holds in the rolling window. Env:
+        /// GUARD_SESSION_MAX_HOLDS.
+        #[arg(long = "session-max-holds", value_name = "N")]
+        session_max_holds: Option<u64>,
+
+        /// Suspend when the rolling denial ratio reaches this percentage. Env:
+        /// GUARD_SESSION_MAX_DENY_RATIO.
+        #[arg(long = "session-max-deny-ratio", value_name = "1-100")]
+        session_max_deny_ratio: Option<u8>,
+
+        /// Minimum rolling command count before applying the denial ratio. Env:
+        /// GUARD_SESSION_DENY_RATIO_MIN_COMMANDS.
+        #[arg(long = "session-deny-ratio-min-commands", value_name = "N")]
+        session_deny_ratio_min_commands: Option<u64>,
+
         /// Internal marker: launched under the Windows Service Control Manager.
         /// The Windows installer sets this in the service binPath so startup
         /// answers the SCM start/stop handshake instead of running in the
@@ -1204,6 +1252,8 @@ async fn run_main() -> Result<()> {
             secret_vars,
             secret_file_vars,
             revert,
+            confirm_check,
+            revert_control_path,
             confirm_within,
             require_approval,
             wait_approval,
@@ -1219,6 +1269,8 @@ async fn run_main() -> Result<()> {
                     .map_err(anyhow::Error::msg)?;
             let gating = GatingOptions {
                 revert,
+                confirm_check,
+                revert_control_path,
                 confirm_within,
                 require_approval,
                 wait_approval,

@@ -121,6 +121,10 @@ struct GuardToolArgs {
     /// Rollback command for a recoverable action, as a single string.
     #[serde(default)]
     revert: Option<String>,
+    #[serde(default, rename = "confirmCheck")]
+    confirm_check: Option<String>,
+    #[serde(default, rename = "revertControlPath")]
+    revert_control_path: Option<String>,
     #[serde(default, rename = "confirmWithin")]
     confirm_within: Option<u64>,
     #[serde(default, rename = "requireApproval")]
@@ -232,7 +236,7 @@ impl GuardExecutor for ClientExecutor {
             .map_err(anyhow::Error::msg)?;
         let secrets = guard_tool_secret_map(&args.secrets, args.secret_env)?;
 
-        let revert = match args.revert.as_deref() {
+        let mut revert = match args.revert.as_deref() {
             Some(spec) => {
                 let parts = shell_words::split(spec)
                     .map_err(|e| anyhow::anyhow!("invalid revert command: {}", e))?;
@@ -240,13 +244,31 @@ impl GuardExecutor for ClientExecutor {
                 let binary = it
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("revert command is empty"))?;
-                Some(server::RevertSpec {
-                    binary,
-                    args: it.collect(),
-                })
+                Some(server::RevertSpec::new(binary, it.collect()))
             }
             None => None,
         };
+        if let Some(check) = args.confirm_check.as_deref() {
+            let parts = shell_words::split(check)
+                .map_err(|e| anyhow::anyhow!("invalid confirm-check command: {}", e))?;
+            let mut it = parts.into_iter();
+            let binary = it
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("confirm-check command is empty"))?;
+            let Some(revert) = revert.as_mut() else {
+                anyhow::bail!("confirmCheck requires revert");
+            };
+            revert.confirm_check = Some(server::CommandSpec {
+                binary,
+                args: it.collect(),
+            });
+        }
+        if let Some(control_path) = args.revert_control_path {
+            let Some(revert) = revert.as_mut() else {
+                anyhow::bail!("revertControlPath requires revert");
+            };
+            revert.control_path = Some(control_path);
+        }
 
         let mut client = daemon_client::Client::new(self.socket_path.clone(), self.tcp_port)
             .with_gating(
@@ -856,7 +878,15 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                             },
                             "revert": {
                                 "type": "string",
-                                "description": "Optional rollback command (single string) for a recoverable action under consequence gating. It is policy-evaluated before the action is armed."
+                                "description": "Optional rollback command (single string) for a recoverable action under consequence gating. The complete containment envelope is assessed before the action is armed."
+                            },
+                            "confirmCheck": {
+                                "type": "string",
+                                "description": "Independent command run at the containment deadline. Exit zero confirms; every other outcome runs the rollback. Requires revert."
+                            },
+                            "revertControlPath": {
+                                "type": "string",
+                                "description": "Authority and transport required for the confirmation check and rollback. Requires revert."
                             },
                             "confirmWithin": {
                                 "type": "integer",
@@ -1348,6 +1378,15 @@ mod tests {
             response["result"]["tools"][0]["inputSchema"]["properties"]["secretFiles"]["type"],
             "object"
         );
+        assert_eq!(
+            response["result"]["tools"][0]["inputSchema"]["properties"]["confirmCheck"]["type"],
+            "string"
+        );
+        assert_eq!(
+            response["result"]["tools"][0]["inputSchema"]["properties"]["revertControlPath"]
+                ["type"],
+            "string"
+        );
     }
 
     #[test]
@@ -1386,6 +1425,29 @@ mod tests {
                 .map(String::as_str),
             Some("service/credential")
         );
+    }
+
+    #[test]
+    fn guard_tool_args_accepts_complete_containment_envelope() {
+        let parsed: GuardToolArgs = serde_json::from_value(json!({
+            "binary": "ssh",
+            "args": ["firewall-a", "apply"],
+            "revert": "ssh firewall-a rollback",
+            "confirmCheck": "ssh firewall-a verify",
+            "revertControlPath": "brokered SSH to firewall-a",
+            "confirmWithin": 45
+        }))
+        .unwrap();
+        assert_eq!(parsed.revert.as_deref(), Some("ssh firewall-a rollback"));
+        assert_eq!(
+            parsed.confirm_check.as_deref(),
+            Some("ssh firewall-a verify")
+        );
+        assert_eq!(
+            parsed.revert_control_path.as_deref(),
+            Some("brokered SSH to firewall-a")
+        );
+        assert_eq!(parsed.confirm_within, Some(45));
     }
 
     #[tokio::test]

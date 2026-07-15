@@ -13,6 +13,7 @@ use super::execute::{
     audit_command_line, audit_session_fingerprint, exec_after_approval, exec_with_read_grant_retry,
 };
 use super::grants::{delete_read_grant_row, finish_read_grant_revert, persist_read_grant};
+use super::runtime::NotifyEvent;
 use super::transport::write_stream_message;
 use super::wire::{
     CallerIdentity, ExecOutcome, ExecuteRequest, ExecuteResult, ExecuteStreamMessage, RevertSpec,
@@ -272,13 +273,27 @@ impl Drop for ProxyHoldOrphanGuard {
                         .to_string(),
                 );
             }
-            if let Some(a) = config.approvals.read().await.get(&handle).cloned() {
-                persist_approval(&config, &a).await;
-            }
+            let session_fingerprint =
+                if let Some(a) = config.approvals.read().await.get(&handle).cloned() {
+                    let session_fingerprint = a.snapshot.session_fingerprint.clone();
+                    persist_approval(&config, &a).await;
+                    session_fingerprint
+                } else {
+                    None
+                };
             tracing::info!(target: "guard::audit",
                 "[AUDIT] HOLD_ORPHANED handle={} (api-proxy client disconnected)",
                 handle
             );
+            config.emit_event(NotifyEvent {
+                event: "decision_made",
+                at_unix: now,
+                handle: Some(handle),
+                session_fingerprint,
+                reason: Some("requester disconnected before a held API decision".to_string()),
+                status: Some("orphaned".to_string()),
+                behavior: None,
+            });
         });
     }
 }
@@ -381,6 +396,10 @@ impl guard::proxy::GateSink for DaemonGateSink {
             // revert_binary/revert_args of a shell provisional.
             revert_binary: String::new(),
             revert_args: Vec::new(),
+            confirm_check_binary: None,
+            confirm_check_args: Vec::new(),
+            control_path: Some(format!("daemon API proxy for protocol {}", self.protocol)),
+            session_fingerprint: None,
             reason: mutation.label,
             created_unix: now,
             deadline_unix: now.saturating_add(self.window_secs),
@@ -391,7 +410,20 @@ impl guard::proxy::GateSink for DaemonGateSink {
             api_revert: Some(api_revert),
         };
         persist_provisional(&self.config, &provisional).await;
-        self.config.provisional.write().await.insert(provisional);
+        self.config
+            .provisional
+            .write()
+            .await
+            .insert(provisional.clone());
+        self.config.emit_event(NotifyEvent {
+            event: "provisional_armed",
+            at_unix: now,
+            handle: Some(handle.clone()),
+            session_fingerprint: None,
+            reason: Some(provisional.reason.clone()),
+            status: Some("armed".to_string()),
+            behavior: None,
+        });
         Some(handle)
     }
 
@@ -450,6 +482,15 @@ impl guard::proxy::GateSink for DaemonGateSink {
             label,
             APPROVAL_TTL_SECS
         );
+        self.config.emit_event(NotifyEvent {
+            event: "hold_created",
+            at_unix: now,
+            handle: Some(handle.clone()),
+            session_fingerprint: None,
+            reason: Some(reason.to_string()),
+            status: Some("pending".to_string()),
+            behavior: None,
+        });
         // If the brokered client disconnects while parked, this future is
         // dropped mid-await; the guard then retires the orphaned hold.
         let mut orphan_guard = ProxyHoldOrphanGuard {
@@ -526,6 +567,15 @@ impl guard::proxy::GateSink for DaemonGateSink {
                     "api-proxy: resolved auto-revert {} (created object deleted by workload)",
                     handle
                 );
+                self.config.emit_event(NotifyEvent {
+                    event: "decision_made",
+                    at_unix: now_unix(),
+                    handle: Some(handle.to_string()),
+                    session_fingerprint: p.session_fingerprint.clone(),
+                    reason: Some("workload removed its contained created object".to_string()),
+                    status: Some("confirmed".to_string()),
+                    behavior: None,
+                });
             }
             Err(e) => tracing::debug!("api-proxy: resolve {} was a no-op: {}", handle, e),
         }
@@ -575,6 +625,25 @@ async fn assess_revert(
     if let Some(reason) = invalid_binary_reason(&revert.binary) {
         return RevertAssessment::NeedsReview(reason);
     }
+    if !binary_allowed(&config.allowed_binaries, &revert.binary) {
+        return RevertAssessment::NeedsReview(format!(
+            "rollback binary '{}' is outside the server allow-list",
+            revert.binary
+        ));
+    }
+    if let Some(check) = &revert.confirm_check {
+        if let Some(reason) = invalid_binary_reason(&check.binary) {
+            return RevertAssessment::NeedsReview(format!(
+                "invalid confirmation-check command: {reason}"
+            ));
+        }
+        if !binary_allowed(&config.allowed_binaries, &check.binary) {
+            return RevertAssessment::NeedsReview(format!(
+                "confirmation-check binary '{}' is outside the server allow-list",
+                check.binary
+            ));
+        }
+    }
     let forward_line = if forward.args.is_empty() {
         forward.binary.clone()
     } else {
@@ -585,16 +654,39 @@ async fn assess_revert(
     } else {
         format!("{} {}", revert.binary, revert.args.join(" "))
     };
+    let check_line = revert.confirm_check.as_ref().map(|check| {
+        if check.args.is_empty() {
+            check.binary.clone()
+        } else {
+            format!("{} {}", check.binary, check.args.join(" "))
+        }
+    });
+    let window = forward
+        .confirm_within_secs
+        .unwrap_or(DEFAULT_CONFIRM_WITHIN_SECS)
+        .clamp(1, MAX_CONFIRM_WITHIN_SECS);
+    let control_path = revert
+        .control_path
+        .clone()
+        .unwrap_or_else(|| infer_control_path(forward, revert));
     let context = format!(
-        "ROLLBACK ASSESSMENT. A recoverable command was approved to run inside an \
-         auto-revert containment envelope. If the operator does not confirm in time, \
-         the daemon runs the rollback unattended.\n\
+        "CONTAINMENT ENVELOPE ASSESSMENT. A recoverable command may run unattended. \
+         At the deadline the daemon runs the independent confirmation check when one \
+         is present; exit zero confirms and every other outcome runs the rollback.\n\
          Forward command: {forward_line}\n\
          Proposed rollback: {revert_line}\n\
-         APPROVE only if the rollback is safe under policy AND is a sensible inverse \
-         that undoes the forward command without additional damage, broader scope, or \
-         unrelated side effects. DENY if it is off-target, destructive, overly broad, \
-         or unrelated to the forward command."
+         Confirmation check: {}\n\
+         Confirmation deadline: {window} seconds\n\
+         Required control path: {control_path}\n\
+         APPROVE only if the rollback is policy-compliant and a sensible inverse, the \
+         check independently verifies the intended result, and the forward command \
+         cannot plausibly sever the SSH, API, socket, credential, daemon, or local \
+         authority needed to run the check and rollback. DENY when any part is \
+         off-target, destructive, overly broad, circular, or connectivity-dependent \
+         in a way the forward action may break.",
+        check_line
+            .as_deref()
+            .unwrap_or("none; deadline always rolls back")
     );
     match config
         .evaluator
@@ -609,6 +701,33 @@ async fn assess_revert(
             RevertAssessment::NeedsReview(format!("rollback could not be evaluated: {e}"))
         }
     }
+}
+
+fn infer_control_path(forward: &ExecuteRequest, revert: &RevertSpec) -> String {
+    let mut transports = Vec::new();
+    for binary in [
+        forward.binary.as_str(),
+        revert.binary.as_str(),
+        revert
+            .confirm_check
+            .as_ref()
+            .map(|check| check.binary.as_str())
+            .unwrap_or(""),
+    ] {
+        let transport = match binary {
+            "ssh" | "scp" | "sftp" | "rsync" => "brokered SSH transport",
+            "kubectl" | "helm" => "daemon-held Kubernetes API credentials and connectivity",
+            "curl" | "wget" => "daemon network and API credential path",
+            _ => "local daemon process execution",
+        };
+        if !transports.contains(&transport) {
+            transports.push(transport);
+        }
+    }
+    if !forward.secrets.is_empty() || !forward.secret_files.is_empty() {
+        transports.push("original caller secret namespace");
+    }
+    transports.join("; ")
 }
 
 /// Bundled inputs for consequence-gate routing.
@@ -684,13 +803,16 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
             // being a sensible inverse of the forward command; if it cannot be
             // affirmed, the command is held for operator review rather than denied
             // or armed with an unverified rollback.
-            if !inputs.revert_preauthorized {
-                if let Some(revert) = request.revert.clone() {
+            if let Some(revert) = request.revert.clone() {
+                let requires_live_assessment = !inputs.revert_preauthorized
+                    || revert.confirm_check.is_some()
+                    || revert.control_path.is_some();
+                if requires_live_assessment {
                     if let RevertAssessment::NeedsReview(why) =
                         assess_revert(config, &request, &revert).await
                     {
                         let hold_reason = format!(
-                            "{} [held for operator review: auto-revert not validated: {}]",
+                            "{} [held for operator review: containment envelope not validated: {}]",
                             inputs.reason, why
                         );
                         return hold_for_approval(
@@ -758,6 +880,36 @@ pub(super) async fn arm_containment<W: AsyncWrite + Unpin>(
         None => return ExecuteResult::held(reason, new_handle(), Coverage::hold()),
     };
 
+    if let Some(why) = invalid_binary_reason(&revert.binary) {
+        return ExecuteResult::exec_failed(reason, why);
+    }
+    if !binary_allowed(&config.allowed_binaries, &revert.binary) {
+        return ExecuteResult::exec_failed(
+            reason,
+            format!(
+                "rollback binary '{}' is outside the server allow-list",
+                revert.binary
+            ),
+        );
+    }
+    if let Some(check) = &revert.confirm_check {
+        if let Some(why) = invalid_binary_reason(&check.binary) {
+            return ExecuteResult::exec_failed(
+                reason,
+                format!("invalid confirmation-check command: {why}"),
+            );
+        }
+        if !binary_allowed(&config.allowed_binaries, &check.binary) {
+            return ExecuteResult::exec_failed(
+                reason,
+                format!(
+                    "confirmation-check binary '{}' is outside the server allow-list",
+                    check.binary
+                ),
+            );
+        }
+    }
+
     if config.dry_run {
         return ExecuteResult::dry_run_gated(
             format!(
@@ -816,6 +968,25 @@ pub(super) async fn arm_containment<W: AsyncWrite + Unpin>(
             .collect(),
         revert_binary: revert.binary.clone(),
         revert_args: revert.args.clone(),
+        confirm_check_binary: revert
+            .confirm_check
+            .as_ref()
+            .map(|check| check.binary.clone()),
+        confirm_check_args: revert
+            .confirm_check
+            .as_ref()
+            .map(|check| check.args.clone())
+            .unwrap_or_default(),
+        control_path: Some(
+            revert
+                .control_path
+                .clone()
+                .unwrap_or_else(|| infer_control_path(&request, &revert)),
+        ),
+        session_fingerprint: request
+            .session_token
+            .as_deref()
+            .map(|token| audit_session_fingerprint(Some(token))),
         api_revert: None,
         reason: reason.clone(),
         created_unix: now,
@@ -867,6 +1038,15 @@ pub(super) async fn arm_containment<W: AsyncWrite + Unpin>(
                 window,
                 audit_command_line(&revert.binary, &revert.args)
             );
+            config.emit_event(NotifyEvent {
+                event: "provisional_armed",
+                at_unix: now_unix(),
+                handle: Some(handle.clone()),
+                session_fingerprint: Some(session_fingerprint),
+                reason: Some(reason.clone()),
+                status: Some("armed".to_string()),
+                behavior: None,
+            });
             ExecuteResult::provisional(
                 reason,
                 handle,
@@ -1022,6 +1202,18 @@ pub(super) async fn hold_for_approval<W: AsyncWrite + Unpin>(
         audit_command_line(&request.binary, &request.args),
         APPROVAL_TTL_SECS
     );
+    config.emit_event(NotifyEvent {
+        event: "hold_created",
+        at_unix: now_unix(),
+        handle: Some(handle.clone()),
+        session_fingerprint: request
+            .session_token
+            .as_deref()
+            .map(|token| audit_session_fingerprint(Some(token))),
+        reason: Some(reason.clone()),
+        status: Some("pending".to_string()),
+        behavior: None,
+    });
 
     match request.wait_approval_secs {
         Some(wait) => {
@@ -1298,6 +1490,15 @@ pub(super) async fn gating_sweeper(config: ServerConfig) {
                         .as_deref()
                         .unwrap_or("none")
                 );
+                config.emit_event(NotifyEvent {
+                    event: "decision_made",
+                    at_unix: now,
+                    handle: Some(h.clone()),
+                    session_fingerprint: a.snapshot.session_fingerprint.clone(),
+                    reason: Some("held action expired without approval".to_string()),
+                    status: Some("expired".to_string()),
+                    behavior: None,
+                });
             }
         }
 
@@ -1310,9 +1511,18 @@ pub(super) async fn gating_sweeper(config: ServerConfig) {
         let due = { config.provisional.write().await.take_due(now) };
         for p in due {
             persist_provisional(&config, &p).await;
+            config.emit_event(NotifyEvent {
+                event: "provisional_due",
+                at_unix: now,
+                handle: Some(p.handle.clone()),
+                session_fingerprint: p.session_fingerprint.clone(),
+                reason: Some(p.reason.clone()),
+                status: Some("reverting".to_string()),
+                behavior: None,
+            });
             let cfg = config.clone();
             tokio::spawn(async move {
-                let _ = finish_revert(&cfg, &p, &CallerIdentity::Unknown, "auto").await;
+                let _ = finish_due_provisional(&cfg, &p).await;
             });
         }
 
@@ -1370,6 +1580,21 @@ pub(super) async fn gating_sweeper(config: ServerConfig) {
 /// Run the revert for a provisional under the original caller's identity, with no
 /// client stream. Used by the sweeper and `guard revert`.
 async fn run_provisional_revert(config: &ServerConfig, p: &Provisional) -> ExecuteResult {
+    if let Some(reason) = invalid_binary_reason(&p.revert_binary) {
+        return ExecuteResult::exec_failed(
+            format!("auto-revert of provisional {}", p.handle),
+            reason,
+        );
+    }
+    if !binary_allowed(&config.allowed_binaries, &p.revert_binary) {
+        return ExecuteResult::exec_failed(
+            format!("auto-revert of provisional {}", p.handle),
+            format!(
+                "rollback binary '{}' is outside the server allow-list",
+                p.revert_binary
+            ),
+        );
+    }
     let caller = reconstruct_caller(p.principal.clone(), &CallerIdentity::Unknown);
     let request = ExecuteRequest {
         binary: p.revert_binary.clone(),
@@ -1408,6 +1633,129 @@ async fn run_provisional_revert(config: &ServerConfig, p: &Provisional) -> Execu
         &mut sink,
     )
     .await
+}
+
+async fn run_provisional_check(config: &ServerConfig, p: &Provisional) -> ExecuteResult {
+    let binary = p.confirm_check_binary.as_deref().unwrap_or_default();
+    if let Some(reason) = invalid_binary_reason(binary) {
+        return ExecuteResult::exec_failed(
+            format!("confirmation check for provisional {}", p.handle),
+            format!("invalid confirmation-check command: {reason}"),
+        );
+    }
+    if !binary_allowed(&config.allowed_binaries, binary) {
+        return ExecuteResult::exec_failed(
+            format!("confirmation check for provisional {}", p.handle),
+            format!(
+                "confirmation-check binary '{}' is outside the server allow-list",
+                binary
+            ),
+        );
+    }
+    let caller = reconstruct_caller(p.principal.clone(), &CallerIdentity::Unknown);
+    let request = ExecuteRequest {
+        binary: p.confirm_check_binary.clone().unwrap_or_default(),
+        args: p.confirm_check_args.clone(),
+        cwd: p.cwd.clone(),
+        auth_token: None,
+        env: std::collections::HashMap::new(),
+        secrets: p
+            .secret_keys
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        secret_files: p
+            .secret_file_keys
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        stream: false,
+        session_token: None,
+        revert: None,
+        confirm_within_secs: None,
+        require_approval: None,
+        wait_approval_secs: None,
+        verb: None,
+        reevaluate: false,
+        ssh_hostkey: None,
+    };
+    let mut sink = tokio::io::sink();
+    exec_after_approval(
+        request,
+        config,
+        &caller,
+        format!("confirmation check for provisional {}", p.handle),
+        0,
+        false,
+        &mut sink,
+    )
+    .await
+}
+
+pub(super) async fn finish_due_provisional(
+    config: &ServerConfig,
+    p: &Provisional,
+) -> (String, Option<i32>) {
+    if p.confirm_check_binary.is_none() {
+        return finish_revert(config, p, &CallerIdentity::Unknown, "auto").await;
+    }
+    let checked = tokio::time::timeout(
+        std::time::Duration::from_secs(REVERT_EXEC_TIMEOUT_SECS),
+        run_provisional_check(config, p),
+    )
+    .await;
+    let check_exit = checked.ok().and_then(|result| match result.exec {
+        ExecOutcome::Completed { exit_code, .. } => exit_code,
+        _ => None,
+    });
+    if check_exit == Some(0) {
+        let confirmed = {
+            let mut registry = config.provisional.write().await;
+            registry.confirm_after_check(&p.handle)
+        };
+        match confirmed {
+            Ok(row) => {
+                persist_provisional(config, &row).await;
+                forget_proxy_provenance(config, &p.handle).await;
+                remove_revert_body(p);
+                tracing::info!(target: "guard::audit",
+                    "[AUDIT] PROVISIONAL_AUTO_CONFIRMED handle={} check=\"{}\" control_path={:?}",
+                    p.handle,
+                    audit_command_line(
+                        p.confirm_check_binary.as_deref().unwrap_or_default(),
+                        &p.confirm_check_args
+                    ),
+                    p.control_path
+                );
+                config.emit_event(NotifyEvent {
+                    event: "decision_made",
+                    at_unix: now_unix(),
+                    handle: Some(p.handle.clone()),
+                    session_fingerprint: p.session_fingerprint.clone(),
+                    reason: Some("independent confirmation check succeeded".to_string()),
+                    status: Some("confirmed".to_string()),
+                    behavior: None,
+                });
+                return (
+                    format!("provisional {} confirmed by independent check", p.handle),
+                    Some(0),
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "confirmation check succeeded but provisional {} could not confirm: {}",
+                    p.handle,
+                    error
+                );
+            }
+        }
+    }
+    tracing::warn!(target: "guard::audit",
+        "[AUDIT] PROVISIONAL_CHECK_FAILED handle={} exit={:?}; running rollback",
+        p.handle,
+        check_exit
+    );
+    finish_revert(config, p, &CallerIdentity::Unknown, "auto-check-failed").await
 }
 
 async fn run_api_revert(
@@ -1498,6 +1846,15 @@ async fn defer_revert(
         kind,
         detail
     );
+    config.emit_event(NotifyEvent {
+        event: "decision_made",
+        at_unix: now_unix(),
+        handle: Some(p.handle.clone()),
+        session_fingerprint: p.session_fingerprint.clone(),
+        reason: Some(detail.clone()),
+        status: Some("needs_operator_decision".to_string()),
+        behavior: None,
+    });
     (
         format!("provisional {} revert deferred: {}", p.handle, detail),
         None,
@@ -1609,6 +1966,15 @@ pub(super) async fn finish_revert(
             kind,
             exit
         );
+        config.emit_event(NotifyEvent {
+            event: "decision_made",
+            at_unix: now_unix(),
+            handle: Some(p.handle.clone()),
+            session_fingerprint: p.session_fingerprint.clone(),
+            reason: Some(format!("rollback completed ({kind})")),
+            status: Some("reverted".to_string()),
+            behavior: None,
+        });
         (
             format!("provisional {} reverted (exit {:?})", p.handle, exit),
             exit,
@@ -1622,6 +1988,15 @@ pub(super) async fn finish_revert(
             exit,
             detail
         );
+        config.emit_event(NotifyEvent {
+            event: "decision_made",
+            at_unix: now_unix(),
+            handle: Some(p.handle.clone()),
+            session_fingerprint: p.session_fingerprint.clone(),
+            reason: detail.clone(),
+            status: Some("revert_failed".to_string()),
+            behavior: None,
+        });
         (
             format!(
                 "REVERT FAILED for provisional {} (exit {:?}); the change may still be in place: {}",

@@ -21,6 +21,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::ffi::CString;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
@@ -34,6 +36,7 @@ use super::gate_runtime::{binary_allowed, route_gated_allow, GateInputs};
 use super::grants::handle_grant_read;
 #[cfg(unix)]
 use super::path_with_shim_dir;
+use super::runtime::NotifyEvent;
 use super::transport::{write_policy_decision, write_stream_message};
 #[cfg(unix)]
 use super::wire::ExecOutcome;
@@ -48,6 +51,7 @@ use super::{
     SESSION_AUTO_AMEND_MAX_ALLOW_RISK, SESSION_AUTO_AMEND_MIN_DENY_RISK,
     SESSION_EXACT_RULE_MAX_ARGS, SESSION_EXACT_RULE_MAX_ARG_LEN,
 };
+use super::{DEFAULT_CONFIRM_WITHIN_SECS, MAX_CONFIRM_WITHIN_SECS};
 
 pub(super) fn log_audit_policy_for_request(
     config: &ServerConfig,
@@ -543,7 +547,7 @@ async fn resolve_verb_context<W: AsyncWrite + Unpin>(
             Ok((r, version)) => {
                 request.binary = r.binary;
                 request.args = r.args;
-                request.revert = r.revert.map(|(binary, args)| RevertSpec { binary, args });
+                request.revert = r.revert.map(|(binary, args)| RevertSpec::new(binary, args));
                 let _ = version;
             }
             Err(e) => {
@@ -793,7 +797,7 @@ fn resolve_scoped_matches(
             .max_by_key(|class| reversibility_rank(*class))
             .expect("selected matches are non-empty");
         let revert = selected[0].matched.rendered.revert.clone();
-        request.revert = revert.map(|(binary, args)| RevertSpec { binary, args });
+        request.revert = revert.map(|(binary, args)| RevertSpec::new(binary, args));
         Some(VerbContext {
             name: first.matched.rendered.name.clone(),
             class,
@@ -1487,7 +1491,7 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
 ) -> Result<ExecuteRequest, ExecuteResult> {
     let config = phase.config;
     if let Some(ref token) = request.session_token {
-        let (decision, exists, static_only) = {
+        let (decision, exists, static_only, suspension) = {
             let reg = config.sessions.read().await;
             let decision = reg.check(
                 token,
@@ -1495,7 +1499,12 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
                 &request.args,
                 request.cwd.as_deref(),
             );
-            (decision, reg.has(token), reg.static_only_for(token))
+            (
+                decision,
+                reg.has(token),
+                reg.static_only_for(token),
+                reg.suspension_reason(token, &config.behavior_limits),
+            )
         };
         if !exists {
             let reason = format!(
@@ -1518,6 +1527,17 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
             )
             .await;
             return Err(ExecuteResult::denied(reason));
+        }
+        if let Some(reason) = suspension {
+            return Err(deny_and_record(
+                phase,
+                &request,
+                command_line.to_string(),
+                SessionDecisionSource::SessionDeny,
+                None,
+                reason,
+            )
+            .await);
         }
         if let Some((decision, reason)) = decision {
             match decision {
@@ -1726,10 +1746,11 @@ async fn resolve_session_prompt(config: &ServerConfig, request: &ExecuteRequest)
     // envelope actually arms. A non-empty prompt append bypasses the decision
     // cache, so a revert-aware verdict is never replayed for a revert-less
     // request.
-    merge_revert_context(
-        session_prompt,
-        config.gate.is_on() && request.revert.is_some(),
-    )
+    if config.gate.is_on() {
+        merge_envelope_context(session_prompt, request)
+    } else {
+        session_prompt
+    }
 }
 
 /// Trusted verb: an operator-reviewed shape skips the LLM evaluator (a
@@ -2445,15 +2466,36 @@ pub(super) async fn record_live_session_interaction(
     let Some(token) = token else {
         return;
     };
-    let snapshot = {
+    let (snapshot, behavior) = {
         let mut reg = config.sessions.write().await;
         if reg.has(token) {
             reg.record_interaction(token, interaction);
-            Some(reg.clone())
+            let behavior = reg
+                .show_with_limits(token, 0, &config.behavior_limits)
+                .and_then(|report| serde_json::to_value(report.stats).ok());
+            (Some(reg.clone()), behavior)
         } else {
-            None
+            (None, None)
         }
     };
+    if let Some(behavior) = behavior {
+        let suspended = behavior
+            .get("suspended")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        config.emit_event(NotifyEvent {
+            event: "session_behavior",
+            at_unix: guard::env::now_unix(),
+            handle: None,
+            session_fingerprint: Some(audit_session_fingerprint(Some(token))),
+            reason: behavior
+                .get("suspension_reason")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            status: Some(if suspended { "suspended" } else { "active" }.to_string()),
+            behavior: Some(behavior),
+        });
+    }
     if let Some(snapshot) = snapshot {
         if let Err(err) = persist_session_snapshot(config.session_store.clone(), snapshot).await {
             tracing::warn!("failed to persist session interaction: {}", err);
@@ -3180,6 +3222,9 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
         }
     }
 
+    #[cfg(unix)]
+    cmd.as_std_mut().process_group(0);
+
     if stream_output {
         let result = execute_spawn_streaming(
             cmd,
@@ -3209,6 +3254,7 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
             );
         }
     };
+    let process_guard = child.id().map(|pid| config.process_tracker.track(pid));
     audit_secret_exposure(caller, &request, &exposed_secret_refs);
     let output = match child.wait_with_output().await {
         Ok(output) => output,
@@ -3220,6 +3266,9 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
             .with_exposed_secret_refs(exposed_secret_refs);
         }
     };
+    if let Some(guard) = process_guard {
+        guard.complete();
+    }
 
     let stdout = if output.stdout.is_empty() {
         None
@@ -3268,6 +3317,7 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
             );
         }
     };
+    let mut process_guard = child.id().map(|pid| config.process_tracker.track(pid));
     audit_secret_exposure(audit.caller, audit.request, &audit.exposed_secret_refs);
 
     let (tx, mut rx) = mpsc::channel::<StreamChunk>(32);
@@ -3308,7 +3358,12 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
                     };
 
                     if let Err(e) = write_stream_message(writer, &message).await {
-                        let _ = child.kill().await;
+                        if let Some(guard) = process_guard.take() {
+                            guard.terminate();
+                        } else {
+                            let _ = child.kill().await;
+                        }
+                        let _ = child.wait().await;
                         return ExecuteResult::exec_failed_after_start(
                             allow_reason,
                             format!("client stream error: {}", e),
@@ -3321,7 +3376,12 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
             }
             _ = keepalive.tick() => {
                 if let Err(e) = write_stream_message(writer, &ExecuteStreamMessage::Keepalive).await {
-                    let _ = child.kill().await;
+                    if let Some(guard) = process_guard.take() {
+                        guard.terminate();
+                    } else {
+                        let _ = child.kill().await;
+                    }
+                    let _ = child.wait().await;
                     return ExecuteResult::exec_failed_after_start(
                         allow_reason,
                         format!("client stream error: {}", e),
@@ -3346,6 +3406,9 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
             .with_exposed_secret_refs(audit.exposed_secret_refs);
         }
     };
+    if let Some(guard) = process_guard {
+        guard.complete();
+    }
 
     ExecuteResult::completed(allow_reason, status.code(), None, None)
         .with_exposed_secret_refs(audit.exposed_secret_refs)
@@ -3468,17 +3531,35 @@ it back unattended unless an operator confirms. A constructible rollback may jus
 borderline recoverable action; it never justifies approving an irreversible or high-risk one, and \
 it does not change your reversibility classification duties.";
 
-/// Merge the session prompt with the revert-availability fragment. Returns
-/// `None` only when neither applies, preserving the cache semantics: any
-/// non-empty append bypasses the decision cache.
-pub(super) fn merge_revert_context(
+pub(super) fn merge_envelope_context(
     session_prompt: Option<String>,
-    revert_supplied: bool,
+    request: &ExecuteRequest,
 ) -> Option<String> {
-    match (session_prompt, revert_supplied) {
-        (sp, false) => sp,
-        (None, true) => Some(REVERT_AVAILABLE_CONTEXT.to_string()),
-        (Some(sp), true) if sp.trim().is_empty() => Some(REVERT_AVAILABLE_CONTEXT.to_string()),
-        (Some(sp), true) => Some(format!("{REVERT_AVAILABLE_CONTEXT}\n\n{sp}")),
+    let Some(revert) = request.revert.as_ref() else {
+        return session_prompt;
+    };
+    let check = revert
+        .confirm_check
+        .as_ref()
+        .map(|check| command_line(&check.binary, &check.args))
+        .unwrap_or_else(|| "none; deadline always rolls back".to_string());
+    let control_path = revert.control_path.as_deref().unwrap_or(
+        "daemon-inferred from the forward, check, rollback, credential, and transport commands",
+    );
+    let window = request
+        .confirm_within_secs
+        .unwrap_or(DEFAULT_CONFIRM_WITHIN_SECS)
+        .clamp(1, MAX_CONFIRM_WITHIN_SECS);
+    let envelope = format!(
+        "{REVERT_AVAILABLE_CONTEXT}\nForward: {}\nRollback: {}\nConfirmation check: {}\nDeadline: {} seconds\nRequired control path: {}\nTreat the entire forward, check, rollback, and control-path chain as one safety decision. HOLD by denying when the forward action can plausibly sever the SSH, API, socket, credential, daemon, or local authority needed to verify or roll back.",
+        command_line(&request.binary, &request.args),
+        command_line(&revert.binary, &revert.args),
+        check,
+        window,
+        control_path
+    );
+    match session_prompt {
+        Some(prompt) if !prompt.trim().is_empty() => Some(format!("{envelope}\n\n{prompt}")),
+        _ => Some(envelope),
     }
 }

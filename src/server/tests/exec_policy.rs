@@ -1654,19 +1654,34 @@ async fn allowed_binary_floor_does_not_permit_shim_dir_recursion() {
     }
 }
 
-/// The revert-availability fragment reaches the evaluator prompt only when a
-/// rollback was supplied under the gate, composes with a session prompt, and
-/// never turns a no-context call into a cache-bypassing one.
 #[test]
-fn revert_context_merges_only_when_supplied() {
-    use crate::server::execute::merge_revert_context;
-    assert_eq!(merge_revert_context(None, false), None);
-    let sp = merge_revert_context(Some("session ctx".to_string()), false);
-    assert_eq!(sp.as_deref(), Some("session ctx"));
-    let with = merge_revert_context(None, true).expect("fragment present");
-    assert!(with.contains("REVERSIBILITY CONTEXT"));
-    let both = merge_revert_context(Some("session ctx".to_string()), true).expect("merged");
-    assert!(both.contains("REVERSIBILITY CONTEXT") && both.ends_with("session ctx"));
+fn containment_context_presents_the_complete_chain_to_the_evaluator() {
+    use crate::server::execute::merge_envelope_context;
+    use crate::server::{CommandSpec, RevertSpec};
+
+    let mut request = basic_request("ssh", vec!["firewall-a".into(), "apply".into()]);
+    request.confirm_within_secs = Some(45);
+    let mut revert = RevertSpec::new("ssh", vec!["firewall-a".into(), "rollback".into()]);
+    revert.confirm_check = Some(CommandSpec {
+        binary: "ssh".into(),
+        args: vec!["firewall-a".into(), "verify".into()],
+    });
+    revert.control_path = Some("brokered SSH to firewall-a".into());
+    request.revert = Some(revert);
+
+    let prompt =
+        merge_envelope_context(Some("session boundary".into()), &request).expect("envelope prompt");
+    for required in [
+        "Forward: ssh firewall-a apply",
+        "Rollback: ssh firewall-a rollback",
+        "Confirmation check: ssh firewall-a verify",
+        "Deadline: 45 seconds",
+        "Required control path: brokered SSH to firewall-a",
+        "can plausibly sever",
+        "session boundary",
+    ] {
+        assert!(prompt.contains(required), "missing {required:?}: {prompt}");
+    }
 }
 
 #[cfg(unix)]

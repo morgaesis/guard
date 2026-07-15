@@ -102,6 +102,20 @@ pub struct Provisional {
     /// agent-supplied `--revert` that was itself evaluated to APPROVE at arm time.
     pub revert_binary: String,
     pub revert_args: Vec<String>,
+    /// Independent command run at the deadline before rollback. Older rows
+    /// omit it and retain the unconditional auto-revert behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm_check_binary: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub confirm_check_args: Vec<String>,
+    /// Evaluator-reviewed authority and transport required by the check and
+    /// rollback. Stored for audit and operator inspection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_path: Option<String>,
+    /// Stable audit-safe attribution for lifecycle notifications. The bearer
+    /// token itself is never persisted in the provisional row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_fingerprint: Option<String>,
     /// Structured API revert plan for proxy-originated provisionals. Command
     /// reverts leave this unset and use `revert_binary` / `revert_args`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -247,6 +261,24 @@ impl ProvisionalRegistry {
         }
     }
 
+    /// A due confirmation check succeeded after the sweeper claimed the row.
+    pub fn confirm_after_check(&mut self, handle: &str) -> Result<Provisional, GateError> {
+        let p = self
+            .items
+            .get_mut(handle)
+            .ok_or_else(|| GateError::NotFound(handle.to_string()))?;
+        if p.status != ProvisionalStatus::Reverting {
+            return Err(GateError::WrongState {
+                handle: handle.to_string(),
+                detail: format!("already {}", p.status.as_str()),
+            });
+        }
+        p.status = ProvisionalStatus::Confirmed;
+        p.revert_exit = None;
+        p.revert_detail = Some("confirmation check exited successfully".to_string());
+        Ok(p.clone())
+    }
+
     /// Claim a handle for revert (operator-initiated `guard revert`, allowed
     /// from `Armed`/`NeedsOperatorDecision`). Transitions to `Reverting` and
     /// returns the row so the daemon can run the revert.
@@ -355,6 +387,10 @@ mod tests {
             secret_file_keys: BTreeMap::new(),
             revert_binary: "systemctl".into(),
             revert_args: vec!["stop".into(), "app".into()],
+            confirm_check_binary: None,
+            confirm_check_args: Vec::new(),
+            control_path: None,
+            session_fingerprint: None,
             api_revert: None,
             reason: "restart".into(),
             created_unix: 100,

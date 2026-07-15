@@ -18,6 +18,7 @@ use super::gate_runtime::{
     execute_snapshot, finish_revert, forget_proxy_provenance, is_api_proxy_sentinel, now_unix,
     persist_approval, persist_provisional, remove_revert_body,
 };
+use super::runtime::NotifyEvent;
 use super::wire::{
     verb_effective_trust, AdminRequest, AdminResponse, ApprovalSummary, CallerIdentity,
     ExecOutcome, ProvisionalSummary, SecretDetail, ServerStatus, VerbSummary,
@@ -621,7 +622,7 @@ pub(super) async fn handle_admin_request(
                 };
             }
             let reg = config.sessions.read().await;
-            match reg.show(&token, limit.unwrap_or(20)) {
+            match reg.show_with_limits(&token, limit.unwrap_or(20), &config.behavior_limits) {
                 Some(mut report) => {
                     // A self-inspecting holder sees the full grant (rules, prompt,
                     // expiry) but never has its own raw bearer token echoed back.
@@ -1044,6 +1045,15 @@ async fn handle_confirm(
             // persisted body so a secret-bearing snapshot is not left on disk.
             remove_revert_body(&p);
             tracing::info!(target: "guard::audit", "[AUDIT] CONFIRM handle={} caller={}", handle, caller);
+            config.emit_event(NotifyEvent {
+                event: "decision_made",
+                at_unix: now_unix(),
+                handle: Some(handle.to_string()),
+                session_fingerprint: p.session_fingerprint.clone(),
+                reason: Some("operator confirmed provisional".to_string()),
+                status: Some("confirmed".to_string()),
+                behavior: None,
+            });
             AdminResponse::GateAction {
                 message: format!("provisional {} confirmed; change kept", handle),
                 exit_code: None,
@@ -1123,6 +1133,15 @@ async fn handle_approve(
             handle,
             caller
         );
+        config.emit_event(NotifyEvent {
+            event: "decision_made",
+            at_unix: now,
+            handle: Some(handle.to_string()),
+            session_fingerprint: snapshot.session_fingerprint.clone(),
+            reason: Some("operator approved held API request".to_string()),
+            status: Some("approved".to_string()),
+            behavior: None,
+        });
         return AdminResponse::GateAction {
             message: format!("approved held API request {handle}; the proxy is forwarding it"),
             exit_code: None,
@@ -1158,6 +1177,15 @@ async fn handle_approve(
                     .unwrap_or("none"),
                 detail
             );
+            config.emit_event(NotifyEvent {
+                event: "decision_made",
+                at_unix: now,
+                handle: Some(handle.to_string()),
+                session_fingerprint: snapshot.session_fingerprint.clone(),
+                reason: Some(detail.clone()),
+                status: Some("voided".to_string()),
+                behavior: None,
+            });
             return AdminResponse::Error { message: detail };
         }
     }
@@ -1228,6 +1256,22 @@ async fn handle_approve(
     if let Some(a) = config.approvals.read().await.get(handle).cloned() {
         persist_approval(config, &a).await;
     }
+    config.emit_event(NotifyEvent {
+        event: "decision_made",
+        at_unix: now,
+        handle: Some(handle.to_string()),
+        session_fingerprint: snapshot.session_fingerprint.clone(),
+        reason: Some(message.clone()),
+        status: Some(
+            if exit.is_some() {
+                "approved"
+            } else {
+                "exec_failed"
+            }
+            .to_string(),
+        ),
+        behavior: None,
+    });
     AdminResponse::GateAction {
         message,
         exit_code: exit,
@@ -1328,6 +1372,15 @@ async fn handle_deny(
                 caller,
                 session_fingerprint.as_deref().unwrap_or("none")
             );
+            config.emit_event(NotifyEvent {
+                event: "decision_made",
+                at_unix: now,
+                handle: Some(handle.to_string()),
+                session_fingerprint,
+                reason: Some("operator denied held command".to_string()),
+                status: Some("denied".to_string()),
+                behavior: None,
+            });
             AdminResponse::GateAction {
                 message: format!("held command {} denied", handle),
                 exit_code: None,
