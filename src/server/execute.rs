@@ -31,7 +31,9 @@ use tokio::sync::mpsc;
 #[cfg(unix)]
 use uzers::os::unix::UserExt;
 
-use super::gate_runtime::{binary_allowed, route_gated_allow, GateInputs};
+use super::gate_runtime::{
+    binary_allowed, route_gated_allow, GateInputs, SessionAuthoritySnapshot,
+};
 #[cfg(unix)]
 use super::grants::handle_grant_read;
 #[cfg(unix)]
@@ -395,8 +397,119 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
     command: String,
     source: SessionDecisionSource,
     risk: Option<i32>,
-    reason: String,
+    mut reason: String,
 ) -> ExecuteResult {
+    if let Some(token) = phase.session_token.as_deref() {
+        super::admin::prune_grant_requests(phase.config).await;
+        let now = guard::env::now_unix();
+        let (saved_grant, session_revision, session_expires_at) = {
+            let sessions = phase.config.sessions.read().await;
+            (
+                sessions.saved_grant_for(token),
+                sessions.effective_revision_key(token),
+                sessions.expires_at_for(token).flatten(),
+            )
+        };
+        let delta = crate::grant_profile::GrantRequestDelta {
+            prompt_append: Some(format!(
+                "Evaluate this denied operation within the operator-approved task scope: {command}"
+            )),
+            ..crate::grant_profile::GrantRequestDelta::default()
+        };
+        let candidate = session_revision.as_ref().and_then(|session_revision| {
+            crate::grant_profile::GrantRequest::new(
+                token.to_string(),
+                saved_grant.as_ref().map(|(name, _)| name.clone()),
+                delta,
+                command.clone(),
+            )
+            .ok()
+            .map(|mut request| {
+                request.issued_saved_revision = saved_grant.map(|(_, revision)| revision);
+                request.issued_session_revision = Some(session_revision.clone());
+                if let Some(session_expires_at) = session_expires_at {
+                    request.expires_unix = request.expires_unix.min(session_expires_at);
+                }
+                request
+            })
+        });
+        let (request, created) = {
+            let mut requests = phase.config.grant_requests.write().await;
+            let queue_full = requests.len() >= super::admin::MAX_GRANT_REQUESTS
+                || requests
+                    .values()
+                    .filter(|request| {
+                        request.session_token == token
+                            && request.status == crate::grant_profile::GrantRequestStatus::Pending
+                    })
+                    .count()
+                    >= super::admin::MAX_PENDING_GRANT_REQUESTS_PER_SESSION;
+            if let Some(existing) = requests
+                .values()
+                .find(|request| {
+                    request.session_token == token
+                        && request.status == crate::grant_profile::GrantRequestStatus::Pending
+                        && request.expires_unix > now
+                        && request.justification == command
+                        && request.issued_session_revision == session_revision
+                })
+                .cloned()
+            {
+                (Some(existing), false)
+            } else if queue_full {
+                (None, false)
+            } else if let Some(candidate) = candidate {
+                if super::admin::grant_request_payload_bytes(&candidate)
+                    > super::admin::MAX_GRANT_REQUEST_PAYLOAD_BYTES
+                {
+                    (None, false)
+                } else {
+                    let persisted = if let Some(store) = &phase.config.session_store {
+                        match store.save_grant_request(candidate.clone()).await {
+                            Ok(()) => true,
+                            Err(error) => {
+                                tracing::warn!("failed to persist denial escalation: {}", error);
+                                false
+                            }
+                        }
+                    } else {
+                        true
+                    };
+                    if persisted {
+                        requests.insert(candidate.handle.clone(), candidate.clone());
+                        (Some(candidate), true)
+                    } else {
+                        (None, false)
+                    }
+                }
+            } else {
+                (None, false)
+            }
+        };
+        if let Some(request) = request {
+            reason.push_str(&format!(
+                "; escalation={} next=`guard grant request show {}` operator=`guard grant request approve {}`",
+                request.handle, request.handle, request.handle
+            ));
+            if created {
+                tracing::warn!(
+                    target: "guard::audit",
+                    "[AUDIT] OPERATOR_NOTIFICATION kind=grant_request handle={} session={}",
+                    request.handle,
+                    audit_session_fingerprint(Some(token))
+                );
+                phase.config.emit_event(NotifyEvent {
+                    event: "grant_request_created",
+                    at_unix: guard::env::now_unix(),
+                    handle: Some(request.handle.clone()),
+                    session_fingerprint: Some(audit_session_fingerprint(Some(token))),
+                    reason: Some("session command denied; grant expansion requested".to_string()),
+                    status: Some("pending".to_string()),
+                    behavior: None,
+                });
+            }
+        }
+    }
     log_audit_policy_for_request(phase.config, phase.caller, request, false, &reason);
     let _ = write_policy_decision(
         phase.stream_output,
@@ -464,6 +577,23 @@ async fn route_allow_and_record<W: AsyncWrite + Unpin>(
     )
     .await;
     result
+}
+
+async fn capture_session_authority(
+    config: &ServerConfig,
+    request: &ExecuteRequest,
+) -> Result<Option<SessionAuthoritySnapshot>, String> {
+    let Some(token) = request.session_token.as_deref() else {
+        return Ok(None);
+    };
+    config
+        .sessions
+        .read()
+        .await
+        .authority_snapshot(token)
+        .map(SessionAuthoritySnapshot::from)
+        .map(Some)
+        .ok_or_else(|| "session expired or was revoked before execution routing".to_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -627,6 +757,7 @@ async fn resolve_verb_context<W: AsyncWrite + Unpin>(
         let overridden = baseline_override_applies(
             scope,
             effective_action,
+            matched.sticky,
             matched.override_marker.as_deref(),
             &override_markers,
         );
@@ -643,10 +774,12 @@ async fn resolve_verb_context<W: AsyncWrite + Unpin>(
 fn baseline_override_applies(
     scope: VerbMatchScope,
     action: CoverageAction,
+    sticky: bool,
     required_marker: Option<&str>,
     granted_markers: &BTreeSet<String>,
 ) -> bool {
     scope == VerbMatchScope::Baseline
+        && !sticky
         && matches!(action, CoverageAction::Evaluate | CoverageAction::Deny)
         && required_marker.is_some_and(|marker| granted_markers.contains(marker))
 }
@@ -680,6 +813,7 @@ fn resolve_scoped_matches(
             if has_session {
                 matched.scope == VerbMatchScope::Session
                     || (matched.scope == VerbMatchScope::Baseline
+                        && (matched.matched.sticky || matched.matched.override_marker.is_some())
                         && matches!(
                             matched.effective_action,
                             CoverageAction::Evaluate | CoverageAction::Deny
@@ -1029,6 +1163,7 @@ mod verb_resolution_tests {
                 cell: cell.to_string(),
                 action,
                 override_marker: marker.map(str::to_string),
+                sticky: false,
                 features: features
                     .iter()
                     .map(|feature| (*feature).to_string())
@@ -1131,18 +1266,21 @@ mod verb_resolution_tests {
         assert!(baseline_override_applies(
             VerbMatchScope::Baseline,
             CoverageAction::Evaluate,
+            false,
             Some("operator:apply"),
             &granted,
         ));
         assert!(!baseline_override_applies(
             VerbMatchScope::Baseline,
             CoverageAction::Evaluate,
+            false,
             Some("operator:other"),
             &granted,
         ));
         assert!(!baseline_override_applies(
             VerbMatchScope::Session,
             CoverageAction::Deny,
+            false,
             Some("operator:apply"),
             &granted,
         ));
@@ -1574,6 +1712,20 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
                     // bypass the consequence gate or any spawn-time invariant:
                     // absent a matched verb class, consequence mode holds
                     // fail-closed as unclassified.
+                    let authority = match capture_session_authority(config, &request).await {
+                        Ok(authority) => authority,
+                        Err(reason) => {
+                            return Err(deny_and_record(
+                                phase,
+                                &request,
+                                command_line.to_string(),
+                                SessionDecisionSource::SessionDeny,
+                                None,
+                                reason,
+                            )
+                            .await)
+                        }
+                    };
                     let inputs = GateInputs {
                         reason,
                         risk: Some(0),
@@ -1581,6 +1733,7 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
                         revert_preauthorized: verb_ctx.is_some(),
                         verb: verb_ctx.clone(),
                         bypass: false,
+                        authority,
                     };
                     let result = route_allow_and_record(
                         phase,
@@ -1596,7 +1749,8 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
             }
         }
         if static_only && !force_evaluate {
-            let reason = "session static-only: no matching session allow rule".to_string();
+            let reason =
+                "session policy-only mode: command is outside active verb coverage".to_string();
             return Err(deny_and_record(
                 phase,
                 &request,
@@ -1707,6 +1861,20 @@ async fn try_static_fast_allow<W: AsyncWrite + Unpin>(
                     format!("client stream error: {}", e),
                 ));
             }
+            let authority = match capture_session_authority(config, &request).await {
+                Ok(authority) => authority,
+                Err(reason) => {
+                    return Err(deny_and_record(
+                        phase,
+                        &request,
+                        command_line.to_string(),
+                        SessionDecisionSource::SessionDeny,
+                        None,
+                        reason,
+                    )
+                    .await)
+                }
+            };
             let inputs = GateInputs {
                 reason,
                 risk: Some(0),
@@ -1714,6 +1882,7 @@ async fn try_static_fast_allow<W: AsyncWrite + Unpin>(
                 revert_preauthorized: false,
                 verb: None,
                 bypass: true,
+                authority,
             };
             return Err(route_allow_and_record(
                 phase,
@@ -1735,7 +1904,21 @@ async fn try_static_fast_allow<W: AsyncWrite + Unpin>(
 async fn resolve_session_prompt(config: &ServerConfig, request: &ExecuteRequest) -> Option<String> {
     let session_prompt = if let Some(ref token) = request.session_token {
         let reg = config.sessions.read().await;
-        reg.prompt_append_for(token)
+        let revision = reg.effective_revision_key(token)?;
+        let mode = reg.evaluation_mode_for(token).unwrap_or_default();
+        let mut sections = vec![format!(
+            "[GUARD AUTHORIZATION CONTEXT]\neffective_grant_revision={revision}\nevaluation_mode={mode}"
+        )];
+        if mode == crate::grant_profile::EvaluationMode::ReadOnly {
+            sections.push(
+                "Allow read-only inspection. Deny mutations unless an activated session verb already preauthorized the exact typed operation."
+                    .to_string(),
+            );
+        }
+        if let Some(prompt) = reg.prompt_append_for(token) {
+            sections.push(prompt);
+        }
+        Some(sections.join("\n\n"))
     } else {
         None
     };
@@ -1780,6 +1963,20 @@ async fn try_trusted_verb_allow<W: AsyncWrite + Unpin>(
                     format!("client stream error: {}", e),
                 ));
             }
+            let authority = match capture_session_authority(phase.config, &request).await {
+                Ok(authority) => authority,
+                Err(reason) => {
+                    return Err(deny_and_record(
+                        phase,
+                        &request,
+                        command_line.to_string(),
+                        SessionDecisionSource::SessionDeny,
+                        None,
+                        reason,
+                    )
+                    .await)
+                }
+            };
             let inputs = GateInputs {
                 reason,
                 risk: Some(0),
@@ -1787,6 +1984,7 @@ async fn try_trusted_verb_allow<W: AsyncWrite + Unpin>(
                 revert_preauthorized: true,
                 verb: Some(vc),
                 bypass: false,
+                authority,
             };
             return Err(route_allow_and_record(
                 phase,
@@ -1817,12 +2015,23 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
 ) -> ExecuteResult {
     let config = phase.config;
     let session_token = phase.session_token.clone();
-    let session_prompt_active = session_prompt
-        .as_deref()
-        .map(|prompt| !prompt.trim().is_empty())
-        .unwrap_or(false);
+    let session_prompt_active = session_prompt.is_some();
     let evaluation_prompt = evaluation_context_prompt(&request, session_prompt);
-    let eval_result = if evaluation_prompt.is_some() && !session_prompt_active {
+    let evaluated_authority = match capture_session_authority(config, &request).await {
+        Ok(authority) => authority,
+        Err(reason) => {
+            return deny_and_record(
+                phase,
+                &request,
+                command_line,
+                SessionDecisionSource::SessionDeny,
+                None,
+                reason,
+            )
+            .await
+        }
+    };
+    let eval_result = if evaluation_prompt.is_some() {
         config
             .evaluator
             .evaluate_with_cacheable_context(
@@ -1991,6 +2200,7 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
                 revert_preauthorized: verb_ctx.is_some(),
                 verb: verb_ctx,
                 bypass,
+                authority: evaluated_authority,
             };
             route_allow_and_record(
                 phase,
@@ -2062,14 +2272,14 @@ pub(super) fn validate_session_exact_rule_candidate(
     }
     if args.len() > SESSION_EXACT_RULE_MAX_ARGS {
         return Err(format!(
-            "appeal command has too many arguments for a durable exact rule (max {})",
+            "appeal command has too many arguments for durable exact coverage (max {})",
             SESSION_EXACT_RULE_MAX_ARGS
         ));
     }
     for arg in args {
         if arg.len() > SESSION_EXACT_RULE_MAX_ARG_LEN {
             return Err(format!(
-                "appeal argument is too long for a durable exact rule (max {} bytes)",
+                "appeal argument is too long for durable exact coverage (max {} bytes)",
                 SESSION_EXACT_RULE_MAX_ARG_LEN
             ));
         }
@@ -2097,10 +2307,27 @@ pub(super) fn allow_session_auto_amend_candidate(
         return Err(reason);
     }
     let command = command_line(binary, args);
-    if crate::grant_rules::looks_dangerous_static_command(&command) {
+    if looks_dangerous_appeal_command(&command) {
         return Err("command contains shell control or sensitive material".to_string());
     }
     Ok(())
+}
+
+fn looks_dangerous_appeal_command(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    lower.contains(';')
+        || lower.contains('|')
+        || lower.contains("&&")
+        || lower.contains("||")
+        || lower.contains('>')
+        || lower.contains('<')
+        || lower.contains('`')
+        || lower.contains("$(")
+        || lower.contains(" rm -rf")
+        || lower.starts_with("rm -rf")
+        || lower.contains("/etc/shadow")
+        || lower.contains(" secret")
+        || lower.contains(" secrets")
 }
 
 pub(super) fn deny_session_auto_amend_candidate(
@@ -2185,10 +2412,10 @@ async fn maybe_auto_amend_session_after_llm(
             let rule = command_line(binary, args);
             match decision {
                 SessionAmendment::Allow => {
-                    Some(format!("Session auto-amended exact allow `{rule}`."))
+                    Some(format!("Session recorded exact allow coverage `{rule}`."))
                 }
                 SessionAmendment::Deny => {
-                    Some(format!("Session auto-amended exact deny `{rule}`."))
+                    Some(format!("Session recorded exact deny coverage `{rule}`."))
                 }
             }
         }
@@ -2227,7 +2454,7 @@ async fn maybe_promote_deny_shape(
     };
     let hint = (outcome.denials >= outcome.required_denials).then(|| {
         format!(
-            "guard has denied {} similar {} commands; if this access is needed, ask your operator to broaden the session grant or add a profile",
+            "guard has denied {} similar {} commands; if this access is needed, use the escalation handle to request a saved-grant or verb amendment",
             outcome.denials, binary
         )
     });
@@ -2366,16 +2593,14 @@ async fn maybe_promote_allow_verb(
 async fn learning_notice(config: &ServerConfig, outcome: &LearningOutcome) -> Option<String> {
     let mut notice = if outcome.is_candidate {
         format!(
-            "Learned-rule candidate `{}` for `{}` reached {} approvals. This does NOT skip the \
-             LLM by itself; an operator can promote it with: guard verb create --prompt \
-             \"allow exactly: {}\" --binary {}.",
-            outcome.pattern, outcome.service, outcome.approvals, outcome.pattern, outcome.service
+            "Verb evidence for `{}` on `{}` reached {} approvals; automatic typed promotion evaluates coverage evidence and boundary probes without routine operator review.",
+            outcome.pattern, outcome.service, outcome.approvals
         )
     } else if let Some(reason) = &outcome.skipped_reason {
-        format!("Learned-rule skip: {reason}.")
+        format!("Verb evidence not promotable: {reason}.")
     } else {
         format!(
-            "Learned-rule candidate `{}` for `{}` ({}/{} approvals).",
+            "Verb evidence `{}` for `{}` ({}/{} approvals).",
             outcome.pattern, outcome.service, outcome.approvals, outcome.required_approvals
         )
     };
@@ -2777,6 +3002,7 @@ pub(super) fn permission_denied_path(output: &str) -> Option<String> {
 /// deny-list, session rules, evaluator, pinned TTL ACL, full audit) and retry
 /// the command. A denied or failed grant returns the original failure
 /// untouched; each round must unblock a new path or the loop stops.
+#[allow(dead_code)]
 pub(super) async fn exec_with_read_grant_retry<W: AsyncWrite + Unpin>(
     request: ExecuteRequest,
     config: &ServerConfig,
@@ -2786,9 +3012,33 @@ pub(super) async fn exec_with_read_grant_retry<W: AsyncWrite + Unpin>(
     stream_output: bool,
     stream_writer: &mut W,
 ) -> ExecuteResult {
+    exec_with_read_grant_retry_with_secret_authority(
+        request,
+        config,
+        caller,
+        allow_reason,
+        depth,
+        stream_output,
+        stream_writer,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn exec_with_read_grant_retry_with_secret_authority<W: AsyncWrite + Unpin>(
+    request: ExecuteRequest,
+    config: &ServerConfig,
+    caller: &CallerIdentity,
+    allow_reason: String,
+    depth: u32,
+    stream_output: bool,
+    stream_writer: &mut W,
+    authority: Option<Option<Vec<String>>>,
+) -> ExecuteResult {
     #[cfg(not(unix))]
     {
-        exec_after_approval(
+        exec_after_approval_with_secret_authority(
             request,
             config,
             caller,
@@ -2796,12 +3046,13 @@ pub(super) async fn exec_with_read_grant_retry<W: AsyncWrite + Unpin>(
             depth,
             stream_output,
             stream_writer,
+            authority,
         )
         .await
     }
     #[cfg(unix)]
     {
-        let mut result = exec_after_approval(
+        let mut result = exec_after_approval_with_secret_authority(
             request.clone(),
             config,
             caller,
@@ -2809,6 +3060,7 @@ pub(super) async fn exec_with_read_grant_retry<W: AsyncWrite + Unpin>(
             depth,
             stream_output,
             stream_writer,
+            authority.clone(),
         )
         .await;
         let mut granted: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -2854,7 +3106,7 @@ pub(super) async fn exec_with_read_grant_retry<W: AsyncWrite + Unpin>(
                 path,
                 AUTO_READ_GRANT_TTL_SECS
             );
-            result = exec_after_approval(
+            result = exec_after_approval_with_secret_authority(
                 request.clone(),
                 config,
                 caller,
@@ -2862,6 +3114,7 @@ pub(super) async fn exec_with_read_grant_retry<W: AsyncWrite + Unpin>(
                 depth,
                 stream_output,
                 stream_writer,
+                authority.clone(),
             )
             .await;
         }
@@ -2869,6 +3122,7 @@ pub(super) async fn exec_with_read_grant_retry<W: AsyncWrite + Unpin>(
     }
 }
 
+#[allow(dead_code)]
 pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
     request: ExecuteRequest,
     config: &ServerConfig,
@@ -2877,6 +3131,32 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
     depth: u32,
     stream_output: bool,
     stream_writer: &mut W,
+) -> ExecuteResult {
+    exec_after_approval_with_secret_authority(
+        request,
+        config,
+        caller,
+        allow_reason,
+        depth,
+        stream_output,
+        stream_writer,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn exec_after_approval_with_secret_authority<W: AsyncWrite + Unpin>(
+    request: ExecuteRequest,
+    config: &ServerConfig,
+    caller: &CallerIdentity,
+    allow_reason: String,
+    depth: u32,
+    stream_output: bool,
+    stream_writer: &mut W,
+    // `None` consults the live session. `Some(None)` is unrestricted and
+    // `Some(Some(selectors))` replays the immutable saved-grant entitlement.
+    authority: Option<Option<Vec<String>>>,
 ) -> ExecuteResult {
     if config.dry_run {
         tracing::info!(
@@ -2920,6 +3200,41 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
     exposed_secret_refs.sort();
     exposed_secret_refs.dedup();
     let mut request_env = HashMap::new();
+
+    for secret_name in &exposed_secret_refs {
+        let allowed = match &authority {
+            Some(None) => true,
+            Some(Some(selectors)) => selectors.iter().any(|selector| {
+                selector == secret_name
+                    || selector == "*"
+                    || selector
+                        .strip_suffix('*')
+                        .is_some_and(|prefix| secret_name.starts_with(prefix))
+            }),
+            None => match request.session_token.as_deref() {
+                Some(token) => match config.sessions.read().await.authority_snapshot(token) {
+                    Some((_, None)) => true,
+                    Some((_, Some(selectors))) => selectors.iter().any(|selector| {
+                        selector == secret_name
+                            || selector == "*"
+                            || selector
+                                .strip_suffix('*')
+                                .is_some_and(|prefix| secret_name.starts_with(prefix))
+                    }),
+                    None => false,
+                },
+                None => true,
+            },
+        };
+        if !allowed {
+            return ExecuteResult::exec_failed(
+                    allow_reason,
+                    format!(
+                        "saved grant does not entitle secret '{secret_name}'; next: guard grant request submit --prompt 'allow secret {secret_name}' --secret {secret_name}"
+                    ),
+                );
+        }
+    }
 
     for key in request
         .env

@@ -40,6 +40,18 @@ pub struct SecretBinding {
     pub salt: String,
     /// env-var -> hex SHA-256(salt-bytes, 0x00, value-bytes).
     pub hashes: BTreeMap<String, String>,
+    /// Secret-store names injected by the tool configuration. `None` marks a
+    /// legacy hold that did not capture tool-level secret provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_hashes: Option<BTreeMap<String, ToolSecretBinding>>,
+}
+
+/// Secret reference and value digest bound to one tool-configured environment
+/// variable at hold time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
+pub struct ToolSecretBinding {
+    pub secret_name: String,
+    pub hash: String,
 }
 
 /// The immutable execution inputs an approval is bound to. Stored at enqueue and
@@ -69,6 +81,14 @@ pub struct ApprovalSnapshot {
         skip_serializing_if = "Option::is_none"
     )]
     pub session_fingerprint: Option<String>,
+    /// Revision of the issued session at hold time. A changed or revoked live
+    /// session voids approval of the forward command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_revision: Option<String>,
+    /// Saved-grant secret selectors captured at hold time. `None` means the
+    /// session was unrestricted; `Some([])` means no secret is entitled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_entitlements: Option<Vec<String>>,
     /// env-var -> secret-key mapping materialized as child-lifetime files.
     #[serde(default)]
     pub secret_file_keys: BTreeMap<String, String>,
@@ -437,6 +457,8 @@ mod tests {
             env: BTreeMap::new(),
             secret_keys: BTreeMap::new(),
             session_fingerprint: None,
+            session_revision: None,
+            secret_entitlements: None,
             secret_file_keys: BTreeMap::new(),
             verb_name: None,
             verb_params: BTreeMap::new(),

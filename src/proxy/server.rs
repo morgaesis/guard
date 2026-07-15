@@ -555,27 +555,39 @@ impl ApiProxy {
                 return self.status_resp(StatusCode::FORBIDDEN, reason, "Forbidden");
             }
         };
-        let session_context = if let Some(token) = session_token.as_deref() {
-            let Some(sink) = self.session_sink.get() else {
-                return self.status_resp(
-                    StatusCode::FORBIDDEN,
-                    "guard api-proxy: session attribution is unavailable",
-                    "Forbidden",
-                );
-            };
-            match sink.resolve(token).await {
-                Some(context) => Some(context),
-                None => {
+        let session_context =
+            if let Some(token) = session_token.as_deref() {
+                let Some(sink) = self.session_sink.get() else {
                     return self.status_resp(
                         StatusCode::FORBIDDEN,
-                        "guard api-proxy: unknown or expired session",
+                        "guard api-proxy: session attribution is unavailable",
                         "Forbidden",
-                    )
+                    );
+                };
+                match sink.resolve(token).await {
+                    Some(context) => {
+                        if context.secret_entitlements.as_ref().is_some_and(|names| {
+                            !names.iter().any(|name| name == &self.credential_ref)
+                        }) {
+                            return self.status_resp(
+                            StatusCode::FORBIDDEN,
+                            "guard api-proxy: session is not entitled to this upstream credential",
+                            "Forbidden",
+                        );
+                        }
+                        Some(context)
+                    }
+                    None => {
+                        return self.status_resp(
+                            StatusCode::FORBIDDEN,
+                            "guard api-proxy: unknown or expired session",
+                            "Forbidden",
+                        )
+                    }
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
         if let (Some(token), Some(context)) = (session_token.clone(), session_context.clone()) {
             req.extensions_mut().insert(SessionAuth { token, context });
         }
@@ -1062,11 +1074,11 @@ impl ApiProxy {
             );
         };
         tracing::info!(target: "guard::apiproxy", "HOLD {} ({})", label, reason);
-        let session_fingerprint = req
+        let session_context = req
             .extensions()
             .get::<SessionAuth>()
-            .map(|auth| auth.context.fingerprint.as_str());
-        let mut response = match gate.hold_request(label, reason, session_fingerprint).await {
+            .map(|auth| &auth.context);
+        let mut response = match gate.hold_request(label, reason, session_context).await {
             HoldDecision::Approved { handle } => {
                 // Redaction follows the protocol's classification, not the rule
                 // flag: a secret-material read that passes the gate (allowed or
@@ -1129,11 +1141,11 @@ impl ApiProxy {
             );
         };
         tracing::info!(target: "guard::apiproxy", "HOLD {} ({})", label, reason);
-        let session_fingerprint = parts
+        let session_context = parts
             .extensions
             .get::<SessionAuth>()
-            .map(|auth| auth.context.fingerprint.as_str());
-        let mut response = match gate.hold_request(label, reason, session_fingerprint).await {
+            .map(|auth| &auth.context);
+        let mut response = match gate.hold_request(label, reason, session_context).await {
             HoldDecision::Approved { handle } => {
                 let redact = self.protocol.redactable_read(op);
                 tracing::info!(
@@ -1288,8 +1300,8 @@ impl ApiProxy {
         {
             prepared_snapshot = Some(self.fetch_prior_object(path).await);
         }
-        let session_fingerprint = match self.revalidate_session(&parts).await {
-            Ok(fingerprint) => fingerprint,
+        let session_context = match self.revalidate_session(&parts).await {
+            Ok(context) => context,
             Err(response) => return response,
         };
         if let Some(op) = op.as_ref() {
@@ -1307,7 +1319,7 @@ impl ApiProxy {
                 op,
                 conn_id,
                 prepared_snapshot,
-                session_fingerprint,
+                session_context,
                 created_cleanup,
             )
             .await
@@ -1338,7 +1350,7 @@ impl ApiProxy {
         op: Option<ApiOp>,
         conn_id: u64,
         prepared_snapshot: Option<Option<Vec<u8>>>,
-        session_fingerprint: Option<String>,
+        session_context: Option<ApiSessionContext>,
         created_cleanup: Option<CreatedMatch>,
     ) -> Result<Response<ProxyBody>> {
         // A recoverable write is wrapped in an auto-revert envelope after the
@@ -1509,7 +1521,7 @@ impl ApiProxy {
             let bytes = upstream_resp.bytes().await.context("read write response")?;
             if status.is_success() {
                 if let Some(o) = op.as_ref() {
-                    self.arm_write_revert(o, snapshot, &bytes, conn_id, session_fingerprint)
+                    self.arm_write_revert(o, snapshot, &bytes, conn_id, session_context)
                         .await;
                 }
             }
@@ -1565,7 +1577,7 @@ impl ApiProxy {
     async fn revalidate_session(
         &self,
         parts: &Parts,
-    ) -> Result<Option<String>, Response<ProxyBody>> {
+    ) -> Result<Option<ApiSessionContext>, Response<ProxyBody>> {
         let Some(auth) = parts.extensions.get::<SessionAuth>() else {
             return Ok(None);
         };
@@ -1576,18 +1588,15 @@ impl ApiProxy {
                 "Forbidden",
             ));
         };
-        let valid = sink
-            .resolve(&auth.token)
-            .await
-            .is_some_and(|current| current.fingerprint == auth.context.fingerprint);
-        if !valid {
+        let current = sink.resolve(&auth.token).await;
+        if current.as_ref() != Some(&auth.context) {
             return Err(self.status_resp(
                 StatusCode::FORBIDDEN,
                 "guard api-proxy: session expired, was revoked, or is suspended",
                 "Forbidden",
             ));
         }
-        Ok(Some(auth.context.fingerprint.clone()))
+        Ok(current)
     }
 
     /// Re-read immutable protocol floors and the hot-reloaded explicit policy
@@ -1685,7 +1694,7 @@ impl ApiProxy {
         snapshot: Option<Vec<u8>>,
         response_body: &[u8],
         conn_id: u64,
-        session_fingerprint: Option<String>,
+        session_context: Option<ApiSessionContext>,
     ) {
         let Some(gate) = self.gate.get() else {
             return;
@@ -1703,7 +1712,9 @@ impl ApiProxy {
         };
         let created_key = plan.created.map(|c| CreatedKey {
             conn: conn_id,
-            session_fingerprint: session_fingerprint.clone(),
+            session_fingerprint: session_context
+                .as_ref()
+                .map(|context| context.fingerprint.clone()),
             group: c.group,
             resource: c.resource,
             namespace: c.namespace,
@@ -1714,7 +1725,14 @@ impl ApiProxy {
             .arm_revert(ApiMutation {
                 label: label.clone(),
                 revert: plan.revert,
-                session_fingerprint,
+                session_fingerprint: session_context
+                    .as_ref()
+                    .map(|context| context.fingerprint.clone()),
+                session_revision: session_context
+                    .as_ref()
+                    .map(|context| context.revision.clone()),
+                secret_entitlements: session_context
+                    .and_then(|context| context.secret_entitlements),
                 upstream_target: self.upstream.base().to_string(),
                 upstream_identity: self.upstream_identity_fingerprint(),
             })

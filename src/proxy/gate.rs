@@ -35,6 +35,11 @@ pub struct ApiMutation {
     /// Session authority that allowed the mutation, represented only by its
     /// audit fingerprint.
     pub session_fingerprint: Option<String>,
+    /// Issued-session authority captured immediately before the upstream
+    /// mutation. Reverts retain the immutable revision and secret selectors so
+    /// they remain constrained to the authority that admitted the write.
+    pub session_revision: Option<String>,
+    pub secret_entitlements: Option<Vec<String>>,
     /// Canonical upstream target and a secret-free identity fingerprint. A
     /// persisted revert only runs through the exact same endpoint identity.
     pub upstream_target: String,
@@ -91,7 +96,7 @@ pub trait GateSink: Send + Sync {
         &self,
         _label: &str,
         _reason: &str,
-        _session_fingerprint: Option<&str>,
+        _session_context: Option<&ApiSessionContext>,
     ) -> HoldDecision {
         HoldDecision::Denied {
             reason: "no operator-approval queue is attached to this proxy".to_string(),
@@ -207,9 +212,15 @@ impl ApiRequestSummary {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiSessionContext {
     pub fingerprint: String,
+    /// Complete effective revision of the issued authority. This changes for
+    /// every scope edit, not only prompt or expiry changes.
+    pub revision: String,
+    /// Saved-grant secret selectors. `None` means an unrestricted legacy or
+    /// ad-hoc session, while `Some([])` entitles no upstream credential.
+    pub secret_entitlements: Option<Vec<String>>,
     pub intent: Option<String>,
     pub can_override_baseline: bool,
 }

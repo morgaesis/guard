@@ -190,16 +190,17 @@ async fn mcp_end_to_end_initialize_list_call() {
     let list = mcp.rpc(2, "tools/list", json!({})).await;
     let tools = list["result"]["tools"].as_array().expect("tools array");
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
-    // guard_run (gated execution) plus the read-only proxy tools.
     assert_eq!(
-        tools.len(),
-        3,
-        "expected guard_run, guard_verbs, guard_approvals; got {:?}",
-        names
+        names,
+        vec![
+            "guard_run",
+            "guard_verbs",
+            "guard_approvals",
+            "guard_evaluate_batch",
+            "guard_session_status",
+        ],
+        "MCP must advertise the complete intentional tool contract"
     );
-    assert!(names.contains(&"guard_run"), "got {:?}", names);
-    assert!(names.contains(&"guard_verbs"), "got {:?}", names);
-    assert!(names.contains(&"guard_approvals"), "got {:?}", names);
     let guard_run = tools
         .iter()
         .find(|t| t["name"] == "guard_run")

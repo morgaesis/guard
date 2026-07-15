@@ -10,7 +10,8 @@ use std::path::PathBuf;
 use tokio::io::AsyncWrite;
 
 use super::execute::{
-    audit_command_line, audit_session_fingerprint, exec_after_approval, exec_with_read_grant_retry,
+    audit_command_line, audit_session_fingerprint, exec_after_approval_with_secret_authority,
+    exec_with_read_grant_retry_with_secret_authority,
 };
 use super::grants::{delete_read_grant_row, finish_read_grant_revert, persist_read_grant};
 use super::runtime::NotifyEvent;
@@ -20,9 +21,9 @@ use super::wire::{
     VerbContext,
 };
 use super::{
-    ServerConfig, APPROVAL_TTL_SECS, DEFAULT_CONFIRM_WITHIN_SECS, GATING_RETENTION_SECS,
-    MAX_CONFIRM_WITHIN_SECS, MAX_PENDING_GLOBAL, MAX_PENDING_PER_CALLER, REVERT_EXEC_TIMEOUT_SECS,
-    SWEEPER_GRACE_SECS, SWEEPER_TICK_SECS,
+    ServerConfig, DEFAULT_CONFIRM_WITHIN_SECS, GATING_RETENTION_SECS, MAX_CONFIRM_WITHIN_SECS,
+    MAX_PENDING_GLOBAL, MAX_PENDING_PER_CALLER, REVERT_EXEC_TIMEOUT_SECS, SWEEPER_GRACE_SECS,
+    SWEEPER_TICK_SECS,
 };
 
 // ===========================================================================
@@ -404,6 +405,8 @@ impl guard::proxy::GateSink for DaemonGateSink {
             confirm_check_args: Vec::new(),
             control_path: Some(format!("daemon API proxy for protocol {}", self.protocol)),
             session_fingerprint: mutation.session_fingerprint.clone(),
+            session_revision: mutation.session_revision,
+            secret_entitlements: mutation.secret_entitlements,
             reason: mutation.label,
             created_unix: now,
             deadline_unix: now.saturating_add(self.window_secs),
@@ -435,7 +438,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
         &self,
         label: &str,
         reason: &str,
-        session_fingerprint: Option<&str>,
+        session_context: Option<&guard::proxy::ApiSessionContext>,
     ) -> guard::proxy::HoldDecision {
         use guard::proxy::HoldDecision;
         let principal = Some(self.config.daemon_principal.clone());
@@ -454,7 +457,10 @@ impl guard::proxy::GateSink for DaemonGateSink {
             cwd: None,
             env: std::collections::BTreeMap::new(),
             secret_keys: std::collections::BTreeMap::new(),
-            session_fingerprint: session_fingerprint.map(str::to_string),
+            session_fingerprint: session_context.map(|context| context.fingerprint.clone()),
+            session_revision: session_context.map(|context| context.revision.clone()),
+            secret_entitlements: session_context
+                .and_then(|context| context.secret_entitlements.clone()),
             secret_file_keys: std::collections::BTreeMap::new(),
             verb_name: None,
             verb_params: std::collections::BTreeMap::new(),
@@ -469,7 +475,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
             risk: None,
             reversibility: None,
             created_unix: now,
-            ttl_secs: APPROVAL_TTL_SECS,
+            ttl_secs: self.config.approval_ttl_secs,
             status: ApprovalStatus::Pending,
             decided_unix: None,
             decided_reason: None,
@@ -488,15 +494,17 @@ impl guard::proxy::GateSink for DaemonGateSink {
         tracing::info!(target: "guard::audit",
             "[AUDIT] HELD handle={} caller=(api-proxy) session={} api=\"{}\" ttl={}s",
             handle,
-            session_fingerprint.unwrap_or("none"),
+            session_context
+                .map(|context| context.fingerprint.as_str())
+                .unwrap_or("none"),
             label,
-            APPROVAL_TTL_SECS
+            self.config.approval_ttl_secs
         );
         self.config.emit_event(NotifyEvent {
             event: "hold_created",
             at_unix: now,
             handle: Some(handle.clone()),
-            session_fingerprint: session_fingerprint.map(str::to_string),
+            session_fingerprint: session_context.map(|context| context.fingerprint.clone()),
             reason: Some(reason.to_string()),
             status: Some("pending".to_string()),
             behavior: None,
@@ -511,8 +519,13 @@ impl guard::proxy::GateSink for DaemonGateSink {
         // The sweeper expires the row at its TTL and wakes this waiter; the
         // slack past the TTL is a backstop against a missed wakeup, not a
         // second policy timer.
-        let deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_secs(APPROVAL_TTL_SECS.saturating_add(60));
+        let deadline = (self.config.approval_ttl_secs != u64::MAX).then(|| {
+            tokio::time::Instant::now()
+                .checked_add(std::time::Duration::from_secs(
+                    self.config.approval_ttl_secs.saturating_add(60),
+                ))
+                .unwrap_or_else(tokio::time::Instant::now)
+        });
         loop {
             // Register with the notifier before checking status (see
             // `wait_for_decision`): a decision landing between the check and
@@ -543,8 +556,9 @@ impl guard::proxy::GateSink for DaemonGateSink {
                     };
                 }
             }
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
+            let remaining = deadline
+                .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()));
+            if remaining.is_some_and(|remaining| remaining.is_zero()) {
                 // Past TTL plus slack: the sweeper's expiry (or an operator
                 // decision) is authoritative, but nothing woke us. Leave the
                 // row to the sweeper and fail closed.
@@ -553,11 +567,10 @@ impl guard::proxy::GateSink for DaemonGateSink {
                     reason: "expired without operator approval".to_string(),
                 };
             }
-            let _ = tokio::time::timeout(
-                remaining.min(std::time::Duration::from_secs(5)),
-                &mut notified,
-            )
-            .await;
+            let poll = remaining
+                .unwrap_or(std::time::Duration::from_secs(5))
+                .min(std::time::Duration::from_secs(5));
+            let _ = tokio::time::timeout(poll, &mut notified).await;
         }
     }
 
@@ -755,6 +768,42 @@ pub(super) struct GateInputs {
     /// operator-authored deterministic allows (static policy), already vetted and
     /// carrying no reversibility class.
     pub(super) bypass: bool,
+    /// Session authority captured before evaluation or deterministic routing.
+    /// Its revision is rechecked before routing and its immutable entitlements
+    /// govern the forward command, confirmation check, and rollback.
+    pub(super) authority: Option<SessionAuthoritySnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SessionAuthoritySnapshot {
+    pub(super) revision: String,
+    pub(super) secret_entitlements: Option<Vec<String>>,
+}
+
+impl From<(String, Option<Vec<String>>)> for SessionAuthoritySnapshot {
+    fn from((revision, secret_entitlements): (String, Option<Vec<String>>)) -> Self {
+        Self {
+            revision,
+            secret_entitlements,
+        }
+    }
+}
+
+async fn session_authority_is_current(
+    config: &ServerConfig,
+    request: &ExecuteRequest,
+    expected: Option<&SessionAuthoritySnapshot>,
+) -> bool {
+    let Some(token) = request.session_token.as_deref() else {
+        return expected.is_none();
+    };
+    let current = config
+        .sessions
+        .read()
+        .await
+        .authority_snapshot(token)
+        .map(SessionAuthoritySnapshot::from);
+    current.as_ref() == expected
 }
 
 /// Route an approved command through the consequence gate.
@@ -767,9 +816,26 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
     stream_output: bool,
     stream_writer: &mut W,
 ) -> ExecuteResult {
+    if request.session_token.is_some() {
+        let Some(expected) = inputs.authority.as_ref() else {
+            return ExecuteResult::denied(
+                "session authority was not captured before execution routing",
+            );
+        };
+        if !session_authority_is_current(config, &request, Some(expected)).await {
+            return ExecuteResult::denied(
+                "session expired, was revoked, or changed while the command was being evaluated",
+            );
+        }
+    }
+    let secret_authority = inputs
+        .authority
+        .as_ref()
+        .map(|snapshot| snapshot.secret_entitlements.clone());
+
     // Gating off, or an operator-authored static-policy allow: execute directly.
     if !config.gate.is_on() || inputs.bypass {
-        return exec_with_read_grant_retry(
+        return exec_with_read_grant_retry_with_secret_authority(
             request,
             config,
             caller,
@@ -777,6 +843,7 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
             depth,
             stream_output,
             stream_writer,
+            secret_authority,
         )
         .await;
     }
@@ -795,7 +862,7 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
 
     match outcome {
         GateOutcome::ExecuteNow => {
-            exec_with_read_grant_retry(
+            exec_with_read_grant_retry_with_secret_authority(
                 request,
                 config,
                 caller,
@@ -803,6 +870,7 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
                 depth,
                 stream_output,
                 stream_writer,
+                secret_authority,
             )
             .await
         }
@@ -825,7 +893,7 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
                             "{} [held for operator review: containment envelope not validated: {}]",
                             inputs.reason, why
                         );
-                        return hold_for_approval(
+                        return hold_for_approval_with_authority(
                             request,
                             config,
                             caller,
@@ -836,12 +904,13 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
                             inputs.verb,
                             stream_output,
                             stream_writer,
+                            inputs.authority,
                         )
                         .await;
                     }
                 }
             }
-            arm_containment(
+            arm_containment_with_authority(
                 request,
                 config,
                 caller,
@@ -850,11 +919,12 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
                 depth,
                 stream_output,
                 stream_writer,
+                inputs.authority,
             )
             .await
         }
         GateOutcome::Hold => {
-            hold_for_approval(
+            hold_for_approval_with_authority(
                 request,
                 config,
                 caller,
@@ -865,6 +935,7 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
                 inputs.verb,
                 stream_output,
                 stream_writer,
+                inputs.authority,
             )
             .await
         }
@@ -874,6 +945,7 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
 /// Arm a containment envelope: persist the provisional, run the forward command,
 /// then mark it armed with an auto-revert deadline.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(super) async fn arm_containment<W: AsyncWrite + Unpin>(
     request: ExecuteRequest,
     config: &ServerConfig,
@@ -883,6 +955,41 @@ pub(super) async fn arm_containment<W: AsyncWrite + Unpin>(
     depth: u32,
     stream_output: bool,
     stream_writer: &mut W,
+) -> ExecuteResult {
+    let authority = match request.session_token.as_deref() {
+        Some(token) => config
+            .sessions
+            .read()
+            .await
+            .authority_snapshot(token)
+            .map(SessionAuthoritySnapshot::from),
+        None => None,
+    };
+    arm_containment_with_authority(
+        request,
+        config,
+        caller,
+        caller_principal,
+        reason,
+        depth,
+        stream_output,
+        stream_writer,
+        authority,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn arm_containment_with_authority<W: AsyncWrite + Unpin>(
+    request: ExecuteRequest,
+    config: &ServerConfig,
+    caller: &CallerIdentity,
+    caller_principal: Option<PrincipalKey>,
+    reason: String,
+    depth: u32,
+    stream_output: bool,
+    stream_writer: &mut W,
+    authority: Option<SessionAuthoritySnapshot>,
 ) -> ExecuteResult {
     // decide_gate only returns Contain when a revert is present.
     let revert = match request.revert.clone() {
@@ -953,6 +1060,7 @@ pub(super) async fn arm_containment<W: AsyncWrite + Unpin>(
 
     let handle = new_handle();
     let now = now_unix();
+
     // The window is caller-supplied, so cap it: a contained change always
     // auto-reverts within MAX_CONFIRM_WITHIN_SECS even if the caller asks for
     // longer. The caller can still shorten it.
@@ -960,6 +1068,22 @@ pub(super) async fn arm_containment<W: AsyncWrite + Unpin>(
         .confirm_within_secs
         .unwrap_or(DEFAULT_CONFIRM_WITHIN_SECS)
         .clamp(1, MAX_CONFIRM_WITHIN_SECS);
+    if !session_authority_is_current(config, &request, authority.as_ref()).await {
+        return ExecuteResult::denied(
+            "session expired, was revoked, or changed before containment could be armed",
+        );
+    }
+    let (session_revision, secret_entitlements) = match request.session_token.as_deref() {
+        Some(_) => match authority {
+            Some(snapshot) => (snapshot.revision, snapshot.secret_entitlements),
+            None => {
+                return ExecuteResult::denied(
+                    "session expired or was revoked before containment could be armed",
+                )
+            }
+        },
+        None => (String::new(), None),
+    };
     let provisional = Provisional {
         handle: handle.clone(),
         principal: caller_principal,
@@ -997,6 +1121,8 @@ pub(super) async fn arm_containment<W: AsyncWrite + Unpin>(
             .session_token
             .as_deref()
             .map(|token| audit_session_fingerprint(Some(token))),
+        session_revision: (!session_revision.is_empty()).then_some(session_revision),
+        secret_entitlements,
         api_revert: None,
         reason: reason.clone(),
         created_unix: now,
@@ -1013,7 +1139,7 @@ pub(super) async fn arm_containment<W: AsyncWrite + Unpin>(
     config.provisional.write().await.insert(provisional.clone());
 
     let session_fingerprint = audit_session_fingerprint(request.session_token.as_deref());
-    let result = exec_after_approval(
+    let result = exec_after_approval_with_secret_authority(
         request,
         config,
         caller,
@@ -1021,6 +1147,7 @@ pub(super) async fn arm_containment<W: AsyncWrite + Unpin>(
         depth,
         stream_output,
         stream_writer,
+        Some(provisional.secret_entitlements.clone()),
     )
     .await;
     let exposed_secret_refs = result.exposed_secret_refs().to_vec();
@@ -1102,6 +1229,7 @@ pub(super) async fn arm_containment<W: AsyncWrite + Unpin>(
 
 /// Hold an irreversible/uncertain/high-risk command for operator approval.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(super) async fn hold_for_approval<W: AsyncWrite + Unpin>(
     request: ExecuteRequest,
     config: &ServerConfig,
@@ -1113,6 +1241,45 @@ pub(super) async fn hold_for_approval<W: AsyncWrite + Unpin>(
     verb: Option<VerbContext>,
     stream_output: bool,
     stream_writer: &mut W,
+) -> ExecuteResult {
+    let authority = match request.session_token.as_deref() {
+        Some(token) => config
+            .sessions
+            .read()
+            .await
+            .authority_snapshot(token)
+            .map(SessionAuthoritySnapshot::from),
+        None => None,
+    };
+    hold_for_approval_with_authority(
+        request,
+        config,
+        caller,
+        caller_principal,
+        reason,
+        risk,
+        reversibility,
+        verb,
+        stream_output,
+        stream_writer,
+        authority,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn hold_for_approval_with_authority<W: AsyncWrite + Unpin>(
+    request: ExecuteRequest,
+    config: &ServerConfig,
+    caller: &CallerIdentity,
+    caller_principal: Option<PrincipalKey>,
+    reason: String,
+    risk: Option<i32>,
+    reversibility: Option<Reversibility>,
+    verb: Option<VerbContext>,
+    stream_output: bool,
+    stream_writer: &mut W,
+    authority: Option<SessionAuthoritySnapshot>,
 ) -> ExecuteResult {
     if config.dry_run {
         return ExecuteResult::dry_run_gated(
@@ -1130,6 +1297,28 @@ pub(super) async fn hold_for_approval<W: AsyncWrite + Unpin>(
     let handle = new_handle();
     let now = now_unix();
 
+    let tool_secret_sources = {
+        let mut registry = config.tool_registry.write().await;
+        let _ = registry.reload_if_stale();
+        match registry
+            .resolve_env(
+                &request.binary,
+                &config.secrets,
+                caller_principal.as_ref(),
+                caller.user_key().as_deref(),
+            )
+            .await
+        {
+            Ok(resolved) => resolved.secret_sources,
+            Err(error) => {
+                return ExecuteResult::exec_failed(
+                    reason,
+                    format!("approval hold rejected: tool secret resolution failed: {error}"),
+                )
+            }
+        }
+    };
+
     // Secret-value binding: hash each referenced secret value NOW so a
     // same-principal caller cannot swap its mapped values between this hold and
     // the operator's approval. The binding is MANDATORY when there are secrets
@@ -1139,7 +1328,7 @@ pub(super) async fn hold_for_approval<W: AsyncWrite + Unpin>(
     // (so it would otherwise be unbound) and then creates it with a chosen value
     // before approval. Verification at approve time fails closed on any change.
     let secret_binding = match caller_principal.clone() {
-        Some(principal) if !request.secrets.is_empty() || !request.secret_files.is_empty() => {
+        Some(principal) => {
             let salt = hex_encode(&rand::random::<u128>().to_le_bytes());
             let mut hashes = std::collections::BTreeMap::new();
             for (env_var, secret_name) in request.secrets.iter().chain(&request.secret_files) {
@@ -1149,11 +1338,46 @@ pub(super) async fn hold_for_approval<W: AsyncWrite + Unpin>(
                 };
                 hashes.insert(env_var.clone(), entry);
             }
-            Some(guard::gating::approval::SecretBinding { salt, hashes })
+            let mut tool_hashes = std::collections::BTreeMap::new();
+            for (env_var, secret_name) in tool_secret_sources {
+                let entry = match config.secrets.get(&principal, &secret_name).await {
+                    Ok(Some(value)) => hash_secret_value(&salt, &value),
+                    _ => SECRET_BINDING_UNRESOLVED.to_string(),
+                };
+                tool_hashes.insert(
+                    env_var,
+                    guard::gating::approval::ToolSecretBinding {
+                        secret_name,
+                        hash: entry,
+                    },
+                );
+            }
+            Some(guard::gating::approval::SecretBinding {
+                salt,
+                hashes,
+                tool_hashes: Some(tool_hashes),
+            })
         }
         _ => None,
     };
 
+    if !session_authority_is_current(config, &request, authority.as_ref()).await {
+        return ExecuteResult::denied(
+            "session expired, was revoked, or changed before approval hold creation",
+        );
+    }
+
+    let (session_revision, secret_entitlements) = match request.session_token.as_deref() {
+        Some(_) => match authority {
+            Some(snapshot) => (snapshot.revision, snapshot.secret_entitlements),
+            None => {
+                return ExecuteResult::denied(
+                    "session expired or was revoked before approval hold creation",
+                )
+            }
+        },
+        None => (String::new(), None),
+    };
     let snapshot = ApprovalSnapshot {
         binary: request.binary.clone(),
         args: request.args.clone(),
@@ -1172,6 +1396,8 @@ pub(super) async fn hold_for_approval<W: AsyncWrite + Unpin>(
             .session_token
             .as_deref()
             .map(|token| audit_session_fingerprint(Some(token))),
+        session_revision: (!session_revision.is_empty()).then_some(session_revision),
+        secret_entitlements,
         secret_file_keys: request
             .secret_files
             .iter()
@@ -1190,7 +1416,7 @@ pub(super) async fn hold_for_approval<W: AsyncWrite + Unpin>(
         risk,
         reversibility,
         created_unix: now,
-        ttl_secs: APPROVAL_TTL_SECS,
+        ttl_secs: config.approval_ttl_secs,
         status: ApprovalStatus::Pending,
         decided_unix: None,
         decided_reason: None,
@@ -1210,7 +1436,7 @@ pub(super) async fn hold_for_approval<W: AsyncWrite + Unpin>(
         risk,
         reversibility.map(|r| r.as_str()),
         audit_command_line(&request.binary, &request.args),
-        APPROVAL_TTL_SECS
+        config.approval_ttl_secs
     );
     config.emit_event(NotifyEvent {
         event: "hold_created",
@@ -1244,7 +1470,11 @@ async fn wait_for_decision<W: AsyncWrite + Unpin>(
     stream_output: bool,
     stream_writer: &mut W,
 ) -> ExecuteResult {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
+    let deadline = (wait_secs != u64::MAX).then(|| {
+        tokio::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(wait_secs))
+            .unwrap_or_else(tokio::time::Instant::now)
+    });
     let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(1));
     loop {
         // Register with the notifier BEFORE checking status: notify_waiters()
@@ -1264,8 +1494,9 @@ async fn wait_for_decision<W: AsyncWrite + Unpin>(
             return ExecuteResult::denied("held command disappeared from the queue");
         }
 
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
+        let remaining = deadline
+            .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()));
+        if remaining.is_some_and(|remaining| remaining.is_zero()) {
             // Still pending at timeout: stays held.
             return ExecuteResult::held(
                 "still awaiting operator approval".to_string(),
@@ -1276,7 +1507,12 @@ async fn wait_for_decision<W: AsyncWrite + Unpin>(
 
         tokio::select! {
             _ = &mut notified => { /* re-check status at loop top */ }
-            _ = tokio::time::sleep(remaining) => { /* timeout: re-check, then held */ }
+            _ = async {
+                match remaining {
+                    Some(remaining) => tokio::time::sleep(remaining).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => { /* timeout: re-check, then held */ }
             _ = keepalive.tick(), if stream_output => {
                 let _ = write_stream_message(stream_writer, &ExecuteStreamMessage::Keepalive).await;
             }
@@ -1331,9 +1567,10 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 /// Salted SHA-256 of a secret value, hex-encoded. The salt and a 0x00 domain
-/// separator ensure the stored digest is not a plain hash of the value, so a
-/// persisted binding does not expose a brute-forceable fingerprint of the
-/// secret. Used only to detect a value change between hold and approval.
+/// separator ensure the stored digest is not a reusable plain hash of the
+/// value. The persisted salt does not make a weak secret resistant to offline
+/// guessing, so approval state remains daemon-private. Used only to detect a
+/// value change between hold and approval.
 pub(super) fn hash_secret_value(salt_hex: &str, value: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -1357,6 +1594,60 @@ pub(super) async fn execute_snapshot(
                 "approval rejected: binary '{}' is not in the server allow-list",
                 snapshot.binary
             ),
+        );
+    }
+    if let (Some(fingerprint), Some(expected_revision)) = (
+        snapshot.session_fingerprint.as_deref(),
+        snapshot.session_revision.as_deref(),
+    ) {
+        let current = config
+            .sessions
+            .read()
+            .await
+            .effective_revision_for_fingerprint(fingerprint);
+        if current.as_deref() != Some(expected_revision) {
+            return ExecuteResult::exec_failed(
+                reason.to_string(),
+                "approval rejected: the issued session changed or was revoked after hold"
+                    .to_string(),
+            );
+        }
+    }
+
+    let caller = reconstruct_caller(snapshot.principal.clone(), &CallerIdentity::Unknown);
+
+    let current_tool_sources = {
+        let mut registry = config.tool_registry.write().await;
+        let _ = registry.reload_if_stale();
+        match registry
+            .resolve_env(
+                &snapshot.binary,
+                &config.secrets,
+                snapshot.principal.as_ref(),
+                caller.user_key().as_deref(),
+            )
+            .await
+        {
+            Ok(resolved) => resolved.secret_sources,
+            Err(error) => {
+                return ExecuteResult::exec_failed(
+                    reason.to_string(),
+                    format!("approval rejected: failed to re-resolve tool secrets: {error}"),
+                )
+            }
+        }
+    };
+
+    // Legacy holds cannot safely use live secret mappings because no value or
+    // tool-environment binding exists for the operator-reviewed snapshot.
+    if snapshot.secret_binding.is_none()
+        && (!snapshot.secret_keys.is_empty()
+            || !snapshot.secret_file_keys.is_empty()
+            || !current_tool_sources.is_empty())
+    {
+        return ExecuteResult::exec_failed(
+            reason.to_string(),
+            "approval rejected: secrets were not bound by the held snapshot".to_string(),
         );
     }
 
@@ -1419,9 +1710,66 @@ pub(super) async fn execute_snapshot(
                 );
             }
         }
+        let Some(tool_hashes) = binding.tool_hashes.as_ref() else {
+            if !current_tool_sources.is_empty() {
+                return ExecuteResult::exec_failed(
+                    reason.to_string(),
+                    "approval rejected: tool secrets were not bound by the held snapshot"
+                        .to_string(),
+                );
+            }
+            return execute_snapshot_request(config, snapshot, reason, &caller).await;
+        };
+        if current_tool_sources.len() != tool_hashes.len()
+            || current_tool_sources.iter().any(|(env_var, secret_name)| {
+                tool_hashes
+                    .get(env_var)
+                    .is_none_or(|bound| bound.secret_name != *secret_name)
+            })
+        {
+            return ExecuteResult::exec_failed(
+                reason.to_string(),
+                "approval rejected: tool secret mappings changed since the command was held"
+                    .to_string(),
+            );
+        }
+        for bound in tool_hashes.values() {
+            let resolved = match config.secrets.get(&principal, &bound.secret_name).await {
+                Ok(value) => value,
+                Err(error) => {
+                    return ExecuteResult::exec_failed(
+                        reason.to_string(),
+                        format!(
+                            "approval rejected: failed to re-resolve tool secret '{}': {error}",
+                            bound.secret_name
+                        ),
+                    )
+                }
+            };
+            let consistent = match (bound.hash.as_str(), resolved) {
+                (SECRET_BINDING_UNRESOLVED, None) => true,
+                (SECRET_BINDING_UNRESOLVED, Some(_)) => false,
+                (hash, Some(value)) => hash_secret_value(&binding.salt, &value) == hash,
+                (_, None) => false,
+            };
+            if !consistent {
+                return ExecuteResult::exec_failed(
+                    reason.to_string(),
+                    "approval rejected: a tool-configured secret value changed since the command was held"
+                        .to_string(),
+                );
+            }
+        }
     }
+    execute_snapshot_request(config, snapshot, reason, &caller).await
+}
 
-    let caller = reconstruct_caller(snapshot.principal.clone(), &CallerIdentity::Unknown);
+async fn execute_snapshot_request(
+    config: &ServerConfig,
+    snapshot: &ApprovalSnapshot,
+    reason: &str,
+    caller: &CallerIdentity,
+) -> ExecuteResult {
     let request = ExecuteRequest {
         binary: snapshot.binary.clone(),
         args: snapshot.args.clone(),
@@ -1453,14 +1801,15 @@ pub(super) async fn execute_snapshot(
         verb: None,
     };
     let mut sink = tokio::io::sink();
-    exec_after_approval(
+    exec_after_approval_with_secret_authority(
         request,
         config,
-        &caller,
+        caller,
         reason.to_string(),
         0,
         false,
         &mut sink,
+        Some(snapshot.secret_entitlements.clone()),
     )
     .await
 }
@@ -1633,7 +1982,7 @@ async fn run_provisional_revert(config: &ServerConfig, p: &Provisional) -> Execu
         verb: None,
     };
     let mut sink = tokio::io::sink();
-    exec_after_approval(
+    exec_after_approval_with_secret_authority(
         request,
         config,
         &caller,
@@ -1641,11 +1990,12 @@ async fn run_provisional_revert(config: &ServerConfig, p: &Provisional) -> Execu
         0,
         false,
         &mut sink,
+        Some(p.secret_entitlements.clone()),
     )
     .await
 }
 
-async fn run_provisional_check(config: &ServerConfig, p: &Provisional) -> ExecuteResult {
+pub(super) async fn run_provisional_check(config: &ServerConfig, p: &Provisional) -> ExecuteResult {
     let binary = p.confirm_check_binary.as_deref().unwrap_or_default();
     if let Some(reason) = invalid_binary_reason(binary) {
         return ExecuteResult::exec_failed(
@@ -1690,7 +2040,7 @@ async fn run_provisional_check(config: &ServerConfig, p: &Provisional) -> Execut
         ssh_hostkey: None,
     };
     let mut sink = tokio::io::sink();
-    exec_after_approval(
+    exec_after_approval_with_secret_authority(
         request,
         config,
         &caller,
@@ -1698,6 +2048,7 @@ async fn run_provisional_check(config: &ServerConfig, p: &Provisional) -> Execut
         0,
         false,
         &mut sink,
+        Some(p.secret_entitlements.clone()),
     )
     .await
 }

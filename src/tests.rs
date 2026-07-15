@@ -1,5 +1,12 @@
 use super::*;
 
+#[test]
+fn bounded_durations_reject_zero() {
+    assert!(parse_unbounded_secs("0").is_err());
+    assert_eq!(parse_unbounded_secs("1").unwrap(), 1);
+    assert_eq!(parse_unbounded_secs("unbounded").unwrap(), u64::MAX);
+}
+
 fn parse_start(args: &[&str]) -> ServerCommands {
     match MainArgs::parse_from(args) {
         MainArgs::Server(ServerCommands::Start {
@@ -44,8 +51,9 @@ fn parse_start(args: &[&str]) -> ServerCommands {
             system_prompt,
             system_prompt_append,
             gate,
+            approval_ttl,
             verbs,
-            profiles,
+            grants,
             allow_bin,
             child_env,
             api_proxy,
@@ -121,8 +129,9 @@ fn parse_start(args: &[&str]) -> ServerCommands {
             system_prompt,
             system_prompt_append,
             gate,
+            approval_ttl,
             verbs,
-            profiles,
+            grants,
             allow_bin,
             child_env,
             api_proxy,
@@ -571,115 +580,178 @@ fn test_server_start_admin_token_flag() {
 }
 
 #[test]
-fn top_level_grant_parses_prose_and_static_only() {
-    match MainArgs::try_parse_from([
-        "guard",
-        "grant",
-        "tok",
-        "--static-only",
-        "readonly grafana kube access",
-    ]) {
-        Ok(MainArgs::Grant {
+fn saved_grant_issue_parses_canonical_command() {
+    match MainArgs::try_parse_from(["guard", "grant", "issue", "readonly-kube"]) {
+        Ok(MainArgs::Grant(GrantCommands::Issue { name, .. })) => {
+            assert_eq!(name, "readonly-kube");
+        }
+        Ok(_) => panic!("expected saved grant issue"),
+        Err(error) => panic!("expected grant parse, got {error}"),
+    }
+}
+
+#[test]
+fn legacy_grant_prompt_routes_to_session_issue() {
+    let args = preprocess_legacy_grant_args(vec![
+        "guard".to_string(),
+        "grant".to_string(),
+        "allow only --check mode".to_string(),
+    ]);
+    match MainArgs::try_parse_from(args) {
+        Ok(MainArgs::Session(SessionCommands::New { prose, .. })) => {
+            assert_eq!(prose.as_deref(), Some("allow only --check mode"));
+        }
+        Ok(_) => panic!("expected legacy grant prompt to issue a session"),
+        Err(error) => panic!("expected legacy grant prompt to parse, got {error}"),
+    }
+}
+
+#[test]
+fn legacy_grant_token_prompt_routes_to_session_amendment() {
+    let token = "0123456789abcdef0123456789abcdef";
+    let args = preprocess_legacy_grant_args(vec![
+        "guard".to_string(),
+        "grant".to_string(),
+        token.to_string(),
+        "allow only --check mode".to_string(),
+    ]);
+    match MainArgs::try_parse_from(args) {
+        Ok(MainArgs::Session(SessionCommands::Grant {
+            token: parsed_token,
+            prose,
+            ..
+        })) => {
+            assert_eq!(parsed_token, token);
+            assert_eq!(prose.as_deref(), Some("allow only --check mode"));
+        }
+        Ok(_) => panic!("expected legacy token grant to amend a session"),
+        Err(error) => panic!("expected legacy token grant to parse, got {error}"),
+    }
+}
+
+#[test]
+fn legacy_grant_prompt_preserves_value_options() {
+    let args = preprocess_legacy_grant_args(
+        ["guard", "grant", "--ttl", "3600", "bounded work"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    );
+    match MainArgs::try_parse_from(args) {
+        Ok(MainArgs::Session(SessionCommands::New { ttl, prose, .. })) => {
+            assert_eq!(ttl, Some(3600));
+            assert_eq!(prose.as_deref(), Some("bounded work"));
+        }
+        Ok(_) => panic!("expected option-bearing legacy grant to issue a session"),
+        Err(error) => panic!("expected option-bearing legacy grant to parse, got {error}"),
+    }
+}
+
+#[test]
+fn legacy_grant_token_preserves_prompt_option() {
+    let token = "0123456789abcdef0123456789abcdef";
+    let args = preprocess_legacy_grant_args(
+        ["guard", "grant", token, "--prompt", "bounded work"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    );
+    match MainArgs::try_parse_from(args) {
+        Ok(MainArgs::Session(SessionCommands::Grant {
+            token: parsed_token,
+            prompt,
+            ..
+        })) => {
+            assert_eq!(parsed_token, token);
+            assert_eq!(prompt.as_deref(), Some("bounded work"));
+        }
+        Ok(_) => panic!("expected token grant to amend a session"),
+        Err(error) => panic!("expected token grant to parse, got {error}"),
+    }
+}
+
+#[test]
+fn legacy_grant_finds_token_after_value_options() {
+    let token = "0123456789abcdef0123456789abcdef";
+    let args = preprocess_legacy_grant_args(
+        [
+            "guard",
+            "grant",
+            "--ttl",
+            "3600",
             token,
-            prose,
-            static_only,
-            ..
-        }) => {
-            assert_eq!(token.as_deref(), Some("tok"));
-            assert_eq!(prose.as_deref(), Some("readonly grafana kube access"));
-            assert!(static_only);
-        }
-        Ok(_) => panic!("expected top-level grant"),
-        Err(err) => panic!("expected grant parse, got {err}"),
-    }
-}
-
-#[test]
-fn top_level_grant_bare_prose_mints_session() {
-    let command = top_level_grant_to_session_command(
-        Some("readonly grafana kube access".to_string()),
-        None,
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Some(120),
-        None,
-        None,
-        true,
-        false,
-        false,
-        None,
+            "--prompt=bounded work",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
     );
-
-    match command {
-        SessionCommands::New {
-            prose,
+    match MainArgs::try_parse_from(args) {
+        Ok(MainArgs::Session(SessionCommands::Grant {
+            token: parsed_token,
             ttl,
-            static_only,
+            prompt,
             ..
-        } => {
-            assert_eq!(prose.as_deref(), Some("readonly grafana kube access"));
-            assert_eq!(ttl, Some(120));
-            assert!(static_only);
+        })) => {
+            assert_eq!(parsed_token, token);
+            assert_eq!(ttl, Some(3600));
+            assert_eq!(prompt.as_deref(), Some("bounded work"));
         }
-        _ => panic!("expected top-level prose grant to mint a session"),
+        Ok(_) => panic!("expected flags-before-token grant to amend a session"),
+        Err(error) => panic!("expected flags-before-token grant to parse, got {error}"),
     }
 }
 
 #[test]
-fn top_level_grant_token_shaped_word_keeps_token_path() {
-    let command = top_level_grant_to_session_command(
-        Some("0123456789abcdef0123456789abcdef".to_string()),
-        None,
-        vec!["whoami".to_string()],
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        None,
-        None,
-        None,
-        false,
-        false,
-        false,
-        None,
+fn legacy_grant_options_only_issue_a_session() {
+    let args = preprocess_legacy_grant_args(
+        ["guard", "grant", "--ttl=3600", "--auto-amend"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
     );
-
-    match command {
-        SessionCommands::Grant { token, allow, .. } => {
-            assert_eq!(token, "0123456789abcdef0123456789abcdef");
-            assert_eq!(allow, vec!["whoami"]);
+    match MainArgs::try_parse_from(args) {
+        Ok(MainArgs::Session(SessionCommands::New {
+            ttl, auto_amend, ..
+        })) => {
+            assert_eq!(ttl, Some(3600));
+            assert!(auto_amend);
         }
-        _ => panic!("expected token-shaped top-level grant to update a session"),
+        Ok(_) => panic!("expected options-only grant to issue a session"),
+        Err(error) => panic!("expected options-only grant to parse, got {error}"),
     }
 }
 
 #[test]
-fn top_level_grant_plain_word_is_prose_not_token() {
-    // `guard grant readonly` must not target a session literally named
-    // "readonly"; a single word that is not 32 lowercase hex chars is prose.
-    let command = top_level_grant_to_session_command(
-        Some("readonly".to_string()),
-        None,
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        None,
-        None,
-        None,
-        false,
-        false,
-        false,
-        None,
-    );
+fn bare_legacy_grant_issues_a_session() {
+    let args =
+        preprocess_legacy_grant_args(["guard", "grant"].into_iter().map(str::to_string).collect());
+    assert!(matches!(
+        MainArgs::try_parse_from(args),
+        Ok(MainArgs::Session(SessionCommands::New { .. }))
+    ));
+}
 
-    match command {
-        SessionCommands::New { prose, .. } => {
-            assert_eq!(prose.as_deref(), Some("readonly"));
-        }
-        _ => panic!("expected non-token single word to mint a session with prose"),
-    }
+#[test]
+fn legacy_grant_unknown_option_remains_a_parse_error() {
+    let args = preprocess_legacy_grant_args(
+        ["guard", "grant", "--unknown-option", "bounded work"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    );
+    assert!(MainArgs::try_parse_from(args).is_err());
+}
+
+#[test]
+fn canonical_grant_commands_bypass_legacy_preprocessing() {
+    let args = vec![
+        "guard".to_string(),
+        "grant".to_string(),
+        "issue".to_string(),
+        "readonly-kube".to_string(),
+    ];
+    assert_eq!(preprocess_legacy_grant_args(args.clone()), args);
 }
 
 #[test]
@@ -1377,4 +1449,21 @@ fn unknown_top_level_command_does_not_execute_implicitly() {
         .err()
         .unwrap();
     assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
+}
+
+#[test]
+fn wait_approval_accepts_explicit_and_bare_unbounded() {
+    for args in [
+        vec!["guard", "run", "--wait-approval=unbounded", "true"],
+        vec!["guard", "run", "--wait-approval", "--", "true"],
+    ] {
+        assert!(matches!(
+            MainArgs::try_parse_from(args),
+            Ok(MainArgs::Run {
+                wait_approval: Some(u64::MAX),
+                ..
+            })
+        ));
+    }
+    assert!(MainArgs::try_parse_from(["guard", "run", "--wait-approval=0", "true"]).is_err());
 }

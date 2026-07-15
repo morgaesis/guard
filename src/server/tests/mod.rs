@@ -11,14 +11,17 @@ use crate::secrets::{EnvBackend, SecretManager};
 use crate::session::SessionRegistry;
 use crate::tool_config::ToolRegistry;
 use guard::policy::PolicyMode;
-#[cfg(unix)]
 use std::future::Future;
 use std::io::Write;
-use std::sync::{Arc, Mutex};
 #[cfg(unix)]
+use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 use tracing::instrument::WithSubscriber;
-use tracing::subscriber::with_default;
+#[cfg(unix)]
+use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::fmt::MakeWriter;
+#[cfg(unix)]
+use tracing_subscriber::{layer::SubscriberExt, Layer};
 
 use super::ServerConfig;
 
@@ -119,24 +122,13 @@ fn args(list: &[&str]) -> Vec<String> {
     list.iter().map(|s| s.to_string()).collect()
 }
 
-fn capture<F: FnOnce()>(buf: &SharedBuf, f: F) -> String {
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(buf.clone())
-        .with_max_level(tracing::Level::INFO)
-        .with_target(false)
-        .with_ansi(false)
-        .without_time()
-        .finish();
-    with_default(subscriber, f);
-    let bytes = buf.0.lock().unwrap().clone();
-    String::from_utf8_lossy(&bytes).to_string()
-}
+static TRACE_CAPTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-#[cfg(unix)]
 async fn capture_async<F>(buf: &SharedBuf, future: F) -> (F::Output, String)
 where
     F: Future,
 {
+    let _capture_lock = TRACE_CAPTURE_LOCK.lock().await;
     let subscriber = tracing_subscriber::fmt()
         .with_writer(buf.clone())
         .with_max_level(tracing::Level::INFO)
@@ -147,4 +139,30 @@ where
     let output = future.with_subscriber(subscriber).await;
     let bytes = buf.0.lock().unwrap().clone();
     (output, String::from_utf8_lossy(&bytes).to_string())
+}
+
+#[cfg(unix)]
+fn production_audit_buffer() -> SharedBuf {
+    static BUFFER: OnceLock<SharedBuf> = OnceLock::new();
+    BUFFER
+        .get_or_init(|| {
+            let audit = SharedBuf(Arc::new(Mutex::new(Vec::new())));
+            let subscriber = tracing_subscriber::registry()
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(std::io::sink)
+                        .with_ansi(false)
+                        .with_filter(filter_fn(|metadata| metadata.target() != "guard::audit")),
+                )
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(audit.clone())
+                        .with_ansi(false)
+                        .with_filter(filter_fn(|metadata| metadata.target() == "guard::audit")),
+                );
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("install production-shaped test audit subscriber");
+            audit
+        })
+        .clone()
 }

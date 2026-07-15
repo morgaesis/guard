@@ -35,7 +35,26 @@ impl ApiSessionSink for LiveSessionSink {
     async fn resolve(&self, token: &str) -> Option<ApiSessionContext> {
         (token == "live-session").then(|| ApiSessionContext {
             fingerprint: "session-fingerprint".to_string(),
+            revision: "live-session-revision".to_string(),
+            secret_entitlements: None,
             intent: Some("manage development pods".to_string()),
+            can_override_baseline: true,
+        })
+    }
+
+    async fn record(&self, _token: &str, _event: ApiSessionEvent) {}
+}
+
+struct RestrictedCredentialSessionSink;
+
+#[async_trait::async_trait]
+impl ApiSessionSink for RestrictedCredentialSessionSink {
+    async fn resolve(&self, token: &str) -> Option<ApiSessionContext> {
+        (token == "restricted-session").then(|| ApiSessionContext {
+            fingerprint: "restricted-session-fingerprint".to_string(),
+            revision: "restricted-session-revision".to_string(),
+            secret_entitlements: Some(vec!["another-endpoint/token".to_string()]),
+            intent: Some("inspect development pods".to_string()),
             can_override_baseline: true,
         })
     }
@@ -50,6 +69,8 @@ impl ApiSessionSink for H2SessionSink {
     async fn resolve(&self, token: &str) -> Option<ApiSessionContext> {
         (token == "h2-live").then(|| ApiSessionContext {
             fingerprint: "h2-live-authority".to_string(),
+            revision: "h2-live-revision".to_string(),
+            secret_entitlements: None,
             intent: Some("inspect discovery".to_string()),
             can_override_baseline: true,
         })
@@ -68,6 +89,8 @@ impl ApiSessionSink for RecordingSessionSink {
     async fn resolve(&self, token: &str) -> Option<ApiSessionContext> {
         (token == "live-session").then(|| ApiSessionContext {
             fingerprint: "session-fingerprint".to_string(),
+            revision: "live-session-revision".to_string(),
+            secret_entitlements: None,
             intent: Some("manage development pods".to_string()),
             can_override_baseline: true,
         })
@@ -101,6 +124,8 @@ impl ApiSessionSink for BudgetSessionSink {
             .is_ok();
         admitted.then(|| ApiSessionContext {
             fingerprint: "budget-session-authority".to_string(),
+            revision: "budget-session-revision".to_string(),
+            secret_entitlements: None,
             intent: Some("manage development pods".to_string()),
             can_override_baseline: true,
         })
@@ -114,12 +139,14 @@ impl ApiSessionSink for ChangingSessionSink {
     async fn resolve(&self, token: &str) -> Option<ApiSessionContext> {
         let attempt = self.resolutions.fetch_add(1, Ordering::SeqCst);
         (token == "live-then-edited").then(|| ApiSessionContext {
-            fingerprint: if attempt == 0 {
-                "original-session-authority"
+            fingerprint: "stable-audit-fingerprint".to_string(),
+            revision: if attempt == 0 {
+                "original-session-revision"
             } else {
-                "edited-session-authority"
+                "edited-session-revision"
             }
             .to_string(),
+            secret_entitlements: None,
             intent: Some("manage development pods".to_string()),
             can_override_baseline: true,
         })
@@ -822,6 +849,39 @@ async fn guard_session_bearer_is_validated_and_never_forwarded() {
         403,
         "unknown or expired sessions fail closed"
     );
+
+    let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
+    let tls = ProxyTls::generate().expect("tls");
+    let ca_pem = tls.ca_pem().to_string();
+    let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).unwrap();
+    let restricted_port = free_port();
+    let restricted_proxy = Arc::new(
+        ApiProxy::new(
+            format!("127.0.0.1:{restricted_port}").parse().unwrap(),
+            tls,
+            upstream,
+            policy,
+            None,
+        )
+        .with_endpoint_context("cluster-a", "cluster-a/token"),
+    );
+    restricted_proxy.attach_session_sink(Arc::new(RestrictedCredentialSessionSink));
+    tokio::spawn(restricted_proxy.serve());
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let restricted_client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    let restricted = restricted_client
+        .get(format!(
+            "https://127.0.0.1:{restricted_port}/api/v1/namespaces/dev/pods"
+        ))
+        .bearer_auth("restricted-session")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restricted.status(), 403);
+    assert!(restricted.text().await.unwrap().contains("not entitled"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1951,7 +2011,7 @@ impl guard::proxy::GateSink for ApprovingSink {
         &self,
         _label: &str,
         _reason: &str,
-        _session_fingerprint: Option<&str>,
+        _session_context: Option<&ApiSessionContext>,
     ) -> guard::proxy::HoldDecision {
         guard::proxy::HoldDecision::Approved {
             handle: "test-approved".to_string(),
@@ -2056,7 +2116,7 @@ impl guard::proxy::GateSink for CountingSink {
         &self,
         _label: &str,
         _reason: &str,
-        _session_fingerprint: Option<&str>,
+        _session_context: Option<&ApiSessionContext>,
     ) -> guard::proxy::HoldDecision {
         *self.holds.lock().unwrap() += 1;
         guard::proxy::HoldDecision::Approved {
