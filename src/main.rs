@@ -9,7 +9,6 @@ mod client_config;
 mod daemon_client;
 mod defaults;
 mod grant_profile;
-mod grant_rules;
 mod injection;
 mod mcp;
 mod secrets;

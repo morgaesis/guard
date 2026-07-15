@@ -13,9 +13,11 @@
 //! while `session_store.rs` persists grants and bounded interaction
 //! history across daemon restarts.
 
+use crate::grant_profile::{EvaluationMode, GrantRequestDelta};
 use guard::env::now_unix;
 use guard::policy::{Decision, PolicyRule};
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
@@ -40,6 +42,10 @@ pub struct SessionGrant {
     /// evaluate or deny cells. Automatic promotion never writes this field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub override_markers: Vec<String>,
+    /// Saved-grant identity, label, entitlements, and per-session evaluator
+    /// posture. One nested field keeps compatibility migrations atomic.
+    #[serde(default)]
+    pub scope: IssuedGrantScope,
     /// Unix seconds after which this grant is treated as absent.
     pub expires_at: Option<u64>,
     /// Free-form text appended to the LLM system prompt for evaluator
@@ -66,6 +72,20 @@ pub struct SessionGrant {
     /// list` to show grant age.
     #[serde(default)]
     pub granted_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct IssuedGrantScope {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_grant: Option<String>,
+    #[serde(default)]
+    pub saved_revision: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_names: Vec<String>,
+    #[serde(default)]
+    pub evaluation_mode: EvaluationMode,
 }
 
 impl SessionGrant {
@@ -143,6 +163,8 @@ pub struct HistoricalGrant {
     pub activated_verbs: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub override_markers: Vec<String>,
+    #[serde(default)]
+    pub scope: IssuedGrantScope,
     pub granted_at: u64,
     pub expires_at: Option<u64>,
     /// Unix seconds when the grant left the active set.
@@ -183,6 +205,8 @@ pub struct SessionGrantSummary {
     pub activated_verbs: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub override_markers: Vec<String>,
+    #[serde(default)]
+    pub scope: IssuedGrantScope,
     pub expires_at: Option<u64>,
     #[serde(default)]
     pub granted_at: u64,
@@ -438,6 +462,7 @@ impl SessionRegistry {
                 deny_exact: g.deny_exact.clone(),
                 activated_verbs: g.activated_verbs.clone(),
                 override_markers: g.override_markers.clone(),
+                scope: g.scope.clone(),
                 expires_at: g.expires_at,
                 granted_at: g.granted_at,
                 prompt_append: g.prompt_append.clone(),
@@ -485,6 +510,7 @@ impl SessionRegistry {
                     deny_exact: grant.deny_exact.clone(),
                     activated_verbs: grant.activated_verbs.clone(),
                     override_markers: grant.override_markers.clone(),
+                    scope: grant.scope.clone(),
                     expires_at: grant.expires_at,
                     granted_at: grant.granted_at,
                     prompt_append: grant.prompt_append.clone(),
@@ -582,7 +608,115 @@ impl SessionRegistry {
         let Some(grant) = self.grants.get(token) else {
             return false;
         };
-        !grant.is_expired(now_unix()) && grant.static_only
+        !grant.is_expired(now_unix())
+            && (grant.static_only || grant.scope.evaluation_mode == EvaluationMode::PolicyOnly)
+    }
+
+    pub fn evaluation_mode_for(&self, token: &str) -> Option<EvaluationMode> {
+        let grant = self.grants.get(token)?;
+        (!grant.is_expired(now_unix())).then_some(grant.scope.evaluation_mode)
+    }
+
+    pub fn saved_grant_for(&self, token: &str) -> Option<(String, u64)> {
+        let grant = self.grants.get(token)?;
+        if grant.is_expired(now_unix()) {
+            return None;
+        }
+        grant
+            .scope
+            .saved_grant
+            .clone()
+            .map(|name| (name, grant.scope.saved_revision))
+    }
+
+    pub fn secret_names_for(&self, token: &str) -> Vec<String> {
+        self.grants
+            .get(token)
+            .filter(|grant| !grant.is_expired(now_unix()))
+            .map(|grant| grant.scope.secret_names.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn effective_revision_key(&self, token: &str) -> Option<String> {
+        let grant = self.grants.get(token)?;
+        if grant.is_expired(now_unix()) {
+            return None;
+        }
+        let encoded = serde_json::to_vec(grant).ok()?;
+        let digest = sha2::Sha256::digest(encoded);
+        Some(
+            digest[..16]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        )
+    }
+
+    pub fn extend(&mut self, token: &str, ttl_secs: u64) -> Option<u64> {
+        let grant = self.grants.get_mut(token)?;
+        if grant.is_expired(now_unix()) {
+            return None;
+        }
+        let expires_at = now_unix().saturating_add(ttl_secs);
+        grant.expires_at = Some(expires_at);
+        self.revision = self.revision.saturating_add(1);
+        Some(expires_at)
+    }
+
+    pub fn apply_delta(&mut self, token: &str, delta: &GrantRequestDelta) -> Option<bool> {
+        let grant = self.grants.get_mut(token)?;
+        if grant.is_expired(now_unix()) {
+            return None;
+        }
+        let before = serde_json::to_vec(grant).ok()?;
+        grant
+            .activated_verbs
+            .extend(delta.activated_verbs.iter().cloned());
+        grant
+            .override_markers
+            .extend(delta.override_markers.iter().cloned());
+        grant
+            .scope
+            .secret_names
+            .extend(delta.secret_names.iter().cloned());
+        grant.activated_verbs.sort();
+        grant.activated_verbs.dedup();
+        grant.override_markers.sort();
+        grant.override_markers.dedup();
+        grant.scope.secret_names.sort();
+        grant.scope.secret_names.dedup();
+        if let Some(ttl_secs) = delta.ttl_secs {
+            grant.expires_at = Some(now_unix().saturating_add(ttl_secs));
+        }
+        if let Some(prompt) = &delta.prompt_append {
+            grant.prompt_append = Some(prompt.clone());
+        }
+        if let Some(mode) = delta.evaluation_mode {
+            grant.scope.evaluation_mode = mode;
+        }
+        let changed = before != serde_json::to_vec(grant).ok()?;
+        if changed {
+            self.revision = self.revision.saturating_add(1);
+        }
+        Some(changed)
+    }
+
+    pub fn revoke_filtered(&mut self, label: Option<&str>, saved_grant: Option<&str>) -> usize {
+        let tokens = self
+            .grants
+            .iter()
+            .filter(|(_, grant)| {
+                label.is_none_or(|label| grant.scope.label.as_deref() == Some(label))
+                    && saved_grant
+                        .is_none_or(|name| grant.scope.saved_grant.as_deref() == Some(name))
+            })
+            .map(|(token, _)| token.clone())
+            .collect::<Vec<_>>();
+        let mut revoked = 0;
+        for token in tokens {
+            revoked += usize::from(self.revoke(&token));
+        }
+        revoked
     }
 
     pub fn auto_amend_for(&self, token: &str) -> bool {
@@ -788,6 +922,7 @@ fn historical(
         deny_exact: grant.deny_exact,
         activated_verbs: grant.activated_verbs,
         override_markers: grant.override_markers,
+        scope: grant.scope,
         granted_at: grant.granted_at,
         expires_at: grant.expires_at,
         ended_at,
@@ -822,6 +957,7 @@ mod tests {
                 deny_exact: Vec::new(),
                 activated_verbs: Vec::new(),
                 override_markers: Vec::new(),
+                scope: Default::default(),
                 expires_at: None,
                 granted_at: 0,
                 prompt_append: None,
@@ -972,6 +1108,7 @@ mod tests {
                 deny_exact: Vec::new(),
                 activated_verbs: Vec::new(),
                 override_markers: Vec::new(),
+                scope: Default::default(),
                 expires_at: Some(1),
                 granted_at: 0, // 1970-01-01 +1s
                 prompt_append: None,
@@ -1003,6 +1140,7 @@ mod tests {
                 deny_exact: Vec::new(),
                 activated_verbs: Vec::new(),
                 override_markers: Vec::new(),
+                scope: Default::default(),
                 expires_at: None,
                 granted_at: 0,
                 prompt_append: Some("session is restoring a backup".to_string()),
@@ -1030,6 +1168,7 @@ mod tests {
                 deny_exact: Vec::new(),
                 activated_verbs: Vec::new(),
                 override_markers: Vec::new(),
+                scope: Default::default(),
                 expires_at: Some(1),
                 granted_at: 0,
                 prompt_append: Some("ignored".to_string()),
@@ -1053,6 +1192,7 @@ mod tests {
                 deny_exact: Vec::new(),
                 activated_verbs: Vec::new(),
                 override_markers: Vec::new(),
+                scope: Default::default(),
                 expires_at: None,
                 granted_at: 0,
                 prompt_append: None,
@@ -1070,6 +1210,7 @@ mod tests {
                 deny_exact: Vec::new(),
                 activated_verbs: Vec::new(),
                 override_markers: Vec::new(),
+                scope: Default::default(),
                 expires_at: Some(1),
                 granted_at: 0,
                 prompt_append: None,
@@ -1102,6 +1243,7 @@ mod tests {
                 deny_exact: Vec::new(),
                 activated_verbs: Vec::new(),
                 override_markers: Vec::new(),
+                scope: Default::default(),
                 expires_at: None,
                 granted_at: 0,
                 prompt_append: None,
@@ -1139,6 +1281,7 @@ mod tests {
                 deny_exact: Vec::new(),
                 activated_verbs: Vec::new(),
                 override_markers: Vec::new(),
+                scope: Default::default(),
                 expires_at: Some(1),
                 granted_at: 0,
                 prompt_append: None,
@@ -1171,6 +1314,7 @@ mod tests {
                 deny_exact: Vec::new(),
                 activated_verbs: Vec::new(),
                 override_markers: Vec::new(),
+                scope: Default::default(),
                 expires_at: None,
                 granted_at: 0,
                 prompt_append: None,

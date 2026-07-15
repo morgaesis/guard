@@ -1,9 +1,9 @@
-use crate::grant_rules::{compile_session_grant_rules, CompiledGrantRules};
+use crate::grant_profile::EvaluationMode;
 use crate::redact::redact_output;
 use crate::secrets::legacy_sentinel;
 use crate::session::{
-    HistoricalGrant, SessionAmendment, SessionDecision, SessionDecisionSource, SessionExecStatus,
-    SessionGrant, SessionGrantSummary, SessionInteraction, SessionReport,
+    HistoricalGrant, IssuedGrantScope, SessionAmendment, SessionDecision, SessionDecisionSource,
+    SessionExecStatus, SessionGrant, SessionGrantSummary, SessionInteraction, SessionReport,
 };
 use guard::gating::verb::CoverageAction;
 use guard::principal::{scope_eq, PrincipalKey};
@@ -32,11 +32,7 @@ fn merge_unique(target: &mut Vec<String>, additions: Vec<String>) {
     }
 }
 
-fn combine_session_prompt(
-    prompt_append: Option<String>,
-    prose: Option<&str>,
-    _compiled: &CompiledGrantRules,
-) -> Option<String> {
+fn combine_session_prompt(prompt_append: Option<String>, prose: Option<&str>) -> Option<String> {
     let mut sections = Vec::new();
     let prompt_append = prompt_append
         .map(|value| value.trim().to_string())
@@ -384,8 +380,8 @@ pub(super) async fn handle_admin_request(
     match request {
         AdminRequest::SessionGrant {
             token,
-            mut allow,
-            mut deny,
+            allow,
+            deny,
             mut activated_verbs,
             mut override_markers,
             mut ttl_secs,
@@ -405,20 +401,39 @@ pub(super) async fn handle_admin_request(
             // minting an empty (unrestricted) grant. The profile only seeds the
             // same fields an operator would type; the grant is installed on the
             // identical path below, so it is no separate trust boundary.
+            let mut saved_scope = IssuedGrantScope::default();
             let mut profile_prompt: Option<String> = None;
             if let Some(name) = profile.as_deref() {
                 match config.profiles.get(name) {
                     Some(p) => {
-                        merge_unique(&mut allow, p.allow.clone());
-                        merge_unique(&mut deny, p.deny.clone());
-                        merge_unique(&mut activated_verbs, p.activated_verbs.clone());
+                        let generated = p.generated_verb_names();
+                        merge_unique(&mut activated_verbs, p.all_activated_verbs());
                         merge_unique(&mut override_markers, p.override_markers.clone());
                         ttl_secs = ttl_secs.or(p.ttl_secs);
                         profile_prompt = p.prompt_append.clone();
+                        saved_scope = IssuedGrantScope {
+                            label: p.label.clone(),
+                            saved_grant: Some(p.name.clone()),
+                            saved_revision: p.revision,
+                            secret_names: p.secret_names.clone(),
+                            evaluation_mode: p.evaluation_mode,
+                        };
+                        let mut catalog = config.verbs.write().await;
+                        for verb in &p.generated_verbs {
+                            if let Err(error) = catalog.upsert_saved_grant_verb(verb.clone()) {
+                                return AdminResponse::Error {
+                                    message: format!(
+                                        "saved grant '{}' has invalid generated coverage: {}",
+                                        name, error
+                                    ),
+                                };
+                            }
+                        }
+                        debug_assert!(generated.iter().all(|name| activated_verbs.contains(name)));
                     }
                     None => {
                         return AdminResponse::Error {
-                            message: format!("unknown session profile: '{}'", name),
+                            message: format!("unknown saved grant: '{}'", name),
                         };
                     }
                 }
@@ -464,23 +479,24 @@ pub(super) async fn handle_admin_request(
                     }
                 }
             }
-            let compiled = prose
-                .as_deref()
-                .map(compile_session_grant_rules)
-                .unwrap_or_default();
-            merge_unique(&mut allow, compiled.allow.clone());
-            merge_unique(&mut deny, compiled.deny.clone());
+            // Prose is evaluator context. It never creates static complement
+            // denies or broad allow patterns. Legacy explicit --allow/--deny
+            // inputs remain accepted only for compatibility.
             // Fold the profile's evaluator context in with any request/prose prompt.
             let base_prompt = match (prompt_append, profile_prompt) {
                 (Some(request), Some(profile)) => Some(format!("{request}\n\n{profile}")),
                 (some, None) | (None, some) => some,
             };
-            let prompt_append = combine_session_prompt(base_prompt, prose.as_deref(), &compiled);
-            let auto_amend = auto_amend && !static_only;
+            let prompt_append = combine_session_prompt(base_prompt, prose.as_deref());
+            if static_only {
+                saved_scope.evaluation_mode = EvaluationMode::PolicyOnly;
+            }
+            let auto_amend =
+                auto_amend && !matches!(saved_scope.evaluation_mode, EvaluationMode::PolicyOnly);
             let expires_at = ttl_secs.map(|secs| now_unix() + secs);
-            let mut generated_notes = compiled.notes.clone();
+            let mut generated_notes = Vec::new();
             if let Some(name) = profile.as_deref() {
-                generated_notes.push(format!("session minted from profile '{name}'"));
+                generated_notes.push(format!("issued from saved grant '{name}'"));
             }
             let grant = SessionGrant {
                 allow,
@@ -489,6 +505,7 @@ pub(super) async fn handle_admin_request(
                 deny_exact: Vec::new(),
                 activated_verbs,
                 override_markers,
+                scope: saved_scope,
                 expires_at,
                 prompt_append,
                 generated_notes,
@@ -517,8 +534,8 @@ pub(super) async fn handle_admin_request(
                 ttl_secs,
                 static_only,
                 auto_amend,
-                compiled.allow.len(),
-                compiled.deny.len()
+                0,
+                0
             );
             AdminResponse::Ok
         }

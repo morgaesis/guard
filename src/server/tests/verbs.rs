@@ -115,6 +115,7 @@ verbs:
         deny_exact: Vec::new(),
         activated_verbs: vec!["session-apply".to_string()],
         override_markers,
+        scope: Default::default(),
         expires_at: None,
         prompt_append: None,
         generated_notes: Vec::new(),

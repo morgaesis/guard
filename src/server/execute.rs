@@ -2074,10 +2074,27 @@ pub(super) fn allow_session_auto_amend_candidate(
         return Err(reason);
     }
     let command = command_line(binary, args);
-    if crate::grant_rules::looks_dangerous_static_command(&command) {
+    if looks_dangerous_appeal_command(&command) {
         return Err("command contains shell control or sensitive material".to_string());
     }
     Ok(())
+}
+
+fn looks_dangerous_appeal_command(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    lower.contains(';')
+        || lower.contains('|')
+        || lower.contains("&&")
+        || lower.contains("||")
+        || lower.contains('>')
+        || lower.contains('<')
+        || lower.contains('`')
+        || lower.contains("$(")
+        || lower.contains(" rm -rf")
+        || lower.starts_with("rm -rf")
+        || lower.contains("/etc/shadow")
+        || lower.contains(" secret")
+        || lower.contains(" secrets")
 }
 
 pub(super) fn deny_session_auto_amend_candidate(

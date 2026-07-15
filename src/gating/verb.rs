@@ -121,6 +121,36 @@ pub struct VerbCoverageCell {
     /// `evaluate` or `deny` cell. Generated verbs cannot mint these markers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub override_marker: Option<String>,
+    /// Explicit operator boundaries survive regeneration and automatic
+    /// promotion. Generated coverage cannot replace a sticky deny or
+    /// always-evaluate cell.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sticky: bool,
+    /// Evidence and evaluator regime that produced this cell. Hand-authored
+    /// cells may omit provenance; generated cells must carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<CoverageProvenance>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoverageProvenance {
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
+    pub regime_stamp: String,
+    pub prompt_stamp: String,
+    pub model_stamp: String,
+    pub generated_unix: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub probes: Vec<CoverageProbe>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoverageProbe {
+    pub dimension: String,
+    pub args: Vec<String>,
+    pub expected_match: bool,
+    pub observed_match: bool,
 }
 
 /// One concrete reverse match before session/global precedence is resolved.
@@ -219,7 +249,7 @@ pub struct Verb {
     pub promotion_stamp: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct CatalogFile {
     #[serde(default)]
     verbs: Vec<Verb>,
@@ -536,6 +566,84 @@ impl VerbCatalog {
             .and_then(|m| m.modified().ok());
         Ok(())
     }
+
+    /// Install or replace a validated daemon-owned verb without writing the
+    /// operator catalog. Saved grants use this for generated coverage that is
+    /// persisted with the grant definition rather than mixed into the catalog
+    /// file. Names outside the reserved `grant-` namespace cannot be replaced.
+    pub fn upsert_saved_grant_verb(&mut self, verb: Verb) -> Result<()> {
+        validate_verb(&verb)?;
+        if !verb.name.starts_with("grant-") {
+            bail!(
+                "saved-grant verb '{}' must use the reserved 'grant-' prefix",
+                verb.name
+            );
+        }
+        if self
+            .verbs
+            .get(&verb.name)
+            .is_some_and(|existing| !existing.name.starts_with("grant-"))
+        {
+            bail!(
+                "saved-grant verb '{}' collides with catalog state",
+                verb.name
+            );
+        }
+        self.verbs.insert(verb.name.clone(), verb);
+        self.refresh_version()?;
+        Ok(())
+    }
+
+    pub fn remove_saved_grant_verbs(&mut self, grant_name: &str) -> Result<usize> {
+        let prefix = format!("grant-{grant_name}-");
+        let before = self.verbs.len();
+        self.verbs.retain(|name, _| !name.starts_with(&prefix));
+        let removed = before.saturating_sub(self.verbs.len());
+        if removed > 0 {
+            self.refresh_version()?;
+        }
+        Ok(removed)
+    }
+
+    /// Delete an operator catalog verb and atomically adopt the rewritten
+    /// catalog. Saved-grant generated verbs are deleted through their grant.
+    pub fn delete_verb(&mut self, name: &str) -> Result<Verb> {
+        let verb = self
+            .verbs
+            .get(name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("unknown verb: '{}'", name))?;
+        if name.starts_with("grant-") {
+            bail!("delete saved-grant coverage through `guard grant delete`");
+        }
+        let path = self.path.clone().ok_or_else(|| {
+            anyhow::anyhow!("verb catalog is not backed by a file; cannot delete a verb")
+        })?;
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let new_content = compose_removed_catalog(&existing, name)?;
+        let validated = Self::from_yaml(&new_content)
+            .context("deleting this verb would make the catalog invalid")?;
+        std::fs::write(&path, &new_content)
+            .with_context(|| format!("failed to write verb catalog {}", path.display()))?;
+        self.verbs = validated.verbs;
+        self.version = validated.version;
+        self.mtime = std::fs::metadata(&path)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        Ok(verb)
+    }
+
+    fn refresh_version(&mut self) -> Result<()> {
+        let yaml = serde_yaml_ng::to_string(&CatalogFile {
+            verbs: self.verbs.values().cloned().collect(),
+        })
+        .context("failed to fingerprint verb catalog")?;
+        let digest = Sha256::digest(yaml.as_bytes());
+        let mut version_bytes = [0u8; 8];
+        version_bytes.copy_from_slice(&digest[..8]);
+        self.version = u64::from_be_bytes(version_bytes);
+        Ok(())
+    }
 }
 
 /// Compose the new catalog text by adding one verb to the top-level `verbs:`
@@ -576,6 +684,31 @@ fn compose_appended_catalog(existing: &str, verb: &Verb) -> Result<String> {
         map.insert(key, serde_yaml_ng::Value::Sequence(vec![verb_value]));
     } else {
         bail!("the catalog's `verbs` key is not a sequence");
+    }
+    serde_yaml_ng::to_string(&doc).context("failed to serialize the updated catalog")
+}
+
+fn compose_removed_catalog(existing: &str, name: &str) -> Result<String> {
+    let body = existing.strip_prefix('\u{feff}').unwrap_or(existing);
+    let mut doc: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(body).context("the existing verb catalog is not valid YAML")?;
+    let map = doc
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow::anyhow!("verb catalog is not a YAML mapping"))?;
+    let key = serde_yaml_ng::Value::String("verbs".to_string());
+    let Some(serde_yaml_ng::Value::Sequence(verbs)) = map.get_mut(&key) else {
+        bail!("the catalog's `verbs` key is not a sequence");
+    };
+    let before = verbs.len();
+    verbs.retain(|value| {
+        value
+            .as_mapping()
+            .and_then(|verb| verb.get(serde_yaml_ng::Value::String("name".to_string())))
+            .and_then(serde_yaml_ng::Value::as_str)
+            != Some(name)
+    });
+    if verbs.len() == before {
+        bail!("unknown verb: '{}'", name);
     }
     serde_yaml_ng::to_string(&doc).context("failed to serialize the updated catalog")
 }
@@ -1793,6 +1926,8 @@ verbs:
             namespace: None,
             fanout: None,
             override_marker: Some("operator:k-check".to_string()),
+            sticky: true,
+            provenance: None,
         });
         assert!(validate_synthesized_safety(&generated_marker).is_err());
     }

@@ -1,6 +1,6 @@
 use crate::session::{
-    HistoricalGrant, HistoricalStatus, SessionDecisionSource, SessionExactRule, SessionExecStatus,
-    SessionGrant, SessionInteraction, SessionRegistry,
+    HistoricalGrant, HistoricalStatus, IssuedGrantScope, SessionDecisionSource, SessionExactRule,
+    SessionExecStatus, SessionGrant, SessionInteraction, SessionRegistry,
 };
 use anyhow::{Context, Result};
 use guard::gating::approval::Approval;
@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const VACUUM_MIN_PAGES: u64 = 512;
 const VACUUM_MIN_FREE_PAGES: u64 = 128;
 
@@ -83,7 +83,7 @@ impl SessionStore {
         let mut grants = HashMap::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT token, allow_json, deny_json, allow_exact_json, deny_exact_json, activated_verbs_json, override_markers_json, expires_at, prompt_append, generated_notes_json, granted_at, static_only, auto_amend
+                "SELECT token, allow_json, deny_json, allow_exact_json, deny_exact_json, activated_verbs_json, override_markers_json, scope_json, expires_at, prompt_append, generated_notes_json, granted_at, static_only, auto_amend
                  FROM session_grants",
             )?;
             let rows = stmt.query_map([], |row| {
@@ -101,12 +101,13 @@ impl SessionStore {
                         deny_exact: decode_exact_vec(&deny_exact_json)?,
                         activated_verbs: decode_vec(&row.get::<_, String>(5)?)?,
                         override_markers: decode_vec(&row.get::<_, String>(6)?)?,
-                        expires_at: decode_optional_u64(row.get(7)?)?,
-                        prompt_append: row.get(8)?,
-                        generated_notes: decode_vec(&row.get::<_, String>(9)?)?,
-                        granted_at: decode_u64(row.get(10)?)?,
-                        static_only: decode_bool(row.get(11)?)?,
-                        auto_amend: decode_bool(row.get(12)?)?,
+                        scope: decode_scope(&row.get::<_, String>(7)?)?,
+                        expires_at: decode_optional_u64(row.get(8)?)?,
+                        prompt_append: row.get(9)?,
+                        generated_notes: decode_vec(&row.get::<_, String>(10)?)?,
+                        granted_at: decode_u64(row.get(11)?)?,
+                        static_only: decode_bool(row.get(12)?)?,
+                        auto_amend: decode_bool(row.get(13)?)?,
                     },
                 ))
             })?;
@@ -119,7 +120,7 @@ impl SessionStore {
         let mut history = Vec::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT token, allow_json, deny_json, allow_exact_json, deny_exact_json, activated_verbs_json, override_markers_json, granted_at, expires_at, ended_at, status, prompt_append, generated_notes_json, static_only, auto_amend
+                "SELECT token, allow_json, deny_json, allow_exact_json, deny_exact_json, activated_verbs_json, override_markers_json, scope_json, granted_at, expires_at, ended_at, status, prompt_append, generated_notes_json, static_only, auto_amend
                  FROM session_history
                  ORDER BY ended_at ASC, id ASC",
             )?;
@@ -128,7 +129,7 @@ impl SessionStore {
                 let deny_json: String = row.get(2)?;
                 let allow_exact_json: String = row.get(3)?;
                 let deny_exact_json: String = row.get(4)?;
-                let status: String = row.get(10)?;
+                let status: String = row.get(11)?;
                 Ok(HistoricalGrant {
                     token: row.get(0)?,
                     allow: decode_vec(&allow_json)?,
@@ -137,14 +138,15 @@ impl SessionStore {
                     deny_exact: decode_exact_vec(&deny_exact_json)?,
                     activated_verbs: decode_vec(&row.get::<_, String>(5)?)?,
                     override_markers: decode_vec(&row.get::<_, String>(6)?)?,
-                    granted_at: decode_u64(row.get(7)?)?,
-                    expires_at: decode_optional_u64(row.get(8)?)?,
-                    ended_at: decode_u64(row.get(9)?)?,
+                    scope: decode_scope(&row.get::<_, String>(7)?)?,
+                    granted_at: decode_u64(row.get(8)?)?,
+                    expires_at: decode_optional_u64(row.get(9)?)?,
+                    ended_at: decode_u64(row.get(10)?)?,
                     status: decode_historical_status(&status)?,
-                    prompt_append: row.get(11)?,
-                    generated_notes: decode_vec(&row.get::<_, String>(12)?)?,
-                    static_only: decode_bool(row.get(13)?)?,
-                    auto_amend: decode_bool(row.get(14)?)?,
+                    prompt_append: row.get(12)?,
+                    generated_notes: decode_vec(&row.get::<_, String>(13)?)?,
+                    static_only: decode_bool(row.get(14)?)?,
+                    auto_amend: decode_bool(row.get(15)?)?,
                 })
             })?;
             for row in rows {
@@ -209,8 +211,8 @@ impl SessionStore {
         for (token, grant) in snapshot.grants_snapshot() {
             tx.execute(
                 "INSERT INTO session_grants
-                 (token, allow_json, deny_json, allow_exact_json, deny_exact_json, activated_verbs_json, override_markers_json, expires_at, prompt_append, generated_notes_json, granted_at, static_only, auto_amend)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                 (token, allow_json, deny_json, allow_exact_json, deny_exact_json, activated_verbs_json, override_markers_json, scope_json, expires_at, prompt_append, generated_notes_json, granted_at, static_only, auto_amend)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     token,
                     encode_vec(&grant.allow)?,
@@ -219,6 +221,7 @@ impl SessionStore {
                     encode_exact_vec(&grant.deny_exact)?,
                     encode_vec(&grant.activated_verbs)?,
                     encode_vec(&grant.override_markers)?,
+                    encode_scope(&grant.scope)?,
                     encode_optional_u64(grant.expires_at)?,
                     grant.prompt_append,
                     encode_vec(&grant.generated_notes)?,
@@ -232,8 +235,8 @@ impl SessionStore {
         for grant in snapshot.history_snapshot() {
             tx.execute(
                 "INSERT INTO session_history
-                 (token, allow_json, deny_json, allow_exact_json, deny_exact_json, activated_verbs_json, override_markers_json, granted_at, expires_at, ended_at, status, prompt_append, generated_notes_json, static_only, auto_amend)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                 (token, allow_json, deny_json, allow_exact_json, deny_exact_json, activated_verbs_json, override_markers_json, scope_json, granted_at, expires_at, ended_at, status, prompt_append, generated_notes_json, static_only, auto_amend)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 params![
                     grant.token,
                     encode_vec(&grant.allow)?,
@@ -242,6 +245,7 @@ impl SessionStore {
                     encode_exact_vec(&grant.deny_exact)?,
                     encode_vec(&grant.activated_verbs)?,
                     encode_vec(&grant.override_markers)?,
+                    encode_scope(&grant.scope)?,
                     encode_u64(grant.granted_at)?,
                     encode_optional_u64(grant.expires_at)?,
                     encode_u64(grant.ended_at)?,
@@ -340,6 +344,7 @@ impl SessionStore {
                 deny_exact_json TEXT NOT NULL DEFAULT '[]',
                 activated_verbs_json TEXT NOT NULL DEFAULT '[]',
                 override_markers_json TEXT NOT NULL DEFAULT '[]',
+                scope_json TEXT NOT NULL DEFAULT '{}',
                 expires_at INTEGER,
                 prompt_append TEXT,
                 generated_notes_json TEXT NOT NULL DEFAULT '[]',
@@ -356,6 +361,7 @@ impl SessionStore {
                 deny_exact_json TEXT NOT NULL DEFAULT '[]',
                 activated_verbs_json TEXT NOT NULL DEFAULT '[]',
                 override_markers_json TEXT NOT NULL DEFAULT '[]',
+                scope_json TEXT NOT NULL DEFAULT '{}',
                 granted_at INTEGER NOT NULL,
                 expires_at INTEGER,
                 ended_at INTEGER NOT NULL,
@@ -421,6 +427,12 @@ impl SessionStore {
         )?;
         ensure_column(
             &tx,
+            "session_history",
+            "scope_json",
+            "TEXT NOT NULL DEFAULT '{}'",
+        )?;
+        ensure_column(
+            &tx,
             "session_grants",
             "static_only",
             "INTEGER NOT NULL DEFAULT 0",
@@ -454,6 +466,12 @@ impl SessionStore {
             "session_grants",
             "override_markers_json",
             "TEXT NOT NULL DEFAULT '[]'",
+        )?;
+        ensure_column(
+            &tx,
+            "session_grants",
+            "scope_json",
+            "TEXT NOT NULL DEFAULT '{}'",
         )?;
         ensure_column(
             &tx,
@@ -498,7 +516,7 @@ impl SessionStore {
     }
 
     /// Repair columns that belong to the current schema version. This keeps
-    /// startup safe after an interrupted or partially applied v2 migration.
+    /// startup safe after an interrupted or partially applied v3 migration.
     fn repair_current_schema(conn: &Connection) -> Result<()> {
         ensure_column(
             conn,
@@ -514,6 +532,12 @@ impl SessionStore {
         )?;
         ensure_column(
             conn,
+            "session_grants",
+            "scope_json",
+            "TEXT NOT NULL DEFAULT '{}'",
+        )?;
+        ensure_column(
+            conn,
             "session_history",
             "activated_verbs_json",
             "TEXT NOT NULL DEFAULT '[]'",
@@ -523,6 +547,12 @@ impl SessionStore {
             "session_history",
             "override_markers_json",
             "TEXT NOT NULL DEFAULT '[]'",
+        )?;
+        ensure_column(
+            conn,
+            "session_history",
+            "scope_json",
+            "TEXT NOT NULL DEFAULT '{}'",
         )?;
         ensure_column(conn, "session_interactions", "exit_code", "INTEGER")?;
         ensure_column(
@@ -731,6 +761,10 @@ fn encode_vec(values: &[String]) -> Result<String> {
     serde_json::to_string(values).context("failed to encode session list")
 }
 
+fn encode_scope(scope: &IssuedGrantScope) -> Result<String> {
+    serde_json::to_string(scope).context("failed to encode issued grant scope")
+}
+
 fn encode_u64(value: u64) -> Result<i64> {
     i64::try_from(value).context("session timestamp exceeds sqlite integer range")
 }
@@ -762,6 +796,16 @@ fn decode_bool(value: i64) -> rusqlite::Result<bool> {
 }
 
 fn decode_vec(value: &str) -> rusqlite::Result<Vec<String>> {
+    serde_json::from_str(value).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(
+            value.len(),
+            rusqlite::types::Type::Text,
+            Box::new(err),
+        )
+    })
+}
+
+fn decode_scope(value: &str) -> rusqlite::Result<IssuedGrantScope> {
     serde_json::from_str(value).map_err(|err| {
         rusqlite::Error::FromSqlConversionFailure(
             value.len(),
@@ -902,6 +946,7 @@ mod tests {
             deny_exact: Vec::new(),
             activated_verbs: Vec::new(),
             override_markers: Vec::new(),
+            scope: Default::default(),
             expires_at: None,
             prompt_append: None,
             generated_notes: Vec::new(),
@@ -1170,6 +1215,7 @@ mod tests {
                 )],
                 activated_verbs: vec!["inspect-secrets".into()],
                 override_markers: vec!["operator:inspect-secrets".into()],
+                scope: Default::default(),
                 expires_at: None,
                 prompt_append: Some("persistent".into()),
                 generated_notes: vec!["generated note".into()],
@@ -1188,6 +1234,7 @@ mod tests {
                 deny_exact: Vec::new(),
                 activated_verbs: vec!["historical-read".into()],
                 override_markers: vec!["operator:historical-read".into()],
+                scope: Default::default(),
                 granted_at: now.saturating_sub(10),
                 expires_at: None,
                 ended_at: now.saturating_sub(5),
