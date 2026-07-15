@@ -117,10 +117,13 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            binary: guard
           - target: aarch64-apple-darwin
             os: macos-latest
+            binary: guard
           - target: x86_64-pc-windows-msvc
             os: windows-latest
+            binary: guard.exe
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
@@ -133,7 +136,31 @@ jobs:
           cache: false
           rustflags: ""
 
+      - name: Identify build environment
+        id: build-environment
+        shell: bash
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+          GIT_SHA: ${{ github.sha }}
+          WORKFLOW_HASH: ${{ hashFiles('.github/workflows/ci.yml') }}
+        run: |
+          rustc_commit=$(rustc -vV | awk '/^commit-hash:/ { print $2 }')
+          runner_image="${ImageOS:-unknown}-${ImageVersion:-unknown}"
+          printf 'cache_key=binary-v1-%s-%s-%s-%s-%s\n' \
+            "$BUILD_TARGET" "$rustc_commit" "$runner_image" "$WORKFLOW_HASH" "$GIT_SHA" \
+            >> "$GITHUB_OUTPUT"
+
+      # build.rs embeds the Git commit in the executable. A binary is therefore
+      # reusable only for an exact rerun with the same toolchain and runner image.
+      - name: Restore exact binary
+        id: binary-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
+          key: ${{ steps.build-environment.outputs.cache_key }}
+
       - name: Rust Cache
+        if: steps.binary-cache.outputs.cache-hit != 'true'
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
         with:
           shared-key: release-${{ matrix.target }}
@@ -141,7 +168,24 @@ jobs:
           save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Build
+        if: steps.binary-cache.outputs.cache-hit != 'true'
         shell: bash
         env:
           BUILD_TARGET: ${{ matrix.target }}
         run: cargo build --release --target "$BUILD_TARGET"
+
+      - name: Save exact binary
+        if: >-
+          steps.binary-cache.outputs.cache-hit != 'true' &&
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/main'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
+          key: ${{ steps.binary-cache.outputs.cache-primary-key }}
+
+      - name: Verify binary
+        shell: bash
+        env:
+          BINARY: target/${{ matrix.target }}/release/${{ matrix.binary }}
+        run: '"$BINARY" --version'
