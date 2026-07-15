@@ -12,9 +12,12 @@ use crate::session::{
     SessionInteraction,
 };
 use crate::session_store::SessionStore;
+use guard::gating::verb::VerbCatalog;
 use guard::gating::GateMode;
 use guard::principal::PrincipalKey;
 use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 use super::make_test_config;
 
@@ -24,6 +27,8 @@ fn granted_session(allow: Vec<String>, allow_exact: Vec<SessionExactRule>) -> Se
         deny: Vec::new(),
         allow_exact,
         deny_exact: Vec::new(),
+        activated_verbs: Vec::new(),
+        override_markers: Vec::new(),
         expires_at: None,
         prompt_append: None,
         generated_notes: Vec::new(),
@@ -31,6 +36,106 @@ fn granted_session(allow: Vec<String>, allow_exact: Vec<SessionExactRule>) -> Se
         auto_amend: false,
         granted_at: 0,
     }
+}
+
+#[tokio::test]
+async fn session_grant_validates_activated_verbs_and_exact_override_markers() {
+    let (mut cfg, _) = make_test_config();
+    cfg.daemon_uid = 777;
+    cfg.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: baseline-review
+    binary: kubectl
+    consequence: reversible
+    coverage:
+      - name: apply
+        action: evaluate
+        required_args: ["apply"]
+        override_marker: operator:apply
+  - name: session-apply
+    binary: kubectl
+    baseline: false
+    consequence: recoverable
+    revert: { binary: kubectl, args: ["rollout", "undo", "deployment/web"] }
+    trusted: true
+    coverage:
+      - name: web
+        action: preauthorized
+        required_args: ["apply"]
+"#,
+        )
+        .expect("valid verb catalog"),
+    ));
+    let daemon = CallerIdentity::Unix { uid: 777 };
+
+    let valid = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::SessionGrant {
+            token: "typed-session".to_string(),
+            allow: Vec::new(),
+            deny: Vec::new(),
+            activated_verbs: vec!["session-apply".to_string()],
+            override_markers: vec!["operator:apply".to_string()],
+            ttl_secs: None,
+            prompt_append: None,
+            prose: None,
+            profile: None,
+            static_only: false,
+            auto_amend: false,
+        },
+    )
+    .await;
+    assert!(matches!(valid, AdminResponse::Ok));
+
+    let unknown_verb = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::SessionGrant {
+            token: "unknown-verb".to_string(),
+            allow: Vec::new(),
+            deny: Vec::new(),
+            activated_verbs: vec!["missing".to_string()],
+            override_markers: Vec::new(),
+            ttl_secs: None,
+            prompt_append: None,
+            prose: None,
+            profile: None,
+            static_only: false,
+            auto_amend: false,
+        },
+    )
+    .await;
+    assert!(matches!(
+        unknown_verb,
+        AdminResponse::Error { message } if message.contains("unknown session verb")
+    ));
+
+    let unknown_marker = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::SessionGrant {
+            token: "unknown-marker".to_string(),
+            allow: Vec::new(),
+            deny: Vec::new(),
+            activated_verbs: vec!["session-apply".to_string()],
+            override_markers: vec!["operator:typo".to_string()],
+            ttl_secs: None,
+            prompt_append: None,
+            prose: None,
+            profile: None,
+            static_only: false,
+            auto_amend: false,
+        },
+    )
+    .await;
+    assert!(matches!(
+        unknown_marker,
+        AdminResponse::Error { message } if message.contains("unknown verb override marker")
+    ));
 }
 
 fn request_with_session(binary: &str, args: Vec<String>, token: String) -> ExecuteRequest {
@@ -226,6 +331,8 @@ async fn static_only_session_miss_denies_before_evaluator() {
                 deny: Vec::new(),
                 allow_exact: Vec::new(),
                 deny_exact: Vec::new(),
+                activated_verbs: Vec::new(),
+                override_markers: Vec::new(),
                 expires_at: None,
                 prompt_append: None,
                 generated_notes: Vec::new(),
@@ -339,6 +446,8 @@ async fn session_list_is_user_visible_but_prompt_is_hidden() {
             token: token.clone(),
             allow: vec!["mkdir /tmp/work/*".into()],
             deny: Vec::new(),
+            activated_verbs: Vec::new(),
+            override_markers: Vec::new(),
             ttl_secs: None,
             prompt_append: Some("operator-only prompt".into()),
             prose: None,
@@ -396,6 +505,8 @@ async fn session_list_shows_current_session_details_without_raw_token_for_user()
             token: token.clone(),
             allow: vec!["mkdir /tmp/work/*".into()],
             deny: Vec::new(),
+            activated_verbs: Vec::new(),
+            override_markers: Vec::new(),
             ttl_secs: None,
             prompt_append: Some("operator prompt".into()),
             prose: Some("kubernetes access for namespace nextcloud".into()),
@@ -457,6 +568,8 @@ async fn session_show_reports_recent_stats() {
             token: token.clone(),
             allow: vec!["echo*".into()],
             deny: vec!["rm*".into()],
+            activated_verbs: Vec::new(),
+            override_markers: Vec::new(),
             ttl_secs: None,
             prompt_append: Some("operator context".into()),
             prose: None,
@@ -549,6 +662,8 @@ async fn session_show_self_token_sees_full_grant() {
             token: token.clone(),
             allow: vec!["kubectl get pods*".into()],
             deny: vec!["rm*".into()],
+            activated_verbs: Vec::new(),
+            override_markers: Vec::new(),
             ttl_secs: Some(3600),
             prompt_append: Some("cert rotation context".into()),
             prose: None,
@@ -609,6 +724,8 @@ async fn session_show_other_token_denied_for_non_admin() {
                 token: token.clone(),
                 allow: vec!["echo*".into()],
                 deny: Vec::new(),
+                activated_verbs: Vec::new(),
+                override_markers: Vec::new(),
                 ttl_secs: None,
                 prompt_append: Some("secret operator context".into()),
                 prose: None,
@@ -668,6 +785,8 @@ async fn session_new_from_profile_mints_expected_grant() {
             token: token.clone(),
             allow: Vec::new(),
             deny: Vec::new(),
+            activated_verbs: Vec::new(),
+            override_markers: Vec::new(),
             ttl_secs: None,
             prompt_append: None,
             prose: None,
@@ -717,6 +836,8 @@ async fn session_new_unknown_profile_fails_clearly() {
             token: token.clone(),
             allow: Vec::new(),
             deny: Vec::new(),
+            activated_verbs: Vec::new(),
+            override_markers: Vec::new(),
             ttl_secs: None,
             prompt_append: None,
             prose: None,
@@ -762,6 +883,8 @@ async fn profile_grant_still_deny_short_circuits_and_falls_through() {
             token: token.clone(),
             allow: Vec::new(),
             deny: Vec::new(),
+            activated_verbs: Vec::new(),
+            override_markers: Vec::new(),
             ttl_secs: None,
             prompt_append: None,
             prose: None,
@@ -808,6 +931,8 @@ async fn session_maintenance_has_one_owner_and_skips_noop_persistence() {
             deny: Vec::new(),
             allow_exact: Vec::new(),
             deny_exact: Vec::new(),
+            activated_verbs: Vec::new(),
+            override_markers: Vec::new(),
             expires_at: Some(1),
             prompt_append: None,
             generated_notes: Vec::new(),
