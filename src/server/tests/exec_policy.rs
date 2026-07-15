@@ -1,8 +1,10 @@
 use crate::server::admin::handle_admin_request;
 #[cfg(windows)]
 use crate::server::binary_path_candidates;
+#[cfg(unix)]
+use crate::server::execute::exec_after_approval;
 use crate::server::execute::{
-    audit_command_line, audit_token, evaluation_context_prompt, execute_command,
+    audit_command_line, audit_session_fingerprint, evaluation_context_prompt, execute_command,
     log_audit_policy_for_request,
 };
 use crate::server::gate_runtime::binary_allowed;
@@ -28,6 +30,8 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 
+#[cfg(unix)]
+use super::capture_async;
 use super::{args, capture, make_test_config, paranoid_test_config};
 
 #[cfg(unix)]
@@ -84,16 +88,21 @@ fn audit_command_line_masks_inline_credentials() {
     assert!(line.contains("curl"), "got: {line}");
 }
 
-/// Tokens in audit lines are truncated head/tail; short and multi-byte
-/// values must not panic or leak.
+/// Audit fingerprints are stable, distinct, 128-bit identifiers that do not
+/// expose token bytes. Short and multi-byte values must also remain safe.
 #[test]
-fn audit_token_truncates_and_is_char_safe() {
-    assert_eq!(audit_token("abcdefghij"), "abcd...ghij");
-    assert_eq!(audit_token("short"), "***");
-    // Multi-byte chars: byte slicing would panic here.
-    let t = audit_token("éééééééééé");
-    assert!(t.starts_with("éééé"), "got: {t}");
-    assert!(!t.contains("éééééééééé"), "full value never appears: {t}");
+fn audit_session_fingerprint_is_stable_distinct_and_non_reversible() {
+    let first = audit_session_fingerprint(Some("abcdefghij"));
+    assert_eq!(first, audit_session_fingerprint(Some("abcdefghij")));
+    assert_ne!(first, audit_session_fingerprint(Some("abcdefghik")));
+    assert!(first.starts_with("sha256:"));
+    assert_eq!(first.len(), "sha256:".len() + 32);
+    for token in ["abcdefghij", "short", "éééééééééé"] {
+        let fingerprint = audit_session_fingerprint(Some(token));
+        assert!(!fingerprint.contains(token), "got: {fingerprint}");
+    }
+    assert_eq!(audit_session_fingerprint(None), "none");
+    assert_eq!(audit_session_fingerprint(Some("")), "none");
 }
 
 #[test]
@@ -102,6 +111,7 @@ fn cwd_is_included_in_audit_and_evaluation_context() {
     let cwd = std::env::current_dir().unwrap();
     let mut req = basic_request("pwd", Vec::new());
     req.cwd = Some(cwd.clone());
+    req.session_token = Some("session-token-that-must-not-appear".into());
 
     let prompt = evaluation_context_prompt(&req, Some("SESSION CONTEXT".to_string()))
         .expect("cwd/session prompt");
@@ -125,6 +135,140 @@ fn cwd_is_included_in_audit_and_evaluation_context() {
         "logs={logs}"
     );
     assert!(logs.contains("cmd=\"pwd\""), "logs={logs}");
+    assert!(
+        logs.contains(&format!(
+            "session_fingerprint={}",
+            audit_session_fingerprint(req.session_token.as_deref())
+        )),
+        "logs={logs}"
+    );
+    assert!(!logs.contains("session-token-that-must-not-appear"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn secret_exposure_is_audited_only_after_successful_spawn() {
+    let caller = CallerIdentity::Unix { uid: 1000 };
+    let principal = PrincipalKey::from_uid(1000);
+    let token = "opaque-session-token-never-logged";
+
+    let (cfg, buf) = make_test_config();
+    cfg.secrets
+        .set(&principal, "service/token", "secret-value-never-logged")
+        .await
+        .unwrap();
+    let mut request = basic_request("/bin/true", Vec::new());
+    request.session_token = Some(token.into());
+    request
+        .secrets
+        .insert("SERVICE_TOKEN".into(), "service/token".into());
+    let mut sink = tokio::io::sink();
+    let (result, logs) = capture_async(
+        &buf,
+        exec_after_approval(
+            request,
+            &cfg,
+            &caller,
+            "test allow".into(),
+            0,
+            false,
+            &mut sink,
+        ),
+    )
+    .await;
+    assert_eq!(result.exit_code(), Some(0));
+    assert_eq!(result.exposed_secret_refs(), &["service/token"]);
+    assert!(logs.contains("[AUDIT] SECRET_EXPOSED"), "logs={logs}");
+    assert!(logs.contains("service/token"), "logs={logs}");
+    assert!(
+        logs.contains(&audit_session_fingerprint(Some(token))),
+        "logs={logs}"
+    );
+    assert!(!logs.contains(token));
+    assert!(!logs.contains("secret-value-never-logged"));
+
+    let (cfg, buf) = make_test_config();
+    cfg.secrets
+        .set(&principal, "service/token", "another-secret-value")
+        .await
+        .unwrap();
+    let mut request = basic_request("guard-command-that-does-not-exist", Vec::new());
+    request.session_token = Some(token.into());
+    request
+        .secrets
+        .insert("SERVICE_TOKEN".into(), "service/token".into());
+    let mut sink = tokio::io::sink();
+    let (result, logs) = capture_async(
+        &buf,
+        exec_after_approval(
+            request,
+            &cfg,
+            &caller,
+            "test allow".into(),
+            0,
+            false,
+            &mut sink,
+        ),
+    )
+    .await;
+    assert!(result.exposed_secret_refs().is_empty());
+    assert!(!logs.contains("SECRET_EXPOSED"), "logs={logs}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn streaming_secret_exposure_is_recorded_even_on_nonzero_exit() {
+    let caller = CallerIdentity::Unix { uid: 1000 };
+    let principal = PrincipalKey::from_uid(1000);
+    let (cfg, buf) = make_test_config();
+    for (name, value) in [
+        ("service/primary", "primary-value-never-logged"),
+        ("service/secondary", "secondary-value-never-logged"),
+    ] {
+        cfg.secrets.set(&principal, name, value).await.unwrap();
+    }
+
+    let mut request = basic_request("/bin/false", Vec::new());
+    request.session_token = Some("streaming-session-token-never-logged".into());
+    request
+        .secrets
+        .insert("PRIMARY_TOKEN".into(), "service/primary".into());
+    request
+        .secrets
+        .insert("SECONDARY_TOKEN".into(), "service/secondary".into());
+    let mut sink = tokio::io::sink();
+    let (result, logs) = capture_async(
+        &buf,
+        exec_after_approval(
+            request,
+            &cfg,
+            &caller,
+            "test allow".into(),
+            0,
+            true,
+            &mut sink,
+        ),
+    )
+    .await;
+
+    assert_eq!(result.exit_code(), Some(1));
+    assert_eq!(
+        result.exposed_secret_refs(),
+        &[
+            "service/primary".to_string(),
+            "service/secondary".to_string()
+        ]
+    );
+    assert_eq!(
+        logs.matches("[AUDIT] SECRET_EXPOSED").count(),
+        2,
+        "logs={logs}"
+    );
+    assert!(logs.contains("service/primary"), "logs={logs}");
+    assert!(logs.contains("service/secondary"), "logs={logs}");
+    assert!(!logs.contains("streaming-session-token-never-logged"));
+    assert!(!logs.contains("primary-value-never-logged"));
+    assert!(!logs.contains("secondary-value-never-logged"));
 }
 
 // ---- ExecuteResult result-shape tests -----------------------------------

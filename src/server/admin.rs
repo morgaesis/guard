@@ -8,9 +8,9 @@ use crate::session::{
 use guard::principal::{scope_eq, PrincipalKey};
 
 use super::execute::{
-    allow_session_auto_amend_candidate, amend_session_exact_rule, audit_token, command_line,
-    deny_session_auto_amend_candidate, persist_current_sessions, persist_session_snapshot,
-    record_live_session_interaction, session_source_from_eval,
+    allow_session_auto_amend_candidate, amend_session_exact_rule, audit_session_fingerprint,
+    command_line, deny_session_auto_amend_candidate, persist_current_sessions,
+    persist_session_snapshot, record_live_session_interaction, session_source_from_eval,
     validate_session_exact_rule_candidate,
 };
 use super::gate_runtime::{
@@ -218,6 +218,8 @@ async fn handle_session_appeal(
                         ),
                         risk,
                         exec_status: SessionExecStatus::NotAttempted,
+                        exit_code: None,
+                        exposed_secret_refs: Vec::new(),
                     },
                 )
                 .await;
@@ -267,13 +269,15 @@ async fn handle_session_appeal(
                     reason: final_reason.clone(),
                     risk,
                     exec_status: SessionExecStatus::NotAttempted,
+                    exit_code: None,
+                    exposed_secret_refs: Vec::new(),
                 },
             )
             .await;
-            tracing::info!(
-                "[AUDIT] SESSION_APPEAL caller={} token={} allowed=true amended={} cmd={}",
+            tracing::info!(target: "guard::audit",
+                "[AUDIT] SESSION_APPEAL caller={} token_fingerprint={} allowed=true amended={} cmd={}",
                 caller,
-                audit_token(&token),
+                audit_session_fingerprint(Some(&token)),
                 amended,
                 redact_output(&command_line)
             );
@@ -328,13 +332,15 @@ async fn handle_session_appeal(
                     reason: final_reason.clone(),
                     risk,
                     exec_status: SessionExecStatus::NotAttempted,
+                    exit_code: None,
+                    exposed_secret_refs: Vec::new(),
                 },
             )
             .await;
-            tracing::info!(
-                "[AUDIT] SESSION_APPEAL caller={} token={} allowed=false amended={} cmd={}",
+            tracing::info!(target: "guard::audit",
+                "[AUDIT] SESSION_APPEAL caller={} token_fingerprint={} allowed=false amended={} cmd={}",
                 caller,
-                audit_token(&token),
+                audit_session_fingerprint(Some(&token)),
                 amended,
                 redact_output(&command_line)
             );
@@ -363,7 +369,7 @@ pub(super) async fn handle_admin_request(
 ) -> AdminResponse {
     if request.requires_daemon_uid() {
         if let Err(e) = config.validate_admin(caller) {
-            tracing::warn!("[AUDIT] ADMIN_REJECTED caller={} reason=\"{}\"", caller, e);
+            tracing::warn!(target: "guard::audit", "[AUDIT] ADMIN_REJECTED caller={} reason=\"{}\"", caller, e);
             return AdminResponse::Error {
                 message: e.to_string(),
             };
@@ -451,10 +457,10 @@ pub(super) async fn handle_admin_request(
                     message: format!("failed to persist session grant: {}", err),
                 };
             }
-            tracing::info!(
-                "[AUDIT] SESSION_GRANT caller={} token={} profile={:?} ttl={:?} static_only={} auto_amend={} generated_allow={} generated_deny={}",
+            tracing::info!(target: "guard::audit",
+                "[AUDIT] SESSION_GRANT caller={} token_fingerprint={} profile={:?} ttl={:?} static_only={} auto_amend={} generated_allow={} generated_deny={}",
                 caller,
-                audit_token(&token),
+                audit_session_fingerprint(Some(&token)),
                 profile,
                 ttl_secs,
                 static_only,
@@ -482,10 +488,10 @@ pub(super) async fn handle_admin_request(
                     message: format!("failed to persist session revoke: {}", err),
                 };
             }
-            tracing::info!(
-                "[AUDIT] SESSION_REVOKE caller={} token={} existed={}",
+            tracing::info!(target: "guard::audit",
+                "[AUDIT] SESSION_REVOKE caller={} token_fingerprint={} existed={}",
                 caller,
-                audit_token(&token),
+                audit_session_fingerprint(Some(&token)),
                 removed
             );
             AdminResponse::Ok
@@ -553,7 +559,7 @@ pub(super) async fn handle_admin_request(
             // returns a denial, never the grant's contents.
             let is_self = !token.is_empty() && caller_token.as_deref() == Some(token.as_str());
             if !is_admin && !is_self {
-                tracing::warn!(
+                tracing::warn!(target: "guard::audit",
                     "[AUDIT] SESSION_SHOW_REJECTED caller={} reason=\"not the token holder\"",
                     caller
                 );
@@ -593,7 +599,7 @@ pub(super) async fn handle_admin_request(
             };
             match config.secrets.set(&principal, &key, &value).await {
                 Ok(()) => {
-                    tracing::info!(
+                    tracing::info!(target: "guard::audit",
                         "[AUDIT] SECRET_SET caller={} principal={} key={}",
                         caller,
                         principal,
@@ -622,7 +628,7 @@ pub(super) async fn handle_admin_request(
             };
             match config.secrets.delete(&principal, &key).await {
                 Ok(()) => {
-                    tracing::info!(
+                    tracing::info!(target: "guard::audit",
                         "[AUDIT] SECRET_DELETE caller={} principal={} key={}",
                         caller,
                         principal,
@@ -928,7 +934,7 @@ pub(super) async fn handle_admin_request(
             match result {
                 Ok(()) => {
                     if !preview {
-                        tracing::info!(
+                        tracing::info!(target: "guard::audit",
                             "[AUDIT] VERB_CREATED name={} consequence={} trusted={}",
                             verb.name,
                             verb.consequence.as_str(),
@@ -982,7 +988,7 @@ async fn handle_confirm(
             // The change is kept and the revert will never fire; drop its
             // persisted body so a secret-bearing snapshot is not left on disk.
             remove_revert_body(&p);
-            tracing::info!("[AUDIT] CONFIRM handle={} caller={}", handle, caller);
+            tracing::info!(target: "guard::audit", "[AUDIT] CONFIRM handle={} caller={}", handle, caller);
             AdminResponse::GateAction {
                 message: format!("provisional {} confirmed; change kept", handle),
                 exit_code: None,
@@ -1057,7 +1063,7 @@ async fn handle_approve(
         if let Some(a) = config.approvals.read().await.get(handle).cloned() {
             persist_approval(config, &a).await;
         }
-        tracing::info!(
+        tracing::info!(target: "guard::audit",
             "[AUDIT] APPROVED handle={} caller={} (api-proxy request released)",
             handle,
             caller
@@ -1087,10 +1093,14 @@ async fn handle_approve(
             if let Some(a) = config.approvals.read().await.get(handle).cloned() {
                 persist_approval(config, &a).await;
             }
-            tracing::warn!(
-                "[AUDIT] APPROVE_VOIDED handle={} caller={} {}",
+            tracing::warn!(target: "guard::audit",
+                "[AUDIT] APPROVE_VOIDED handle={} caller={} session_fingerprint={} {}",
                 handle,
                 caller,
+                snapshot
+                    .session_fingerprint
+                    .as_deref()
+                    .unwrap_or("none"),
                 detail
             );
             return AdminResponse::Error { message: detail };
@@ -1114,10 +1124,14 @@ async fn handle_approve(
                 let mut reg = config.approvals.write().await;
                 reg.set_result(handle, now, exit_code, stdout.clone(), stderr.clone());
             }
-            tracing::info!(
-                "[AUDIT] APPROVED handle={} caller={} exit={:?}",
+            tracing::info!(target: "guard::audit",
+                "[AUDIT] APPROVED handle={} caller={} session_fingerprint={} exit={:?}",
                 handle,
                 caller,
+                snapshot
+                    .session_fingerprint
+                    .as_deref()
+                    .unwrap_or("none"),
                 exit_code
             );
             (
@@ -1132,10 +1146,14 @@ async fn handle_approve(
                 let mut reg = config.approvals.write().await;
                 reg.set_exec_failed(handle, now, detail.clone());
             }
-            tracing::error!(
-                "[AUDIT] APPROVE_EXEC_FAILED handle={} caller={} detail={}",
+            tracing::error!(target: "guard::audit",
+                "[AUDIT] APPROVE_EXEC_FAILED handle={} caller={} session_fingerprint={} detail={}",
                 handle,
                 caller,
+                snapshot
+                    .session_fingerprint
+                    .as_deref()
+                    .unwrap_or("none"),
                 detail
             );
             (
@@ -1208,7 +1226,7 @@ pub(super) async fn handle_approval_note(
             match updated {
                 Some(a) => {
                     persist_approval(config, &a).await;
-                    tracing::info!(
+                    tracing::info!(target: "guard::audit",
                         "[AUDIT] APPROVAL_NOTE handle={} author={} caller={}",
                         handle,
                         author,
@@ -1241,10 +1259,20 @@ async fn handle_deny(
     };
     match result {
         Ok(()) => {
-            if let Some(a) = config.approvals.read().await.get(handle).cloned() {
-                persist_approval(config, &a).await;
-            }
-            tracing::info!("[AUDIT] DENIED_HOLD handle={} caller={}", handle, caller);
+            let session_fingerprint =
+                if let Some(a) = config.approvals.read().await.get(handle).cloned() {
+                    let session_fingerprint = a.snapshot.session_fingerprint.clone();
+                    persist_approval(config, &a).await;
+                    session_fingerprint
+                } else {
+                    None
+                };
+            tracing::info!(target: "guard::audit",
+                "[AUDIT] DENIED_HOLD handle={} caller={} session_fingerprint={}",
+                handle,
+                caller,
+                session_fingerprint.as_deref().unwrap_or("none")
+            );
             AdminResponse::GateAction {
                 message: format!("held command {} denied", handle),
                 exit_code: None,

@@ -53,6 +53,7 @@ pub(super) async fn handle_grant_read(
             let reason = "read grants require a local Unix socket caller".to_string();
             config.log_audit_policy(
                 caller,
+                session_token.as_deref(),
                 AUTO_READ_GRANT_LABEL,
                 &grant_read_audit_args(&path, ttl),
                 false,
@@ -71,6 +72,7 @@ pub(super) async fn handle_grant_read(
             let reason = format!("read-grant denied: cannot resolve '{path}': {e}");
             config.log_audit_policy(
                 caller,
+                session_token.as_deref(),
                 AUTO_READ_GRANT_LABEL,
                 &grant_read_audit_args(&path, ttl),
                 false,
@@ -84,7 +86,14 @@ pub(super) async fn handle_grant_read(
 
     // 1. Hard static credential deny-list, BEFORE the evaluator.
     if let Some(reason) = credential_path_deny_reason(&canonical_str) {
-        config.log_audit_policy(caller, AUTO_READ_GRANT_LABEL, &audit_args, false, &reason);
+        config.log_audit_policy(
+            caller,
+            session_token.as_deref(),
+            AUTO_READ_GRANT_LABEL,
+            &audit_args,
+            false,
+            &reason,
+        );
         return ExecuteResult::denied(reason);
     }
 
@@ -103,18 +112,39 @@ pub(super) async fn handle_grant_read(
         if !exists {
             let reason =
                 format!("unknown session token: '{token}' is revoked, expired, or never existed");
-            config.log_audit_policy(caller, AUTO_READ_GRANT_LABEL, &audit_args, false, &reason);
+            config.log_audit_policy(
+                caller,
+                session_token.as_deref(),
+                AUTO_READ_GRANT_LABEL,
+                &audit_args,
+                false,
+                &reason,
+            );
             return ExecuteResult::denied(reason);
         }
         match decision {
             Some((SessionDecision::Deny, reason)) => {
-                config.log_audit_policy(caller, AUTO_READ_GRANT_LABEL, &audit_args, false, &reason);
+                config.log_audit_policy(
+                    caller,
+                    session_token.as_deref(),
+                    AUTO_READ_GRANT_LABEL,
+                    &audit_args,
+                    false,
+                    &reason,
+                );
                 return ExecuteResult::denied(reason);
             }
             Some((SessionDecision::Allow, reason)) => allow_reason = Some(reason),
             None if static_only => {
                 let reason = "session static-only: no matching session allow rule".to_string();
-                config.log_audit_policy(caller, AUTO_READ_GRANT_LABEL, &audit_args, false, &reason);
+                config.log_audit_policy(
+                    caller,
+                    session_token.as_deref(),
+                    AUTO_READ_GRANT_LABEL,
+                    &audit_args,
+                    false,
+                    &reason,
+                );
                 return ExecuteResult::denied(reason);
             }
             None => {}
@@ -156,12 +186,26 @@ pub(super) async fn handle_grant_read(
         {
             crate::evaluate::EvalResult::Allow { reason, .. } => allow_reason = Some(reason),
             crate::evaluate::EvalResult::Deny { reason, .. } => {
-                config.log_audit_policy(caller, AUTO_READ_GRANT_LABEL, &audit_args, false, &reason);
+                config.log_audit_policy(
+                    caller,
+                    session_token.as_deref(),
+                    AUTO_READ_GRANT_LABEL,
+                    &audit_args,
+                    false,
+                    &reason,
+                );
                 return ExecuteResult::denied(reason);
             }
             crate::evaluate::EvalResult::Error(e) => {
                 let reason = format!("evaluation error: {e}");
-                config.log_audit_policy(caller, AUTO_READ_GRANT_LABEL, &audit_args, false, &reason);
+                config.log_audit_policy(
+                    caller,
+                    session_token.as_deref(),
+                    AUTO_READ_GRANT_LABEL,
+                    &audit_args,
+                    false,
+                    &reason,
+                );
                 return ExecuteResult::denied(reason);
             }
         }
@@ -169,7 +213,14 @@ pub(super) async fn handle_grant_read(
     let reason = allow_reason.unwrap_or_default();
 
     if config.dry_run {
-        config.log_audit_policy(caller, AUTO_READ_GRANT_LABEL, &audit_args, true, &reason);
+        config.log_audit_policy(
+            caller,
+            session_token.as_deref(),
+            AUTO_READ_GRANT_LABEL,
+            &audit_args,
+            true,
+            &reason,
+        );
         return ExecuteResult::completed(
             reason,
             Some(0),
@@ -192,7 +243,14 @@ pub(super) async fn handle_grant_read(
         Ok(ctx) => ctx.gid,
         Err(e) => {
             let reason = format!("grantee uid {grantee_uid} could not be resolved: {e}");
-            config.log_audit_policy(caller, AUTO_READ_GRANT_LABEL, &audit_args, true, &reason);
+            config.log_audit_policy(
+                caller,
+                session_token.as_deref(),
+                AUTO_READ_GRANT_LABEL,
+                &audit_args,
+                true,
+                &reason,
+            );
             return ExecuteResult::exec_failed(reason.clone(), reason);
         }
     };
@@ -204,7 +262,14 @@ pub(super) async fn handle_grant_read(
         Ok(home) => home,
         Err(e) => {
             let reason = format!("read-grant denied: {e}");
-            config.log_audit_policy(caller, AUTO_READ_GRANT_LABEL, &audit_args, false, &reason);
+            config.log_audit_policy(
+                caller,
+                session_token.as_deref(),
+                AUTO_READ_GRANT_LABEL,
+                &audit_args,
+                false,
+                &reason,
+            );
             return ExecuteResult::denied(reason);
         }
     };
@@ -217,7 +282,14 @@ pub(super) async fn handle_grant_read(
         Ok(planned) => planned,
         Err(e) => {
             let reason = format!("read-grant denied: {e}");
-            config.log_audit_policy(caller, AUTO_READ_GRANT_LABEL, &audit_args, false, &reason);
+            config.log_audit_policy(
+                caller,
+                session_token.as_deref(),
+                AUTO_READ_GRANT_LABEL,
+                &audit_args,
+                false,
+                &reason,
+            );
             return ExecuteResult::denied(reason);
         }
     };
@@ -242,24 +314,44 @@ pub(super) async fn handle_grant_read(
         // Nothing survived the in-apply rollback, so drop the committed row too.
         delete_read_grant_row(config, &grant.target_path).await;
         let exec_reason = format!("failed to apply read grant: {e}");
-        config.log_audit_policy(caller, AUTO_READ_GRANT_LABEL, &audit_args, true, &reason);
-        config.log_audit_exec_failed(caller, AUTO_READ_GRANT_LABEL, &audit_args, &exec_reason);
+        config.log_audit_policy(
+            caller,
+            session_token.as_deref(),
+            AUTO_READ_GRANT_LABEL,
+            &audit_args,
+            true,
+            &reason,
+        );
+        config.log_audit_exec_failed(
+            caller,
+            session_token.as_deref(),
+            AUTO_READ_GRANT_LABEL,
+            &audit_args,
+            &exec_reason,
+        );
         return ExecuteResult::exec_failed(reason, exec_reason);
     }
 
     let traverse_count = grant.entries.len().saturating_sub(1);
     config.read_grants.write().await.insert(grant.clone());
 
-    config.log_audit_policy(caller, AUTO_READ_GRANT_LABEL, &audit_args, true, &reason);
-    tracing::info!(
-        "[AUDIT] READ_GRANT_ISSUED caller={} handle={} path=\"{}\" grantee_uid={} ttl={} traverse_grants={} session={}",
+    config.log_audit_policy(
+        caller,
+        session_token.as_deref(),
+        AUTO_READ_GRANT_LABEL,
+        &audit_args,
+        true,
+        &reason,
+    );
+    tracing::info!(target: "guard::audit",
+        "[AUDIT] READ_GRANT_ISSUED caller={} handle={} path=\"{}\" grantee_uid={} ttl={} traverse_grants={} session_fingerprint={}",
         caller,
         grant.handle,
         grant.target_path,
         grantee_uid,
         ttl,
         traverse_count,
-        session_token.as_deref().unwrap_or("-"),
+        super::execute::audit_session_fingerprint(session_token.as_deref()),
     );
 
     let stdout = format!(
@@ -644,7 +736,7 @@ pub(super) async fn finish_read_grant_revert(
                 if let Some(updated) = config.read_grants.read().await.get(&grant.target_path) {
                     persist_read_grant(config, updated).await;
                 }
-                tracing::info!(
+                tracing::info!(target: "guard::audit",
                     "[AUDIT] READ_GRANT_REVOKED handle={} path=\"{}\" source={}",
                     grant.handle,
                     grant.target_path,
@@ -660,7 +752,7 @@ pub(super) async fn finish_read_grant_revert(
                 if let Some(updated) = config.read_grants.read().await.get(&grant.target_path) {
                     persist_read_grant(config, updated).await;
                 }
-                tracing::warn!(
+                tracing::warn!(target: "guard::audit",
                     "[AUDIT] READ_GRANT_REVOKE_FAILED handle={} path=\"{}\" source={} detail=\"{}\"",
                     grant.handle,
                     grant.target_path,

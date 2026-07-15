@@ -9,6 +9,25 @@ fn default_state_db_path() -> Option<PathBuf> {
     default_guard_state_dir().map(|dir| dir.join("state.db"))
 }
 
+pub(crate) fn resolve_history_retention(
+    configured: Option<u64>,
+    environment: Option<String>,
+) -> Result<u64> {
+    let value = match configured {
+        Some(value) => value,
+        None => match environment {
+            Some(value) => value
+                .parse::<u64>()
+                .context("GUARD_HISTORY_RETENTION_SECS must be a positive integer")?,
+            None => session::DEFAULT_HISTORY_RETENTION_SECS,
+        },
+    };
+    if value == 0 {
+        anyhow::bail!("history retention must be greater than zero");
+    }
+    Ok(value)
+}
+
 /// Resolve the GUARD_MODE env value: unset or blank defaults to readonly,
 /// and a present-but-invalid value fails startup loudly (like --gate)
 /// instead of silently falling back to readonly.
@@ -99,6 +118,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             learn_allow_min_approvals,
             dry_run,
             state_db,
+            history_retention,
             exec_as_caller,
             system_prompt,
             system_prompt_append,
@@ -703,13 +723,13 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 redact_secrets.push(token.clone());
             }
 
+            let history_retention_secs =
+                resolve_history_retention(history_retention, guard_env("HISTORY_RETENTION_SECS"))?;
+
             let (sessions, session_store) = if let Some(ref path) = state_db_path {
-                let store = session_store::SessionStore::open(
-                    path.clone(),
-                    session::DEFAULT_HISTORY_RETENTION_SECS,
-                )
-                .await
-                .with_context(|| format!("failed to open state db {}", path.display()))?;
+                let store = session_store::SessionStore::open(path.clone(), history_retention_secs)
+                    .await
+                    .with_context(|| format!("failed to open state db {}", path.display()))?;
                 let sessions = store
                     .load_registry()
                     .await

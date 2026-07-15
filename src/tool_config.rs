@@ -6,6 +6,14 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolvedToolEnv {
+    pub env: HashMap<String, String>,
+    /// Secret-store keys that contributed values to `env`. Values are never
+    /// retained here, so callers can audit provenance without exposing them.
+    pub secret_refs: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UserToolOverride {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -159,12 +167,13 @@ impl ToolRegistry {
         secrets: &SecretManager,
         principal: Option<&PrincipalKey>,
         user_key: Option<&str>,
-    ) -> Result<HashMap<String, String>> {
+    ) -> Result<ResolvedToolEnv> {
         let Some(tool_config) = self.get(tool) else {
-            return Ok(HashMap::new());
+            return Ok(ResolvedToolEnv::default());
         };
 
         let mut env = tool_config.env.clone();
+        let mut secret_sources = HashMap::new();
 
         for (env_var, secret_key) in &tool_config.secrets {
             let principal = principal.ok_or_else(|| {
@@ -184,12 +193,14 @@ impl ToolRegistry {
                     )
                 })?;
             env.insert(env_var.clone(), value);
+            secret_sources.insert(env_var.clone(), secret_key.clone());
         }
 
         if let Some(user_key) = user_key {
             if let Some(user_override) = tool_config.users.get(user_key) {
                 for (k, v) in &user_override.env {
                     env.insert(k.clone(), v.clone());
+                    secret_sources.remove(k);
                 }
                 for (env_var, secret_key) in &user_override.secrets {
                     let principal = principal.ok_or_else(|| {
@@ -210,11 +221,15 @@ impl ToolRegistry {
                             )
                         })?;
                     env.insert(env_var.clone(), value);
+                    secret_sources.insert(env_var.clone(), secret_key.clone());
                 }
             }
         }
 
-        Ok(env)
+        let mut secret_refs: Vec<String> = secret_sources.into_values().collect();
+        secret_refs.sort();
+        secret_refs.dedup();
+        Ok(ResolvedToolEnv { env, secret_refs })
     }
 
     fn save(&self) -> Result<()> {
@@ -352,5 +367,43 @@ tools:
             aws.secrets.get("AWS_SECRET_ACCESS_KEY").unwrap(),
             "my-aws-key"
         );
+    }
+
+    #[tokio::test]
+    async fn resolved_env_preserves_secret_key_provenance() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            "tools:\n  deploy:\n    secrets:\n      BASE_TOKEN: base/key\n      OVERRIDDEN: unused/key\n    users:\n      '424242':\n        env:\n          OVERRIDDEN: plain-value\n        secrets:\n          USER_TOKEN: user/key\n",
+        )
+        .unwrap();
+        let registry = ToolRegistry::load(tmp.path()).unwrap();
+        let manager = SecretManager::with_backend(crate::secrets::EnvBackend::default());
+        let principal = PrincipalKey::from_uid(424242);
+        manager
+            .set(&principal, "base/key", "base-value")
+            .await
+            .unwrap();
+        manager
+            .set(&principal, "user/key", "user-value")
+            .await
+            .unwrap();
+        manager
+            .set(&principal, "unused/key", "unused-value")
+            .await
+            .unwrap();
+
+        let resolved = registry
+            .resolve_env("deploy", &manager, Some(&principal), Some("424242"))
+            .await
+            .unwrap();
+        assert_eq!(resolved.env.get("BASE_TOKEN").unwrap(), "base-value");
+        assert_eq!(resolved.env.get("USER_TOKEN").unwrap(), "user-value");
+        assert_eq!(resolved.env.get("OVERRIDDEN").unwrap(), "plain-value");
+        assert_eq!(resolved.secret_refs, vec!["base/key", "user/key"]);
+
+        manager.delete(&principal, "base/key").await.unwrap();
+        manager.delete(&principal, "user/key").await.unwrap();
+        manager.delete(&principal, "unused/key").await.unwrap();
     }
 }

@@ -1,4 +1,5 @@
 use crate::server::admin::{handle_admin_request, handle_approval_note};
+use crate::server::execute::audit_session_fingerprint;
 use crate::server::gate_runtime::{
     approval_to_result, execute_snapshot, hash_secret_value, hold_for_approval, new_handle,
     now_unix, route_gated_allow, GateInputs,
@@ -1059,6 +1060,7 @@ async fn nonstreaming_wait_approval_returns_promptly_on_decision() {
 async fn hold_then_ttl_expiry_denies_fail_closed() {
     let (cfg, _operator, agent) = gating_config(7006, 1000);
     let agent_principal = agent.principal();
+    let session_token = new_handle();
 
     let request = ExecuteRequest {
         binary: "rm".to_string(),
@@ -1067,7 +1069,7 @@ async fn hold_then_ttl_expiry_denies_fail_closed() {
         env: HashMap::new(),
         secrets: HashMap::new(),
         stream: false,
-        session_token: None,
+        session_token: Some(session_token.clone()),
         revert: None,
         confirm_within_secs: None,
         reevaluate: false,
@@ -1106,6 +1108,14 @@ async fn hold_then_ttl_expiry_denies_fail_closed() {
     assert_eq!(expired, vec![handle.clone()]);
 
     let row = cfg.approvals.read().await.get(&handle).cloned().unwrap();
+    let expected_session_fingerprint = audit_session_fingerprint(Some(&session_token));
+    assert_eq!(
+        row.snapshot.session_fingerprint.as_deref(),
+        Some(expected_session_fingerprint.as_str())
+    );
+    assert!(!serde_json::to_string(&row.snapshot)
+        .unwrap()
+        .contains(&session_token));
     assert_eq!(
         row.status,
         ApprovalStatus::Expired,
@@ -1482,6 +1492,7 @@ async fn approve_voided_when_verb_catalog_version_changed() {
         cwd: None,
         env: BTreeMap::new(),
         secret_keys: BTreeMap::new(),
+        session_fingerprint: None,
         verb_name: Some("restart-service".to_string()),
         verb_params: BTreeMap::new(),
         // Live catalog (VerbCatalog::empty()) has version 0; a stale stamp.
@@ -1547,6 +1558,7 @@ async fn approved_snapshot_rechecks_binary_floor_before_exec() {
         cwd: None,
         env: BTreeMap::new(),
         secret_keys: BTreeMap::new(),
+        session_fingerprint: None,
         verb_name: None,
         verb_params: BTreeMap::new(),
         catalog_version: None,
@@ -1578,6 +1590,7 @@ async fn approved_snapshot_rejects_dangerous_request_env_before_exec() {
             "/tmp/caller-agent.sock".to_string(),
         )]),
         secret_keys: BTreeMap::new(),
+        session_fingerprint: None,
         verb_name: None,
         verb_params: BTreeMap::new(),
         catalog_version: None,
@@ -1611,6 +1624,7 @@ async fn approved_snapshot_executes_in_snapshotted_cwd() {
         cwd: Some(temp.path().to_path_buf()),
         env: BTreeMap::new(),
         secret_keys: BTreeMap::new(),
+        session_fingerprint: None,
         verb_name: None,
         verb_params: BTreeMap::new(),
         catalog_version: None,
@@ -1645,6 +1659,7 @@ async fn approved_snapshot_rejects_missing_snapshotted_cwd_before_exec() {
         cwd: Some(cwd.clone()),
         env: BTreeMap::new(),
         secret_keys: BTreeMap::new(),
+        session_fingerprint: None,
         verb_name: None,
         verb_params: BTreeMap::new(),
         catalog_version: None,
@@ -1687,6 +1702,7 @@ async fn approved_snapshot_rejects_retargeted_snapshotted_cwd_before_exec() {
         cwd: Some(cwd.clone()),
         env: BTreeMap::new(),
         secret_keys: BTreeMap::new(),
+        session_fingerprint: None,
         verb_name: None,
         verb_params: BTreeMap::new(),
         catalog_version: None,

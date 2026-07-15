@@ -79,7 +79,7 @@ impl ApiJudge for DaemonApiJudge {
             };
             if let Some(hit) = hit {
                 tracing::info!(
-                    target: "guard::apiproxy",
+                    target: "guard::audit",
                     "[AUDIT] API_LEARNED_DENY {} denials={}",
                     hit.shape.audit_label(),
                     hit.denials
@@ -98,7 +98,7 @@ impl ApiJudge for DaemonApiJudge {
                 };
                 if let Some(hit) = hit {
                     tracing::info!(
-                        target: "guard::apiproxy",
+                        target: "guard::audit",
                         "[AUDIT] API_LEARNED_ALLOW {} approvals={} risk={} reversibility={}",
                         hit.shape.audit_label(),
                         hit.approvals,
@@ -166,7 +166,7 @@ impl DaemonApiJudge {
                 reversibility,
             })) => {
                 tracing::info!(
-                    target: "guard::apiproxy",
+                    target: "guard::audit",
                     "[AUDIT] API_SHAPE_PROMOTED decision=allow {} approvals={} risk={} reversibility={}",
                     shape.audit_label(),
                     approvals,
@@ -191,7 +191,7 @@ impl DaemonApiJudge {
         match outcome {
             Ok(Some(ApiPromotionOutcome::DenyLearned { shape, denials })) => {
                 tracing::info!(
-                    target: "guard::apiproxy",
+                    target: "guard::audit",
                     "[AUDIT] API_SHAPE_PROMOTED decision=deny {} denials={}",
                     shape.audit_label(),
                     denials

@@ -35,9 +35,12 @@ use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tracing_subscriber::filter::{filter_fn, FilterExt};
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::FormatTime;
-use tracing_subscriber::{fmt as tracing_fmt, EnvFilter};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{fmt as tracing_fmt, EnvFilter, Layer};
 
 const EXIT_GUARD_ERROR: i32 = 125;
 const EXIT_GUARD_DENIED: i32 = 126;
@@ -777,6 +780,11 @@ enum ServerCommands {
         #[arg(long, value_name = "PATH")]
         state_db: Option<PathBuf>,
 
+        /// Retain ended session grants and command interactions for this many
+        /// seconds. Env: GUARD_HISTORY_RETENTION_SECS. Default: 86400.
+        #[arg(long = "history-retention", value_name = "SECONDS")]
+        history_retention: Option<u64>,
+
         /// Execute approved Unix-socket requests as the connecting UID instead of the daemon UID.
         /// Requires a root daemon and no TCP listener.
         #[arg(long = "exec-as-caller", action = ArgAction::SetTrue)]
@@ -1118,12 +1126,26 @@ async fn run_main() -> Result<()> {
         let level = guard_env("LOG_LEVEL").unwrap_or_else(|| "warn".to_string());
         EnvFilter::new(level)
     });
-    tracing_fmt()
-        .with_env_filter(filter)
-        .with_target(true)
-        .with_timer(UtcTimestamp)
-        .with_ansi(color_enabled_for_stderr())
-        .with_writer(std::io::stderr)
+    let non_audit = filter_fn(|metadata| metadata.target() != "guard::audit").and(filter);
+    let audit = filter_fn(|metadata| metadata.target() == "guard::audit");
+    let ansi = color_enabled_for_stderr();
+    tracing_subscriber::registry()
+        .with(
+            tracing_fmt::layer()
+                .with_target(true)
+                .with_timer(UtcTimestamp)
+                .with_ansi(ansi)
+                .with_writer(std::io::stderr)
+                .with_filter(non_audit),
+        )
+        .with(
+            tracing_fmt::layer()
+                .with_target(true)
+                .with_timer(UtcTimestamp)
+                .with_ansi(ansi)
+                .with_writer(std::io::stderr)
+                .with_filter(audit),
+        )
         .init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -1474,7 +1496,7 @@ fn format_optional_timestamp(ts: Option<u64>) -> String {
 
 fn log_cli_usage_error(args: &[String], error: &clap::Error) {
     let command_path = cli_command_path(args);
-    tracing::warn!(
+    tracing::warn!(target: "guard::audit",
         "[AUDIT] CLI_USAGE_ERROR command={} kind={:?} argc={}",
         command_path,
         error.kind(),
