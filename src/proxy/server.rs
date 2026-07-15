@@ -361,7 +361,7 @@ impl ApiProxy {
         policy: ApiPolicy,
         policy_path: Option<PathBuf>,
     ) -> Self {
-        let proxy_url = format!("https://127.0.0.1:{}", listen.port());
+        let proxy_url = format!("https://{listen}");
         Self {
             listen,
             proxy_url,
@@ -1537,6 +1537,18 @@ impl ApiProxy {
                     }
                     continue;
                 }
+                if name.as_str() == "link" {
+                    if let Some(link) = self.safe_link(value, &response_secrets) {
+                        hdrs.append(name, link);
+                    }
+                    continue;
+                }
+                if is_rate_limit_response_header(name) {
+                    if value.as_bytes().len() <= MAX_RATE_LIMIT_HEADER_LEN {
+                        hdrs.append(name, value.clone());
+                    }
+                    continue;
+                }
                 if !is_safe_response_header(name) {
                     continue;
                 }
@@ -1944,7 +1956,34 @@ impl ApiProxy {
             rewritten.push('?');
             rewritten.push_str(query);
         }
+        if let Some(fragment) = location.fragment() {
+            rewritten.push('#');
+            rewritten.push_str(fragment);
+        }
         HeaderValue::from_str(&rewritten).ok()
+    }
+
+    fn safe_link(&self, value: &HeaderValue, secrets: &[Vec<u8>]) -> Option<HeaderValue> {
+        if header_contains_secret(value.as_bytes(), secrets) {
+            return None;
+        }
+        let raw = value.to_str().ok()?;
+        let mut rewritten = Vec::new();
+        for link in split_link_values(raw)? {
+            let link = link.trim();
+            let target_end = link.strip_prefix('<')?.find('>')? + 1;
+            let target = &link[1..target_end];
+            if target.is_empty() {
+                return None;
+            }
+            let params = &link[target_end + 1..];
+            if !params.trim().is_empty() && !params.trim_start().starts_with(';') {
+                return None;
+            }
+            let target = self.safe_location(&HeaderValue::from_str(target).ok()?, secrets)?;
+            rewritten.push(format!("<{}>{params}", target.to_str().ok()?));
+        }
+        HeaderValue::from_str(&rewritten.join(", ")).ok()
     }
 
     fn status_resp(&self, code: StatusCode, message: &str, reason: &str) -> Response<ProxyBody> {
@@ -2128,6 +2167,47 @@ fn is_safe_response_header(name: &header::HeaderName) -> bool {
     )
 }
 
+const MAX_RATE_LIMIT_HEADER_LEN: usize = 1024;
+
+fn is_rate_limit_response_header(name: &header::HeaderName) -> bool {
+    name.as_str().starts_with("x-ratelimit-") || name.as_str().starts_with("ratelimit-")
+}
+
+fn split_link_values(raw: &str) -> Option<Vec<&str>> {
+    let mut values = Vec::new();
+    let mut start = 0;
+    let mut in_target = false;
+    let mut in_quote = false;
+    let mut escaped = false;
+    for (index, character) in raw.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_quote && character == '\\' {
+            escaped = true;
+            continue;
+        }
+        match character {
+            '"' if !in_target => in_quote = !in_quote,
+            '<' if !in_quote && !in_target => in_target = true,
+            '<' if !in_quote => return None,
+            '>' if !in_quote && in_target => in_target = false,
+            '>' if !in_quote => return None,
+            ',' if !in_quote && !in_target => {
+                values.push(&raw[start..index]);
+                start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if in_target || in_quote || escaped {
+        return None;
+    }
+    values.push(&raw[start..]);
+    (!values.is_empty()).then_some(values)
+}
+
 fn header_contains_secret(value: &[u8], secrets: &[Vec<u8>]) -> bool {
     secrets.iter().any(|secret| {
         !secret.is_empty()
@@ -2138,9 +2218,11 @@ fn header_contains_secret(value: &[u8], secrets: &[Vec<u8>]) -> bool {
 }
 
 fn validate_listener_identity(listen: SocketAddr) -> Result<()> {
-    if listen.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) {
+    if listen.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        && listen.ip() != std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+    {
         return Err(anyhow!(
-            "api-proxy listener must bind exactly 127.0.0.1 (got {listen})"
+            "api-proxy listener must bind to 127.0.0.1 or ::1 (got {listen})"
         ));
     }
     if listen.port() == 0 {
@@ -2336,9 +2418,10 @@ mod tests {
     }
 
     #[test]
-    fn listener_identity_is_exact_nonzero_ipv4_loopback() {
+    fn listener_identity_is_exact_nonzero_loopback() {
         assert!(validate_listener_identity("127.0.0.1:8443".parse().unwrap()).is_ok());
-        for address in ["127.0.0.1:0", "127.0.0.2:8443", "[::1]:8443"] {
+        assert!(validate_listener_identity("[::1]:8443".parse().unwrap()).is_ok());
+        for address in ["127.0.0.1:0", "[::1]:0", "127.0.0.2:8443"] {
             assert!(validate_listener_identity(address.parse().unwrap()).is_err());
         }
     }
@@ -2371,6 +2454,42 @@ mod tests {
                 .unwrap(),
             HeaderValue::from_static("/api/v1")
         );
+    }
+
+    #[test]
+    fn link_rewrites_every_safe_target_and_rejects_any_unsafe_target() {
+        let proxy = test_proxy();
+        let secrets = vec![b"operator-secret-token".to_vec()];
+        let safe = proxy
+            .safe_link(
+                &HeaderValue::from_static(
+                    "<https://x:6443/items?page=2>; rel=\"next\", </items?page=1>; rel=\"prev alternate\"; title=\"a,b\"",
+                ),
+                &secrets,
+            )
+            .unwrap();
+        assert_eq!(
+            safe,
+            HeaderValue::from_static(
+                "<https://127.0.0.1:0/items?page=2>; rel=\"next\", </items?page=1>; rel=\"prev alternate\"; title=\"a,b\""
+            )
+        );
+        assert!(proxy
+            .safe_link(
+                &HeaderValue::from_static(
+                    "</items?page=2>; rel=\"next\", <https://attacker.invalid/collect>; rel=\"prev\"",
+                ),
+                &secrets,
+            )
+            .is_none());
+        assert!(proxy
+            .safe_link(
+                &HeaderValue::from_static(
+                    "<https://x:6443/items?token=operator-secret-token>; rel=\"next\"",
+                ),
+                &secrets,
+            )
+            .is_none());
     }
 
     fn created_key(conn: u64, name: &str) -> CreatedKey {

@@ -213,6 +213,40 @@ async fn spawn_mock_upstream() -> String {
     format!("http://{addr}")
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ipv6_loopback_listener_serves_with_matching_tls_identity() {
+    let mock_base = spawn_mock_upstream().await;
+    let upstream =
+        Upstream::from_kubeconfig_str(&kubeconfig_for(&mock_base), None).expect("upstream");
+    let tls = ProxyTls::generate().expect("tls");
+    let ca_pem = tls.ca_pem().to_string();
+    let listener = tokio::net::TcpListener::bind("[::1]:0")
+        .await
+        .expect("bind IPv6 localhost");
+    let listen = listener.local_addr().unwrap();
+    let proxy = Arc::new(ApiProxy::new(
+        listen,
+        tls,
+        upstream,
+        ApiPolicy::deny_all(),
+        None,
+    ));
+    assert_eq!(proxy.proxy_url(), format!("https://{listen}"));
+    tokio::spawn(proxy.serve_on(listener));
+
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .no_proxy()
+        .build()
+        .unwrap();
+    let response = client
+        .get(format!("https://{listen}/version"))
+        .send()
+        .await
+        .expect("request IPv6 loopback proxy");
+    assert_eq!(response.status(), 200);
+}
+
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -780,6 +814,12 @@ async fn header_echo_handler(req: Request<Incoming>) -> Result<Response<Full<Byt
             "location",
             format!("https://attacker.invalid/collect?auth={reflected_authorization}"),
         )
+        .header(
+            "link",
+            "</api/v1/namespaces/dev/pods?limit=50&continue=next>; rel=\"next\"",
+        )
+        .header("x-ratelimit-limit", "60")
+        .header("x-ratelimit-remaining", "42")
         .body(Full::new(Bytes::from(body.to_string())))
         .unwrap())
 }
@@ -915,6 +955,18 @@ async fn guard_session_bearer_is_validated_and_never_forwarded() {
     assert!(!response.headers().contains_key("set-cookie"));
     assert!(!response.headers().contains_key("authorization"));
     assert!(!response.headers().contains_key("www-authenticate"));
+    assert_eq!(
+        response
+            .headers()
+            .get("link")
+            .and_then(|value| value.to_str().ok()),
+        Some("</api/v1/namespaces/dev/pods?limit=50&continue=next>; rel=\"next\"")
+    );
+    assert_eq!(response.headers().get("x-ratelimit-limit").unwrap(), "60");
+    assert_eq!(
+        response.headers().get("x-ratelimit-remaining").unwrap(),
+        "42"
+    );
     let body: Value = response.json().await.unwrap();
     assert_eq!(
         body["receivedHeaders"]["authorization"].as_str(),
