@@ -107,6 +107,12 @@ pub struct VerbCoverageCell {
     pub required_args: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forbidden_args: Vec<String>,
+    /// Inclusive argv cardinality bounds. These constrain the complete argv,
+    /// including tokens not otherwise selected by a value constraint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_args: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_args: Option<usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<ValueConstraint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -830,6 +836,11 @@ fn coverage_cell_matches(
     cell: &VerbCoverageCell,
     args: &[String],
 ) -> Option<(BTreeSet<String>, CoverageSpecificity)> {
+    if cell.min_args.is_some_and(|minimum| args.len() < minimum)
+        || cell.max_args.is_some_and(|maximum| args.len() > maximum)
+    {
+        return None;
+    }
     if cell
         .required_args
         .iter()
@@ -853,6 +864,18 @@ fn coverage_cell_matches(
         requirements: features.clone(),
         ..CoverageSpecificity::default()
     };
+    if let Some(minimum) = cell.min_args {
+        features.insert(format!("argv:min={minimum}"));
+        specificity
+            .requirements
+            .insert(format!("argv:min={minimum}"));
+    }
+    if let Some(maximum) = cell.max_args {
+        features.insert(format!("argv:max={maximum}"));
+        specificity
+            .requirements
+            .insert(format!("argv:max={maximum}"));
+    }
 
     for (kind, constraint) in cell
         .options
@@ -1294,6 +1317,13 @@ fn validate_verb(verb: &Verb) -> Result<()> {
                     cell.name
                 );
             }
+        }
+        if matches!((cell.min_args, cell.max_args), (Some(min), Some(max)) if min > max) {
+            bail!(
+                "verb '{}' coverage cell '{}': min_args cannot exceed max_args",
+                verb.name,
+                cell.name
+            );
         }
     }
     Ok(())
@@ -1952,6 +1982,8 @@ verbs:
             action: CoverageAction::Evaluate,
             required_args: Vec::new(),
             forbidden_args: Vec::new(),
+            min_args: None,
+            max_args: None,
             options: Vec::new(),
             target: None,
             inventory: None,

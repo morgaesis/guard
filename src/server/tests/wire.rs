@@ -38,6 +38,15 @@ fn session_scoped_public_rpcs_carry_distinct_owner_bearers() {
         delta: Default::default(),
     };
     assert!(!submit.requires_daemon_uid());
+
+    let list = crate::server::wire::AdminRequest::GrantRequestList {
+        session_token: Some("target".to_string()),
+        caller_token: Some("owner".to_string()),
+    };
+    assert!(!list.requires_daemon_uid());
+    let json = serde_json::to_value(&list).unwrap();
+    assert_eq!(json["session_token"], "target");
+    assert_eq!(json["caller_token"], "owner");
 }
 
 // ---- Audit-line redaction helpers ---------------------------------------

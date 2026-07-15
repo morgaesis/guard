@@ -518,6 +518,10 @@ pub enum AdminRequest {
         #[serde(default)]
         clear_verbs: bool,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        override_markers: Vec<String>,
+        #[serde(default)]
+        clear_override_markers: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         secret_names: Vec<String>,
         #[serde(default)]
         clear_secrets: bool,
@@ -552,6 +556,8 @@ pub enum AdminRequest {
     GrantRequestList {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_token: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_token: Option<String>,
     },
     GrantRequestShow {
         handle: String,

@@ -1015,12 +1015,17 @@ async fn grant_requests_use_the_issued_ceiling_and_redact_session_tokens() {
             if request.status == crate::grant_profile::GrantRequestStatus::Approved
                 && request.session_token.starts_with("sha256:")
     ));
+    cfg.sessions.write().await.grant(
+        "other-live-session".to_string(),
+        granted_session(Vec::new(), Vec::new()),
+    );
 
     let unscoped = handle_admin_request(
         &cfg,
         &worker,
         AdminRequest::GrantRequestList {
             session_token: None,
+            caller_token: None,
         },
     )
     .await;
@@ -1029,7 +1034,8 @@ async fn grant_requests_use_the_issued_ceiling_and_redact_session_tokens() {
         &cfg,
         &worker,
         AdminRequest::GrantRequestList {
-            session_token: Some(token),
+            session_token: Some(token.clone()),
+            caller_token: Some(token.clone()),
         },
     )
     .await;
@@ -1038,6 +1044,236 @@ async fn grant_requests_use_the_issued_ceiling_and_redact_session_tokens() {
         AdminResponse::GrantRequests { items }
             if items.len() == 1 && items[0].session_token.starts_with("sha256:")
     ));
+
+    let cross_session = handle_admin_request(
+        &cfg,
+        &worker,
+        AdminRequest::GrantRequestList {
+            session_token: Some(token),
+            caller_token: Some("other-live-session".to_string()),
+        },
+    )
+    .await;
+    assert!(matches!(
+        cross_session,
+        AdminResponse::Error { message } if message.contains("only list its own")
+    ));
+
+    let admin = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::GrantRequestList {
+            session_token: None,
+            caller_token: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        admin,
+        AdminResponse::GrantRequests { items } if items.len() == 1
+    ));
+}
+
+#[tokio::test]
+async fn grant_request_submit_enforces_suspension_quota_and_aggregate_size() {
+    let (mut cfg, _) = make_test_config();
+    cfg.daemon_uid = 777;
+    cfg.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.behavior_limits.max_denials = Some(1);
+    let worker = CallerIdentity::Unix { uid: 778 };
+    for token in ["suspended-request", "quota-request", "large-request"] {
+        cfg.sessions
+            .write()
+            .await
+            .grant(token.to_string(), granted_session(Vec::new(), Vec::new()));
+    }
+    cfg.sessions.write().await.record_interaction(
+        "suspended-request",
+        SessionInteraction {
+            command: "denied".to_string(),
+            allowed: false,
+            source: SessionDecisionSource::Llm,
+            reason: "denied".to_string(),
+            risk: Some(5),
+            exec_status: SessionExecStatus::NotAttempted,
+            exit_code: None,
+            at_unix: guard::env::now_unix(),
+            exposed_secret_refs: Vec::new(),
+        },
+    );
+    let submit =
+        |token: &str, prompt: String, delta_prompt: String| AdminRequest::GrantRequestSubmit {
+            session_token: token.to_string(),
+            caller_token: Some(token.to_string()),
+            saved_grant: None,
+            prompt,
+            delta: crate::grant_profile::GrantRequestDelta {
+                prompt_append: Some(delta_prompt),
+                ..Default::default()
+            },
+        };
+    assert!(matches!(
+        handle_admin_request(
+            &cfg,
+            &worker,
+            submit("suspended-request", "request".to_string(), "scope".to_string()),
+        )
+        .await,
+        AdminResponse::Error { message } if message.contains("suspended")
+    ));
+
+    for index in 0..crate::server::admin::MAX_PENDING_GRANT_REQUESTS_PER_SESSION {
+        let request = crate::grant_profile::GrantRequest::new(
+            "quota-request".to_string(),
+            None,
+            crate::grant_profile::GrantRequestDelta {
+                prompt_append: Some(format!("scope-{index}")),
+                ..Default::default()
+            },
+            format!("request-{index}"),
+        )
+        .unwrap();
+        cfg.grant_requests
+            .write()
+            .await
+            .insert(request.handle.clone(), request);
+    }
+    assert!(matches!(
+        handle_admin_request(
+            &cfg,
+            &worker,
+            submit("quota-request", "one more".to_string(), "scope".to_string()),
+        )
+        .await,
+        AdminResponse::Error { message } if message.contains("per session")
+    ));
+
+    let half = "x".repeat(crate::server::admin::MAX_GRANT_REQUEST_PAYLOAD_BYTES / 2 + 1);
+    assert!(matches!(
+        handle_admin_request(
+            &cfg,
+            &worker,
+            submit("large-request", half.clone(), half),
+        )
+        .await,
+        AdminResponse::Error { message } if message.contains("byte limit")
+    ));
+}
+
+#[tokio::test]
+async fn auto_and_operator_approval_fail_without_partial_session_authority() {
+    let (mut cfg, _) = make_test_config();
+    cfg.daemon_uid = 777;
+    cfg.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.saved_grants = Arc::new(RwLock::new(
+        SavedGrantCatalog::from_yaml(
+            "grants:\n  - name: automatic\n    ttl_secs: 300\n    prompt_append: automatic work\n    auto_approve_requests: true\n  - name: reviewed\n    ttl_secs: 300\n    prompt_append: reviewed work\n    auto_approve_requests: false\n",
+        )
+        .unwrap(),
+    ));
+    let tmp = tempfile::tempdir().unwrap();
+    cfg.session_store = Some(
+        SessionStore::open(tmp.path().join("state.db"), 3600)
+            .await
+            .unwrap(),
+    );
+    let daemon = CallerIdentity::Unix { uid: 777 };
+    let worker = CallerIdentity::Unix { uid: 778 };
+    for (token, saved_grant) in [
+        ("automatic-approval", "automatic"),
+        ("operator-approval", "reviewed"),
+    ] {
+        assert!(matches!(
+            handle_admin_request(
+                &cfg,
+                &daemon,
+                AdminRequest::SessionGrant {
+                    token: token.to_string(),
+                    allow: Vec::new(),
+                    deny: Vec::new(),
+                    activated_verbs: Vec::new(),
+                    override_markers: Vec::new(),
+                    ttl_secs: None,
+                    prompt_append: None,
+                    prose: None,
+                    saved_grant: Some(saved_grant.to_string()),
+                    profile: None,
+                    evaluation_mode: None,
+                    static_only: false,
+                    auto_amend: false,
+                },
+            )
+            .await,
+            AdminResponse::Ok
+        ));
+    }
+    let submit = |token: &str| AdminRequest::GrantRequestSubmit {
+        session_token: token.to_string(),
+        caller_token: Some(token.to_string()),
+        saved_grant: None,
+        prompt: "shorten bounded work".to_string(),
+        delta: crate::grant_profile::GrantRequestDelta {
+            ttl_secs: Some(120),
+            ..Default::default()
+        },
+    };
+
+    let auto_revision = cfg
+        .sessions
+        .read()
+        .await
+        .effective_revision_key("automatic-approval");
+    cfg.session_store
+        .as_ref()
+        .unwrap()
+        .fail_next_approval_for_test();
+    assert!(matches!(
+        handle_admin_request(&cfg, &worker, submit("automatic-approval")).await,
+        AdminResponse::Error { message } if message.contains("approval transaction failure")
+    ));
+    assert_eq!(
+        cfg.sessions
+            .read()
+            .await
+            .effective_revision_key("automatic-approval"),
+        auto_revision
+    );
+
+    let reviewed_revision = cfg
+        .sessions
+        .read()
+        .await
+        .effective_revision_key("operator-approval");
+    let response = handle_admin_request(&cfg, &worker, submit("operator-approval")).await;
+    let AdminResponse::GrantRequest { request } = response else {
+        panic!("expected pending request")
+    };
+    cfg.session_store
+        .as_ref()
+        .unwrap()
+        .fail_next_approval_for_test();
+    assert!(matches!(
+        handle_admin_request(
+            &cfg,
+            &daemon,
+            AdminRequest::GrantRequestApprove {
+                handle: request.handle.clone(),
+            },
+        )
+        .await,
+        AdminResponse::Error { message } if message.contains("approval transaction failure")
+    ));
+    assert_eq!(
+        cfg.sessions
+            .read()
+            .await
+            .effective_revision_key("operator-approval"),
+        reviewed_revision
+    );
+    assert_eq!(
+        cfg.grant_requests.read().await[&request.handle].status,
+        crate::grant_profile::GrantRequestStatus::Pending
+    );
 }
 
 #[tokio::test]
@@ -1047,7 +1283,7 @@ async fn saved_grant_edit_uses_explicit_clear_and_tristate_operations() {
     cfg.daemon_principal = PrincipalKey::from_uid(777);
     let daemon = CallerIdentity::Unix { uid: 777 };
     let source = SavedGrantCatalog::from_yaml(
-        "grants:\n  - name: editable\n    description: original\n    activated_verbs: [inspect]\n    secret_names: [service/*]\n    ttl_secs: 300\n    prompt_append: original prompt\n    auto_approve_requests: true\n",
+        "grants:\n  - name: editable\n    description: original\n    activated_verbs: [inspect]\n    override_markers: [operator:inspect]\n    secret_names: [service/*]\n    ttl_secs: 300\n    prompt_append: original prompt\n    auto_approve_requests: true\n",
     )
     .unwrap();
     let grant = source.get("editable").unwrap().clone();
@@ -1064,6 +1300,8 @@ async fn saved_grant_edit_uses_explicit_clear_and_tristate_operations() {
             description: Some("updated".to_string()),
             activated_verbs: Vec::new(),
             clear_verbs: true,
+            override_markers: Vec::new(),
+            clear_override_markers: true,
             secret_names: Vec::new(),
             clear_secrets: true,
             ttl_secs: None,
@@ -1079,6 +1317,7 @@ async fn saved_grant_edit_uses_explicit_clear_and_tristate_operations() {
     };
     assert_eq!(grant.description, "updated");
     assert!(grant.activated_verbs.is_empty());
+    assert!(grant.override_markers.is_empty());
     assert!(grant.secret_names.is_empty());
     assert_eq!(grant.ttl_secs, None);
     assert_eq!(grant.prompt_append.as_deref(), Some("original prompt"));
@@ -1094,6 +1333,8 @@ async fn saved_grant_edit_uses_explicit_clear_and_tristate_operations() {
             description: None,
             activated_verbs: vec!["inspect".to_string()],
             clear_verbs: false,
+            override_markers: vec!["operator:inspect".to_string()],
+            clear_override_markers: false,
             secret_names: Vec::new(),
             clear_secrets: false,
             ttl_secs: None,
@@ -1234,6 +1475,77 @@ async fn grant_request_show_and_withdraw_require_the_issuing_session() {
         AdminResponse::GrantRequest { request }
             if request.status == crate::grant_profile::GrantRequestStatus::Withdrawn
     ));
+}
+
+#[tokio::test]
+async fn withdraw_and_prune_keep_memory_when_persistence_fails() {
+    let (mut cfg, _) = make_test_config();
+    cfg.daemon_uid = 777;
+    cfg.daemon_principal = PrincipalKey::from_uid(777);
+    let tmp = tempfile::tempdir().unwrap();
+    cfg.session_store = Some(
+        SessionStore::open(tmp.path().join("state.db"), 3600)
+            .await
+            .unwrap(),
+    );
+    let token = "persisted-request-owner".to_string();
+    cfg.sessions
+        .write()
+        .await
+        .grant(token.clone(), granted_session(Vec::new(), Vec::new()));
+    let mut request = crate::grant_profile::GrantRequest::new(
+        token.clone(),
+        None,
+        crate::grant_profile::GrantRequestDelta {
+            prompt_append: Some("bounded request".to_string()),
+            ..Default::default()
+        },
+        "bounded request".to_string(),
+    )
+    .unwrap();
+    let handle = request.handle.clone();
+    cfg.grant_requests
+        .write()
+        .await
+        .insert(handle.clone(), request.clone());
+    let store = cfg.session_store.as_ref().unwrap();
+    store.save_grant_request(request.clone()).await.unwrap();
+    store.fail_next_write_for_test();
+
+    let response = handle_admin_request(
+        &cfg,
+        &CallerIdentity::Unix { uid: 778 },
+        AdminRequest::GrantRequestWithdraw {
+            handle: handle.clone(),
+            session_token: Some(token),
+        },
+    )
+    .await;
+    assert!(matches!(response, AdminResponse::Error { .. }));
+    assert_eq!(
+        cfg.grant_requests.read().await[&handle].status,
+        crate::grant_profile::GrantRequestStatus::Pending
+    );
+    assert_eq!(
+        store.load_grant_requests().await.unwrap()[0].status,
+        crate::grant_profile::GrantRequestStatus::Pending
+    );
+
+    request.expires_unix = 1;
+    cfg.grant_requests
+        .write()
+        .await
+        .insert(handle.clone(), request.clone());
+    store.save_grant_request(request).await.unwrap();
+    store.fail_next_write_for_test();
+    crate::server::admin::prune_grant_requests(&cfg).await;
+    assert!(cfg.grant_requests.read().await.contains_key(&handle));
+    assert!(store
+        .load_grant_requests()
+        .await
+        .unwrap()
+        .iter()
+        .any(|request| request.handle == handle));
 }
 
 #[tokio::test]
@@ -1389,6 +1701,8 @@ async fn grant_request_approval_rejects_expiry_and_stale_saved_revision() {
                 description: Some("new revision".to_string()),
                 activated_verbs: Vec::new(),
                 clear_verbs: false,
+                override_markers: Vec::new(),
+                clear_override_markers: false,
                 secret_names: Vec::new(),
                 clear_secrets: false,
                 ttl_secs: None,
@@ -1480,7 +1794,8 @@ async fn grant_request_binds_unsaved_session_revision_and_prunes_expired_rows() 
         &cfg,
         &worker,
         AdminRequest::GrantRequestList {
-            session_token: Some(token),
+            session_token: Some(token.clone()),
+            caller_token: Some(token),
         },
     )
     .await;
@@ -1506,14 +1821,14 @@ async fn grant_request_queue_is_bounded_and_recovers_capacity_from_expiry() {
     cfg.daemon_uid = 777;
     cfg.daemon_principal = PrincipalKey::from_uid(777);
     let worker = CallerIdentity::Unix { uid: 778 };
-    let token = "bounded-queue".to_string();
+    let token = "bounded-queue-0".to_string();
     cfg.sessions
         .write()
         .await
         .grant(token.clone(), granted_session(Vec::new(), Vec::new()));
     for index in 0..1024 {
         let request = crate::grant_profile::GrantRequest::new(
-            token.clone(),
+            format!("bounded-queue-{}", index / 32),
             None,
             crate::grant_profile::GrantRequestDelta {
                 activated_verbs: vec![format!("verb-{index}")],
@@ -1545,7 +1860,7 @@ async fn grant_request_queue_is_bounded_and_recovers_capacity_from_expiry() {
         .write()
         .await
         .values_mut()
-        .next()
+        .find(|request| request.session_token == token)
         .unwrap()
         .expires_unix = 1;
     assert!(matches!(

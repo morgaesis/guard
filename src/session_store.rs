@@ -1,13 +1,14 @@
 use crate::grant_profile::{GrantRequest, SavedGrant};
 use crate::session::{
-    HistoricalGrant, HistoricalStatus, IssuedGrantScope, SessionDecisionSource, SessionExactRule,
-    SessionExecStatus, SessionGrant, SessionInteraction, SessionRegistry,
+    session_grant_revision_key, HistoricalGrant, HistoricalStatus, IssuedGrantScope,
+    SessionDecisionSource, SessionExactRule, SessionExecStatus, SessionGrant, SessionInteraction,
+    SessionRegistry,
 };
 use anyhow::{Context, Result};
 use guard::gating::approval::Approval;
 use guard::gating::provisional::Provisional;
 use guard::gating::read_grant::ReadGrant;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -27,6 +28,10 @@ pub struct SessionStore {
     /// the rewrite and drops any snapshot older than what already landed.
     /// Shared across clones so every handle to the same store agrees.
     registry_write_gate: std::sync::Arc<tokio::sync::Mutex<u64>>,
+    #[cfg(test)]
+    fail_next_write: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    fail_next_approval: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl SessionStore {
@@ -71,6 +76,10 @@ impl SessionStore {
             path,
             history_retention_secs,
             registry_write_gate: std::sync::Arc::new(tokio::sync::Mutex::new(0)),
+            #[cfg(test)]
+            fail_next_write: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_next_approval: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let registry = Self::load_registry_sync(&store.path, history_retention_secs)?;
         Self::persist_registry_sync(&store.path, history_retention_secs, &registry)?;
@@ -200,6 +209,16 @@ impl SessionStore {
         Self::init_schema(&conn)?;
         let tx = conn.unchecked_transaction()?;
 
+        Self::rewrite_registry_transaction(&tx, history_retention_secs, registry)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn rewrite_registry_transaction(
+        tx: &Transaction<'_>,
+        history_retention_secs: u64,
+        registry: &SessionRegistry,
+    ) -> Result<()> {
         tx.execute("DELETE FROM session_grants", [])?;
         tx.execute("DELETE FROM session_history", [])?;
         tx.execute("DELETE FROM session_interactions", [])?;
@@ -279,8 +298,34 @@ impl SessionStore {
             )?;
         }
 
-        tx.commit()?;
         Ok(())
+    }
+
+    fn load_session_grant(conn: &Connection, token: &str) -> Result<Option<SessionGrant>> {
+        conn.query_row(
+            "SELECT allow_json, deny_json, allow_exact_json, deny_exact_json, activated_verbs_json, override_markers_json, scope_json, expires_at, prompt_append, generated_notes_json, granted_at, static_only, auto_amend
+             FROM session_grants WHERE token = ?1",
+            params![token],
+            |row| {
+                Ok(SessionGrant {
+                    allow: decode_vec(&row.get::<_, String>(0)?)?,
+                    deny: decode_vec(&row.get::<_, String>(1)?)?,
+                    allow_exact: decode_exact_vec(&row.get::<_, String>(2)?)?,
+                    deny_exact: decode_exact_vec(&row.get::<_, String>(3)?)?,
+                    activated_verbs: decode_vec(&row.get::<_, String>(4)?)?,
+                    override_markers: decode_vec(&row.get::<_, String>(5)?)?,
+                    scope: decode_scope(&row.get::<_, String>(6)?)?,
+                    expires_at: decode_optional_u64(row.get(7)?)?,
+                    prompt_append: row.get(8)?,
+                    generated_notes: decode_vec(&row.get::<_, String>(9)?)?,
+                    granted_at: decode_u64(row.get(10)?)?,
+                    static_only: decode_bool(row.get(11)?)?,
+                    auto_amend: decode_bool(row.get(12)?)?,
+                })
+            },
+        )
+        .optional()
+        .context("load session grant for request approval")
     }
 
     /// Reclaim storage only when deleted pages are both substantial and a
@@ -412,6 +457,10 @@ impl SessionStore {
                 json TEXT NOT NULL,
                 updated_unix INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS saved_grant_tombstones (
+                name TEXT PRIMARY KEY,
+                deleted_unix INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS grant_requests (
                 handle TEXT PRIMARY KEY,
                 json TEXT NOT NULL,
@@ -536,6 +585,10 @@ impl SessionStore {
                 json TEXT NOT NULL,
                 updated_unix INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS saved_grant_tombstones (
+                name TEXT PRIMARY KEY,
+                deleted_unix INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS grant_requests (
                 handle TEXT PRIMARY KEY,
                 json TEXT NOT NULL,
@@ -592,13 +645,19 @@ impl SessionStore {
     pub async fn save_saved_grant(&self, grant: SavedGrant) -> Result<()> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = Self::open_connection(&path)?;
+            let mut conn = Self::open_connection(&path)?;
             Self::init_schema(&conn)?;
             let json = serde_json::to_string(&grant).context("encode saved grant")?;
-            conn.execute(
+            let tx = conn.transaction()?;
+            tx.execute(
                 "INSERT OR REPLACE INTO saved_grants (name, json, updated_unix) VALUES (?1, ?2, ?3)",
-                params![grant.name, json, encode_u64(grant.updated_unix)?],
+                params![&grant.name, json, encode_u64(grant.updated_unix)?],
             )?;
+            tx.execute(
+                "DELETE FROM saved_grant_tombstones WHERE name = ?1",
+                params![grant.name],
+            )?;
+            tx.commit()?;
             Ok(())
         })
         .await
@@ -608,9 +667,15 @@ impl SessionStore {
     pub async fn delete_saved_grant(&self, name: String) -> Result<()> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = Self::open_connection(&path)?;
+            let mut conn = Self::open_connection(&path)?;
             Self::init_schema(&conn)?;
-            conn.execute("DELETE FROM saved_grants WHERE name = ?1", params![name])?;
+            let tx = conn.transaction()?;
+            tx.execute("DELETE FROM saved_grants WHERE name = ?1", params![&name])?;
+            tx.execute(
+                "INSERT OR REPLACE INTO saved_grant_tombstones (name, deleted_unix) VALUES (?1, ?2)",
+                params![name, encode_u64(guard::env::now_unix())?],
+            )?;
+            tx.commit()?;
             Ok(())
         })
         .await
@@ -622,7 +687,28 @@ impl SessionStore {
             .await
     }
 
+    pub async fn load_saved_grant_tombstones(&self) -> Result<Vec<String>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = Self::open_connection(&path)?;
+            Self::init_schema(&conn)?;
+            let mut stmt = conn.prepare("SELECT name FROM saved_grant_tombstones ORDER BY name")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .context("load saved grant tombstones")
+        })
+        .await
+        .context("load saved grant tombstones task failed")?
+    }
+
     pub async fn save_grant_request(&self, request: GrantRequest) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("simulated session-store write failure");
+        }
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
             let conn = Self::open_connection(&path)?;
@@ -638,6 +724,109 @@ impl SessionStore {
         .context("save grant request task failed")?
     }
 
+    /// Commit an approved request and the session authority it changes in one
+    /// SQLite transaction. The durable pending request and session revision
+    /// are rechecked inside that transaction before either row set changes.
+    pub async fn commit_grant_request_approval(
+        &self,
+        pending: GrantRequest,
+        approved: GrantRequest,
+        registry: SessionRegistry,
+    ) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_approval
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("simulated grant approval transaction failure");
+        }
+        #[cfg(test)]
+        if self
+            .fail_next_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("simulated session-store write failure");
+        }
+        let path = self.path.clone();
+        let retention = self.history_retention_secs;
+        let revision = registry.revision();
+        let mut last_written = self.registry_write_gate.lock().await;
+        if revision < *last_written {
+            anyhow::bail!("approved session snapshot is stale");
+        }
+        tokio::task::spawn_blocking(move || {
+            Self::commit_grant_request_approval_sync(
+                &path, retention, &pending, &approved, &registry, false,
+            )
+        })
+        .await
+        .context("grant request approval transaction task failed")??;
+        *last_written = revision;
+        Ok(())
+    }
+
+    fn commit_grant_request_approval_sync(
+        path: &Path,
+        history_retention_secs: u64,
+        pending: &GrantRequest,
+        approved: &GrantRequest,
+        registry: &SessionRegistry,
+        fail_before_commit: bool,
+    ) -> Result<()> {
+        if pending.status != crate::grant_profile::GrantRequestStatus::Pending
+            || approved.status != crate::grant_profile::GrantRequestStatus::Approved
+            || approved.handle != pending.handle
+            || approved.session_token != pending.session_token
+            || approved.issued_saved_revision != pending.issued_saved_revision
+            || approved.issued_session_revision != pending.issued_session_revision
+            || approved.delta != pending.delta
+        {
+            anyhow::bail!("invalid grant request approval transition");
+        }
+
+        let conn = Self::open_connection(path)?;
+        Self::init_schema(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        let durable_json = tx
+            .query_row(
+                "SELECT json FROM grant_requests WHERE handle = ?1",
+                params![pending.handle],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .context("durable pending grant request is missing")?;
+        let durable: GrantRequest =
+            serde_json::from_str(&durable_json).context("decode durable pending grant request")?;
+        if durable != *pending {
+            anyhow::bail!("durable grant request changed after approval began");
+        }
+        let durable_grant = Self::load_session_grant(&tx, &pending.session_token)?
+            .context("durable session for grant request is missing")?;
+        if durable_grant.is_expired(guard::env::now_unix())
+            || session_grant_revision_key(&durable_grant) != pending.issued_session_revision
+        {
+            anyhow::bail!("durable session changed after grant request issuance");
+        }
+
+        Self::rewrite_registry_transaction(&tx, history_retention_secs, registry)?;
+        let approved_json =
+            serde_json::to_string(approved).context("encode approved grant request")?;
+        tx.execute(
+            "UPDATE grant_requests SET json = ?1, status = ?2, created_unix = ?3 WHERE handle = ?4",
+            params![
+                approved_json,
+                approved.status.as_str(),
+                encode_u64(approved.created_unix)?,
+                approved.handle
+            ],
+        )?;
+        if fail_before_commit {
+            anyhow::bail!("simulated crash before approval transaction commit");
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub async fn load_grant_requests(&self) -> Result<Vec<GrantRequest>> {
         self.load_json_rows("SELECT json FROM grant_requests", "grant request")
             .await
@@ -646,6 +835,13 @@ impl SessionStore {
     pub async fn delete_grant_requests(&self, handles: Vec<String>) -> Result<()> {
         if handles.is_empty() {
             return Ok(());
+        }
+        #[cfg(test)]
+        if self
+            .fail_next_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("simulated session-store write failure");
         }
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
@@ -663,6 +859,18 @@ impl SessionStore {
         })
         .await
         .context("delete grant requests task failed")?
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_write_for_test(&self) {
+        self.fail_next_write
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_approval_for_test(&self) {
+        self.fail_next_approval
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     async fn load_json_rows<T>(&self, query: &'static str, kind: &'static str) -> Result<Vec<T>>
@@ -1090,6 +1298,128 @@ mod tests {
         assert_eq!(saved[0].name, grant.name);
         assert_eq!(saved[0].revision, grant.revision);
         assert_eq!(store.load_grant_requests().await.unwrap(), vec![request]);
+    }
+
+    #[tokio::test]
+    async fn saved_grant_tombstone_survives_restart_and_save_restores_name() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+        store
+            .delete_saved_grant("file-only".to_string())
+            .await
+            .unwrap();
+
+        let restarted = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let mut catalog = crate::grant_profile::SavedGrantCatalog::from_yaml(
+            "grants:\n  - name: file-only\n    prompt_append: file definition\n",
+        )
+        .unwrap();
+        catalog
+            .overlay_rows(restarted.load_saved_grants().await.unwrap())
+            .unwrap();
+        catalog.apply_tombstones(&restarted.load_saved_grant_tombstones().await.unwrap());
+        assert!(catalog.get("file-only").is_none());
+
+        let restored = crate::grant_profile::SavedGrantCatalog::from_yaml(
+            "grants:\n  - name: file-only\n    prompt_append: explicit restore\n",
+        )
+        .unwrap()
+        .get("file-only")
+        .unwrap()
+        .clone();
+        restarted.save_saved_grant(restored).await.unwrap();
+        let restored_store = SessionStore::open(path, 3600).await.unwrap();
+        assert!(restored_store
+            .load_saved_grant_tombstones()
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(restored_store.load_saved_grants().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn approval_transaction_rolls_back_request_and_session_before_commit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let token = "atomic-approval".to_string();
+        let mut registry = SessionRegistry::new();
+        registry.grant(
+            token.clone(),
+            SessionGrant {
+                allow: Vec::new(),
+                deny: Vec::new(),
+                allow_exact: Vec::new(),
+                deny_exact: Vec::new(),
+                activated_verbs: Vec::new(),
+                override_markers: Vec::new(),
+                scope: Default::default(),
+                expires_at: None,
+                prompt_append: None,
+                generated_notes: Vec::new(),
+                granted_at: 0,
+                static_only: false,
+                auto_amend: false,
+            },
+        );
+        store.persist_registry(&registry).await.unwrap();
+        let mut pending = GrantRequest::new(
+            token.clone(),
+            None,
+            crate::grant_profile::GrantRequestDelta {
+                activated_verbs: vec!["inspect".to_string()],
+                ..Default::default()
+            },
+            "inspect".to_string(),
+        )
+        .unwrap();
+        pending.issued_session_revision = registry.effective_revision_key(&token);
+        store.save_grant_request(pending.clone()).await.unwrap();
+        let mut approved = pending.clone();
+        approved.status = crate::grant_profile::GrantRequestStatus::Approved;
+        approved.decided_unix = Some(guard::env::now_unix());
+        let mut staged = registry.clone();
+        staged.apply_delta(&token, &pending.delta).unwrap();
+
+        let error = SessionStore::commit_grant_request_approval_sync(
+            &path, 3600, &pending, &approved, &staged, true,
+        )
+        .expect_err("simulated crash must roll back");
+        assert!(error.to_string().contains("simulated crash"));
+        let after_crash = SessionStore::open(path.clone(), 3600).await.unwrap();
+        assert!(after_crash
+            .load_registry()
+            .await
+            .unwrap()
+            .verb_scope_for(&token)
+            .unwrap()
+            .0
+            .is_empty());
+        assert_eq!(
+            after_crash.load_grant_requests().await.unwrap()[0].status,
+            crate::grant_profile::GrantRequestStatus::Pending
+        );
+
+        after_crash
+            .commit_grant_request_approval(pending, approved, staged)
+            .await
+            .unwrap();
+        let committed = SessionStore::open(path, 3600).await.unwrap();
+        assert_eq!(
+            committed.load_grant_requests().await.unwrap()[0].status,
+            crate::grant_profile::GrantRequestStatus::Approved
+        );
+        assert_eq!(
+            committed
+                .load_registry()
+                .await
+                .unwrap()
+                .verb_scope_for(&token)
+                .unwrap()
+                .0,
+            vec!["inspect"]
+        );
     }
 
     /// A stale snapshot (cloned before a later mutation) must never clobber a

@@ -782,6 +782,7 @@ pub(crate) async fn handle_grant(subcommand: GrantCommands) -> Result<()> {
             name,
             description,
             verbs,
+            override_markers,
             secret_names,
             ttl,
             prompt,
@@ -796,7 +797,7 @@ pub(crate) async fn handle_grant(subcommand: GrantCommands) -> Result<()> {
                 label: None,
                 description: description.unwrap_or_default(),
                 activated_verbs: verbs.clone(),
-                override_markers: Vec::new(),
+                override_markers,
                 secret_names: secret_names.clone(),
                 ttl_secs: ttl,
                 prompt_append: prompt,
@@ -821,6 +822,8 @@ pub(crate) async fn handle_grant(subcommand: GrantCommands) -> Result<()> {
             description,
             verbs,
             clear_verbs,
+            override_markers,
+            clear_override_markers,
             secret_names,
             clear_secrets,
             ttl,
@@ -842,6 +845,8 @@ pub(crate) async fn handle_grant(subcommand: GrantCommands) -> Result<()> {
                     description,
                     activated_verbs: verbs,
                     clear_verbs,
+                    override_markers,
+                    clear_override_markers,
                     secret_names,
                     clear_secrets,
                     ttl_secs: ttl,
@@ -1002,7 +1007,10 @@ pub(crate) async fn handle_grant(subcommand: GrantCommands) -> Result<()> {
                     .filter(|value| !value.is_empty());
                 (
                     socket,
-                    server::AdminRequest::GrantRequestList { session_token },
+                    server::AdminRequest::GrantRequestList {
+                        caller_token: session_token.clone(),
+                        session_token,
+                    },
                     json,
                 )
             }

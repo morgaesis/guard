@@ -70,6 +70,17 @@ pub struct SessionGrant {
     pub granted_at: u64,
 }
 
+pub(crate) fn session_grant_revision_key(grant: &SessionGrant) -> Option<String> {
+    let encoded = serde_json::to_vec(grant).ok()?;
+    let digest = sha2::Sha256::digest(encoded);
+    Some(
+        digest[..16]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct IssuedGrantScope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -776,14 +787,7 @@ impl SessionRegistry {
         if grant.is_expired(now_unix()) {
             return None;
         }
-        let encoded = serde_json::to_vec(grant).ok()?;
-        let digest = sha2::Sha256::digest(encoded);
-        Some(
-            digest[..16]
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect(),
-        )
+        session_grant_revision_key(grant)
     }
 
     pub fn extend(&mut self, token: &str, ttl_secs: u64) -> Option<u64> {

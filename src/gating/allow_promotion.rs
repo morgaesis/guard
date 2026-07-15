@@ -606,6 +606,8 @@ pub(crate) fn build_candidate_verb(
         action: CoverageAction::Preauthorized,
         required_args: fixed_args,
         forbidden_args: Vec::new(),
+        min_args: None,
+        max_args: None,
         options: Vec::new(),
         target: None,
         inventory: None,

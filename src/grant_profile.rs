@@ -307,6 +307,14 @@ impl SavedGrantCatalog {
         Ok(())
     }
 
+    /// Apply durable deletions after file definitions and stored edits load.
+    /// Saving the same name again removes its tombstone in the store.
+    pub fn apply_tombstones(&mut self, names: &[String]) {
+        for name in names {
+            self.grants.remove(name);
+        }
+    }
+
     pub fn names(&self) -> Vec<String> {
         self.grants.keys().cloned().collect()
     }
@@ -458,6 +466,7 @@ fn migrate_legacy_pattern(
         );
     }
     let prefix = pattern.strip_suffix(" *").unwrap_or(pattern).trim();
+    let trailing_wildcard = pattern.ends_with(" *");
     let tokens = prefix.split_whitespace().collect::<Vec<_>>();
     if tokens.is_empty() {
         bail!("legacy grant pattern {:?} has no binary", pattern);
@@ -498,6 +507,8 @@ fn migrate_legacy_pattern(
         action,
         required_args: Vec::new(),
         forbidden_args: Vec::new(),
+        min_args: Some(evidence_args.len()),
+        max_args: (!trailing_wildcard).then_some(evidence_args.len()),
         options,
         target: None,
         inventory: None,
@@ -522,8 +533,8 @@ fn migrate_legacy_pattern(
                 CoverageProbe {
                     dimension: "boundary".to_string(),
                     args: boundary_args,
-                    expected_match: pattern.ends_with(" *"),
-                    observed_match: pattern.ends_with(" *"),
+                    expected_match: trailing_wildcard,
+                    observed_match: trailing_wildcard,
                 },
             ],
         }),
@@ -661,11 +672,11 @@ mod tests {
     #[test]
     fn migrates_unambiguous_profile_without_complement_denies() {
         let catalog = SavedGrantCatalog::from_yaml(
-            "profiles:\n  - name: legacy\n    allow: [\"kubectl get *\"]\n    deny: [\"kubectl delete namespace *\"]\n",
+            "profiles:\n  - name: legacy\n    allow: [\"kubectl get pods\", \"kubectl describe *\"]\n    deny: [\"kubectl delete pod\"]\n",
         )
         .expect("migrate profile");
         let grant = catalog.get("legacy").expect("saved grant");
-        assert_eq!(grant.generated_verbs.len(), 2);
+        assert_eq!(grant.generated_verbs.len(), 3);
         assert_eq!(grant.generated_verbs[0].coverage.len(), 1);
         assert_eq!(
             grant.generated_verbs[0].coverage[0].action,
@@ -674,8 +685,60 @@ mod tests {
         assert!(grant.generated_verbs[0].trusted);
         assert!(grant.generated_verbs[0].coverage[0].sticky);
         assert_eq!(
-            grant.generated_verbs[1].coverage[0].action,
+            grant.generated_verbs[2].coverage[0].action,
             CoverageAction::Deny
+        );
+
+        let mut verbs = guard::gating::verb::VerbCatalog::empty();
+        for verb in &grant.generated_verbs {
+            verbs
+                .upsert_saved_grant_verb(verb.clone())
+                .expect("install migrated verb");
+        }
+        let actions = |args: &[&str]| {
+            verbs
+                .match_command_all(
+                    "kubectl",
+                    &args
+                        .iter()
+                        .map(|value| (*value).to_string())
+                        .collect::<Vec<_>>(),
+                )
+                .into_iter()
+                .map(|matched| matched.action)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            actions(&["get", "pods"]),
+            vec![CoverageAction::Preauthorized]
+        );
+        assert!(
+            actions(&["get"]).is_empty(),
+            "missing exact argv must not match"
+        );
+        assert!(
+            actions(&["get", "pods", "-A"]).is_empty(),
+            "extra exact argv must not match"
+        );
+        assert_eq!(
+            actions(&["describe"]),
+            vec![CoverageAction::Preauthorized],
+            "a trailing wildcard may match an empty suffix"
+        );
+        assert_eq!(
+            actions(&["describe", "pod", "web"]),
+            vec![CoverageAction::Preauthorized],
+            "a trailing wildcard widens only the suffix after its fixed prefix"
+        );
+        assert!(
+            actions(&[]).is_empty(),
+            "missing wildcard prefix must not match"
+        );
+        assert_eq!(actions(&["delete", "pod"]), vec![CoverageAction::Deny]);
+        assert!(
+            actions(&["delete", "pod", "--force"]).is_empty(),
+            "exact deny cardinality must be preserved"
         );
     }
 

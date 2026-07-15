@@ -416,7 +416,7 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
             )),
             ..crate::grant_profile::GrantRequestDelta::default()
         };
-        let candidate = session_revision.and_then(|session_revision| {
+        let candidate = session_revision.as_ref().and_then(|session_revision| {
             crate::grant_profile::GrantRequest::new(
                 token.to_string(),
                 saved_grant.as_ref().map(|(name, _)| name.clone()),
@@ -426,7 +426,7 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
             .ok()
             .map(|mut request| {
                 request.issued_saved_revision = saved_grant.map(|(_, revision)| revision);
-                request.issued_session_revision = Some(session_revision);
+                request.issued_session_revision = Some(session_revision.clone());
                 if let Some(session_expires_at) = session_expires_at {
                     request.expires_unix = request.expires_unix.min(session_expires_at);
                 }
@@ -435,6 +435,15 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
         });
         let (request, created) = {
             let mut requests = phase.config.grant_requests.write().await;
+            let queue_full = requests.len() >= super::admin::MAX_GRANT_REQUESTS
+                || requests
+                    .values()
+                    .filter(|request| {
+                        request.session_token == token
+                            && request.status == crate::grant_profile::GrantRequestStatus::Pending
+                    })
+                    .count()
+                    >= super::admin::MAX_PENDING_GRANT_REQUESTS_PER_SESSION;
             if let Some(existing) = requests
                 .values()
                 .find(|request| {
@@ -442,27 +451,42 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
                         && request.status == crate::grant_profile::GrantRequestStatus::Pending
                         && request.expires_unix > now
                         && request.justification == command
+                        && request.issued_session_revision == session_revision
                 })
                 .cloned()
             {
                 (Some(existing), false)
-            } else if requests.len() >= super::admin::MAX_GRANT_REQUESTS {
+            } else if queue_full {
                 (None, false)
             } else if let Some(candidate) = candidate {
-                requests.insert(candidate.handle.clone(), candidate.clone());
-                (Some(candidate), true)
+                if super::admin::grant_request_payload_bytes(&candidate)
+                    > super::admin::MAX_GRANT_REQUEST_PAYLOAD_BYTES
+                {
+                    (None, false)
+                } else {
+                    let persisted = if let Some(store) = &phase.config.session_store {
+                        match store.save_grant_request(candidate.clone()).await {
+                            Ok(()) => true,
+                            Err(error) => {
+                                tracing::warn!("failed to persist denial escalation: {}", error);
+                                false
+                            }
+                        }
+                    } else {
+                        true
+                    };
+                    if persisted {
+                        requests.insert(candidate.handle.clone(), candidate.clone());
+                        (Some(candidate), true)
+                    } else {
+                        (None, false)
+                    }
+                }
             } else {
                 (None, false)
             }
         };
         if let Some(request) = request {
-            if created {
-                if let Some(store) = &phase.config.session_store {
-                    if let Err(error) = store.save_grant_request(request.clone()).await {
-                        tracing::warn!("failed to persist denial escalation: {}", error);
-                    }
-                }
-            }
             reason.push_str(&format!(
                 "; escalation={} next=`guard grant request show {}` operator=`guard grant request approve {}`",
                 request.handle, request.handle, request.handle

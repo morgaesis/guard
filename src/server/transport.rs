@@ -168,13 +168,28 @@ impl Server {
             return;
         };
 
-        match store.load_saved_grants().await {
-            Ok(rows) => {
-                if let Err(error) = self.config.saved_grants.write().await.overlay_rows(rows) {
+        match (
+            store.load_saved_grants().await,
+            store.load_saved_grant_tombstones().await,
+        ) {
+            (Ok(rows), Ok(tombstones)) => {
+                let mut grants = self.config.saved_grants.write().await;
+                if let Err(error) = grants.overlay_rows(rows) {
                     tracing::error!("failed to validate saved grants: {}", error);
+                    *grants = crate::grant_profile::SavedGrantCatalog::empty();
+                } else {
+                    grants.apply_tombstones(&tombstones);
                 }
             }
-            Err(error) => tracing::error!("failed to load saved grants: {}", error),
+            (rows, tombstones) => {
+                tracing::error!(
+                    "failed to load durable saved-grant state: rows={:?}, tombstones={:?}",
+                    rows.err(),
+                    tombstones.err()
+                );
+                *self.config.saved_grants.write().await =
+                    crate::grant_profile::SavedGrantCatalog::empty();
+            }
         }
         self.install_saved_grant_verbs().await;
         match store.load_grant_requests().await {

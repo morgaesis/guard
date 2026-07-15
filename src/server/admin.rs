@@ -28,6 +28,31 @@ use super::wire::{
 use super::{is_valid_secret_key, ServerConfig};
 
 pub(super) const MAX_GRANT_REQUESTS: usize = 1024;
+pub(super) const MAX_PENDING_GRANT_REQUESTS_PER_SESSION: usize = 32;
+pub(super) const MAX_GRANT_REQUEST_PAYLOAD_BYTES: usize = 64 * 1024;
+
+pub(super) fn grant_request_payload_bytes(request: &GrantRequest) -> usize {
+    request.justification.len()
+        + request
+            .delta
+            .activated_verbs
+            .iter()
+            .map(String::len)
+            .sum::<usize>()
+        + request
+            .delta
+            .override_markers
+            .iter()
+            .map(String::len)
+            .sum::<usize>()
+        + request
+            .delta
+            .secret_names
+            .iter()
+            .map(String::len)
+            .sum::<usize>()
+        + request.delta.prompt_append.as_deref().map_or(0, str::len)
+}
 
 fn merge_unique(target: &mut Vec<String>, additions: Vec<String>) {
     for value in additions {
@@ -105,6 +130,8 @@ fn stamp_generated_verb(
         action: CoverageAction::Evaluate,
         required_args: fixed_args,
         forbidden_args: Vec::new(),
+        min_args: None,
+        max_args: None,
         options: Vec::new(),
         target: None,
         inventory: None,
@@ -1289,6 +1316,8 @@ pub(super) async fn handle_admin_request(
             description,
             activated_verbs,
             clear_verbs,
+            override_markers,
+            clear_override_markers,
             secret_names,
             clear_secrets,
             ttl_secs,
@@ -1314,6 +1343,11 @@ pub(super) async fn handle_admin_request(
                 } else if !activated_verbs.is_empty() {
                     grant.activated_verbs = activated_verbs.clone();
                     grant.ceiling.verbs = activated_verbs;
+                }
+                if clear_override_markers {
+                    grant.override_markers.clear();
+                } else if !override_markers.is_empty() {
+                    grant.override_markers = override_markers;
                 }
                 if clear_secrets {
                     grant.secret_names.clear();
@@ -1483,6 +1517,13 @@ pub(super) async fn handle_admin_request(
                         message: format!("unknown active session: '{session_token}'"),
                     };
                 }
+                if let Some(reason) =
+                    registry.suspension_reason(&session_token, &config.behavior_limits)
+                {
+                    return AdminResponse::Error {
+                        message: format!("session is suspended: {reason}"),
+                    };
+                }
                 let issued = registry.saved_grant_for(&session_token);
                 (
                     issued.as_ref().map(|(name, _)| name.clone()),
@@ -1512,6 +1553,14 @@ pub(super) async fn handle_admin_request(
             };
             request.issued_saved_revision = issued_saved_revision;
             request.issued_session_revision = issued_session_revision;
+            if grant_request_payload_bytes(&request) > MAX_GRANT_REQUEST_PAYLOAD_BYTES {
+                return AdminResponse::Error {
+                    message: format!(
+                        "grant request payload exceeds the {} byte limit",
+                        MAX_GRANT_REQUEST_PAYLOAD_BYTES
+                    ),
+                };
+            }
             if let Some(session_expires_at) = session_expires_at {
                 request.expires_unix = request.expires_unix.min(session_expires_at);
             }
@@ -1532,6 +1581,22 @@ pub(super) async fn handle_admin_request(
                             .to_string(),
                     };
                 }
+                if requests
+                    .values()
+                    .filter(|existing| {
+                        existing.session_token == session_token
+                            && existing.status == GrantRequestStatus::Pending
+                    })
+                    .count()
+                    >= MAX_PENDING_GRANT_REQUESTS_PER_SESSION
+                {
+                    return AdminResponse::Error {
+                        message: format!(
+                            "session grant request queue is full; at most {} pending requests are allowed per session",
+                            MAX_PENDING_GRANT_REQUESTS_PER_SESSION
+                        ),
+                    };
+                }
                 requests.insert(request.handle.clone(), request.clone());
             }
             if let Some(store) = &config.session_store {
@@ -1550,30 +1615,11 @@ pub(super) async fn handle_admin_request(
                 approved.decided_reason =
                     Some("within the saved grant auto-approval ceiling".to_string());
                 approved.next_action = "guard session status".to_string();
-                if let Some(store) = &config.session_store {
-                    if let Err(error) = store.save_grant_request(approved.clone()).await {
-                        return AdminResponse::Error {
-                            message: format!(
-                                "failed to persist auto-approved grant request: {error}"
-                            ),
-                        };
-                    }
-                }
                 if let Err(message) =
-                    apply_and_persist_grant_request_delta_if_current(config, &pending).await
+                    apply_and_persist_grant_request_delta_if_current(config, &pending, &approved)
+                        .await
                 {
-                    let rollback_error = if let Some(store) = &config.session_store {
-                        store.save_grant_request(pending).await.err()
-                    } else {
-                        None
-                    };
-                    return AdminResponse::Error {
-                        message: rollback_error.map_or(message.clone(), |error| {
-                            format!(
-                                "{message}; also failed to restore the pending request: {error}"
-                            )
-                        }),
-                    };
+                    return AdminResponse::Error { message };
                 }
                 request = approved;
             }
@@ -1587,13 +1633,29 @@ pub(super) async fn handle_admin_request(
                 request: redact_grant_request(request),
             }
         }
-        AdminRequest::GrantRequestList { session_token } => {
+        AdminRequest::GrantRequestList {
+            session_token,
+            caller_token,
+        } => {
             prune_grant_requests(config).await;
             let is_admin = caller_is_session_admin(config, caller);
-            if !is_admin && session_token.is_none() {
-                return AdminResponse::Error {
-                    message: "grant request list requires GUARD_SESSION".to_string(),
+            if !is_admin {
+                let Some(target) = session_token.as_deref() else {
+                    return AdminResponse::Error {
+                        message: "grant request list requires GUARD_SESSION".to_string(),
+                    };
                 };
+                if caller_token.as_deref() != Some(target) {
+                    return AdminResponse::Error {
+                        message: "not authorized: a session may only list its own grant requests"
+                            .to_string(),
+                    };
+                }
+                if !config.sessions.read().await.has(target) {
+                    return AdminResponse::Error {
+                        message: format!("unknown active session: '{target}'"),
+                    };
+                }
             }
             let items = config
                 .grant_requests
@@ -1643,7 +1705,7 @@ pub(super) async fn handle_admin_request(
         } => {
             prune_grant_requests(config).await;
             let mut requests = config.grant_requests.write().await;
-            let Some(request) = requests.get_mut(&handle) else {
+            let Some(current) = requests.get(&handle) else {
                 return AdminResponse::Error {
                     message: format!("unknown grant request: '{handle}'"),
                 };
@@ -1651,22 +1713,21 @@ pub(super) async fn handle_admin_request(
             if !caller_is_session_admin(config, caller)
                 && session_token
                     .as_deref()
-                    .is_none_or(|token| token != request.session_token)
+                    .is_none_or(|token| token != current.session_token)
             {
                 return AdminResponse::Error {
                     message: "unknown or unauthorized grant request".to_string(),
                 };
             }
-            if request.status != GrantRequestStatus::Pending {
+            if current.status != GrantRequestStatus::Pending {
                 return AdminResponse::Error {
                     message: format!("grant request '{handle}' is not pending"),
                 };
             }
+            let mut request = current.clone();
             request.status = GrantRequestStatus::Withdrawn;
             request.decided_unix = Some(now_unix());
             request.next_action = format!("guard grant request show {handle}");
-            let request = request.clone();
-            drop(requests);
             if let Some(store) = &config.session_store {
                 if let Err(error) = store.save_grant_request(request.clone()).await {
                     return AdminResponse::Error {
@@ -1674,6 +1735,8 @@ pub(super) async fn handle_admin_request(
                     };
                 }
             }
+            requests.insert(handle, request.clone());
+            drop(requests);
             emit_grant_request_event(config, &request, "grant_request_withdrawn");
             AdminResponse::GrantRequest {
                 request: redact_grant_request(request),
@@ -1895,26 +1958,16 @@ async fn decide_grant_request(
     }
     request.decided_unix = Some(now_unix());
     request.decided_reason = Some(reason.to_string());
-    if let Some(store) = &config.session_store {
+    if approve {
+        if let Err(message) =
+            apply_and_persist_grant_request_delta_if_current(config, &pending, &request).await
+        {
+            return AdminResponse::Error { message };
+        }
+    } else if let Some(store) = &config.session_store {
         if let Err(error) = store.save_grant_request(request.clone()).await {
             return AdminResponse::Error {
                 message: format!("failed to persist grant request decision: {error}"),
-            };
-        }
-    }
-    if approve {
-        if let Err(message) =
-            apply_and_persist_grant_request_delta_if_current(config, &pending).await
-        {
-            let rollback_error = if let Some(store) = &config.session_store {
-                store.save_grant_request(pending).await.err()
-            } else {
-                None
-            };
-            return AdminResponse::Error {
-                message: rollback_error.map_or(message.clone(), |error| {
-                    format!("{message}; also failed to restore the pending request: {error}")
-                }),
             };
         }
     }
@@ -1931,17 +1984,18 @@ async fn decide_grant_request(
 
 async fn apply_and_persist_grant_request_delta_if_current(
     config: &ServerConfig,
-    request: &GrantRequest,
+    pending: &GrantRequest,
+    approved: &GrantRequest,
 ) -> Result<(), String> {
     let mut sessions = config.sessions.write().await;
-    if sessions.effective_revision_key(&request.session_token) != request.issued_session_revision {
+    if sessions.effective_revision_key(&pending.session_token) != pending.issued_session_revision {
         return Err(format!(
             "grant request '{}' no longer matches the issued session revision; submit a new request",
-            request.handle
+            pending.handle
         ));
     }
-    let issued = sessions.saved_grant_for(&request.session_token);
-    let issued_matches = match (&request.saved_grant, request.issued_saved_revision, issued) {
+    let issued = sessions.saved_grant_for(&pending.session_token);
+    let issued_matches = match (&pending.saved_grant, pending.issued_saved_revision, issued) {
         (Some(expected_name), Some(expected_revision), Some((name, revision))) => {
             expected_name == &name && expected_revision == revision
         }
@@ -1951,16 +2005,19 @@ async fn apply_and_persist_grant_request_delta_if_current(
     if !issued_matches {
         return Err(format!(
             "grant request '{}' no longer matches the issued session revision; submit a new request",
-            request.handle
+            pending.handle
         ));
     }
     let mut staged = sessions.clone();
     staged
-        .apply_delta(&request.session_token, &request.delta)
-        .ok_or_else(|| format!("unknown active session: '{}'", request.session_token))?;
-    persist_session_snapshot(config.session_store.clone(), staged.clone())
-        .await
-        .map_err(|error| format!("failed to persist approved grant request: {error}"))?;
+        .apply_delta(&pending.session_token, &pending.delta)
+        .ok_or_else(|| format!("unknown active session: '{}'", pending.session_token))?;
+    if let Some(store) = &config.session_store {
+        store
+            .commit_grant_request_approval(pending.clone(), approved.clone(), staged.clone())
+            .await
+            .map_err(|error| format!("failed to persist approved grant request: {error}"))?;
+    }
     *sessions = staged;
     Ok(())
 }
@@ -2031,38 +2088,39 @@ async fn validate_grant_request_for_approval(
 
 pub(super) async fn prune_grant_requests(config: &ServerConfig) {
     let now = now_unix();
-    let removed = {
-        let mut requests = config.grant_requests.write().await;
-        let mut removed = requests
+    let mut requests = config.grant_requests.write().await;
+    let mut removed = requests
+        .iter()
+        .filter(|(_, request)| {
+            request.status == GrantRequestStatus::Pending
+                && (request.expires_unix == 0 || request.expires_unix <= now)
+        })
+        .map(|(handle, _)| handle.clone())
+        .collect::<Vec<_>>();
+    let retained_after_expiry = requests.len().saturating_sub(removed.len());
+    let mut retained_count = retained_after_expiry;
+    while retained_count >= MAX_GRANT_REQUESTS {
+        let oldest_terminal = requests
             .iter()
-            .filter(|(_, request)| {
-                request.status == GrantRequestStatus::Pending
-                    && (request.expires_unix == 0 || request.expires_unix <= now)
-            })
-            .map(|(handle, _)| handle.clone())
-            .collect::<Vec<_>>();
-        for handle in &removed {
-            requests.remove(handle);
-        }
-        while requests.len() >= MAX_GRANT_REQUESTS {
-            let oldest_terminal = requests
-                .iter()
-                .filter(|(_, request)| request.status != GrantRequestStatus::Pending)
-                .min_by_key(|(handle, request)| (request.created_unix, *handle))
-                .map(|(handle, _)| handle.clone());
-            let Some(handle) = oldest_terminal else {
-                break;
-            };
-            requests.remove(&handle);
-            removed.push(handle);
-        }
-        removed
-    };
+            .filter(|(handle, _)| !removed.contains(handle))
+            .filter(|(_, request)| request.status != GrantRequestStatus::Pending)
+            .min_by_key(|(handle, request)| (request.created_unix, *handle))
+            .map(|(handle, _)| handle.clone());
+        let Some(handle) = oldest_terminal else {
+            break;
+        };
+        removed.push(handle);
+        retained_count = retained_count.saturating_sub(1);
+    }
     if !removed.is_empty() {
         if let Some(store) = &config.session_store {
-            if let Err(error) = store.delete_grant_requests(removed).await {
+            if let Err(error) = store.delete_grant_requests(removed.clone()).await {
                 tracing::warn!("failed to prune expired grant requests: {error}");
+                return;
             }
+        }
+        for handle in removed {
+            requests.remove(&handle);
         }
     }
 }

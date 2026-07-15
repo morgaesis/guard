@@ -381,6 +381,8 @@ enum GrantCommands {
         description: Option<String>,
         #[arg(long = "verb")]
         verbs: Vec<String>,
+        #[arg(long = "override-marker")]
+        override_markers: Vec<String>,
         #[arg(long = "secret")]
         secret_names: Vec<String>,
         #[arg(long)]
@@ -406,6 +408,11 @@ enum GrantCommands {
         /// Remove every activated verb.
         #[arg(long, conflicts_with = "verbs")]
         clear_verbs: bool,
+        #[arg(long = "override-marker")]
+        override_markers: Vec<String>,
+        /// Remove every baseline override marker.
+        #[arg(long, conflicts_with = "override_markers")]
+        clear_override_markers: bool,
         #[arg(long = "secret")]
         secret_names: Vec<String>,
         /// Remove every secret-name entitlement.
