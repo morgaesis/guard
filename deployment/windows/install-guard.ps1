@@ -26,6 +26,10 @@
          brokered secret and cannot write a forged "approved" row to flip a held
          command into an executed one.
 
+         Per-execution secret files and API-revert body snapshots use a stricter
+         protected DACL containing only the guard service SID. Guard verifies
+         those ACLs and rejects reparse points before storing secret material.
+
     The single trust boundary is Windows account isolation enforced by:
       * the named-pipe SID check in the daemon (operator identity), and
       * the NTFS DACL on C:\ProgramData\guard (state + credential confidentiality).

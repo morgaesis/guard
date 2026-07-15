@@ -160,8 +160,8 @@ async fn secret_exposure_is_audited_only_after_successful_spawn() {
     let mut request = basic_request("/bin/true", Vec::new());
     request.session_token = Some(token.into());
     request
-        .secrets
-        .insert("SERVICE_TOKEN".into(), "service/token".into());
+        .secret_files
+        .insert("SERVICE_TOKEN_FILE".into(), "service/token".into());
     let mut sink = tokio::io::sink();
     let (result, logs) = capture_async(
         &buf,
@@ -389,6 +389,7 @@ async fn env_and_secret_injections_cannot_target_same_env_var() {
         auth_token: None,
         env: HashMap::from([("API_TOKEN".to_string(), "plain".to_string())]),
         secrets: HashMap::from([("API_TOKEN".to_string(), "api/token".to_string())]),
+        secret_files: HashMap::new(),
         stream: false,
         session_token: None,
         revert: None,
@@ -422,6 +423,7 @@ async fn injection_refuses_non_local_tcp_caller() {
         auth_token: None,
         env: HashMap::new(),
         secrets: HashMap::from([("API_TOKEN".to_string(), "api/token".to_string())]),
+        secret_files: HashMap::new(),
         stream: false,
         session_token: None,
         revert: None,
@@ -479,6 +481,7 @@ async fn missing_requested_secret_denies_before_policy_evaluation() {
         auth_token: None,
         env: HashMap::new(),
         secrets: HashMap::from([("NONEXISTING_SEC".to_string(), "nonexisting_sec".to_string())]),
+        secret_files: HashMap::new(),
         stream: false,
         session_token: None,
         revert: None,
@@ -516,6 +519,7 @@ async fn invalid_secret_shell_reference_denies_before_policy_evaluation() {
             "OPNSENSE_APIKEY_SECRET".to_string(),
             "opnsense-apikey-secret".to_string(),
         )]),
+        secret_files: HashMap::new(),
         stream: false,
         session_token: None,
         revert: None,
@@ -604,6 +608,7 @@ fn basic_request(binary: &str, args: Vec<String>) -> ExecuteRequest {
         auth_token: None,
         env: HashMap::new(),
         secrets: HashMap::new(),
+        secret_files: HashMap::new(),
         stream: false,
         session_token: None,
         revert: None,
@@ -901,6 +906,7 @@ async fn exec_secret_injection_is_isolated_per_uid() {
         auth_token: None,
         env: HashMap::new(),
         secrets: secrets_map,
+        secret_files: HashMap::new(),
         stream: false,
         session_token: None,
         revert: None,
@@ -978,6 +984,7 @@ async fn extra_child_env_forwards_named_var_to_child() {
         auth_token: None,
         env: HashMap::new(),
         secrets: HashMap::new(),
+        secret_files: HashMap::new(),
         stream: false,
         session_token: Some(token),
         revert: None,
@@ -1660,4 +1667,78 @@ fn revert_context_merges_only_when_supplied() {
     assert!(with.contains("REVERSIBILITY CONTEXT"));
     let both = merge_revert_context(Some("session ctx".to_string()), true).expect("merged");
     assert!(both.contains("REVERSIBILITY CONTEXT") && both.ends_with("session ctx"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn secret_file_exists_only_for_child_lifetime_and_failure_exit_cleans_it() {
+    let (cfg, _) = make_test_config();
+    let principal = PrincipalKey::from_uid(1000);
+    cfg.secrets
+        .set(&principal, "child-file-secret", "expected-value")
+        .await
+        .unwrap();
+    let mut request = basic_request(
+        "sh",
+        vec![
+            "-c".to_string(),
+            "test \"$(cat \"$CREDENTIAL_FILE\")\" = expected-value; printf '%s' \"$CREDENTIAL_FILE\"; exit 7"
+                .to_string(),
+        ],
+    );
+    request.secret_files.insert(
+        "CREDENTIAL_FILE".to_string(),
+        "child-file-secret".to_string(),
+    );
+    let mut sink = tokio::io::sink();
+    let result = exec_after_approval(
+        request,
+        &cfg,
+        &CallerIdentity::Unix { uid: 1000 },
+        "test allow".to_string(),
+        0,
+        false,
+        &mut sink,
+    )
+    .await;
+    let path = match result.exec {
+        ExecOutcome::Completed {
+            exit_code: Some(7),
+            stdout: Some(path),
+            ..
+        } => path,
+        other => panic!("unexpected result: {other:?}"),
+    };
+    assert!(!std::path::Path::new(&path).exists());
+    assert_eq!(
+        std::fs::read_dir(cfg.secret_file_root.as_ref().unwrap())
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn secret_file_is_strictly_refused_with_exec_as_caller() {
+    let (mut cfg, _) = make_test_config();
+    cfg.exec_as_caller = true;
+    let principal = PrincipalKey::from_uid(1000);
+    cfg.secrets
+        .set(&principal, "caller-file-secret", "value")
+        .await
+        .unwrap();
+    let mut request = basic_request("echo", vec!["ok".to_string()]);
+    request.secret_files.insert(
+        "CREDENTIAL_FILE".to_string(),
+        "caller-file-secret".to_string(),
+    );
+    let reason = validate_request_injections(
+        &request,
+        &cfg,
+        &CallerIdentity::Unix { uid: 1000 },
+        "echo ok",
+    )
+    .await
+    .unwrap_err();
+    assert!(reason.contains("--exec-as-caller"), "got: {reason}");
 }

@@ -200,7 +200,8 @@ pub(super) fn is_api_proxy_sentinel(binary: &str) -> bool {
 /// Write a file readable and writable only by the daemon account. On Unix the
 /// mode is set atomically at create so the secret-bearing body is never briefly
 /// world-readable, and `O_NOFOLLOW` refuses to follow a symlink planted at the
-/// target path; other platforms fall back to a plain write.
+/// target path. Windows creates the empty file inside a daemon-only directory,
+/// applies and verifies a protected daemon-SID-only DACL, then writes the body.
 async fn write_owner_only(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -216,9 +217,17 @@ async fn write_owner_only(path: &std::path::Path, bytes: &[u8]) -> std::io::Resu
         file.write_all(bytes).await?;
         file.flush().await
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        tokio::fs::write(path, bytes).await
+        super::secure_fs::write_new_private(path, bytes).map_err(std::io::Error::other)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (path, bytes);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "owner-only files are unsupported on this platform",
+        ))
     }
 }
 
@@ -367,6 +376,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
             args: vec![mutation.label.clone()],
             cwd: None,
             secret_keys: std::collections::BTreeMap::new(),
+            secret_file_keys: std::collections::BTreeMap::new(),
             // An API revert is executed from `api_revert`, not the command-shaped
             // revert_binary/revert_args of a shell provisional.
             revert_binary: String::new(),
@@ -404,6 +414,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
             env: std::collections::BTreeMap::new(),
             secret_keys: std::collections::BTreeMap::new(),
             session_fingerprint: None,
+            secret_file_keys: std::collections::BTreeMap::new(),
             verb_name: None,
             verb_params: std::collections::BTreeMap::new(),
             catalog_version: None,
@@ -798,6 +809,11 @@ pub(super) async fn arm_containment<W: AsyncWrite + Unpin>(
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
+        secret_file_keys: request
+            .secret_files
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
         revert_binary: revert.binary.clone(),
         revert_args: revert.args.clone(),
         api_revert: None,
@@ -933,10 +949,10 @@ pub(super) async fn hold_for_approval<W: AsyncWrite + Unpin>(
     // (so it would otherwise be unbound) and then creates it with a chosen value
     // before approval. Verification at approve time fails closed on any change.
     let secret_binding = match caller_principal.clone() {
-        Some(principal) if !request.secrets.is_empty() => {
+        Some(principal) if !request.secrets.is_empty() || !request.secret_files.is_empty() => {
             let salt = hex_encode(&rand::random::<u128>().to_le_bytes());
             let mut hashes = std::collections::BTreeMap::new();
-            for (env_var, secret_name) in &request.secrets {
+            for (env_var, secret_name) in request.secrets.iter().chain(&request.secret_files) {
                 let entry = match config.secrets.get(&principal, secret_name).await {
                     Ok(Some(value)) => hash_secret_value(&salt, &value),
                     _ => SECRET_BINDING_UNRESOLVED.to_string(),
@@ -966,6 +982,11 @@ pub(super) async fn hold_for_approval<W: AsyncWrite + Unpin>(
             .session_token
             .as_deref()
             .map(|token| audit_session_fingerprint(Some(token))),
+        secret_file_keys: request
+            .secret_files
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
         verb_name: verb.as_ref().map(|v| v.name.clone()),
         verb_params: verb.as_ref().map(|v| v.params.clone()).unwrap_or_default(),
         catalog_version: verb.as_ref().map(|v| v.catalog_version),
@@ -1148,7 +1169,11 @@ pub(super) async fn execute_snapshot(
                 "approval rejected: a secret-value binding is present but the caller principal is unknown".to_string(),
             );
         };
-        for (env_var, secret_name) in &snapshot.secret_keys {
+        for (env_var, secret_name) in snapshot
+            .secret_keys
+            .iter()
+            .chain(&snapshot.secret_file_keys)
+        {
             // Every secret was bound at hold; a missing entry means the request
             // was altered between hold and approval. Fail closed.
             let Some(expected) = binding.hashes.get(env_var) else {
@@ -1207,6 +1232,11 @@ pub(super) async fn execute_snapshot(
             .collect(),
         secrets: snapshot
             .secret_keys
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        secret_files: snapshot
+            .secret_file_keys
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
@@ -1349,6 +1379,11 @@ async fn run_provisional_revert(config: &ServerConfig, p: &Provisional) -> Execu
         env: std::collections::HashMap::new(),
         secrets: p
             .secret_keys
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        secret_files: p
+            .secret_file_keys
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
@@ -1519,7 +1554,7 @@ pub(super) async fn finish_revert(
                     started: false,
                     reason,
                     ..
-                } if !p.secret_keys.is_empty() => {
+                } if !p.secret_keys.is_empty() || !p.secret_file_keys.is_empty() => {
                     return defer_revert(
                         config,
                         p,

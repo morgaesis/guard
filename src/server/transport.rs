@@ -9,6 +9,8 @@ use anyhow::bail;
 use anyhow::{Context, Result};
 use guard::gating::approval::{ApprovalRegistry, ApprovalStatus};
 use guard::gating::provisional::ProvisionalRegistry;
+#[cfg(windows)]
+use guard::gating::provisional::ProvisionalStatus;
 #[cfg(unix)]
 use guard::gating::read_grant::{GrantReadRegistry, ReadGrantStatus};
 use guard::gating::verb::VerbCatalog;
@@ -68,7 +70,7 @@ impl Server {
         session_store: Option<SessionStore>,
         exec_as_caller: bool,
         state_db_path: Option<PathBuf>,
-    ) -> Self {
+    ) -> Result<Self> {
         let config = ServerConfig::new(
             socket_path,
             tcp_port,
@@ -89,7 +91,18 @@ impl Server {
             exec_as_caller,
             state_db_path,
         );
-        Self { config }
+        let mut server = Self { config };
+        let root = server
+            .config
+            .state_db_path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .map(|path| path.join("secret-files"))
+            .unwrap_or_else(|| std::env::temp_dir().join("guard-secret-files"));
+        super::secure_fs::prepare_private_root(&root)
+            .with_context(|| format!("prepare secret-file root {}", root.display()))?;
+        server.config.secret_file_root = Some(root);
+        Ok(server)
     }
 
     /// Enable consequence gating. Must be called before `run`.
@@ -144,6 +157,51 @@ impl Server {
 
         match store.load_provisionals().await {
             Ok(rows) => {
+                #[cfg(windows)]
+                let mut rows = rows;
+                #[cfg(windows)]
+                if let Some(state_parent) = self
+                    .config
+                    .state_db_path
+                    .as_ref()
+                    .and_then(|path| path.parent())
+                {
+                    let snapshot_dir = state_parent.join("api-proxy-reverts");
+                    let dir_safe = std::fs::create_dir_all(&snapshot_dir).is_ok()
+                        && super::secure_fs::harden_existing_private_path(&snapshot_dir, true);
+                    for row in &mut rows {
+                        let Some(body_file) = row
+                            .api_revert
+                            .as_ref()
+                            .and_then(|revert| revert.body_file.as_ref())
+                            .cloned()
+                        else {
+                            continue;
+                        };
+                        let file_safe = dir_safe
+                            && body_file.parent() == Some(snapshot_dir.as_path())
+                            && super::secure_fs::harden_existing_private_path(&body_file, false);
+                        if !file_safe {
+                            row.status = ProvisionalStatus::RevertFailed;
+                            row.revert_detail = Some(
+                                "persisted API-revert body failed the Windows daemon-only ACL check"
+                                    .to_string(),
+                            );
+                            tracing::error!(
+                                "[AUDIT] API_REVERT_FILE_UNSAFE handle={} path=\"{}\"",
+                                row.handle,
+                                body_file.display()
+                            );
+                            if let Err(e) = store.save_provisional(row.clone()).await {
+                                tracing::warn!(
+                                    "failed to persist unsafe API-revert state {}: {}",
+                                    row.handle,
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
                 let (reg, moved) = ProvisionalRegistry::from_rows(rows);
                 if !moved.is_empty() {
                     tracing::warn!(target: "guard::audit",
@@ -380,8 +438,11 @@ impl Server {
                     );
                     revert_dir_is_owner_only(&snapshot_dir)
                 };
-                #[cfg(not(unix))]
-                let snapshot_dir_safe = true;
+                #[cfg(windows)]
+                let snapshot_dir_safe =
+                    super::secure_fs::harden_existing_private_path(&snapshot_dir, true);
+                #[cfg(not(any(unix, windows)))]
+                let snapshot_dir_safe = false;
                 if !snapshot_dir_safe {
                     tracing::error!(target: "guard::audit",
                         "[AUDIT] API_REVERT_DIR_UNSAFE path=\"{}\" (not owner-only; body-bearing auto-reverts are disabled)",
@@ -608,8 +669,9 @@ pub(crate) mod winplat {
     ///
     /// Connect access is NOT the trust boundary: the gate enforces policy on
     /// every request and never exposes the brokered credentials. The boundary is
-    /// the daemon's account isolation. Tighten the trustee set (currently
-    /// Administrators/SYSTEM/Authenticated Users) for a multi-user host.
+    /// the daemon's account isolation. On a multi-user host every authenticated
+    /// local user can submit policy-gated work unless the deployment uses a
+    /// build whose pipe DACL names only the intended agent SID.
     pub fn create_pipe_server(pipe_name: &str, first: bool) -> Result<NamedPipeServer> {
         let wide: Vec<u16> = pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
         // The daemon's own account gets full control so it can create the
@@ -619,8 +681,7 @@ pub(crate) mod winplat {
         // but is denied the second (the AU ACE below excludes create-instance).
         // Administrators/SYSTEM also get full control. Authenticated Users get
         // only FILE_GENERIC_READ|FILE_GENERIC_WRITE (0x0012019b) so they can
-        // CONNECT but NOT stand up rogue instances. Tighten AU to a specific
-        // agent SID for a multi-user host.
+        // CONNECT but NOT stand up rogue instances.
         let owner_sid =
             unsafe { process_user_sid() }.context("resolve daemon SID for pipe DACL")?;
         let sddl: Vec<u16> =
@@ -779,7 +840,7 @@ pub(crate) mod winplat {
         Ok(s)
     }
 
-    unsafe fn widestring_to_string(ptr: *const u16) -> String {
+    pub(crate) unsafe fn widestring_to_string(ptr: *const u16) -> String {
         if ptr.is_null() {
             return String::new();
         }

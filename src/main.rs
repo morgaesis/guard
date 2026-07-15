@@ -58,7 +58,7 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
 use cli_client::{
     handle_approval_note_cmd, handle_approvals, handle_config, handle_gate_action,
     handle_provisionals, handle_session, handle_status, handle_verb, run_exec, run_mcp,
-    top_level_grant_to_session_command, GatingOptions, SshHostKeyCliMode,
+    top_level_grant_to_session_command, GatingOptions, RunInjections, SshHostKeyCliMode,
 };
 use cli_secrets::handle_secrets;
 use cli_server::run_server;
@@ -93,6 +93,9 @@ enum MainArgs {
         /// Repeat the flag or pass a comma-separated list for multiple secrets.
         #[arg(long = "secret", value_name = "SECRET[,SECRET]", value_parser = parse_secret_mapping, value_delimiter = ',')]
         secret_vars: Vec<(String, String)>,
+        /// Inject a stored secret through a private file path in ENV_VAR.
+        #[arg(long = "secret-file", value_name = "ENV_VAR=SECRET", value_parser = parse_env_assignment, value_delimiter = ',')]
+        secret_file_vars: Vec<(String, String)>,
         /// Rollback command for a recoverable action under consequence gating,
         /// as a single string (e.g. --revert "systemctl stop nginx"). It is
         /// itself policy-evaluated; if denied, the whole request is denied.
@@ -993,6 +996,9 @@ enum ServerCommands {
         /// Repeat the flag or pass a comma-separated list for multiple secrets.
         #[arg(long = "secret", value_name = "SECRET[,SECRET]", value_parser = parse_secret_mapping, value_delimiter = ',')]
         secret_vars: Vec<(String, String)>,
+        /// Inject a stored secret through a private file path in ENV_VAR.
+        #[arg(long = "secret-file", value_name = "ENV_VAR=SECRET", value_parser = parse_env_assignment, value_delimiter = ',')]
+        secret_file_vars: Vec<(String, String)>,
 
         /// Binary to execute
         binary: String,
@@ -1196,6 +1202,7 @@ async fn run_main() -> Result<()> {
             json,
             env_vars,
             secret_vars,
+            secret_file_vars,
             revert,
             confirm_within,
             require_approval,
@@ -1207,6 +1214,9 @@ async fn run_main() -> Result<()> {
         }) => {
             let env_vars = env_pairs_to_map(env_vars).map_err(anyhow::Error::msg)?;
             let secret_vars = secret_pairs_to_map(secret_vars).map_err(anyhow::Error::msg)?;
+            let secret_file_vars =
+                collect_unique_pairs(secret_file_vars, "secret-file injection", "secret")
+                    .map_err(anyhow::Error::msg)?;
             let gating = GatingOptions {
                 revert,
                 confirm_within,
@@ -1217,8 +1227,11 @@ async fn run_main() -> Result<()> {
             run_exec(
                 binary,
                 args,
-                env_vars,
-                secret_vars,
+                RunInjections {
+                    env: env_vars,
+                    secrets: secret_vars,
+                    secret_files: secret_file_vars,
+                },
                 gating,
                 hostkey.into(),
                 json,

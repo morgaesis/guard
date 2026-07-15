@@ -120,6 +120,23 @@ satisfy `validate_admin` to approve its own held commands and cannot read the
 daemon's state or brokered credentials. `deployment/windows/install-guard.ps1`
 provisions this model.
 
+Per-run secret-file injection is a generic execution binding. The wire request,
+approval snapshot, and provisional record carry only
+`environment-variable -> secret-name`; the daemon resolves the value immediately
+before execution and exposes only a private pathname to the child. Each run gets
+an unpredictable directory. Unix uses owner-only `0700` directories and `0600`
+files with no-follow, create-new semantics. Windows uses a protected DACL with
+one allow ACE for the daemon SID and rejects reparse points. A lease object owns
+the exact created paths through the awaited child lifecycle, including streaming
+disconnect cleanup, and startup removes stale leases. The mode is incompatible
+with `--exec-as-caller` because no ACL is widened to the caller.
+
+Windows API-revert snapshots use the same daemon-only file contract. Startup
+applies and verifies the snapshot directory DACL before enabling body-bearing
+reverts, and each snapshot file is ACL-locked before its body is written. A
+failed verification disables body-bearing reverts rather than trusting platform
+defaults.
+
 Systemd hardening changes what approved commands can do. In particular,
 `NoNewPrivileges=true` prevents setuid helpers such as `sudo` from elevating,
 and user-service sandboxing may place the daemon in a user namespace where
