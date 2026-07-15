@@ -1296,7 +1296,10 @@ fn validate_state_ancestor(
         );
     }
     let mode = metadata.mode();
-    let protected_by_sticky_root = owner == 0 && mode & libc::S_ISVTX != 0;
+    // libc exposes mode_t constants with platform-specific integer widths.
+    #[allow(clippy::unnecessary_cast)]
+    let sticky_mode_bit = libc::S_ISVTX as u32;
+    let protected_by_sticky_root = owner == 0 && mode & sticky_mode_bit != 0;
     if mode & 0o022 != 0
         && !protected_by_sticky_root
         && !(is_immediate_parent && owner == effective_uid)
