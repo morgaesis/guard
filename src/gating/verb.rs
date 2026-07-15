@@ -18,7 +18,7 @@ use anyhow::{bail, Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -51,6 +51,108 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// What a matching coverage cell authorizes. A cell that does not match says
+/// nothing about the command, so coverage never denies its complement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoverageAction {
+    Preauthorized,
+    Evaluate,
+    Deny,
+}
+
+/// Select one or more argv values either by option spelling or by exact argv
+/// position. Option spellings accept both `--name value` and `--name=value`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValueConstraint {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<String>,
+    /// Permit a selected value to begin with `-`. Off by default so a missing
+    /// option value cannot consume the next flag and satisfy a broad cell.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_dash: bool,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub required: bool,
+    /// Duplicate option spellings are rejected unless this is set. This keeps a
+    /// later value from silently changing the meaning checked by the cell.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_multiple: bool,
+}
+
+/// A bound on a list-valued target selector such as Ansible `--limit a,b`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FanoutConstraint {
+    #[serde(flatten)]
+    pub selector: ValueConstraint,
+    pub max: usize,
+    #[serde(default = "default_fanout_separator")]
+    pub separator: String,
+}
+
+fn default_fanout_separator() -> String {
+    ",".to_string()
+}
+
+/// One typed region of a verb's command space. Constraints are conjunctive.
+/// Required and forbidden argv tokens are exact argv elements, never globs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerbCoverageCell {
+    pub name: String,
+    pub action: CoverageAction,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forbidden_args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<ValueConstraint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<ValueConstraint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory: Option<ValueConstraint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<ValueConstraint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fanout: Option<FanoutConstraint>,
+    /// Exact marker an operator-issued session grant must carry to override an
+    /// `evaluate` or `deny` cell. Generated verbs cannot mint these markers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_marker: Option<String>,
+}
+
+/// One concrete reverse match before session/global precedence is resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoverageMatch {
+    pub rendered: RenderedVerb,
+    pub cell: String,
+    pub action: CoverageAction,
+    pub override_marker: Option<String>,
+    pub features: BTreeSet<String>,
+    pub specificity: CoverageSpecificity,
+}
+
+/// Comparable semantic restrictions for one matched cell. Observed values are
+/// deliberately excluded so ordering depends on authored coverage, not argv
+/// spelling or catalog declaration order.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CoverageSpecificity {
+    pub requirements: BTreeSet<String>,
+    pub values: BTreeMap<String, ValueDomain>,
+    pub fanout: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValueDomain {
+    pub required: bool,
+    pub allow_multiple: bool,
+    pub allow_dash: bool,
+    /// Empty means unrestricted.
+    pub values: BTreeSet<String>,
+}
+
 /// A structured command template (binary + argv templates). No shell.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerbCommand {
@@ -68,6 +170,18 @@ pub struct Verb {
     pub binary: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
+    /// Baseline verbs apply without a session. A session can activate a
+    /// non-baseline verb by name for its own lifetime.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub baseline: bool,
+    /// Typed command-space regions. An empty list preserves the legacy exact
+    /// argv-template behavior as one implicit cell.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub coverage: Vec<VerbCoverageCell>,
+    /// Opaque identifier for the daemon-held credential plan. Different
+    /// non-empty plans are incompatible and force evaluator conflict handling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_plan: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub params: BTreeMap<String, ParamSpec>,
     pub consequence: Reversibility,
@@ -121,6 +235,8 @@ pub struct RenderedVerb {
     pub revert: Option<(String, Vec<String>)>,
     pub trusted: bool,
     pub prompt_context: Option<String>,
+    pub baseline: bool,
+    pub credential_plan: Option<String>,
     /// Validated params, recorded into the approval snapshot for the binding.
     pub params: BTreeMap<String, String>,
     /// Mirrors `Verb::auto_promoted` / `Verb::promotion_stamp`. The caller
@@ -296,6 +412,8 @@ impl VerbCatalog {
             revert,
             trusted: verb.trusted,
             prompt_context: verb.prompt_context.clone(),
+            baseline: verb.baseline,
+            credential_plan: verb.credential_plan.clone(),
             params: resolved,
             auto_promoted: verb.auto_promoted,
             promotion_stamp: verb.promotion_stamp.clone(),
@@ -307,31 +425,77 @@ impl VerbCatalog {
         self.path.as_deref()
     }
 
-    /// Reverse-match a raw `(binary, args)` command against the catalog: does
-    /// any verb's template unify with these concrete args? This lets a caller
-    /// that runs a tool directly (`kubectl get pods -n foo`) pick up a
-    /// matching verb's declared consequence class and trust the same way an
-    /// explicit `--verb` invocation would, without naming the verb -- the
-    /// mechanism that makes a catalog (hand-authored or auto-promoted) useful
-    /// for transparently gating a high-volume tool a caller invokes normally.
-    ///
-    /// Verbs are tried in name order (deterministic, since names are unique)
-    /// and the first template that both unifies with `args` AND passes full
-    /// parameter validation (`render`) wins; a shape that unifies but fails a
-    /// param's pattern is skipped, not treated as a match.
-    pub fn match_command(&self, binary: &str, args: &[String]) -> Option<RenderedVerb> {
+    /// Collect every verb coverage cell applicable to a concrete command. The
+    /// returned order is canonical `(verb name, cell name)` order and therefore
+    /// independent of YAML declaration order. Resolution happens after this
+    /// collection step so an alphabetically earlier verb can never shadow a
+    /// semantically stronger match.
+    pub fn match_command_all(&self, binary: &str, args: &[String]) -> Vec<CoverageMatch> {
+        let mut matches = Vec::new();
         for verb in self.verbs.values() {
             if !binary_names_match(binary, &verb.binary) {
                 continue;
             }
-            let Some(captured) = match_args_template(&verb.args, args) else {
+
+            let captured = if verb.args.is_empty() && !verb.coverage.is_empty() {
+                BTreeMap::new()
+            } else {
+                let Some(captured) = match_args_template(&verb.args, args) else {
+                    continue;
+                };
+                captured
+            };
+            let Ok(mut rendered) = self.render(&verb.name, &captured) else {
                 continue;
             };
-            if let Ok(rendered) = self.render(&verb.name, &captured) {
-                return Some(rendered);
+            if verb.args.is_empty() && !verb.coverage.is_empty() {
+                rendered.binary = binary.to_string();
+                rendered.args = args.to_vec();
+            }
+
+            if verb.coverage.is_empty() {
+                matches.push(CoverageMatch {
+                    rendered,
+                    cell: "legacy-template".to_string(),
+                    action: if verb.trusted {
+                        CoverageAction::Preauthorized
+                    } else {
+                        CoverageAction::Evaluate
+                    },
+                    override_marker: None,
+                    features: legacy_template_features(&verb.args),
+                    specificity: CoverageSpecificity {
+                        requirements: legacy_template_features(&verb.args),
+                        ..CoverageSpecificity::default()
+                    },
+                });
+                continue;
+            }
+
+            for cell in &verb.coverage {
+                if let Some((features, specificity)) = coverage_cell_matches(cell, args) {
+                    matches.push(CoverageMatch {
+                        rendered: rendered.clone(),
+                        cell: cell.name.clone(),
+                        action: cell.action,
+                        override_marker: cell.override_marker.clone(),
+                        features,
+                        specificity,
+                    });
+                }
             }
         }
-        None
+        matches.sort_by(|a, b| (&a.rendered.name, &a.cell).cmp(&(&b.rendered.name, &b.cell)));
+        matches
+    }
+
+    /// Compatibility wrapper for callers that have not migrated to collect-all
+    /// resolution. It returns the first canonical match, not declaration order.
+    pub fn match_command(&self, binary: &str, args: &[String]) -> Option<RenderedVerb> {
+        self.match_command_all(binary, args)
+            .into_iter()
+            .next()
+            .map(|matched| matched.rendered)
     }
 
     /// Validate a candidate verb against this catalog: it must pass the same
@@ -512,6 +676,163 @@ fn binary_names_match(observed: &str, verb_binary: &str) -> bool {
     binary_match_key(observed) == binary_match_key(verb_binary)
 }
 
+fn legacy_template_features(args: &[String]) -> BTreeSet<String> {
+    args.iter()
+        .enumerate()
+        .map(|(index, arg)| format!("template:{index}:{arg}"))
+        .collect()
+}
+
+fn coverage_cell_matches(
+    cell: &VerbCoverageCell,
+    args: &[String],
+) -> Option<(BTreeSet<String>, CoverageSpecificity)> {
+    if cell
+        .required_args
+        .iter()
+        .any(|required| !args.contains(required))
+        || cell
+            .forbidden_args
+            .iter()
+            .any(|forbidden| args.contains(forbidden))
+    {
+        return None;
+    }
+
+    let mut features = BTreeSet::new();
+    for arg in &cell.required_args {
+        features.insert(format!("required:{arg}"));
+    }
+    for arg in &cell.forbidden_args {
+        features.insert(format!("forbidden:{arg}"));
+    }
+    let mut specificity = CoverageSpecificity {
+        requirements: features.clone(),
+        ..CoverageSpecificity::default()
+    };
+
+    for (kind, constraint) in cell
+        .options
+        .iter()
+        .map(|constraint| ("option", constraint))
+        .chain(cell.target.iter().map(|constraint| ("target", constraint)))
+        .chain(
+            cell.inventory
+                .iter()
+                .map(|constraint| ("inventory", constraint)),
+        )
+        .chain(
+            cell.namespace
+                .iter()
+                .map(|constraint| ("namespace", constraint)),
+        )
+    {
+        let values = matched_values(constraint, args)?;
+        add_constraint_features(&mut features, &mut specificity, kind, constraint, &values);
+    }
+
+    if let Some(fanout) = &cell.fanout {
+        let values = matched_values(&fanout.selector, args)?;
+        let members = values
+            .iter()
+            .flat_map(|value| value.split(&fanout.separator))
+            .collect::<Vec<_>>();
+        if !values.is_empty()
+            && (members.iter().any(|value| value.is_empty()) || members.len() > fanout.max)
+        {
+            return None;
+        }
+        add_constraint_features(
+            &mut features,
+            &mut specificity,
+            "fanout",
+            &fanout.selector,
+            &values,
+        );
+        features.insert(format!("fanout:max={}", fanout.max));
+        let selector = constraint_selector(&fanout.selector);
+        specificity.fanout.insert(selector, fanout.max);
+    }
+
+    Some((features, specificity))
+}
+
+fn matched_values(constraint: &ValueConstraint, args: &[String]) -> Option<Vec<String>> {
+    let mut found = Vec::new();
+    if let Some(position) = constraint.position {
+        if let Some(value) = args.get(position) {
+            found.push(value.clone());
+        }
+    } else {
+        for (index, arg) in args.iter().enumerate() {
+            for option in &constraint.options {
+                if arg == option {
+                    found.push(args.get(index + 1)?.clone());
+                } else if let Some(value) = arg.strip_prefix(&format!("{option}=")) {
+                    found.push(value.to_string());
+                }
+            }
+        }
+    }
+
+    if found.is_empty() {
+        return (!constraint.required).then_some(found);
+    }
+    if found.iter().any(String::is_empty)
+        || (!constraint.allow_dash && found.iter().any(|value| value.starts_with('-')))
+    {
+        return None;
+    }
+    if found.len() > 1 && !constraint.allow_multiple {
+        return None;
+    }
+    if !constraint.values.is_empty() && found.iter().any(|value| !constraint.values.contains(value))
+    {
+        return None;
+    }
+    Some(found)
+}
+
+fn add_constraint_features(
+    features: &mut BTreeSet<String>,
+    specificity: &mut CoverageSpecificity,
+    kind: &str,
+    constraint: &ValueConstraint,
+    observed: &[String],
+) {
+    let selector = constraint_selector(constraint);
+    let key = format!("{kind}:{selector}");
+    features.insert(key.clone());
+    specificity.values.insert(
+        key.clone(),
+        ValueDomain {
+            required: constraint.required,
+            allow_multiple: constraint.allow_multiple,
+            allow_dash: constraint.allow_dash,
+            values: constraint.values.iter().cloned().collect(),
+        },
+    );
+    if !constraint.values.is_empty() {
+        let mut values = constraint.values.clone();
+        values.sort();
+        features.insert(format!("{kind}:{selector}:allowed={}", values.join("|")));
+    }
+    if !observed.is_empty() {
+        features.insert(format!("{kind}:{selector}:observed={}", observed.join("|")));
+    }
+}
+
+fn constraint_selector(constraint: &ValueConstraint) -> String {
+    constraint
+        .position
+        .map(|position| format!("position:{position}"))
+        .unwrap_or_else(|| {
+            let mut options = constraint.options.clone();
+            options.sort();
+            format!("options:{}", options.join("|"))
+        })
+}
+
 /// Reject a shell/interpreter binary (see `SYNTH_BINARY_DENYLIST`): one
 /// argument to these could carry an arbitrary command, defeating the
 /// catalog's "no shell" guarantee. Shared by both synthesis paths below.
@@ -566,6 +887,13 @@ pub fn validate_synthesized_safety(verb: &Verb) -> Result<()> {
     validate_binary_not_shell(&verb.binary, "synthesized verb")?;
     for (pname, spec) in &verb.params {
         validate_param_not_overbroad(pname, spec, "synthesized verb")?;
+    }
+    if verb
+        .coverage
+        .iter()
+        .any(|cell| cell.override_marker.is_some())
+    {
+        bail!("a synthesized verb may not mint override markers");
     }
     Ok(())
 }
@@ -659,6 +987,15 @@ fn validate_verb(verb: &Verb) -> Result<()> {
     if verb.binary.trim().is_empty() {
         bail!("verb '{}' has an empty binary", verb.name);
     }
+    if verb.credential_plan.as_deref().is_some_and(str::is_empty) {
+        bail!("verb '{}' has an empty credential_plan", verb.name);
+    }
+    if !verb.coverage.is_empty() && verb.args.is_empty() && !verb.params.is_empty() {
+        bail!(
+            "verb '{}' uses generic coverage with parameters but has no argv template to capture them",
+            verb.name
+        );
+    }
     for (pname, spec) in &verb.params {
         if !(spec.pattern.starts_with('^') && spec.pattern.ends_with('$')) {
             bail!(
@@ -694,6 +1031,178 @@ fn validate_verb(verb: &Verb) -> Result<()> {
                 );
             }
         }
+    }
+    let mut cell_names = BTreeSet::new();
+    for cell in &verb.coverage {
+        if cell.name.trim().is_empty() {
+            bail!(
+                "verb '{}' has a coverage cell with an empty name",
+                verb.name
+            );
+        }
+        if !cell_names.insert(cell.name.clone()) {
+            bail!(
+                "verb '{}' has duplicate coverage cell name '{}'",
+                verb.name,
+                cell.name
+            );
+        }
+        if matches!(cell.action, CoverageAction::Preauthorized) && cell.override_marker.is_some() {
+            bail!(
+                "verb '{}' coverage cell '{}': only evaluate or deny cells may declare an override_marker",
+                verb.name,
+                cell.name
+            );
+        }
+        if !verb.baseline && cell.override_marker.is_some() {
+            bail!(
+                "verb '{}' coverage cell '{}': only baseline verbs may declare override markers",
+                verb.name,
+                cell.name
+            );
+        }
+        if matches!(cell.action, CoverageAction::Preauthorized) && !verb.trusted {
+            bail!(
+                "verb '{}' coverage cell '{}': preauthorized coverage requires trusted: true",
+                verb.name,
+                cell.name
+            );
+        }
+        if cell
+            .override_marker
+            .as_deref()
+            .is_some_and(|marker| !valid_override_marker(marker))
+        {
+            bail!(
+                "verb '{}' coverage cell '{}': override_marker must begin with an ASCII letter or digit and contain only letters, digits, '.', '_', ':', '/', or '-'",
+                verb.name,
+                cell.name
+            );
+        }
+        if verb.auto_promoted && cell.override_marker.is_some() {
+            bail!(
+                "auto-promoted verb '{}' may not mint override markers",
+                verb.name
+            );
+        }
+        let required = cell.required_args.iter().collect::<BTreeSet<_>>();
+        let forbidden = cell.forbidden_args.iter().collect::<BTreeSet<_>>();
+        if required.len() != cell.required_args.len()
+            || forbidden.len() != cell.forbidden_args.len()
+        {
+            bail!(
+                "verb '{}' coverage cell '{}': required_args and forbidden_args may not contain duplicates",
+                verb.name,
+                cell.name
+            );
+        }
+        if !required.is_disjoint(&forbidden) {
+            bail!(
+                "verb '{}' coverage cell '{}': an argv element may not be both required and forbidden",
+                verb.name,
+                cell.name
+            );
+        }
+        let option_selectors = cell
+            .options
+            .iter()
+            .map(constraint_selector)
+            .collect::<BTreeSet<_>>();
+        if option_selectors.len() != cell.options.len() {
+            bail!(
+                "verb '{}' coverage cell '{}': option constraints may not repeat the same selector",
+                verb.name,
+                cell.name
+            );
+        }
+        for constraint in cell
+            .options
+            .iter()
+            .chain(cell.target.iter())
+            .chain(cell.inventory.iter())
+            .chain(cell.namespace.iter())
+            .chain(cell.fanout.iter().map(|fanout| &fanout.selector))
+        {
+            validate_value_constraint(&verb.name, &cell.name, constraint)?;
+        }
+        if let Some(fanout) = &cell.fanout {
+            if fanout.max == 0 {
+                bail!(
+                    "verb '{}' coverage cell '{}': fanout max must be greater than zero",
+                    verb.name,
+                    cell.name
+                );
+            }
+            if fanout.separator.is_empty() {
+                bail!(
+                    "verb '{}' coverage cell '{}': fanout separator may not be empty",
+                    verb.name,
+                    cell.name
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn valid_override_marker(marker: &str) -> bool {
+    let mut chars = marker.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphanumeric())
+        && chars.all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | ':' | '/' | '-')
+        })
+}
+
+fn validate_value_constraint(verb: &str, cell: &str, constraint: &ValueConstraint) -> Result<()> {
+    if constraint.position.is_some() != constraint.options.is_empty() {
+        bail!(
+            "verb '{}' coverage cell '{}': a value constraint must set exactly one of position or options",
+            verb,
+            cell
+        );
+    }
+    if constraint
+        .options
+        .iter()
+        .any(|option| !option.starts_with('-') || option.contains('='))
+    {
+        bail!(
+            "verb '{}' coverage cell '{}': option selectors must begin with '-' and may not contain '='",
+            verb,
+            cell
+        );
+    }
+    let unique_options = constraint.options.iter().collect::<BTreeSet<_>>();
+    if unique_options.len() != constraint.options.len() {
+        bail!(
+            "verb '{}' coverage cell '{}': option selectors may not contain duplicates",
+            verb,
+            cell
+        );
+    }
+    if constraint.values.iter().any(|value| value.is_empty()) {
+        bail!(
+            "verb '{}' coverage cell '{}': allowed values may not be empty",
+            verb,
+            cell
+        );
+    }
+    if !constraint.allow_dash && constraint.values.iter().any(|value| value.starts_with('-')) {
+        bail!(
+            "verb '{}' coverage cell '{}': dash-prefixed allowed values require allow_dash: true",
+            verb,
+            cell
+        );
+    }
+    let unique_values = constraint.values.iter().collect::<BTreeSet<_>>();
+    if unique_values.len() != constraint.values.len() {
+        bail!(
+            "verb '{}' coverage cell '{}': allowed values may not contain duplicates",
+            verb,
+            cell
+        );
     }
     Ok(())
 }
@@ -1051,6 +1560,9 @@ verbs:
             description: "Read-only CloudStack listing".to_string(),
             binary: "cmk".to_string(),
             args: vec!["list".to_string(), "{resource}".to_string()],
+            baseline: true,
+            coverage: Vec::new(),
+            credential_plan: None,
             params: p,
             consequence: Reversibility::Reversible,
             revert: None,
@@ -1111,6 +1623,9 @@ verbs:
                 description: String::new(),
                 binary: "echo".to_string(),
                 args,
+                baseline: true,
+                coverage: Vec::new(),
+                credential_plan: None,
                 params,
                 consequence: Reversibility::Reversible,
                 revert: None,
@@ -1147,6 +1662,9 @@ verbs:
             description: String::new(),
             binary: "echo".to_string(),
             args: vec![],
+            baseline: true,
+            coverage: Vec::new(),
+            credential_plan: None,
             params: BTreeMap::new(),
             consequence: Reversibility::Reversible,
             revert: None,
@@ -1194,6 +1712,9 @@ verbs:
             description: String::new(),
             binary: binary.to_string(),
             args,
+            baseline: true,
+            coverage: Vec::new(),
+            credential_plan: None,
             params,
             consequence: Reversibility::Reversible,
             revert: None,
@@ -1259,6 +1780,21 @@ verbs:
             "k-get"
         ))
         .is_ok());
+
+        let mut generated_marker = synth_verb("kubectl", None, false, "k-check");
+        generated_marker.coverage.push(VerbCoverageCell {
+            name: "review".to_string(),
+            action: CoverageAction::Evaluate,
+            required_args: Vec::new(),
+            forbidden_args: Vec::new(),
+            options: Vec::new(),
+            target: None,
+            inventory: None,
+            namespace: None,
+            fanout: None,
+            override_marker: Some("operator:k-check".to_string()),
+        });
+        assert!(validate_synthesized_safety(&generated_marker).is_err());
     }
 
     #[test]
@@ -1517,6 +2053,204 @@ verbs:
         let templates = vec!["a".to_string(), "b".to_string()];
         assert!(match_args_template(&templates, &args_vec(&["a"])).is_none());
         assert!(match_args_template(&templates, &args_vec(&["a", "b", "c"])).is_none());
+    }
+
+    #[test]
+    fn typed_coverage_matches_conjunctive_command_dimensions() {
+        let cat = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: ansible-check
+    binary: ansible
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: bounded-check
+        action: preauthorized
+        required_args: ["--check"]
+        forbidden_args: ["--diff=false"]
+        options:
+          - options: ["-m", "--module-name"]
+            values: ["ping"]
+        target:
+          position: 0
+          values: ["web"]
+        inventory:
+          options: ["-i", "--inventory"]
+          values: ["inventory/prod"]
+        namespace:
+          options: ["--namespace"]
+          values: ["prod"]
+        fanout:
+          options: ["--limit"]
+          max: 2
+"#,
+        )
+        .unwrap();
+
+        let matching = args_vec(&[
+            "web",
+            "-m",
+            "ping",
+            "-i",
+            "inventory/prod",
+            "--namespace=prod",
+            "--limit",
+            "one,two",
+            "--check",
+        ]);
+        let matches = cat.match_command_all("ansible", &matching);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].rendered.name, "ansible-check");
+        assert_eq!(matches[0].cell, "bounded-check");
+        assert_eq!(matches[0].action, CoverageAction::Preauthorized);
+
+        let without_check = matching
+            .iter()
+            .filter(|arg| arg.as_str() != "--check")
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(cat.match_command_all("ansible", &without_check).is_empty());
+
+        let too_many = args_vec(&[
+            "web",
+            "--module-name=ping",
+            "--inventory=inventory/prod",
+            "--namespace=prod",
+            "--limit=one,two,three",
+            "--check",
+        ]);
+        assert!(cat.match_command_all("ansible", &too_many).is_empty());
+
+        let duplicate_selector = args_vec(&[
+            "web",
+            "-m",
+            "ping",
+            "-i",
+            "inventory/prod",
+            "--namespace",
+            "prod",
+            "--limit=one",
+            "--limit",
+            "two",
+            "--check",
+        ]);
+        assert!(cat
+            .match_command_all("ansible", &duplicate_selector)
+            .is_empty());
+
+        let missing_value = args_vec(&[
+            "web",
+            "-m",
+            "ping",
+            "-i",
+            "inventory/prod",
+            "--namespace",
+            "prod",
+            "--limit",
+            "--check",
+        ]);
+        assert!(cat.match_command_all("ansible", &missing_value).is_empty());
+    }
+
+    #[test]
+    fn unmatched_coverage_cell_does_not_deny_its_complement() {
+        let cat = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: check-only
+    binary: ansible-playbook
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: check
+        action: preauthorized
+        required_args: ["--check"]
+"#,
+        )
+        .unwrap();
+
+        let apply = args_vec(&["site.yml"]);
+        assert!(cat.match_command_all("ansible-playbook", &apply).is_empty());
+    }
+
+    #[test]
+    fn collect_all_order_is_independent_of_yaml_declaration_order() {
+        let first = r#"
+verbs:
+  - name: broad
+    binary: kubectl
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: reads
+        action: preauthorized
+        required_args: ["get"]
+  - name: narrow
+    binary: kubectl
+    consequence: reversible
+    coverage:
+      - name: namespace
+        action: evaluate
+        required_args: ["get"]
+        namespace:
+          options: ["-n", "--namespace"]
+          values: ["prod"]
+"#;
+        let second = r#"
+verbs:
+  - name: narrow
+    binary: kubectl
+    consequence: reversible
+    coverage:
+      - name: namespace
+        action: evaluate
+        required_args: ["get"]
+        namespace:
+          options: ["-n", "--namespace"]
+          values: ["prod"]
+  - name: broad
+    binary: kubectl
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: reads
+        action: preauthorized
+        required_args: ["get"]
+"#;
+        let command = args_vec(&["get", "pods", "--namespace=prod"]);
+        let summarize = |catalog: VerbCatalog| {
+            catalog
+                .match_command_all("kubectl", &command)
+                .into_iter()
+                .map(|matched| (matched.rendered.name, matched.cell, matched.action))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            summarize(VerbCatalog::from_yaml(first).unwrap()),
+            summarize(VerbCatalog::from_yaml(second).unwrap())
+        );
+    }
+
+    #[test]
+    fn auto_promoted_coverage_cannot_mint_override_marker() {
+        let err = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: generated-deny
+    binary: kubectl
+    consequence: reversible
+    trusted: true
+    auto_promoted: true
+    coverage:
+      - name: deletes
+        action: deny
+        required_args: ["delete"]
+        override_marker: operator:delete
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("may not mint override markers"));
     }
 
     fn args_vec(v: &[&str]) -> Vec<String> {

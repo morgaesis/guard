@@ -216,8 +216,31 @@ cannot express - without writing YAML by hand.
 
 A caller does not have to name a verb to benefit from one: a raw command
 (`guard run kubectl get pods -n foo`) reverse-matches any catalog verb whose
-template it satisfies, hand-authored or auto-promoted, picking up its class
-and trust the same way `guard verb run` would.
+template or typed coverage cell it satisfies. Guard collects every matching
+cell in canonical verb-name and cell-name order. A more specific cell wins over
+a broader cell in the same scope; equally specific incompatible authorization,
+credential, execution, or rollback plans are sent to the evaluator together.
+Guard holds an evaluator-approved command when the plans remain incompatible,
+so catalog name order never chooses a credential or rollback plan.
+
+A coverage cell can constrain exact required or forbidden argv elements,
+option values, positional targets, inventory, namespace, and list fanout. Its
+action is `preauthorized`, `evaluate`, or `deny`. A `preauthorized` cell
+requires `trusted: true`. A non-matching cell says
+nothing about the command and never denies the complement of its coverage.
+`baseline: false` keeps a verb inactive until a session grant names it with
+`--verb`. Session cells replace matching baseline preauthorization. A baseline
+`evaluate` or `deny` cell remains active unless it declares an
+`override_marker` and the operator-issued session grant carries that exact
+marker with `--override-marker`. Automatically promoted verbs cannot declare
+override markers.
+
+Machine-readable run results include every applicable cell in `verb_matches`
+and any escalation text in `verb_guidance`. Human output stays quiet after a
+successful execution. Held and denied commands print the matching verbs and
+guidance to stderr so an agent can ask the operator for the exact grant change.
+`guard verb list --json` returns each verb's baseline flag, credential plan,
+and complete typed coverage; human listing prints the same coverage dimensions.
 
 #### Auto-verb-promotion
 
@@ -405,7 +428,7 @@ Unless marked "(client)", a variable is read by the daemon at startup; setting i
 | `GUARD_ALLOW_BIN` | (none) | Comma-separated binary allow-list. When set, only these binaries may execute, on every route, regardless of the LLM decision. Bare names match by command name via the daemon PATH; path-qualified entries must match exactly. |
 | `GUARD_GATE` | `off` | Consequence gating: `off` or `consequence`. Requires a local listener (`--socket`: a Unix-domain socket on Unix, a named pipe on Windows); refused over TCP. |
 | `GUARD_VERBS` | (none) | Path to the verb catalog YAML. Hot-reloaded on change. |
-| `GUARD_PROFILES` | (none) | Path to the session-profile YAML (named `{ttl, allow, deny, prompt}` bundles for `guard session new --profile <name>`; see `examples/session-profiles.yaml`). |
+| `GUARD_PROFILES` | (none) | Path to the session-profile YAML (named `{ttl, allow, deny, activated_verbs, override_markers, prompt}` bundles for `guard session new --profile <name>`; see `examples/session-profiles.yaml`). |
 | `GUARD_PREFLIGHT` | `false` | Deterministic pre-LLM checks: reject binaries not on the daemon `PATH` and known credential-disclosure patterns before any LLM call. Coarse by design; enable where LLM cost/latency dominates over false positives. Flag: `--preflight`. |
 | `GUARD_CACHE` | `true` | In-memory cache of LLM decisions keyed on the exact command line. Disable with `--no-cache` or `GUARD_CACHE=false`. |
 | `GUARD_CACHE_CAPACITY` | `1024` | Maximum cached decisions (`--cache-capacity`). |
@@ -634,7 +657,7 @@ The additive prompt is appended to whichever base prompt is active (readonly, sa
 
 ## Session grants
 
-Session grants hand a specific agent narrow extra permissions for a specific run, without relaxing the global mode. The agent identifies its session by the `GUARD_SESSION` env var; every `guard run` (and `guard server connect`) reads that env var and forwards it as the session token in the request. Operators can attach legacy allow/deny patterns, prose intent, and optional evaluator context to that token. The token is a bearer credential; treat it like access to the scoped session itself.
+Session grants hand a specific agent narrow permissions for a specific run. The agent identifies its session by the `GUARD_SESSION` env var; every `guard run` (and `guard server connect`) reads that env var and forwards it as the session token in the request. Operators can activate typed verbs, carry exact declared override markers, or attach legacy allow/deny patterns, prose intent, and evaluator context to that token. An override replaces only its matching baseline verb region; server hard invariants remain active. The token is a bearer credential; treat it like access to the scoped session itself.
 
 The simplest flow is `guard session new`, which mints a token and (optionally) grants it in one round trip, printing an eval-friendly export line:
 
@@ -654,11 +677,21 @@ GUARD_SESSION="$GUARD_SESSION" my-agent
 
 Inside the agent's process tree, every `guard run` call automatically picks up `GUARD_SESSION` from the inherited environment, so the model itself does not need to know or pass the token explicitly. The scope is bound to the shell that launched the agent.
 
-To grant rules to an existing token (e.g. one the agent already has):
+To grant legacy rules or activate typed verbs for an existing token (e.g. one
+the agent already has):
 
 ```bash
-guard session grant <token> --allow '<glob>' --deny '<glob>' [--ttl N] [--prompt TEXT] [--auto-amend]
+guard session grant <token> \
+  --verb deploy-host-a \
+  --override-marker operator:apply-host-a \
+  [--allow '<glob>'] [--deny '<glob>'] [--ttl N] [--prompt TEXT]
 ```
+
+`--verb` activates a catalog verb whose `baseline` field is false. An override
+marker applies only to a matching baseline `evaluate` or `deny` coverage cell
+that declares the same marker. It does not bypass the server binary allow-list,
+credential checks, consequence routing, or any other hard invariant. Active and
+historical session records persist both fields in the state database.
 
 There is also a top-level shorthand. With a quoted prose description it mints and
 grants a fresh session, again printing an eval-friendly export line:
@@ -691,7 +724,7 @@ guard session appeal <token> kubectl get httproute -n grafana
 
 An appeal runs the evaluator with the session context and then either amends an exact allow, amends an exact deny for a high-risk denial, or refuses to amend. It exits nonzero when the appealed command remains denied. Appeals are admin RPCs, like grant and revoke, because they can change durable authorization state.
 
-Session grants are persisted in the daemon state database and survive daemon restarts by default. The default path is the XDG state dir (`$XDG_STATE_HOME/guard/state.db` or `~/.local/state/guard/state.db`); override it with `--state-db` or `GUARD_STATE_DB`. `guard session revoke <token>` is restricted to the daemon principal. `guard session list` is visible over a local listener to exec-allowed callers: non-admin callers see redacted tokens, hidden rule bodies, hidden generated notes, and hidden prompt text for other sessions. If `GUARD_SESSION` matches an active or historical grant, that row is shown as `token=(current)` with its own rules, prompt context, and generated notes visible, but the raw token is still not printed.
+Session grants are persisted in the daemon state database and survive daemon restarts by default. The default path is the XDG state dir (`$XDG_STATE_HOME/guard/state.db` or `~/.local/state/guard/state.db`); override it with `--state-db` or `GUARD_STATE_DB`. `guard session revoke <token>` is restricted to the daemon principal. `guard session list` is visible over a local listener to exec-allowed callers: non-admin callers see redacted tokens, hidden rule bodies, hidden verb activations, hidden override markers, hidden generated notes, and hidden prompt text for other sessions. If `GUARD_SESSION` matches an active or historical grant, that row is shown as `token=(current)` with its own permissions, prompt context, and generated notes visible, but the raw token is still not printed.
 
 For forensics, `guard session show <token>` prints prompt context, generated notes, aggregate allow/deny and exec outcome counts, source breakdown (`llm`, `cache`, `static_policy`, `session_allow`, `session_deny`, `session_static_only`, `validation`), a risk histogram for LLM-evaluated calls, and a bounded recent interaction log. Each interaction includes an optional child exit code and the names, never values, of secrets that reached a successfully spawned child. Daemon-principal and TCP admin-token callers see the raw token. Non-admin local callers may show a session only by presenting its token and receive the same session details with tokens rendered as `(provided)`. Those summaries are loaded from the state database, so they remain available after a service restart within the configured retention window.
 

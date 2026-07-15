@@ -21,9 +21,25 @@
 #   description   operator-facing note (metadata only)
 #   ttl_secs      grant lifetime in seconds; omit for no expiry
 #   allow / deny  session glob patterns (deny beats allow)
+#   activated_verbs non-baseline catalog verbs enabled for the session
+#   override_markers exact markers declared by baseline evaluate/deny cells
 #   prompt_append evaluator context for commands that fall through the globs
 
 profiles:
+  # This profile pairs with examples/verbs.yaml. The session verb supplies the
+  # bounded apply plan and rollback; the exact marker replaces the matching
+  # baseline evaluator requirement for that area only.
+  - name: ansible-host-a-apply
+    description: Apply bounded Ansible changes to host-a
+    ttl_secs: 1800
+    activated_verbs:
+      - ansible-host-a-apply
+    override_markers:
+      - operator:ansible-apply
+    prompt_append: >
+      This session applies the operator-authored host-a capability. Other
+      Ansible targets and inventories remain outside the grant.
+
   # A repeatable "box" for cert-manager certificate rotation: the allow globs
   # cover the expected read/rotate commands, the deny globs fence off the
   # destructive neighbours, and the prompt tells the evaluator what the session

@@ -918,6 +918,8 @@ where
                     status: None,
                     handle: None,
                     coverage: None,
+                    verb_matches: Vec::new(),
+                    verb_guidance: None,
                 };
                 writer
                     .write_all(serde_json::to_string(&resp)?.as_bytes())
@@ -929,7 +931,7 @@ where
 
         let request = match incoming {
             IncomingMessage::Admin { admin, .. } => {
-                let resp = handle_admin_request(config, &caller, admin).await;
+                let resp = handle_admin_request(config, &caller, *admin).await;
                 writer
                     .write_all(serde_json::to_string(&resp)?.as_bytes())
                     .await?;
@@ -957,6 +959,8 @@ where
                 status: None,
                 handle: None,
                 coverage: None,
+                verb_matches: Vec::new(),
+                verb_guidance: None,
             };
             writer
                 .write_all(serde_json::to_string(&resp)?.as_bytes())
@@ -1107,6 +1111,8 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
                     status: None,
                     handle: None,
                     coverage: None,
+                    verb_matches: Vec::new(),
+                    verb_guidance: None,
                 };
                 writer
                     .write_all(serde_json::to_string(&resp)?.as_bytes())
@@ -1118,7 +1124,7 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
 
         let request = match incoming {
             IncomingMessage::Admin { admin, admin_token } => {
-                let caller = if matches!(admin, AdminRequest::Ping) {
+                let caller = if matches!(admin.as_ref(), AdminRequest::Ping) {
                     CallerIdentity::Tcp {
                         token: "<tcp>".to_string(),
                     }
@@ -1136,7 +1142,7 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
                         token: admin_token.unwrap_or_else(|| "<missing>".to_string()),
                     }
                 };
-                let resp = handle_admin_request(config, &caller, admin).await;
+                let resp = handle_admin_request(config, &caller, *admin).await;
                 writer
                     .write_all(serde_json::to_string(&resp)?.as_bytes())
                     .await?;
@@ -1165,6 +1171,8 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
                 status: None,
                 handle: None,
                 coverage: None,
+                verb_matches: Vec::new(),
+                verb_guidance: None,
             };
             writer
                 .write_all(serde_json::to_string(&resp)?.as_bytes())

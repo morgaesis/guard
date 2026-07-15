@@ -33,6 +33,13 @@ pub struct SessionGrant {
     pub allow_exact: Vec<SessionExactRule>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny_exact: Vec<SessionExactRule>,
+    /// Catalog verbs activated only while this session grant is live.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activated_verbs: Vec<String>,
+    /// Exact operator-issued markers that may override matching baseline
+    /// evaluate or deny cells. Automatic promotion never writes this field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub override_markers: Vec<String>,
     /// Unix seconds after which this grant is treated as absent.
     pub expires_at: Option<u64>,
     /// Free-form text appended to the LLM system prompt for evaluator
@@ -132,6 +139,10 @@ pub struct HistoricalGrant {
     pub allow_exact: Vec<SessionExactRule>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny_exact: Vec<SessionExactRule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activated_verbs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub override_markers: Vec<String>,
     pub granted_at: u64,
     pub expires_at: Option<u64>,
     /// Unix seconds when the grant left the active set.
@@ -168,6 +179,10 @@ pub struct SessionGrantSummary {
     pub allow_exact: Vec<SessionExactRule>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny_exact: Vec<SessionExactRule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activated_verbs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub override_markers: Vec<String>,
     pub expires_at: Option<u64>,
     #[serde(default)]
     pub granted_at: u64,
@@ -421,6 +436,8 @@ impl SessionRegistry {
                 deny: g.deny.clone(),
                 allow_exact: g.allow_exact.clone(),
                 deny_exact: g.deny_exact.clone(),
+                activated_verbs: g.activated_verbs.clone(),
+                override_markers: g.override_markers.clone(),
                 expires_at: g.expires_at,
                 granted_at: g.granted_at,
                 prompt_append: g.prompt_append.clone(),
@@ -466,6 +483,8 @@ impl SessionRegistry {
                     deny: grant.deny.clone(),
                     allow_exact: grant.allow_exact.clone(),
                     deny_exact: grant.deny_exact.clone(),
+                    activated_verbs: grant.activated_verbs.clone(),
+                    override_markers: grant.override_markers.clone(),
                     expires_at: grant.expires_at,
                     granted_at: grant.granted_at,
                     prompt_append: grant.prompt_append.clone(),
@@ -546,6 +565,17 @@ impl SessionRegistry {
             return None;
         }
         grant.prompt_append.clone()
+    }
+
+    pub fn verb_scope_for(&self, token: &str) -> Option<(Vec<String>, Vec<String>)> {
+        let grant = self.grants.get(token)?;
+        if grant.is_expired(now_unix()) {
+            return None;
+        }
+        Some((
+            grant.activated_verbs.clone(),
+            grant.override_markers.clone(),
+        ))
     }
 
     pub fn static_only_for(&self, token: &str) -> bool {
@@ -756,6 +786,8 @@ fn historical(
         deny: grant.deny,
         allow_exact: grant.allow_exact,
         deny_exact: grant.deny_exact,
+        activated_verbs: grant.activated_verbs,
+        override_markers: grant.override_markers,
         granted_at: grant.granted_at,
         expires_at: grant.expires_at,
         ended_at,
@@ -788,6 +820,8 @@ mod tests {
                 deny: deny.iter().map(|s| s.to_string()).collect(),
                 allow_exact: Vec::new(),
                 deny_exact: Vec::new(),
+                activated_verbs: Vec::new(),
+                override_markers: Vec::new(),
                 expires_at: None,
                 granted_at: 0,
                 prompt_append: None,
@@ -936,6 +970,8 @@ mod tests {
                 deny: vec![],
                 allow_exact: Vec::new(),
                 deny_exact: Vec::new(),
+                activated_verbs: Vec::new(),
+                override_markers: Vec::new(),
                 expires_at: Some(1),
                 granted_at: 0, // 1970-01-01 +1s
                 prompt_append: None,
@@ -965,6 +1001,8 @@ mod tests {
                 deny: vec![],
                 allow_exact: Vec::new(),
                 deny_exact: Vec::new(),
+                activated_verbs: Vec::new(),
+                override_markers: Vec::new(),
                 expires_at: None,
                 granted_at: 0,
                 prompt_append: Some("session is restoring a backup".to_string()),
@@ -990,6 +1028,8 @@ mod tests {
                 deny: vec![],
                 allow_exact: Vec::new(),
                 deny_exact: Vec::new(),
+                activated_verbs: Vec::new(),
+                override_markers: Vec::new(),
                 expires_at: Some(1),
                 granted_at: 0,
                 prompt_append: Some("ignored".to_string()),
@@ -1011,6 +1051,8 @@ mod tests {
                 deny: vec![],
                 allow_exact: Vec::new(),
                 deny_exact: Vec::new(),
+                activated_verbs: Vec::new(),
+                override_markers: Vec::new(),
                 expires_at: None,
                 granted_at: 0,
                 prompt_append: None,
@@ -1026,6 +1068,8 @@ mod tests {
                 deny: vec![],
                 allow_exact: Vec::new(),
                 deny_exact: Vec::new(),
+                activated_verbs: Vec::new(),
+                override_markers: Vec::new(),
                 expires_at: Some(1),
                 granted_at: 0,
                 prompt_append: None,
@@ -1056,6 +1100,8 @@ mod tests {
                 deny: vec![],
                 allow_exact: Vec::new(),
                 deny_exact: Vec::new(),
+                activated_verbs: Vec::new(),
+                override_markers: Vec::new(),
                 expires_at: None,
                 granted_at: 0,
                 prompt_append: None,
@@ -1091,6 +1137,8 @@ mod tests {
                 deny: vec![],
                 allow_exact: Vec::new(),
                 deny_exact: Vec::new(),
+                activated_verbs: Vec::new(),
+                override_markers: Vec::new(),
                 expires_at: Some(1),
                 granted_at: 0,
                 prompt_append: None,
@@ -1121,6 +1169,8 @@ mod tests {
                 deny: vec![],
                 allow_exact: Vec::new(),
                 deny_exact: Vec::new(),
+                activated_verbs: Vec::new(),
+                override_markers: Vec::new(),
                 expires_at: None,
                 granted_at: 0,
                 prompt_append: None,

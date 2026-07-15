@@ -1,8 +1,10 @@
+use crate::evaluate::{EvalConfig, Evaluator};
 use crate::server::admin::handle_admin_request;
 use crate::server::execute::execute_command;
 use crate::server::wire::{
     AdminRequest, AdminResponse, CallerIdentity, ExecuteRequest, GateStatus, VerbInvocation,
 };
+use crate::session::SessionGrant;
 use guard::gating::verb::VerbCatalog;
 use guard::gating::GateMode;
 use std::collections::HashMap;
@@ -10,6 +12,197 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use super::make_test_config;
+
+fn raw_request(binary: &str, args: &[&str], session_token: Option<&str>) -> ExecuteRequest {
+    ExecuteRequest {
+        binary: binary.to_string(),
+        args: args.iter().map(|arg| (*arg).to_string()).collect(),
+        auth_token: None,
+        env: HashMap::new(),
+        secrets: HashMap::new(),
+        stream: false,
+        session_token: session_token.map(str::to_string),
+        revert: None,
+        confirm_within_secs: None,
+        reevaluate: false,
+        ssh_hostkey: None,
+        cwd: None,
+        require_approval: None,
+        wait_approval_secs: None,
+        verb: None,
+    }
+}
+
+#[tokio::test]
+async fn raw_command_collects_all_typed_matches_and_executes_selected_cell() {
+    let (mut cfg, _buf) = make_test_config();
+    cfg.gate = GateMode::Consequence;
+    cfg.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: broad-check
+    binary: true
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: any-check
+        action: preauthorized
+        required_args: ["--check"]
+  - name: narrow-check
+    binary: true
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: explicit-safe
+        action: preauthorized
+        required_args: ["--check", "safe"]
+"#,
+        )
+        .expect("valid typed catalog"),
+    ));
+
+    let response = execute_command(
+        raw_request("true", &["--check", "safe"], None),
+        &cfg,
+        &CallerIdentity::Unix { uid: 1000 },
+    )
+    .await
+    .into_response();
+
+    assert!(response.allowed);
+    assert_eq!(response.exit_code, Some(0));
+    assert_eq!(response.verb_matches.len(), 2);
+    assert!(!response.verb_matches[0].selected);
+    assert!(response.verb_matches[1].selected);
+    assert!(response.verb_guidance.is_none());
+}
+
+#[tokio::test]
+async fn session_verb_needs_exact_marker_to_override_baseline_evaluation() {
+    let (mut cfg, _buf) = make_test_config();
+    cfg.gate = GateMode::Consequence;
+    cfg.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: baseline-review
+    binary: true
+    consequence: recoverable
+    coverage:
+      - name: apply
+        action: evaluate
+        required_args: ["apply"]
+        override_marker: operator:apply
+  - name: session-apply
+    binary: true
+    baseline: false
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: apply
+        action: preauthorized
+        required_args: ["apply"]
+"#,
+        )
+        .expect("valid typed catalog"),
+    ));
+
+    let grant = |override_markers| SessionGrant {
+        allow: Vec::new(),
+        deny: Vec::new(),
+        allow_exact: Vec::new(),
+        deny_exact: Vec::new(),
+        activated_verbs: vec!["session-apply".to_string()],
+        override_markers,
+        expires_at: None,
+        prompt_append: None,
+        generated_notes: Vec::new(),
+        static_only: false,
+        auto_amend: false,
+        granted_at: 0,
+    };
+    cfg.sessions
+        .write()
+        .await
+        .grant("typed".to_string(), grant(Vec::new()));
+
+    let without_marker = execute_command(
+        raw_request("true", &["apply"], Some("typed")),
+        &cfg,
+        &CallerIdentity::Unix { uid: 1000 },
+    )
+    .await
+    .into_response();
+    assert!(!without_marker.allowed);
+    assert_eq!(without_marker.verb_matches.len(), 2);
+    assert!(without_marker.verb_guidance.is_some());
+
+    cfg.sessions.write().await.grant(
+        "typed".to_string(),
+        grant(vec!["operator:apply".to_string()]),
+    );
+    let with_marker = execute_command(
+        raw_request("true", &["apply"], Some("typed")),
+        &cfg,
+        &CallerIdentity::Unix { uid: 1000 },
+    )
+    .await
+    .into_response();
+    assert!(with_marker.allowed);
+    assert_eq!(with_marker.exit_code, Some(0));
+    assert!(with_marker.verb_matches[0].overridden);
+    assert!(!with_marker.verb_matches[0].selected);
+    assert!(with_marker.verb_matches[1].selected);
+}
+
+#[tokio::test]
+async fn typed_evaluation_keeps_consequence_gate_after_static_policy_allow() {
+    let (mut cfg, _buf) = make_test_config();
+    cfg.gate = GateMode::Consequence;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let policy = tmp.path().join("policy.yaml");
+    std::fs::write(
+        &policy,
+        "policy:\n  commands:\n    allow:\n      - \"true apply\"\n",
+    )
+    .expect("write policy");
+    cfg.evaluator = Arc::new(
+        Evaluator::new(EvalConfig::default().llm_enabled(false).policy_path(policy))
+            .expect("build static evaluator"),
+    );
+    cfg.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: reviewed-apply
+    binary: true
+    consequence: irreversible
+    coverage:
+      - name: apply
+        action: evaluate
+        required_args: ["apply"]
+"#,
+        )
+        .expect("valid typed catalog"),
+    ));
+
+    let response = execute_command(
+        raw_request("true", &["apply"], None),
+        &cfg,
+        &CallerIdentity::Unix { uid: 1000 },
+    )
+    .await
+    .into_response();
+
+    assert!(response.allowed, "the evaluator approved the command");
+    assert_eq!(response.status, Some(GateStatus::Held));
+    assert!(
+        response.exit_code.is_none(),
+        "the held command must not run"
+    );
+    assert!(response.verb_matches[0].selected);
+}
 
 /// Trusted-verb + consequence-gate interaction: `trusted` only skips the
 /// LLM evaluator (`bypass: false` in the `GateInputs` built for it, see

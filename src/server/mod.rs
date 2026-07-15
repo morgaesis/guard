@@ -156,12 +156,10 @@ struct ServerConfig {
     pub approvals: Arc<RwLock<ApprovalRegistry>>,
     /// Operator-authored verb catalog (the typed, least-expressive interface).
     pub verbs: Arc<RwLock<VerbCatalog>>,
-    /// Operator-authored session-grant profiles: named {ttl, allow, deny,
-    /// prompt_append} bundles that `guard session new --profile <name>` mints a
-    /// grant from. Loaded at startup from `--profiles` / `GUARD_PROFILES`; empty
-    /// by default. A profile is only a pre-authored convenience: the grant it
-    /// mints takes the identical install/validation path as a hand-authored one,
-    /// so it is no new trust boundary.
+    /// Operator-authored session-grant profiles: named legacy patterns, typed
+    /// verb activations, override markers, ttl, and prompt context. Loaded at
+    /// startup from `--profiles` / `GUARD_PROFILES`; empty by default. A profile
+    /// takes the same install and validation path as a hand-authored grant.
     pub profiles: ProfileCatalog,
     /// Optional server-wide binary allow-list. `None` (the default) imposes no
     /// restriction. When `Some`, only binaries permitted by [`binary_allowed`]

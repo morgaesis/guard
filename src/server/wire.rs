@@ -1,6 +1,7 @@
 use crate::session::{HistoricalGrant, SessionExecStatus, SessionGrantSummary, SessionReport};
 use guard::gating::approval::Approval;
 use guard::gating::provisional::Provisional;
+use guard::gating::verb::CoverageAction;
 use guard::gating::{Coverage, Reversibility};
 use guard::principal::PrincipalKey;
 use serde::{Deserialize, Serialize};
@@ -247,6 +248,28 @@ pub(super) struct VerbContext {
     pub(super) catalog_version: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerbMatchScope {
+    Baseline,
+    Session,
+}
+
+/// Structured explanation of one applicable verb coverage cell.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerbMatchInfo {
+    pub verb: String,
+    pub cell: String,
+    pub scope: VerbMatchScope,
+    pub action: CoverageAction,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
+    #[serde(default)]
+    pub selected: bool,
+    #[serde(default)]
+    pub overridden: bool,
+}
+
 /// Whether a verb's `trusted` flag still applies, given its own
 /// `auto_promoted`/`promotion_stamp` and the daemon's current stamp. A
 /// hand-authored verb (`auto_promoted == false`) has no expiry: an operator
@@ -305,14 +328,18 @@ pub enum AdminRequest {
         #[serde(default)]
         deny: Vec<String>,
         #[serde(default)]
+        activated_verbs: Vec<String>,
+        #[serde(default)]
+        override_markers: Vec<String>,
+        #[serde(default)]
         ttl_secs: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt_append: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prose: Option<String>,
         /// Name of an operator-defined profile to seed this grant from. Unknown
-        /// names are rejected; a known profile's ttl/allow/deny/prompt are merged
-        /// in before the grant is installed on the normal path.
+        /// names are rejected; a known profile's grant fields are merged before
+        /// the grant is installed on the normal path.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         profile: Option<String>,
         #[serde(default)]
@@ -537,6 +564,12 @@ pub struct VerbSummary {
     pub name: String,
     pub description: String,
     pub binary: String,
+    #[serde(default = "verb_summary_default_baseline")]
+    pub baseline: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub coverage: Vec<guard::gating::verb::VerbCoverageCell>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_plan: Option<String>,
     pub consequence: String,
     /// Whether this verb currently skips the LLM. For an auto-promoted verb
     /// this already reflects the staleness check (`verb_effective_trust`):
@@ -556,6 +589,10 @@ pub struct VerbSummary {
     /// for an auto-promotion).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<String>,
+}
+
+fn verb_summary_default_baseline() -> bool {
+    true
 }
 
 /// Operator-facing view of a provisional execution.
@@ -731,7 +768,7 @@ pub struct ServerStatus {
 #[serde(untagged)]
 pub(crate) enum IncomingMessage {
     Admin {
-        admin: AdminRequest,
+        admin: Box<AdminRequest>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         admin_token: Option<String>,
     },
@@ -761,6 +798,13 @@ pub struct ExecuteResponse {
     /// Honest statement of what the gate checked and did not check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coverage: Option<Coverage>,
+    /// Every applicable typed verb cell in canonical order. Present in
+    /// structured output even when success stays quiet on stderr.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verb_matches: Vec<VerbMatchInfo>,
+    /// Actionable guidance for denied or held coverage decisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verb_guidance: Option<String>,
 }
 
 /// Wire-level consequence-gate outcome.
@@ -846,6 +890,8 @@ pub(super) struct ExecuteResult {
     /// Secret-store key names whose values entered the environment of a
     /// successfully spawned child. This does not prove the child consumed them.
     exposed_secret_refs: Vec<String>,
+    verb_matches: Vec<VerbMatchInfo>,
+    verb_guidance: Option<String>,
 }
 
 impl ExecuteResult {
@@ -856,6 +902,8 @@ impl ExecuteResult {
             },
             exec: ExecOutcome::NotAttempted,
             exposed_secret_refs: Vec::new(),
+            verb_matches: Vec::new(),
+            verb_guidance: None,
         }
     }
 
@@ -876,6 +924,8 @@ impl ExecuteResult {
                 stderr,
             },
             exposed_secret_refs: Vec::new(),
+            verb_matches: Vec::new(),
+            verb_guidance: None,
         }
     }
 
@@ -894,6 +944,8 @@ impl ExecuteResult {
                 started: false,
             },
             exposed_secret_refs: Vec::new(),
+            verb_matches: Vec::new(),
+            verb_guidance: None,
         }
     }
 
@@ -913,6 +965,8 @@ impl ExecuteResult {
                 started: true,
             },
             exposed_secret_refs: Vec::new(),
+            verb_matches: Vec::new(),
+            verb_guidance: None,
         }
     }
 
@@ -923,6 +977,8 @@ impl ExecuteResult {
             },
             exposed_secret_refs: Vec::new(),
             exec: ExecOutcome::DryRun { coverage: None },
+            verb_matches: Vec::new(),
+            verb_guidance: None,
         }
     }
 
@@ -937,6 +993,8 @@ impl ExecuteResult {
                 coverage: Some(coverage),
             },
             exposed_secret_refs: Vec::new(),
+            verb_matches: Vec::new(),
+            verb_guidance: None,
         }
     }
 
@@ -949,6 +1007,8 @@ impl ExecuteResult {
             },
             exec: ExecOutcome::Held { handle, coverage },
             exposed_secret_refs: Vec::new(),
+            verb_matches: Vec::new(),
+            verb_guidance: None,
         }
     }
 
@@ -973,6 +1033,8 @@ impl ExecuteResult {
                 stderr,
             },
             exposed_secret_refs: Vec::new(),
+            verb_matches: Vec::new(),
+            verb_guidance: None,
         }
     }
 
@@ -995,6 +1057,16 @@ impl ExecuteResult {
         }
     }
 
+    pub(super) fn with_verb_resolution(
+        mut self,
+        matches: Vec<VerbMatchInfo>,
+        guidance: Option<String>,
+    ) -> Self {
+        self.verb_matches = matches;
+        self.verb_guidance = guidance;
+        self
+    }
+
     /// True if the policy approved the command. Note: this does NOT mean
     /// the command actually ran — check the exec outcome for that.
     pub(super) fn policy_allowed(&self) -> bool {
@@ -1015,6 +1087,8 @@ impl ExecuteResult {
     /// audit events first should do so before consuming the result.
     pub(super) fn into_response(self) -> ExecuteResponse {
         let allowed = self.policy_allowed();
+        let verb_matches = self.verb_matches;
+        let verb_guidance = self.verb_guidance;
         let policy_reason = match self.policy {
             PolicyOutcome::Allowed { reason } | PolicyOutcome::Denied { reason } => reason,
         };
@@ -1034,6 +1108,8 @@ impl ExecuteResult {
                 status: None,
                 handle: None,
                 coverage: None,
+                verb_matches,
+                verb_guidance,
             },
             ExecOutcome::Failed {
                 reason: exec_msg, ..
@@ -1051,6 +1127,8 @@ impl ExecuteResult {
                 status: None,
                 handle: None,
                 coverage: None,
+                verb_matches,
+                verb_guidance,
             },
             ExecOutcome::DryRun { coverage } => ExecuteResponse {
                 allowed: true,
@@ -1063,6 +1141,8 @@ impl ExecuteResult {
                 status: coverage.as_ref().map(|_| GateStatus::DryRun),
                 handle: None,
                 coverage,
+                verb_matches,
+                verb_guidance,
             },
             ExecOutcome::NotAttempted => ExecuteResponse {
                 allowed,
@@ -1073,6 +1153,8 @@ impl ExecuteResult {
                 status: None,
                 handle: None,
                 coverage: None,
+                verb_matches,
+                verb_guidance,
             },
             ExecOutcome::Held { handle, coverage } => ExecuteResponse {
                 // Approved but held: allowed=true (not a denial), no exit code.
@@ -1084,6 +1166,8 @@ impl ExecuteResult {
                 status: Some(GateStatus::Held),
                 handle: Some(handle),
                 coverage: Some(coverage),
+                verb_matches,
+                verb_guidance,
             },
             ExecOutcome::Provisional {
                 handle,
@@ -1100,6 +1184,8 @@ impl ExecuteResult {
                 status: Some(GateStatus::Provisional),
                 handle: Some(handle),
                 coverage: Some(coverage),
+                verb_matches,
+                verb_guidance,
             },
         }
     }

@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const VACUUM_MIN_PAGES: u64 = 512;
 const VACUUM_MIN_FREE_PAGES: u64 = 128;
 
@@ -83,7 +83,7 @@ impl SessionStore {
         let mut grants = HashMap::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT token, allow_json, deny_json, allow_exact_json, deny_exact_json, expires_at, prompt_append, generated_notes_json, granted_at, static_only, auto_amend
+                "SELECT token, allow_json, deny_json, allow_exact_json, deny_exact_json, activated_verbs_json, override_markers_json, expires_at, prompt_append, generated_notes_json, granted_at, static_only, auto_amend
                  FROM session_grants",
             )?;
             let rows = stmt.query_map([], |row| {
@@ -99,12 +99,14 @@ impl SessionStore {
                         deny: decode_vec(&deny_json)?,
                         allow_exact: decode_exact_vec(&allow_exact_json)?,
                         deny_exact: decode_exact_vec(&deny_exact_json)?,
-                        expires_at: decode_optional_u64(row.get(5)?)?,
-                        prompt_append: row.get(6)?,
-                        generated_notes: decode_vec(&row.get::<_, String>(7)?)?,
-                        granted_at: decode_u64(row.get(8)?)?,
-                        static_only: decode_bool(row.get(9)?)?,
-                        auto_amend: decode_bool(row.get(10)?)?,
+                        activated_verbs: decode_vec(&row.get::<_, String>(5)?)?,
+                        override_markers: decode_vec(&row.get::<_, String>(6)?)?,
+                        expires_at: decode_optional_u64(row.get(7)?)?,
+                        prompt_append: row.get(8)?,
+                        generated_notes: decode_vec(&row.get::<_, String>(9)?)?,
+                        granted_at: decode_u64(row.get(10)?)?,
+                        static_only: decode_bool(row.get(11)?)?,
+                        auto_amend: decode_bool(row.get(12)?)?,
                     },
                 ))
             })?;
@@ -117,7 +119,7 @@ impl SessionStore {
         let mut history = Vec::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT token, allow_json, deny_json, allow_exact_json, deny_exact_json, granted_at, expires_at, ended_at, status, prompt_append, generated_notes_json, static_only, auto_amend
+                "SELECT token, allow_json, deny_json, allow_exact_json, deny_exact_json, activated_verbs_json, override_markers_json, granted_at, expires_at, ended_at, status, prompt_append, generated_notes_json, static_only, auto_amend
                  FROM session_history
                  ORDER BY ended_at ASC, id ASC",
             )?;
@@ -126,21 +128,23 @@ impl SessionStore {
                 let deny_json: String = row.get(2)?;
                 let allow_exact_json: String = row.get(3)?;
                 let deny_exact_json: String = row.get(4)?;
-                let status: String = row.get(8)?;
+                let status: String = row.get(10)?;
                 Ok(HistoricalGrant {
                     token: row.get(0)?,
                     allow: decode_vec(&allow_json)?,
                     deny: decode_vec(&deny_json)?,
                     allow_exact: decode_exact_vec(&allow_exact_json)?,
                     deny_exact: decode_exact_vec(&deny_exact_json)?,
-                    granted_at: decode_u64(row.get(5)?)?,
-                    expires_at: decode_optional_u64(row.get(6)?)?,
-                    ended_at: decode_u64(row.get(7)?)?,
+                    activated_verbs: decode_vec(&row.get::<_, String>(5)?)?,
+                    override_markers: decode_vec(&row.get::<_, String>(6)?)?,
+                    granted_at: decode_u64(row.get(7)?)?,
+                    expires_at: decode_optional_u64(row.get(8)?)?,
+                    ended_at: decode_u64(row.get(9)?)?,
                     status: decode_historical_status(&status)?,
-                    prompt_append: row.get(9)?,
-                    generated_notes: decode_vec(&row.get::<_, String>(10)?)?,
-                    static_only: decode_bool(row.get(11)?)?,
-                    auto_amend: decode_bool(row.get(12)?)?,
+                    prompt_append: row.get(11)?,
+                    generated_notes: decode_vec(&row.get::<_, String>(12)?)?,
+                    static_only: decode_bool(row.get(13)?)?,
+                    auto_amend: decode_bool(row.get(14)?)?,
                 })
             })?;
             for row in rows {
@@ -205,14 +209,16 @@ impl SessionStore {
         for (token, grant) in snapshot.grants_snapshot() {
             tx.execute(
                 "INSERT INTO session_grants
-                 (token, allow_json, deny_json, allow_exact_json, deny_exact_json, expires_at, prompt_append, generated_notes_json, granted_at, static_only, auto_amend)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 (token, allow_json, deny_json, allow_exact_json, deny_exact_json, activated_verbs_json, override_markers_json, expires_at, prompt_append, generated_notes_json, granted_at, static_only, auto_amend)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     token,
                     encode_vec(&grant.allow)?,
                     encode_vec(&grant.deny)?,
                     encode_exact_vec(&grant.allow_exact)?,
                     encode_exact_vec(&grant.deny_exact)?,
+                    encode_vec(&grant.activated_verbs)?,
+                    encode_vec(&grant.override_markers)?,
                     encode_optional_u64(grant.expires_at)?,
                     grant.prompt_append,
                     encode_vec(&grant.generated_notes)?,
@@ -226,14 +232,16 @@ impl SessionStore {
         for grant in snapshot.history_snapshot() {
             tx.execute(
                 "INSERT INTO session_history
-                 (token, allow_json, deny_json, allow_exact_json, deny_exact_json, granted_at, expires_at, ended_at, status, prompt_append, generated_notes_json, static_only, auto_amend)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                 (token, allow_json, deny_json, allow_exact_json, deny_exact_json, activated_verbs_json, override_markers_json, granted_at, expires_at, ended_at, status, prompt_append, generated_notes_json, static_only, auto_amend)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     grant.token,
                     encode_vec(&grant.allow)?,
                     encode_vec(&grant.deny)?,
                     encode_exact_vec(&grant.allow_exact)?,
                     encode_exact_vec(&grant.deny_exact)?,
+                    encode_vec(&grant.activated_verbs)?,
+                    encode_vec(&grant.override_markers)?,
                     encode_u64(grant.granted_at)?,
                     encode_optional_u64(grant.expires_at)?,
                     encode_u64(grant.ended_at)?,
@@ -330,6 +338,8 @@ impl SessionStore {
                 deny_json TEXT NOT NULL,
                 allow_exact_json TEXT NOT NULL DEFAULT '[]',
                 deny_exact_json TEXT NOT NULL DEFAULT '[]',
+                activated_verbs_json TEXT NOT NULL DEFAULT '[]',
+                override_markers_json TEXT NOT NULL DEFAULT '[]',
                 expires_at INTEGER,
                 prompt_append TEXT,
                 generated_notes_json TEXT NOT NULL DEFAULT '[]',
@@ -344,6 +354,8 @@ impl SessionStore {
                 deny_json TEXT NOT NULL,
                 allow_exact_json TEXT NOT NULL DEFAULT '[]',
                 deny_exact_json TEXT NOT NULL DEFAULT '[]',
+                activated_verbs_json TEXT NOT NULL DEFAULT '[]',
+                override_markers_json TEXT NOT NULL DEFAULT '[]',
                 granted_at INTEGER NOT NULL,
                 expires_at INTEGER,
                 ended_at INTEGER NOT NULL,
@@ -397,6 +409,18 @@ impl SessionStore {
         )?;
         ensure_column(
             &tx,
+            "session_history",
+            "activated_verbs_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
+        ensure_column(
+            &tx,
+            "session_history",
+            "override_markers_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
+        ensure_column(
+            &tx,
             "session_grants",
             "static_only",
             "INTEGER NOT NULL DEFAULT 0",
@@ -417,6 +441,18 @@ impl SessionStore {
             &tx,
             "session_grants",
             "deny_exact_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
+        ensure_column(
+            &tx,
+            "session_grants",
+            "activated_verbs_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
+        ensure_column(
+            &tx,
+            "session_grants",
+            "override_markers_json",
             "TEXT NOT NULL DEFAULT '[]'",
         )?;
         ensure_column(
@@ -462,8 +498,32 @@ impl SessionStore {
     }
 
     /// Repair columns that belong to the current schema version. This keeps
-    /// startup safe after an interrupted or partially applied v1 migration.
+    /// startup safe after an interrupted or partially applied v2 migration.
     fn repair_current_schema(conn: &Connection) -> Result<()> {
+        ensure_column(
+            conn,
+            "session_grants",
+            "activated_verbs_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
+        ensure_column(
+            conn,
+            "session_grants",
+            "override_markers_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
+        ensure_column(
+            conn,
+            "session_history",
+            "activated_verbs_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
+        ensure_column(
+            conn,
+            "session_history",
+            "override_markers_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
         ensure_column(conn, "session_interactions", "exit_code", "INTEGER")?;
         ensure_column(
             conn,
@@ -840,6 +900,8 @@ mod tests {
             deny: Vec::new(),
             allow_exact: Vec::new(),
             deny_exact: Vec::new(),
+            activated_verbs: Vec::new(),
+            override_markers: Vec::new(),
             expires_at: None,
             prompt_append: None,
             generated_notes: Vec::new(),
@@ -924,7 +986,7 @@ mod tests {
     }
 
     #[test]
-    fn repairs_missing_columns_in_current_schema_version() {
+    fn migrates_missing_columns_from_v1_schema() {
         let conn = Connection::open_in_memory().expect("open database");
         conn.execute_batch(
             "CREATE TABLE session_interactions (
@@ -1026,6 +1088,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn old_session_schema_migrates_typed_verb_scope_columns() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("state.db");
+        let conn = Connection::open(&path).expect("create old database");
+        conn.execute_batch(
+            "CREATE TABLE session_grants (
+                token TEXT PRIMARY KEY,
+                allow_json TEXT NOT NULL,
+                deny_json TEXT NOT NULL,
+                allow_exact_json TEXT NOT NULL DEFAULT '[]',
+                deny_exact_json TEXT NOT NULL DEFAULT '[]',
+                expires_at INTEGER,
+                prompt_append TEXT,
+                generated_notes_json TEXT NOT NULL DEFAULT '[]',
+                granted_at INTEGER NOT NULL,
+                static_only INTEGER NOT NULL DEFAULT 0,
+                auto_amend INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO session_grants
+                (token, allow_json, deny_json, granted_at)
+                VALUES ('legacy', '[]', '[]', 1);
+            CREATE TABLE session_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token TEXT NOT NULL,
+                allow_json TEXT NOT NULL,
+                deny_json TEXT NOT NULL,
+                allow_exact_json TEXT NOT NULL DEFAULT '[]',
+                deny_exact_json TEXT NOT NULL DEFAULT '[]',
+                granted_at INTEGER NOT NULL,
+                expires_at INTEGER,
+                ended_at INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                prompt_append TEXT,
+                generated_notes_json TEXT NOT NULL DEFAULT '[]',
+                static_only INTEGER NOT NULL DEFAULT 0,
+                auto_amend INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO session_history
+                (token, allow_json, deny_json, granted_at, ended_at, status)
+                VALUES ('legacy-history', '[]', '[]', 1, 2000000000, 'revoked');",
+        )
+        .expect("seed old schema");
+        drop(conn);
+
+        let store = SessionStore::open(path, 24 * 60 * 60)
+            .await
+            .expect("migrate old database");
+        let loaded = store.load_registry().await.expect("load migrated database");
+        assert_eq!(
+            loaded.verb_scope_for("legacy"),
+            Some((Vec::new(), Vec::new()))
+        );
+        let history = loaded.list_history(None);
+        assert_eq!(history.len(), 1);
+        assert!(history[0].activated_verbs.is_empty());
+        assert!(history[0].override_markers.is_empty());
+    }
+
+    #[tokio::test]
     async fn session_store_round_trips_registry() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let store = SessionStore::open(tmp.path().join("state.db"), 24 * 60 * 60)
@@ -1047,6 +1168,8 @@ mod tests {
                     "kubectl",
                     vec!["get".into(), "secrets".into()],
                 )],
+                activated_verbs: vec!["inspect-secrets".into()],
+                override_markers: vec!["operator:inspect-secrets".into()],
                 expires_at: None,
                 prompt_append: Some("persistent".into()),
                 generated_notes: vec!["generated note".into()],
@@ -1063,6 +1186,8 @@ mod tests {
                 deny: Vec::new(),
                 allow_exact: Vec::new(),
                 deny_exact: Vec::new(),
+                activated_verbs: vec!["historical-read".into()],
+                override_markers: vec!["operator:historical-read".into()],
                 granted_at: now.saturating_sub(10),
                 expires_at: None,
                 ended_at: now.saturating_sub(5),
@@ -1114,6 +1239,13 @@ mod tests {
         );
         assert!(loaded.static_only_for("tok"));
         assert!(loaded.auto_amend_for("tok"));
+        assert_eq!(
+            loaded.verb_scope_for("tok"),
+            Some((
+                vec!["inspect-secrets".to_string()],
+                vec!["operator:inspect-secrets".to_string()]
+            ))
+        );
         assert!(loaded
             .check("tok", "kubectl", &["get".into(), "pods".into()], None)
             .is_some());
@@ -1123,6 +1255,12 @@ mod tests {
                 .map(|hit| hit.0),
             Some(crate::session::SessionDecision::Deny)
         ));
-        assert_eq!(loaded.list_history(None).len(), 1);
+        let history = loaded.list_history(None);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].activated_verbs, vec!["historical-read"]);
+        assert_eq!(
+            history[0].override_markers,
+            vec!["operator:historical-read"]
+        );
     }
 }
