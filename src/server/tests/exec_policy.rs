@@ -212,6 +212,58 @@ async fn secret_use_is_audited_only_after_successful_spawn() {
     assert!(!logs.contains("SECRET_USE"), "logs={logs}");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn streaming_secret_use_records_each_name_after_spawn_even_on_nonzero_exit() {
+    let caller = CallerIdentity::Unix { uid: 1000 };
+    let principal = PrincipalKey::from_uid(1000);
+    let (cfg, buf) = make_test_config();
+    for (name, value) in [
+        ("service/primary", "primary-value-never-logged"),
+        ("service/secondary", "secondary-value-never-logged"),
+    ] {
+        cfg.secrets.set(&principal, name, value).await.unwrap();
+    }
+
+    let mut request = basic_request("/bin/false", Vec::new());
+    request.session_token = Some("streaming-session-token-never-logged".into());
+    request
+        .secrets
+        .insert("PRIMARY_TOKEN".into(), "service/primary".into());
+    request
+        .secrets
+        .insert("SECONDARY_TOKEN".into(), "service/secondary".into());
+    let mut sink = tokio::io::sink();
+    let (result, logs) = capture_async(
+        &buf,
+        exec_after_approval(
+            request,
+            &cfg,
+            &caller,
+            "test allow".into(),
+            0,
+            true,
+            &mut sink,
+        ),
+    )
+    .await;
+
+    assert_eq!(result.exit_code(), Some(1));
+    assert_eq!(
+        result.secret_refs(),
+        &[
+            "service/primary".to_string(),
+            "service/secondary".to_string()
+        ]
+    );
+    assert_eq!(logs.matches("[AUDIT] SECRET_USE").count(), 2, "logs={logs}");
+    assert!(logs.contains("service/primary"), "logs={logs}");
+    assert!(logs.contains("service/secondary"), "logs={logs}");
+    assert!(!logs.contains("streaming-session-token-never-logged"));
+    assert!(!logs.contains("primary-value-never-logged"));
+    assert!(!logs.contains("secondary-value-never-logged"));
+}
+
 // ---- ExecuteResult result-shape tests -----------------------------------
 
 #[test]
