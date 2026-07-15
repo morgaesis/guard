@@ -65,7 +65,7 @@ pub(crate) async fn handle_secrets(subcommand: SecretCommands) -> Result<()> {
                 other => anyhow::bail!("unexpected admin response: {:?}", other),
             }
         }
-        SecretCommands::List { detailed } => {
+        SecretCommands::List { detailed, json } => {
             let request = if detailed {
                 server::AdminRequest::SecretListDetailed
             } else {
@@ -73,6 +73,18 @@ pub(crate) async fn handle_secrets(subcommand: SecretCommands) -> Result<()> {
             };
             match client.send_admin(request).await? {
                 server::AdminResponse::SecretList { keys } => {
+                    if json {
+                        let items = keys
+                            .into_iter()
+                            .map(|key| serde_json::json!({ "key": key }))
+                            .collect::<Vec<_>>();
+                        return print_json(&serde_json::json!({
+                            "schema_version": JSON_SCHEMA_VERSION,
+                            "type": "secret_list",
+                            "detailed": false,
+                            "items": items,
+                        }));
+                    }
                     if keys.is_empty() {
                         println!("No secrets stored");
                     } else {
@@ -83,6 +95,14 @@ pub(crate) async fn handle_secrets(subcommand: SecretCommands) -> Result<()> {
                     Ok(())
                 }
                 server::AdminResponse::SecretListDetailed { items } => {
+                    if json {
+                        return print_json(&serde_json::json!({
+                            "schema_version": JSON_SCHEMA_VERSION,
+                            "type": "secret_list",
+                            "detailed": true,
+                            "items": items,
+                        }));
+                    }
                     if items.is_empty() {
                         println!("No secrets stored");
                     } else {

@@ -751,6 +751,13 @@ pub(super) async fn handle_admin_request(
                 .mode()
                 .map(|m| m.as_str().to_string())
                 .unwrap_or_else(|| "readonly".to_string());
+            let (verb_catalog_hash, verb_catalog_changed_unix) = {
+                let mut catalog = config.verbs.write().await;
+                if let Err(error) = catalog.reload_if_stale() {
+                    tracing::warn!("verb catalog reload failed during status: {}", error);
+                }
+                (catalog.short_hash(), catalog.changed_unix())
+            };
 
             AdminResponse::Status {
                 status: ServerStatus {
@@ -789,6 +796,8 @@ pub(super) async fn handle_admin_request(
                     gate: config.gate.as_str().to_string(),
                     pending_provisionals: config.provisional.read().await.outstanding(),
                     pending_approvals: config.approvals.read().await.outstanding(),
+                    verb_catalog_hash,
+                    verb_catalog_changed_unix,
                 },
             }
         }

@@ -17,9 +17,8 @@ use super::Reversibility;
 use anyhow::{bail, Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::DefaultHasher;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -151,6 +150,20 @@ impl VerbCatalog {
         self.version
     }
 
+    /// Stable, compact representation of the loaded catalog content version.
+    pub fn short_hash(&self) -> String {
+        format!("{:012x}", self.version & 0x0000_ffff_ffff_ffff)
+    }
+
+    /// Filesystem change time for file-backed catalogs, in Unix seconds.
+    pub fn changed_unix(&self) -> Option<u64> {
+        self.mtime.and_then(|time| {
+            time.duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|duration| duration.as_secs())
+        })
+    }
+
     pub fn is_empty(&self) -> bool {
         self.verbs.is_empty()
     }
@@ -180,11 +193,12 @@ impl VerbCatalog {
                 bail!("duplicate verb name: '{}'", verb.name);
             }
         }
-        let mut hasher = DefaultHasher::new();
-        text.hash(&mut hasher);
+        let digest = Sha256::digest(text.as_bytes());
+        let mut version_bytes = [0u8; 8];
+        version_bytes.copy_from_slice(&digest[..8]);
         Ok(Self {
             verbs,
-            version: hasher.finish(),
+            version: u64::from_be_bytes(version_bytes),
             path: None,
             mtime: None,
         })
@@ -835,6 +849,16 @@ verbs:
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn catalog_status_hash_is_short_and_content_sensitive() {
+        let first = VerbCatalog::from_yaml(YAML).unwrap();
+        let changed = VerbCatalog::from_yaml(&YAML.replace("tail-log", "show-log")).unwrap();
+
+        assert_eq!(first.short_hash().len(), 12);
+        assert_ne!(first.short_hash(), changed.short_hash());
+        assert_eq!(first.changed_unix(), None);
     }
 
     #[test]

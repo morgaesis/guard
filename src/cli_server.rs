@@ -1227,6 +1227,6 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 std::process::exit(1);
             }
         }
-        ServerCommands::Status { socket } => handle_status(socket).await,
+        ServerCommands::Status { socket, json } => handle_status(socket, json).await,
     }
 }

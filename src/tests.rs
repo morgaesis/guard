@@ -1128,8 +1128,71 @@ fn singular_secret_alias_parses_as_secrets_subcommand() {
     let args = MainArgs::try_parse_from(["guard", "secret", "list"]).unwrap();
     assert!(matches!(
         args,
-        MainArgs::Secrets(SecretCommands::List { detailed: false })
+        MainArgs::Secrets(SecretCommands::List {
+            detailed: false,
+            json: false,
+        })
     ));
+}
+
+#[test]
+fn machine_readable_flags_cover_read_and_execution_commands() {
+    assert!(matches!(
+        MainArgs::try_parse_from(["guard", "run", "--json", "echo", "ok"]),
+        Ok(MainArgs::Run { json: true, .. })
+    ));
+    assert!(matches!(
+        MainArgs::try_parse_from(["guard", "status", "--json"]),
+        Ok(MainArgs::Status { json: true, .. })
+    ));
+    assert!(matches!(
+        MainArgs::try_parse_from(["guard", "server", "status", "--json"]),
+        Ok(MainArgs::Server(ServerCommands::Status { json: true, .. }))
+    ));
+    assert!(matches!(
+        MainArgs::try_parse_from(["guard", "provisionals", "--json"]),
+        Ok(MainArgs::Provisionals { json: true, .. })
+    ));
+    assert!(matches!(
+        MainArgs::try_parse_from(["guard", "approvals", "--json"]),
+        Ok(MainArgs::Approvals { json: true, .. })
+    ));
+    assert!(matches!(
+        MainArgs::try_parse_from(["guard", "verb", "list", "--json"]),
+        Ok(MainArgs::Verb(VerbCommands::List { json: true, .. }))
+    ));
+    assert!(matches!(
+        MainArgs::try_parse_from(["guard", "verb", "run", "uptime", "--json"]),
+        Ok(MainArgs::Verb(VerbCommands::Run { json: true, .. }))
+    ));
+    assert!(matches!(
+        MainArgs::try_parse_from(["guard", "session", "list", "--json"]),
+        Ok(MainArgs::Session(SessionCommands::List { json: true, .. }))
+    ));
+    assert!(matches!(
+        MainArgs::try_parse_from(["guard", "session", "show", "--json", "token"]),
+        Ok(MainArgs::Session(SessionCommands::Show { json: true, .. }))
+    ));
+    assert!(matches!(
+        MainArgs::try_parse_from(["guard", "secret", "list", "--json"]),
+        Ok(MainArgs::Secrets(SecretCommands::List { json: true, .. }))
+    ));
+    assert!(matches!(
+        MainArgs::try_parse_from(["guard", "config", "show", "--json"]),
+        Ok(MainArgs::Config(ConfigCommands::Show { json: true }))
+    ));
+    assert!(matches!(
+        MainArgs::try_parse_from(["guard", "shim", "--json"]),
+        Ok(MainArgs::Shim { json: true, .. })
+    ));
+}
+
+#[test]
+fn guard_exit_codes_do_not_collide_with_common_child_failures() {
+    let guard_codes = [EXIT_GUARD_ERROR, EXIT_GUARD_DENIED, EXIT_GUARD_HELD];
+    assert_eq!(guard_codes, [125, 126, 127]);
+    assert!(!guard_codes.contains(&1));
+    assert!(!guard_codes.contains(&75));
 }
 
 #[test]

@@ -70,6 +70,7 @@ pub(crate) async fn run_exec(
     secret_vars: HashMap<String, String>,
     gating: GatingOptions,
     hostkey: server::SshHostKeyMode,
+    json: bool,
 ) -> Result<()> {
     let config = client_config::ClientConfig::load().ok().unwrap_or_default();
 
@@ -105,22 +106,39 @@ pub(crate) async fn run_exec(
         "REQUEST"
     );
     let mut streamed_output = false;
-    let resp = client
-        .execute_streaming_with_injections(&binary, &args, env_vars, secret_vars, |stream, data| {
-            streamed_output = true;
-            match stream {
-                server::OutputStream::Stdout => {
-                    print!("{}", data);
-                    let _ = std::io::stdout().flush();
-                }
-                server::OutputStream::Stderr => {
-                    eprint!("{}", data);
-                    let _ = std::io::stderr().flush();
-                }
-            }
-        })
-        .await
-        .map_err(|e| describe_connect_failure(e, &client, endpoint_source))?;
+    let resp = if json {
+        client
+            .execute_with_injections(&binary, &args, env_vars, secret_vars)
+            .await
+    } else {
+        client
+            .execute_streaming_with_injections(
+                &binary,
+                &args,
+                env_vars,
+                secret_vars,
+                |stream, data| {
+                    streamed_output = true;
+                    match stream {
+                        server::OutputStream::Stdout => {
+                            print!("{}", data);
+                            let _ = std::io::stdout().flush();
+                        }
+                        server::OutputStream::Stderr => {
+                            eprint!("{}", data);
+                            let _ = std::io::stderr().flush();
+                        }
+                    }
+                },
+            )
+            .await
+    }
+    .map_err(|e| describe_connect_failure(e, &client, endpoint_source))?;
+
+    if json {
+        print_execute_response_json("run_result", &binary, &args, &resp)?;
+        exit_for_execute_response(&resp);
+    }
 
     // Consequence-gate outcomes: a held command did not run; a provisional ran
     // behind an auto-revert timer.
@@ -139,7 +157,7 @@ pub(crate) async fn run_exec(
             eprintln!("  result:  not executed until approved");
             print_coverage(&resp.coverage);
             // Not executed; exit non-zero so callers do not treat it as success.
-            std::process::exit(75); // EX_TEMPFAIL: try again after approval
+            std::process::exit(EXIT_GUARD_HELD);
         }
         Some(server::GateStatus::Provisional) => {
             let color = color_enabled_for_stderr();
@@ -209,8 +227,44 @@ pub(crate) async fn run_exec(
             paint("DENIED", AnsiColor::Red, color),
             resp.reason
         );
-        std::process::exit(1);
+        std::process::exit(EXIT_GUARD_DENIED);
     }
+}
+
+fn print_execute_response_json(
+    kind: &str,
+    binary: &str,
+    args: &[String],
+    response: &server::ExecuteResponse,
+) -> Result<()> {
+    print_json(&execute_response_envelope(kind, binary, args, response))
+}
+
+fn execute_response_envelope(
+    kind: &str,
+    binary: &str,
+    args: &[String],
+    response: &server::ExecuteResponse,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": JSON_SCHEMA_VERSION,
+        "type": kind,
+        "command": {
+            "binary": binary,
+            "args": args,
+        },
+        "response": response,
+    })
+}
+
+fn exit_for_execute_response(response: &server::ExecuteResponse) -> ! {
+    if response.status == Some(server::GateStatus::Held) {
+        std::process::exit(EXIT_GUARD_HELD);
+    }
+    if !response.allowed {
+        std::process::exit(EXIT_GUARD_DENIED);
+    }
+    std::process::exit(response.exit_code.unwrap_or(0));
 }
 
 /// Resolve the admin endpoint and build a client for a gate-control RPC.
@@ -225,7 +279,7 @@ fn gate_client(socket_override: Option<String>) -> (daemon_client::Client, Endpo
     (client, source)
 }
 
-pub(crate) async fn handle_provisionals(socket: Option<String>) -> Result<()> {
+pub(crate) async fn handle_provisionals(socket: Option<String>, json: bool) -> Result<()> {
     let (client, source) = gate_client(socket);
     match client
         .send_admin(server::AdminRequest::Provisionals)
@@ -233,6 +287,13 @@ pub(crate) async fn handle_provisionals(socket: Option<String>) -> Result<()> {
         .map_err(|e| describe_connect_failure(e, &client, source))?
     {
         server::AdminResponse::Provisionals { items } => {
+            if json {
+                return print_json(&serde_json::json!({
+                    "schema_version": JSON_SCHEMA_VERSION,
+                    "type": "provisional_list",
+                    "items": items,
+                }));
+            }
             if items.is_empty() {
                 println!("(no provisional executions)");
             }
@@ -306,7 +367,11 @@ pub(crate) async fn handle_approval_note_cmd(
     }
 }
 
-pub(crate) async fn handle_approvals(socket: Option<String>, handle: Option<String>) -> Result<()> {
+pub(crate) async fn handle_approvals(
+    socket: Option<String>,
+    handle: Option<String>,
+    json: bool,
+) -> Result<()> {
     let (client, source) = gate_client(socket);
     let request = match handle {
         Some(h) => server::AdminRequest::ApprovalShow { handle: h },
@@ -318,6 +383,13 @@ pub(crate) async fn handle_approvals(socket: Option<String>, handle: Option<Stri
         .map_err(|e| describe_connect_failure(e, &client, source))?
     {
         server::AdminResponse::Approvals { items } => {
+            if json {
+                return print_json(&serde_json::json!({
+                    "schema_version": JSON_SCHEMA_VERSION,
+                    "type": "approval_list",
+                    "items": items,
+                }));
+            }
             if items.is_empty() {
                 println!("(no approvals)");
             }
@@ -344,6 +416,13 @@ pub(crate) async fn handle_approvals(socket: Option<String>, handle: Option<Stri
             Ok(())
         }
         server::AdminResponse::ApprovalShow { item } => {
+            if json {
+                return print_json(&serde_json::json!({
+                    "schema_version": JSON_SCHEMA_VERSION,
+                    "type": "approval",
+                    "item": item,
+                }));
+            }
             let color = color_enabled_for_stdout();
             println!(
                 "[{}] handle={} risk={:?} class={:?} created={} deadline={} cmd={:?} fp={}",
@@ -391,7 +470,7 @@ pub(crate) async fn handle_approvals(socket: Option<String>, handle: Option<Stri
 
 pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
     match subcommand {
-        VerbCommands::List { socket } => {
+        VerbCommands::List { socket, json } => {
             let (client, source) = gate_client(socket);
             match client
                 .send_admin(server::AdminRequest::VerbList)
@@ -399,6 +478,13 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                 .map_err(|e| describe_connect_failure(e, &client, source))?
             {
                 server::AdminResponse::Verbs { items } => {
+                    if json {
+                        return print_json(&serde_json::json!({
+                            "schema_version": JSON_SCHEMA_VERSION,
+                            "type": "verb_list",
+                            "items": items,
+                        }));
+                    }
                     if items.is_empty() {
                         println!("(no verbs; start the daemon with --verbs <catalog.yaml>)");
                     }
@@ -441,6 +527,7 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
             confirm_within,
             wait_approval,
             socket,
+            json,
         } => {
             let config = client_config::ClientConfig::load().ok().unwrap_or_default();
             let (socket_path, tcp_port, endpoint_source) =
@@ -449,7 +536,7 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                 params.into_iter().collect();
             let invocation = server::VerbInvocation {
                 name: name.clone(),
-                params: param_map,
+                params: param_map.clone(),
             };
             let mut client = daemon_client::Client::new(socket_path, tcp_port)
                 .with_verb(invocation)
@@ -464,28 +551,46 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
             }
             // Verb binary/args are rendered server-side; the client sends empty.
             let mut streamed = false;
-            let resp = client
-                .execute_streaming_with_injections(
-                    "",
-                    &[],
-                    HashMap::new(),
-                    HashMap::new(),
-                    |stream, data| {
-                        streamed = true;
-                        match stream {
-                            server::OutputStream::Stdout => {
-                                print!("{}", data);
-                                let _ = std::io::stdout().flush();
+            let resp = if json {
+                client
+                    .execute_with_injections("", &[], HashMap::new(), HashMap::new())
+                    .await
+            } else {
+                client
+                    .execute_streaming_with_injections(
+                        "",
+                        &[],
+                        HashMap::new(),
+                        HashMap::new(),
+                        |stream, data| {
+                            streamed = true;
+                            match stream {
+                                server::OutputStream::Stdout => {
+                                    print!("{}", data);
+                                    let _ = std::io::stdout().flush();
+                                }
+                                server::OutputStream::Stderr => {
+                                    eprint!("{}", data);
+                                    let _ = std::io::stderr().flush();
+                                }
                             }
-                            server::OutputStream::Stderr => {
-                                eprint!("{}", data);
-                                let _ = std::io::stderr().flush();
-                            }
-                        }
+                        },
+                    )
+                    .await
+            }
+            .map_err(|e| describe_connect_failure(e, &client, endpoint_source))?;
+            if json {
+                print_json(&serde_json::json!({
+                    "schema_version": JSON_SCHEMA_VERSION,
+                    "type": "verb_run_result",
+                    "command": {
+                        "verb": name,
+                        "params": param_map,
                     },
-                )
-                .await
-                .map_err(|e| describe_connect_failure(e, &client, endpoint_source))?;
+                    "response": resp,
+                }))?;
+                exit_for_execute_response(&resp);
+            }
             render_gated_response(&resp, streamed, &name)
         }
         VerbCommands::Create {
@@ -493,6 +598,7 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
             binary,
             preview,
             socket,
+            json,
         } => {
             let (client, source) = gate_client(socket);
             let req = server::AdminRequest::VerbCreate {
@@ -506,6 +612,14 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                 .map_err(|e| describe_connect_failure(e, &client, source))?
             {
                 server::AdminResponse::VerbCreated { verb, persisted } => {
+                    if json {
+                        return print_json(&serde_json::json!({
+                            "schema_version": JSON_SCHEMA_VERSION,
+                            "type": "verb",
+                            "persisted": persisted,
+                            "verb": verb,
+                        }));
+                    }
                     if persisted {
                         println!("Created verb '{}' and added it to the catalog:", verb.name);
                     } else {
@@ -557,7 +671,7 @@ fn render_gated_response(
             eprintln!("  poll:    guard approvals {}", handle);
             eprintln!("  result:  not executed until approved");
             print_coverage(&resp.coverage);
-            std::process::exit(75);
+            std::process::exit(EXIT_GUARD_HELD);
         }
         Some(server::GateStatus::Provisional) => {
             let color = color_enabled_for_stderr();
@@ -616,7 +730,7 @@ fn render_gated_response(
                     label,
                     resp.reason
                 );
-                std::process::exit(1);
+                std::process::exit(EXIT_GUARD_DENIED);
             }
         }
     }
@@ -912,24 +1026,26 @@ fn absolute_path(path: &str) -> String {
     }
 }
 
-pub(crate) async fn handle_status(socket: Option<String>) -> Result<()> {
+pub(crate) async fn handle_status(socket: Option<String>, json: bool) -> Result<()> {
     let config = client_config::ClientConfig::load().ok().unwrap_or_default();
     let (socket_path, tcp_port, source) = resolve_client_endpoint_with_source(socket, &config);
     let client = admin_client(socket_path.clone(), tcp_port, &config);
 
     // Client info first - useful even when the daemon is unreachable.
-    println!("Client:");
-    println!(
-        "  version        {} ({}, {}{})",
-        env!("CARGO_PKG_VERSION"),
-        env!("GUARD_GIT_COMMIT"),
-        env!("GUARD_GIT_BRANCH"),
-        option_env!("GUARD_GIT_TAG")
-            .map(|t| format!(", tag {t}"))
-            .unwrap_or_default()
-    );
-    println!("  endpoint       {}", client.endpoint_for_log());
-    println!();
+    if !json {
+        println!("Client:");
+        println!(
+            "  version        {} ({}, {}{})",
+            env!("CARGO_PKG_VERSION"),
+            env!("GUARD_GIT_COMMIT"),
+            env!("GUARD_GIT_BRANCH"),
+            option_env!("GUARD_GIT_TAG")
+                .map(|t| format!(", tag {t}"))
+                .unwrap_or_default()
+        );
+        println!("  endpoint       {}", client.endpoint_for_log());
+        println!();
+    }
 
     // Ping is the public liveness probe. Always permitted to any
     // exec-allowed UID; reveals only version/uptime/mode/dry_run.
@@ -956,16 +1072,47 @@ pub(crate) async fn handle_status(socket: Option<String>) -> Result<()> {
     };
 
     let (version, uptime, mode, dry_run) = ping;
-    println!("Server:");
-    println!("  version        {}", version);
-    println!("  uptime         {}s", uptime);
-    println!("  mode           {}", mode);
-    println!("  dry_run        {}", dry_run);
+    if !json {
+        println!("Server:");
+        println!("  version        {}", version);
+        println!("  uptime         {}s", uptime);
+        println!("  mode           {}", mode);
+        println!("  dry_run        {}", dry_run);
+        if version != env!("CARGO_PKG_VERSION") {
+            eprintln!(
+                "warning: guard client {} differs from server {}",
+                env!("CARGO_PKG_VERSION"),
+                version
+            );
+        }
+    }
 
     // Try the full Status RPC. Succeeds for daemon-UID Unix callers or
     // TCP callers with the configured admin token.
     match client.send_admin(server::AdminRequest::Status).await {
         Ok(server::AdminResponse::Status { status }) => {
+            if json {
+                return print_json(&serde_json::json!({
+                    "schema_version": JSON_SCHEMA_VERSION,
+                    "type": "status",
+                    "client": {
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "git_commit": env!("GUARD_GIT_COMMIT"),
+                        "git_branch": env!("GUARD_GIT_BRANCH"),
+                        "git_tag": option_env!("GUARD_GIT_TAG"),
+                        "endpoint": client.endpoint_for_log(),
+                    },
+                    "server": {
+                        "version": version,
+                        "uptime_secs": uptime,
+                        "mode": mode,
+                        "dry_run": dry_run,
+                        "version_mismatch": version != env!("CARGO_PKG_VERSION"),
+                        "full_restricted": false,
+                        "full": status,
+                    },
+                }));
+            }
             if let Some(ref s) = status.socket_path {
                 println!("  socket         {}", s);
             }
@@ -998,6 +1145,14 @@ pub(crate) async fn handle_status(socket: Option<String>) -> Result<()> {
                 "  learn_allow    enabled={} observations={}",
                 status.allow_promotion_enabled, status.allow_promotion_observation_count
             );
+            println!("  verb_catalog  {}", status.verb_catalog_hash);
+            if let Some(changed) = status.verb_catalog_changed_unix {
+                println!("  verb_changed  {}", format_timestamp(changed));
+            }
+            println!(
+                "  queues         approvals={} provisionals={}",
+                status.pending_approvals, status.pending_provisionals
+            );
             println!("  sessions       {}", status.session_count);
             println!("  daemon_uid     {}", status.daemon_uid);
             println!("  exec_identity  {}", status.exec_identity);
@@ -1007,6 +1162,28 @@ pub(crate) async fn handle_status(socket: Option<String>) -> Result<()> {
             Ok(())
         }
         Ok(server::AdminResponse::Error { .. }) => {
+            if json {
+                return print_json(&serde_json::json!({
+                    "schema_version": JSON_SCHEMA_VERSION,
+                    "type": "status",
+                    "client": {
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "git_commit": env!("GUARD_GIT_COMMIT"),
+                        "git_branch": env!("GUARD_GIT_BRANCH"),
+                        "git_tag": option_env!("GUARD_GIT_TAG"),
+                        "endpoint": client.endpoint_for_log(),
+                    },
+                    "server": {
+                        "version": version,
+                        "uptime_secs": uptime,
+                        "mode": mode,
+                        "dry_run": dry_run,
+                        "version_mismatch": version != env!("CARGO_PKG_VERSION"),
+                        "full_restricted": true,
+                        "full": null,
+                    },
+                }));
+            }
             // Expected when caller is not the daemon UID. Hide the rest.
             println!();
             println!("(full server config is restricted to the daemon UID)");
@@ -1250,6 +1427,7 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
     }
 
     let mut print_full_prompt = false;
+    let mut json_output = false;
 
     let (socket_override, request) = match subcommand {
         SessionCommands::New { .. } => unreachable!("handled above"),
@@ -1308,7 +1486,9 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
             token,
             limit,
             socket,
+            json,
         } => {
+            json_output = json;
             let self_token = std::env::var("GUARD_SESSION")
                 .ok()
                 .filter(|value| !value.is_empty());
@@ -1331,7 +1511,9 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
             since,
             full,
             socket,
+            json,
         } => {
+            json_output = json;
             let since_unix = match since.as_deref() {
                 Some(s) => Some(parse_since_to_unix(s)?),
                 None => None,
@@ -1369,7 +1551,26 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
             eprintln!("error: {}", message);
             std::process::exit(1);
         }
-        server::AdminResponse::SessionList { grants, history } => {
+        server::AdminResponse::SessionList {
+            mut grants,
+            mut history,
+        } => {
+            if json_output {
+                if !print_full_prompt {
+                    for grant in &mut grants {
+                        truncate_prompt(&mut grant.prompt_append);
+                    }
+                    for entry in &mut history {
+                        truncate_prompt(&mut entry.prompt_append);
+                    }
+                }
+                return print_json(&serde_json::json!({
+                    "schema_version": JSON_SCHEMA_VERSION,
+                    "type": "session_list",
+                    "active": grants,
+                    "history": history,
+                }));
+            }
             if grants.is_empty() && history.is_empty() {
                 println!("(no session grants)");
             } else {
@@ -1421,6 +1622,13 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
             }
         }
         server::AdminResponse::SessionShow { report } => {
+            if json_output {
+                return print_json(&serde_json::json!({
+                    "schema_version": JSON_SCHEMA_VERSION,
+                    "type": "session",
+                    "report": report,
+                }));
+            }
             if let Some(active) = report.active {
                 println!(
                     "token={} status=active static_only={} auto_amend={} granted_at={} expires_at={} allow={:?} deny={:?} allow_exact={:?} deny_exact={:?}",
@@ -1576,14 +1784,34 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
     Ok(())
 }
 
+fn truncate_prompt(prompt: &mut Option<String>) {
+    let Some(value) = prompt else {
+        return;
+    };
+    if value.chars().count() > 60 {
+        *value = format!("{}...", value.chars().take(60).collect::<String>());
+    }
+}
+
 pub(crate) async fn handle_config(subcommand: ConfigCommands) -> Result<()> {
     // Surface load errors loudly for every subcommand - this catches the
     // relative-XDG_CONFIG_HOME case that can otherwise fall through silently
     // and risked writing to the default path instead of the intended one.
     match subcommand {
-        ConfigCommands::Show => {
+        ConfigCommands::Show { json } => {
             let config =
                 client_config::ClientConfig::load().context("failed to load client config")?;
+            if json {
+                return print_json(&serde_json::json!({
+                    "schema_version": JSON_SCHEMA_VERSION,
+                    "type": "client_config",
+                    "server_socket": config.server_socket,
+                    "server_tcp_port": config.server_tcp_port,
+                    "default_user": config.default_user,
+                    "auth_token_configured": config.auth_token.is_some(),
+                    "admin_token_configured": config.admin_token.is_some(),
+                }));
+            }
             println!("socket: {:?}", config.server_socket.unwrap_or_default());
             println!(
                 "port: {:?}",
@@ -1799,5 +2027,44 @@ mod tests {
             normalize_server_socket_value("/run/guard/guard.sock".to_string()),
             "/run/guard/guard.sock"
         );
+    }
+
+    #[test]
+    fn execute_json_envelope_keeps_decision_output_and_child_status() {
+        let response = server::ExecuteResponse {
+            allowed: true,
+            reason: "trusted verb".to_string(),
+            exit_code: Some(75),
+            stdout: Some("out".to_string()),
+            stderr: Some("err".to_string()),
+            status: Some(server::GateStatus::Executed),
+            handle: None,
+            coverage: None,
+        };
+        let envelope = execute_response_envelope(
+            "run_result",
+            "sh",
+            &["-c".to_string(), "exit 75".to_string()],
+            &response,
+        );
+
+        assert_eq!(envelope["schema_version"], JSON_SCHEMA_VERSION);
+        assert_eq!(envelope["type"], "run_result");
+        assert_eq!(envelope["command"]["binary"], "sh");
+        assert_eq!(envelope["response"]["allowed"], true);
+        assert_eq!(envelope["response"]["exit_code"], 75);
+        assert_eq!(envelope["response"]["stdout"], "out");
+        assert_eq!(envelope["response"]["stderr"], "err");
+    }
+
+    #[test]
+    fn json_session_list_prompt_truncation_matches_human_default() {
+        let mut prompt = Some("x".repeat(61));
+        truncate_prompt(&mut prompt);
+        assert_eq!(prompt, Some(format!("{}...", "x".repeat(60))));
+
+        let mut short = Some("short".to_string());
+        truncate_prompt(&mut short);
+        assert_eq!(short.as_deref(), Some("short"));
     }
 }

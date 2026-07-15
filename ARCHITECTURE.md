@@ -144,10 +144,13 @@ successful dry-run response and are not spawned. Denied commands behave the same
 as normal mode.
 
 The daemon protocol has two response modes. Non-streaming clients receive a
-single JSON response after the approved command exits. `guard run` and
-`guard server connect` opt into streaming mode, where stdout/stderr line events
-are redacted server-side and sent as they arrive, followed by a final result
-message carrying the policy reason and exit code.
+single JSON response after the approved command exits. Human `guard run` and
+`guard server connect` invocations opt into streaming mode, where stdout/stderr
+line events are redacted server-side and sent as they arrive, followed by a
+final result message carrying the policy reason and exit code. `guard run
+--json` and `guard verb run --json` deliberately select non-streaming mode and
+wrap the response in a versioned CLI envelope so stdout contains exactly one
+machine-readable object.
 
 Execution requests carry `binary`, `args`, optional session token, optional
 plain env injections, and optional secret env mappings. Secret values are never
