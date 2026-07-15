@@ -20,6 +20,7 @@ fn raw_request(binary: &str, args: &[&str], session_token: Option<&str>) -> Exec
         auth_token: None,
         env: HashMap::new(),
         secrets: HashMap::new(),
+        secret_files: HashMap::new(),
         stream: false,
         session_token: session_token.map(str::to_string),
         revert: None,

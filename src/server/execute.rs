@@ -974,6 +974,7 @@ mod verb_resolution_tests {
             auth_token: None,
             env: HashMap::new(),
             secrets: HashMap::new(),
+            secret_files: HashMap::new(),
             stream: false,
             session_token: None,
             revert: None,
