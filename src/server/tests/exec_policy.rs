@@ -166,6 +166,77 @@ async fn cwd_is_included_in_audit_and_evaluation_context() {
     assert!(!logs.contains("session-token-that-must-not-appear"));
 }
 
+#[test]
+fn caller_environment_is_sorted_redacted_and_cache_partitioned() {
+    let mut first = basic_request("ansible-playbook", vec!["site.yml".to_string()]);
+    first.env.insert(
+        "ANSIBLE_CONFIG".to_string(),
+        "/srv/automation/ansible.cfg".to_string(),
+    );
+    first.env.insert(
+        "DEPLOY_TOKEN".to_string(),
+        "sk-live-first-1234567890".to_string(),
+    );
+    first.secrets.insert(
+        "VAULT_PASSWORD".to_string(),
+        "ansible/vault-password".to_string(),
+    );
+    first.secret_files.insert(
+        "KUBECONFIG".to_string(),
+        "clusters/dev/kubeconfig".to_string(),
+    );
+    let first_prompt = evaluation_context_prompt(&first, None).unwrap();
+    assert!(first_prompt.contains("ANSIBLE_CONFIG"));
+    assert!(first_prompt.contains("ansible/vault-password"));
+    assert!(first_prompt.contains("clusters/dev/kubeconfig"));
+    assert!(first_prompt.contains("sha256"));
+    assert!(!first_prompt.contains("sk-live-first-1234567890"));
+    let model_subject = guard::evaluate::redact_for_llm(&first_prompt);
+    assert!(model_subject.contains("ansible/vault-password"));
+    assert!(model_subject.contains("clusters/dev/kubeconfig"));
+
+    let mut second = first.clone();
+    second.env.insert(
+        "DEPLOY_TOKEN".to_string(),
+        "sk-live-second-0987654321".to_string(),
+    );
+    let second_prompt = evaluation_context_prompt(&second, None).unwrap();
+    assert!(!second_prompt.contains("sk-live-second-0987654321"));
+    assert_ne!(
+        first_prompt, second_prompt,
+        "different raw values must partition evaluator cache keys even when both redact"
+    );
+
+    let ansible = first_prompt.find("ANSIBLE_CONFIG").unwrap();
+    let token = first_prompt.find("DEPLOY_TOKEN").unwrap();
+    assert!(ansible < token, "plain environment keys must be canonical");
+}
+
+#[tokio::test]
+async fn secret_binding_names_are_evaluator_inputs_but_never_audit_fields() {
+    let (cfg, buf) = make_test_config();
+    let mut request = basic_request("true", Vec::new());
+    request.secrets.insert(
+        "VAULT_PASSWORD".to_string(),
+        "private/automation/vault-name".to_string(),
+    );
+    let prompt = evaluation_context_prompt(&request, None).unwrap();
+    assert!(prompt.contains("private/automation/vault-name"));
+
+    let (_, logs) = capture_async(&buf, async {
+        log_audit_policy_for_request(
+            &cfg,
+            &CallerIdentity::Unix { uid: 1000 },
+            &request,
+            false,
+            "denied for test",
+        );
+    })
+    .await;
+    assert!(!logs.contains("private/automation/vault-name"));
+    assert!(!logs.contains("VAULT_PASSWORD"));
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn secret_exposure_is_audited_only_after_successful_spawn() {

@@ -1385,8 +1385,7 @@ async fn direct_allow_revalidates_session_after_delayed_snapshot() {
     assert_eq!(writes.load(Ordering::SeqCst), 0);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn direct_allow_rechecks_hot_policy_after_delayed_snapshot() {
+async fn assert_direct_allow_reload_fails_closed(next_action: &str, next_intent: &str) {
     let started = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let writes = Arc::new(AtomicUsize::new(0));
@@ -1400,7 +1399,7 @@ async fn direct_allow_rechecks_hot_policy_after_delayed_snapshot() {
     let policy_path = temp.path().join("api-policy.yaml");
     std::fs::write(
         &policy_path,
-        "default: deny\nrules:\n  - verbs: [patch]\n    resources: [deployments]\n    namespaces: [dev]\n    action: allow\n",
+        "intent: initial task intent\ndefault: deny\nrules:\n  - verbs: [patch]\n    resources: [deployments]\n    namespaces: [dev]\n    action: allow\n",
     )
     .unwrap();
     let policy = ApiPolicy::load_file(&policy_path).unwrap();
@@ -1430,16 +1429,26 @@ async fn direct_allow_rechecks_hot_policy_after_delayed_snapshot() {
             .unwrap()
     });
     started.notified().await;
-    std::fs::write(
-        &policy_path,
-        "default: deny\nrules:\n  - verbs: [patch]\n    resources: [deployments]\n    namespaces: [dev]\n    action: deny\n",
-    )
-    .unwrap();
+    std::fs::write(&policy_path, format!(
+        "intent: {next_intent}\ndefault: deny\nrules:\n  - verbs: [patch]\n    resources: [deployments]\n    namespaces: [dev]\n    action: {next_action}\n"
+    )).unwrap();
     tokio::time::sleep(Duration::from_secs(6)).await;
     release.notify_one();
 
     assert_eq!(request.await.unwrap().status(), 403);
     assert_eq!(writes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_allow_fails_closed_for_every_hot_authority_transition() {
+    for (action, intent) in [
+        ("hold", "initial task intent"),
+        ("evaluate", "initial task intent"),
+        ("deny", "initial task intent"),
+        ("allow", "changed evaluator intent"),
+    ] {
+        assert_direct_allow_reload_fails_closed(action, intent).await;
+    }
 }
 
 /// A `SelfSubjectAccessReview` (`kubectl auth can-i`) is forwarded with the same

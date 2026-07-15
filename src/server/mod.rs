@@ -7,7 +7,7 @@
 //! - UNIX socket: peer UID-based authorization
 //! - TCP socket: auth token required
 //! - Socket dir: 0755 when managed by socket_group
-//! - Socket: 0666 so local clients can connect before UID validation
+//! - Socket: 0600 by default, or 0660 after a successful socket-group change
 
 use crate::evaluate::Evaluator;
 use crate::grant_profile::{GrantRequest, SavedGrantCatalog};

@@ -41,8 +41,9 @@ as a backstop.
 
 Coverage cells describe regions of ordinary tool argv. They can constrain exact
 required and forbidden tokens, option spellings and values, positional targets,
-inventory, namespace, and bounded fanout. Their actions are `preauthorized`,
-`evaluate`, or `deny`; preauthorization requires a trusted verb.
+inventory, namespace, bounded fanout, and caller-requested environment bindings.
+Their actions are `preauthorized`, `evaluate`, or `deny`; preauthorization
+requires a trusted verb.
 
 ```yaml
   - name: ansible-baseline
@@ -60,6 +61,10 @@ inventory, namespace, and bounded fanout. Their actions are `preauthorized`,
         fanout:
           options: [--limit]
           max: 2
+        environment:
+          - name: ANSIBLE_CONFIG
+            source: plain
+            values: [ansible.cfg]
       - name: bounded-apply
         action: evaluate
         forbidden_args: [--check]
@@ -72,6 +77,12 @@ inventory, namespace, and bounded fanout. Their actions are `preauthorized`,
 A non-matching cell has no decision. The check cell above allows its bounded
 region and does not deny apply mode, SSH inspection, or any other command. Those
 areas follow their own matching cells or evaluator path.
+
+Environment sources are `plain`, `secret`, and `secret-file`. A constraint may
+name exact `values` or a fully anchored `pattern`. A cell with no environment
+constraints cannot preauthorize a request that adds caller-controlled bindings;
+that request returns to the evaluator. Automatically promoted cells never
+preauthorize environment bindings.
 
 ## Reverse matching
 

@@ -70,6 +70,12 @@ const GUARD_SESSION_HEADER: &str = "x-guard-session";
 #[derive(Debug, Clone)]
 struct GuardRejected;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RouteAuthority {
+    revision: u64,
+    policy_fingerprint: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GuardHoldOutcome {
     Approved,
@@ -164,6 +170,10 @@ pub struct ApiProxy {
     protocol: Arc<dyn ProtocolConfig>,
     policy: Arc<RwLock<ApiPolicy>>,
     policy_path: Option<PathBuf>,
+    /// Even values are stable authority generations. Policy and evaluator
+    /// swaps mark the generation odd for their short transition, then publish
+    /// the next even value. Routes bind an even generation plus policy digest.
+    authority_revision: AtomicU64,
     /// Bridge to the daemon's consequence machinery, attached before serving.
     /// When present, recoverable writes are wrapped in an auto-revert envelope.
     gate: OnceLock<Arc<dyn GateSink>>,
@@ -373,6 +383,7 @@ impl ApiProxy {
             protocol,
             policy: Arc::new(RwLock::new(policy)),
             policy_path,
+            authority_revision: AtomicU64::new(0),
             gate: OnceLock::new(),
             judge: StdRwLock::new(None),
             judge_builder: OnceLock::new(),
@@ -440,7 +451,9 @@ impl ApiProxy {
     /// Attach an API judge. Later calls replace the active judge, which lets a
     /// policy intent reload swap in a fresh evaluator and fresh cache.
     pub fn attach_judge(&self, judge: Arc<dyn ApiJudge>) {
+        self.begin_authority_update();
         *self.judge.write().unwrap() = Some(judge);
+        self.finish_authority_update();
     }
 
     /// Attach a builder used by the policy reloader to rebuild the judge when
@@ -456,6 +469,55 @@ impl ApiProxy {
             .unwrap()
             .as_ref()
             .is_some_and(|judge| judge.evaluator_enabled())
+    }
+
+    fn begin_authority_update(&self) {
+        loop {
+            let revision = self.authority_revision.load(Ordering::Acquire);
+            if !revision.is_multiple_of(2) {
+                std::thread::yield_now();
+                continue;
+            }
+            if self
+                .authority_revision
+                .compare_exchange(
+                    revision,
+                    revision.saturating_add(1),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    fn finish_authority_update(&self) {
+        let previous = self.authority_revision.fetch_add(1, Ordering::Release);
+        debug_assert!(!previous.is_multiple_of(2));
+    }
+
+    async fn capture_route_authority(&self) -> (ApiPolicy, RouteAuthority) {
+        loop {
+            let before = self.authority_revision.load(Ordering::Acquire);
+            if !before.is_multiple_of(2) {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            let policy = self.policy.read().await.clone();
+            let after = self.authority_revision.load(Ordering::Acquire);
+            if before == after && after.is_multiple_of(2) {
+                let policy_fingerprint = policy.authority_fingerprint();
+                return (
+                    policy,
+                    RouteAuthority {
+                        revision: after,
+                        policy_fingerprint,
+                    },
+                );
+            }
+        }
     }
 
     pub fn protocol_name(&self) -> &str {
@@ -638,10 +700,12 @@ impl ApiProxy {
 
     async fn route_inner(
         &self,
-        req: Request<Incoming>,
+        mut req: Request<Incoming>,
         conn_id: u64,
         session_context: Option<ApiSessionContext>,
     ) -> Response<ProxyBody> {
+        let (route_policy, route_authority) = self.capture_route_authority().await;
+        req.extensions_mut().insert(route_authority);
         let method = req.method().clone();
         let path = req.uri().path().to_string();
         let query = req.uri().query().unwrap_or("").to_string();
@@ -685,7 +749,7 @@ impl ApiProxy {
 
         let label = format!("{} {}", op.verb.as_str(), path);
 
-        let decision = self.policy.read().await.decide(&op);
+        let decision = route_policy.decide(&op);
 
         // Protocol floors and explicit operator policy denies are absolute.
         // Session mode can only choose a stricter deterministic path or route a
@@ -882,8 +946,15 @@ impl ApiProxy {
             Ok(buffered) => buffered,
             Err(error) => return self.request_body_error_response(error),
         };
+        let route_authority = match self.route_authority_from_parts(&parts) {
+            Some(authority) => authority,
+            None => return self.missing_route_authority_response(),
+        };
         let body_shape = redacted_body_shape(&body);
-        let prepared = self.prepare_revert(op, path).await;
+        let prepared = match self.prepare_revert(op, path, &route_authority).await {
+            Ok(prepared) => prepared,
+            Err(response) => return response,
+        };
         let summary = ApiRequestSummary {
             protocol: self.protocol.name().to_string(),
             verb: op.verb.as_str().to_string(),
@@ -1003,7 +1074,10 @@ impl ApiProxy {
                         if let Err(response) = self.revalidate_session(&parts).await {
                             return response;
                         }
-                        if let Some(response) = self.recheck_final_authority(op).await {
+                        if let Some(response) = self
+                            .recheck_final_authority(&route_authority, Some(op))
+                            .await
+                        {
                             return response;
                         }
                         // Contain was chosen over Hold only because a revert was
@@ -1029,9 +1103,12 @@ impl ApiProxy {
                                 .await;
                         }
                         let snapshot = if self.protocol.wants_prior_snapshot(op) {
-                            match self.fetch_validated_snapshot(op, path).await {
-                                Some(s) => Some(Some(s)),
-                                None => {
+                            match self
+                                .fetch_validated_snapshot(op, path, &route_authority)
+                                .await
+                            {
+                                Ok(Some(s)) => Some(Some(s)),
+                                Ok(None) => {
                                     return self
                                         .route_hold_buffered(
                                             parts,
@@ -1044,6 +1121,7 @@ impl ApiProxy {
                                         )
                                         .await;
                                 }
+                                Err(response) => return response,
                             }
                         } else {
                             // A create's revert is built from the write response
@@ -1395,6 +1473,10 @@ impl ApiProxy {
         mut prepared_snapshot: Option<Option<Vec<u8>>>,
         created_cleanup: Option<CreatedMatch>,
     ) -> Response<ProxyBody> {
+        let route_authority = match self.route_authority_from_parts(&parts) {
+            Some(authority) => authority,
+            None => return self.missing_route_authority_response(),
+        };
         // Snapshot reads can block on the upstream. Acquire any snapshot before
         // the common final authority checks so a session edit, expiry, or policy
         // reload during that read is observed immediately before mutation.
@@ -1408,16 +1490,20 @@ impl ApiProxy {
                 .protocol
                 .wants_prior_snapshot(op.as_ref().expect("tracked write has operation"))
         {
-            prepared_snapshot = Some(self.fetch_prior_object(path).await);
+            prepared_snapshot = match self.fetch_prior_object(path, &route_authority).await {
+                Ok(snapshot) => Some(snapshot),
+                Err(response) => return response,
+            };
         }
         let session_context = match self.revalidate_session(&parts).await {
             Ok(context) => context,
             Err(response) => return response,
         };
-        if let Some(op) = op.as_ref() {
-            if let Some(response) = self.recheck_final_authority(op).await {
-                return response;
-            }
+        if let Some(response) = self
+            .recheck_final_authority(&route_authority, op.as_ref())
+            .await
+        {
+            return response;
         }
         match self
             .forward_inner(
@@ -1431,6 +1517,7 @@ impl ApiProxy {
                 prepared_snapshot,
                 session_context,
                 created_cleanup,
+                route_authority,
             )
             .await
         {
@@ -1462,6 +1549,7 @@ impl ApiProxy {
         prepared_snapshot: Option<Option<Vec<u8>>>,
         session_context: Option<ApiSessionContext>,
         created_cleanup: Option<CreatedMatch>,
+        route_authority: RouteAuthority,
     ) -> Result<Response<ProxyBody>> {
         // A recoverable write is wrapped in an auto-revert envelope after the
         // upstream succeeds. Snapshot acquisition occurs in the caller before
@@ -1513,6 +1601,12 @@ impl ApiProxy {
             rb = rb.body(body);
         }
 
+        if let Some(response) = self
+            .recheck_final_authority(&route_authority, op.as_ref())
+            .await
+        {
+            return Ok(response);
+        }
         let upstream_resp = rb.send().await.context("forward to apiserver")?;
         let status = upstream_resp.status();
         let upstream_headers = upstream_resp.headers().clone();
@@ -1736,24 +1830,34 @@ impl ApiProxy {
         }
     }
 
-    /// Re-read immutable protocol floors and the hot-reloaded explicit policy
-    /// after any evaluator or operator delay and immediately before upstream
-    /// I/O. An intervening deny invalidates the earlier authorization.
-    async fn recheck_final_authority(&self, op: &ApiOp) -> Option<Response<ProxyBody>> {
-        if let Some(reason) = self.protocol.deny_outright(op) {
+    fn route_authority_from_parts(&self, parts: &Parts) -> Option<RouteAuthority> {
+        parts.extensions.get::<RouteAuthority>().cloned()
+    }
+
+    fn missing_route_authority_response(&self) -> Response<ProxyBody> {
+        self.status_resp(
+            StatusCode::FORBIDDEN,
+            "guard api-proxy: request authority binding is missing",
+            "Forbidden",
+        )
+    }
+
+    /// Re-read the complete policy and evaluator-intent generation immediately
+    /// before upstream I/O. Any intervening authority change invalidates the
+    /// route, even when the new action is another permissive action.
+    async fn recheck_final_authority(
+        &self,
+        expected: &RouteAuthority,
+        op: Option<&ApiOp>,
+    ) -> Option<Response<ProxyBody>> {
+        if let Some(reason) = op.and_then(|operation| self.protocol.deny_outright(operation)) {
             return Some(self.status_resp(StatusCode::FORBIDDEN, &reason, "Forbidden"));
         }
-        let decision = self.policy.read().await.decide(op);
-        if decision.action == ApiAction::Deny {
+        let (_, current) = self.capture_route_authority().await;
+        if &current != expected {
             return Some(self.status_resp(
                 StatusCode::FORBIDDEN,
-                &format!(
-                    "guard api-proxy ({}) denied {} {} during final authority check: {}",
-                    self.protocol.name(),
-                    op.verb.as_str(),
-                    op.resource,
-                    decision.reason
-                ),
+                "guard api-proxy: API policy or evaluator intent changed while the request was in flight; submit a fresh request",
                 "Forbidden",
             ));
         }
@@ -1764,7 +1868,14 @@ impl ApiProxy {
     /// can build a restore-style revert from it. Returns the raw body; `None`
     /// if the fetch failed (the protocol then synthesizes a
     /// delete-the-created-object revert instead).
-    async fn fetch_prior_object(&self, path: &str) -> Option<Vec<u8>> {
+    async fn fetch_prior_object(
+        &self,
+        path: &str,
+        route_authority: &RouteAuthority,
+    ) -> Result<Option<Vec<u8>>, Response<ProxyBody>> {
+        if let Some(response) = self.recheck_final_authority(route_authority, None).await {
+            return Err(response);
+        }
         let url = format!("{}{}", self.upstream.base(), path);
         let mut rb = self
             .upstream
@@ -1776,51 +1887,65 @@ impl ApiProxy {
         } else if let Some((user, pass)) = self.upstream.basic_auth() {
             rb = rb.basic_auth(user, Some(pass));
         }
-        let resp = rb.send().await.ok()?;
+        let Ok(resp) = rb.send().await else {
+            return Ok(None);
+        };
         if !resp.status().is_success() {
-            return None;
+            return Ok(None);
         }
-        resp.bytes().await.ok().map(|b| b.to_vec())
+        Ok(resp.bytes().await.ok().map(|b| b.to_vec()))
     }
 
     /// Fetch the prior object and confirm the protocol can plan a revert from
     /// it, returning the snapshot when it can. Used on the evaluate Contain path
     /// immediately before forwarding, so containment is only committed to when
     /// the revert is genuinely armable from current state.
-    async fn fetch_validated_snapshot(&self, op: &ApiOp, path: &str) -> Option<Vec<u8>> {
-        let snapshot = self.fetch_prior_object(path).await?;
+    async fn fetch_validated_snapshot(
+        &self,
+        op: &ApiOp,
+        path: &str,
+        route_authority: &RouteAuthority,
+    ) -> Result<Option<Vec<u8>>, Response<ProxyBody>> {
+        let Some(snapshot) = self.fetch_prior_object(path, route_authority).await? else {
+            return Ok(None);
+        };
         if self.protocol.plan_revert(op, Some(&snapshot), &[]).is_err() {
-            return None;
+            return Ok(None);
         }
-        Some(snapshot)
+        Ok(Some(snapshot))
     }
 
     /// Pre-judge which revert (if any) the proxy could construct for this
     /// operation. The prior object is not carried forward; the Contain path
     /// re-fetches and re-validates it before forwarding so the armed revert
     /// reflects state at write time, not at judge time.
-    async fn prepare_revert(&self, op: &ApiOp, path: &str) -> RevertConstructible {
+    async fn prepare_revert(
+        &self,
+        op: &ApiOp,
+        path: &str,
+        route_authority: &RouteAuthority,
+    ) -> Result<RevertConstructible, Response<ProxyBody>> {
         let track_write = self.gate.get().is_some() && self.protocol.tracks_write(op);
         if !track_write {
-            return RevertConstructible::None;
+            return Ok(RevertConstructible::None);
         }
         if self.protocol.wants_prior_snapshot(op) {
-            let Some(snapshot) = self.fetch_prior_object(path).await else {
-                return RevertConstructible::None;
+            let Some(snapshot) = self.fetch_prior_object(path, route_authority).await? else {
+                return Ok(RevertConstructible::None);
             };
             // The marker is an input the evaluator trusts, so it must not claim a
             // revert the protocol cannot actually build from this snapshot (e.g.
             // an encrypted value the sanitizer drops). Validate by planning the
             // snapshot-based revert; the response body is unused for these verbs.
             if self.protocol.plan_revert(op, Some(&snapshot), &[]).is_err() {
-                return RevertConstructible::None;
+                return Ok(RevertConstructible::None);
             }
-            return match op.verb {
+            return Ok(match op.verb {
                 Verb::Delete => RevertConstructible::RecreateFromSnapshot,
                 _ => RevertConstructible::RestorePriorState,
-            };
+            });
         }
-        RevertConstructible::DeleteCreated
+        Ok(RevertConstructible::DeleteCreated)
     }
 
     /// Arm an auto-revert envelope for a tracked write the proxy just
@@ -2006,7 +2131,7 @@ impl ApiProxy {
         response
     }
 
-    fn rebuild_judge_for_intent(&self, intent: Option<String>) {
+    fn rebuild_judge_for_intent_during_update(&self, intent: Option<String>) {
         let Some(builder) = self.judge_builder.get() else {
             return;
         };
@@ -2369,10 +2494,12 @@ async fn policy_reloader(path: PathBuf, proxy: Arc<ApiProxy>) {
             Ok(p) => {
                 let old_intent = proxy.policy.read().await.intent.clone();
                 let new_intent = p.intent.clone();
-                *proxy.policy.write().await = p;
+                proxy.begin_authority_update();
                 if old_intent != new_intent {
-                    proxy.rebuild_judge_for_intent(new_intent);
+                    proxy.rebuild_judge_for_intent_during_update(new_intent);
                 }
+                *proxy.policy.write().await = p;
+                proxy.finish_authority_update();
                 tracing::info!(target: "guard::apiproxy", "reloaded api-policy from {}", path.display());
             }
             Err(e) => {

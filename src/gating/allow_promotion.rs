@@ -613,6 +613,7 @@ pub(crate) fn build_candidate_verb(
         inventory: None,
         namespace: None,
         fanout: None,
+        environment: Vec::new(),
         override_marker: None,
         sticky: false,
         provenance: Some(CoverageProvenance {

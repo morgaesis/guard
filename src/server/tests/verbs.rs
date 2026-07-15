@@ -358,6 +358,76 @@ async fn raw_command_reverse_matches_trusted_verb_and_executes_now() {
     );
 }
 
+#[tokio::test]
+async fn trusted_reverse_match_cannot_skip_evaluator_for_untyped_ansible_config() {
+    let (mut cfg, _buf) = make_test_config();
+    cfg.gate = GateMode::Consequence;
+    cfg.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: check-only
+    binary: true
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: check
+        action: preauthorized
+        required_args: ["--check"]
+"#,
+        )
+        .unwrap(),
+    ));
+    let mut request = raw_request("true", &["--check"], None);
+    request.env.insert(
+        "ANSIBLE_CONFIG".to_string(),
+        "/tmp/caller-controlled.cfg".to_string(),
+    );
+    let response = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 })
+        .await
+        .into_response();
+    assert!(!response.allowed);
+    assert_eq!(
+        response.verb_matches[0].action,
+        guard::gating::verb::CoverageAction::Evaluate
+    );
+}
+
+#[tokio::test]
+async fn trusted_reverse_match_accepts_exact_typed_ansible_config() {
+    let (mut cfg, _buf) = make_test_config();
+    cfg.gate = GateMode::Consequence;
+    cfg.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: check-only
+    binary: true
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: check
+        action: preauthorized
+        required_args: ["--check"]
+        environment:
+          - name: ANSIBLE_CONFIG
+            values: ["/srv/automation/ansible.cfg"]
+"#,
+        )
+        .unwrap(),
+    ));
+    let mut request = raw_request("true", &["--check"], None);
+    request.env.insert(
+        "ANSIBLE_CONFIG".to_string(),
+        "/srv/automation/ansible.cfg".to_string(),
+    );
+    let response = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 })
+        .await
+        .into_response();
+    assert!(response.allowed, "{response:?}");
+    assert_eq!(response.exit_code, Some(0));
+}
+
 /// An auto-promoted verb (`gating::allow_promotion`) is trusted only as
 /// long as its `promotion_stamp` matches the daemon's current model +
 /// prompt stamp. A stale stamp must downgrade `trusted` to false rather
