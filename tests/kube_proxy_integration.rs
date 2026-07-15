@@ -541,10 +541,23 @@ async fn proxy_gates_redacts_and_forwards() {
         "/api",
         "/apis/apps/v1",
         "/openapi/v3/apis/apps/v1",
+        "/healthz",
+        "/livez",
+        "/readyz?verbose",
     ] {
         let resp = client.get(format!("{base}{path}")).send().await.unwrap();
         assert_eq!(resp.status(), 200, "discovery path {path} must forward");
     }
+    for path in ["/readyz/etcd", "/healthz/", "/livez?exclude=log"] {
+        let resp = client.get(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(
+            resp.status(),
+            403,
+            "unapproved health path {path} must deny"
+        );
+    }
+    let resp = client.head(format!("{base}/readyz")).send().await.unwrap();
+    assert_eq!(resp.status(), 200, "exact health HEAD must forward");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2253,6 +2266,29 @@ impl guard::proxy::GateSink for ApprovingSink {
     }
 }
 
+#[derive(Clone)]
+struct DenyingSink {
+    reason: &'static str,
+}
+
+#[async_trait::async_trait]
+impl guard::proxy::GateSink for DenyingSink {
+    async fn arm_revert(&self, _mutation: guard::proxy::ApiMutation) -> Option<String> {
+        None
+    }
+
+    async fn hold_request(
+        &self,
+        _snapshot: &ApiHoldSnapshot,
+        _reason: &str,
+        _session_context: Option<&ApiSessionContext>,
+    ) -> guard::proxy::HoldDecision {
+        guard::proxy::HoldDecision::Denied {
+            reason: self.reason.to_string(),
+        }
+    }
+}
+
 /// A policy `hold` routes through the attached approval queue: an approved hold
 /// forwards to the upstream, while a proxy running without any queue (no gate
 /// sink) fails the hold closed with a 403 that names the missing gate.
@@ -2327,10 +2363,48 @@ rules:
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "an approved hold is forwarded upstream");
-    let events = session_sink.events.lock().unwrap();
-    assert_eq!(events.len(), 1, "the held request is recorded once");
-    assert!(events[0].held, "an approved hold remains held in history");
-    assert!(events[0].allowed, "the operator-approved hold was allowed");
+    {
+        let events = session_sink.events.lock().unwrap();
+        assert_eq!(events.len(), 1, "the held request is recorded once");
+        assert!(events[0].held, "an approved hold remains held in history");
+        assert!(events[0].allowed, "the operator-approved hold was allowed");
+    }
+
+    for reason in ["operator denied", "approval expired"] {
+        let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
+        let tls = ProxyTls::generate().expect("tls");
+        let ca_pem = tls.ca_pem().to_string();
+        let policy = ApiPolicy::from_yaml(policy_yaml).expect("policy");
+        let port = free_port();
+        let listen = format!("127.0.0.1:{port}").parse().unwrap();
+        let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
+        proxy.attach_gate(Arc::new(DenyingSink { reason }));
+        let denied_session = RecordingSessionSink::default();
+        proxy.attach_session_sink(Arc::new(denied_session.clone()));
+        tokio::spawn(proxy.clone().serve());
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let client = reqwest::Client::builder()
+            .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+            .build()
+            .unwrap();
+        let response = client
+            .delete(format!(
+                "https://127.0.0.1:{port}/api/v1/namespaces/dev/pods/web-0"
+            ))
+            .bearer_auth("live-session")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 403, "{reason} must fail closed");
+        let events = denied_session.events.lock().unwrap();
+        assert_eq!(events.len(), 1, "{reason} is recorded once");
+        assert!(events[0].held, "{reason} remains a hold in history");
+        assert!(
+            !events[0].allowed,
+            "{reason} must not be recorded as allowed"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
