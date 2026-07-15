@@ -2715,6 +2715,34 @@ verbs:
     }
 
     #[test]
+    fn auto_promoted_verb_cannot_authorize_caller_environment() {
+        let catalog = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: generated-check
+    binary: ansible-playbook
+    consequence: reversible
+    trusted: true
+    auto_promoted: true
+    coverage:
+      - name: check
+        action: preauthorized
+        required_args: ["--check"]
+        environment:
+          - name: ANSIBLE_CONFIG
+            values: ["/srv/automation/ansible.cfg"]
+"#,
+        )
+        .unwrap();
+        let verb = catalog.get("generated-check").unwrap();
+
+        let error = validate_auto_promoted_verb_safety(verb, &[]).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("may not authorize caller environment bindings"));
+    }
+
+    #[test]
     fn operator_baseline_denies_are_normalized_sticky() {
         let catalog = VerbCatalog::from_yaml(
             r#"
