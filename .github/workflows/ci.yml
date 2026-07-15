@@ -64,6 +64,10 @@ jobs:
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          shared-key: test
+          cache-workspace-crates: true
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Rustfmt check
         run: cargo fmt --all -- --check
@@ -132,7 +136,9 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
         with:
-          key: ${{ matrix.target }}
+          shared-key: release-${{ matrix.target }}
+          cache-workspace-crates: true
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Build
         shell: bash

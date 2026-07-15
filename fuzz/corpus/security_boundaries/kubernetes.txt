@@ -1,0 +1,5 @@
+KGET
+===
+/api/v1/namespaces/prod/secrets/example
+===
+watch=false&dryRun=All
