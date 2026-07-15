@@ -18,6 +18,7 @@ reimplementing approval logic.
 5. `src/session.rs`, `src/grant_profile.rs`, and `src/session_store.rs` own live
    sessions, saved grants, grant requests, immutable authority snapshots,
    behavior limits, and SQLite persistence.
+
 6. `src/secrets/` and `src/redact.rs` own secret backends, per-principal names,
    value resolution, and output redaction.
 7. `src/daemon_client.rs`, `src/cli_client.rs`, `src/mcp.rs`, and `src/shim.rs`
@@ -208,3 +209,4 @@ release.
   `ssh` command execution does not imply transport-level mediation.
 - Human output remains compatible with normal tools. Structured output carries
   decision, coverage, and escalation context for agents.
+- The guard binary name is `guard`. Environment variables use the `GUARD_*` prefix. `SSH_GUARD_*` names are not recognized.
