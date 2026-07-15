@@ -10,6 +10,10 @@ name: CI
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -23,6 +27,8 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: Test release integrity logic
         if: runner.os == 'Linux'
@@ -50,9 +56,11 @@ jobs:
           rm -rf /tmp/guard-release-test
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659  # v1.17.0
         with:
           components: clippy, rustfmt
+          cache: false
+          rustflags: ""
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
@@ -88,9 +96,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check matrix result
+        env:
+          TEST_RESULT: ${{ needs.test.result }}
         run: |
-          if [ "${{ needs.test.result }}" != "success" ]; then
-            echo "Test & Lint matrix did not succeed: ${{ needs.test.result }}"
+          if [ "$TEST_RESULT" != "success" ]; then
+            echo "Test & Lint matrix did not succeed: $TEST_RESULT"
             exit 1
           fi
 
@@ -109,11 +119,15 @@ jobs:
             os: windows-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659  # v1.17.0
         with:
-          targets: ${{ matrix.target }}
+          target: ${{ matrix.target }}
+          cache: false
+          rustflags: ""
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
@@ -121,4 +135,6 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+        run: cargo build --release --target "$BUILD_TARGET"

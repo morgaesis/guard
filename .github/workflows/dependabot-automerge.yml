@@ -3,17 +3,16 @@ name: Dependabot review gate
 # Gate Dependabot PRs that need human review while staying quiet for updates
 # that normal CI can cover:
 #
-#   - security updates (any semver level)
 #   - patch and minor cargo updates
 #   - all GitHub Actions updates (we already SHA-pin them, so the bump
 #     is functionally a vetted-tag → vetted-tag move)
 #
-# Major version bumps are evaluated by an AI review gate. The workflow fails
-# and tags @morgaesis only when the gate is unavailable or requests review.
-# Otherwise it succeeds without PR comments, review approvals, or merge actions.
+# Major and unclassified version bumps fail closed for human review. The gate
+# does not execute pull request code, use external model credentials, post
+# comments, approve reviews, or merge changes.
 
 on:
-  pull_request_target:
+  pull_request:
     types:
       - opened
       - reopened
@@ -28,14 +27,18 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: dependabot-review-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: true
+
 jobs:
   review-gate:
+    name: Classify dependency update
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.user.login == 'dependabot[bot]'
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      issues: write
-      pull-requests: read
+      pull-requests: read  # Reads Dependabot PR metadata and changed-file names.
     steps:
       - name: Resolve pull request
         id: pr
@@ -67,10 +70,8 @@ jobs:
 
       - name: Resolve update metadata
         id: fetch_meta
-        if: github.event_name == 'pull_request_target'
+        if: github.event_name == 'pull_request'
         uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
-        with:
-          alert-lookup: true
 
       - name: Resolve dispatched update metadata
         id: meta
@@ -78,14 +79,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           FETCH_UPDATE_TYPE: ${{ steps.fetch_meta.outputs.update-type }}
-          FETCH_ALERT_STATE: ${{ steps.fetch_meta.outputs.alert-state }}
           FETCH_PACKAGE_ECOSYSTEM: ${{ steps.fetch_meta.outputs.package-ecosystem }}
           HEAD_REF: ${{ steps.pr.outputs.head_ref }}
         run: |
           set -euo pipefail
 
           update_type="$FETCH_UPDATE_TYPE"
-          alert_state="$FETCH_ALERT_STATE"
           package_ecosystem="$FETCH_PACKAGE_ECOSYSTEM"
 
           if [ -z "$update_type" ]; then
@@ -113,171 +112,27 @@ jobs:
 
           {
             echo "update-type=${update_type}"
-            echo "alert-state=${alert_state}"
             echo "package-ecosystem=${package_ecosystem}"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Succeed silently for safe bumps
-        if: >-
-          steps.meta.outputs.update-type == 'version-update:semver-patch' ||
-          steps.meta.outputs.update-type == 'version-update:semver-minor' ||
-          steps.meta.outputs.alert-state == 'open' ||
-          steps.meta.outputs.package-ecosystem == 'github_actions'
-        run: |
-          echo "No manual review required."
-
-      - name: Prepare major bump review context
-        if: >-
-          steps.meta.outputs.update-type == 'version-update:semver-major' &&
-          steps.meta.outputs.alert-state != 'open' &&
-          steps.meta.outputs.package-ecosystem != 'github_actions'
+      - name: Enforce review policy
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_URL: ${{ steps.pr.outputs.url }}
-          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
+          PACKAGE_ECOSYSTEM: ${{ steps.meta.outputs.package-ecosystem }}
         run: |
-          mkdir -p .cache/dependabot-review
-          gh pr diff "$PR_URL" --patch > .cache/dependabot-review/diff.patch
-          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" \
-            --paginate > .cache/dependabot-review/files.json
-          cat > .cache/dependabot-review/prompt.md <<'PROMPT'
-          You are reviewing a Dependabot semver-major update for guard.
+          set -euo pipefail
 
-          Decide whether a human maintainer must review this PR before the gate passes.
-          Base the decision only on the attached diff and changed-file metadata.
+          case "$UPDATE_TYPE" in
+            version-update:semver-patch|version-update:semver-minor)
+              echo "Routine update; normal CI is sufficient."
+              exit 0
+              ;;
+          esac
 
-          Return only JSON with this schema:
-          {
-            "manual_review_required": true,
-            "risk": "low|medium|high",
-            "reason": "one concise sentence",
-            "blocking_findings": ["specific issue, or empty array"]
-          }
-
-          Require human review for workflow permission expansion, release/signing behavior changes,
-          production dependency major upgrades with unclear migration impact, security-sensitive
-          dependency changes, lockfile anomalies, or any diff you cannot confidently assess.
-          If the update is low-risk and normal CI is enough, set manual_review_required to false.
-          PROMPT
-
-      - name: Require AI review secret for major bumps
-        id: require_ai_key
-        if: >-
-          steps.meta.outputs.update-type == 'version-update:semver-major' &&
-          steps.meta.outputs.alert-state != 'open' &&
-          steps.meta.outputs.package-ecosystem != 'github_actions'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_URL: ${{ steps.pr.outputs.url }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-        run: |
-          if [ -n "$OPENROUTER_API_KEY" ]; then
+          if [ "$PACKAGE_ECOSYSTEM" = "github_actions" ]; then
+            echo "SHA-pinned GitHub Actions update; normal CI is sufficient."
             exit 0
           fi
 
-          gh pr comment "$PR_URL" --body \
-            "@morgaesis Major version bump detected, but OPENROUTER_API_KEY is not configured for the AI review gate. Configure it as a Dependabot-accessible secret, then re-run this workflow or review manually."
+          echo "Major or unclassified dependency update requires human review."
           exit 1
-
-      - name: Run opencode major bump review
-        id: opencode
-        if: >-
-          steps.meta.outputs.update-type == 'version-update:semver-major' &&
-          steps.meta.outputs.alert-state != 'open' &&
-          steps.meta.outputs.package-ecosystem != 'github_actions'
-        env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          DEPENDABOT_AI_MODEL: ${{ vars.DEPENDABOT_AI_MODEL || 'openrouter/moonshotai/kimi-k2' }}
-        run: |
-          npm install -g opencode-ai@latest
-          {
-            echo "Changed files metadata:"
-            cat .cache/dependabot-review/files.json
-            echo
-            echo "Patch:"
-            cat .cache/dependabot-review/diff.patch
-          } > .cache/dependabot-review/context.md
-
-          opencode run \
-            --model "$DEPENDABOT_AI_MODEL" \
-            "$(cat .cache/dependabot-review/prompt.md)
-
-          $(cat .cache/dependabot-review/context.md)
-
-          Review this Dependabot major update and return only the requested JSON." \
-            > .cache/dependabot-review/result.txt
-
-      - name: Evaluate opencode decision
-        id: ai
-        if: >-
-          steps.meta.outputs.update-type == 'version-update:semver-major' &&
-          steps.meta.outputs.alert-state != 'open' &&
-          steps.meta.outputs.package-ecosystem != 'github_actions'
-        run: |
-          node <<'NODE'
-          const fs = require("fs");
-          const output = fs.readFileSync(".cache/dependabot-review/result.txt", "utf8");
-          const match = output.match(/\{[\s\S]*\}/);
-          if (!match) {
-            console.error("No JSON object found in opencode output.");
-            process.exit(1);
-          }
-
-          const decision = JSON.parse(match[0]);
-          const manual = decision.manual_review_required === true;
-          const risk = String(decision.risk || "unknown").replace(/\r?\n/g, " ");
-          const reason = String(decision.reason || "No reason provided.").replace(/\r?\n/g, " ");
-          const findings = Array.isArray(decision.blocking_findings)
-            ? decision.blocking_findings.map(String)
-            : [];
-          const summary = [
-            `AI review risk: ${risk}`,
-            `Decision: ${manual ? "human review required" : "human review not required"}`,
-            `Reason: ${reason}`,
-            findings.length ? `Blocking findings: ${findings.join("; ")}` : "Blocking findings: none",
-          ].join("\n");
-
-          fs.appendFileSync(process.env.GITHUB_OUTPUT, `manual=${manual}\n`);
-          fs.appendFileSync(process.env.GITHUB_OUTPUT, `summary<<EOF\n${summary}\nEOF\n`);
-          NODE
-
-      - name: Escalate major bump when AI review fails
-        if: >-
-          failure() &&
-          steps.meta.outputs.update-type == 'version-update:semver-major' &&
-          steps.meta.outputs.alert-state != 'open' &&
-          steps.meta.outputs.package-ecosystem != 'github_actions' &&
-          steps.require_ai_key.outcome == 'success' &&
-          steps.ai.outputs.manual == ''
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_URL: ${{ steps.pr.outputs.url }}
-        run: |
-          gh pr comment "$PR_URL" --body \
-            "@morgaesis AI review could not produce a usable decision for this major Dependabot update. Review manually or re-run after fixing the AI review gate."
-          exit 1
-
-      - name: Escalate major bump when AI requests review
-        if: >-
-          steps.meta.outputs.update-type == 'version-update:semver-major' &&
-          steps.meta.outputs.alert-state != 'open' &&
-          steps.meta.outputs.package-ecosystem != 'github_actions' &&
-          steps.ai.outputs.manual == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_URL: ${{ steps.pr.outputs.url }}
-          SUMMARY: ${{ steps.ai.outputs.summary }}
-        run: |
-          gh pr comment "$PR_URL" --body "@morgaesis AI review recommends human review before merging.
-
-          ${SUMMARY}"
-          exit 1
-
-      - name: Succeed silently for AI-cleared major bump
-        if: >-
-          steps.meta.outputs.update-type == 'version-update:semver-major' &&
-          steps.meta.outputs.alert-state != 'open' &&
-          steps.meta.outputs.package-ecosystem != 'github_actions' &&
-          steps.ai.outputs.manual == 'false'
-        run: |
-          echo "AI review did not require manual review."
