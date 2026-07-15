@@ -165,11 +165,13 @@ jobs:
         run: |
           mapfile -d '' archives < <(find artifacts -type f -name '*.tar.gz' -print0)
           test "${#archives[@]}" -gt 0
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" \
-              --clobber \
-              "${archives[@]}" \
-              SHA256SUMS
+          if release_state=$(gh release view "$RELEASE_TAG" --json isDraft 2>/dev/null); then
+            if ! jq -e '.isDraft' <<< "$release_state" >/dev/null; then
+              echo "published release already exists for ${RELEASE_TAG}"
+              exit 1
+            fi
+            gh release upload "$RELEASE_TAG" --clobber "${archives[@]}" SHA256SUMS
+            gh release edit "$RELEASE_TAG" --draft=false
           else
             gh release create "$RELEASE_TAG" \
               --generate-notes \
