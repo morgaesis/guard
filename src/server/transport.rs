@@ -737,27 +737,10 @@ impl Server {
 
     #[cfg(unix)]
     async fn run_unix_static(socket_path: &Path, config: &ServerConfig) -> Result<()> {
-        if let Some(parent) = socket_path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .context("failed to create socket directory")?;
-        }
-
-        if socket_path.exists() {
-            tokio::fs::remove_file(socket_path).await?;
-        }
-
-        let listener = UnixListener::bind(socket_path).context("failed to bind UNIX socket")?;
-        Self::chmod_path(socket_path, 0o666).await?;
+        let listener =
+            Self::prepare_unix_listener(socket_path, config.socket_group.as_deref()).await?;
 
         tracing::info!("guard server listening on {}", socket_path.display());
-
-        if let Some(ref group) = config.socket_group {
-            Self::chown_to_group(socket_path, group).await?;
-            if let Some(parent) = socket_path.parent() {
-                Self::chmod_path(parent, 0o755).await?;
-            }
-        }
 
         loop {
             match listener.accept().await {
@@ -775,6 +758,34 @@ impl Server {
                 }
             }
         }
+    }
+
+    #[cfg(unix)]
+    async fn prepare_unix_listener(
+        socket_path: &Path,
+        socket_group: Option<&str>,
+    ) -> Result<UnixListener> {
+        if let Some(parent) = socket_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .context("failed to create socket directory")?;
+        }
+
+        if socket_path.exists() {
+            tokio::fs::remove_file(socket_path).await?;
+        }
+
+        let listener = UnixListener::bind(socket_path).context("failed to bind UNIX socket")?;
+        Self::chmod_path(socket_path, 0o600).await?;
+
+        if let Some(group) = socket_group {
+            Self::chown_to_group(socket_path, group).await?;
+            Self::chmod_path(socket_path, 0o660).await?;
+            if let Some(parent) = socket_path.parent() {
+                Self::chmod_path(parent, 0o755).await?;
+            }
+        }
+        Ok(listener)
     }
 
     async fn run_tcp_static(port: u16, config: &ServerConfig) -> Result<()> {
@@ -1465,4 +1476,53 @@ pub(super) async fn write_policy_decision<W: AsyncWrite + Unpin>(
         .await?;
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod unix_listener_tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    fn mode(path: &Path) -> u32 {
+        std::fs::symlink_metadata(path).unwrap().mode() & 0o777
+    }
+
+    #[tokio::test]
+    async fn unix_socket_defaults_to_owner_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("guard.sock");
+        let listener = Server::prepare_unix_listener(&socket, None).await.unwrap();
+        assert_eq!(mode(&socket), 0o600);
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn unix_socket_becomes_group_accessible_only_after_chgrp() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("guard.sock");
+        let gid = unsafe { libc::getegid() };
+        let group = uzers::get_group_by_gid(gid).expect("effective group must resolve");
+        let group = group.name().to_string_lossy();
+        let listener = Server::prepare_unix_listener(&socket, Some(&group))
+            .await
+            .unwrap();
+        let metadata = std::fs::symlink_metadata(&socket).unwrap();
+        assert_eq!(metadata.gid(), gid);
+        assert_eq!(metadata.mode() & 0o777, 0o660);
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn failed_socket_group_change_never_opens_socket_permissions() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("guard.sock");
+        let error = Server::prepare_unix_listener(
+            &socket,
+            Some("guard-group-that-must-not-exist-9fce06b7"),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("failed to change group"));
+        assert_eq!(mode(&socket), 0o600);
+    }
 }

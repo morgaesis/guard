@@ -13,6 +13,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+
 const SCHEMA_VERSION: i64 = 4;
 const VACUUM_MIN_PAGES: u64 = 512;
 const VACUUM_MIN_FREE_PAGES: u64 = 128;
@@ -356,13 +359,11 @@ impl SessionStore {
     }
 
     fn open_connection(path: &Path) -> Result<Connection> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
+        prepare_state_path(path)?;
         let conn =
             Connection::open(path).with_context(|| format!("failed to open {}", path.display()))?;
         conn.busy_timeout(Duration::from_secs(2))?;
+        enforce_private_state_files(path)?;
         Ok(conn)
     }
 
@@ -1191,6 +1192,147 @@ fn encode_scope(scope: &IssuedGrantScope) -> Result<String> {
     serde_json::to_string(scope).context("failed to encode issued grant scope")
 }
 
+#[cfg(unix)]
+fn prepare_state_path(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    if let Some(parent) = parent {
+        create_parent_without_symlinks(parent)?;
+        secure_state_parent(parent)?;
+    }
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => secure_existing_state_file(path, &metadata)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut options = std::fs::OpenOptions::new();
+            options
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            options
+                .open(path)
+                .with_context(|| format!("failed to securely create {}", path.display()))?;
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()))
+        }
+    }
+    enforce_private_state_files(path)
+}
+
+#[cfg(not(unix))]
+fn prepare_state_path(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_parent_without_symlinks(parent: &Path) -> Result<()> {
+    let mut current = PathBuf::new();
+    for component in parent.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    anyhow::bail!("state database parent {} is a symlink", current.display());
+                }
+                if !metadata.is_dir() {
+                    anyhow::bail!(
+                        "state database parent {} is not a directory",
+                        current.display()
+                    );
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut builder = std::fs::DirBuilder::new();
+                builder.mode(0o700);
+                builder
+                    .create(&current)
+                    .with_context(|| format!("failed to securely create {}", current.display()))?;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect {}", current.display()))
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn secure_state_parent(parent: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(parent)
+        .with_context(|| format!("failed to inspect {}", parent.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        anyhow::bail!(
+            "state database parent {} is not a real directory",
+            parent.display()
+        );
+    }
+    let effective_uid = unsafe { libc::geteuid() };
+    if metadata.uid() == effective_uid {
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to protect {}", parent.display()))?;
+    } else if metadata.mode() & 0o022 != 0 {
+        anyhow::bail!(
+            "state database parent {} is writable by another principal",
+            parent.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn secure_existing_state_file(path: &Path, metadata: &std::fs::Metadata) -> Result<()> {
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!("state database {} is not a regular file", path.display());
+    }
+    let effective_uid = unsafe { libc::geteuid() };
+    if metadata.uid() != effective_uid {
+        anyhow::bail!(
+            "state database {} is not owned by the daemon",
+            path.display()
+        );
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to protect {}", path.display()))
+}
+
+#[cfg(unix)]
+fn enforce_private_state_files(path: &Path) -> Result<()> {
+    let sidecar = |suffix: &str| {
+        let mut value = path.as_os_str().to_os_string();
+        value.push(suffix);
+        PathBuf::from(value)
+    };
+    for candidate in [
+        path.to_path_buf(),
+        sidecar("-wal"),
+        sidecar("-shm"),
+        sidecar("-journal"),
+    ] {
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(metadata) => secure_existing_state_file(&candidate, &metadata)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect {}", candidate.display()))
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn enforce_private_state_files(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 fn encode_u64(value: u64) -> Result<i64> {
     i64::try_from(value).context("session timestamp exceeds sqlite integer range")
 }
@@ -1357,6 +1499,117 @@ fn decode_exec_status(value: &str) -> rusqlite::Result<SessionExecStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        std::fs::symlink_metadata(path).unwrap().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn state_store_creates_private_parent_database_and_sidecars() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("private-state");
+        let path = parent.join("state.db");
+        let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+        assert_eq!(mode(&parent), 0o700);
+        assert_eq!(mode(&path), 0o600);
+
+        let conn = SessionStore::open_connection(&path).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute("CREATE TABLE IF NOT EXISTS sidecar_test (value TEXT)", [])
+            .unwrap();
+        conn.execute("INSERT INTO sidecar_test VALUES ('value')", [])
+            .unwrap();
+        enforce_private_state_files(&path).unwrap();
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = PathBuf::from(format!("{}{suffix}", path.display()));
+            assert!(sidecar.exists(), "{} must exist", sidecar.display());
+            assert_eq!(mode(&sidecar), 0o600);
+        }
+        drop(conn);
+        drop(store);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn state_store_repairs_owned_existing_modes_and_protects_raw_bearers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("state");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let path = parent.join("state.db");
+        std::fs::write(&path, []).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let mut registry = SessionRegistry::new();
+        registry.grant(
+            "raw-bearer-must-stay-owner-only".to_string(),
+            SessionGrant {
+                allow: Vec::new(),
+                deny: Vec::new(),
+                allow_exact: Vec::new(),
+                deny_exact: Vec::new(),
+                activated_verbs: Vec::new(),
+                override_markers: Vec::new(),
+                scope: Default::default(),
+                expires_at: None,
+                prompt_append: None,
+                generated_notes: Vec::new(),
+                granted_at: 0,
+                static_only: false,
+                auto_amend: false,
+            },
+        );
+        store.persist_registry(&registry).await.unwrap();
+        assert_eq!(mode(&parent), 0o700);
+        assert_eq!(mode(&path), 0o600);
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(
+            bytes
+                .windows(b"raw-bearer-must-stay-owner-only".len())
+                .any(|window| window == b"raw-bearer-must-stay-owner-only"),
+            "test must prove the protected database contains bearer authority"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn state_store_rejects_symlinks_and_non_regular_database_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target.db");
+        std::fs::write(&target, []).unwrap();
+        let linked = tmp.path().join("linked.db");
+        symlink(&target, &linked).unwrap();
+        assert!(SessionStore::open(linked, 3600).await.is_err());
+
+        let directory = tmp.path().join("directory.db");
+        std::fs::create_dir(&directory).unwrap();
+        assert!(SessionStore::open(directory, 3600).await.is_err());
+
+        let real_parent = tmp.path().join("real-parent");
+        std::fs::create_dir(&real_parent).unwrap();
+        let linked_parent = tmp.path().join("linked-parent");
+        symlink(&real_parent, &linked_parent).unwrap();
+        assert!(SessionStore::open(linked_parent.join("state.db"), 3600)
+            .await
+            .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_store_rejects_shared_writable_parent_not_owned_by_daemon() {
+        let shared = Path::new("/tmp");
+        let metadata = std::fs::symlink_metadata(shared).unwrap();
+        if metadata.uid() != unsafe { libc::geteuid() } && metadata.mode() & 0o022 != 0 {
+            let error = secure_state_parent(shared).unwrap_err();
+            assert!(error.to_string().contains("writable by another principal"));
+        }
+    }
 
     #[test]
     fn api_proxy_decision_source_round_trips() {

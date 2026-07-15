@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=simple
 User=guard
 Group=guard
+SupplementaryGroups=guard-clients
 WorkingDirectory=/var/lib/guard
 EnvironmentFile=-/etc/default/guard
 # The daemon spawns ssh itself, so `guard run ssh --hostkey accept-new` needs a
@@ -16,7 +17,12 @@ Environment=HOME=/var/lib/guard
 RuntimeDirectory=guard
 RuntimeDirectoryMode=0755
 StateDirectory=guard guard/.ssh
-ExecStart=/usr/local/bin/guard server start --socket /run/guard/guard.sock --state-db /var/lib/guard/state.db
+StateDirectoryMode=0700
+UMask=0077
+# Set GUARD_ALLOWED_USERS to `--users UID[,UID...]` for a second authorization
+# boundary inside the guard-clients socket group.
+Environment=GUARD_ALLOWED_USERS=
+ExecStart=/usr/local/bin/guard server start --socket /run/guard/guard.sock --socket-group guard-clients --state-db /var/lib/guard/state.db ${GUARD_ALLOWED_USERS}
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
