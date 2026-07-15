@@ -20,7 +20,7 @@ cargo build --quiet --release
 ## Release archive
 
 ```bash
-GUARD_VERSION=v0.4.0
+GUARD_VERSION=v0.5.0
 curl -fsSLO "https://github.com/morgaesis/guard/releases/download/${GUARD_VERSION}/guard-${GUARD_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 curl -fsSLO "https://github.com/morgaesis/guard/releases/download/${GUARD_VERSION}/SHA256SUMS"
 sha256sum --check --ignore-missing SHA256SUMS
