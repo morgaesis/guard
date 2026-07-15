@@ -557,20 +557,139 @@ fn legacy_grant_prompt_routes_to_session_issue() {
 
 #[test]
 fn legacy_grant_token_prompt_routes_to_session_amendment() {
+    let token = "0123456789abcdef0123456789abcdef";
     let args = preprocess_legacy_grant_args(vec![
         "guard".to_string(),
         "grant".to_string(),
-        "session-token".to_string(),
+        token.to_string(),
         "allow only --check mode".to_string(),
     ]);
     match MainArgs::try_parse_from(args) {
-        Ok(MainArgs::Session(SessionCommands::Grant { token, prose, .. })) => {
-            assert_eq!(token, "session-token");
+        Ok(MainArgs::Session(SessionCommands::Grant {
+            token: parsed_token,
+            prose,
+            ..
+        })) => {
+            assert_eq!(parsed_token, token);
             assert_eq!(prose.as_deref(), Some("allow only --check mode"));
         }
         Ok(_) => panic!("expected legacy token grant to amend a session"),
         Err(error) => panic!("expected legacy token grant to parse, got {error}"),
     }
+}
+
+#[test]
+fn legacy_grant_prompt_preserves_value_options() {
+    let args = preprocess_legacy_grant_args(
+        ["guard", "grant", "--ttl", "3600", "bounded work"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    );
+    match MainArgs::try_parse_from(args) {
+        Ok(MainArgs::Session(SessionCommands::New { ttl, prose, .. })) => {
+            assert_eq!(ttl, Some(3600));
+            assert_eq!(prose.as_deref(), Some("bounded work"));
+        }
+        Ok(_) => panic!("expected option-bearing legacy grant to issue a session"),
+        Err(error) => panic!("expected option-bearing legacy grant to parse, got {error}"),
+    }
+}
+
+#[test]
+fn legacy_grant_token_preserves_prompt_option() {
+    let token = "0123456789abcdef0123456789abcdef";
+    let args = preprocess_legacy_grant_args(
+        ["guard", "grant", token, "--prompt", "bounded work"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    );
+    match MainArgs::try_parse_from(args) {
+        Ok(MainArgs::Session(SessionCommands::Grant {
+            token: parsed_token,
+            prompt,
+            ..
+        })) => {
+            assert_eq!(parsed_token, token);
+            assert_eq!(prompt.as_deref(), Some("bounded work"));
+        }
+        Ok(_) => panic!("expected token grant to amend a session"),
+        Err(error) => panic!("expected token grant to parse, got {error}"),
+    }
+}
+
+#[test]
+fn legacy_grant_finds_token_after_value_options() {
+    let token = "0123456789abcdef0123456789abcdef";
+    let args = preprocess_legacy_grant_args(
+        [
+            "guard",
+            "grant",
+            "--ttl",
+            "3600",
+            token,
+            "--prompt=bounded work",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+    );
+    match MainArgs::try_parse_from(args) {
+        Ok(MainArgs::Session(SessionCommands::Grant {
+            token: parsed_token,
+            ttl,
+            prompt,
+            ..
+        })) => {
+            assert_eq!(parsed_token, token);
+            assert_eq!(ttl, Some(3600));
+            assert_eq!(prompt.as_deref(), Some("bounded work"));
+        }
+        Ok(_) => panic!("expected flags-before-token grant to amend a session"),
+        Err(error) => panic!("expected flags-before-token grant to parse, got {error}"),
+    }
+}
+
+#[test]
+fn legacy_grant_options_only_issue_a_session() {
+    let args = preprocess_legacy_grant_args(
+        ["guard", "grant", "--ttl=3600", "--auto-amend"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    );
+    match MainArgs::try_parse_from(args) {
+        Ok(MainArgs::Session(SessionCommands::New {
+            ttl, auto_amend, ..
+        })) => {
+            assert_eq!(ttl, Some(3600));
+            assert!(auto_amend);
+        }
+        Ok(_) => panic!("expected options-only grant to issue a session"),
+        Err(error) => panic!("expected options-only grant to parse, got {error}"),
+    }
+}
+
+#[test]
+fn bare_legacy_grant_issues_a_session() {
+    let args =
+        preprocess_legacy_grant_args(["guard", "grant"].into_iter().map(str::to_string).collect());
+    assert!(matches!(
+        MainArgs::try_parse_from(args),
+        Ok(MainArgs::Session(SessionCommands::New { .. }))
+    ));
+}
+
+#[test]
+fn legacy_grant_unknown_option_remains_a_parse_error() {
+    let args = preprocess_legacy_grant_args(
+        ["guard", "grant", "--unknown-option", "bounded work"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    );
+    assert!(MainArgs::try_parse_from(args).is_err());
 }
 
 #[test]

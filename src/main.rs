@@ -62,7 +62,7 @@ fn parse_unbounded_secs(value: &str) -> Result<u64, String> {
 /// Preserve the original top-level grant shorthand without adding it back to
 /// the public command tree. Canonical saved-grant subcommands pass through.
 fn preprocess_legacy_grant_args(mut args: Vec<String>) -> Vec<String> {
-    if args.len() < 3 || args.get(1).map(String::as_str) != Some("grant") {
+    if args.get(1).map(String::as_str) != Some("grant") {
         return args;
     }
     const CANONICAL: &[&str] = &[
@@ -76,15 +76,69 @@ fn preprocess_legacy_grant_args(mut args: Vec<String>) -> Vec<String> {
         "request",
         "help",
     ];
-    if CANONICAL.contains(&args[2].as_str()) || args[2].starts_with('-') {
+    if args
+        .get(2)
+        .is_some_and(|arg| CANONICAL.contains(&arg.as_str()))
+    {
         return args;
     }
-    match args.len() {
-        3 => args.splice(1..2, ["session".to_string(), "new".to_string()]),
-        4 => args.splice(1..2, ["session".to_string(), "grant".to_string()]),
-        _ => return args,
+    const VALUE_FLAGS: &[&str] = &[
+        "--allow",
+        "--deny",
+        "--verb",
+        "--override-marker",
+        "--ttl",
+        "--prompt",
+        "--prompt-file",
+        "--socket",
+    ];
+    const BOOLEAN_FLAGS: &[&str] = &[
+        "--static-only",
+        "--no-llm-fallback",
+        "--auto-amend",
+        "--no-auto-amend",
+    ];
+    let mut first_positional = None;
+    let mut index = 2;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--" {
+            first_positional = args.get(index + 1).map(String::as_str);
+            break;
+        }
+        if VALUE_FLAGS.contains(&arg.as_str()) {
+            index += 2;
+            continue;
+        }
+        if VALUE_FLAGS.iter().any(|flag| {
+            arg.strip_prefix(flag)
+                .is_some_and(|rest| rest.starts_with('='))
+        }) || BOOLEAN_FLAGS.contains(&arg.as_str())
+        {
+            index += 1;
+            continue;
+        }
+        if arg.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        first_positional = Some(arg.as_str());
+        break;
+    }
+    let command = if first_positional.is_some_and(is_legacy_session_token) {
+        "grant"
+    } else {
+        "new"
     };
+    args.splice(1..2, ["session".to_string(), command.to_string()]);
     args
+}
+
+fn is_legacy_session_token(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
