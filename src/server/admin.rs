@@ -45,6 +45,9 @@ mod regeneration_proposal_tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    const KEY_A: [u8; 32] = [0x11; 32];
+    const KEY_B: [u8; 32] = [0x22; 32];
+
     fn candidate() -> Verb {
         Verb {
             name: "generated:test".to_string(),
@@ -79,8 +82,8 @@ mod regeneration_proposal_tests {
     #[test]
     fn proposal_round_trip_preserves_exact_candidate_and_bindings() {
         let proposal = proposal();
-        let id = encode_regeneration_proposal(&proposal).unwrap();
-        let decoded = decode_regeneration_proposal(&id).unwrap();
+        let id = encode_regeneration_proposal(&proposal, &KEY_A).unwrap();
+        let decoded = decode_regeneration_proposal(&id, &KEY_A).unwrap();
         assert_eq!(decoded.name, "saved");
         assert_eq!(decoded.source_revision, 7);
         assert_eq!(decoded.regime, "regime-a");
@@ -92,10 +95,32 @@ mod regeneration_proposal_tests {
 
     #[test]
     fn proposal_tampering_fails_integrity_check() {
-        let mut id = encode_regeneration_proposal(&proposal()).unwrap();
+        let mut id = encode_regeneration_proposal(&proposal(), &KEY_A).unwrap();
         let last = id.pop().unwrap();
         id.push(if last == '0' { '1' } else { '0' });
-        assert!(decode_regeneration_proposal(&id).is_err());
+        assert!(decode_regeneration_proposal(&id, &KEY_A).is_err());
+    }
+
+    #[test]
+    fn proposal_recomputed_under_another_key_is_rejected() {
+        let forged = encode_regeneration_proposal(&proposal(), &KEY_B).unwrap();
+        assert!(decode_regeneration_proposal(&forged, &KEY_A).is_err());
+    }
+
+    #[test]
+    fn server_config_clones_share_proposal_authentication_authority() {
+        let config = crate::server::tests::config_for_proposal_test();
+        let preview = config.clone();
+        assert!(std::sync::Arc::ptr_eq(
+            &config.regeneration_proposal_key,
+            &preview.regeneration_proposal_key
+        ));
+        let id =
+            encode_regeneration_proposal(&proposal(), config.regeneration_proposal_key.as_ref())
+                .unwrap();
+        assert!(
+            decode_regeneration_proposal(&id, preview.regeneration_proposal_key.as_ref()).is_ok()
+        );
     }
 }
 
@@ -116,25 +141,36 @@ fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
-fn encode_regeneration_proposal(proposal: &RegenerationProposal) -> Result<String, String> {
-    use sha2::{Digest, Sha256};
+fn encode_regeneration_proposal(
+    proposal: &RegenerationProposal,
+    key: &[u8],
+) -> Result<String, String> {
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256;
     let bytes = serde_json::to_vec(proposal).map_err(|error| error.to_string())?;
-    let digest = encode_hex(&Sha256::digest(&bytes));
-    Ok(format!("rg1-{digest}-{}", encode_hex(&bytes)))
+    let mut mac = Hmac::<Sha256>::new_from_slice(key)
+        .map_err(|_| "invalid regeneration proposal signing key".to_string())?;
+    mac.update(&bytes);
+    let signature = encode_hex(&mac.finalize().into_bytes());
+    Ok(format!("rg2-{signature}-{}", encode_hex(&bytes)))
 }
 
-fn decode_regeneration_proposal(value: &str) -> Result<RegenerationProposal, String> {
-    use sha2::{Digest, Sha256};
+fn decode_regeneration_proposal(value: &str, key: &[u8]) -> Result<RegenerationProposal, String> {
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256;
     let rest = value
-        .strip_prefix("rg1-")
+        .strip_prefix("rg2-")
         .ok_or_else(|| "invalid regeneration proposal version".to_string())?;
-    let (expected, payload) = rest
+    let (signature, payload) = rest
         .split_once('-')
         .ok_or_else(|| "invalid regeneration proposal".to_string())?;
     let bytes = decode_hex(payload)?;
-    if encode_hex(&Sha256::digest(&bytes)) != expected {
-        return Err("regeneration proposal integrity check failed".to_string());
-    }
+    let signature = decode_hex(signature)?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(key)
+        .map_err(|_| "invalid regeneration proposal signing key".to_string())?;
+    mac.update(&bytes);
+    mac.verify_slice(&signature)
+        .map_err(|_| "regeneration proposal authentication failed".to_string())?;
     serde_json::from_slice(&bytes).map_err(|_| "invalid regeneration proposal".to_string())
 }
 
@@ -1666,7 +1702,10 @@ pub(super) async fn handle_admin_request(
             };
             let regime = config.evaluator.verb_promotion_stamp().to_string();
             let (prompt, synthesized, is_apply) = if let Some(proposal_id) = proposal_id {
-                let proposal = match decode_regeneration_proposal(&proposal_id) {
+                let proposal = match decode_regeneration_proposal(
+                    &proposal_id,
+                    config.regeneration_proposal_key.as_ref(),
+                ) {
                     Ok(proposal) => proposal,
                     Err(message) => return AdminResponse::Error { message },
                 };
@@ -1745,7 +1784,10 @@ pub(super) async fn handle_admin_request(
                     prompt,
                     candidate: verb.clone(),
                 };
-                let proposal_id = match encode_regeneration_proposal(&proposal) {
+                let proposal_id = match encode_regeneration_proposal(
+                    &proposal,
+                    config.regeneration_proposal_key.as_ref(),
+                ) {
                     Ok(id) => id,
                     Err(message) => return AdminResponse::Error { message },
                 };

@@ -171,6 +171,10 @@ struct ServerConfig {
     /// Serializes terminal transitions so memory and durable state observe one
     /// winner for approve, deny, and withdraw races.
     pub grant_request_transition_gate: Arc<Mutex<()>>,
+    /// Daemon-lifetime authentication key for stateless regeneration
+    /// proposals. Cloned configurations share the same key so internal preview
+    /// configurations can verify proposals without exposing authority.
+    pub regeneration_proposal_key: Arc<[u8; 32]>,
     /// Optional server-wide binary allow-list. `None` (the default) imposes no
     /// restriction. When `Some`, only binaries permitted by [`binary_allowed`]
     /// may execute, on every route (raw run, verb, and gated approval), as a
@@ -234,6 +238,9 @@ impl ServerConfig {
         exec_as_caller: bool,
         state_db_path: Option<PathBuf>,
     ) -> Self {
+        use rand::Rng;
+        let mut regeneration_proposal_key = [0u8; 32];
+        rand::rng().fill_bytes(&mut regeneration_proposal_key);
         Self {
             socket_path,
             tcp_port,
@@ -268,6 +275,7 @@ impl ServerConfig {
             saved_grants: Arc::new(RwLock::new(SavedGrantCatalog::empty())),
             grant_requests: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
             grant_request_transition_gate: Arc::new(Mutex::new(())),
+            regeneration_proposal_key: Arc::new(regeneration_proposal_key),
             // No binary restriction by default; the entrypoint sets this from
             // --allow-bin / GUARD_ALLOW_BIN, like the gate fields above.
             allowed_binaries: None,
