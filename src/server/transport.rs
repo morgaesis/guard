@@ -769,6 +769,9 @@ impl Server {
             tokio::fs::create_dir_all(parent)
                 .await
                 .context("failed to create socket directory")?;
+            Self::chmod_path(parent, 0o700)
+                .await
+                .context("failed to restrict socket directory before binding")?;
         }
 
         if socket_path.exists() {
@@ -776,7 +779,9 @@ impl Server {
         }
 
         let listener = UnixListener::bind(socket_path).context("failed to bind UNIX socket")?;
-        Self::chmod_path(socket_path, 0o600).await?;
+        if let Err(error) = Self::chmod_path(socket_path, 0o600).await {
+            return Err(Self::fail_closed_socket(socket_path, error).await);
+        }
 
         if let Some(group) = socket_group {
             if let Err(error) = Self::chown_to_group(socket_path, group).await {
@@ -794,16 +799,20 @@ impl Server {
 
     #[cfg(unix)]
     async fn fail_closed_socket(socket_path: &Path, setup_error: anyhow::Error) -> anyhow::Error {
-        match Self::chmod_path(socket_path, 0o600).await {
-            Ok(()) => setup_error,
-            Err(permission_error) => match tokio::fs::remove_file(socket_path).await {
-                Ok(()) => setup_error.context(format!(
-                    "failed to restore owner-only socket permissions; the socket was removed: {permission_error}"
-                )),
-                Err(removal_error) => setup_error.context(format!(
-                    "failed to restore owner-only socket permissions ({permission_error}) and failed to remove the socket ({removal_error})"
-                )),
-            },
+        let permission_error = Self::chmod_path(socket_path, 0o600).await.err();
+        let removal_error = tokio::fs::remove_file(socket_path).await.err();
+
+        match (permission_error, removal_error) {
+            (None, None) => setup_error,
+            (Some(permission_error), None) => setup_error.context(format!(
+                "failed to restore owner-only socket permissions before removing the socket: {permission_error}"
+            )),
+            (None, Some(removal_error)) => setup_error.context(format!(
+                "restored owner-only socket permissions but failed to remove the socket: {removal_error}"
+            )),
+            (Some(permission_error), Some(removal_error)) => setup_error.context(format!(
+                "failed to restore owner-only socket permissions ({permission_error}) and failed to remove the socket ({removal_error})"
+            )),
         }
     }
 
@@ -1511,6 +1520,7 @@ mod unix_listener_tests {
         let temp = tempfile::tempdir().unwrap();
         let socket = temp.path().join("guard.sock");
         let listener = Server::prepare_unix_listener(&socket, None).await.unwrap();
+        assert_eq!(mode(temp.path()), 0o700);
         assert_eq!(mode(&socket), 0o600);
         drop(listener);
     }
@@ -1528,6 +1538,7 @@ mod unix_listener_tests {
         let metadata = std::fs::symlink_metadata(&socket).unwrap();
         assert_eq!(metadata.gid(), gid);
         assert_eq!(metadata.mode() & 0o777, 0o660);
+        assert_eq!(mode(temp.path()), 0o755);
         drop(listener);
     }
 
@@ -1542,6 +1553,7 @@ mod unix_listener_tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains("failed to change group"));
-        assert_eq!(mode(&socket), 0o600);
+        assert!(!socket.exists());
+        assert_eq!(mode(temp.path()), 0o700);
     }
 }
