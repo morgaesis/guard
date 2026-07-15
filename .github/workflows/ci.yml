@@ -135,6 +135,7 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build
+        shell: bash
         env:
           BUILD_TARGET: ${{ matrix.target }}
         run: cargo build --release --target "$BUILD_TARGET"

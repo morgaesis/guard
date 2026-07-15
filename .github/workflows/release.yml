@@ -100,6 +100,7 @@ jobs:
 
       - name: Build binary (Native)
         if: "!matrix.use_cross"
+        shell: bash
         env:
           BUILD_TARGET: ${{ matrix.target }}
         run: |
@@ -111,6 +112,7 @@ jobs:
 
       - name: Build binary (Cross)
         if: matrix.use_cross
+        shell: bash
         env:
           BUILD_TARGET: ${{ matrix.target }}
         run: |
