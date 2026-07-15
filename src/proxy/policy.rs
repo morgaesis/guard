@@ -7,6 +7,7 @@
 
 use super::op::ApiOp;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// What to do with a matched request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,6 +128,17 @@ impl ApiPolicy {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
     }
 
+    /// Stable digest of every policy field that can affect routing or evaluator
+    /// intent. A route binds this digest before classification and requires it
+    /// unchanged at each upstream boundary.
+    pub fn authority_fingerprint(&self) -> String {
+        let encoded = serde_json::to_vec(self).expect("API policy serializes");
+        Sha256::digest(encoded)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
     /// First matching rule wins; otherwise the default action. Redaction is
     /// forced on for any Secret read regardless of the rule flag, so an operator
     /// cannot accidentally allow reading secret values by omitting the flag.
@@ -196,6 +208,27 @@ mod tests {
     fn default_is_deny() {
         let p = ApiPolicy::deny_all();
         assert_eq!(p.decide(&op("GET", "/api/v1/pods")).action, ApiAction::Deny);
+    }
+
+    #[test]
+    fn authority_fingerprint_covers_actions_and_intent() {
+        let base = policy(
+            "intent: inspect dev\ndefault: deny\nrules:\n  - verbs: [get]\n    resources: [pods]\n    action: allow\n",
+        );
+        let changed_action = policy(
+            "intent: inspect dev\ndefault: deny\nrules:\n  - verbs: [get]\n    resources: [pods]\n    action: evaluate\n",
+        );
+        let changed_intent = policy(
+            "intent: inspect prod\ndefault: deny\nrules:\n  - verbs: [get]\n    resources: [pods]\n    action: allow\n",
+        );
+        assert_ne!(
+            base.authority_fingerprint(),
+            changed_action.authority_fingerprint()
+        );
+        assert_ne!(
+            base.authority_fingerprint(),
+            changed_intent.authority_fingerprint()
+        );
     }
 
     #[test]
