@@ -79,6 +79,7 @@ mod api_judge;
 mod execute;
 mod gate_runtime;
 mod grants;
+mod secure_fs;
 #[cfg(test)]
 mod tests;
 mod transport;
@@ -186,6 +187,8 @@ struct ServerConfig {
     /// expiry and startup reconciliation revokes any that expired while the
     /// daemon was down.
     pub read_grants: Arc<RwLock<GrantReadRegistry>>,
+    /// Daemon-only root for child-lifetime secret files.
+    pub secret_file_root: Option<PathBuf>,
 }
 
 impl ServerConfig {
@@ -249,6 +252,7 @@ impl ServerConfig {
             extra_child_env: Vec::new(),
             protocol_registry: Arc::new(RwLock::new(std::collections::HashMap::new())),
             read_grants: Arc::new(RwLock::new(GrantReadRegistry::new())),
+            secret_file_root: None,
         }
     }
 
@@ -914,7 +918,12 @@ async fn validate_request_injections(
     caller: &CallerIdentity,
     command_line: &str,
 ) -> std::result::Result<(), String> {
-    for key in request.env.keys().chain(request.secrets.keys()) {
+    for key in request
+        .env
+        .keys()
+        .chain(request.secrets.keys())
+        .chain(request.secret_files.keys())
+    {
         if !is_valid_env_name(key) {
             return Err(format!(
                 "invalid injected environment variable name: '{}'",
@@ -929,20 +938,36 @@ async fn validate_request_injections(
         }
     }
 
-    for env_var in request.secrets.keys() {
-        if request.env.contains_key(env_var) {
+    let mut names = std::collections::HashSet::new();
+    for env_var in request
+        .env
+        .keys()
+        .chain(request.secrets.keys())
+        .chain(request.secret_files.keys())
+    {
+        if !names.insert(env_var) {
             return Err(format!(
-                "conflicting injection for '{}': choose either --env or --secret, not both",
+                "conflicting injection for '{}': choose one of --env, --secret, or --secret-file",
                 env_var
             ));
         }
     }
 
+    if config.exec_as_caller && !request.secret_files.is_empty() {
+        return Err(
+            "--secret-file is unavailable when the daemon uses --exec-as-caller because the caller identity must not receive access to daemon-owned secret files"
+                .to_string(),
+        );
+    }
+
     let principal = match caller.principal() {
         Some(principal) if caller.is_local_peer() => principal,
         _ => {
-            if !request.secrets.is_empty() {
-                return Err("secret injection requires an authenticated local caller".to_string());
+            if !request.secrets.is_empty() || !request.secret_files.is_empty() {
+                return Err(
+                    "secret and secret-file injection require an authenticated local caller"
+                        .to_string(),
+                );
             }
             return Ok(());
         }
@@ -966,6 +991,22 @@ async fn validate_request_injections(
             Err(e) => {
                 return Err(format!("failed to read secret '{}': {}", secret_key, e));
             }
+        }
+    }
+
+    for (env_var, secret_key) in &request.secret_files {
+        if !is_valid_secret_key(secret_key) {
+            return Err(format!("invalid secret key: '{}'", secret_key));
+        }
+        match config.secrets.get(&principal, secret_key).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Err(format!(
+                    "secret not found: '{}' (required by --secret-file {})",
+                    secret_key, env_var
+                ));
+            }
+            Err(e) => return Err(format!("failed to read secret '{}': {}", secret_key, e)),
         }
     }
 

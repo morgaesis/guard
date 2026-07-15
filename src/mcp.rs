@@ -115,6 +115,8 @@ struct GuardToolArgs {
     secrets: Vec<String>,
     #[serde(default, rename = "secretEnv")]
     secret_env: HashMap<String, String>,
+    #[serde(default, rename = "secretFiles")]
+    secret_files: HashMap<String, String>,
     // --- Consequence gating (optional) ---
     /// Rollback command for a recoverable action, as a single string.
     #[serde(default)]
@@ -268,7 +270,7 @@ impl GuardExecutor for ClientExecutor {
         }
 
         let response = client
-            .execute_with_injections(&args.binary, &args.args, env, secrets)
+            .execute_with_injections(&args.binary, &args.args, env, secrets, args.secret_files)
             .await
             .context("failed to execute command through guard server")?;
 
@@ -838,6 +840,11 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                                 "additionalProperties": { "type": "string" },
                                 "description": "Optional explicit environment-variable to stored-secret mappings."
                             },
+                            "secretFiles": {
+                                "type": "object",
+                                "additionalProperties": { "type": "string" },
+                                "description": "Optional environment-variable to stored-secret mappings. Each variable receives a daemon-private child-lifetime file path."
+                            },
                             "verb": {
                                 "type": "object",
                                 "description": "Optional: invoke an operator-defined verb instead of a raw binary. Provide name and params; the daemon renders the typed template.",
@@ -1337,6 +1344,10 @@ mod tests {
             response["result"]["tools"][0]["inputSchema"]["properties"]["hostkey"]["enum"],
             json!(["only-existing", "accept-new", "accept-all"])
         );
+        assert_eq!(
+            response["result"]["tools"][0]["inputSchema"]["properties"]["secretFiles"]["type"],
+            "object"
+        );
     }
 
     #[test]
@@ -1356,6 +1367,25 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(without.hostkey, None);
+    }
+
+    #[test]
+    fn guard_tool_args_accepts_secret_file_bindings() {
+        let parsed: GuardToolArgs = serde_json::from_value(json!({
+            "binary": "credential-tool",
+            "args": ["inspect"],
+            "secretFiles": {
+                "CREDENTIAL_FILE": "service/credential"
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            parsed
+                .secret_files
+                .get("CREDENTIAL_FILE")
+                .map(String::as_str),
+            Some("service/credential")
+        );
     }
 
     #[tokio::test]

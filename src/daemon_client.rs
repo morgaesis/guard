@@ -183,8 +183,10 @@ impl Client {
         args: &[String],
         env: HashMap<String, String>,
         secrets: HashMap<String, String>,
+        secret_files: HashMap<String, String>,
     ) -> Result<ExecuteResponse> {
-        let mut request = self.build_execute_request(binary, args, env, secrets, false);
+        let mut request =
+            self.build_execute_request(binary, args, env, secrets, secret_files, false);
 
         tracing::debug!(
             binary = %binary,
@@ -209,12 +211,14 @@ impl Client {
         args: &[String],
         env: HashMap<String, String>,
         secrets: HashMap<String, String>,
+        secret_files: HashMap<String, String>,
         mut on_output: F,
     ) -> Result<ExecuteResponse>
     where
         F: FnMut(OutputStream, &str),
     {
-        let mut request = self.build_execute_request(binary, args, env, secrets, true);
+        let mut request =
+            self.build_execute_request(binary, args, env, secrets, secret_files, true);
 
         tracing::debug!(
             binary = %binary,
@@ -241,6 +245,7 @@ impl Client {
         args: &[String],
         env: HashMap<String, String>,
         secrets: HashMap<String, String>,
+        secret_files: HashMap<String, String>,
         stream: bool,
     ) -> ExecuteRequest {
         ExecuteRequest {
@@ -249,6 +254,7 @@ impl Client {
             auth_token: self.auth_token.clone(),
             env,
             secrets,
+            secret_files,
             stream,
             session_token: self.session_token.clone(),
             revert: self.revert.clone(),
@@ -582,8 +588,14 @@ mod tests {
     #[test]
     fn tcp_execute_request_does_not_carry_cwd() {
         let client = Client::new(None, Some(8123));
-        let request =
-            client.build_execute_request("id", &[], HashMap::new(), HashMap::new(), false);
+        let request = client.build_execute_request(
+            "id",
+            &[],
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            false,
+        );
         assert!(request.cwd.is_none());
     }
 }

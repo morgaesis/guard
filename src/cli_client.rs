@@ -9,6 +9,12 @@ pub(crate) struct GatingOptions {
     pub(crate) reevaluate: bool,
 }
 
+pub(crate) struct RunInjections {
+    pub(crate) env: HashMap<String, String>,
+    pub(crate) secrets: HashMap<String, String>,
+    pub(crate) secret_files: HashMap<String, String>,
+}
+
 /// CLI spelling of the ssh host-key mode. Kebab-case value names
 /// (`only-existing`, `accept-new`, `accept-all`) are derived by clap.
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -66,8 +72,7 @@ fn print_coverage(coverage: &Option<guard::gating::Coverage>) {
 pub(crate) async fn run_exec(
     binary: String,
     args: Vec<String>,
-    env_vars: HashMap<String, String>,
-    secret_vars: HashMap<String, String>,
+    injections: RunInjections,
     gating: GatingOptions,
     hostkey: server::SshHostKeyMode,
     json: bool,
@@ -106,17 +111,23 @@ pub(crate) async fn run_exec(
         "REQUEST"
     );
     let mut streamed_output = false;
+    let RunInjections {
+        env,
+        secrets,
+        secret_files,
+    } = injections;
     let resp = if json {
         client
-            .execute_with_injections(&binary, &args, env_vars, secret_vars)
+            .execute_with_injections(&binary, &args, env, secrets, secret_files)
             .await
     } else {
         client
             .execute_streaming_with_injections(
                 &binary,
                 &args,
-                env_vars,
-                secret_vars,
+                env,
+                secrets,
+                secret_files,
                 |stream, data| {
                     streamed_output = true;
                     match stream {
@@ -556,13 +567,20 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
             let mut streamed = false;
             let resp = if json {
                 client
-                    .execute_with_injections("", &[], HashMap::new(), HashMap::new())
+                    .execute_with_injections(
+                        "",
+                        &[],
+                        HashMap::new(),
+                        HashMap::new(),
+                        HashMap::new(),
+                    )
                     .await
             } else {
                 client
                     .execute_streaming_with_injections(
                         "",
                         &[],
+                        HashMap::new(),
                         HashMap::new(),
                         HashMap::new(),
                         |stream, data| {

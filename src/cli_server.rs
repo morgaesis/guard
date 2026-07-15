@@ -763,7 +763,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 session_store,
                 exec_as_caller,
                 state_db_path,
-            );
+            )?;
             srv.set_gate(gate_mode);
 
             let explicit_verbs_path = verbs.or_else(|| {
@@ -1180,11 +1180,15 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             token,
             env_vars,
             secret_vars,
+            secret_file_vars,
             binary,
             args,
         } => {
             let env_vars = env_pairs_to_map(env_vars).map_err(anyhow::Error::msg)?;
             let secret_vars = secret_pairs_to_map(secret_vars).map_err(anyhow::Error::msg)?;
+            let secret_file_vars =
+                collect_unique_pairs(secret_file_vars, "secret-file injection", "secret")
+                    .map_err(anyhow::Error::msg)?;
             let socket_path = socket.map(PathBuf::from);
             let mut client = daemon_client::Client::new(socket_path, tcp_port);
             if let Some(token) = token {
@@ -1208,6 +1212,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                     &args,
                     env_vars,
                     secret_vars,
+                    secret_file_vars,
                     |stream, data| {
                         streamed_output = true;
                         match stream {

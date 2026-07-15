@@ -15,6 +15,8 @@ use guard::policy::PolicyMode;
 use std::future::Future;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
+use tracing::instrument::WithSubscriber;
 use tracing::subscriber::with_default;
 use tracing_subscriber::fmt::MakeWriter;
 
@@ -48,7 +50,7 @@ fn make_test_config() -> (ServerConfig, SharedBuf) {
     let eval_config = EvalConfig::default().llm_enabled(false);
     let evaluator = Evaluator::new(eval_config).expect("build evaluator");
     let secrets = SecretManager::with_backend(EnvBackend::default());
-    let cfg = ServerConfig::new(
+    let mut cfg = ServerConfig::new(
         None,
         None,
         evaluator,
@@ -68,6 +70,12 @@ fn make_test_config() -> (ServerConfig, SharedBuf) {
         false,
         None,
     );
+    let secret_root = tempfile::tempdir()
+        .expect("secret-file test parent")
+        .keep()
+        .join("secret-files");
+    super::secure_fs::prepare_private_root(&secret_root).expect("prepare secret-file test root");
+    cfg.secret_file_root = Some(secret_root);
     let buf = SharedBuf(Arc::new(Mutex::new(Vec::new())));
     (cfg, buf)
 }
@@ -78,7 +86,7 @@ fn paranoid_test_config() -> ServerConfig {
         .mode(PolicyMode::Paranoid);
     let evaluator = Evaluator::new(eval_config).expect("build evaluator");
     let secrets = SecretManager::with_backend(EnvBackend::default());
-    ServerConfig::new(
+    let mut cfg = ServerConfig::new(
         None,
         None,
         evaluator,
@@ -97,7 +105,14 @@ fn paranoid_test_config() -> ServerConfig {
         None,
         false,
         None,
-    )
+    );
+    let secret_root = tempfile::tempdir()
+        .expect("secret-file test parent")
+        .keep()
+        .join("secret-files");
+    super::secure_fs::prepare_private_root(&secret_root).expect("prepare secret-file test root");
+    cfg.secret_file_root = Some(secret_root);
+    cfg
 }
 
 fn args(list: &[&str]) -> Vec<String> {
@@ -129,8 +144,7 @@ where
         .with_ansi(false)
         .without_time()
         .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
-    let output = future.await;
+    let output = future.with_subscriber(subscriber).await;
     let bytes = buf.0.lock().unwrap().clone();
     (output, String::from_utf8_lossy(&bytes).to_string())
 }

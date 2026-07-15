@@ -144,6 +144,11 @@ pub struct ExecuteRequest {
     /// Secret values are resolved by the daemon immediately before execution.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub secrets: HashMap<String, String>,
+    /// Per-run secret-file mappings: child env var -> daemon secret key. The
+    /// daemon materializes each value into a private child-lifetime file and
+    /// injects only its path.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub secret_files: HashMap<String, String>,
     #[serde(default)]
     pub stream: bool,
     /// Session grant token. When present and matched server-side, session
