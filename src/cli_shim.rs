@@ -1,16 +1,32 @@
 use super::*;
 
-pub(crate) async fn handle_shim(
-    tools: Option<Vec<String>>,
-    list: bool,
-    remove: bool,
-    path: Option<PathBuf>,
-    env_vars: Vec<(String, String)>,
-    secret_vars: Vec<(String, String)>,
-    user: Option<String>,
-) -> Result<()> {
+pub(crate) struct ShimOptions {
+    pub(crate) tools: Option<Vec<String>>,
+    pub(crate) list: bool,
+    pub(crate) remove: bool,
+    pub(crate) path: Option<PathBuf>,
+    pub(crate) env_vars: Vec<(String, String)>,
+    pub(crate) secret_vars: Vec<(String, String)>,
+    pub(crate) user: Option<String>,
+    pub(crate) json: bool,
+}
+
+pub(crate) async fn handle_shim(options: ShimOptions) -> Result<()> {
+    let ShimOptions {
+        tools,
+        list,
+        remove,
+        path,
+        env_vars,
+        secret_vars,
+        user,
+        json,
+    } = options;
     let env_vars = env_pairs_to_map(env_vars).map_err(anyhow::Error::msg)?;
     let secret_vars = env_pairs_to_map(secret_vars).map_err(anyhow::Error::msg)?;
+    if json && !list && (remove || tools.is_some()) {
+        anyhow::bail!("--json is supported for shim listing, not installation or removal");
+    }
     let shim_dir = path.unwrap_or_else(|| {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -18,7 +34,7 @@ pub(crate) async fn handle_shim(
     });
 
     if list {
-        return print_installed_shims(shim_dir);
+        return print_installed_shims(shim_dir, json);
     }
 
     if remove {
@@ -47,7 +63,7 @@ pub(crate) async fn handle_shim(
                 "no tools named; specify which tools to configure, e.g. `guard shim ssh,scp --env KEY=VALUE`"
             );
         }
-        return print_installed_shims(shim_dir);
+        return print_installed_shims(shim_dir, json);
     };
     let generator = shim::ShimGenerator::new(std::env::current_exe()?, shim_dir.clone());
     let tools_refs: Vec<&str> = tools_to_install.iter().map(|s| s.as_str()).collect();
@@ -94,9 +110,30 @@ pub(crate) async fn handle_shim(
     Ok(())
 }
 
-fn print_installed_shims(shim_dir: PathBuf) -> Result<()> {
+fn print_installed_shims(shim_dir: PathBuf, json: bool) -> Result<()> {
     let generator = shim::ShimGenerator::new(std::env::current_exe()?, shim_dir);
     let installed = generator.list_installed()?;
+    if json {
+        let registry = tool_config::ToolRegistry::load_default()
+            .unwrap_or_else(|_| tool_config::ToolRegistry::empty());
+        let items = installed
+            .iter()
+            .map(|name| {
+                let config = registry.get(name);
+                serde_json::json!({
+                    "name": name,
+                    "env": config.map(|value| &value.env),
+                    "secrets": config.map(|value| &value.secrets),
+                    "users": config.map(|value| &value.users),
+                })
+            })
+            .collect::<Vec<_>>();
+        return print_json(&serde_json::json!({
+            "schema_version": JSON_SCHEMA_VERSION,
+            "type": "shim_list",
+            "items": items,
+        }));
+    }
     if installed.is_empty() {
         println!("No shims installed");
     } else {

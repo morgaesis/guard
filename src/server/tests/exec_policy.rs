@@ -31,6 +31,9 @@ use tokio::sync::RwLock;
 use super::{args, capture, make_test_config, paranoid_test_config};
 
 #[cfg(unix)]
+static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(unix)]
 struct EnvRestore {
     key: &'static str,
     value: Option<OsString>,
@@ -1274,6 +1277,7 @@ async fn redaction_covers_effective_tool_child_and_request_env_values() {
 #[cfg(unix)]
 #[tokio::test]
 async fn ansible_discovers_config_from_cwd_without_inherited_ansible_config() {
+    let _env_guard = TEST_ENV_LOCK.lock().await;
     let (cfg, _) = make_test_config();
     let temp = tempfile::tempdir().unwrap();
     let bin_dir = temp.path().join("bin");
@@ -1372,6 +1376,7 @@ async fn tcp_caller_cannot_assert_working_directory() {
 #[cfg(unix)]
 #[tokio::test]
 async fn shim_dir_only_path_fails_without_recursing_into_primary_shim() {
+    let _env_guard = TEST_ENV_LOCK.lock().await;
     let (mut cfg, _) = make_test_config();
     let shim_dir = tempfile::tempdir().unwrap();
     let shim_path = shim_dir.path().join("missing-tool");
@@ -1417,6 +1422,7 @@ async fn shim_dir_only_path_fails_without_recursing_into_primary_shim() {
 #[cfg(unix)]
 #[tokio::test]
 async fn allowed_binary_floor_does_not_permit_shim_dir_recursion() {
+    let _env_guard = TEST_ENV_LOCK.lock().await;
     let (mut cfg, _) = make_test_config();
     let shim_dir = tempfile::tempdir().unwrap();
     let shim_path = shim_dir.path().join("allowed-tool");

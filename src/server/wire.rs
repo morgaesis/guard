@@ -706,6 +706,12 @@ pub struct ServerStatus {
     /// Outstanding held approvals.
     #[serde(default)]
     pub pending_approvals: usize,
+    /// Short content hash of the active verb catalog.
+    #[serde(default)]
+    pub verb_catalog_hash: String,
+    /// Filesystem change time for a file-backed verb catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verb_catalog_changed_unix: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

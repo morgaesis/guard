@@ -771,7 +771,7 @@ guard run --env OPNSENSE_HOST=opnsense-host --secret OPNSENSE_API_KEY \
 
 Session mutating RPCs (`grant`, grant-installing `session new`, `appeal`, and `revoke`, plus the privileged subset of `status`) are restricted to **the daemon's own principal** over a local listener: its uid over a Unix-domain socket, its SID over a Windows named pipe. Token-only `session new` runs locally and does not contact the daemon. `session list` is visible to exec-allowed local callers with redaction. Non-admin callers see that grants exist, when they were granted, and when they expire, but tokens, rule bodies, generated notes, and prompt text are hidden for other sessions. If `GUARD_SESSION` names a session the caller already has, that row is shown as `token=(current)` and includes its own rules, generated notes, and prompt context without printing the raw token. `session show <token>` accepts a known token from an exec-allowed local caller and prints details with token output hidden as `(provided)`. On TCP transports, non-Ping admin RPCs require the separate `GUARD_ADMIN_TOKEN`; the ordinary TCP exec `GUARD_AUTH_TOKEN` is not enough to mint grants.
 
-The non-privileged `guard status` (run as your normal user or any other exec-allowed UID, or over TCP without the admin token) returns only client + server version, uptime, evaluation mode, and dry-run state. It is a liveness probe - enough to confirm the connection works and what mode the evaluator is in, but nothing that would help fingerprint the deployment or escalate privilege.
+The non-privileged `guard status` (run as your normal user or any other exec-allowed UID, or over TCP without the admin token) returns only client + server version, uptime, evaluation mode, and dry-run state. It is a liveness probe, enough to confirm the connection works and what mode the evaluator is in without exposing deployment detail. The daemon principal also sees queue depths, learned-store counts, the verb-catalog content hash and change time, and the resolved server configuration. A client/server version mismatch is reported explicitly.
 
 The `--prompt` / `--prompt-file` flags attach a free-form context fragment that is appended to the LLM system prompt under a `Session context:` heading for evaluator calls made under that token. Prose grants use the same context path after static rule synthesis. Use prompt/prose for guidance the static glob patterns cannot express. The decision cache is bypassed when a session prompt is in play, because cached verdicts were made under the base prompt and may not hold under the extended context.
 
@@ -787,11 +787,20 @@ By default the daemon executes approved commands as its own service identity, on
 
 Point your agent's command execution at `guard run` instead of direct execution.
 
-Exit codes for scripted callers: an approved command propagates the child
-process's exit code, a denied command exits `1` with the denial reason on
-stderr, and a command held for operator approval exits `75` (EX_TEMPFAIL)
-with the approval handle on stderr, so the caller can retry after
-`guard approve`.
+Human output streams child stdout and stderr as they arrive. `guard run --json`
+and `guard verb run <name> --json` instead wait for completion and emit one JSON
+object containing the command, decision, reason, handle, coverage, child output,
+and child exit code. Read commands support the same flag: `status`,
+`provisionals`, `approvals`, `verb list`, `session list`, `session show`,
+`secrets list`, `config show`, and shim listing. JSON data goes to stdout;
+diagnostics go to stderr. Every envelope carries `schema_version: 1`.
+
+Exit codes for scripted callers are stable. An executed command propagates the
+child process's exit code, including `1` and `75`. Guard uses `125` for its own
+operational errors, `126` for policy denial, and `127` for a command held for
+operator approval. Invalid CLI usage follows the conventional exit code `2`.
+The structured response retains the exact child status and the hold or
+provisional handle.
 
 ### MCP server
 

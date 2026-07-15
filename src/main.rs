@@ -39,6 +39,19 @@ use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::{fmt as tracing_fmt, EnvFilter};
 
+const EXIT_GUARD_ERROR: i32 = 125;
+const EXIT_GUARD_DENIED: i32 = 126;
+const EXIT_GUARD_HELD: i32 = 127;
+const JSON_SCHEMA_VERSION: u32 = 1;
+
+fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    serde_json::to_writer_pretty(&mut lock, value)?;
+    writeln!(lock)?;
+    Ok(())
+}
+
 use cli_client::{
     handle_approval_note_cmd, handle_approvals, handle_config, handle_gate_action,
     handle_provisionals, handle_session, handle_status, handle_verb, run_exec, run_mcp,
@@ -46,7 +59,7 @@ use cli_client::{
 };
 use cli_secrets::handle_secrets;
 use cli_server::run_server;
-use cli_shim::handle_shim;
+use cli_shim::{handle_shim, ShimOptions};
 
 #[derive(Parser)]
 #[command(
@@ -67,6 +80,9 @@ enum MainArgs {
         after_help = "Use `guard run <binary> --help` to pass --help to the child command."
     )]
     Run {
+        /// Emit one machine-readable result object instead of streaming child output.
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
         /// Inject an environment variable (KEY=VALUE, repeatable)
         #[arg(long = "env", value_name = "KEY=VALUE", value_parser = parse_env_assignment)]
         env_vars: Vec<(String, String)>,
@@ -119,6 +135,9 @@ enum MainArgs {
     /// Manage shim scripts for command interposition. Naming tools installs
     /// their shims; bare `guard shim` lists what is installed.
     Shim {
+        /// Emit machine-readable output when listing shims.
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
         /// Comma-separated list of tools to shim (e.g. ssh,kubectl,helm);
         /// required to install, omit to list installed shims
         #[arg(value_delimiter = ',')]
@@ -219,6 +238,9 @@ enum MainArgs {
     Status {
         #[arg(long)]
         socket: Option<String>,
+        /// Emit machine-readable status.
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
     },
     /// Print a categorized command tree with access markers.
     #[clap(name = "help-tree")]
@@ -231,6 +253,9 @@ enum MainArgs {
     Provisionals {
         #[arg(long)]
         socket: Option<String>,
+        /// Emit machine-readable provisional records.
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
     },
     /// Confirm a provisional: keep the change and cancel its auto-revert.
     /// Daemon-UID only.
@@ -251,6 +276,9 @@ enum MainArgs {
         handle: Option<String>,
         #[arg(long)]
         socket: Option<String>,
+        /// Emit machine-readable approval records.
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
     },
     /// Approve a held command: execute it from its bound snapshot. Daemon-UID only.
     Approve {
@@ -286,6 +314,9 @@ enum VerbCommands {
     List {
         #[arg(long)]
         socket: Option<String>,
+        /// Emit machine-readable verb records.
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
     },
     /// Run a verb with validated parameters: --param key=value (repeatable).
     Run {
@@ -302,6 +333,9 @@ enum VerbCommands {
         wait_approval: Option<u64>,
         #[arg(long)]
         socket: Option<String>,
+        /// Emit one machine-readable result object instead of streaming child output.
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
     },
     /// Create a verb from plain-language prose (LLM-synthesized, validated, and
     /// stored with the prose + evidence). Operator-only.
@@ -317,6 +351,9 @@ enum VerbCommands {
         preview: bool,
         #[arg(long)]
         socket: Option<String>,
+        /// Emit the synthesized verb as machine-readable JSON.
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
     },
 }
 
@@ -451,6 +488,9 @@ enum SessionCommands {
         /// Server socket path (defaults to configured)
         #[arg(long, value_name = "PATH")]
         socket: Option<String>,
+        /// Emit machine-readable session detail.
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
     },
     /// List active session grants
     List {
@@ -470,6 +510,9 @@ enum SessionCommands {
         /// Server socket path (defaults to configured)
         #[arg(long, value_name = "PATH")]
         socket: Option<String>,
+        /// Emit machine-readable session records.
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
     },
 }
 
@@ -933,13 +976,20 @@ enum ServerCommands {
     Status {
         #[arg(long)]
         socket: Option<String>,
+        /// Emit machine-readable status.
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
     },
 }
 
 #[derive(Subcommand)]
 enum ConfigCommands {
     /// Show current configuration
-    Show,
+    Show {
+        /// Emit machine-readable configuration with credentials masked.
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
     /// Set server socket path
     SetServer {
         /// UNIX socket path for guard clients.
@@ -1017,6 +1067,9 @@ enum SecretCommands {
         /// Include daemon-only ownership/origin detail for migration work.
         #[arg(long, action = ArgAction::SetTrue)]
         detailed: bool,
+        /// Emit machine-readable secret metadata. Values are never included.
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
     },
     /// Remove a stored secret.
     Remove {
@@ -1033,7 +1086,14 @@ fn guard_env(suffix: &str) -> Option<String> {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    if let Err(error) = run_main().await {
+        eprintln!("guard: {error:#}");
+        std::process::exit(EXIT_GUARD_ERROR);
+    }
+}
+
+async fn run_main() -> Result<()> {
     let _ = dotenvy::dotenv();
 
     // Windows service entry. The installer registers the daemon with
@@ -1090,6 +1150,7 @@ async fn main() -> Result<()> {
 
     match result {
         Ok(MainArgs::Run {
+            json,
             env_vars,
             secret_vars,
             revert,
@@ -1110,10 +1171,19 @@ async fn main() -> Result<()> {
                 wait_approval,
                 reevaluate,
             };
-            run_exec(binary, args, env_vars, secret_vars, gating, hostkey.into()).await
+            run_exec(
+                binary,
+                args,
+                env_vars,
+                secret_vars,
+                gating,
+                hostkey.into(),
+                json,
+            )
+            .await
         }
         Ok(MainArgs::Server(cmd)) => run_server(cmd).await,
-        Ok(MainArgs::Provisionals { socket }) => handle_provisionals(socket).await,
+        Ok(MainArgs::Provisionals { socket, json }) => handle_provisionals(socket, json).await,
         Ok(MainArgs::Confirm { handle, socket }) => {
             handle_gate_action(socket, "confirm", handle).await
         }
@@ -1124,7 +1194,11 @@ async fn main() -> Result<()> {
             handle_gate_action(socket, "approve", handle).await
         }
         Ok(MainArgs::Deny { handle, socket }) => handle_gate_action(socket, "deny", handle).await,
-        Ok(MainArgs::Approvals { handle, socket }) => handle_approvals(socket, handle).await,
+        Ok(MainArgs::Approvals {
+            handle,
+            socket,
+            json,
+        }) => handle_approvals(socket, handle, json).await,
         Ok(MainArgs::ApprovalNote {
             handle,
             text,
@@ -1133,6 +1207,7 @@ async fn main() -> Result<()> {
         Ok(MainArgs::Verb(subcommand)) => handle_verb(subcommand).await,
         Ok(MainArgs::Secrets(subcommand)) => handle_secrets(subcommand).await,
         Ok(MainArgs::Shim {
+            json,
             tools,
             list,
             remove,
@@ -1140,7 +1215,19 @@ async fn main() -> Result<()> {
             env_vars,
             secret_vars,
             user,
-        }) => handle_shim(tools, list, remove, path, env_vars, secret_vars, user).await,
+        }) => {
+            handle_shim(ShimOptions {
+                tools,
+                list,
+                remove,
+                path,
+                env_vars,
+                secret_vars,
+                user,
+                json,
+            })
+            .await
+        }
         Ok(MainArgs::Config(subcommand)) => handle_config(subcommand).await,
         Ok(MainArgs::Mcp(subcommand)) => run_mcp(subcommand).await,
         Ok(MainArgs::Session(subcommand)) => handle_session(subcommand).await,
@@ -1192,7 +1279,7 @@ async fn main() -> Result<()> {
             })
             .await
         }
-        Ok(MainArgs::Status { socket }) => handle_status(socket).await,
+        Ok(MainArgs::Status { socket, json }) => handle_status(socket, json).await,
         Ok(MainArgs::HelpTree { admin }) => {
             print_help_tree(admin);
             Ok(())
@@ -1208,7 +1295,7 @@ async fn main() -> Result<()> {
         Err(e) => {
             log_cli_usage_error(&args, &e);
             eprintln!("{}", e);
-            std::process::exit(1);
+            std::process::exit(2);
         }
     }
 }
