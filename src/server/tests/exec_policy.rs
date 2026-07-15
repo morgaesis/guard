@@ -4,7 +4,7 @@ use crate::server::binary_path_candidates;
 #[cfg(unix)]
 use crate::server::execute::exec_after_approval;
 use crate::server::execute::{
-    audit_command_line, audit_session_ref, audit_token, evaluation_context_prompt, execute_command,
+    audit_command_line, audit_session_fingerprint, evaluation_context_prompt, execute_command,
     log_audit_policy_for_request,
 };
 use crate::server::gate_runtime::binary_allowed;
@@ -88,18 +88,21 @@ fn audit_command_line_masks_inline_credentials() {
     assert!(line.contains("curl"), "got: {line}");
 }
 
-/// Tokens in audit lines use stable hashes; short and multi-byte values must
-/// not panic or expose any token bytes.
+/// Audit fingerprints are stable, distinct, 128-bit identifiers that do not
+/// expose token bytes. Short and multi-byte values must also remain safe.
 #[test]
-fn audit_token_is_stable_and_secret_safe() {
-    let first = audit_token("abcdefghij");
-    assert_eq!(first, audit_token("abcdefghij"));
-    assert_ne!(first, audit_token("abcdefghik"));
+fn audit_session_fingerprint_is_stable_distinct_and_non_reversible() {
+    let first = audit_session_fingerprint(Some("abcdefghij"));
+    assert_eq!(first, audit_session_fingerprint(Some("abcdefghij")));
+    assert_ne!(first, audit_session_fingerprint(Some("abcdefghik")));
     assert!(first.starts_with("sha256:"));
+    assert_eq!(first.len(), "sha256:".len() + 32);
     for token in ["abcdefghij", "short", "éééééééééé"] {
-        let fingerprint = audit_token(token);
+        let fingerprint = audit_session_fingerprint(Some(token));
         assert!(!fingerprint.contains(token), "got: {fingerprint}");
     }
+    assert_eq!(audit_session_fingerprint(None), "none");
+    assert_eq!(audit_session_fingerprint(Some("")), "none");
 }
 
 #[test]
@@ -134,8 +137,8 @@ fn cwd_is_included_in_audit_and_evaluation_context() {
     assert!(logs.contains("cmd=\"pwd\""), "logs={logs}");
     assert!(
         logs.contains(&format!(
-            "session={}",
-            audit_session_ref(req.session_token.as_deref())
+            "session_fingerprint={}",
+            audit_session_fingerprint(req.session_token.as_deref())
         )),
         "logs={logs}"
     );
@@ -144,7 +147,7 @@ fn cwd_is_included_in_audit_and_evaluation_context() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn secret_use_is_audited_only_after_successful_spawn() {
+async fn secret_exposure_is_audited_only_after_successful_spawn() {
     let caller = CallerIdentity::Unix { uid: 1000 };
     let principal = PrincipalKey::from_uid(1000);
     let token = "opaque-session-token-never-logged";
@@ -174,11 +177,11 @@ async fn secret_use_is_audited_only_after_successful_spawn() {
     )
     .await;
     assert_eq!(result.exit_code(), Some(0));
-    assert_eq!(result.secret_refs(), &["service/token"]);
-    assert!(logs.contains("[AUDIT] SECRET_USE"), "logs={logs}");
+    assert_eq!(result.exposed_secret_refs(), &["service/token"]);
+    assert!(logs.contains("[AUDIT] SECRET_EXPOSED"), "logs={logs}");
     assert!(logs.contains("service/token"), "logs={logs}");
     assert!(
-        logs.contains(&audit_session_ref(Some(token))),
+        logs.contains(&audit_session_fingerprint(Some(token))),
         "logs={logs}"
     );
     assert!(!logs.contains(token));
@@ -208,13 +211,13 @@ async fn secret_use_is_audited_only_after_successful_spawn() {
         ),
     )
     .await;
-    assert!(result.secret_refs().is_empty());
-    assert!(!logs.contains("SECRET_USE"), "logs={logs}");
+    assert!(result.exposed_secret_refs().is_empty());
+    assert!(!logs.contains("SECRET_EXPOSED"), "logs={logs}");
 }
 
 #[cfg(unix)]
 #[tokio::test]
-async fn streaming_secret_use_records_each_name_after_spawn_even_on_nonzero_exit() {
+async fn streaming_secret_exposure_is_recorded_even_on_nonzero_exit() {
     let caller = CallerIdentity::Unix { uid: 1000 };
     let principal = PrincipalKey::from_uid(1000);
     let (cfg, buf) = make_test_config();
@@ -250,13 +253,17 @@ async fn streaming_secret_use_records_each_name_after_spawn_even_on_nonzero_exit
 
     assert_eq!(result.exit_code(), Some(1));
     assert_eq!(
-        result.secret_refs(),
+        result.exposed_secret_refs(),
         &[
             "service/primary".to_string(),
             "service/secondary".to_string()
         ]
     );
-    assert_eq!(logs.matches("[AUDIT] SECRET_USE").count(), 2, "logs={logs}");
+    assert_eq!(
+        logs.matches("[AUDIT] SECRET_EXPOSED").count(),
+        2,
+        "logs={logs}"
+    );
     assert!(logs.contains("service/primary"), "logs={logs}");
     assert!(logs.contains("service/secondary"), "logs={logs}");
     assert!(!logs.contains("streaming-session-token-never-logged"));

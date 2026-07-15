@@ -344,14 +344,14 @@ pub(super) async fn handle_grant_read(
         &reason,
     );
     tracing::info!(target: "guard::audit",
-        "[AUDIT] READ_GRANT_ISSUED caller={} handle={} path=\"{}\" grantee_uid={} ttl={} traverse_grants={} session={}",
+        "[AUDIT] READ_GRANT_ISSUED caller={} handle={} path=\"{}\" grantee_uid={} ttl={} traverse_grants={} session_fingerprint={}",
         caller,
         grant.handle,
         grant.target_path,
         grantee_uid,
         ttl,
         traverse_count,
-        super::execute::audit_session_ref(session_token.as_deref()),
+        super::execute::audit_session_fingerprint(session_token.as_deref()),
     );
 
     let stdout = format!(

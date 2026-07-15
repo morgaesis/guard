@@ -31,6 +31,7 @@ use anyhow::Result;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -96,7 +97,7 @@ pub use wire::{
 };
 pub(crate) use wire::{ExecuteStreamMessage, IncomingMessage};
 
-use execute::{audit_command_line, audit_session_ref};
+use execute::{audit_command_line, audit_session_fingerprint};
 use wire::CallerIdentity;
 
 #[derive(Clone)]
@@ -127,6 +128,9 @@ struct ServerConfig {
     /// decision for a specific session token.
     pub sessions: Arc<RwLock<SessionRegistry>>,
     pub session_store: Option<SessionStore>,
+    /// Shared task-ownership guard. Cloned server configurations can start
+    /// session maintenance at most once for this daemon instance.
+    pub session_maintenance_started: Arc<AtomicBool>,
     /// When true, approved Unix-socket requests execute as the connecting
     /// user instead of the daemon UID.
     pub exec_as_caller: bool,
@@ -222,6 +226,7 @@ impl ServerConfig {
             redact_secrets,
             preflight,
             session_store,
+            session_maintenance_started: Arc::new(AtomicBool::new(false)),
             exec_as_caller,
             daemon_uid: current_uid(),
             daemon_principal: resolve_daemon_principal(),
@@ -331,10 +336,10 @@ impl ServerConfig {
     ) {
         let action = if allowed { "ALLOWED" } else { "DENIED" };
         tracing::info!(target: "guard::audit",
-            "[AUDIT] {} caller={} session={} cmd=\"{}\" reason=\"{}\"",
+            "[AUDIT] {} caller={} session_fingerprint={} cmd=\"{}\" reason=\"{}\"",
             action,
             caller,
-            audit_session_ref(session_token),
+            audit_session_fingerprint(session_token),
             audit_command_line(binary, args),
             reason
         );
@@ -354,9 +359,9 @@ impl ServerConfig {
         reason: &str,
     ) {
         tracing::info!(target: "guard::audit",
-            "[AUDIT] EXEC_FAILED caller={} session={} cmd=\"{}\" reason=\"{}\"",
+            "[AUDIT] EXEC_FAILED caller={} session_fingerprint={} cmd=\"{}\" reason=\"{}\"",
             caller,
-            audit_session_ref(session_token),
+            audit_session_fingerprint(session_token),
             audit_command_line(binary, args),
             reason
         );

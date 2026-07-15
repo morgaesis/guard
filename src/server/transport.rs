@@ -296,7 +296,7 @@ impl Server {
             let config = self.config.clone();
             tokio::spawn(async move { gating_sweeper(config).await });
         }
-        if self.config.session_store.is_some() {
+        if self.config.session_store.is_some() && claim_session_maintenance(&self.config) {
             let config = self.config.clone();
             tokio::spawn(async move { session_maintenance(config).await });
         }
@@ -989,23 +989,40 @@ async fn session_maintenance(config: ServerConfig) {
     tick.tick().await;
     loop {
         tick.tick().await;
-        let snapshot = {
-            let mut sessions = config.sessions.write().await;
-            sessions.purge_expired();
-            sessions.clone()
-        };
-        if let Some(store) = &config.session_store {
-            if let Err(error) = store.persist_registry(&snapshot).await {
-                tracing::warn!("failed to prune session history: {}", error);
-                continue;
-            }
-            match store.compact_if_needed().await {
-                Ok(true) => tracing::info!("compacted session state database"),
-                Ok(false) => {}
-                Err(error) => tracing::warn!("session state compaction deferred: {}", error),
-            }
+        if let Err(error) = session_maintenance_once(&config).await {
+            tracing::warn!("session state maintenance failed: {}", error);
         }
     }
+}
+
+pub(super) fn claim_session_maintenance(config: &ServerConfig) -> bool {
+    config
+        .session_maintenance_started
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+pub(super) async fn session_maintenance_once(config: &ServerConfig) -> Result<bool> {
+    let Some(store) = &config.session_store else {
+        return Ok(false);
+    };
+    let snapshot = {
+        let mut sessions = config.sessions.write().await;
+        if !sessions.purge_expired() {
+            return Ok(false);
+        }
+        sessions.clone()
+    };
+    store.persist_registry(&snapshot).await?;
+    if store.compact_if_needed().await? {
+        tracing::info!("compacted session state database");
+    }
+    Ok(true)
 }
 
 async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig) -> Result<()> {

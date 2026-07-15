@@ -241,10 +241,11 @@ pub struct SessionInteraction {
     /// `None` also covers signals and paths where no child was started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
-    /// Secret-store key names used by the spawned child. Values are never
-    /// persisted. Empty for commands that did not start.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub secret_refs: Vec<String>,
+    /// Secret-store key names whose values entered the environment of a
+    /// successfully spawned child. This records exposure, not proof that the
+    /// child read or consumed a value. Values are never persisted.
+    #[serde(default, alias = "secret_refs", skip_serializing_if = "Vec::is_empty")]
+    pub exposed_secret_refs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -303,10 +304,9 @@ pub struct SessionRegistry {
     /// (all of which run under the registry's write lock). A snapshot clone
     /// carries the revision of the state it represents, so the store can
     /// refuse to overwrite newer on-disk state with a stale snapshot when
-    /// concurrent persists complete out of order. `purge_expired` does not
-    /// bump: it derives no new state (expiry and retention are re-derived at
-    /// every load), so two same-revision snapshots differ at most in purge
-    /// progress and are interchangeable on disk.
+    /// concurrent persists complete out of order. Expiry and retention pruning
+    /// also bump the revision when they remove state, so every distinct
+    /// persistable snapshot has a distinct revision.
     revision: u64,
 }
 
@@ -607,7 +607,10 @@ impl SessionRegistry {
 
     /// Remove expired entries (move them to history) and trim history
     /// older than the retention window. Called opportunistically.
-    pub fn purge_expired(&mut self) {
+    pub fn purge_expired(&mut self) -> bool {
+        let grants_before = self.grants.len();
+        let history_before = self.history.len();
+        let interactions_before = self.interactions.len();
         let now = now_unix();
         let retention_cutoff = now.saturating_sub(self.history_retention_secs);
 
@@ -627,6 +630,14 @@ impl SessionRegistry {
         self.history.retain(|h| h.ended_at >= retention_cutoff);
         self.interactions
             .retain(|entry| entry.interaction.at_unix >= retention_cutoff);
+
+        let changed = self.grants.len() != grants_before
+            || self.history.len() != history_before
+            || self.interactions.len() != interactions_before;
+        if changed {
+            self.revision += 1;
+        }
+        changed
     }
 
     /// Check whether the session's grants short-circuit the decision.
@@ -1087,11 +1098,16 @@ mod tests {
                 auto_amend: false,
             },
         );
-        reg.purge_expired();
+        let before = reg.revision();
+        assert!(reg.purge_expired());
+        assert_eq!(reg.revision(), before + 1);
         assert!(!reg.has("expired"));
         let history = reg.list_history(None);
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].status, HistoricalStatus::Expired);
+        let after = reg.revision();
+        assert!(!reg.purge_expired());
+        assert_eq!(reg.revision(), after);
     }
 
     #[test]
@@ -1133,7 +1149,7 @@ mod tests {
                 risk: Some(2),
                 exec_status: SessionExecStatus::Completed,
                 exit_code: Some(0),
-                secret_refs: Vec::new(),
+                exposed_secret_refs: Vec::new(),
             },
         );
         reg.record_interaction(
@@ -1147,7 +1163,7 @@ mod tests {
                 risk: None,
                 exec_status: SessionExecStatus::NotAttempted,
                 exit_code: None,
-                secret_refs: Vec::new(),
+                exposed_secret_refs: Vec::new(),
             },
         );
         reg.record_interaction(
@@ -1161,7 +1177,7 @@ mod tests {
                 risk: Some(1),
                 exec_status: SessionExecStatus::Failed,
                 exit_code: None,
-                secret_refs: Vec::new(),
+                exposed_secret_refs: Vec::new(),
             },
         );
 

@@ -47,8 +47,9 @@ impl SessionStore {
     pub async fn persist_registry(&self, registry: &SessionRegistry) -> Result<()> {
         let path = self.path.clone();
         let retention = self.history_retention_secs;
-        let revision = registry.revision();
-        let mut snapshot = registry.clone();
+        let mut snapshot = registry.clone().with_history_retention(retention);
+        snapshot.purge_expired();
+        let revision = snapshot.revision();
         let mut last_written = self.registry_write_gate.lock().await;
         if revision < *last_written {
             // A newer snapshot already landed; a full-table rewrite from this
@@ -56,7 +57,6 @@ impl SessionStore {
             return Ok(());
         }
         tokio::task::spawn_blocking(move || {
-            snapshot.purge_expired();
             Self::persist_registry_sync(&path, retention, &snapshot)
         })
         .await
@@ -169,7 +169,7 @@ impl SessionStore {
                         risk: row.get(6)?,
                         exec_status: decode_exec_status(&exec_status)?,
                         exit_code: row.get(8)?,
-                        secret_refs: decode_vec(&row.get::<_, String>(9)?)?,
+                        exposed_secret_refs: decode_vec(&row.get::<_, String>(9)?)?,
                     },
                 ))
             })?;
@@ -261,7 +261,7 @@ impl SessionStore {
                     interaction.risk,
                     encode_exec_status(interaction.exec_status),
                     interaction.exit_code,
-                    encode_vec(&interaction.secret_refs)?
+                    encode_vec(&interaction.exposed_secret_refs)?
                 ],
             )?;
         }
@@ -318,6 +318,7 @@ impl SessionStore {
             );
         }
         if version == SCHEMA_VERSION {
+            Self::repair_current_schema(conn)?;
             return Ok(());
         }
 
@@ -457,6 +458,19 @@ impl SessionStore {
         )?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Repair columns that belong to the current schema version. This keeps
+    /// startup safe after an interrupted or partially applied v1 migration.
+    fn repair_current_schema(conn: &Connection) -> Result<()> {
+        ensure_column(conn, "session_interactions", "exit_code", "INTEGER")?;
+        ensure_column(
+            conn,
+            "session_interactions",
+            "secret_refs_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
         Ok(())
     }
 
@@ -890,7 +904,7 @@ mod tests {
         let registry = store.load_registry().await.expect("load migrated store");
         let report = registry.show("legacy-token", 10).expect("legacy report");
         assert_eq!(report.recent[0].exit_code, None);
-        assert!(report.recent[0].secret_refs.is_empty());
+        assert!(report.recent[0].exposed_secret_refs.is_empty());
         let conn = Connection::open(&legacy_path).expect("reopen migrated db");
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -907,6 +921,39 @@ mod tests {
             .await
             .expect_err("future schema must fail closed");
         assert!(error.to_string().contains("newer than supported"));
+    }
+
+    #[test]
+    fn repairs_missing_columns_in_current_schema_version() {
+        let conn = Connection::open_in_memory().expect("open database");
+        conn.execute_batch(
+            "CREATE TABLE session_interactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token TEXT NOT NULL,
+                at_unix INTEGER NOT NULL,
+                command TEXT NOT NULL,
+                allowed INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                risk INTEGER,
+                exec_status TEXT NOT NULL
+            );
+            PRAGMA user_version = 1;",
+        )
+        .expect("create partial v1 schema");
+
+        SessionStore::init_schema(&conn).expect("repair current schema");
+
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(session_interactions)")
+            .expect("prepare table info");
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get(1))
+            .expect("query columns")
+            .collect::<rusqlite::Result<_>>()
+            .expect("collect columns");
+        assert!(columns.iter().any(|column| column == "exit_code"));
+        assert!(columns.iter().any(|column| column == "secret_refs_json"));
     }
 
     #[test]
@@ -963,7 +1010,7 @@ mod tests {
                     risk: Some(0),
                     exec_status: SessionExecStatus::Completed,
                     exit_code: Some(0),
-                    secret_refs: Vec::new(),
+                    exposed_secret_refs: Vec::new(),
                 },
             )],
             1,
@@ -1036,7 +1083,7 @@ mod tests {
                     risk: Some(1),
                     exec_status: SessionExecStatus::Completed,
                     exit_code: Some(0),
-                    secret_refs: vec!["service/token".into()],
+                    exposed_secret_refs: vec!["service/token".into()],
                 },
             )],
             24 * 60 * 60,
@@ -1053,7 +1100,7 @@ mod tests {
         assert_eq!(report.stats.total, 1);
         assert_eq!(report.stats.risk_histogram[1], 1);
         assert_eq!(report.recent[0].exit_code, Some(0));
-        assert_eq!(report.recent[0].secret_refs, vec!["service/token"]);
+        assert_eq!(report.recent[0].exposed_secret_refs, vec!["service/token"]);
         assert_eq!(
             report.active.and_then(|grant| grant.prompt_append),
             Some("persistent".into())

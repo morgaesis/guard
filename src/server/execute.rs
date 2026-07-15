@@ -58,10 +58,10 @@ pub(super) fn log_audit_policy_for_request(
     if let Some(cwd) = &request.cwd {
         let action = if allowed { "ALLOWED" } else { "DENIED" };
         tracing::info!(target: "guard::audit",
-            "[AUDIT] {} caller={} session={} cwd=\"{}\" cmd=\"{}\" reason=\"{}\"",
+            "[AUDIT] {} caller={} session_fingerprint={} cwd=\"{}\" cmd=\"{}\" reason=\"{}\"",
             action,
             caller,
-            audit_session_ref(request.session_token.as_deref()),
+            audit_session_fingerprint(request.session_token.as_deref()),
             cwd.display(),
             audit_command_line(&request.binary, &request.args),
             reason
@@ -81,16 +81,16 @@ pub(super) fn log_audit_policy_for_request(
 /// Stable correlation identifier for a session without exposing any bearer
 /// token bytes. This can be joined to persisted session interactions by hashing
 /// the operator-held token with the same function.
-pub(super) fn audit_session_ref(token: Option<&str>) -> String {
+pub(super) fn audit_session_fingerprint(token: Option<&str>) -> String {
     let Some(token) = token.filter(|token| !token.is_empty()) else {
         return "none".to_string();
     };
     let digest = Sha256::digest(token.as_bytes());
-    let short = digest[..6]
+    let fingerprint = digest[..16]
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    format!("sha256:{short}")
+    format!("sha256:{fingerprint}")
 }
 
 pub(super) async fn execute_command(
@@ -344,7 +344,7 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
             risk,
             exec_status: SessionExecStatus::NotAttempted,
             exit_code: None,
-            secret_refs: Vec::new(),
+            exposed_secret_refs: Vec::new(),
         },
     )
     .await;
@@ -386,7 +386,7 @@ async fn route_allow_and_record<W: AsyncWrite + Unpin>(
             risk,
             exec_status: result.session_exec_status(),
             exit_code: result.exit_code(),
-            secret_refs: result.secret_refs().to_vec(),
+            exposed_secret_refs: result.exposed_secret_refs().to_vec(),
         },
     )
     .await;
@@ -1117,11 +1117,6 @@ pub(super) fn evaluation_context_prompt(
 /// secret store.
 pub(super) fn audit_command_line(binary: &str, args: &[String]) -> String {
     redact_output(&command_line(binary, args))
-}
-
-/// Hash a bearer token for audit correlation without exposing any token bytes.
-pub(super) fn audit_token(token: &str) -> String {
-    audit_session_ref(Some(token))
 }
 
 pub(super) fn validate_session_exact_rule_candidate(
@@ -1903,9 +1898,9 @@ pub(super) async fn exec_with_read_grant_retry<W: AsyncWrite + Unpin>(
                 break;
             }
             tracing::info!(target: "guard::audit",
-                "[AUDIT] READ_GRANT_AUTO caller={} session={} path=\"{}\" ttl={}s (retrying after permission denied)",
+                "[AUDIT] READ_GRANT_AUTO caller={} session_fingerprint={} path=\"{}\" ttl={}s (retrying after permission denied)",
                 caller,
-                audit_session_ref(request.session_token.as_deref()),
+                audit_session_fingerprint(request.session_token.as_deref()),
                 path,
                 AUTO_READ_GRANT_TTL_SECS
             );
@@ -1969,10 +1964,10 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
         }
     };
     let trusted_tool_env = tool_env.env;
-    let mut used_secret_refs = tool_env.secret_refs;
-    used_secret_refs.extend(request.secrets.values().cloned());
-    used_secret_refs.sort();
-    used_secret_refs.dedup();
+    let mut exposed_secret_refs = tool_env.secret_refs;
+    exposed_secret_refs.extend(request.secrets.values().cloned());
+    exposed_secret_refs.sort();
+    exposed_secret_refs.dedup();
     let mut request_env = HashMap::new();
 
     for key in request.env.keys().chain(request.secrets.keys()) {
@@ -2184,7 +2179,7 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
             SpawnAuditContext {
                 caller,
                 request: &request,
-                secret_refs: used_secret_refs,
+                exposed_secret_refs,
             },
             stream_writer,
         )
@@ -2202,7 +2197,7 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
             );
         }
     };
-    audit_secret_use(caller, &request, &used_secret_refs);
+    audit_secret_exposure(caller, &request, &exposed_secret_refs);
     let output = match child.wait_with_output().await {
         Ok(output) => output,
         Err(e) => {
@@ -2210,7 +2205,7 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
                 allow_reason,
                 format!("failed to wait for '{}': {}", request.binary, e),
             )
-            .with_secret_refs(used_secret_refs);
+            .with_exposed_secret_refs(exposed_secret_refs);
         }
     };
 
@@ -2231,7 +2226,7 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
     };
 
     ExecuteResult::completed(allow_reason, output.status.code(), stdout, stderr)
-        .with_secret_refs(used_secret_refs)
+        .with_exposed_secret_refs(exposed_secret_refs)
 }
 
 #[derive(Debug)]
@@ -2260,7 +2255,7 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
             );
         }
     };
-    audit_secret_use(audit.caller, audit.request, &audit.secret_refs);
+    audit_secret_exposure(audit.caller, audit.request, &audit.exposed_secret_refs);
 
     let (tx, mut rx) = mpsc::channel::<StreamChunk>(32);
     let mut stream_tasks = Vec::new();
@@ -2305,7 +2300,7 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
                             allow_reason,
                             format!("client stream error: {}", e),
                         )
-                        .with_secret_refs(audit.secret_refs);
+                        .with_exposed_secret_refs(audit.exposed_secret_refs);
                     }
                     }
                     None => break,
@@ -2318,7 +2313,7 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
                         allow_reason,
                         format!("client stream error: {}", e),
                     )
-                    .with_secret_refs(audit.secret_refs);
+                    .with_exposed_secret_refs(audit.exposed_secret_refs);
                 }
             }
         }
@@ -2335,28 +2330,32 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
                 allow_reason,
                 format!("failed to wait for '{}': {}", audit.request.binary, e),
             )
-            .with_secret_refs(audit.secret_refs);
+            .with_exposed_secret_refs(audit.exposed_secret_refs);
         }
     };
 
     ExecuteResult::completed(allow_reason, status.code(), None, None)
-        .with_secret_refs(audit.secret_refs)
+        .with_exposed_secret_refs(audit.exposed_secret_refs)
 }
 
 struct SpawnAuditContext<'a> {
     caller: &'a CallerIdentity,
     request: &'a ExecuteRequest,
-    secret_refs: Vec<String>,
+    exposed_secret_refs: Vec<String>,
 }
 
-fn audit_secret_use(caller: &CallerIdentity, request: &ExecuteRequest, secret_refs: &[String]) {
-    for secret_ref in secret_refs {
+fn audit_secret_exposure(
+    caller: &CallerIdentity,
+    request: &ExecuteRequest,
+    exposed_secret_refs: &[String],
+) {
+    for secret_ref in exposed_secret_refs {
         let secret_name = serde_json::to_string(secret_ref)
             .unwrap_or_else(|_| "\"<invalid-secret-name>\"".to_string());
         tracing::info!(target: "guard::audit",
-            "[AUDIT] SECRET_USE caller={} session={} secret={} cmd=\"{}\"",
+            "[AUDIT] SECRET_EXPOSED caller={} session_fingerprint={} secret={} cmd=\"{}\"",
             caller,
-            audit_session_ref(request.session_token.as_deref()),
+            audit_session_fingerprint(request.session_token.as_deref()),
             secret_name,
             audit_command_line(&request.binary, &request.args)
         );

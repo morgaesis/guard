@@ -4,12 +4,14 @@ use crate::server::execute::{
     allow_session_auto_amend_candidate, deny_session_auto_amend_candidate, execute_command,
     session_source_from_eval,
 };
+use crate::server::transport::{claim_session_maintenance, session_maintenance_once};
 use crate::server::wire::ExecOutcome;
 use crate::server::wire::{AdminRequest, AdminResponse, CallerIdentity, ExecuteRequest};
 use crate::session::{
     SessionDecision, SessionDecisionSource, SessionExactRule, SessionExecStatus, SessionGrant,
     SessionInteraction,
 };
+use crate::session_store::SessionStore;
 use guard::gating::GateMode;
 use guard::principal::PrincipalKey;
 use std::collections::HashMap;
@@ -484,7 +486,7 @@ async fn session_show_reports_recent_stats() {
                 risk: Some(1),
                 exec_status: SessionExecStatus::Completed,
                 exit_code: Some(0),
-                secret_refs: vec!["service/token".into()],
+                exposed_secret_refs: vec!["service/token".into()],
             },
         );
         reg.record_interaction(
@@ -498,7 +500,7 @@ async fn session_show_reports_recent_stats() {
                 risk: None,
                 exec_status: SessionExecStatus::NotAttempted,
                 exit_code: None,
-                secret_refs: Vec::new(),
+                exposed_secret_refs: Vec::new(),
             },
         );
     }
@@ -788,4 +790,39 @@ async fn profile_grant_still_deny_short_circuits_and_falls_through() {
         reg.check(&token, "helm", &["list".into()], None).is_none(),
         "an unmatched command must fall through to the evaluator"
     );
+}
+
+#[tokio::test]
+async fn session_maintenance_has_one_owner_and_skips_noop_persistence() {
+    let (mut cfg, _) = make_test_config();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    cfg.session_store = Some(
+        SessionStore::open(tmp.path().join("state.db"), 3600)
+            .await
+            .expect("open store"),
+    );
+    cfg.sessions.write().await.grant(
+        "expired".into(),
+        SessionGrant {
+            allow: vec!["true".into()],
+            deny: Vec::new(),
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            expires_at: Some(1),
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            granted_at: 0,
+            static_only: false,
+            auto_amend: false,
+        },
+    );
+
+    assert!(claim_session_maintenance(&cfg));
+    assert!(!claim_session_maintenance(&cfg.clone()));
+    assert!(session_maintenance_once(&cfg)
+        .await
+        .expect("prune expired state"));
+    assert!(!session_maintenance_once(&cfg)
+        .await
+        .expect("skip unchanged state"));
 }

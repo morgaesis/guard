@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use super::execute::audit_token;
+use super::execute::audit_session_fingerprint;
 
 /// Identifies the caller for per-user secret injection.
 #[derive(Debug, Clone)]
@@ -77,10 +77,18 @@ impl std::fmt::Display for CallerIdentity {
             #[cfg(windows)]
             Self::Windows { sid } => write!(f, "sid={}", sid),
             Self::Tcp { token } => {
-                write!(f, "token={}", audit_token(token))
+                write!(
+                    f,
+                    "token_fingerprint={}",
+                    audit_session_fingerprint(Some(token))
+                )
             }
             Self::TcpAdmin { token } => {
-                write!(f, "admin_token={}", audit_token(token))
+                write!(
+                    f,
+                    "admin_token_fingerprint={}",
+                    audit_session_fingerprint(Some(token))
+                )
             }
             Self::Unknown => write!(f, "unknown"),
         }
@@ -830,9 +838,9 @@ pub(super) enum ExecOutcome {
 pub(super) struct ExecuteResult {
     policy: PolicyOutcome,
     pub(super) exec: ExecOutcome,
-    /// Secret-store key names whose values reached a successfully spawned
-    /// child. Values are never retained.
-    secret_refs: Vec<String>,
+    /// Secret-store key names whose values entered the environment of a
+    /// successfully spawned child. This does not prove the child consumed them.
+    exposed_secret_refs: Vec<String>,
 }
 
 impl ExecuteResult {
@@ -842,7 +850,7 @@ impl ExecuteResult {
                 reason: reason.into(),
             },
             exec: ExecOutcome::NotAttempted,
-            secret_refs: Vec::new(),
+            exposed_secret_refs: Vec::new(),
         }
     }
 
@@ -862,7 +870,7 @@ impl ExecuteResult {
                 stdout,
                 stderr,
             },
-            secret_refs: Vec::new(),
+            exposed_secret_refs: Vec::new(),
         }
     }
 
@@ -880,7 +888,7 @@ impl ExecuteResult {
                 reason: exec_reason.into(),
                 started: false,
             },
-            secret_refs: Vec::new(),
+            exposed_secret_refs: Vec::new(),
         }
     }
 
@@ -899,7 +907,7 @@ impl ExecuteResult {
                 reason: exec_reason.into(),
                 started: true,
             },
-            secret_refs: Vec::new(),
+            exposed_secret_refs: Vec::new(),
         }
     }
 
@@ -908,7 +916,7 @@ impl ExecuteResult {
             policy: PolicyOutcome::Allowed {
                 reason: reason.into(),
             },
-            secret_refs: Vec::new(),
+            exposed_secret_refs: Vec::new(),
             exec: ExecOutcome::DryRun { coverage: None },
         }
     }
@@ -923,7 +931,7 @@ impl ExecuteResult {
             exec: ExecOutcome::DryRun {
                 coverage: Some(coverage),
             },
-            secret_refs: Vec::new(),
+            exposed_secret_refs: Vec::new(),
         }
     }
 
@@ -935,7 +943,7 @@ impl ExecuteResult {
                 reason: reason.into(),
             },
             exec: ExecOutcome::Held { handle, coverage },
-            secret_refs: Vec::new(),
+            exposed_secret_refs: Vec::new(),
         }
     }
 
@@ -959,19 +967,19 @@ impl ExecuteResult {
                 stdout,
                 stderr,
             },
-            secret_refs: Vec::new(),
+            exposed_secret_refs: Vec::new(),
         }
     }
 
-    pub(super) fn with_secret_refs(mut self, mut secret_refs: Vec<String>) -> Self {
-        secret_refs.sort();
-        secret_refs.dedup();
-        self.secret_refs = secret_refs;
+    pub(super) fn with_exposed_secret_refs(mut self, mut exposed_secret_refs: Vec<String>) -> Self {
+        exposed_secret_refs.sort();
+        exposed_secret_refs.dedup();
+        self.exposed_secret_refs = exposed_secret_refs;
         self
     }
 
-    pub(super) fn secret_refs(&self) -> &[String] {
-        &self.secret_refs
+    pub(super) fn exposed_secret_refs(&self) -> &[String] {
+        &self.exposed_secret_refs
     }
 
     pub(super) fn exit_code(&self) -> Option<i32> {

@@ -936,7 +936,7 @@ LLM token usage is logged per evaluation:
 [LLM_USAGE] model=openai/gpt-5.4-mini attempt=1 prompt_tokens=3594 completion_tokens=47 total_tokens=3641 status=ok
 ```
 
-Per-command audit records use stable hashed session fingerprints, so events correlate without exposing bearer token bytes. `SECRET_USE` records are emitted only after a child starts and contain the secret name, session fingerprint, and masked command, never the value.
+Per-command audit records use stable 128-bit SHA-256 session fingerprints, so events correlate without exposing bearer token bytes. `SECRET_EXPOSED` records are emitted only after a child starts and contain the secret name, session fingerprint, and masked command, never the value. Exposure means the value entered the child environment; it does not prove the child read or consumed it.
 
 For this local deployment model, the audit source of truth is the daemon's structured `tracing` output, typically collected by journald. The SQLite state database is for session state and queryable session history, not for replacing your log pipeline. `guard session show` is an operator view over that persisted session history; it complements journald.
 

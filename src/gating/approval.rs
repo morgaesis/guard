@@ -63,8 +63,12 @@ pub struct ApprovalSnapshot {
     /// Non-secret fingerprint of the originating Guard session. Approval
     /// audit events use this to correlate the held command without persisting
     /// the bearer token itself.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_ref: Option<String>,
+    #[serde(
+        default,
+        alias = "session_ref",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub session_fingerprint: Option<String>,
     /// If this hold originated from a verb, the verb name and the validated
     /// params, plus the catalog version it was rendered against. A catalog
     /// change voids the approval.
@@ -429,7 +433,7 @@ mod tests {
             cwd: None,
             env: BTreeMap::new(),
             secret_keys: BTreeMap::new(),
-            session_ref: None,
+            session_fingerprint: None,
             verb_name: None,
             verb_params: BTreeMap::new(),
             catalog_version: None,

@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use tokio::io::AsyncWrite;
 
 use super::execute::{
-    audit_command_line, audit_session_ref, exec_after_approval, exec_with_read_grant_retry,
+    audit_command_line, audit_session_fingerprint, exec_after_approval, exec_with_read_grant_retry,
 };
 use super::grants::{delete_read_grant_row, finish_read_grant_revert, persist_read_grant};
 use super::transport::write_stream_message;
@@ -403,7 +403,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
             cwd: None,
             env: std::collections::BTreeMap::new(),
             secret_keys: std::collections::BTreeMap::new(),
-            session_ref: None,
+            session_fingerprint: None,
             verb_name: None,
             verb_params: std::collections::BTreeMap::new(),
             catalog_version: None,
@@ -815,7 +815,7 @@ pub(super) async fn arm_containment<W: AsyncWrite + Unpin>(
     persist_provisional(config, &provisional).await;
     config.provisional.write().await.insert(provisional.clone());
 
-    let session_ref = audit_session_ref(request.session_token.as_deref());
+    let session_fingerprint = audit_session_fingerprint(request.session_token.as_deref());
     let result = exec_after_approval(
         request,
         config,
@@ -826,7 +826,7 @@ pub(super) async fn arm_containment<W: AsyncWrite + Unpin>(
         stream_writer,
     )
     .await;
-    let secret_refs = result.secret_refs().to_vec();
+    let exposed_secret_refs = result.exposed_secret_refs().to_vec();
 
     match result.exec {
         ExecOutcome::Completed {
@@ -843,10 +843,10 @@ pub(super) async fn arm_containment<W: AsyncWrite + Unpin>(
                 persist_provisional(config, &u).await;
             }
             tracing::info!(target: "guard::audit",
-                "[AUDIT] PROVISIONAL handle={} caller={} session={} deadline={} window={}s revert=\"{}\"",
+                "[AUDIT] PROVISIONAL handle={} caller={} session_fingerprint={} deadline={} window={}s revert=\"{}\"",
                 handle,
                 caller,
-                session_ref,
+                session_fingerprint,
                 now.saturating_add(window),
                 window,
                 audit_command_line(&revert.binary, &revert.args)
@@ -859,7 +859,7 @@ pub(super) async fn arm_containment<W: AsyncWrite + Unpin>(
                 stdout,
                 stderr,
             )
-            .with_secret_refs(secret_refs)
+            .with_exposed_secret_refs(exposed_secret_refs)
         }
         // The child was launched and then failed (e.g. the client stream dropped
         // mid-run). It may already have applied its mutation, so keep the
@@ -876,10 +876,10 @@ pub(super) async fn arm_containment<W: AsyncWrite + Unpin>(
                 persist_provisional(config, &u).await;
             }
             tracing::warn!(target: "guard::audit",
-                "[AUDIT] PROVISIONAL_INTERRUPTED handle={} caller={} session={} deadline={} (forward launched then failed; auto-revert armed)",
+                "[AUDIT] PROVISIONAL_INTERRUPTED handle={} caller={} session_fingerprint={} deadline={} (forward launched then failed; auto-revert armed)",
                 handle,
                 caller,
-                session_ref,
+                session_fingerprint,
                 now.saturating_add(window)
             );
             result
@@ -962,10 +962,10 @@ pub(super) async fn hold_for_approval<W: AsyncWrite + Unpin>(
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
-        session_ref: request
+        session_fingerprint: request
             .session_token
             .as_deref()
-            .map(|token| audit_session_ref(Some(token))),
+            .map(|token| audit_session_fingerprint(Some(token))),
         verb_name: verb.as_ref().map(|v| v.name.clone()),
         verb_params: verb.as_ref().map(|v| v.params.clone()).unwrap_or_default(),
         catalog_version: verb.as_ref().map(|v| v.catalog_version),
@@ -992,10 +992,10 @@ pub(super) async fn hold_for_approval<W: AsyncWrite + Unpin>(
     let notify = config.approvals.write().await.enqueue(approval.clone());
     persist_approval(config, &approval).await;
     tracing::info!(target: "guard::audit",
-        "[AUDIT] HELD handle={} caller={} session={} risk={:?} class={:?} cmd=\"{}\" ttl={}s",
+        "[AUDIT] HELD handle={} caller={} session_fingerprint={} risk={:?} class={:?} cmd=\"{}\" ttl={}s",
         handle,
         caller,
-        audit_session_ref(request.session_token.as_deref()),
+        audit_session_fingerprint(request.session_token.as_deref()),
         risk,
         reversibility.map(|r| r.as_str()),
         audit_command_line(&request.binary, &request.args),
@@ -1261,9 +1261,12 @@ pub(super) async fn gating_sweeper(config: ServerConfig) {
             if let Some(a) = row {
                 persist_approval(&config, &a).await;
                 tracing::warn!(target: "guard::audit",
-                    "[AUDIT] APPROVAL_EXPIRED handle={} session={} (fail-closed deny)",
+                    "[AUDIT] APPROVAL_EXPIRED handle={} session_fingerprint={} (fail-closed deny)",
                     h,
-                    a.snapshot.session_ref.as_deref().unwrap_or("none")
+                    a.snapshot
+                        .session_fingerprint
+                        .as_deref()
+                        .unwrap_or("none")
                 );
             }
         }
