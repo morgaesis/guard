@@ -13,7 +13,7 @@
 //! tells the daemon which provisionals are due.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use super::GateError;
@@ -89,6 +89,11 @@ pub struct Provisional {
     /// command-shaped revert. Absent on older rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
+    /// env-var -> secret-key mapping needed by the revert. Secret values are
+    /// never persisted; the daemon resolves these references under `principal`
+    /// immediately before the revert executes. Absent on older rows.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secret_keys: BTreeMap<String, String>,
     /// The structured revert command (no shell). Operator-authored (verb) or an
     /// agent-supplied `--revert` that was itself evaluated to APPROVE at arm time.
     pub revert_binary: String,
@@ -342,6 +347,7 @@ mod tests {
             binary: "systemctl".into(),
             args: vec!["restart".into(), "app".into()],
             cwd: None,
+            secret_keys: BTreeMap::new(),
             revert_binary: "systemctl".into(),
             revert_args: vec!["stop".into(), "app".into()],
             api_revert: None,
@@ -454,5 +460,28 @@ mod tests {
         let dropped = r.prune_terminal(100 + 999_999, 1000);
         assert_eq!(dropped, vec!["old".to_string()]);
         assert!(r.get("old").is_none());
+    }
+
+    #[test]
+    fn pre_injection_fields_row_deserializes_with_empty_defaults() {
+        let json = r#"{
+            "handle":"legacy",
+            "caller_uid":1001,
+            "binary":"systemctl",
+            "args":["restart","app"],
+            "revert_binary":"systemctl",
+            "revert_args":["stop","app"],
+            "reason":"restart",
+            "created_unix":100,
+            "deadline_unix":200,
+            "forward_done":true,
+            "status":"armed",
+            "revert_exit":null,
+            "revert_detail":null
+        }"#;
+
+        let p: Provisional = serde_json::from_str(json).expect("legacy provisional row");
+        assert_eq!(p.principal, Some(PrincipalKey::from_uid(1001)));
+        assert!(p.secret_keys.is_empty());
     }
 }
