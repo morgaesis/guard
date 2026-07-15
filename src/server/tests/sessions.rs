@@ -1,4 +1,4 @@
-use crate::grant_profile::SavedGrantCatalog;
+use crate::grant_profile::{EvaluationMode, SavedGrantCatalog};
 use crate::server::admin::handle_admin_request;
 use crate::server::execute::{
     allow_session_auto_amend_candidate, deny_session_auto_amend_candidate, execute_command,
@@ -1035,6 +1035,252 @@ async fn grant_requests_use_the_issued_ceiling_and_redact_session_tokens() {
         scoped,
         AdminResponse::GrantRequests { items }
             if items.len() == 1 && items[0].session_token.starts_with("sha256:")
+    ));
+}
+
+#[tokio::test]
+async fn saved_grant_edit_uses_explicit_clear_and_tristate_operations() {
+    let (mut cfg, _) = make_test_config();
+    cfg.daemon_uid = 777;
+    cfg.daemon_principal = PrincipalKey::from_uid(777);
+    let daemon = CallerIdentity::Unix { uid: 777 };
+    let source = SavedGrantCatalog::from_yaml(
+        "grants:\n  - name: editable\n    description: original\n    activated_verbs: [inspect]\n    secret_names: [service/*]\n    ttl_secs: 300\n    prompt_append: original prompt\n    auto_approve_requests: true\n",
+    )
+    .unwrap();
+    let grant = source.get("editable").unwrap().clone();
+    assert!(matches!(
+        handle_admin_request(&cfg, &daemon, AdminRequest::SavedGrantSave { grant }).await,
+        AdminResponse::SavedGrant { .. }
+    ));
+
+    let edited = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::SavedGrantEdit {
+            name: "editable".to_string(),
+            description: Some("updated".to_string()),
+            activated_verbs: Vec::new(),
+            clear_verbs: true,
+            secret_names: Vec::new(),
+            clear_secrets: true,
+            ttl_secs: None,
+            clear_ttl: true,
+            prompt_append: None,
+            evaluation_mode: Some(EvaluationMode::PolicyOnly),
+            auto_approve_requests: Some(false),
+        },
+    )
+    .await;
+    let AdminResponse::SavedGrant { grant } = edited else {
+        panic!("expected edited saved grant, got {edited:?}");
+    };
+    assert_eq!(grant.description, "updated");
+    assert!(grant.activated_verbs.is_empty());
+    assert!(grant.secret_names.is_empty());
+    assert_eq!(grant.ttl_secs, None);
+    assert_eq!(grant.prompt_append.as_deref(), Some("original prompt"));
+    assert_eq!(grant.evaluation_mode, EvaluationMode::PolicyOnly);
+    assert!(!grant.auto_approve_requests);
+    assert_eq!(grant.revision, 2);
+
+    let cleared_prompt = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::SavedGrantEdit {
+            name: "editable".to_string(),
+            description: None,
+            activated_verbs: vec!["inspect".to_string()],
+            clear_verbs: false,
+            secret_names: Vec::new(),
+            clear_secrets: false,
+            ttl_secs: None,
+            clear_ttl: false,
+            prompt_append: Some(String::new()),
+            evaluation_mode: None,
+            auto_approve_requests: None,
+        },
+    )
+    .await;
+    let AdminResponse::SavedGrant { grant } = cleared_prompt else {
+        panic!("expected prompt-cleared grant, got {cleared_prompt:?}");
+    };
+    assert_eq!(grant.prompt_append, None);
+    assert_eq!(grant.activated_verbs, vec!["inspect"]);
+    assert!(!grant.auto_approve_requests);
+    assert_eq!(grant.revision, 3);
+}
+
+#[tokio::test]
+async fn grant_request_show_and_withdraw_require_the_issuing_session() {
+    let (mut cfg, _) = make_test_config();
+    cfg.daemon_uid = 777;
+    cfg.daemon_principal = PrincipalKey::from_uid(777);
+    let daemon = CallerIdentity::Unix { uid: 777 };
+    let worker = CallerIdentity::Unix { uid: 778 };
+    cfg.sessions.write().await.grant(
+        "owner-session".to_string(),
+        granted_session(Vec::new(), Vec::new()),
+    );
+    let submitted = handle_admin_request(
+        &cfg,
+        &worker,
+        AdminRequest::GrantRequestSubmit {
+            session_token: "owner-session".to_string(),
+            saved_grant: None,
+            prompt: "request one verb".to_string(),
+            delta: crate::grant_profile::GrantRequestDelta {
+                activated_verbs: vec!["inspect".to_string()],
+                ..Default::default()
+            },
+        },
+    )
+    .await;
+    let AdminResponse::GrantRequest { request } = submitted else {
+        panic!("expected pending request, got {submitted:?}");
+    };
+    let handle = request.handle;
+
+    for response in [
+        handle_admin_request(
+            &cfg,
+            &worker,
+            AdminRequest::GrantRequestShow {
+                handle: handle.clone(),
+                session_token: Some("other-session".to_string()),
+            },
+        )
+        .await,
+        handle_admin_request(
+            &cfg,
+            &worker,
+            AdminRequest::GrantRequestWithdraw {
+                handle: handle.clone(),
+                session_token: Some("other-session".to_string()),
+            },
+        )
+        .await,
+    ] {
+        assert!(
+            matches!(response, AdminResponse::Error { message } if message.contains("unauthorized"))
+        );
+    }
+    assert!(matches!(
+        handle_admin_request(
+            &cfg,
+            &daemon,
+            AdminRequest::GrantRequestShow {
+                handle: handle.clone(),
+                session_token: None,
+            },
+        )
+        .await,
+        AdminResponse::GrantRequest { .. }
+    ));
+    assert!(matches!(
+        handle_admin_request(
+            &cfg,
+            &worker,
+            AdminRequest::GrantRequestWithdraw {
+                handle,
+                session_token: Some("owner-session".to_string()),
+            },
+        )
+        .await,
+        AdminResponse::GrantRequest { request }
+            if request.status == crate::grant_profile::GrantRequestStatus::Withdrawn
+    ));
+}
+
+#[tokio::test]
+async fn grant_request_approval_rejects_expiry_and_stale_saved_revision() {
+    let (mut cfg, _) = make_test_config();
+    cfg.daemon_uid = 777;
+    cfg.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.saved_grants = Arc::new(RwLock::new(
+        SavedGrantCatalog::from_yaml(
+            "grants:\n  - name: reviewed\n    prompt_append: reviewed task\n    auto_approve_requests: false\n",
+        )
+        .unwrap(),
+    ));
+    let daemon = CallerIdentity::Unix { uid: 777 };
+    let worker = CallerIdentity::Unix { uid: 778 };
+    let token = "revision-session".to_string();
+    assert!(matches!(
+        handle_admin_request(
+            &cfg,
+            &daemon,
+            AdminRequest::SessionGrant {
+                token: token.clone(),
+                allow: Vec::new(),
+                deny: Vec::new(),
+                activated_verbs: Vec::new(),
+                override_markers: Vec::new(),
+                ttl_secs: None,
+                prompt_append: None,
+                prose: None,
+                saved_grant: Some("reviewed".to_string()),
+                profile: None,
+                evaluation_mode: None,
+                static_only: false,
+                auto_amend: false,
+            },
+        )
+        .await,
+        AdminResponse::Ok
+    ));
+    let submit = |prompt: &str| AdminRequest::GrantRequestSubmit {
+        session_token: token.clone(),
+        saved_grant: None,
+        prompt: prompt.to_string(),
+        delta: crate::grant_profile::GrantRequestDelta {
+            prompt_append: Some(prompt.to_string()),
+            ..Default::default()
+        },
+    };
+    let first = handle_admin_request(&cfg, &worker, submit("expired")).await;
+    let AdminResponse::GrantRequest { request } = first else {
+        panic!()
+    };
+    cfg.grant_requests
+        .write()
+        .await
+        .get_mut(&request.handle)
+        .unwrap()
+        .expires_unix = 1;
+    assert!(matches!(
+        handle_admin_request(&cfg, &daemon, AdminRequest::GrantRequestApprove { handle: request.handle }).await,
+        AdminResponse::Error { message } if message.contains("expired")
+    ));
+
+    let second = handle_admin_request(&cfg, &worker, submit("stale")).await;
+    let AdminResponse::GrantRequest { request } = second else {
+        panic!()
+    };
+    assert!(matches!(
+        handle_admin_request(
+            &cfg,
+            &daemon,
+            AdminRequest::SavedGrantEdit {
+                name: "reviewed".to_string(),
+                description: Some("new revision".to_string()),
+                activated_verbs: Vec::new(),
+                clear_verbs: false,
+                secret_names: Vec::new(),
+                clear_secrets: false,
+                ttl_secs: None,
+                clear_ttl: false,
+                prompt_append: None,
+                evaluation_mode: None,
+                auto_approve_requests: None,
+            }
+        )
+        .await,
+        AdminResponse::SavedGrant { .. }
+    ));
+    assert!(matches!(
+        handle_admin_request(&cfg, &daemon, AdminRequest::GrantRequestApprove { handle: request.handle }).await,
+        AdminResponse::Error { message } if message.contains("changed after request issuance")
     ));
 }
 

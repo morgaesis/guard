@@ -334,7 +334,8 @@ impl VerbCatalog {
         let file: CatalogFile =
             serde_yaml_ng::from_str(text).context("failed to parse verb catalog")?;
         let mut verbs = BTreeMap::new();
-        for verb in file.verbs {
+        for mut verb in file.verbs {
+            normalize_operator_boundaries(&mut verb);
             validate_verb(&verb)?;
             if verbs.insert(verb.name.clone(), verb.clone()).is_some() {
                 bail!("duplicate verb name: '{}'", verb.name);
@@ -1170,6 +1171,17 @@ fn validate_verb(verb: &Verb) -> Result<()> {
     }
     let mut cell_names = BTreeSet::new();
     for cell in &verb.coverage {
+        if verb.baseline
+            && !verb.auto_promoted
+            && matches!(cell.action, CoverageAction::Deny)
+            && !cell.sticky
+        {
+            bail!(
+                "verb '{}' coverage cell '{}': baseline deny coverage must be sticky",
+                verb.name,
+                cell.name
+            );
+        }
         if cell.name.trim().is_empty() {
             bail!(
                 "verb '{}' has a coverage cell with an empty name",
@@ -1279,6 +1291,17 @@ fn validate_verb(verb: &Verb) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn normalize_operator_boundaries(verb: &mut Verb) {
+    if !verb.baseline || verb.auto_promoted || verb.promotion_stamp.is_some() {
+        return;
+    }
+    for cell in &mut verb.coverage {
+        if matches!(cell.action, CoverageAction::Deny) {
+            cell.sticky = true;
+        }
+    }
 }
 
 fn valid_override_marker(marker: &str) -> bool {
@@ -2389,6 +2412,34 @@ verbs:
         )
         .unwrap_err();
         assert!(err.to_string().contains("may not mint override markers"));
+    }
+
+    #[test]
+    fn operator_baseline_denies_are_normalized_sticky() {
+        let catalog = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: operator-boundary
+    binary: kubectl
+    consequence: irreversible
+    coverage:
+      - name: destructive
+        action: deny
+        required_args: ["delete"]
+"#,
+        )
+        .unwrap();
+        let verb = catalog.get("operator-boundary").unwrap();
+        assert!(verb.coverage[0].sticky);
+
+        let mut programmatic = verb.clone();
+        programmatic.name = "unsafe-boundary".to_string();
+        programmatic.coverage[0].sticky = false;
+        assert!(catalog
+            .validate_candidate(&programmatic)
+            .unwrap_err()
+            .to_string()
+            .contains("baseline deny coverage must be sticky"));
     }
 
     fn args_vec(v: &[&str]) -> Vec<String> {

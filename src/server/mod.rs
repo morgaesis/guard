@@ -13,7 +13,7 @@ use crate::evaluate::Evaluator;
 use crate::grant_profile::{GrantRequest, SavedGrantCatalog};
 use crate::injection::is_valid_env_name;
 use crate::secrets::SecretManager;
-use crate::session::SessionRegistry;
+use crate::session::{SessionBehaviorLimits, SessionRegistry};
 use crate::session_store::SessionStore;
 use guard::gating::approval::ApprovalRegistry;
 use guard::gating::provisional::ProvisionalRegistry;
@@ -79,6 +79,7 @@ mod api_judge;
 mod execute;
 mod gate_runtime;
 mod grants;
+mod runtime;
 mod secure_fs;
 #[cfg(test)]
 mod tests;
@@ -93,8 +94,9 @@ pub(crate) use api_judge::DaemonApiJudge;
 pub(crate) use transport::winplat;
 pub use transport::Server;
 pub use wire::{
-    AdminRequest, AdminResponse, ApprovalSummary, BatchCommand, ExecuteRequest, ExecuteResponse,
-    GateStatus, OutputStream, RevertSpec, SshHostKeyMode, VerbInvocation, VerbSummary,
+    AdminRequest, AdminResponse, ApprovalSummary, BatchCommand, CommandSpec, ExecuteRequest,
+    ExecuteResponse, GateStatus, OutputStream, RevertSpec, SshHostKeyMode, VerbInvocation,
+    VerbSummary,
 };
 pub(crate) use wire::{ExecuteStreamMessage, IncomingMessage};
 
@@ -188,6 +190,14 @@ struct ServerConfig {
     pub read_grants: Arc<RwLock<GrantReadRegistry>>,
     /// Daemon-only root for child-lifetime secret files.
     pub secret_file_root: Option<PathBuf>,
+    /// Optional fire-and-forget operator event hook.
+    pub notify_hook: Option<runtime::NotifyHook>,
+    /// Every brokered child stays owned by the daemon until it exits or uses a
+    /// documented detach boundary.
+    pub process_tracker: runtime::ProcessTracker,
+    /// Optional session-scoped circuit breakers derived from persisted
+    /// interactions. Every threshold is disabled by default.
+    pub behavior_limits: SessionBehaviorLimits,
 }
 
 impl ServerConfig {
@@ -253,6 +263,15 @@ impl ServerConfig {
             protocol_registry: Arc::new(RwLock::new(std::collections::HashMap::new())),
             read_grants: Arc::new(RwLock::new(GrantReadRegistry::new())),
             secret_file_root: None,
+            notify_hook: None,
+            process_tracker: runtime::ProcessTracker::default(),
+            behavior_limits: SessionBehaviorLimits::default(),
+        }
+    }
+
+    pub(super) fn emit_event(&self, event: runtime::NotifyEvent) {
+        if let Some(hook) = &self.notify_hook {
+            hook.emit(event);
         }
     }
 

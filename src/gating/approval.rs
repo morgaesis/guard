@@ -69,6 +69,14 @@ pub struct ApprovalSnapshot {
         skip_serializing_if = "Option::is_none"
     )]
     pub session_fingerprint: Option<String>,
+    /// Revision of the issued session at hold time. A changed or revoked live
+    /// session voids approval of the forward command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_revision: Option<String>,
+    /// Saved-grant secret selectors captured at hold time. `None` means the
+    /// session was unrestricted; `Some([])` means no secret is entitled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_entitlements: Option<Vec<String>>,
     /// env-var -> secret-key mapping materialized as child-lifetime files.
     #[serde(default)]
     pub secret_file_keys: BTreeMap<String, String>,
@@ -437,6 +445,8 @@ mod tests {
             env: BTreeMap::new(),
             secret_keys: BTreeMap::new(),
             session_fingerprint: None,
+            session_revision: None,
+            secret_entitlements: None,
             secret_file_keys: BTreeMap::new(),
             verb_name: None,
             verb_params: BTreeMap::new(),

@@ -298,6 +298,20 @@ pub struct SessionStats {
     pub not_attempted: u64,
     pub source_counts: BTreeMap<String, u64>,
     pub risk_histogram: Vec<u64>,
+    #[serde(default)]
+    pub evaluator_calls: u64,
+    #[serde(default)]
+    pub cache_hits: u64,
+    #[serde(default)]
+    pub holds: u64,
+    #[serde(default)]
+    pub novel_shapes: u64,
+    #[serde(default)]
+    pub novel_shape_rate_percent: u8,
+    #[serde(default)]
+    pub suspended: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspension_reason: Option<String>,
 }
 
 impl Default for SessionStats {
@@ -312,8 +326,26 @@ impl Default for SessionStats {
             not_attempted: 0,
             source_counts: BTreeMap::new(),
             risk_histogram: vec![0; 11],
+            evaluator_calls: 0,
+            cache_hits: 0,
+            holds: 0,
+            novel_shapes: 0,
+            novel_shape_rate_percent: 0,
+            suspended: false,
+            suspension_reason: None,
         }
     }
+}
+
+/// Optional daemon-wide behavioral circuit breakers. `None` thresholds are
+/// disabled so a default deployment remains deploy-and-forget.
+#[derive(Debug, Clone, Default)]
+pub struct SessionBehaviorLimits {
+    pub window_secs: u64,
+    pub max_denials: Option<u64>,
+    pub max_holds: Option<u64>,
+    pub max_deny_ratio_percent: Option<u8>,
+    pub min_commands_for_ratio: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -497,7 +529,17 @@ impl SessionRegistry {
         });
     }
 
+    #[cfg(test)]
     pub fn show(&self, token: &str, limit: usize) -> Option<SessionReport> {
+        self.show_with_limits(token, limit, &SessionBehaviorLimits::default())
+    }
+
+    pub fn show_with_limits(
+        &self,
+        token: &str,
+        limit: usize,
+        limits: &SessionBehaviorLimits,
+    ) -> Option<SessionReport> {
         let active = self.grants.get(token).and_then(|grant| {
             if grant.is_expired(now_unix()) {
                 None
@@ -568,7 +610,32 @@ impl SessionRegistry {
                 let bucket = risk.clamp(0, 10) as usize;
                 stats.risk_histogram[bucket] += 1;
             }
+            if matches!(
+                interaction.source,
+                SessionDecisionSource::Llm | SessionDecisionSource::EvaluatorError
+            ) {
+                stats.evaluator_calls += 1;
+            }
+            if interaction.source == SessionDecisionSource::Cache {
+                stats.cache_hits += 1;
+            }
+            if interaction.exec_status == SessionExecStatus::Held {
+                stats.holds += 1;
+            }
         }
+        stats.novel_shapes = matching
+            .iter()
+            .map(|interaction| session_command_shape(&interaction.command))
+            .collect::<std::collections::HashSet<_>>()
+            .len() as u64;
+        stats.novel_shape_rate_percent = stats
+            .novel_shapes
+            .saturating_mul(100)
+            .checked_div(stats.total)
+            .unwrap_or(0)
+            .min(100) as u8;
+        stats.suspension_reason = self.suspension_reason(token, limits);
+        stats.suspended = stats.suspension_reason.is_some();
 
         let mut recent = matching;
         if recent.len() > limit {
@@ -581,6 +648,49 @@ impl SessionRegistry {
             stats,
             recent,
         })
+    }
+
+    pub fn suspension_reason(&self, token: &str, limits: &SessionBehaviorLimits) -> Option<String> {
+        if !self.has(token) {
+            return None;
+        }
+        let cutoff = now_unix().saturating_sub(limits.window_secs.max(1));
+        let window = self
+            .interactions
+            .iter()
+            .filter(|entry| entry.token == token && entry.interaction.at_unix >= cutoff)
+            .map(|entry| &entry.interaction)
+            .collect::<Vec<_>>();
+        let denials = window.iter().filter(|entry| !entry.allowed).count() as u64;
+        let holds = window
+            .iter()
+            .filter(|entry| entry.exec_status == SessionExecStatus::Held)
+            .count() as u64;
+        if limits.max_denials.is_some_and(|limit| denials >= limit) {
+            return Some(format!(
+                "session suspended after {denials} denials within {}s",
+                limits.window_secs.max(1)
+            ));
+        }
+        if limits.max_holds.is_some_and(|limit| holds >= limit) {
+            return Some(format!(
+                "session suspended after {holds} holds within {}s",
+                limits.window_secs.max(1)
+            ));
+        }
+        let total = window.len() as u64;
+        if total >= limits.min_commands_for_ratio.max(1) {
+            if let Some(limit) = limits.max_deny_ratio_percent {
+                let ratio = denials.saturating_mul(100) / total.max(1);
+                if ratio >= u64::from(limit) {
+                    return Some(format!(
+                        "session suspended at {ratio}% denials ({denials}/{total}) within {}s",
+                        limits.window_secs.max(1)
+                    ));
+                }
+            }
+        }
+        None
     }
 
     /// Return the additive prompt for this session, if the grant exists,
@@ -629,6 +739,11 @@ impl SessionRegistry {
             .map(|name| (name, grant.scope.saved_revision))
     }
 
+    pub fn expires_at_for(&self, token: &str) -> Option<Option<u64>> {
+        let grant = self.grants.get(token)?;
+        (!grant.is_expired(now_unix())).then_some(grant.expires_at)
+    }
+
     pub fn secret_name_allowed(&self, token: &str, name: &str) -> Option<bool> {
         let grant = self.grants.get(token)?;
         if grant.is_expired(now_unix()) {
@@ -644,6 +759,37 @@ impl SessionRegistry {
                     .strip_suffix('*')
                     .is_some_and(|prefix| name.starts_with(prefix))
         }))
+    }
+
+    /// Immutable authority captured when a hold or containment envelope is
+    /// created. `None` selectors mean the session is not saved-grant scoped.
+    pub fn authority_snapshot(&self, token: &str) -> Option<(String, Option<Vec<String>>)> {
+        let grant = self.grants.get(token)?;
+        if grant.is_expired(now_unix()) {
+            return None;
+        }
+        let selectors = grant
+            .scope
+            .saved_grant
+            .is_some()
+            .then(|| grant.scope.secret_names.clone());
+        Some((self.effective_revision_key(token)?, selectors))
+    }
+
+    pub fn effective_revision_for_fingerprint(&self, fingerprint: &str) -> Option<String> {
+        self.grants.keys().find_map(|token| {
+            let digest = sha2::Sha256::digest(token.as_bytes());
+            let candidate = format!(
+                "sha256:{}",
+                digest[..16]
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            );
+            (candidate == fingerprint)
+                .then(|| self.effective_revision_key(token))
+                .flatten()
+        })
     }
 
     pub fn effective_revision_key(&self, token: &str) -> Option<String> {
@@ -928,6 +1074,24 @@ impl SessionRegistry {
 
         None
     }
+}
+
+/// Stable, value-insensitive behavioral bucket matching the command-learning
+/// tuple: binary, first argument, and arity. It distinguishes operation families
+/// without treating every object name or path as a fresh shape.
+fn session_command_shape(command: &str) -> String {
+    let parts = shell_words::split(command).unwrap_or_else(|_| {
+        command
+            .split_whitespace()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    });
+    let binary = parts.first().map(String::as_str).unwrap_or("");
+    let first_arg = parts.get(1).map(String::as_str).unwrap_or("");
+    format!(
+        "{binary}\u{1f}{first_arg}\u{1f}{}",
+        parts.len().saturating_sub(1)
+    )
 }
 
 fn historical(
@@ -1408,8 +1572,94 @@ mod tests {
         assert_eq!(report.stats.not_attempted, 1);
         assert_eq!(report.stats.risk_histogram[1], 1);
         assert_eq!(report.stats.risk_histogram[2], 1);
+        assert_eq!(report.stats.evaluator_calls, 2);
+        assert_eq!(report.stats.cache_hits, 0);
+        assert_eq!(report.stats.holds, 0);
+        assert_eq!(report.stats.novel_shapes, 3);
+        assert_eq!(report.stats.novel_shape_rate_percent, 100);
         assert_eq!(report.recent.len(), 2);
         assert_eq!(report.recent[0].command, "rm -rf /tmp/a");
         assert_eq!(report.recent[1].command, "echo hi");
+    }
+
+    #[test]
+    fn behavioral_limits_use_the_persistable_interaction_history() {
+        let mut reg = reg_with("tok", &[], &[]);
+        let now = now_unix();
+        for (command, allowed, source, status) in [
+            (
+                "kubectl get services",
+                true,
+                SessionDecisionSource::Llm,
+                SessionExecStatus::Completed,
+            ),
+            (
+                "kubectl get pods",
+                true,
+                SessionDecisionSource::Cache,
+                SessionExecStatus::Completed,
+            ),
+            (
+                "kubectl delete pod x",
+                false,
+                SessionDecisionSource::Llm,
+                SessionExecStatus::NotAttempted,
+            ),
+            (
+                "kubectl apply -f change.yaml",
+                true,
+                SessionDecisionSource::Llm,
+                SessionExecStatus::Held,
+            ),
+        ] {
+            reg.record_interaction(
+                "tok",
+                SessionInteraction {
+                    at_unix: now,
+                    command: command.into(),
+                    allowed,
+                    source,
+                    reason: "test".into(),
+                    risk: None,
+                    exec_status: status,
+                    exit_code: None,
+                    exposed_secret_refs: Vec::new(),
+                },
+            );
+        }
+
+        let limits = SessionBehaviorLimits {
+            window_secs: 60,
+            max_denials: None,
+            max_holds: Some(1),
+            max_deny_ratio_percent: None,
+            min_commands_for_ratio: 1,
+        };
+        let report = reg.show_with_limits("tok", 10, &limits).unwrap();
+        assert_eq!(report.stats.total, 4);
+        assert_eq!(report.stats.evaluator_calls, 3);
+        assert_eq!(report.stats.cache_hits, 1);
+        assert_eq!(report.stats.denied, 1);
+        assert_eq!(report.stats.holds, 1);
+        assert_eq!(report.stats.novel_shapes, 3);
+        assert_eq!(report.stats.novel_shape_rate_percent, 75);
+        assert!(report.stats.suspended);
+        assert!(report
+            .stats
+            .suspension_reason
+            .as_deref()
+            .unwrap()
+            .contains("1 holds"));
+
+        let ratio_limits = SessionBehaviorLimits {
+            max_holds: None,
+            max_deny_ratio_percent: Some(25),
+            min_commands_for_ratio: 4,
+            ..limits
+        };
+        assert!(reg
+            .suspension_reason("tok", &ratio_limits)
+            .unwrap()
+            .contains("25% denials"));
     }
 }

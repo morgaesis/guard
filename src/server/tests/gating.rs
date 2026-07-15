@@ -1,16 +1,22 @@
 use crate::server::admin::{handle_admin_request, handle_approval_note};
 use crate::server::execute::audit_session_fingerprint;
+#[cfg(unix)]
+use crate::server::gate_runtime::run_provisional_check;
 use crate::server::gate_runtime::{
     approval_to_result, execute_snapshot, hash_secret_value, hold_for_approval, new_handle,
     now_unix, route_gated_allow, GateInputs,
 };
 #[cfg(unix)]
-use crate::server::gate_runtime::{arm_containment, finish_revert, DaemonGateSink};
+use crate::server::gate_runtime::{
+    arm_containment, finish_due_provisional, finish_revert, DaemonGateSink,
+};
 use crate::server::wire::{
     AdminRequest, AdminResponse, CallerIdentity, ExecOutcome, ExecuteRequest, ExecuteResult,
     RevertSpec,
 };
 use crate::server::{ServerConfig, APPROVAL_TTL_SECS};
+#[cfg(unix)]
+use crate::session::SessionGrant;
 #[cfg(unix)]
 use crate::session_store::SessionStore;
 use guard::gating::approval::{Approval, ApprovalSnapshot, ApprovalStatus};
@@ -19,7 +25,6 @@ use guard::gating::provisional::{ApiRevertPlan, Provisional, ProvisionalStatus};
 use guard::gating::{Coverage, GateMode, Reversibility};
 use guard::principal::PrincipalKey;
 use std::collections::HashMap;
-#[cfg(unix)]
 #[cfg(unix)]
 use std::sync::Arc;
 #[cfg(unix)]
@@ -136,6 +141,8 @@ impl AsyncWrite for FlakyWriter {
 #[cfg(unix)]
 #[tokio::test]
 async fn containment_stays_armed_when_client_stream_drops_after_launch() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let escaped_marker = temp.path().join("background-child-survived");
     let (cfg, _operator, agent) = gating_config(7001, 1000);
     let agent_principal = agent.principal();
     cfg.secrets
@@ -147,15 +154,19 @@ async fn containment_stays_armed_when_client_stream_drops_after_launch() {
         .await
         .unwrap();
 
-    // Forward `echo` produces a line, so the daemon attempts to stream it;
-    // our writer fails on that first write -> exec_failed_after_start.
+    // The shell produces a line and starts a same-group background child. The
+    // writer fails on the first stream write, so the daemon must group-kill the
+    // shell and background child while retaining the containment envelope.
     let mut request = contain_request(
-        "echo",
-        &["contained-change"],
-        RevertSpec {
-            binary: "true".to_string(),
-            args: Vec::new(),
-        },
+        "sh",
+        &[
+            "-c",
+            &format!(
+                "echo launched; (sleep 0.3; touch '{}') & wait",
+                escaped_marker.display()
+            ),
+        ],
+        RevertSpec::new("true", Vec::new()),
     );
     request.secret_files.insert(
         "STREAM_SECRET_FILE".to_string(),
@@ -174,6 +185,7 @@ async fn containment_stays_armed_when_client_stream_drops_after_launch() {
         &mut writer,
     )
     .await;
+    tokio::time::sleep(std::time::Duration::from_millis(450)).await;
 
     // The forward child launched then failed: started=true.
     match &result.exec {
@@ -207,6 +219,10 @@ async fn containment_stays_armed_when_client_stream_drops_after_launch() {
         0,
         "stream disconnect must remove child-lifetime secret files"
     );
+    assert!(
+        !escaped_marker.exists(),
+        "same-group background child survived the stream disconnect"
+    );
 }
 
 /// Counterpart to the leak test: a contained forward command that FAILS TO
@@ -221,10 +237,7 @@ async fn containment_dropped_when_forward_fails_to_spawn() {
     let request = contain_request(
         "guard-nonexistent-binary-xyz",
         &[],
-        RevertSpec {
-            binary: "true".to_string(),
-            args: Vec::new(),
-        },
+        RevertSpec::new("true", Vec::new()),
     );
     let mut sink = tokio::io::sink();
 
@@ -264,14 +277,7 @@ async fn contain_then_operator_confirm_keeps_change_nonoperator_refused() {
     let (cfg, operator, agent) = gating_config(7003, 1000);
     let agent_principal = agent.principal();
 
-    let request = contain_request(
-        "true",
-        &[],
-        RevertSpec {
-            binary: "true".to_string(),
-            args: Vec::new(),
-        },
-    );
+    let request = contain_request("true", &[], RevertSpec::new("true", Vec::new()));
     let mut sink = tokio::io::sink();
     let result = arm_containment(
         request,
@@ -351,14 +357,7 @@ async fn contain_then_deadline_triggers_sweeper_autorevert() {
     let agent_principal = agent.principal();
 
     // A 1s window: the smallest the clamp allows.
-    let mut request = contain_request(
-        "true",
-        &[],
-        RevertSpec {
-            binary: "true".to_string(),
-            args: Vec::new(),
-        },
-    );
+    let mut request = contain_request("true", &[], RevertSpec::new("true", Vec::new()));
     request.confirm_within_secs = Some(1);
     let mut sink = tokio::io::sink();
     let result = arm_containment(
@@ -401,6 +400,160 @@ async fn contain_then_deadline_triggers_sweeper_autorevert() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn due_confirm_check_reuses_secret_bindings_and_keeps_the_change() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let revert_marker = temp.path().join("revert-ran");
+    let (cfg, _operator, agent) = gating_config(7_021, 1_000);
+    let principal = agent.principal().expect("agent principal");
+    cfg.secrets
+        .set(&principal, "check-token", "expected-check-secret")
+        .await
+        .expect("seed check secret");
+
+    let mut revert = RevertSpec::new(
+        "sh",
+        vec!["-c".into(), format!("touch '{}'", revert_marker.display())],
+    );
+    revert.confirm_check = Some(crate::server::CommandSpec {
+        binary: "sh".into(),
+        args: vec![
+            "-c".into(),
+            "test \"$(cat \"$CHECK_TOKEN_FILE\")\" = expected-check-secret".into(),
+        ],
+    });
+    revert.control_path = Some("local daemon identity and secret namespace".into());
+    let mut request = contain_request("true", &[], revert);
+    request.session_token = Some("check-session".into());
+    request
+        .secret_files
+        .insert("CHECK_TOKEN_FILE".into(), "check-token".into());
+    let mut sink = tokio::io::sink();
+    let result = arm_containment(
+        request,
+        &cfg,
+        &agent,
+        Some(principal),
+        "verified change".into(),
+        0,
+        false,
+        &mut sink,
+    )
+    .await;
+    let handle = match result.exec {
+        ExecOutcome::Provisional { handle, .. } => handle,
+        other => panic!("expected provisional, got {other:?}"),
+    };
+    let due = cfg
+        .provisional
+        .write()
+        .await
+        .take_due(now_unix() + 10_000_000);
+    assert_eq!(due.len(), 1);
+    let outcome = finish_due_provisional(&cfg, &due[0]).await;
+
+    assert_eq!(outcome.1, Some(0));
+    let row = cfg.provisional.read().await.get(&handle).cloned().unwrap();
+    assert_eq!(row.status, ProvisionalStatus::Confirmed);
+    assert_eq!(
+        row.session_fingerprint.as_deref(),
+        Some(audit_session_fingerprint(Some("check-session")).as_str())
+    );
+    assert!(
+        !revert_marker.exists(),
+        "successful check must not roll back"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn due_failed_confirm_check_runs_the_rollback() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let revert_marker = temp.path().join("revert-ran");
+    let (cfg, _operator, agent) = gating_config(7_022, 1_000);
+    let mut revert = RevertSpec::new(
+        "sh",
+        vec!["-c".into(), format!("touch '{}'", revert_marker.display())],
+    );
+    revert.confirm_check = Some(crate::server::CommandSpec {
+        binary: "false".into(),
+        args: Vec::new(),
+    });
+    let request = contain_request("true", &[], revert);
+    let mut sink = tokio::io::sink();
+    let result = arm_containment(
+        request,
+        &cfg,
+        &agent,
+        agent.principal(),
+        "failed verification change".into(),
+        0,
+        false,
+        &mut sink,
+    )
+    .await;
+    let handle = match result.exec {
+        ExecOutcome::Provisional { handle, .. } => handle,
+        other => panic!("expected provisional, got {other:?}"),
+    };
+    let due = cfg
+        .provisional
+        .write()
+        .await
+        .take_due(now_unix() + 10_000_000);
+    let outcome = finish_due_provisional(&cfg, &due[0]).await;
+
+    assert_eq!(outcome.1, Some(0));
+    assert_eq!(
+        cfg.provisional.read().await.get(&handle).unwrap().status,
+        ProvisionalStatus::Reverted
+    );
+    assert!(revert_marker.exists(), "failed check must roll back");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn containment_check_cannot_bypass_the_server_binary_floor() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let forward_marker = temp.path().join("forward-ran");
+    let (mut cfg, _operator, agent) = gating_config(7_023, 1_000);
+    cfg.allowed_binaries = Some(vec!["sh".into(), "true".into()]);
+    let mut revert = RevertSpec::new("true", Vec::new());
+    revert.confirm_check = Some(crate::server::CommandSpec {
+        binary: "false".into(),
+        args: Vec::new(),
+    });
+    let request = contain_request(
+        "sh",
+        &["-c", &format!("touch '{}'", forward_marker.display())],
+        revert,
+    );
+    let mut sink = tokio::io::sink();
+    let result = arm_containment(
+        request,
+        &cfg,
+        &agent,
+        agent.principal(),
+        "binary floor test".into(),
+        0,
+        false,
+        &mut sink,
+    )
+    .await;
+
+    match result.exec {
+        ExecOutcome::Failed {
+            started: false,
+            reason,
+            ..
+        } => assert!(reason.contains("outside the server allow-list"), "{reason}"),
+        other => panic!("expected pre-exec failure, got {other:?}"),
+    }
+    assert!(!forward_marker.exists());
+    assert!(cfg.provisional.read().await.list().is_empty());
+}
+
 /// A persisted provisional keeps only a secret-file reference. After a
 /// simulated daemon restart, the operator-initiated revert resolves and
 /// materializes that reference from the new daemon's live secret manager. A
@@ -430,15 +583,15 @@ async fn provisional_revert_reresolves_secret_after_restart() {
     let mut request = contain_request(
         "true",
         &[],
-        RevertSpec {
-            binary: "sh".to_string(),
-            args: vec![
+        RevertSpec::new(
+            "sh",
+            vec![
                 "-c".to_string(),
                 "cat \"$REVERT_TOKEN_FILE\" > \"$1\"".to_string(),
                 "sh".to_string(),
                 output.display().to_string(),
             ],
-        },
+        ),
     );
     request
         .secret_files
@@ -557,10 +710,7 @@ async fn containment_refuses_plain_env_before_forward_exec() {
     let mut request = contain_request(
         "sh",
         &["-c", &format!("touch '{}'", marker.display())],
-        RevertSpec {
-            binary: "true".to_string(),
-            args: Vec::new(),
-        },
+        RevertSpec::new("true", Vec::new()),
     );
     request
         .env
@@ -623,6 +773,12 @@ async fn api_revert_without_running_proxy_defers_to_operator() {
             "POST".to_string(),
             "/repos/o/r/labels".to_string(),
         ],
+        confirm_check_binary: None,
+        confirm_check_args: Vec::new(),
+        control_path: None,
+        session_fingerprint: None,
+        session_revision: None,
+        secret_entitlements: None,
         api_revert: Some(ApiRevertPlan {
             protocol: "github".to_string(),
             method: "POST".to_string(),
@@ -718,6 +874,12 @@ async fn api_revert_executes_through_registered_proxy_upstream() {
             "POST".to_string(),
             "/repos/o/r/labels".to_string(),
         ],
+        confirm_check_binary: None,
+        confirm_check_args: Vec::new(),
+        control_path: None,
+        session_fingerprint: None,
+        session_revision: None,
+        secret_entitlements: None,
         api_revert: Some(ApiRevertPlan {
             protocol: "github".to_string(),
             method: "POST".to_string(),
@@ -767,10 +929,10 @@ async fn recoverable_with_unaffirmable_revert_is_held_for_review() {
     let request = contain_request(
         "systemctl",
         &["restart", "app"],
-        RevertSpec {
-            binary: "../evil".to_string(), // `..` rejected by invalid_binary_reason
-            args: Vec::new(),
-        },
+        RevertSpec::new(
+            "../evil", // `..` rejected by invalid_binary_reason
+            Vec::new(),
+        ),
     );
     let inputs = GateInputs {
         reason: "recoverable restart".to_string(),
@@ -1539,6 +1701,8 @@ async fn approve_voided_when_verb_catalog_version_changed() {
         env: BTreeMap::new(),
         secret_keys: BTreeMap::new(),
         session_fingerprint: None,
+        session_revision: None,
+        secret_entitlements: None,
         secret_file_keys: BTreeMap::new(),
         verb_name: Some("restart-service".to_string()),
         verb_params: BTreeMap::new(),
@@ -1606,6 +1770,8 @@ async fn approved_snapshot_rechecks_binary_floor_before_exec() {
         env: BTreeMap::new(),
         secret_keys: BTreeMap::new(),
         session_fingerprint: None,
+        session_revision: None,
+        secret_entitlements: None,
         secret_file_keys: BTreeMap::new(),
         verb_name: None,
         verb_params: BTreeMap::new(),
@@ -1626,6 +1792,164 @@ async fn approved_snapshot_rechecks_binary_floor_before_exec() {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn stored_entitlements_cover_tool_secrets_for_approval_check_and_revert() {
+    let (cfg, _, agent) = gating_config(7020, 1000);
+    let principal = agent.principal().unwrap();
+    cfg.secrets
+        .set(&principal, "broker/token", "never-printed")
+        .await
+        .unwrap();
+    let tools = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        tools.path(),
+        "tools:\n  true:\n    secrets:\n      BROKER_TOKEN: broker/token\n",
+    )
+    .unwrap();
+    *cfg.tool_registry.write().await =
+        crate::tool_config::ToolRegistry::load(tools.path()).unwrap();
+
+    let snapshot = ApprovalSnapshot {
+        binary: "true".to_string(),
+        args: Vec::new(),
+        cwd: None,
+        env: BTreeMap::new(),
+        secret_keys: BTreeMap::new(),
+        session_fingerprint: None,
+        session_revision: None,
+        secret_entitlements: Some(Vec::new()),
+        secret_file_keys: BTreeMap::new(),
+        verb_name: None,
+        verb_params: BTreeMap::new(),
+        catalog_version: None,
+        principal: Some(principal.clone()),
+        secret_binding: None,
+    };
+    let approved = execute_snapshot(&cfg, &snapshot, "operator approved").await;
+    assert!(matches!(
+        approved.exec,
+        ExecOutcome::Failed { started: false, ref reason }
+            if reason.contains("does not entitle secret 'broker/token'")
+    ));
+
+    let provisional = Provisional {
+        handle: "entitled-control-path".to_string(),
+        principal: Some(principal),
+        binary: "true".to_string(),
+        args: Vec::new(),
+        cwd: None,
+        secret_keys: BTreeMap::new(),
+        secret_file_keys: BTreeMap::new(),
+        revert_binary: "true".to_string(),
+        revert_args: Vec::new(),
+        confirm_check_binary: Some("true".to_string()),
+        confirm_check_args: Vec::new(),
+        control_path: Some("test".to_string()),
+        session_fingerprint: None,
+        session_revision: Some("revoked-session-revision".to_string()),
+        secret_entitlements: Some(Vec::new()),
+        api_revert: None,
+        reason: "test".to_string(),
+        created_unix: now_unix(),
+        deadline_unix: now_unix(),
+        forward_done: true,
+        status: ProvisionalStatus::Reverting,
+        revert_exit: None,
+        revert_detail: None,
+    };
+    let checked = run_provisional_check(&cfg, &provisional).await;
+    assert!(matches!(
+        checked.exec,
+        ExecOutcome::Failed { started: false, ref reason }
+            if reason.contains("does not entitle secret 'broker/token'")
+    ));
+    cfg.provisional.write().await.insert(provisional.clone());
+    let (_, exit) = finish_revert(&cfg, &provisional, &agent, "test").await;
+    assert_eq!(exit, None);
+    assert!(matches!(
+        cfg.provisional
+            .read()
+            .await
+            .get(&provisional.handle)
+            .unwrap()
+            .status,
+        ProvisionalStatus::RevertFailed
+    ));
+
+    let mut viable = provisional;
+    viable.handle = "revoked-session-rollback".to_string();
+    viable.secret_entitlements = Some(vec!["broker/token".to_string()]);
+    viable.status = ProvisionalStatus::Reverting;
+    viable.revert_exit = None;
+    viable.revert_detail = None;
+    let checked = run_provisional_check(&cfg, &viable).await;
+    assert!(matches!(
+        checked.exec,
+        ExecOutcome::Completed {
+            exit_code: Some(0),
+            ..
+        }
+    ));
+    cfg.provisional.write().await.insert(viable.clone());
+    let (_, exit) = finish_revert(&cfg, &viable, &agent, "test").await;
+    assert_eq!(exit, Some(0));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn approved_snapshot_rejects_changed_session_revision() {
+    let (cfg, _, agent) = gating_config(7021, 1000);
+    let token = "held-session-revision";
+    cfg.sessions.write().await.grant(
+        token.to_string(),
+        SessionGrant {
+            allow: Vec::new(),
+            deny: Vec::new(),
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            activated_verbs: Vec::new(),
+            override_markers: Vec::new(),
+            scope: Default::default(),
+            expires_at: None,
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            static_only: false,
+            auto_amend: false,
+            granted_at: 0,
+        },
+    );
+    let revision = cfg
+        .sessions
+        .read()
+        .await
+        .effective_revision_key(token)
+        .unwrap();
+    let snapshot = ApprovalSnapshot {
+        binary: "true".to_string(),
+        args: Vec::new(),
+        cwd: None,
+        env: BTreeMap::new(),
+        secret_keys: BTreeMap::new(),
+        session_fingerprint: Some(audit_session_fingerprint(Some(token))),
+        session_revision: Some(revision),
+        secret_entitlements: None,
+        secret_file_keys: BTreeMap::new(),
+        verb_name: None,
+        verb_params: BTreeMap::new(),
+        catalog_version: None,
+        principal: agent.principal(),
+        secret_binding: None,
+    };
+    assert!(cfg.sessions.write().await.revoke(token));
+    let result = execute_snapshot(&cfg, &snapshot, "operator approved").await;
+    assert!(matches!(
+        result.exec,
+        ExecOutcome::Failed { started: false, ref reason }
+            if reason.contains("session changed or was revoked")
+    ));
+}
+
 #[tokio::test]
 async fn approved_snapshot_rejects_dangerous_request_env_before_exec() {
     let (cfg, _, agent) = gating_config(7018, 1000);
@@ -1639,6 +1963,8 @@ async fn approved_snapshot_rejects_dangerous_request_env_before_exec() {
         )]),
         secret_keys: BTreeMap::new(),
         session_fingerprint: None,
+        session_revision: None,
+        secret_entitlements: None,
         secret_file_keys: BTreeMap::new(),
         verb_name: None,
         verb_params: BTreeMap::new(),
@@ -1674,6 +2000,8 @@ async fn approved_snapshot_executes_in_snapshotted_cwd() {
         env: BTreeMap::new(),
         secret_keys: BTreeMap::new(),
         session_fingerprint: None,
+        session_revision: None,
+        secret_entitlements: None,
         secret_file_keys: BTreeMap::new(),
         verb_name: None,
         verb_params: BTreeMap::new(),
@@ -1710,6 +2038,8 @@ async fn approved_snapshot_rejects_missing_snapshotted_cwd_before_exec() {
         env: BTreeMap::new(),
         secret_keys: BTreeMap::new(),
         session_fingerprint: None,
+        session_revision: None,
+        secret_entitlements: None,
         secret_file_keys: BTreeMap::new(),
         verb_name: None,
         verb_params: BTreeMap::new(),
@@ -1754,6 +2084,8 @@ async fn approved_snapshot_rejects_retargeted_snapshotted_cwd_before_exec() {
         env: BTreeMap::new(),
         secret_keys: BTreeMap::new(),
         session_fingerprint: None,
+        session_revision: None,
+        secret_entitlements: None,
         secret_file_keys: BTreeMap::new(),
         verb_name: None,
         verb_params: BTreeMap::new(),
@@ -1801,6 +2133,12 @@ async fn provisional_revert_executes_in_snapshotted_cwd() {
             "-c".to_string(),
             "printf reverted > provisional-cwd.txt".to_string(),
         ],
+        confirm_check_binary: None,
+        confirm_check_args: Vec::new(),
+        control_path: None,
+        session_fingerprint: None,
+        session_revision: None,
+        secret_entitlements: None,
         api_revert: None,
         reason: "cwd revert".to_string(),
         created_unix: now_unix(),

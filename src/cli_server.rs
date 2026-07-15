@@ -28,6 +28,28 @@ pub(crate) fn resolve_history_retention(
     Ok(value)
 }
 
+fn guard_env_u64(suffix: &str) -> Result<Option<u64>> {
+    guard_env(suffix)
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .with_context(|| format!("GUARD_{suffix} must be an unsigned integer"))
+        })
+        .transpose()
+}
+
+fn guard_env_u8(suffix: &str) -> Result<Option<u8>> {
+    guard_env(suffix)
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            value
+                .parse::<u8>()
+                .with_context(|| format!("GUARD_{suffix} must be an integer from 1 to 100"))
+        })
+        .transpose()
+}
+
 /// Resolve the GUARD_MODE env value: unset or blank defaults to readonly,
 /// and a present-but-invalid value fails startup loudly (like --gate)
 /// instead of silently falling back to readonly.
@@ -145,6 +167,13 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             api_promotion_state,
             api_promotion_min_approvals,
             api_promotion_min_denials,
+            notify_cmd,
+            notify_timeout,
+            session_behavior_window,
+            session_max_denials,
+            session_max_holds,
+            session_max_deny_ratio,
+            session_deny_ratio_min_commands,
             // Consumed in `main` (Windows SCM dispatch); irrelevant to the
             // server run itself, which is identical in service and foreground.
             service: _,
@@ -780,6 +809,62 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             )?;
             srv.set_gate(gate_mode);
             srv.set_approval_ttl(approval_ttl);
+            let notify_cmd = notify_cmd
+                .or_else(|| guard_env("NOTIFY_CMD").filter(|value| !value.trim().is_empty()));
+            if let Some(command) = notify_cmd {
+                let argv = shell_words::split(&command).context("invalid --notify-cmd command")?;
+                if argv.is_empty() {
+                    anyhow::bail!("--notify-cmd must contain an executable");
+                }
+                let timeout = notify_timeout
+                    .map(Some)
+                    .unwrap_or(guard_env_u64("NOTIFY_TIMEOUT_SECS")?)
+                    .unwrap_or(10);
+                if !(1..=60).contains(&timeout) {
+                    anyhow::bail!("--notify-timeout must be between 1 and 60 seconds");
+                }
+                srv.set_notify_hook(argv, timeout);
+            }
+            let ratio = session_max_deny_ratio
+                .map(Some)
+                .unwrap_or(guard_env_u8("SESSION_MAX_DENY_RATIO")?);
+            if ratio.is_some_and(|value| !(1..=100).contains(&value)) {
+                anyhow::bail!("--session-max-deny-ratio must be between 1 and 100");
+            }
+            let window = session_behavior_window
+                .map(Some)
+                .unwrap_or(guard_env_u64("SESSION_BEHAVIOR_WINDOW_SECS")?)
+                .unwrap_or(300);
+            let max_denials = session_max_denials
+                .map(Some)
+                .unwrap_or(guard_env_u64("SESSION_MAX_DENIALS")?);
+            let max_holds = session_max_holds
+                .map(Some)
+                .unwrap_or(guard_env_u64("SESSION_MAX_HOLDS")?);
+            let min_commands = session_deny_ratio_min_commands
+                .map(Some)
+                .unwrap_or(guard_env_u64("SESSION_DENY_RATIO_MIN_COMMANDS")?)
+                .unwrap_or(10);
+            if window == 0 {
+                anyhow::bail!("--session-behavior-window must be at least 1 second");
+            }
+            if max_denials == Some(0) {
+                anyhow::bail!("--session-max-denials must be at least 1");
+            }
+            if max_holds == Some(0) {
+                anyhow::bail!("--session-max-holds must be at least 1");
+            }
+            if min_commands == 0 {
+                anyhow::bail!("--session-deny-ratio-min-commands must be at least 1");
+            }
+            let limits = session::SessionBehaviorLimits {
+                window_secs: window,
+                max_denials,
+                max_holds,
+                max_deny_ratio_percent: ratio,
+                min_commands_for_ratio: min_commands,
+            };
+            srv.set_behavior_limits(limits);
 
             let explicit_verbs_path = verbs.or_else(|| {
                 guard_env("VERBS")

@@ -1413,6 +1413,9 @@ mod tests {
         let report = loaded.show("tok", 10).expect("session report");
         assert_eq!(report.stats.total, 1);
         assert_eq!(report.stats.risk_histogram[1], 1);
+        assert_eq!(report.stats.evaluator_calls, 1);
+        assert_eq!(report.stats.novel_shapes, 1);
+        assert_eq!(report.stats.novel_shape_rate_percent, 100);
         assert_eq!(report.recent[0].exit_code, Some(0));
         assert_eq!(report.recent[0].exposed_secret_refs, vec!["service/token"]);
         assert_eq!(

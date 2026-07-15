@@ -18,18 +18,13 @@ use std::fmt;
 use std::path::Path;
 use std::str::FromStr;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvaluationMode {
+    #[default]
     Evaluator,
     PolicyOnly,
     ReadOnly,
-}
-
-impl Default for EvaluationMode {
-    fn default() -> Self {
-        Self::Evaluator
-    }
 }
 
 impl fmt::Display for EvaluationMode {
@@ -154,10 +149,11 @@ impl SavedGrant {
     }
 
     pub fn contains_delta(&self, delta: &GrantRequestDelta) -> bool {
-        delta
-            .activated_verbs
-            .iter()
-            .all(|name| self.ceiling.verbs.contains(name))
+        delta.override_markers.is_empty()
+            && delta
+                .activated_verbs
+                .iter()
+                .all(|name| self.ceiling.verbs.contains(name))
             && delta.secret_names.iter().all(|name| {
                 self.ceiling
                     .secret_names
@@ -232,10 +228,16 @@ pub struct GrantRequest {
     pub session_token: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub saved_grant: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issued_saved_revision: Option<u64>,
     pub delta: GrantRequestDelta,
     pub justification: String,
     pub status: GrantRequestStatus,
     pub created_unix: u64,
+    /// Requests are capabilities with a bounded review window. A decision made
+    /// after this instant is rejected and must be resubmitted.
+    #[serde(default)]
+    pub expires_unix: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decided_unix: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -263,15 +265,18 @@ impl GrantRequest {
             bail!("grant request has no requested change");
         }
         let handle = format!("gr-{:032x}", rand::random::<u128>());
+        let created_unix = now_unix();
         Ok(Self {
             next_action: format!("guard grant request show {handle}"),
             handle,
             session_token,
             saved_grant,
+            issued_saved_revision: None,
             delta,
             justification,
             status: GrantRequestStatus::Pending,
-            created_unix: now_unix(),
+            created_unix,
+            expires_unix: created_unix.saturating_add(86_400),
             decided_unix: None,
             decided_reason: None,
         })
@@ -708,6 +713,10 @@ mod tests {
         }));
         assert!(!grant.contains_delta(&GrantRequestDelta {
             activated_verbs: vec!["deploy-b".to_string()],
+            ..GrantRequestDelta::default()
+        }));
+        assert!(!grant.contains_delta(&GrantRequestDelta {
+            override_markers: vec!["operator:apply".to_string()],
             ..GrantRequestDelta::default()
         }));
     }

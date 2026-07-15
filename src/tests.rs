@@ -66,6 +66,13 @@ fn parse_start(args: &[&str]) -> ServerCommands {
             api_promotion_state,
             api_promotion_min_approvals,
             api_promotion_min_denials,
+            notify_cmd,
+            notify_timeout,
+            session_behavior_window,
+            session_max_denials,
+            session_max_holds,
+            session_max_deny_ratio,
+            session_deny_ratio_min_commands,
             service,
         }) => ServerCommands::Start {
             socket,
@@ -131,6 +138,13 @@ fn parse_start(args: &[&str]) -> ServerCommands {
             api_promotion_state,
             api_promotion_min_approvals,
             api_promotion_min_denials,
+            notify_cmd,
+            notify_timeout,
+            session_behavior_window,
+            session_max_denials,
+            session_max_holds,
+            session_max_deny_ratio,
+            session_deny_ratio_min_commands,
             service,
         },
         _ => panic!("expected server start args"),
@@ -174,6 +188,48 @@ fn test_server_start_llm_retries_flag() {
         panic!("expected start");
     };
     assert_eq!(llm_retries, Some(1));
+}
+
+#[test]
+fn test_server_start_parses_notification_and_behavior_limits() {
+    let ServerCommands::Start {
+        notify_cmd,
+        notify_timeout,
+        session_behavior_window,
+        session_max_denials,
+        session_max_holds,
+        session_max_deny_ratio,
+        session_deny_ratio_min_commands,
+        ..
+    } = parse_start(&[
+        "guard",
+        "server",
+        "start",
+        "--notify-cmd",
+        "notify-guard --channel sre",
+        "--notify-timeout",
+        "9",
+        "--session-behavior-window",
+        "120",
+        "--session-max-denials",
+        "4",
+        "--session-max-holds",
+        "2",
+        "--session-max-deny-ratio",
+        "35",
+        "--session-deny-ratio-min-commands",
+        "8",
+    ])
+    else {
+        panic!("expected start");
+    };
+    assert_eq!(notify_cmd.as_deref(), Some("notify-guard --channel sre"));
+    assert_eq!(notify_timeout, Some(9));
+    assert_eq!(session_behavior_window, Some(120));
+    assert_eq!(session_max_denials, Some(4));
+    assert_eq!(session_max_holds, Some(2));
+    assert_eq!(session_max_deny_ratio, Some(35));
+    assert_eq!(session_deny_ratio_min_commands, Some(8));
 }
 
 #[test]
@@ -391,6 +447,44 @@ fn test_run_reevaluate_flag() {
         Ok(_) => panic!("expected Run variant"),
         Err(e) => panic!("parser rejected plain run: {}", e),
     }
+}
+
+#[test]
+fn test_run_confirm_check_requires_and_composes_with_revert() {
+    match MainArgs::try_parse_from([
+        "guard",
+        "run",
+        "--revert",
+        "ssh firewall-a rollback",
+        "--confirm-check",
+        "ssh firewall-a verify",
+        "--revert-control-path",
+        "brokered SSH to firewall-a",
+        "--confirm-within",
+        "45",
+        "ssh",
+        "firewall-a",
+        "apply",
+    ]) {
+        Ok(MainArgs::Run {
+            revert,
+            confirm_check,
+            revert_control_path,
+            confirm_within,
+            ..
+        }) => {
+            assert_eq!(revert.as_deref(), Some("ssh firewall-a rollback"));
+            assert_eq!(confirm_check.as_deref(), Some("ssh firewall-a verify"));
+            assert_eq!(
+                revert_control_path.as_deref(),
+                Some("brokered SSH to firewall-a")
+            );
+            assert_eq!(confirm_within, Some(45));
+        }
+        Ok(_) => panic!("expected Run variant"),
+        Err(error) => panic!("parser rejected containment envelope: {error}"),
+    }
+    assert!(MainArgs::try_parse_from(["guard", "run", "--confirm-check", "true", "true"]).is_err());
 }
 
 #[test]
@@ -1127,4 +1221,21 @@ fn unknown_top_level_command_does_not_execute_implicitly() {
         .err()
         .unwrap();
     assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
+}
+
+#[test]
+fn wait_approval_accepts_explicit_and_bare_unbounded() {
+    for args in [
+        vec!["guard", "run", "--wait-approval=unbounded", "true"],
+        vec!["guard", "run", "--wait-approval", "--", "true"],
+    ] {
+        assert!(matches!(
+            MainArgs::try_parse_from(args),
+            Ok(MainArgs::Run {
+                wait_approval: Some(u64::MAX),
+                ..
+            })
+        ));
+    }
+    assert!(MainArgs::try_parse_from(["guard", "run", "--wait-approval=0", "true"]).is_err());
 }

@@ -20,6 +20,7 @@ use super::gate_runtime::{
     execute_snapshot, finish_revert, forget_proxy_provenance, is_api_proxy_sentinel, now_unix,
     persist_approval, persist_provisional, remove_revert_body,
 };
+use super::runtime::NotifyEvent;
 use super::wire::{
     verb_effective_trust, AdminRequest, AdminResponse, ApprovalSummary, CallerIdentity,
     ExecOutcome, ProvisionalSummary, SecretDetail, ServerStatus, VerbSummary,
@@ -784,7 +785,7 @@ pub(super) async fn handle_admin_request(
                 };
             }
             let reg = config.sessions.read().await;
-            match reg.show(&token, limit.unwrap_or(20)) {
+            match reg.show_with_limits(&token, limit.unwrap_or(20), &config.behavior_limits) {
                 Some(mut report) => {
                     // A self-inspecting holder sees the full grant (rules, prompt,
                     // expiry) but never has its own raw bearer token echoed back.
@@ -810,7 +811,13 @@ pub(super) async fn handle_admin_request(
                         .to_string(),
                 };
             }
-            let Some(mut report) = config.sessions.read().await.show(&token, 20) else {
+            let Some(mut report) =
+                config
+                    .sessions
+                    .read()
+                    .await
+                    .show_with_limits(&token, 20, &config.behavior_limits)
+            else {
                 return AdminResponse::Error {
                     message: format!("unknown session token: '{token}'"),
                 };
@@ -1260,25 +1267,88 @@ pub(super) async fn handle_admin_request(
             }
         }
         AdminRequest::SavedGrantSave { grant } => {
+            let before = config.saved_grants.read().await.clone();
+            let result = config.saved_grants.write().await.insert(grant);
+            match result {
+                Ok(grant) => {
+                    if let Some(store) = &config.session_store {
+                        if let Err(error) = store.save_saved_grant(grant.clone()).await {
+                            *config.saved_grants.write().await = before;
+                            return AdminResponse::Error {
+                                message: format!("failed to persist saved grant: {error}"),
+                            };
+                        }
+                    }
+                    AdminResponse::SavedGrant { grant }
+                }
+                Err(error) => AdminResponse::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
+        AdminRequest::SavedGrantEdit {
+            name,
+            description,
+            activated_verbs,
+            clear_verbs,
+            secret_names,
+            clear_secrets,
+            ttl_secs,
+            clear_ttl,
+            prompt_append,
+            evaluation_mode,
+            auto_approve_requests,
+        } => {
+            let before = config.saved_grants.read().await.clone();
             let result = {
                 let mut catalog = config.saved_grants.write().await;
-                if catalog.get(&grant.name).is_some() {
-                    let mut grant = grant;
-                    if grant.generated_verbs.is_empty() {
-                        grant.generated_verbs = catalog
-                            .get(&grant.name)
-                            .map(|existing| existing.generated_verbs.clone())
-                            .unwrap_or_default();
-                    }
-                    catalog.replace(grant)
-                } else {
-                    catalog.insert(grant)
+                let Some(mut grant) = catalog.get(&name).cloned() else {
+                    return AdminResponse::Error {
+                        message: format!("unknown saved grant: '{name}'"),
+                    };
+                };
+                if let Some(description) = description {
+                    grant.description = description;
                 }
+                if clear_verbs {
+                    grant.activated_verbs.clear();
+                    grant.ceiling.verbs.clear();
+                } else if !activated_verbs.is_empty() {
+                    grant.activated_verbs = activated_verbs.clone();
+                    grant.ceiling.verbs = activated_verbs;
+                }
+                if clear_secrets {
+                    grant.secret_names.clear();
+                    grant.ceiling.secret_names.clear();
+                } else if !secret_names.is_empty() {
+                    grant.secret_names = secret_names.clone();
+                    grant.ceiling.secret_names = secret_names;
+                }
+                if clear_ttl {
+                    grant.ttl_secs = None;
+                    grant.ceiling.max_ttl_secs = None;
+                } else if let Some(ttl_secs) = ttl_secs {
+                    grant.ttl_secs = Some(ttl_secs);
+                    grant.ceiling.max_ttl_secs = Some(ttl_secs);
+                }
+                if let Some(prompt_append) = prompt_append {
+                    grant.prompt_append =
+                        (!prompt_append.trim().is_empty()).then_some(prompt_append);
+                }
+                if let Some(evaluation_mode) = evaluation_mode {
+                    grant.evaluation_mode = evaluation_mode;
+                    grant.ceiling.evaluation_modes = vec![evaluation_mode];
+                }
+                if let Some(auto_approve_requests) = auto_approve_requests {
+                    grant.auto_approve_requests = auto_approve_requests;
+                }
+                catalog.replace(grant)
             };
             match result {
                 Ok(grant) => {
                     if let Some(store) = &config.session_store {
                         if let Err(error) = store.save_saved_grant(grant.clone()).await {
+                            *config.saved_grants.write().await = before;
                             return AdminResponse::Error {
                                 message: format!("failed to persist saved grant: {error}"),
                             };
@@ -1351,19 +1421,17 @@ pub(super) async fn handle_admin_request(
             let mut updated = existing;
             updated.prompt_append = Some(prompt);
             updated.generated_verbs = vec![verb.clone()];
-            let updated = match config.saved_grants.write().await.replace(updated) {
-                Ok(grant) => grant,
-                Err(error) => {
-                    return AdminResponse::Error {
-                        message: error.to_string(),
-                    }
-                }
+            let staged = stage_saved_grant_regeneration(
+                &*config.saved_grants.read().await,
+                &*config.verbs.read().await,
+                &name,
+                updated,
+                verb,
+            );
+            let (staged_grants, staged_verbs, updated, added, removed, changed) = match staged {
+                Ok(staged) => staged,
+                Err(message) => return AdminResponse::Error { message },
             };
-            if let Err(error) = config.verbs.write().await.upsert_saved_grant_verb(verb) {
-                return AdminResponse::Error {
-                    message: error.to_string(),
-                };
-            }
             if let Some(store) = &config.session_store {
                 if let Err(error) = store.save_saved_grant(updated.clone()).await {
                     return AdminResponse::Error {
@@ -1371,7 +1439,14 @@ pub(super) async fn handle_admin_request(
                     };
                 }
             }
-            AdminResponse::SavedGrant { grant: updated }
+            *config.saved_grants.write().await = staged_grants;
+            *config.verbs.write().await = staged_verbs;
+            AdminResponse::SavedGrantRegenerated {
+                grant: updated,
+                added,
+                removed,
+                changed,
+            }
         }
         AdminRequest::GrantRequestSubmit {
             session_token,
@@ -1379,16 +1454,19 @@ pub(super) async fn handle_admin_request(
             prompt,
             delta,
         } => {
-            let issued_saved_grant = {
+            let (issued_saved_grant, issued_saved_revision, session_expires_at) = {
                 let registry = config.sessions.read().await;
                 if !registry.has(&session_token) {
                     return AdminResponse::Error {
                         message: format!("unknown active session: '{session_token}'"),
                     };
                 }
-                registry
-                    .saved_grant_for(&session_token)
-                    .map(|(name, _)| name)
+                let issued = registry.saved_grant_for(&session_token);
+                (
+                    issued.as_ref().map(|(name, _)| name.clone()),
+                    issued.as_ref().map(|(_, revision)| *revision),
+                    registry.expires_at_for(&session_token).flatten(),
+                )
             };
             if saved_grant.is_some() && saved_grant != issued_saved_grant {
                 return AdminResponse::Error {
@@ -1409,12 +1487,18 @@ pub(super) async fn handle_admin_request(
                     }
                 }
             };
+            request.issued_saved_revision = issued_saved_revision;
+            if let Some(session_expires_at) = session_expires_at {
+                request.expires_unix = request.expires_unix.min(session_expires_at);
+            }
             let selected = match issued_saved_grant.as_deref() {
                 Some(name) => config.saved_grants.read().await.get(name).cloned(),
                 None => None,
             };
             let auto_approved = selected.is_some_and(|grant| {
-                grant.auto_approve_requests && grant.contains_delta(&request.delta)
+                Some(grant.revision) == request.issued_saved_revision
+                    && grant.auto_approve_requests
+                    && grant.contains_delta(&request.delta)
             });
             if auto_approved {
                 let changed = config
@@ -1450,6 +1534,7 @@ pub(super) async fn handle_admin_request(
                     };
                 }
             }
+            emit_grant_request_event(config, &request, "grant_request_submitted");
             AdminResponse::GrantRequest {
                 request: redact_grant_request(request),
             }
@@ -1477,13 +1562,22 @@ pub(super) async fn handle_admin_request(
                 .collect();
             AdminResponse::GrantRequests { items }
         }
-        AdminRequest::GrantRequestShow { handle } => {
-            match config.grant_requests.read().await.get(&handle).cloned() {
+        AdminRequest::GrantRequestShow {
+            handle,
+            session_token,
+        } => {
+            let request = config.grant_requests.read().await.get(&handle).cloned();
+            match request.filter(|request| {
+                caller_is_session_admin(config, caller)
+                    || session_token
+                        .as_deref()
+                        .is_some_and(|token| token == request.session_token)
+            }) {
                 Some(request) => AdminResponse::GrantRequest {
                     request: redact_grant_request(request),
                 },
                 None => AdminResponse::Error {
-                    message: format!("unknown grant request: '{handle}'"),
+                    message: "unknown or unauthorized grant request".to_string(),
                 },
             }
         }
@@ -1493,13 +1587,25 @@ pub(super) async fn handle_admin_request(
         AdminRequest::GrantRequestDeny { handle, reason } => {
             decide_grant_request(config, &handle, false, &reason).await
         }
-        AdminRequest::GrantRequestWithdraw { handle } => {
+        AdminRequest::GrantRequestWithdraw {
+            handle,
+            session_token,
+        } => {
             let mut requests = config.grant_requests.write().await;
             let Some(request) = requests.get_mut(&handle) else {
                 return AdminResponse::Error {
                     message: format!("unknown grant request: '{handle}'"),
                 };
             };
+            if !caller_is_session_admin(config, caller)
+                && session_token
+                    .as_deref()
+                    .is_none_or(|token| token != request.session_token)
+            {
+                return AdminResponse::Error {
+                    message: "unknown or unauthorized grant request".to_string(),
+                };
+            }
             if request.status != GrantRequestStatus::Pending {
                 return AdminResponse::Error {
                     message: format!("grant request '{handle}' is not pending"),
@@ -1517,6 +1623,7 @@ pub(super) async fn handle_admin_request(
                     };
                 }
             }
+            emit_grant_request_event(config, &request, "grant_request_withdrawn");
             AdminResponse::GrantRequest {
                 request: redact_grant_request(request),
             }
@@ -1578,6 +1685,85 @@ fn normalize_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn generated_verb_delta(old: &[Verb], new: &[Verb]) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let old = old
+        .iter()
+        .map(|verb| {
+            (
+                verb.name.clone(),
+                serde_json::to_vec(verb).unwrap_or_default(),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let new = new
+        .iter()
+        .map(|verb| {
+            (
+                verb.name.clone(),
+                serde_json::to_vec(verb).unwrap_or_default(),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let added = new
+        .keys()
+        .filter(|name| !old.contains_key(*name))
+        .cloned()
+        .collect();
+    let removed = old
+        .keys()
+        .filter(|name| !new.contains_key(*name))
+        .cloned()
+        .collect();
+    let changed = new
+        .iter()
+        .filter(|(name, body)| old.get(*name).is_some_and(|old_body| old_body != *body))
+        .map(|(name, _)| name.clone())
+        .collect();
+    (added, removed, changed)
+}
+
+type RegenerationStage = (
+    crate::grant_profile::SavedGrantCatalog,
+    guard::gating::verb::VerbCatalog,
+    crate::grant_profile::SavedGrant,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+);
+
+fn stage_saved_grant_regeneration(
+    grants: &crate::grant_profile::SavedGrantCatalog,
+    verbs: &guard::gating::verb::VerbCatalog,
+    name: &str,
+    updated: crate::grant_profile::SavedGrant,
+    verb: Verb,
+) -> Result<RegenerationStage, String> {
+    let old_generated = grants
+        .get(name)
+        .map(|grant| grant.generated_verbs.clone())
+        .ok_or_else(|| format!("unknown saved grant: '{name}'"))?;
+    let mut staged_grants = grants.clone();
+    let updated = staged_grants
+        .replace(updated)
+        .map_err(|error| error.to_string())?;
+    let mut staged_verbs = verbs.clone();
+    staged_verbs
+        .remove_saved_grant_verbs(name)
+        .map_err(|error| error.to_string())?;
+    staged_verbs
+        .upsert_saved_grant_verb(verb)
+        .map_err(|error| error.to_string())?;
+    let (added, removed, changed) = generated_verb_delta(&old_generated, &updated.generated_verbs);
+    Ok((
+        staged_grants,
+        staged_verbs,
+        updated,
+        added,
+        removed,
+        changed,
+    ))
+}
+
 async fn decide_grant_request(
     config: &ServerConfig,
     handle: &str,
@@ -1596,6 +1782,9 @@ async fn decide_grant_request(
         };
     }
     if approve {
+        if let Err(message) = validate_grant_request_for_approval(config, &request).await {
+            return AdminResponse::Error { message };
+        }
         let changed = config
             .sessions
             .write()
@@ -1633,14 +1822,86 @@ async fn decide_grant_request(
             };
         }
     }
+    emit_grant_request_event(config, &request, "grant_request_decided");
     AdminResponse::GrantRequest {
         request: redact_grant_request(request),
     }
 }
 
+async fn validate_grant_request_for_approval(
+    config: &ServerConfig,
+    request: &GrantRequest,
+) -> Result<(), String> {
+    if request.expires_unix == 0 || now_unix() >= request.expires_unix {
+        return Err(format!(
+            "grant request '{}' expired; submit a new request",
+            request.handle
+        ));
+    }
+    let issued = config
+        .sessions
+        .read()
+        .await
+        .saved_grant_for(&request.session_token);
+    match (&request.saved_grant, request.issued_saved_revision, issued) {
+        (Some(expected_name), Some(expected_revision), Some((name, revision)))
+            if expected_name == &name && expected_revision == revision => {}
+        (None, None, None) => {}
+        _ => {
+            return Err(format!(
+                "grant request '{}' no longer matches the issued session revision; submit a new request",
+                request.handle
+            ))
+        }
+    }
+    if let (Some(name), Some(revision)) = (
+        request.saved_grant.as_deref(),
+        request.issued_saved_revision,
+    ) {
+        let current = config.saved_grants.read().await.get(name).cloned();
+        if current.as_ref().map(|grant| grant.revision) != Some(revision) {
+            return Err(format!(
+                "saved grant '{name}' changed after request issuance; submit a new request"
+            ));
+        }
+    }
+    if !request.delta.override_markers.is_empty() {
+        let available = config
+            .verbs
+            .read()
+            .await
+            .list()
+            .into_iter()
+            .flat_map(|verb| verb.coverage)
+            .filter_map(|cell| cell.override_marker)
+            .collect::<std::collections::BTreeSet<_>>();
+        if let Some(marker) = request
+            .delta
+            .override_markers
+            .iter()
+            .find(|marker| !available.contains(*marker))
+        {
+            return Err(format!("unknown verb override marker: '{marker}'"));
+        }
+    }
+    Ok(())
+}
+
 fn redact_grant_request(mut request: GrantRequest) -> GrantRequest {
     request.session_token = audit_session_fingerprint(Some(&request.session_token));
     request
+}
+
+fn emit_grant_request_event(config: &ServerConfig, request: &GrantRequest, event: &'static str) {
+    config.emit_event(NotifyEvent {
+        event,
+        at_unix: now_unix(),
+        handle: Some(request.handle.clone()),
+        session_fingerprint: Some(audit_session_fingerprint(Some(&request.session_token))),
+        reason: request.decided_reason.clone(),
+        status: Some(request.status.as_str().to_string()),
+        behavior: None,
+    });
 }
 
 /// Returns `(is_daemon, caller_principal)` for read-scoping. A caller is the
@@ -1672,6 +1933,15 @@ async fn handle_confirm(
             // persisted body so a secret-bearing snapshot is not left on disk.
             remove_revert_body(&p);
             tracing::info!(target: "guard::audit", "[AUDIT] CONFIRM handle={} caller={}", handle, caller);
+            config.emit_event(NotifyEvent {
+                event: "decision_made",
+                at_unix: now_unix(),
+                handle: Some(handle.to_string()),
+                session_fingerprint: p.session_fingerprint.clone(),
+                reason: Some("operator confirmed provisional".to_string()),
+                status: Some("confirmed".to_string()),
+                behavior: None,
+            });
             AdminResponse::GateAction {
                 message: format!("provisional {} confirmed; change kept", handle),
                 exit_code: None,
@@ -1682,6 +1952,61 @@ async fn handle_confirm(
         Err(e) => AdminResponse::Error {
             message: e.to_string(),
         },
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod regeneration_tests {
+    use super::*;
+    use crate::grant_profile::SavedGrantCatalog;
+    use guard::gating::verb::VerbCatalog;
+
+    fn fixture() -> (SavedGrantCatalog, VerbCatalog) {
+        let grants = SavedGrantCatalog::from_yaml(
+            "profiles:\n  - name: atomic\n    allow: ['kubectl get pods']\n",
+        )
+        .unwrap();
+        let mut verbs = VerbCatalog::empty();
+        for verb in &grants.get("atomic").unwrap().generated_verbs {
+            verbs.upsert_saved_grant_verb(verb.clone()).unwrap();
+        }
+        (grants, verbs)
+    }
+
+    #[test]
+    fn regeneration_stages_atomically_and_reports_deterministic_delta() {
+        let (grants, verbs) = fixture();
+        let original_grant = grants.get("atomic").unwrap().clone();
+        let original_names = verbs.names();
+        let mut changed = original_grant.generated_verbs[0].clone();
+        changed.description = "regenerated".to_string();
+        let mut updated = original_grant.clone();
+        updated.generated_verbs = vec![changed.clone()];
+
+        let (_, _, _, added, removed, changed_names) =
+            stage_saved_grant_regeneration(&grants, &verbs, "atomic", updated, changed).unwrap();
+        assert!(added.is_empty() && removed.is_empty());
+        assert_eq!(changed_names, original_names);
+        assert_eq!(
+            grants.get("atomic").unwrap().revision,
+            original_grant.revision
+        );
+        assert_eq!(verbs.names(), original_names);
+
+        let mut invalid = original_grant.generated_verbs[0].clone();
+        invalid.name = "outside-reserved-namespace".to_string();
+        let mut invalid_update = original_grant.clone();
+        invalid_update.generated_verbs = vec![invalid.clone()];
+        assert!(
+            stage_saved_grant_regeneration(&grants, &verbs, "atomic", invalid_update, invalid,)
+                .is_err()
+        );
+        assert_eq!(
+            grants.get("atomic").unwrap().revision,
+            original_grant.revision
+        );
+        assert_eq!(verbs.names(), original_names);
     }
 }
 
@@ -1751,6 +2076,15 @@ async fn handle_approve(
             handle,
             caller
         );
+        config.emit_event(NotifyEvent {
+            event: "decision_made",
+            at_unix: now,
+            handle: Some(handle.to_string()),
+            session_fingerprint: snapshot.session_fingerprint.clone(),
+            reason: Some("operator approved held API request".to_string()),
+            status: Some("approved".to_string()),
+            behavior: None,
+        });
         return AdminResponse::GateAction {
             message: format!("approved held API request {handle}; the proxy is forwarding it"),
             exit_code: None,
@@ -1786,6 +2120,15 @@ async fn handle_approve(
                     .unwrap_or("none"),
                 detail
             );
+            config.emit_event(NotifyEvent {
+                event: "decision_made",
+                at_unix: now,
+                handle: Some(handle.to_string()),
+                session_fingerprint: snapshot.session_fingerprint.clone(),
+                reason: Some(detail.clone()),
+                status: Some("voided".to_string()),
+                behavior: None,
+            });
             return AdminResponse::Error { message: detail };
         }
     }
@@ -1856,6 +2199,22 @@ async fn handle_approve(
     if let Some(a) = config.approvals.read().await.get(handle).cloned() {
         persist_approval(config, &a).await;
     }
+    config.emit_event(NotifyEvent {
+        event: "decision_made",
+        at_unix: now,
+        handle: Some(handle.to_string()),
+        session_fingerprint: snapshot.session_fingerprint.clone(),
+        reason: Some(message.clone()),
+        status: Some(
+            if exit.is_some() {
+                "approved"
+            } else {
+                "exec_failed"
+            }
+            .to_string(),
+        ),
+        behavior: None,
+    });
     AdminResponse::GateAction {
         message,
         exit_code: exit,
@@ -1956,6 +2315,15 @@ async fn handle_deny(
                 caller,
                 session_fingerprint.as_deref().unwrap_or("none")
             );
+            config.emit_event(NotifyEvent {
+                event: "decision_made",
+                at_unix: now,
+                handle: Some(handle.to_string()),
+                session_fingerprint,
+                reason: Some("operator denied held command".to_string()),
+                status: Some("denied".to_string()),
+                behavior: None,
+            });
             AdminResponse::GateAction {
                 message: format!("held command {} denied", handle),
                 exit_code: None,

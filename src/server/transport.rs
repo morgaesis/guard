@@ -114,6 +114,15 @@ impl Server {
         self.config.approval_ttl_secs = ttl_secs;
     }
 
+    /// Configure the optional operator notification command.
+    pub fn set_notify_hook(&mut self, command: Vec<String>, timeout_secs: u64) {
+        self.config.notify_hook = super::runtime::NotifyHook::new(command, timeout_secs);
+    }
+
+    pub fn set_behavior_limits(&mut self, limits: crate::session::SessionBehaviorLimits) {
+        self.config.behavior_limits = limits;
+    }
+
     /// Install the operator-defined verb catalog. Must be called before `run`.
     pub fn set_verbs(&mut self, catalog: VerbCatalog) {
         self.config.verbs = Arc::new(RwLock::new(catalog));
@@ -377,6 +386,7 @@ impl Server {
 
     pub async fn run(&self) -> Result<()> {
         tracing::info!("Server::run() called");
+        let _process_shutdown = self.config.process_tracker.shutdown_guard();
 
         // Load durable authorization state. Consequence rows also receive
         // boot-safe recovery when gating is enabled.
@@ -517,13 +527,31 @@ impl Server {
             anyhow::bail!("no socket path or TCP port specified");
         }
 
+        let abort_handles = futures
+            .iter()
+            .map(tokio::task::JoinHandle::abort_handle)
+            .collect::<Vec<_>>();
+        let joined = futures::future::join_all(futures);
+        tokio::pin!(joined);
+        let results = tokio::select! {
+            results = &mut joined => results,
+            _ = shutdown_signal() => {
+                tracing::info!("shutdown requested; stopping listeners and brokered children");
+                for handle in abort_handles {
+                    handle.abort();
+                }
+                self.config.process_tracker.terminate_all();
+                return Ok(());
+            }
+        };
+
         // A listener loop only returns on a fatal error (e.g. it could not bind);
         // surface it as an error return rather than exiting silently. This makes
         // the process exit non-zero, so the Windows service reports a failure and
         // the SCM restart action engages instead of the daemon sitting STOPPED
         // after a bind failure while having briefly reported RUNNING.
         let mut listener_error: Option<anyhow::Error> = None;
-        for result in futures::future::join_all(futures).await {
+        for result in results {
             match result {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
@@ -672,6 +700,29 @@ impl Server {
         std::fs::set_permissions(path, permissions)
             .with_context(|| format!("failed to chmod {} to {:o}", path.display(), mode))?;
         Ok(())
+    }
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(error) => {
+                tracing::warn!("failed to install SIGTERM handler: {error}");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 

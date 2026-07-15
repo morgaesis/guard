@@ -461,8 +461,8 @@ ls -l /run/guard/guard.sock
 - On Windows, run `deployment/windows/install-guard.ps1` to register the
   service-account model over a named pipe; this is required for consequence
   gating and credential brokering, since both authorize on the named-pipe SID.
-  For a no-gating deployment, run `guard server start --tcp-port 8123
-  --learn-rules` from a service manager or scheduled task, set
+  For a no-gating deployment, run `guard server start --tcp-port 8123`
+  from a service manager or scheduled task, set
   `GUARD_LLM_API_KEY` / `OPENROUTER_API_KEY` and `GUARD_AUTH_TOKEN` in that
   service environment (a TCP listener refuses to start without an exec token;
   the environment variable keeps it out of process listings), and configure
@@ -472,10 +472,9 @@ ls -l /run/guard/guard.sock
 - Omit `--users` to allow any local UNIX-socket caller. Add `--users` only when the daemon should reject all callers outside a specific UID list.
 - The packaged unit stores persistent session state at `/var/lib/guard/state.db`, which remains writable under the default systemd sandbox profile.
 - For LLM-backed evaluation, provide credentials through the environment file rather than command-line arguments.
-- For static-policy-only deployments, use `--no-llm` and provide a `--policy` file.
-- For latency-sensitive service APIs, enable learned static allows with
-  `--learn-rules`; use `--learn-shims suggest` or `--learn-shims create` to
-  surface shorter wrappers for repeated SSH/API prefixes.
+- For policy-only deployments, use `--no-evaluator` and provide a `--policy` file.
+- For latency-sensitive repeated operations, enable consequence gating and
+  automatic verb promotion with `--learn-allow`.
 - Pre-LLM executable validation and credential-pattern deny are off by default. Enable with `--preflight` or `GUARD_PREFLIGHT=true`. These checks are coarse and over-match (they deny any command containing the `env` token); prefer them only on hosts where LLM cost or latency dominates over false positives.
 - For prompt and policy testing, run a separate `--dry-run` server on its own
   socket so approved commands are evaluated but not executed.

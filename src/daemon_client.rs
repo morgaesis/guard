@@ -131,6 +131,7 @@ impl Client {
             AdminRequest::SavedGrantList => "saved_grant_list",
             AdminRequest::SavedGrantShow { .. } => "saved_grant_show",
             AdminRequest::SavedGrantSave { .. } => "saved_grant_save",
+            AdminRequest::SavedGrantEdit { .. } => "saved_grant_edit",
             AdminRequest::SavedGrantDelete { .. } => "saved_grant_delete",
             AdminRequest::SavedGrantRegenerate { .. } => "saved_grant_regenerate",
             AdminRequest::GrantRequestSubmit { .. } => "grant_request_submit",

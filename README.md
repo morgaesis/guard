@@ -135,7 +135,10 @@ guard server start --gate consequence --exec-as-caller \
 guard run ls -la /etc/nginx/
 
 # Recoverable: executes inside an auto-revert envelope.
-guard run --revert "systemctl stop app" --confirm-within 900 \
+guard run --revert "systemctl stop app" \
+  --confirm-check "systemctl is-active app" \
+  --revert-control-path "local systemd control socket" \
+  --confirm-within 900 \
   systemctl restart app
 # PROVISIONAL containment envelope: ... handle: 3f9c...
 # result: executed, auto-reverts unless confirmed
@@ -152,22 +155,35 @@ guard approve a1b2...           # operator: execute the exact held command
 guard deny a1b2...              # operator: reject it
 ```
 
-A free-form `--revert` is assessed by the evaluator at arm time, with the forward
-command as context, for both policy compliance and whether it is a sensible
-inverse of the forward action. The daemon may run it unattended, so it is gated
-as the consequential action it is. Only an explicit approval arms the envelope;
-any other verdict escalates the command to operator review (it is held, not armed
-with an unverified rollback and not silently denied), so an agent cannot smuggle
-an arbitrary or off-target command into the rollback slot. An operator-authored
-verb revert is the slow clock and is not re-evaluated. A recoverable command with
-no usable revert is held, not run unconfined. Held commands fail closed: an
-unattended queue denies on a TTL rather than stalling. Held and provisional state
-survives a daemon restart, and a revert never runs unattended at boot. A
+A free-form `--revert` is assessed at arm time as part of one containment
+envelope. The evaluator sees the forward command, rollback, optional
+`--confirm-check`, deadline, and the explicit or inferred control path needed to
+verify and roll back. It approves only a plausible complete chain. A forward
+action that may sever its SSH, API, socket, credential, daemon, or local control
+path is held for review with the same durable handle as other uncertain actions.
+An operator-authored verb rollback remains preauthorized, but adding a check or
+an explicit control path causes the complete envelope to receive a live
+assessment.
+
+At the deadline, an envelope without a confirmation check rolls back. With a
+check, exit zero confirms the change and every other outcome, including timeout
+or spawn failure, runs the rollback. Both commands retain the forward action's
+canonical working directory, original principal, and daemon-side secret and
+secret-file bindings. A recoverable command with no usable rollback is held, not
+run unconfined. Held commands fail closed on their TTL. Held and provisional
+state survives a daemon restart, and a rollback never runs unattended at boot. A
 past-deadline provisional becomes `needs_operator_decision` for explicit
 handling. `DENIED` means the command did not execute. Evaluator errors, invalid
 revert commands, missing approval snapshots, and unsafe replay checks fail closed
 and return an explicit denial or hold reason. Inspect state with `guard
 provisionals` and `guard approvals`.
+
+An optional operator notification hook receives lifecycle JSON on standard input
+for holds, provisionals, decisions, session behavior, and grant-request creation
+or resolution.
+Configure it with `--notify-cmd` or `GUARD_NOTIFY_CMD`; Guard supplies no webhook
+or delivery credentials. Hook processes have a bounded timeout, a concurrency
+ceiling, a cleared environment, and no effect on the gate decision.
 
 ### Verbs: the typed interface
 
@@ -403,15 +419,10 @@ Unless marked "(client)", a variable is read by the daemon at startup; setting i
 | `GUARD_SOCKET` | (none) | (client) Endpoint override: Unix-domain socket path (Unix) or named-pipe name (Windows) to connect to. |
 | `GUARD_MODE` | `readonly` | `readonly`, `safe`, or `paranoid` |
 | `GUARD_DRY_RUN` | `false` | Evaluate policy but do not execute approved commands. Useful for prompt and policy testing. |
-| `GUARD_LEARN_RULES` | `false` | Learn static allows from repeated low-risk LLM approvals. |
-| `GUARD_LEARNED_RULES` | `<state dir>/learned-rules.yaml` | Path to the learned static rules YAML (used with `GUARD_LEARN_RULES`). |
-| `GUARD_LEARN_MIN_APPROVALS` | `2` | Approvals required before promotion. |
-| `GUARD_LEARN_MAX_RISK` | `2` | Highest LLM risk score eligible for promotion. |
-| `GUARD_LEARN_SHIMS` | `suggest` | `off`, `suggest`, or `create` service shims for learned SSH/API wrappers. |
-| `GUARD_LEARN_DENY` | `true` | Auto-learn deny shapes from repeated LLM denials and fast-reject matching commands without another LLM call. On by default -- unlike `GUARD_LEARN_RULES`, this never grants anything, so it needs no operator promotion step. |
+| `GUARD_LEARN_DENY` | `true` | Auto-learn deny shapes from repeated evaluator denials and fast-reject matching commands without another evaluator call. |
 | `GUARD_DENY_SHAPES` | `<state dir>/learned-deny.yaml` | Path to the auto-learned deny-shape state YAML. |
 | `GUARD_LEARN_DENY_MIN_DENIALS` | `3` | LLM denials of the same shape required before attempting to synthesize an auto-learned deny fast path. |
-| `GUARD_LEARN_ALLOW` | `true` | Auto-promote trusted verbs from repeated low-risk LLM approvals (requires `--gate consequence`). On by default; needs no operator step, unlike `GUARD_LEARN_RULES` -- restricted to reversible/recoverable-with-a-validated-revert shapes, never irreversible. |
+| `GUARD_LEARN_ALLOW` | `true` | Auto-promote trusted verbs from repeated low-risk evaluator approvals. Requires consequence gating; restricted to reversible operations or recoverable operations with a validated revert. |
 | `GUARD_LEARN_ALLOW_STATE` | `<state dir>/learned-allow.yaml` | Path to the auto-verb-promotion observation state YAML (bookkeeping only; promoted verbs land in `GUARD_VERBS`). |
 | `GUARD_LEARN_ALLOW_MIN_APPROVALS` | `5` | LLM approvals of the same shape required before attempting to promote a trusted verb. |
 | `GUARD_API_PROMOTION` | `true` | Auto-learn exact API request shapes from repeated evaluator allows and denies on proxied `evaluate` traffic. |
@@ -681,7 +692,9 @@ guard grant regenerate scratch-prep
 guard grant delete scratch-prep
 ```
 
-Edit updates the saved prompt and fields. Regenerate asks the evaluator to
+Save rejects an existing name. Edit changes only the fields supplied and
+preserves generated verbs; this makes `guard grant edit <name> --prompt ...`
+the direct prompt-update path. Regenerate asks the evaluator to
 produce typed coverage, preserves sticky operator boundaries, stamps the
 evidence regime, and increments the grant revision. Issue snapshots that
 revision into the session so grant changes invalidate cached evaluator results.
@@ -742,7 +755,41 @@ requester, and can be approved or denied by the operator.
 
 Session grants are persisted in the daemon state database and survive daemon restarts by default. The default path is the XDG state dir (`$XDG_STATE_HOME/guard/state.db` or `~/.local/state/guard/state.db`); override it with `--state-db` or `GUARD_STATE_DB`. `guard session revoke <token>` is restricted to the daemon principal. `guard session list` is visible over a local listener to exec-allowed callers: non-admin callers see redacted tokens, hidden rule bodies, hidden verb activations, hidden override markers, hidden generated notes, and hidden prompt text for other sessions. If `GUARD_SESSION` matches an active or historical grant, that row is shown as `token=(current)` with its own permissions, prompt context, and generated notes visible, but the raw token is still not printed.
 
-For forensics, `guard session show <token>` prints prompt context, generated notes, aggregate allow/deny and exec outcome counts, source breakdown (`llm`, `cache`, `static_policy`, `session_allow`, `session_deny`, `session_static_only`, `validation`), a risk histogram for LLM-evaluated calls, and a bounded recent interaction log. Each interaction includes an optional child exit code and the names, never values, of secrets that reached a successfully spawned child. Daemon-principal and TCP admin-token callers see the raw token. Non-admin local callers may show a session only by presenting its token and receive the same session details with tokens rendered as `(provided)`. Those summaries are loaded from the state database, so they remain available after a service restart within the configured retention window.
+For forensics, `guard session show <token>` prints prompt context, generated
+notes, aggregate allow/deny and exec outcome counts, evaluator calls, cache hits,
+holds, distinct command shapes, novel-shape rate, source breakdown, a risk
+histogram, and a bounded recent interaction log. Each interaction includes an
+optional child exit code and the names, never values, of secrets that reached a
+successfully spawned child. The aggregates derive from persisted interactions,
+so they survive daemon restart within the configured retention window.
+
+The daemon can suspend a live session when rolling behavior crosses a configured
+denial count, hold count, or denial ratio. Configure the window and thresholds
+with `--session-behavior-window`, `--session-max-denials`,
+`--session-max-holds`, `--session-max-deny-ratio`, and
+`--session-deny-ratio-min-commands`, or the corresponding `GUARD_*` variables.
+Thresholds are disabled unless set. A suspended session denies every subsequent
+request until its triggering events age out of the rolling window or the grant
+is revoked. The notification hook receives the same behavior snapshot without
+the bearer session token.
+
+## Brokered child lifetime
+
+On Unix, each brokered child leads a dedicated process group. A streaming client
+disconnect or daemon shutdown kills that group, including ordinary background
+children. A descendant that deliberately creates a new session can outlive the
+request; `systemd-run` is the preferred sanctioned detach mechanism because it
+gives the work an explicit service lifetime. `setsid` has the same lifetime
+effect without service supervision. `nohup` only becomes detached after the
+parent exits and all inherited output pipes reach EOF; a descendant that keeps a
+Guard stream attached remains owned and is killed on disconnect.
+
+The non-streaming request path waits for the child to finish because it has no
+live output write with which to observe a client disconnect. Cancellation of the
+server task and service shutdown still terminate the tracked child. On Windows,
+Guard terminates the tracked direct child when the request or service lifetime
+ends; long-running independent work belongs in a Windows service or scheduled
+task with its own authorization.
 
 ## Scoped file read grants
 
@@ -902,8 +949,9 @@ guard config set-server ~/.guard/guard.sock
 guard mcp serve
 ```
 
-The server exposes three tools: `guard_run`, `guard_verbs`, and
-`guard_approvals`. `guard_run` executes a command through the daemon:
+The server exposes five tools: `guard_run`, `guard_verbs`, `guard_approvals`,
+`guard_evaluate_batch`, and `guard_session_status`. `guard_run` executes a
+command through the daemon:
 
 ```json
 {
@@ -942,13 +990,19 @@ Response:
 
 Denied commands return a normal MCP tool result with `allowed: false` and the denial reason. Transport or daemon failures still use `isError: true`.
 
-The other two tools take no arguments and are read-only. `guard_verbs` lists
+`guard_verbs` and `guard_approvals` take no arguments and are read-only.
+`guard_verbs` lists
 the operator-defined verb catalog: each verb names a binary, its consequence
 class, and its validated parameters; invoke a verb through `guard_run`.
 `guard_approvals` lists the caller's held approvals and provisional
 (auto-revert) executions, scoped to the caller by the daemon; it is how an
 agent polls whether an operator has approved a held command or which
 provisionals are still inside their revert window.
+
+`guard_evaluate_batch` evaluates 1 to 64 structured commands without executing
+them and uses the active session revision as cache context.
+`guard_session_status` returns the caller's effective grant, behavior summary,
+grant requests, approvals, and provisionals without exposing the bearer token.
 
 `guard mcp serve` defaults to stdio and the configured daemon endpoint;
 `--socket`, `--tcp-port`, and `--token` override the endpoint. `--tool-name`

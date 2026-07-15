@@ -46,6 +46,19 @@ const EXIT_GUARD_DENIED: i32 = 126;
 const EXIT_GUARD_HELD: i32 = 127;
 const JSON_SCHEMA_VERSION: u32 = 1;
 
+fn parse_unbounded_secs(value: &str) -> Result<u64, String> {
+    if value.eq_ignore_ascii_case("unbounded") {
+        return Ok(u64::MAX);
+    }
+    let seconds = value
+        .parse::<u64>()
+        .map_err(|_| "expected positive seconds or 'unbounded'".to_string())?;
+    if seconds == 0 {
+        return Err("duration must be greater than zero or 'unbounded'".to_string());
+    }
+    Ok(seconds)
+}
+
 fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
@@ -97,18 +110,30 @@ enum MainArgs {
         secret_file_vars: Vec<(String, String)>,
         /// Rollback command for a recoverable action under consequence gating,
         /// as a single string (e.g. --revert "systemctl stop nginx"). It is
-        /// itself policy-evaluated; if denied, the whole request is denied.
+        /// assessed with the full envelope; an uncertain chain is held.
         #[arg(long = "revert", value_name = "COMMAND")]
         revert: Option<String>,
+        /// Independent command run at the deadline. Exit zero confirms the
+        /// change; any other result runs the rollback.
+        #[arg(long = "confirm-check", value_name = "COMMAND", requires = "revert")]
+        confirm_check: Option<String>,
+        /// Authority and transport required to run the confirmation check and
+        /// rollback, such as "brokered SSH to firewall-a".
+        #[arg(
+            long = "revert-control-path",
+            value_name = "DESCRIPTION",
+            requires = "revert"
+        )]
+        revert_control_path: Option<String>,
         /// Auto-revert window in seconds for the containment envelope.
         #[arg(long = "confirm-within", value_name = "SECONDS")]
         confirm_within: Option<u64>,
         /// Force the command onto the operator-approval (hold) path.
         #[arg(long = "require-approval", action = ArgAction::SetTrue)]
         require_approval: bool,
-        /// Block up to SECONDS for an operator decision on a held command and
-        /// return the real result inline. Bare flag waits the full approval TTL.
-        #[arg(long = "wait-approval", value_name = "SECONDS", num_args = 0..=1, default_missing_value = "3600")]
+        /// Block for SECONDS or `unbounded` for an operator decision. A bare
+        /// flag is unbounded and remains cancellable by disconnecting.
+        #[arg(long = "wait-approval", value_name = "SECONDS|unbounded", num_args = 0..=1, default_missing_value = "unbounded", value_parser = parse_unbounded_secs)]
         wait_approval: Option<u64>,
         /// Skip the daemon's auto-learned deny-shape fast path and force a
         /// fresh LLM look at this command. Never skips an operator-authored
@@ -317,8 +342,9 @@ enum VerbCommands {
         /// Auto-revert window in seconds for a recoverable verb.
         #[arg(long = "confirm-within", value_name = "SECONDS")]
         confirm_within: Option<u64>,
-        /// Block up to SECONDS for an operator decision if the verb is held.
-        #[arg(long = "wait-approval", value_name = "SECONDS", num_args = 0..=1, default_missing_value = "3600")]
+        /// Block for SECONDS or `unbounded` for an operator decision. A bare
+        /// flag is unbounded and remains cancellable by disconnecting.
+        #[arg(long = "wait-approval", value_name = "SECONDS|unbounded", num_args = 0..=1, default_missing_value = "unbounded", value_parser = parse_unbounded_secs)]
         wait_approval: Option<u64>,
         #[arg(long)]
         socket: Option<String>,
@@ -348,7 +374,7 @@ enum VerbCommands {
 
 #[derive(Subcommand)]
 enum GrantCommands {
-    /// Save a reusable grant. Existing names are updated with a new revision.
+    /// Save a new reusable grant. Use `edit` for an existing name.
     Save {
         name: String,
         #[arg(long)]
@@ -377,16 +403,25 @@ enum GrantCommands {
         description: Option<String>,
         #[arg(long = "verb")]
         verbs: Vec<String>,
+        /// Remove every activated verb.
+        #[arg(long, conflicts_with = "verbs")]
+        clear_verbs: bool,
         #[arg(long = "secret")]
         secret_names: Vec<String>,
+        /// Remove every secret-name entitlement.
+        #[arg(long, conflicts_with = "secret_names")]
+        clear_secrets: bool,
         #[arg(long)]
         ttl: Option<u64>,
+        /// Remove the default TTL.
+        #[arg(long, conflicts_with = "ttl")]
+        clear_ttl: bool,
         #[arg(long)]
         prompt: Option<String>,
-        #[arg(long, default_value = "evaluator")]
-        evaluation_mode: String,
-        #[arg(long, action = ArgAction::SetTrue)]
-        auto_approve: bool,
+        #[arg(long)]
+        evaluation_mode: Option<String>,
+        #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+        auto_approve: Option<bool>,
         #[arg(long)]
         socket: Option<String>,
         #[arg(long, action = ArgAction::SetTrue)]
@@ -1130,6 +1165,42 @@ enum ServerCommands {
         #[arg(long = "api-promotion-min-denials", value_name = "N")]
         api_promotion_min_denials: Option<u32>,
 
+        /// Fire an operator command for gate lifecycle events. The command is
+        /// parsed into argv, receives one JSON event on stdin, and is killed at
+        /// the bounded timeout. Off by default. Env: GUARD_NOTIFY_CMD.
+        #[arg(long = "notify-cmd", value_name = "COMMAND")]
+        notify_cmd: Option<String>,
+
+        /// Notify command timeout in seconds (1-60). Env:
+        /// GUARD_NOTIFY_TIMEOUT_SECS.
+        #[arg(long = "notify-timeout", value_name = "SECONDS")]
+        notify_timeout: Option<u64>,
+
+        /// Rolling window for session behavioral circuit breakers. Env:
+        /// GUARD_SESSION_BEHAVIOR_WINDOW_SECS.
+        #[arg(long = "session-behavior-window", value_name = "SECONDS")]
+        session_behavior_window: Option<u64>,
+
+        /// Suspend a session after this many denials in the rolling window.
+        /// Env: GUARD_SESSION_MAX_DENIALS.
+        #[arg(long = "session-max-denials", value_name = "N")]
+        session_max_denials: Option<u64>,
+
+        /// Suspend a session after this many holds in the rolling window. Env:
+        /// GUARD_SESSION_MAX_HOLDS.
+        #[arg(long = "session-max-holds", value_name = "N")]
+        session_max_holds: Option<u64>,
+
+        /// Suspend when the rolling denial ratio reaches this percentage. Env:
+        /// GUARD_SESSION_MAX_DENY_RATIO.
+        #[arg(long = "session-max-deny-ratio", value_name = "1-100")]
+        session_max_deny_ratio: Option<u8>,
+
+        /// Minimum rolling command count before applying the denial ratio. Env:
+        /// GUARD_SESSION_DENY_RATIO_MIN_COMMANDS.
+        #[arg(long = "session-deny-ratio-min-commands", value_name = "N")]
+        session_deny_ratio_min_commands: Option<u64>,
+
         /// Internal marker: launched under the Windows Service Control Manager.
         /// The Windows installer sets this in the service binPath so startup
         /// answers the SCM start/stop handshake instead of running in the
@@ -1368,6 +1439,8 @@ async fn run_main() -> Result<()> {
             secret_vars,
             secret_file_vars,
             revert,
+            confirm_check,
+            revert_control_path,
             confirm_within,
             require_approval,
             wait_approval,
@@ -1383,6 +1456,8 @@ async fn run_main() -> Result<()> {
                     .map_err(anyhow::Error::msg)?;
             let gating = GatingOptions {
                 revert,
+                confirm_check,
+                revert_control_path,
                 confirm_within,
                 require_approval,
                 wait_approval,

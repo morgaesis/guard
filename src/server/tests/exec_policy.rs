@@ -217,6 +217,67 @@ async fn secret_exposure_is_audited_only_after_successful_spawn() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn saved_grant_entitlement_covers_tool_config_secret_refs() {
+    let caller = CallerIdentity::Unix { uid: 1000 };
+    let principal = PrincipalKey::from_uid(1000);
+    let (cfg, _) = make_test_config();
+    cfg.secrets
+        .set(&principal, "broker/token", "never-printed")
+        .await
+        .unwrap();
+    let tools = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        tools.path(),
+        "tools:\n  true:\n    secrets:\n      BROKER_TOKEN: broker/token\n",
+    )
+    .unwrap();
+    *cfg.tool_registry.write().await =
+        crate::tool_config::ToolRegistry::load(tools.path()).unwrap();
+    let mut grant = SessionGrant {
+        allow: Vec::new(),
+        deny: Vec::new(),
+        allow_exact: Vec::new(),
+        deny_exact: Vec::new(),
+        activated_verbs: Vec::new(),
+        override_markers: Vec::new(),
+        scope: Default::default(),
+        expires_at: None,
+        prompt_append: None,
+        generated_notes: Vec::new(),
+        static_only: false,
+        auto_amend: false,
+        granted_at: 0,
+    };
+    grant.scope.saved_grant = Some("no-secrets".to_string());
+    grant.scope.secret_names = Vec::new();
+    cfg.sessions
+        .write()
+        .await
+        .grant("tool-secret-session".to_string(), grant);
+    let mut request = basic_request("true", Vec::new());
+    request.session_token = Some("tool-secret-session".to_string());
+    let mut sink = tokio::io::sink();
+    let result = exec_after_approval(
+        request,
+        &cfg,
+        &caller,
+        "test allow".to_string(),
+        0,
+        false,
+        &mut sink,
+    )
+    .await;
+    match result.exec {
+        ExecOutcome::Failed { reason, started } => {
+            assert!(!started);
+            assert!(reason.contains("does not entitle secret 'broker/token'"));
+        }
+        other => panic!("expected tool secret entitlement rejection, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn streaming_secret_exposure_is_recorded_even_on_nonzero_exit() {
     let caller = CallerIdentity::Unix { uid: 1000 };
     let principal = PrincipalKey::from_uid(1000);
@@ -663,7 +724,7 @@ async fn repeated_llm_denials_append_count_hint_at_threshold_only() {
     .await;
     let reason = second.policy_reason();
     assert!(reason.contains("destructive request"));
-    assert!(reason.contains("guard has denied 2 similar echo commands; if this access is needed, ask your operator to broaden the session grant or add a profile"));
+    assert!(reason.contains("guard has denied 2 similar echo commands; if this access is needed, use the escalation handle to request a saved-grant or verb amendment"));
     for forbidden in ["promoted", "learned", "fast path"] {
         assert!(
             !reason.to_ascii_lowercase().contains(forbidden),
@@ -1666,19 +1727,34 @@ async fn allowed_binary_floor_does_not_permit_shim_dir_recursion() {
     }
 }
 
-/// The revert-availability fragment reaches the evaluator prompt only when a
-/// rollback was supplied under the gate, composes with a session prompt, and
-/// never turns a no-context call into a cache-bypassing one.
 #[test]
-fn revert_context_merges_only_when_supplied() {
-    use crate::server::execute::merge_revert_context;
-    assert_eq!(merge_revert_context(None, false), None);
-    let sp = merge_revert_context(Some("session ctx".to_string()), false);
-    assert_eq!(sp.as_deref(), Some("session ctx"));
-    let with = merge_revert_context(None, true).expect("fragment present");
-    assert!(with.contains("REVERSIBILITY CONTEXT"));
-    let both = merge_revert_context(Some("session ctx".to_string()), true).expect("merged");
-    assert!(both.contains("REVERSIBILITY CONTEXT") && both.ends_with("session ctx"));
+fn containment_context_presents_the_complete_chain_to_the_evaluator() {
+    use crate::server::execute::merge_envelope_context;
+    use crate::server::{CommandSpec, RevertSpec};
+
+    let mut request = basic_request("ssh", vec!["firewall-a".into(), "apply".into()]);
+    request.confirm_within_secs = Some(45);
+    let mut revert = RevertSpec::new("ssh", vec!["firewall-a".into(), "rollback".into()]);
+    revert.confirm_check = Some(CommandSpec {
+        binary: "ssh".into(),
+        args: vec!["firewall-a".into(), "verify".into()],
+    });
+    revert.control_path = Some("brokered SSH to firewall-a".into());
+    request.revert = Some(revert);
+
+    let prompt =
+        merge_envelope_context(Some("session boundary".into()), &request).expect("envelope prompt");
+    for required in [
+        "Forward: ssh firewall-a apply",
+        "Rollback: ssh firewall-a rollback",
+        "Confirmation check: ssh firewall-a verify",
+        "Deadline: 45 seconds",
+        "Required control path: brokered SSH to firewall-a",
+        "can plausibly sever",
+        "session boundary",
+    ] {
+        assert!(prompt.contains(required), "missing {required:?}: {prompt}");
+    }
 }
 
 #[cfg(unix)]

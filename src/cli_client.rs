@@ -3,6 +3,8 @@ use super::*;
 /// Consequence-gating options parsed from `guard run` flags.
 pub(crate) struct GatingOptions {
     pub(crate) revert: Option<String>,
+    pub(crate) confirm_check: Option<String>,
+    pub(crate) revert_control_path: Option<String>,
     pub(crate) confirm_within: Option<u64>,
     pub(crate) require_approval: bool,
     pub(crate) wait_approval: Option<u64>,
@@ -43,10 +45,7 @@ fn parse_revert(spec: &str) -> Result<server::RevertSpec> {
     let binary = it
         .next()
         .ok_or_else(|| anyhow::anyhow!("--revert command is empty"))?;
-    Ok(server::RevertSpec {
-        binary,
-        args: it.collect(),
-    })
+    Ok(server::RevertSpec::new(binary, it.collect()))
 }
 
 fn print_coverage(coverage: &Option<guard::gating::Coverage>) {
@@ -110,10 +109,26 @@ pub(crate) async fn run_exec(
     let (socket_path, tcp_port, endpoint_source) =
         resolve_client_endpoint_with_source(None, &config);
 
-    let revert = match gating.revert.as_deref() {
+    let mut revert = match gating.revert.as_deref() {
         Some(spec) => Some(parse_revert(spec)?),
         None => None,
     };
+    if let Some(check) = gating.confirm_check.as_deref() {
+        let parsed = parse_revert(check)?;
+        let Some(revert) = revert.as_mut() else {
+            anyhow::bail!("--confirm-check requires --revert");
+        };
+        revert.confirm_check = Some(server::CommandSpec {
+            binary: parsed.binary,
+            args: parsed.args,
+        });
+    }
+    if let Some(control_path) = gating.revert_control_path {
+        let Some(revert) = revert.as_mut() else {
+            anyhow::bail!("--revert-control-path requires --revert");
+        };
+        revert.control_path = Some(control_path);
+    }
 
     let mut client = daemon_client::Client::new(socket_path, tcp_port)
         .with_gating(
@@ -345,11 +360,14 @@ pub(crate) async fn handle_provisionals(socket: Option<String>, json: bool) -> R
             for p in &items {
                 let status = paint(&p.status, AnsiColor::Yellow, color);
                 println!(
-                    "[{}] handle={} cmd={:?} revert={:?} deadline={} reason={:?}{}",
+                    "[{}] handle={} cmd={:?} revert={:?} check={:?} control_path={:?} session={} deadline={} reason={:?}{}",
                     status,
                     p.handle,
                     p.command,
                     p.revert_command,
+                    p.confirm_check,
+                    p.control_path,
+                    p.session_fingerprint.as_deref().unwrap_or("none"),
                     format_timestamp(p.deadline_unix),
                     p.reason,
                     p.revert_detail
@@ -771,18 +789,6 @@ pub(crate) async fn handle_grant(subcommand: GrantCommands) -> Result<()> {
             auto_approve,
             socket,
             json,
-        }
-        | GrantCommands::Edit {
-            name,
-            description,
-            verbs,
-            secret_names,
-            ttl,
-            prompt,
-            evaluation_mode,
-            auto_approve,
-            socket,
-            json,
         } => {
             let evaluation_mode = EvaluationMode::from_str(&evaluation_mode)?;
             let grant = SavedGrant {
@@ -809,6 +815,43 @@ pub(crate) async fn handle_grant(subcommand: GrantCommands) -> Result<()> {
                 updated_unix: 0,
             };
             (socket, server::AdminRequest::SavedGrantSave { grant }, json)
+        }
+        GrantCommands::Edit {
+            name,
+            description,
+            verbs,
+            clear_verbs,
+            secret_names,
+            clear_secrets,
+            ttl,
+            clear_ttl,
+            prompt,
+            evaluation_mode,
+            auto_approve,
+            socket,
+            json,
+        } => {
+            let evaluation_mode = evaluation_mode
+                .as_deref()
+                .map(EvaluationMode::from_str)
+                .transpose()?;
+            (
+                socket,
+                server::AdminRequest::SavedGrantEdit {
+                    name,
+                    description,
+                    activated_verbs: verbs,
+                    clear_verbs,
+                    secret_names,
+                    clear_secrets,
+                    ttl_secs: ttl,
+                    clear_ttl,
+                    prompt_append: prompt,
+                    evaluation_mode,
+                    auto_approve_requests: auto_approve,
+                },
+                json,
+            )
         }
         GrantCommands::Regenerate {
             name,
@@ -947,11 +990,19 @@ pub(crate) async fn handle_grant(subcommand: GrantCommands) -> Result<()> {
                 handle,
                 socket,
                 json,
-            } => (
-                socket,
-                server::AdminRequest::GrantRequestShow { handle },
-                json,
-            ),
+            } => {
+                let session_token = std::env::var("GUARD_SESSION")
+                    .ok()
+                    .filter(|value| !value.is_empty());
+                (
+                    socket,
+                    server::AdminRequest::GrantRequestShow {
+                        handle,
+                        session_token,
+                    },
+                    json,
+                )
+            }
             GrantRequestCommands::Approve { handle, socket } => (
                 socket,
                 server::AdminRequest::GrantRequestApprove { handle },
@@ -966,11 +1017,19 @@ pub(crate) async fn handle_grant(subcommand: GrantCommands) -> Result<()> {
                 server::AdminRequest::GrantRequestDeny { handle, reason },
                 false,
             ),
-            GrantRequestCommands::Withdraw { handle, socket } => (
-                socket,
-                server::AdminRequest::GrantRequestWithdraw { handle },
-                false,
-            ),
+            GrantRequestCommands::Withdraw { handle, socket } => {
+                let session_token = std::env::var("GUARD_SESSION")
+                    .ok()
+                    .filter(|value| !value.is_empty());
+                (
+                    socket,
+                    server::AdminRequest::GrantRequestWithdraw {
+                        handle,
+                        session_token,
+                    },
+                    false,
+                )
+            }
         },
     };
 
@@ -1008,6 +1067,15 @@ pub(crate) async fn handle_grant(subcommand: GrantCommands) -> Result<()> {
         server::AdminResponse::SavedGrant { grant } => {
             println!("{}", serde_json::to_string_pretty(&grant)?);
             println!("next: guard grant issue {}", grant.name);
+        }
+        server::AdminResponse::SavedGrantRegenerated {
+            grant,
+            added,
+            removed,
+            changed,
+        } => {
+            println!("{}", serde_json::to_string_pretty(&grant)?);
+            println!("added={added:?} removed={removed:?} changed={changed:?}");
         }
         server::AdminResponse::GrantRequests { items } => {
             for request in items {
@@ -2075,6 +2143,18 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                 report.stats.dry_run,
                 report.stats.not_attempted,
             );
+            println!(
+                "behavior evaluator_calls={} cache_hits={} holds={} novel_shapes={} novel_shape_rate={}% suspended={}",
+                report.stats.evaluator_calls,
+                report.stats.cache_hits,
+                report.stats.holds,
+                report.stats.novel_shapes,
+                report.stats.novel_shape_rate_percent,
+                report.stats.suspended,
+            );
+            if let Some(reason) = &report.stats.suspension_reason {
+                println!("suspension_reason={reason:?}");
+            }
             if !report.stats.source_counts.is_empty() {
                 let sources = report
                     .stats
@@ -2218,6 +2298,7 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
         | server::AdminResponse::VerbCreated { .. }
         | server::AdminResponse::SavedGrants { .. }
         | server::AdminResponse::SavedGrant { .. }
+        | server::AdminResponse::SavedGrantRegenerated { .. }
         | server::AdminResponse::GrantRequests { .. }
         | server::AdminResponse::GrantRequest { .. }
         | server::AdminResponse::EvaluationBatch { .. } => {
