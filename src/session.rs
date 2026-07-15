@@ -267,6 +267,8 @@ impl SessionDecisionSource {
 pub enum SessionExecStatus {
     NotAttempted,
     Completed,
+    /// Held for operator approval, then approved and completed.
+    CompletedAfterApproval,
     Failed,
     DryRun,
     /// Approved but held for operator approval (consequence gating); not run.
@@ -601,9 +603,9 @@ impl SessionRegistry {
                 // Provisional commands did execute (inside a containment
                 // envelope); held commands did not run. The fine-grained gating
                 // states are surfaced by `guard provisionals` / `guard approvals`.
-                SessionExecStatus::Completed | SessionExecStatus::Provisional => {
-                    stats.completed += 1
-                }
+                SessionExecStatus::Completed
+                | SessionExecStatus::CompletedAfterApproval
+                | SessionExecStatus::Provisional => stats.completed += 1,
                 SessionExecStatus::Failed => stats.exec_failed += 1,
                 SessionExecStatus::DryRun => stats.dry_run += 1,
                 SessionExecStatus::NotAttempted | SessionExecStatus::Held => {
@@ -627,7 +629,10 @@ impl SessionRegistry {
             if interaction.source == SessionDecisionSource::Cache {
                 stats.cache_hits += 1;
             }
-            if interaction.exec_status == SessionExecStatus::Held {
+            if matches!(
+                interaction.exec_status,
+                SessionExecStatus::Held | SessionExecStatus::CompletedAfterApproval
+            ) {
                 stats.holds += 1;
             }
         }
@@ -672,7 +677,12 @@ impl SessionRegistry {
         let denials = window.iter().filter(|entry| !entry.allowed).count() as u64;
         let holds = window
             .iter()
-            .filter(|entry| entry.exec_status == SessionExecStatus::Held)
+            .filter(|entry| {
+                matches!(
+                    entry.exec_status,
+                    SessionExecStatus::Held | SessionExecStatus::CompletedAfterApproval
+                )
+            })
             .count() as u64;
         if limits.max_denials.is_some_and(|limit| denials >= limit) {
             return Some(format!(
@@ -1648,7 +1658,7 @@ mod tests {
                 "kubectl apply -f change.yaml",
                 true,
                 SessionDecisionSource::Llm,
-                SessionExecStatus::Held,
+                SessionExecStatus::CompletedAfterApproval,
             ),
         ] {
             reg.record_interaction(
@@ -1679,6 +1689,7 @@ mod tests {
         assert_eq!(report.stats.evaluator_calls, 3);
         assert_eq!(report.stats.cache_hits, 1);
         assert_eq!(report.stats.denied, 1);
+        assert_eq!(report.stats.completed, 3);
         assert_eq!(report.stats.holds, 1);
         assert_eq!(report.stats.novel_shapes, 3);
         assert_eq!(report.stats.novel_shape_rate_percent, 75);
