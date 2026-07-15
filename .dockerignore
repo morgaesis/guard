@@ -13,6 +13,10 @@
 !tests/**
 !examples/
 !examples/**
+!.clusterfuzzlite/
+!.clusterfuzzlite/**
+!fuzz/
+!fuzz/**
 !ctf/
 ctf/*
 !ctf/gating/
