@@ -39,8 +39,9 @@ use tokio::sync::RwLock;
 use tokio_rustls::TlsAcceptor;
 
 use super::gate::{
-    ApiJudge, ApiJudgeVerdict, ApiMutation, ApiRequestSummary, ApiSessionContext, ApiSessionEvent,
-    ApiSessionSink, GateSink, HoldDecision, RevertConstructible,
+    ApiCoverageVerdict, ApiEvaluationMode, ApiHoldSnapshot, ApiJudge, ApiJudgeVerdict, ApiMutation,
+    ApiRequestSummary, ApiSessionContext, ApiSessionEvent, ApiSessionSink, GateSink, HoldDecision,
+    RevertConstructible,
 };
 use super::k8s_protocol::KubernetesProtocol;
 use super::op::{ApiOp, Verb};
@@ -53,6 +54,7 @@ use crate::gating::{decide_gate, GateOutcome};
 /// Cap on a forwarded request body. Manifests are small; this bounds memory by
 /// rejecting an oversized request body.
 const MAX_REQ_BODY: usize = 16 * 1024 * 1024;
+const REQUEST_BODY_READ_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// How often the policy file is checked for changes (the operator "slow clock").
 const POLICY_RELOAD_SECS: u64 = 5;
@@ -68,8 +70,17 @@ const GUARD_SESSION_HEADER: &str = "x-guard-session";
 #[derive(Debug, Clone)]
 struct GuardRejected;
 
-#[derive(Debug, Clone)]
-struct GuardHeld;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuardHoldOutcome {
+    Approved,
+    Denied,
+}
+
+#[derive(Debug)]
+enum RequestBodyError {
+    Timeout,
+    Read(anyhow::Error),
+}
 
 #[derive(Debug, Clone)]
 struct SessionAuth {
@@ -181,6 +192,7 @@ pub struct ApiProxy {
     credential_ref: String,
     session_sink: OnceLock<Arc<dyn ApiSessionSink>>,
     listener_mode: ApiListenerMode,
+    request_body_timeout: Duration,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -205,6 +217,7 @@ struct ShapeKey {
     resource: String,
     subresource: Option<String>,
     namespace: Option<String>,
+    authority_selectors: std::collections::BTreeMap<String, String>,
 }
 
 /// Counts request shapes seen over the proxy's lifetime and reports whether a
@@ -351,7 +364,7 @@ impl ApiProxy {
         policy: ApiPolicy,
         policy_path: Option<PathBuf>,
     ) -> Self {
-        let proxy_url = format!("https://127.0.0.1:{}", listen.port());
+        let proxy_url = format!("https://{listen}");
         Self {
             listen,
             proxy_url,
@@ -370,6 +383,7 @@ impl ApiProxy {
             credential_ref: "upstream".to_string(),
             session_sink: OnceLock::new(),
             listener_mode: ApiListenerMode::Policy,
+            request_body_timeout: REQUEST_BODY_READ_TIMEOUT,
         }
     }
 
@@ -385,6 +399,13 @@ impl ApiProxy {
 
     pub fn with_listener_mode(mut self, mode: ApiListenerMode) -> Self {
         self.listener_mode = mode;
+        self
+    }
+
+    /// Bound how long the proxy waits to capture an entire request body before
+    /// any evaluator or operator authorization. The default is 15 seconds.
+    pub fn with_request_body_timeout(mut self, timeout: Duration) -> Self {
+        self.request_body_timeout = timeout;
         self
     }
 
@@ -430,7 +451,11 @@ impl ApiProxy {
     }
 
     pub fn has_judge(&self) -> bool {
-        self.judge.read().unwrap().is_some()
+        self.judge
+            .read()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|judge| judge.evaluator_enabled())
     }
 
     pub fn protocol_name(&self) -> &str {
@@ -593,14 +618,16 @@ impl ApiProxy {
         }
         let response = self.route_inner(req, conn_id, session_context).await;
         if let (Some(token), Some(sink)) = (session_token.as_deref(), self.session_sink.get()) {
+            let hold_outcome = response.extensions().get::<GuardHoldOutcome>().copied();
             sink.record(
                 token,
                 ApiSessionEvent {
                     endpoint: self.endpoint.clone(),
                     operation: format!("{} {}", method, path),
-                    allowed: response.extensions().get::<GuardRejected>().is_none(),
+                    allowed: hold_outcome != Some(GuardHoldOutcome::Denied)
+                        && response.extensions().get::<GuardRejected>().is_none(),
                     status: response.status().as_u16(),
-                    held: response.extensions().get::<GuardHeld>().is_some(),
+                    held: hold_outcome.is_some(),
                     credential_ref: self.credential_ref.clone(),
                 },
             )
@@ -656,25 +683,70 @@ impl ApiProxy {
             return self.status_resp(StatusCode::FORBIDDEN, &reason, "Forbidden");
         }
 
-        let readonly_session_override = self.listener_mode == ApiListenerMode::Readonly
-            && !op.is_read()
-            && session_context
-                .as_ref()
-                .is_some_and(|context| context.can_override_baseline);
-        if self.listener_mode == ApiListenerMode::Readonly
-            && !op.is_read()
-            && !readonly_session_override
-        {
-            return self.status_resp(
-                StatusCode::FORBIDDEN,
-                "guard api-proxy: listener readonly baseline denied a write without a session override",
-                "Forbidden",
-            );
-        }
-
         let label = format!("{} {}", op.verb.as_str(), path);
 
         let decision = self.policy.read().await.decide(&op);
+
+        // Protocol floors and explicit operator policy denies are absolute.
+        // Session mode can only choose a stricter deterministic path or route a
+        // readonly listener write to evaluation under explicit issued intent.
+        if matches!(decision.action, ApiAction::Deny) {
+            tracing::info!(target: "guard::apiproxy", "DENY {} ({})", label, decision.reason);
+            return self.status_resp(
+                StatusCode::FORBIDDEN,
+                &format!(
+                    "guard api-proxy ({}) denied {label}: {}",
+                    self.protocol.name(),
+                    decision.reason
+                ),
+                "Forbidden",
+            );
+        }
+        let session_mode = session_context
+            .as_ref()
+            .map(|context| context.evaluation_mode)
+            .unwrap_or_default();
+        if !op.is_read() && session_mode == ApiEvaluationMode::ReadOnly {
+            return self
+                .route_coverage_only(req, &path, &op, false, conn_id, session_context.as_ref())
+                .await;
+        }
+        if !matches!(decision.action, ApiAction::Hold) {
+            if self.listener_mode == ApiListenerMode::Readonly && !op.is_read() {
+                if session_context
+                    .as_ref()
+                    .is_some_and(|context| context.can_evaluate_api_override)
+                {
+                    return self
+                        .route_evaluate(req, &path, &op, false, conn_id, session_context.as_ref())
+                        .await;
+                }
+                if session_context.is_some() {
+                    return self
+                        .route_coverage_only(
+                            req,
+                            &path,
+                            &op,
+                            false,
+                            conn_id,
+                            session_context.as_ref(),
+                        )
+                        .await;
+                }
+                return self.status_resp(
+                    StatusCode::FORBIDDEN,
+                    "guard api-proxy: listener readonly baseline denied a write without explicit session authority",
+                    "Forbidden",
+                );
+            }
+            if session_mode == ApiEvaluationMode::PolicyOnly
+                && matches!(decision.action, ApiAction::Evaluate)
+            {
+                return self
+                    .route_coverage_only(req, &path, &op, false, conn_id, session_context.as_ref())
+                    .await;
+            }
+        }
 
         // A delete of a resource guard itself created (and is still tracking for
         // auto-revert) in this process is contained cleanup, such as a Helm
@@ -709,18 +781,7 @@ impl ApiProxy {
         }
 
         match decision.action {
-            ApiAction::Deny => {
-                tracing::info!(target: "guard::apiproxy", "DENY {} ({})", label, decision.reason);
-                self.status_resp(
-                    StatusCode::FORBIDDEN,
-                    &format!(
-                        "guard api-proxy ({}) denied {label}: {}",
-                        self.protocol.name(),
-                        decision.reason
-                    ),
-                    "Forbidden",
-                )
-            }
+            ApiAction::Deny => unreachable!("explicit deny returned above"),
             ApiAction::Hold => {
                 self.route_hold(req, &path, &query, &op, &decision.reason, conn_id)
                     .await
@@ -730,15 +791,6 @@ impl ApiProxy {
                     .await
             }
             ApiAction::Allow => {
-                // A session can expand the listener's readonly baseline, but
-                // the expansion is prose intent rather than typed coverage.
-                // Judge it before accepting a policy-wide allow so the session
-                // prompt remains an actual boundary instead of a bypass flag.
-                if readonly_session_override {
-                    return self
-                        .route_evaluate(req, &path, &op, false, conn_id, session_context.as_ref())
-                        .await;
-                }
                 // Rarity escalation: a broad allow rule fails toward scrutiny on
                 // a shape it covers that the proxy has rarely (or never) seen.
                 // With a judge attached, the rare shape is evaluated with an
@@ -747,7 +799,7 @@ impl ApiProxy {
                 if self.rarity.enabled() {
                     let key = self.shape_key(&op);
                     if self.rarity.observe_is_rare(key) {
-                        if self.has_judge() {
+                        if self.has_judge() && session_mode != ApiEvaluationMode::PolicyOnly {
                             tracing::info!(
                                 target: "guard::apiproxy",
                                 "EVALUATE {} (rare shape under an allow rule)",
@@ -798,7 +850,22 @@ impl ApiProxy {
     ) -> Response<ProxyBody> {
         let label = format!("{} {}", op.verb.as_str(), path);
         let query = req.uri().query().unwrap_or("").to_string();
-        let Some(judge) = self.judge.read().unwrap().clone() else {
+        if session_context
+            .is_some_and(|context| context.evaluation_mode == ApiEvaluationMode::PolicyOnly)
+        {
+            return self.status_resp(
+                StatusCode::FORBIDDEN,
+                "guard api-proxy: policy-only session cannot invoke the evaluator",
+                "Forbidden",
+            );
+        }
+        let Some(judge) = self
+            .judge
+            .read()
+            .unwrap()
+            .clone()
+            .filter(|judge| judge.evaluator_enabled())
+        else {
             return self
                 .route_hold(
                     req,
@@ -811,15 +878,9 @@ impl ApiProxy {
                 .await;
         };
 
-        let (parts, body) = match collect_request_body(req).await {
+        let (parts, body) = match collect_request_body(req, self.request_body_timeout).await {
             Ok(buffered) => buffered,
-            Err(e) => {
-                return self.status_resp(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    &format!("guard api-proxy: request body could not be buffered: {e}"),
-                    "RequestEntityTooLarge",
-                );
-            }
+            Err(error) => return self.request_body_error_response(error),
         };
         let body_shape = redacted_body_shape(&body);
         let prepared = self.prepare_revert(op, path).await;
@@ -835,11 +896,13 @@ impl ApiProxy {
             namespace: op.namespace.clone(),
             name: op.name.clone(),
             dry_run: op.dry_run,
+            authority_selectors: op.authority_selectors.clone(),
             redacted_body_shape: body_shape,
             revert_constructible: prepared,
             rarity,
             endpoint: self.endpoint.clone(),
             session_fingerprint: session_context.map(|context| context.fingerprint.clone()),
+            session_revision: session_context.map(|context| context.revision.clone()),
             session_intent: session_context.and_then(|context| {
                 context
                     .intent
@@ -1024,6 +1087,102 @@ impl ApiProxy {
         }
     }
 
+    /// Resolve exact typed API coverage without invoking the evaluator. This is
+    /// the only write path available to read-only sessions and the fallback for
+    /// `evaluate` policy cells under policy-only sessions.
+    async fn route_coverage_only(
+        &self,
+        req: Request<Incoming>,
+        path: &str,
+        op: &ApiOp,
+        rarity: bool,
+        conn_id: u64,
+        session_context: Option<&ApiSessionContext>,
+    ) -> Response<ProxyBody> {
+        let query = req.uri().query().unwrap_or("").to_string();
+        let (parts, body) = match collect_request_body(req, self.request_body_timeout).await {
+            Ok(buffered) => buffered,
+            Err(error) => return self.request_body_error_response(error),
+        };
+        let Some(judge) = self.judge.read().unwrap().clone() else {
+            return self.status_resp(
+                StatusCode::FORBIDDEN,
+                "guard api-proxy: no exact typed API coverage resolver is attached",
+                "Forbidden",
+            );
+        };
+        let summary = ApiRequestSummary {
+            protocol: self.protocol.name().to_string(),
+            verb: op.verb.as_str().to_string(),
+            path: path.to_string(),
+            redacted_query: crate::evaluate::redact_for_llm(&query),
+            group: op.group.clone(),
+            version: op.version.clone(),
+            resource: op.resource.clone(),
+            subresource: op.subresource.clone(),
+            namespace: op.namespace.clone(),
+            name: op.name.clone(),
+            dry_run: op.dry_run,
+            authority_selectors: op.authority_selectors.clone(),
+            redacted_body_shape: redacted_body_shape(&body),
+            revert_constructible: RevertConstructible::None,
+            rarity,
+            endpoint: self.endpoint.clone(),
+            session_fingerprint: session_context.map(|context| context.fingerprint.clone()),
+            session_revision: session_context.map(|context| context.revision.clone()),
+            session_intent: session_context.and_then(|context| {
+                context
+                    .intent
+                    .as_deref()
+                    .map(crate::evaluate::redact_for_llm)
+            }),
+            credential_ref: self.credential_ref.clone(),
+        };
+        match judge.coverage(&summary).await {
+            ApiCoverageVerdict::Allow {
+                risk,
+                reversibility,
+            } => {
+                let outcome = decide_gate(Some(reversibility), Some(risk), false, false);
+                if outcome != GateOutcome::ExecuteNow {
+                    return self
+                        .route_hold_buffered(
+                            parts,
+                            body,
+                            path,
+                            &query,
+                            op,
+                            "exact typed API coverage requires consequence approval",
+                            conn_id,
+                        )
+                        .await;
+                }
+                let redact = self.protocol.redactable_read(op);
+                self.forward_buffered(
+                    parts,
+                    body,
+                    path,
+                    &query,
+                    redact,
+                    Some(op.clone()),
+                    conn_id,
+                    None,
+                )
+                .await
+            }
+            ApiCoverageVerdict::Deny { reason, .. } => self.status_resp(
+                StatusCode::FORBIDDEN,
+                &format!("guard api-proxy exact typed coverage denied request: {reason}"),
+                "Forbidden",
+            ),
+            ApiCoverageVerdict::None => self.status_resp(
+                StatusCode::FORBIDDEN,
+                "guard api-proxy: exact session-scoped typed API coverage is required",
+                "Forbidden",
+            ),
+        }
+    }
+
     /// The rarity-accounting shape for an operation: everything that
     /// distinguishes one kind of request from another except the object name.
     fn shape_key(&self, op: &ApiOp) -> ShapeKey {
@@ -1034,6 +1193,7 @@ impl ApiProxy {
             resource: op.resource.clone(),
             subresource: op.subresource.clone(),
             namespace: op.namespace.clone(),
+            authority_selectors: op.authority_selectors.clone(),
         }
     }
 
@@ -1051,13 +1211,8 @@ impl ApiProxy {
         reason: &str,
         conn_id: u64,
     ) -> Response<ProxyBody> {
-        // Same label the caller logged: "<verb> <path>".
         let label = format!("{} {}", op.verb.as_str(), path);
-        let label = label.as_str();
-        // The request is parked here, still buffered, while the daemon queues it
-        // for the operator (`guard approvals` / `guard approve`). Only an
-        // explicit approval forwards it.
-        let Some(gate) = self.gate.get() else {
+        if self.gate.get().is_none() {
             tracing::info!(
                 target: "guard::apiproxy",
                 "HOLD {} denied: no approval queue (--gate consequence is not active)",
@@ -1072,43 +1227,13 @@ impl ApiProxy {
                 ),
                 "Forbidden",
             );
+        }
+        let (parts, body) = match collect_request_body(req, self.request_body_timeout).await {
+            Ok(buffered) => buffered,
+            Err(error) => return self.request_body_error_response(error),
         };
-        tracing::info!(target: "guard::apiproxy", "HOLD {} ({})", label, reason);
-        let session_context = req
-            .extensions()
-            .get::<SessionAuth>()
-            .map(|auth| &auth.context);
-        let mut response = match gate.hold_request(label, reason, session_context).await {
-            HoldDecision::Approved { handle } => {
-                // Redaction follows the protocol's classification, not the rule
-                // flag: a secret-material read that passes the gate (allowed or
-                // operator-approved) is always redacted, so no policy wording can
-                // expose values.
-                let redact = self.protocol.redactable_read(op);
-                tracing::info!(
-                    target: "guard::apiproxy",
-                    "ALLOW {} (operator approved hold {}){}",
-                    label,
-                    handle,
-                    if redact { " (redacting)" } else { "" }
-                );
-                self.forward(req, path, query, redact, Some(op.clone()), conn_id)
-                    .await
-            }
-            HoldDecision::Denied { reason } => {
-                tracing::info!(target: "guard::apiproxy", "DENY {} (held: {})", label, reason);
-                self.status_resp(
-                    StatusCode::FORBIDDEN,
-                    &format!(
-                        "guard api-proxy ({}): {label} held for operator approval: {reason}",
-                        self.protocol.name()
-                    ),
-                    "Forbidden",
-                )
-            }
-        };
-        response.extensions_mut().insert(GuardHeld);
-        response
+        self.route_hold_buffered(parts, body, path, query, op, reason, conn_id)
+            .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1123,7 +1248,6 @@ impl ApiProxy {
         conn_id: u64,
     ) -> Response<ProxyBody> {
         let label = format!("{} {}", op.verb.as_str(), path);
-        let label = label.as_str();
         let Some(gate) = self.gate.get() else {
             tracing::info!(
                 target: "guard::apiproxy",
@@ -1141,45 +1265,50 @@ impl ApiProxy {
             );
         };
         tracing::info!(target: "guard::apiproxy", "HOLD {} ({})", label, reason);
+        let snapshot = api_hold_snapshot(label.clone(), query, op, &body);
         let session_context = parts
             .extensions
             .get::<SessionAuth>()
             .map(|auth| &auth.context);
-        let mut response = match gate.hold_request(label, reason, session_context).await {
-            HoldDecision::Approved { handle } => {
-                let redact = self.protocol.redactable_read(op);
-                tracing::info!(
-                    target: "guard::apiproxy",
-                    "ALLOW {} (operator approved hold {}){}",
-                    label,
-                    handle,
-                    if redact { " (redacting)" } else { "" }
-                );
-                self.forward_buffered(
-                    parts,
-                    body,
-                    path,
-                    query,
-                    redact,
-                    Some(op.clone()),
-                    conn_id,
-                    None,
-                )
-                .await
-            }
-            HoldDecision::Denied { reason } => {
-                tracing::info!(target: "guard::apiproxy", "DENY {} (held: {})", label, reason);
-                self.status_resp(
-                    StatusCode::FORBIDDEN,
-                    &format!(
-                        "guard api-proxy ({}): {label} held for operator approval: {reason}",
-                        self.protocol.name()
-                    ),
-                    "Forbidden",
-                )
-            }
-        };
-        response.extensions_mut().insert(GuardHeld);
+        let (mut response, outcome) =
+            match gate.hold_request(&snapshot, reason, session_context).await {
+                HoldDecision::Approved { handle } => {
+                    let redact = self.protocol.redactable_read(op);
+                    tracing::info!(
+                        target: "guard::apiproxy",
+                        "ALLOW {} (operator approved hold {}){}",
+                        label,
+                        handle,
+                        if redact { " (redacting)" } else { "" }
+                    );
+                    let response = self
+                        .forward_buffered(
+                            parts,
+                            body,
+                            path,
+                            query,
+                            redact,
+                            Some(op.clone()),
+                            conn_id,
+                            None,
+                        )
+                        .await;
+                    (response, GuardHoldOutcome::Approved)
+                }
+                HoldDecision::Denied { reason } => {
+                    tracing::info!(target: "guard::apiproxy", "DENY {} (held: {})", label, reason);
+                    let response = self.status_resp(
+                        StatusCode::FORBIDDEN,
+                        &format!(
+                            "guard api-proxy ({}): {label} held for operator approval: {reason}",
+                            self.protocol.name()
+                        ),
+                        "Forbidden",
+                    );
+                    (response, GuardHoldOutcome::Denied)
+                }
+            };
+        response.extensions_mut().insert(outcome);
         response
     }
 
@@ -1192,19 +1321,9 @@ impl ApiProxy {
         op: Option<ApiOp>,
         conn_id: u64,
     ) -> Response<ProxyBody> {
-        let (parts, body) = match collect_request_body(req).await {
+        let (parts, body) = match collect_request_body(req, self.request_body_timeout).await {
             Ok(buffered) => buffered,
-            Err(e) => {
-                tracing::warn!(target: "guard::apiproxy", "request body error for {path}: {e:#}");
-                return self.status_resp(
-                    StatusCode::BAD_GATEWAY,
-                    &format!(
-                        "guard api-proxy ({}): request body error: {e}",
-                        self.protocol.name()
-                    ),
-                    "InternalError",
-                );
-            }
+            Err(error) => return self.request_body_error_response(error),
         };
         self.forward_buffered(parts, body, path, query, redact, op, conn_id, None)
             .await
@@ -1219,18 +1338,9 @@ impl ApiProxy {
         conn_id: u64,
         created: CreatedMatch,
     ) -> Response<ProxyBody> {
-        let (parts, body) = match collect_request_body(req).await {
+        let (parts, body) = match collect_request_body(req, self.request_body_timeout).await {
             Ok(buffered) => buffered,
-            Err(error) => {
-                return self.status_resp(
-                    StatusCode::BAD_GATEWAY,
-                    &format!(
-                        "guard api-proxy ({}): request body error: {error}",
-                        self.protocol.name()
-                    ),
-                    "InternalError",
-                );
-            }
+            Err(error) => return self.request_body_error_response(error),
         };
         self.forward_buffered_with_cleanup(
             parts,
@@ -1436,6 +1546,18 @@ impl ApiProxy {
                     }
                     continue;
                 }
+                if name.as_str() == "link" {
+                    if let Some(link) = self.safe_link(value, &response_secrets) {
+                        hdrs.append(name, link);
+                    }
+                    continue;
+                }
+                if is_rate_limit_response_header(name) {
+                    if value.as_bytes().len() <= MAX_RATE_LIMIT_HEADER_LEN {
+                        hdrs.append(name, value.clone());
+                    }
+                    continue;
+                }
                 if !is_safe_response_header(name) {
                     continue;
                 }
@@ -1597,6 +1719,21 @@ impl ApiProxy {
             ));
         }
         Ok(current)
+    }
+
+    fn request_body_error_response(&self, error: RequestBodyError) -> Response<ProxyBody> {
+        match error {
+            RequestBodyError::Timeout => self.status_resp(
+                StatusCode::REQUEST_TIMEOUT,
+                "guard api-proxy: request body read timed out before authorization",
+                "RequestTimeout",
+            ),
+            RequestBodyError::Read(error) => self.status_resp(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                &format!("guard api-proxy: request body could not be buffered: {error}"),
+                "RequestEntityTooLarge",
+            ),
+        }
     }
 
     /// Re-read immutable protocol floors and the hot-reloaded explicit policy
@@ -1828,7 +1965,34 @@ impl ApiProxy {
             rewritten.push('?');
             rewritten.push_str(query);
         }
+        if let Some(fragment) = location.fragment() {
+            rewritten.push('#');
+            rewritten.push_str(fragment);
+        }
         HeaderValue::from_str(&rewritten).ok()
+    }
+
+    fn safe_link(&self, value: &HeaderValue, secrets: &[Vec<u8>]) -> Option<HeaderValue> {
+        if header_contains_secret(value.as_bytes(), secrets) {
+            return None;
+        }
+        let raw = value.to_str().ok()?;
+        let mut rewritten = Vec::new();
+        for link in split_link_values(raw)? {
+            let link = link.trim();
+            let target_end = link.strip_prefix('<')?.find('>')? + 1;
+            let target = &link[1..target_end];
+            if target.is_empty() {
+                return None;
+            }
+            let params = &link[target_end + 1..];
+            if !params.trim().is_empty() && !params.trim_start().starts_with(';') {
+                return None;
+            }
+            let target = self.safe_location(&HeaderValue::from_str(target).ok()?, secrets)?;
+            rewritten.push(format!("<{}>{params}", target.to_str().ok()?));
+        }
+        HeaderValue::from_str(&rewritten.join(", ")).ok()
     }
 
     fn status_resp(&self, code: StatusCode, message: &str, reason: &str) -> Response<ProxyBody> {
@@ -1896,14 +2060,31 @@ fn take_guard_session(headers: &mut HeaderMap) -> Result<Option<String>, &'stati
     }
 }
 
-async fn collect_request_body(req: Request<Incoming>) -> Result<(Parts, Bytes)> {
+async fn collect_request_body(
+    req: Request<Incoming>,
+    timeout: Duration,
+) -> std::result::Result<(Parts, Bytes), RequestBodyError> {
     let (parts, body) = req.into_parts();
-    let collected = Limited::new(body, MAX_REQ_BODY)
-        .collect()
+    let collected = tokio::time::timeout(timeout, Limited::new(body, MAX_REQ_BODY).collect())
         .await
-        .map_err(|e| anyhow!("read request body (limit {MAX_REQ_BODY}): {e}"))?
+        .map_err(|_| RequestBodyError::Timeout)?
+        .map_err(|error| {
+            RequestBodyError::Read(anyhow!("read request body (limit {MAX_REQ_BODY}): {error}"))
+        })?
         .to_bytes();
     Ok((parts, collected))
+}
+
+fn api_hold_snapshot(label: String, query: &str, op: &ApiOp, body: &[u8]) -> ApiHoldSnapshot {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(body);
+    ApiHoldSnapshot {
+        label,
+        body_sha256: digest.iter().map(|byte| format!("{byte:02x}")).collect(),
+        redacted_body_shape: redacted_body_shape(body),
+        redacted_query: crate::evaluate::redact_for_llm(query),
+        authority_selectors: op.authority_selectors.clone(),
+    }
 }
 
 fn full_body(bytes: Bytes) -> ProxyBody {
@@ -1995,6 +2176,47 @@ fn is_safe_response_header(name: &header::HeaderName) -> bool {
     )
 }
 
+const MAX_RATE_LIMIT_HEADER_LEN: usize = 1024;
+
+fn is_rate_limit_response_header(name: &header::HeaderName) -> bool {
+    name.as_str().starts_with("x-ratelimit-") || name.as_str().starts_with("ratelimit-")
+}
+
+fn split_link_values(raw: &str) -> Option<Vec<&str>> {
+    let mut values = Vec::new();
+    let mut start = 0;
+    let mut in_target = false;
+    let mut in_quote = false;
+    let mut escaped = false;
+    for (index, character) in raw.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_quote && character == '\\' {
+            escaped = true;
+            continue;
+        }
+        match character {
+            '"' if !in_target => in_quote = !in_quote,
+            '<' if !in_quote && !in_target => in_target = true,
+            '<' if !in_quote => return None,
+            '>' if !in_quote && in_target => in_target = false,
+            '>' if !in_quote => return None,
+            ',' if !in_quote && !in_target => {
+                values.push(&raw[start..index]);
+                start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if in_target || in_quote || escaped {
+        return None;
+    }
+    values.push(&raw[start..]);
+    (!values.is_empty()).then_some(values)
+}
+
 fn header_contains_secret(value: &[u8], secrets: &[Vec<u8>]) -> bool {
     secrets.iter().any(|secret| {
         !secret.is_empty()
@@ -2005,9 +2227,11 @@ fn header_contains_secret(value: &[u8], secrets: &[Vec<u8>]) -> bool {
 }
 
 fn validate_listener_identity(listen: SocketAddr) -> Result<()> {
-    if listen.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) {
+    if listen.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        && listen.ip() != std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+    {
         return Err(anyhow!(
-            "api-proxy listener must bind exactly 127.0.0.1 (got {listen})"
+            "api-proxy listener must bind to 127.0.0.1 or ::1 (got {listen})"
         ));
     }
     if listen.port() == 0 {
@@ -2203,9 +2427,10 @@ mod tests {
     }
 
     #[test]
-    fn listener_identity_is_exact_nonzero_ipv4_loopback() {
+    fn listener_identity_is_exact_nonzero_loopback() {
         assert!(validate_listener_identity("127.0.0.1:8443".parse().unwrap()).is_ok());
-        for address in ["127.0.0.1:0", "127.0.0.2:8443", "[::1]:8443"] {
+        assert!(validate_listener_identity("[::1]:8443".parse().unwrap()).is_ok());
+        for address in ["127.0.0.1:0", "[::1]:0", "127.0.0.2:8443"] {
             assert!(validate_listener_identity(address.parse().unwrap()).is_err());
         }
     }
@@ -2238,6 +2463,42 @@ mod tests {
                 .unwrap(),
             HeaderValue::from_static("/api/v1")
         );
+    }
+
+    #[test]
+    fn link_rewrites_every_safe_target_and_rejects_any_unsafe_target() {
+        let proxy = test_proxy();
+        let secrets = vec![b"operator-secret-token".to_vec()];
+        let safe = proxy
+            .safe_link(
+                &HeaderValue::from_static(
+                    "<https://x:6443/items?page=2>; rel=\"next\", </items?page=1>; rel=\"prev alternate\"; title=\"a,b\"",
+                ),
+                &secrets,
+            )
+            .unwrap();
+        assert_eq!(
+            safe,
+            HeaderValue::from_static(
+                "<https://127.0.0.1:0/items?page=2>; rel=\"next\", </items?page=1>; rel=\"prev alternate\"; title=\"a,b\""
+            )
+        );
+        assert!(proxy
+            .safe_link(
+                &HeaderValue::from_static(
+                    "</items?page=2>; rel=\"next\", <https://attacker.invalid/collect>; rel=\"prev\"",
+                ),
+                &secrets,
+            )
+            .is_none());
+        assert!(proxy
+            .safe_link(
+                &HeaderValue::from_static(
+                    "<https://x:6443/items?token=operator-secret-token>; rel=\"next\"",
+                ),
+                &secrets,
+            )
+            .is_none());
     }
 
     fn created_key(conn: u64, name: &str) -> CreatedKey {
@@ -2344,6 +2605,7 @@ mod tests {
             namespace: Some("dev".to_string()),
             name: Some(name.to_string()),
             dry_run: false,
+            authority_selectors: Default::default(),
         }
     }
 
@@ -2357,6 +2619,7 @@ mod tests {
             resource: "pods".to_string(),
             subresource: None,
             namespace: Some("dev".to_string()),
+            authority_selectors: Default::default(),
         };
         // First two occurrences are still under the threshold -> escalate.
         assert!(t.observe_is_rare(key()));
@@ -2383,6 +2646,7 @@ mod tests {
             resource: "namespaces".to_string(),
             subresource: None,
             namespace: None,
+            authority_selectors: Default::default(),
         };
         assert!(!t.observe_is_rare(key));
     }

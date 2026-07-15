@@ -3,7 +3,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use guard::gating::api_promotion::{ApiCoverageProvenance, ApiPromotionOutcome, ApiPromotionStore};
 use guard::gating::GateMode;
-use guard::proxy::{ApiJudge, ApiJudgeVerdict, ApiRequestSummary};
+use guard::proxy::{ApiCoverageVerdict, ApiJudge, ApiJudgeVerdict, ApiRequestSummary};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -25,6 +25,11 @@ pub(crate) struct DaemonApiJudge {
     /// learned shape stamped with a different regime is not trusted.
     stamp: String,
     spend: Arc<ApiJudgeSpend>,
+}
+
+struct DaemonApiCoverageJudge {
+    api_promotion: Arc<RwLock<ApiPromotionStore>>,
+    stamp: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -288,6 +293,88 @@ impl DaemonApiJudge {
             spend,
         }))
     }
+
+    pub(crate) fn build_coverage_only(
+        llm: &LlmConfig,
+        intent: Option<&str>,
+        api_promotion: Arc<RwLock<ApiPromotionStore>>,
+    ) -> Arc<dyn ApiJudge> {
+        Arc::new(DaemonApiCoverageJudge {
+            api_promotion,
+            stamp: regime_stamp(llm, intent),
+        })
+    }
+}
+
+async fn lookup_api_coverage(
+    store: &Arc<RwLock<ApiPromotionStore>>,
+    stamp: &str,
+    summary: &ApiRequestSummary,
+) -> ApiCoverageVerdict {
+    let request_stamp = request_stamp(stamp, summary);
+    let guard = store.read().await;
+    if let Some(hit) = guard.learned_deny(summary, &request_stamp) {
+        return ApiCoverageVerdict::Deny {
+            reason: hit.reason,
+            operator: hit.provenance == ApiCoverageProvenance::Operator,
+        };
+    }
+    if !summary.rarity {
+        if let Some(hit) = guard.learned_allow(summary, &request_stamp) {
+            return ApiCoverageVerdict::Allow {
+                risk: hit.risk,
+                reversibility: hit.reversibility,
+            };
+        }
+    }
+    if summary.session_fingerprint.is_some() {
+        let mut baseline = summary.clone();
+        baseline.session_fingerprint = None;
+        baseline.session_revision = None;
+        baseline.session_intent = None;
+        if let Some(hit) = guard.learned_deny(&baseline, stamp) {
+            if hit.provenance == ApiCoverageProvenance::Operator {
+                return ApiCoverageVerdict::Deny {
+                    reason: hit.reason,
+                    operator: true,
+                };
+            }
+        }
+    }
+    ApiCoverageVerdict::None
+}
+
+fn request_stamp(stamp: &str, summary: &ApiRequestSummary) -> String {
+    if summary.session_revision.is_none() && summary.session_intent.is_none() {
+        return stamp.to_string();
+    }
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(stamp.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(summary.session_revision.as_deref().unwrap_or("").as_bytes());
+    hasher.update([0u8]);
+    hasher.update(summary.session_intent.as_deref().unwrap_or("").as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[async_trait]
+impl ApiJudge for DaemonApiCoverageJudge {
+    fn evaluator_enabled(&self) -> bool {
+        false
+    }
+
+    async fn coverage(&self, summary: &ApiRequestSummary) -> ApiCoverageVerdict {
+        lookup_api_coverage(&self.api_promotion, &self.stamp, summary).await
+    }
+
+    async fn judge(&self, _summary: &ApiRequestSummary) -> ApiJudgeVerdict {
+        ApiJudgeVerdict::Error("API evaluator is disabled".to_string())
+    }
 }
 
 /// A stable fingerprint of the evaluator regime: the prompt version, the model,
@@ -315,6 +402,13 @@ fn regime_stamp(llm: &LlmConfig, intent: Option<&str>) -> String {
 
 #[async_trait]
 impl ApiJudge for DaemonApiJudge {
+    async fn coverage(&self, summary: &ApiRequestSummary) -> ApiCoverageVerdict {
+        let Some(store) = &self.api_promotion else {
+            return ApiCoverageVerdict::None;
+        };
+        lookup_api_coverage(store, &self.stamp, summary).await
+    }
+
     async fn judge(&self, summary: &ApiRequestSummary) -> ApiJudgeVerdict {
         let request_stamp = self.request_stamp(summary);
         if let Some(store) = &self.api_promotion {
@@ -368,6 +462,7 @@ impl ApiJudge for DaemonApiJudge {
             if summary.session_fingerprint.is_some() {
                 let mut baseline = summary.clone();
                 baseline.session_fingerprint = None;
+                baseline.session_revision = None;
                 baseline.session_intent = None;
                 let deny = {
                     let guard = store.read().await;
@@ -431,19 +526,7 @@ impl ApiJudge for DaemonApiJudge {
 
 impl DaemonApiJudge {
     fn request_stamp(&self, summary: &ApiRequestSummary) -> String {
-        let Some(intent) = summary.session_intent.as_deref() else {
-            return self.stamp.clone();
-        };
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(self.stamp.as_bytes());
-        hasher.update([0u8]);
-        hasher.update(intent.as_bytes());
-        hasher
-            .finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
+        request_stamp(&self.stamp, summary)
     }
 
     async fn record_allow(
@@ -572,11 +655,13 @@ mod tests {
             namespace: Some("dev".to_string()),
             name: Some("api".to_string()),
             dry_run: false,
+            authority_selectors: Default::default(),
             redacted_body_shape: "(no body)".to_string(),
             revert_constructible: RevertConstructible::RestorePriorState,
             rarity: false,
             endpoint: "default".to_string(),
             session_fingerprint: None,
+            session_revision: None,
             session_intent: None,
             credential_ref: "upstream".to_string(),
         };
@@ -713,11 +798,13 @@ mod tests {
             namespace: Some("dev".to_string()),
             name: Some("api".to_string()),
             dry_run: false,
+            authority_selectors: Default::default(),
             redacted_body_shape: "{\"spec\":{\"replicas\":<number>}}".to_string(),
             revert_constructible: RevertConstructible::RestorePriorState,
             rarity: false,
             endpoint: "default".to_string(),
             session_fingerprint: None,
+            session_revision: None,
             session_intent: None,
             credential_ref: "upstream".to_string(),
         };
@@ -780,11 +867,13 @@ mod tests {
             namespace: Some("dev".to_string()),
             name: Some(name.to_string()),
             dry_run: false,
+            authority_selectors: Default::default(),
             redacted_body_shape: "(no body)".to_string(),
             revert_constructible: RevertConstructible::RestorePriorState,
             rarity,
             endpoint: "default".to_string(),
             session_fingerprint: None,
+            session_revision: None,
             session_intent: None,
             credential_ref: "upstream".to_string(),
         }
@@ -1172,5 +1261,26 @@ mod tests {
         let mut edited = first.clone();
         edited.session_intent = Some("apply deployments".to_string());
         assert_ne!(judge.request_stamp(&first), judge.request_stamp(&edited));
+    }
+
+    #[test]
+    fn session_revision_alone_changes_evaluator_and_cache_regime() {
+        let judge = DaemonApiJudge {
+            evaluator: Evaluator::new(EvalConfig::default().llm_enabled(false)).unwrap(),
+            api_promotion: None,
+            stamp: "base".to_string(),
+            spend: Arc::new(ApiJudgeSpend::new(ApiJudgeSpendConfig::default())),
+        };
+        let mut first = api_summary("api", false);
+        first.session_fingerprint = Some("session".to_string());
+        first.session_revision = Some("revision-one".to_string());
+        first.session_intent = Some("manage deployments".to_string());
+        let unchanged = first.clone();
+        let mut edited = first.clone();
+        edited.session_revision = Some("revision-two".to_string());
+        assert_eq!(judge.request_stamp(&first), judge.request_stamp(&unchanged));
+        assert_eq!(first.stable_text(), unchanged.stable_text());
+        assert_ne!(judge.request_stamp(&first), judge.request_stamp(&edited));
+        assert_ne!(first.stable_text(), edited.stable_text());
     }
 }

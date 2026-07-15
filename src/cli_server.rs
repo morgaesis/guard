@@ -1348,6 +1348,13 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 }
                 let proxy = Arc::new(proxy);
                 let mut api_judge_attached = false;
+                if let Some(coverage) = api_promotion_store.clone() {
+                    proxy.attach_judge(server::DaemonApiJudge::build_coverage_only(
+                        &api_judge_llm,
+                        policy_intent.as_deref(),
+                        coverage,
+                    ));
+                }
                 if api_judge_llm.enabled
                     && api_judge_llm
                         .api_key
@@ -1599,15 +1606,20 @@ fn write_brokered_kubeconfig_output(
 }
 
 fn validate_api_listener(listen: std::net::SocketAddr, label: &str) -> Result<()> {
-    if listen.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) {
+    if !is_supported_api_loopback(listen.ip()) {
         anyhow::bail!(
-            "{label} must bind exactly 127.0.0.1 because the generated TLS certificate and brokered URL use that address (got {listen})"
+            "{label} must bind to 127.0.0.1 or ::1 because the generated TLS certificate is limited to localhost (got {listen})"
         );
     }
     if listen.port() == 0 {
         anyhow::bail!("{label} must use an explicit nonzero listener port");
     }
     Ok(())
+}
+
+fn is_supported_api_loopback(ip: std::net::IpAddr) -> bool {
+    ip == std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        || ip == std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1739,6 +1751,13 @@ fn build_named_api_proxy(
     }
     let proxy = Arc::new(proxy);
     let mut judge_attached = false;
+    if let Some(store) = coverage.clone() {
+        proxy.attach_judge(server::DaemonApiJudge::build_coverage_only(
+            llm,
+            policy_intent.as_deref(),
+            store,
+        ));
+    }
     if llm.enabled && llm.api_key.as_ref().is_some_and(|key| !key.is_empty()) {
         let llm = llm.clone();
         let builder = Arc::new(move |intent: Option<String>| {
@@ -1853,9 +1872,10 @@ mod api_endpoint_tests {
     }
 
     #[test]
-    fn listener_validation_matches_generated_url_and_tls_san() {
+    fn listener_validation_accepts_both_tls_loopback_identities() {
         assert!(validate_api_listener("127.0.0.1:8443".parse().unwrap(), "test").is_ok());
-        for address in ["127.0.0.1:0", "127.0.0.2:8443", "[::1]:8443"] {
+        assert!(validate_api_listener("[::1]:8443".parse().unwrap(), "test").is_ok());
+        for address in ["127.0.0.1:0", "[::1]:0", "127.0.0.2:8443"] {
             assert!(
                 validate_api_listener(address.parse().unwrap(), "test").is_err(),
                 "{address} must be rejected"

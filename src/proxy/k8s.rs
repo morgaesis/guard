@@ -91,6 +91,7 @@ pub fn parse_api_op(method: &str, path: &str, query: &str) -> Option<ApiOp> {
         namespace,
         name,
         dry_run,
+        authority_selectors: Default::default(),
     })
 }
 

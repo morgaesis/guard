@@ -50,6 +50,18 @@ struct DaemonApiSessionSink {
     config: ServerConfig,
 }
 
+fn api_session_exec_status(allowed: bool, held: bool) -> SessionExecStatus {
+    if held && allowed {
+        SessionExecStatus::CompletedAfterApproval
+    } else if held {
+        SessionExecStatus::Held
+    } else if allowed {
+        SessionExecStatus::Completed
+    } else {
+        SessionExecStatus::NotAttempted
+    }
+}
+
 #[async_trait::async_trait]
 impl guard::proxy::ApiSessionSink for DaemonApiSessionSink {
     async fn resolve(&self, token: &str) -> Option<guard::proxy::ApiSessionContext> {
@@ -62,11 +74,27 @@ impl guard::proxy::ApiSessionSink for DaemonApiSessionSink {
         }
         let (fingerprint, intent) = registry.api_authority_for(token)?;
         let (revision, secret_entitlements) = registry.authority_snapshot(token)?;
+        let evaluation_mode = registry.evaluation_mode_for(token).unwrap_or_default();
         Some(guard::proxy::ApiSessionContext {
             fingerprint,
             revision,
             secret_entitlements,
-            can_override_baseline: intent.is_some(),
+            can_evaluate_api_override: evaluation_mode
+                == crate::grant_profile::EvaluationMode::Evaluator
+                && intent
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty()),
+            evaluation_mode: match evaluation_mode {
+                crate::grant_profile::EvaluationMode::Evaluator => {
+                    guard::proxy::ApiEvaluationMode::Evaluator
+                }
+                crate::grant_profile::EvaluationMode::PolicyOnly => {
+                    guard::proxy::ApiEvaluationMode::PolicyOnly
+                }
+                crate::grant_profile::EvaluationMode::ReadOnly => {
+                    guard::proxy::ApiEvaluationMode::ReadOnly
+                }
+            },
             intent,
         })
     }
@@ -82,13 +110,7 @@ impl guard::proxy::ApiSessionSink for DaemonApiSessionSink {
                 source: SessionDecisionSource::ApiProxy,
                 reason: format!("API proxy returned HTTP {}", event.status),
                 risk: None,
-                exec_status: if event.held {
-                    SessionExecStatus::Held
-                } else if event.allowed {
-                    SessionExecStatus::Completed
-                } else {
-                    SessionExecStatus::NotAttempted
-                },
+                exec_status: api_session_exec_status(event.allowed, event.held),
                 exit_code: None,
                 exposed_secret_refs: if event.allowed {
                     vec![event.credential_ref]
@@ -98,6 +120,27 @@ impl guard::proxy::ApiSessionSink for DaemonApiSessionSink {
             },
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+mod api_session_event_tests {
+    use super::*;
+
+    #[test]
+    fn approved_api_hold_records_both_approval_and_completion() {
+        assert_eq!(
+            api_session_exec_status(true, true),
+            SessionExecStatus::CompletedAfterApproval
+        );
+        assert_eq!(
+            api_session_exec_status(false, true),
+            SessionExecStatus::Held
+        );
+        assert_eq!(
+            api_session_exec_status(true, false),
+            SessionExecStatus::Completed
+        );
     }
 }
 

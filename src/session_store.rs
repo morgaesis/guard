@@ -1329,6 +1329,7 @@ fn encode_exec_status(status: SessionExecStatus) -> &'static str {
     match status {
         SessionExecStatus::NotAttempted => "not_attempted",
         SessionExecStatus::Completed => "completed",
+        SessionExecStatus::CompletedAfterApproval => "completed_after_approval",
         SessionExecStatus::Failed => "failed",
         SessionExecStatus::DryRun => "dry_run",
         SessionExecStatus::Held => "held",
@@ -1340,6 +1341,7 @@ fn decode_exec_status(value: &str) -> rusqlite::Result<SessionExecStatus> {
     match value {
         "not_attempted" => Ok(SessionExecStatus::NotAttempted),
         "completed" => Ok(SessionExecStatus::Completed),
+        "completed_after_approval" => Ok(SessionExecStatus::CompletedAfterApproval),
         "failed" => Ok(SessionExecStatus::Failed),
         "dry_run" => Ok(SessionExecStatus::DryRun),
         "held" => Ok(SessionExecStatus::Held),
@@ -1852,7 +1854,7 @@ mod tests {
                     source: SessionDecisionSource::Llm,
                     reason: "safe".into(),
                     risk: Some(1),
-                    exec_status: SessionExecStatus::Completed,
+                    exec_status: SessionExecStatus::CompletedAfterApproval,
                     exit_code: Some(0),
                     exposed_secret_refs: vec!["service/token".into()],
                 },
@@ -1869,11 +1871,17 @@ mod tests {
         assert!(loaded.has("tok"));
         let report = loaded.show("tok", 10).expect("session report");
         assert_eq!(report.stats.total, 1);
+        assert_eq!(report.stats.completed, 1);
+        assert_eq!(report.stats.holds, 1);
         assert_eq!(report.stats.risk_histogram[1], 1);
         assert_eq!(report.stats.evaluator_calls, 1);
         assert_eq!(report.stats.novel_shapes, 1);
         assert_eq!(report.stats.novel_shape_rate_percent, 100);
         assert_eq!(report.recent[0].exit_code, Some(0));
+        assert_eq!(
+            report.recent[0].exec_status,
+            SessionExecStatus::CompletedAfterApproval
+        );
         assert_eq!(report.recent[0].exposed_secret_refs, vec!["service/token"]);
         assert_eq!(
             report.active.and_then(|grant| grant.prompt_append),

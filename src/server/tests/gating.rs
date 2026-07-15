@@ -1446,15 +1446,18 @@ async fn kube_proxy_hold_routes_through_approval_queue() {
             revision: "session-revision".to_string(),
             secret_entitlements: Some(vec!["cluster/token".to_string()]),
             intent: Some("inspect the cluster".to_string()),
-            can_override_baseline: true,
+            evaluation_mode: guard::proxy::ApiEvaluationMode::Evaluator,
+            can_evaluate_api_override: true,
         };
-        guard::proxy::GateSink::hold_request(
-            &*s,
-            "delete namespaces/prod",
-            "namespace delete",
-            Some(&context),
-        )
-        .await
+        let snapshot = guard::proxy::ApiHoldSnapshot {
+            label: "delete namespaces/prod".to_string(),
+            body_sha256: "body-digest".to_string(),
+            redacted_body_shape: "(no body)".to_string(),
+            redacted_query: String::new(),
+            authority_selectors: Default::default(),
+        };
+        guard::proxy::GateSink::hold_request(&*s, &snapshot, "namespace delete", Some(&context))
+            .await
     });
     let handle = wait_for_pending_hold(&cfg).await;
     assert_eq!(
@@ -1508,13 +1511,14 @@ async fn kube_proxy_hold_routes_through_approval_queue() {
     // Deny: the waiter fails closed with the operator's reason.
     let s = sink.clone();
     let waiter = tokio::spawn(async move {
-        guard::proxy::GateSink::hold_request(
-            &*s,
-            "delete namespaces/prod",
-            "namespace delete",
-            None,
-        )
-        .await
+        let snapshot = guard::proxy::ApiHoldSnapshot {
+            label: "delete namespaces/prod".to_string(),
+            body_sha256: "body-digest".to_string(),
+            redacted_body_shape: "(no body)".to_string(),
+            redacted_query: String::new(),
+            authority_selectors: Default::default(),
+        };
+        guard::proxy::GateSink::hold_request(&*s, &snapshot, "namespace delete", None).await
     });
     let handle = wait_for_pending_hold(&cfg).await;
     let resp = handle_admin_request(
@@ -1542,13 +1546,14 @@ async fn kube_proxy_hold_routes_through_approval_queue() {
     // Disconnect: dropping the waiter mid-hold retires the pending row.
     let s = sink.clone();
     let waiter = tokio::spawn(async move {
-        guard::proxy::GateSink::hold_request(
-            &*s,
-            "delete namespaces/prod",
-            "namespace delete",
-            None,
-        )
-        .await
+        let snapshot = guard::proxy::ApiHoldSnapshot {
+            label: "delete namespaces/prod".to_string(),
+            body_sha256: "body-digest".to_string(),
+            redacted_body_shape: "(no body)".to_string(),
+            redacted_query: String::new(),
+            authority_selectors: Default::default(),
+        };
+        guard::proxy::GateSink::hold_request(&*s, &snapshot, "namespace delete", None).await
     });
     let handle = wait_for_pending_hold(&cfg).await;
     waiter.abort();

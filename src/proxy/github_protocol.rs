@@ -136,6 +136,7 @@ impl ProtocolConfig for GithubProtocol {
             namespace,
             name,
             dry_run: false,
+            authority_selectors: Default::default(),
         })
     }
 

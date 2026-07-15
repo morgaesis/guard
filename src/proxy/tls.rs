@@ -1,11 +1,11 @@
 //! TLS material for the proxy: an ephemeral CA and a leaf certificate for
-//! `127.0.0.1`/`localhost`, plus the rustls server config that terminates the
+//! `127.0.0.1`/`::1`/`localhost`, plus the rustls server config that terminates the
 //! agent's connection. The CA (base64 PEM) goes into the brokered kubeconfig as
 //! `certificate-authority-data`; the leaf, signed by the CA, is what the proxy
 //! presents. ALPN offers both `h2` and `http/1.1` so client-go (h2) and HTTP/1.1
 //! clients both negotiate.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -42,7 +42,7 @@ impl ProxyTls {
         let ca_cert = ca_params.self_signed(&ca_key).context("self-sign CA")?;
         let ca_pem = ca_cert.pem();
 
-        // Leaf for the loopback listener, signed by the CA, with SAN 127.0.0.1.
+        // Leaf for either loopback listener family, signed by the CA.
         let issuer = Issuer::new(ca_params, ca_key);
         let leaf_key = KeyPair::generate().context("generate leaf key")?;
         let mut leaf_params =
@@ -50,6 +50,7 @@ impl ProxyTls {
         leaf_params.subject_alt_names = vec![
             SanType::DnsName("localhost".try_into().context("dns san")?),
             SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            SanType::IpAddress(IpAddr::V6(Ipv6Addr::LOCALHOST)),
         ];
         leaf_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         leaf_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];

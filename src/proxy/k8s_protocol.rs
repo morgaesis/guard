@@ -30,7 +30,7 @@ impl ProtocolConfig for KubernetesProtocol {
         &self,
         method: &str,
         path: &str,
-        _query: &str,
+        query: &str,
     ) -> Option<NonResourceRead> {
         if !matches!(method, "GET" | "HEAD") {
             return None;
@@ -54,7 +54,12 @@ impl ProtocolConfig for KubernetesProtocol {
             ["openapi", "v3", "apis", group, version] => safe_token(group) && safe_token(version),
             _ => false,
         };
-        discovery.then_some(NonResourceRead::Discovery)
+        if discovery {
+            return Some(NonResourceRead::Discovery);
+        }
+        let health =
+            matches!(path, "/healthz" | "/livez" | "/readyz") && matches!(query, "" | "verbose");
+        health.then_some(NonResourceRead::Health)
     }
 
     fn deny_outright(&self, op: &ApiOp) -> Option<String> {
@@ -324,10 +329,27 @@ mod tests {
                 "{path}"
             );
         }
+        for path in ["/healthz", "/livez", "/readyz"] {
+            for method in ["GET", "HEAD"] {
+                assert_eq!(
+                    protocol.classify_non_resource_read(method, path, ""),
+                    Some(NonResourceRead::Health),
+                    "{method} {path}"
+                );
+                assert_eq!(
+                    protocol.classify_non_resource_read(method, path, "verbose"),
+                    Some(NonResourceRead::Health),
+                    "{method} {path}?verbose"
+                );
+            }
+        }
         for path in [
             "/",
             "/metrics",
-            "/healthz",
+            "/healthz/",
+            "/healthz/ping",
+            "/livez/log",
+            "/readyz/etcd",
             "/debug/pprof",
             "/openapi/v3/../../metrics",
         ] {
@@ -335,6 +357,14 @@ mod tests {
         }
         assert_eq!(
             protocol.classify_non_resource_read("POST", "/version", ""),
+            None
+        );
+        assert_eq!(
+            protocol.classify_non_resource_read("POST", "/readyz", ""),
+            None
+        );
+        assert_eq!(
+            protocol.classify_non_resource_read("GET", "/readyz", "exclude=etcd"),
             None
         );
     }
