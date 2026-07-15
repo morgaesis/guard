@@ -57,6 +57,7 @@ fn parse_start(args: &[&str]) -> ServerCommands {
             allow_bin,
             child_env,
             api_proxy,
+            api_endpoints,
             api_protocol,
             api_upstream,
             api_token_env,
@@ -80,6 +81,11 @@ fn parse_start(args: &[&str]) -> ServerCommands {
             session_max_holds,
             session_max_deny_ratio,
             session_deny_ratio_min_commands,
+            api_judge_max_concurrency,
+            api_judge_rate_per_minute,
+            api_judge_burst,
+            api_judge_error_threshold,
+            api_judge_circuit_cooldown,
             service,
         }) => ServerCommands::Start {
             socket,
@@ -129,6 +135,7 @@ fn parse_start(args: &[&str]) -> ServerCommands {
             allow_bin,
             child_env,
             api_proxy,
+            api_endpoints,
             api_protocol,
             api_upstream,
             api_token_env,
@@ -152,10 +159,54 @@ fn parse_start(args: &[&str]) -> ServerCommands {
             session_max_holds,
             session_max_deny_ratio,
             session_deny_ratio_min_commands,
+            api_judge_max_concurrency,
+            api_judge_rate_per_minute,
+            api_judge_burst,
+            api_judge_error_threshold,
+            api_judge_circuit_cooldown,
             service,
         },
         _ => panic!("expected server start args"),
     }
+}
+
+#[test]
+fn parses_named_api_endpoints_and_spend_controls() {
+    let command = parse_start(&[
+        "guard",
+        "server",
+        "start",
+        "--api-endpoints",
+        "/tmp/endpoints.yaml",
+        "--api-judge-max-concurrency",
+        "2",
+        "--api-judge-rate-per-minute",
+        "30",
+        "--api-judge-burst",
+        "4",
+        "--api-judge-error-threshold",
+        "3",
+        "--api-judge-circuit-cooldown",
+        "90",
+    ]);
+    let ServerCommands::Start {
+        api_endpoints,
+        api_judge_max_concurrency,
+        api_judge_rate_per_minute,
+        api_judge_burst,
+        api_judge_error_threshold,
+        api_judge_circuit_cooldown,
+        ..
+    } = command
+    else {
+        panic!("expected server start");
+    };
+    assert_eq!(api_endpoints, Some(PathBuf::from("/tmp/endpoints.yaml")));
+    assert_eq!(api_judge_max_concurrency, Some(2));
+    assert_eq!(api_judge_rate_per_minute, Some(30));
+    assert_eq!(api_judge_burst, Some(4));
+    assert_eq!(api_judge_error_threshold, Some(3));
+    assert_eq!(api_judge_circuit_cooldown, Some(90));
 }
 
 fn resolved_llm(args: &[&str]) -> bool {
@@ -1355,6 +1406,12 @@ fn machine_readable_flags_cover_read_and_execution_commands() {
     assert!(matches!(
         MainArgs::try_parse_from(["guard", "verb", "run", "uptime", "--json"]),
         Ok(MainArgs::Verb(VerbCommands::Run { json: true, .. }))
+    ));
+    assert!(matches!(
+        MainArgs::try_parse_from(["guard", "verb", "coverage", "list", "--json"]),
+        Ok(MainArgs::Verb(VerbCommands::Coverage {
+            command: VerbCoverageCommands::List { json: true, .. }
+        }))
     ));
     assert!(matches!(
         MainArgs::try_parse_from(["guard", "session", "list", "--json"]),

@@ -4,8 +4,9 @@
 //! `auth-provider` credential plugins are rejected because the proxy cannot run
 //! them and a brokered client that could would reach the apiserver around the
 //! gate. Other protocols build from a base URL plus an optional bearer token.
-//! The daemon holds these credentials; the brokered config the agent receives
-//! carries none, so the proxy is the sole path to the upstream.
+//! The daemon holds these upstream credentials. A brokered config carries no
+//! upstream credential, though it may carry a Guard session bearer that the
+//! proxy consumes, so the proxy is the sole path to the upstream.
 
 use std::path::Path;
 
@@ -91,6 +92,7 @@ pub struct Upstream {
     client: reqwest::Client,
     bearer: Option<String>,
     basic: Option<(String, String)>,
+    identity_fingerprint: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,11 +129,21 @@ impl Upstream {
             UpstreamAuth::None => None,
             UpstreamAuth::Bearer(token) => Some(token),
         };
+        let canonical_base = base.trim_end_matches('/').to_string();
+        let identity_fingerprint = fingerprint_identity(
+            &canonical_base,
+            if let Some(token) = bearer.as_deref() {
+                ("bearer", token.as_bytes())
+            } else {
+                ("none", &[])
+            },
+        );
         Ok(Self {
-            base: base.trim_end_matches('/').to_string(),
+            base: canonical_base,
             client,
             bearer,
             basic: None,
+            identity_fingerprint,
         })
     }
 
@@ -250,6 +262,7 @@ impl Upstream {
         // Bind the single method to the client/request path. Attaching the client
         // certificate is a client-level decision, so only do it when the cert is
         // the elected method (a token takes precedence and stands alone).
+        let selected_client_cert = bearer.is_none() && client_identity.is_some();
         let (bearer, basic) = if bearer.is_some() {
             (bearer, None)
         } else if client_identity.is_some() {
@@ -264,11 +277,30 @@ impl Upstream {
         }
 
         let client = builder.build().context("build upstream TLS client")?;
+        let base = cluster.cluster.server.trim_end_matches('/').to_string();
+        let identity_fingerprint = if let Some(token) = bearer.as_deref() {
+            fingerprint_identity(&base, ("bearer", token.as_bytes()))
+        } else if selected_client_cert {
+            fingerprint_identity(
+                &base,
+                (
+                    "client-certificate",
+                    cert_pem.as_deref().unwrap_or_default(),
+                ),
+            )
+        } else if let Some((username, _password)) = basic.as_ref() {
+            // The username is the Basic-auth principal. Hashing the password
+            // would persist an offline verifier in revert metadata.
+            fingerprint_identity(&base, ("basic", username.as_bytes()))
+        } else {
+            fingerprint_identity(&base, ("none", &[]))
+        };
         Ok(Self {
-            base: cluster.cluster.server.trim_end_matches('/').to_string(),
+            base,
             client,
             bearer,
             basic,
+            identity_fingerprint,
         })
     }
 
@@ -293,6 +325,90 @@ impl Upstream {
     pub fn basic_auth(&self) -> Option<(&str, &str)> {
         self.basic.as_ref().map(|(u, p)| (u.as_str(), p.as_str()))
     }
+
+    /// Secret-free digest of the canonical target and selected upstream
+    /// authentication identity. Credential values never leave this object.
+    pub fn identity_fingerprint(&self) -> &str {
+        &self.identity_fingerprint
+    }
+
+    /// Exact byte sequences derived from the authentication material this
+    /// proxy injects. Response filtering uses them to prevent a cooperative or
+    /// hostile upstream from reflecting daemon-held credentials to the client.
+    pub fn response_secret_values(&self) -> Vec<Vec<u8>> {
+        let mut values = Vec::new();
+        if let Some(token) = self.bearer.as_deref() {
+            if !token.is_empty() {
+                values.push(token.as_bytes().to_vec());
+                values.push(format!("Bearer {token}").into_bytes());
+            }
+        }
+        if let Some((username, password)) = self.basic.as_ref() {
+            let joined = format!("{username}:{password}");
+            if !password.is_empty() {
+                values.push(password.as_bytes().to_vec());
+            }
+            values.push(joined.as_bytes().to_vec());
+            values.push(
+                format!(
+                    "Basic {}",
+                    base64::engine::general_purpose::STANDARD.encode(joined.as_bytes())
+                )
+                .into_bytes(),
+            );
+        }
+        values.sort();
+        values.dedup();
+        values
+    }
+
+    /// Produce a bounded, credential-safe diagnostic excerpt for persisted
+    /// revert errors and audit messages.
+    pub fn redact_error_excerpt(&self, bytes: &[u8], max_chars: usize) -> String {
+        let secrets = self.response_secret_values();
+        let mut text =
+            String::from_utf8_lossy(trim_trailing_secret_prefix(bytes, &secrets)).to_string();
+        for secret in secrets {
+            if !secret.is_empty() {
+                text = text.replace(&*String::from_utf8_lossy(&secret), "[REDACTED]");
+            }
+        }
+        text = crate::redact::redact_output_text(&text);
+        let mut excerpt = text.chars().take(max_chars).collect::<String>();
+        if text.chars().count() > max_chars {
+            excerpt.push('~');
+        }
+        excerpt
+    }
+}
+
+fn trim_trailing_secret_prefix<'a>(bytes: &'a [u8], secrets: &[Vec<u8>]) -> &'a [u8] {
+    let mut safe_end = bytes.len();
+    for secret in secrets {
+        let max_prefix = secret.len().saturating_sub(1).min(bytes.len());
+        for prefix_len in (1..=max_prefix).rev() {
+            if bytes.ends_with(&secret[..prefix_len]) {
+                safe_end = safe_end.min(bytes.len() - prefix_len);
+                break;
+            }
+        }
+    }
+    &bytes[..safe_end]
+}
+
+fn fingerprint_identity(base: &str, auth: (&str, &[u8])) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(base.as_bytes());
+    hasher.update([0]);
+    hasher.update(auth.0.as_bytes());
+    hasher.update([0]);
+    hasher.update(auth.1);
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Resolve a PEM field that may be inline base64 (`*-data`) or a file path.
@@ -338,6 +454,58 @@ users:
         let up = Upstream::from_kubeconfig_str(yaml, None).expect("parse");
         assert_eq!(up.base(), "https://api.example.test:6443");
         assert_eq!(up.bearer(), Some("brokered-secret-token"));
+        assert_eq!(up.identity_fingerprint().len(), 64);
+        assert!(!up.identity_fingerprint().contains("brokered-secret-token"));
+    }
+
+    #[test]
+    fn identity_fingerprint_changes_when_the_credential_rotates() {
+        let first = Upstream::from_base_url(
+            "https://api.example.test",
+            UpstreamAuth::Bearer("token-one".to_string()),
+        )
+        .unwrap();
+        let second = Upstream::from_base_url(
+            "https://api.example.test",
+            UpstreamAuth::Bearer("token-two".to_string()),
+        )
+        .unwrap();
+        assert_ne!(first.identity_fingerprint(), second.identity_fingerprint());
+    }
+
+    #[test]
+    fn revert_error_excerpt_is_bounded_and_redacts_injected_credentials() {
+        let upstream = Upstream::from_base_url(
+            "https://api.example.test",
+            UpstreamAuth::Bearer("operator-secret-token".to_string()),
+        )
+        .unwrap();
+        let body = format!(
+            "upstream reflected Bearer operator-secret-token {}",
+            "x".repeat(2000)
+        );
+        let excerpt = upstream.redact_error_excerpt(body.as_bytes(), 80);
+        assert!(!excerpt.contains("operator-secret-token"));
+        assert!(excerpt.contains("[REDACTED]"));
+        assert!(excerpt.chars().count() <= 81);
+    }
+
+    #[test]
+    fn revert_error_excerpt_drops_a_credential_prefix_at_the_read_boundary() {
+        let upstream = Upstream::from_base_url(
+            "https://api.example.test",
+            UpstreamAuth::Bearer("operator-secret-token".to_string()),
+        )
+        .unwrap();
+        let mut body = vec![b'x'; 4096 - "operator-secr".len()];
+        body.extend_from_slice(b"operator-secr");
+
+        let secrets = upstream.response_secret_values();
+        let trimmed = trim_trailing_secret_prefix(&body, &secrets);
+        let excerpt = upstream.redact_error_excerpt(&body, 5000);
+
+        assert_eq!(trimmed.len(), 4096 - "operator-secr".len());
+        assert!(!excerpt.contains("operator-secr"));
     }
 
     #[test]

@@ -11,6 +11,12 @@
 
 use super::gate::HttpRevert;
 use super::op::ApiOp;
+/// A non-resource read the protocol explicitly recognizes. Unknown paths are
+/// never forwarded merely because their method is GET or HEAD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NonResourceRead {
+    Discovery,
+}
 
 /// Identity of an object a tracked write created. The proxy records it (scoped
 /// to the creating connection) so a later delete of the same object is
@@ -44,10 +50,21 @@ pub trait ProtocolConfig: Send + Sync {
     fn name(&self) -> &str;
 
     /// Parse a request line into a typed operation. `path` is the URL path (no
-    /// query), `query` the raw query string. `None` means the path carries no
-    /// object to gate (discovery, health, version); the server forwards safe
-    /// reads of those and blocks everything else.
+    /// query), `query` the raw query string. `None` means the path is not a
+    /// typed resource operation; it remains denied unless
+    /// [`Self::classify_non_resource_read`] explicitly recognizes it.
     fn parse_op(&self, method: &str, path: &str, query: &str) -> Option<ApiOp>;
+
+    /// Classify an exact non-resource read required by this protocol. The safe
+    /// default recognizes nothing.
+    fn classify_non_resource_read(
+        &self,
+        _method: &str,
+        _path: &str,
+        _query: &str,
+    ) -> Option<NonResourceRead> {
+        None
+    }
 
     /// The client-facing reason an operation is denied regardless of policy —
     /// streams the request-level gate cannot inspect or redact per object.

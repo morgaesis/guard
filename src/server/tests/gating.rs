@@ -803,7 +803,10 @@ async fn api_revert_without_running_proxy_defers_to_operator() {
         session_revision: None,
         secret_entitlements: None,
         api_revert: Some(ApiRevertPlan {
+            endpoint: String::new(),
             protocol: "github".to_string(),
+            upstream_target: String::new(),
+            upstream_identity: String::new(),
             method: "POST".to_string(),
             path: "/repos/o/r/labels".to_string(),
             body_file: None,
@@ -873,6 +876,8 @@ async fn api_revert_executes_through_registered_proxy_upstream() {
         guard::proxy::ApiPolicy::deny_all(),
         None,
     ));
+    let upstream_target = proxy.upstream().base().to_string();
+    let upstream_identity = proxy.upstream_identity_fingerprint();
     cfg.protocol_registry
         .write()
         .await
@@ -904,7 +909,10 @@ async fn api_revert_executes_through_registered_proxy_upstream() {
         session_revision: None,
         secret_entitlements: None,
         api_revert: Some(ApiRevertPlan {
+            endpoint: String::new(),
             protocol: "github".to_string(),
+            upstream_target,
+            upstream_identity,
             method: "POST".to_string(),
             path: "/repos/o/r/labels".to_string(),
             body_file: Some(body_file.clone()),
@@ -938,6 +946,53 @@ async fn api_revert_executes_through_registered_proxy_upstream() {
         !body_file.exists(),
         "revert body file must be unlinked after a terminal revert"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn api_provisional_binds_session_and_upstream_identity() {
+    let (cfg, _operator, _agent) = gating_config(7016, 1000);
+    let sink = DaemonGateSink {
+        config: cfg.clone(),
+        endpoint: "cluster-a".to_string(),
+        protocol: "kubernetes".to_string(),
+        snapshot_dir: std::env::temp_dir(),
+        snapshot_dir_safe: true,
+        window_secs: 60,
+    };
+    let handle = guard::proxy::GateSink::arm_revert(
+        &sink,
+        guard::proxy::ApiMutation {
+            label: "patch deployments/api".to_string(),
+            revert: guard::proxy::HttpRevert {
+                method: "PUT".to_string(),
+                path: "/apis/apps/v1/namespaces/dev/deployments/api".to_string(),
+                body: None,
+            },
+            session_fingerprint: Some("session-fingerprint".to_string()),
+            session_revision: Some("session-revision".to_string()),
+            secret_entitlements: Some(vec!["cluster-a/token".to_string()]),
+            upstream_target: "https://cluster-a.invalid".to_string(),
+            upstream_identity: "identity-fingerprint".to_string(),
+        },
+    )
+    .await
+    .expect("provisional armed");
+
+    let row = cfg.provisional.read().await.get(&handle).cloned().unwrap();
+    assert_eq!(
+        row.session_fingerprint.as_deref(),
+        Some("session-fingerprint")
+    );
+    assert_eq!(row.session_revision.as_deref(), Some("session-revision"));
+    assert_eq!(
+        row.secret_entitlements.as_deref(),
+        Some(["cluster-a/token".to_string()].as_slice())
+    );
+    let api = row.api_revert.unwrap();
+    assert_eq!(api.endpoint, "cluster-a");
+    assert_eq!(api.upstream_target, "https://cluster-a.invalid");
+    assert_eq!(api.upstream_identity, "identity-fingerprint");
 }
 
 /// A recoverable command whose free-form `--revert` cannot be affirmed is
@@ -1375,6 +1430,7 @@ async fn kube_proxy_hold_routes_through_approval_queue() {
     let (cfg, operator, _agent) = gating_config(7013, 1000);
     let sink = Arc::new(DaemonGateSink {
         config: cfg.clone(),
+        endpoint: "default".to_string(),
         protocol: "kubernetes".to_string(),
         snapshot_dir: std::env::temp_dir(),
         snapshot_dir_safe: true,
@@ -1385,10 +1441,44 @@ async fn kube_proxy_hold_routes_through_approval_queue() {
     // Approved and carries no exec result (nothing ran).
     let s = sink.clone();
     let waiter = tokio::spawn(async move {
-        guard::proxy::GateSink::hold_request(&*s, "delete namespaces/prod", "namespace delete")
-            .await
+        let context = guard::proxy::ApiSessionContext {
+            fingerprint: "session-fingerprint".to_string(),
+            revision: "session-revision".to_string(),
+            secret_entitlements: Some(vec!["cluster/token".to_string()]),
+            intent: Some("inspect the cluster".to_string()),
+            can_override_baseline: true,
+        };
+        guard::proxy::GateSink::hold_request(
+            &*s,
+            "delete namespaces/prod",
+            "namespace delete",
+            Some(&context),
+        )
+        .await
     });
     let handle = wait_for_pending_hold(&cfg).await;
+    assert_eq!(
+        cfg.approvals
+            .read()
+            .await
+            .get(&handle)
+            .unwrap()
+            .snapshot
+            .session_fingerprint
+            .as_deref(),
+        Some("session-fingerprint")
+    );
+    assert_eq!(
+        cfg.approvals
+            .read()
+            .await
+            .get(&handle)
+            .unwrap()
+            .snapshot
+            .session_revision
+            .as_deref(),
+        Some("session-revision")
+    );
     let resp = handle_admin_request(
         &cfg,
         &operator,
@@ -1418,8 +1508,13 @@ async fn kube_proxy_hold_routes_through_approval_queue() {
     // Deny: the waiter fails closed with the operator's reason.
     let s = sink.clone();
     let waiter = tokio::spawn(async move {
-        guard::proxy::GateSink::hold_request(&*s, "delete namespaces/prod", "namespace delete")
-            .await
+        guard::proxy::GateSink::hold_request(
+            &*s,
+            "delete namespaces/prod",
+            "namespace delete",
+            None,
+        )
+        .await
     });
     let handle = wait_for_pending_hold(&cfg).await;
     let resp = handle_admin_request(
@@ -1447,8 +1542,13 @@ async fn kube_proxy_hold_routes_through_approval_queue() {
     // Disconnect: dropping the waiter mid-hold retires the pending row.
     let s = sink.clone();
     let waiter = tokio::spawn(async move {
-        guard::proxy::GateSink::hold_request(&*s, "delete namespaces/prod", "namespace delete")
-            .await
+        guard::proxy::GateSink::hold_request(
+            &*s,
+            "delete namespaces/prod",
+            "namespace delete",
+            None,
+        )
+        .await
     });
     let handle = wait_for_pending_hold(&cfg).await;
     waiter.abort();

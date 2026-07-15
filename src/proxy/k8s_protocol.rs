@@ -10,7 +10,7 @@ use serde_json::Value;
 use super::gate::HttpRevert;
 use super::k8s;
 use super::op::{ApiOp, Verb};
-use super::protocol::{CreatedIdentity, PlannedRevert, ProtocolConfig};
+use super::protocol::{CreatedIdentity, NonResourceRead, PlannedRevert, ProtocolConfig};
 
 /// Stateless: all Kubernetes awareness is in the pure functions it delegates
 /// to, so the protocol is a unit value.
@@ -24,6 +24,37 @@ impl ProtocolConfig for KubernetesProtocol {
 
     fn parse_op(&self, method: &str, path: &str, query: &str) -> Option<ApiOp> {
         k8s::parse_api_op(method, path, query)
+    }
+
+    fn classify_non_resource_read(
+        &self,
+        method: &str,
+        path: &str,
+        _query: &str,
+    ) -> Option<NonResourceRead> {
+        if !matches!(method, "GET" | "HEAD") {
+            return None;
+        }
+        let segments = path
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+        let safe_token = |value: &str| {
+            !value.is_empty()
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+        };
+        let discovery = match segments.as_slice() {
+            ["version"] | ["api"] | ["apis"] | ["openapi", "v2"] | ["openapi", "v3"] => true,
+            ["api", version] => safe_token(version),
+            ["apis", group] => safe_token(group),
+            ["apis", group, version] => safe_token(group) && safe_token(version),
+            ["openapi", "v3", "api", version] => safe_token(version),
+            ["openapi", "v3", "apis", group, version] => safe_token(group) && safe_token(version),
+            _ => false,
+        };
+        discovery.then_some(NonResourceRead::Discovery)
     }
 
     fn deny_outright(&self, op: &ApiOp) -> Option<String> {
@@ -270,6 +301,42 @@ mod tests {
 
     fn op_q(method: &str, path: &str, query: &str) -> ApiOp {
         parse_api_op(method, path, query).expect("should parse")
+    }
+
+    #[test]
+    fn only_typed_kubernetes_discovery_paths_are_non_resource_reads() {
+        let protocol = KubernetesProtocol;
+        for path in [
+            "/version",
+            "/api",
+            "/api/v1",
+            "/apis",
+            "/apis/apps",
+            "/apis/apps/v1",
+            "/openapi/v2",
+            "/openapi/v3",
+            "/openapi/v3/api/v1",
+            "/openapi/v3/apis/apps/v1",
+        ] {
+            assert_eq!(
+                protocol.classify_non_resource_read("GET", path, ""),
+                Some(NonResourceRead::Discovery),
+                "{path}"
+            );
+        }
+        for path in [
+            "/",
+            "/metrics",
+            "/healthz",
+            "/debug/pprof",
+            "/openapi/v3/../../metrics",
+        ] {
+            assert_eq!(protocol.classify_non_resource_read("GET", path, ""), None);
+        }
+        assert_eq!(
+            protocol.classify_non_resource_read("POST", "/version", ""),
+            None
+        );
     }
 
     #[test]

@@ -128,6 +128,8 @@ impl Client {
             AdminRequest::VerbShow { .. } => "verb_show",
             AdminRequest::VerbDelete { .. } => "verb_delete",
             AdminRequest::VerbCreate { .. } => "verb_create",
+            AdminRequest::VerbCoverageList => "verb_coverage_list",
+            AdminRequest::VerbCoverageClear => "verb_coverage_clear",
             AdminRequest::SavedGrantList => "saved_grant_list",
             AdminRequest::SavedGrantShow { .. } => "saved_grant_show",
             AdminRequest::SavedGrantSave { .. } => "saved_grant_save",

@@ -30,7 +30,7 @@ use tokio::process::Command;
 use tokio::sync::RwLock;
 
 use super::admin::handle_admin_request;
-use super::execute::{execute_command, execute_command_streaming};
+use super::execute::{execute_command, execute_command_streaming, record_live_session_interaction};
 #[cfg(unix)]
 use super::gate_runtime::revert_dir_is_owner_only;
 use super::gate_runtime::{gating_sweeper, is_api_proxy_sentinel, now_unix, DaemonGateSink};
@@ -43,6 +43,63 @@ use super::wire::{
 use super::{
     ServerConfig, DEFAULT_CONFIRM_WITHIN_SECS, MAX_REQUEST_BYTES, SESSION_MAINTENANCE_INTERVAL_SECS,
 };
+use crate::session::{SessionDecisionSource, SessionExecStatus, SessionInteraction};
+
+#[derive(Clone)]
+struct DaemonApiSessionSink {
+    config: ServerConfig,
+}
+
+#[async_trait::async_trait]
+impl guard::proxy::ApiSessionSink for DaemonApiSessionSink {
+    async fn resolve(&self, token: &str) -> Option<guard::proxy::ApiSessionContext> {
+        let registry = self.config.sessions.read().await;
+        if registry
+            .suspension_reason(token, &self.config.behavior_limits)
+            .is_some()
+        {
+            return None;
+        }
+        let (fingerprint, intent) = registry.api_authority_for(token)?;
+        let (revision, secret_entitlements) = registry.authority_snapshot(token)?;
+        Some(guard::proxy::ApiSessionContext {
+            fingerprint,
+            revision,
+            secret_entitlements,
+            can_override_baseline: intent.is_some(),
+            intent,
+        })
+    }
+
+    async fn record(&self, token: &str, event: guard::proxy::ApiSessionEvent) {
+        record_live_session_interaction(
+            &self.config,
+            Some(token),
+            SessionInteraction {
+                at_unix: 0,
+                command: format!("api:{} {}", event.endpoint, event.operation),
+                allowed: event.allowed,
+                source: SessionDecisionSource::ApiProxy,
+                reason: format!("API proxy returned HTTP {}", event.status),
+                risk: None,
+                exec_status: if event.held {
+                    SessionExecStatus::Held
+                } else if event.allowed {
+                    SessionExecStatus::Completed
+                } else {
+                    SessionExecStatus::NotAttempted
+                },
+                exit_code: None,
+                exposed_secret_refs: if event.allowed {
+                    vec![event.credential_ref]
+                } else {
+                    Vec::new()
+                },
+            },
+        )
+        .await;
+    }
+}
 
 #[derive(Clone)]
 pub struct Server {
@@ -145,14 +202,28 @@ impl Server {
         self.config.extra_child_env = vars;
     }
 
+    pub fn set_api_coverage(
+        &mut self,
+        store: Option<Arc<RwLock<guard::gating::api_promotion::ApiPromotionStore>>>,
+    ) {
+        self.config.api_coverage = store;
+    }
+
     /// Attach an API proxy to run alongside the gate socket. Must be
     /// called before `run`.
-    pub async fn register_api_proxy(&mut self, proxy: Arc<guard::proxy::ApiProxy>) {
+    pub async fn register_api_proxy(
+        &mut self,
+        name: impl Into<String>,
+        proxy: Arc<guard::proxy::ApiProxy>,
+    ) {
+        proxy.attach_session_sink(Arc::new(DaemonApiSessionSink {
+            config: self.config.clone(),
+        }));
         self.config
             .protocol_registry
             .write()
             .await
-            .insert(proxy.protocol_name().to_string(), proxy);
+            .insert(name.into(), proxy);
     }
 
     /// Load persisted provisional/approval state and apply startup recovery:
@@ -451,10 +522,10 @@ impl Server {
             .protocol_registry
             .read()
             .await
-            .values()
-            .cloned()
+            .iter()
+            .map(|(name, proxy)| (name.clone(), proxy.clone()))
             .collect();
-        for proxy in proxies {
+        for (endpoint, proxy) in proxies {
             // The auto-revert envelope needs the consequence sweeper, which only
             // runs under `--gate consequence`. Without it the proxy still gates
             // (allow/deny/hold/redact) but forwards recoverable writes unwrapped.
@@ -519,6 +590,7 @@ impl Server {
                 }
                 proxy.attach_gate(Arc::new(DaemonGateSink {
                     config: self.config.clone(),
+                    endpoint,
                     protocol: proxy.protocol_name().to_string(),
                     snapshot_dir,
                     snapshot_dir_safe,
@@ -547,10 +619,10 @@ impl Server {
             .iter()
             .map(tokio::task::JoinHandle::abort_handle)
             .collect::<Vec<_>>();
-        let joined = futures::future::join_all(futures);
-        tokio::pin!(joined);
-        let results = tokio::select! {
-            results = &mut joined => results,
+        let first = futures::future::select_all(futures);
+        tokio::pin!(first);
+        let (result, _, remaining) = tokio::select! {
+            result = &mut first => result,
             _ = shutdown_signal() => {
                 tracing::info!("shutdown requested; stopping listeners and brokered children");
                 for handle in abort_handles {
@@ -561,30 +633,23 @@ impl Server {
             }
         };
 
-        // A listener loop only returns on a fatal error (e.g. it could not bind);
-        // surface it as an error return rather than exiting silently. This makes
-        // the process exit non-zero, so the Windows service reports a failure and
-        // the SCM restart action engages instead of the daemon sitting STOPPED
-        // after a bind failure while having briefly reported RUNNING.
-        let mut listener_error: Option<anyhow::Error> = None;
-        for result in results {
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    tracing::error!("listener exited with error: {:#}", e);
-                    listener_error.get_or_insert(e);
-                }
-                Err(e) => {
-                    tracing::error!("listener task panicked: {}", e);
-                    listener_error
-                        .get_or_insert_with(|| anyhow::anyhow!("listener task panicked: {}", e));
-                }
-            }
+        // A listener loop only returns on a fatal error. Wait for the first one,
+        // abort the other infinite loops, and return the failure immediately so
+        // one bad named endpoint cannot hide behind healthy listeners forever.
+        for task in remaining {
+            task.abort();
         }
-
-        match listener_error {
-            Some(e) => Err(e),
-            None => Ok(()),
+        self.config.process_tracker.terminate_all();
+        match result {
+            Ok(Ok(())) => anyhow::bail!("listener exited unexpectedly"),
+            Ok(Err(error)) => {
+                tracing::error!("listener exited with error: {error:#}");
+                Err(error)
+            }
+            Err(error) => {
+                tracing::error!("listener task panicked: {error}");
+                Err(anyhow::anyhow!("listener task panicked: {error}"))
+            }
         }
     }
 

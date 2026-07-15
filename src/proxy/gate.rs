@@ -32,6 +32,18 @@ pub struct ApiMutation {
     /// The HTTP request that undoes the mutation, executed through the
     /// protocol's upstream with the daemon's credential.
     pub revert: HttpRevert,
+    /// Session authority that allowed the mutation, represented only by its
+    /// audit fingerprint.
+    pub session_fingerprint: Option<String>,
+    /// Issued-session authority captured immediately before the upstream
+    /// mutation. Reverts retain the immutable revision and secret selectors so
+    /// they remain constrained to the authority that admitted the write.
+    pub session_revision: Option<String>,
+    pub secret_entitlements: Option<Vec<String>>,
+    /// Canonical upstream target and a secret-free identity fingerprint. A
+    /// persisted revert only runs through the exact same endpoint identity.
+    pub upstream_target: String,
+    pub upstream_identity: String,
 }
 
 /// Operator decision on a held API request.
@@ -80,7 +92,12 @@ pub trait GateSink: Send + Sync {
     /// reviews it (`guard approvals` / `guard approve` / `guard deny`); only an
     /// explicit approval releases it, and an unattended hold expires to a
     /// denial. Default: fail closed, for sinks with no approval queue.
-    async fn hold_request(&self, _label: &str, _reason: &str) -> HoldDecision {
+    async fn hold_request(
+        &self,
+        _label: &str,
+        _reason: &str,
+        _session_context: Option<&ApiSessionContext>,
+    ) -> HoldDecision {
         HoldDecision::Denied {
             reason: "no operator-approval queue is attached to this proxy".to_string(),
         }
@@ -135,6 +152,10 @@ pub struct ApiRequestSummary {
     pub redacted_body_shape: String,
     pub revert_constructible: RevertConstructible,
     pub rarity: bool,
+    pub endpoint: String,
+    pub session_fingerprint: Option<String>,
+    pub session_intent: Option<String>,
+    pub credential_ref: String,
 }
 
 impl ApiRequestSummary {
@@ -158,7 +179,8 @@ impl ApiRequestSummary {
                 "dry_run: {}\n",
                 "body_shape: {}\n",
                 "revert_constructible: {}\n",
-                "rarity: {}"
+                "rarity: {}",
+                "\nendpoint: {}\nsession: {}\nsession_intent: {}\ncredential_ref: {}"
             ),
             self.protocol,
             self.verb,
@@ -181,9 +203,42 @@ impl ApiRequestSummary {
             self.dry_run,
             self.redacted_body_shape,
             self.revert_constructible.as_str(),
-            self.rarity
+            self.rarity,
+            self.endpoint,
+            self.session_fingerprint.as_deref().unwrap_or("(none)"),
+            self.session_intent.as_deref().unwrap_or("(none)"),
+            self.credential_ref,
         )
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiSessionContext {
+    pub fingerprint: String,
+    /// Complete effective revision of the issued authority. This changes for
+    /// every scope edit, not only prompt or expiry changes.
+    pub revision: String,
+    /// Saved-grant secret selectors. `None` means an unrestricted legacy or
+    /// ad-hoc session, while `Some([])` entitles no upstream credential.
+    pub secret_entitlements: Option<Vec<String>>,
+    pub intent: Option<String>,
+    pub can_override_baseline: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApiSessionEvent {
+    pub endpoint: String,
+    pub operation: String,
+    pub allowed: bool,
+    pub status: u16,
+    pub held: bool,
+    pub credential_ref: String,
+}
+
+#[async_trait]
+pub trait ApiSessionSink: Send + Sync {
+    async fn resolve(&self, token: &str) -> Option<ApiSessionContext>;
+    async fn record(&self, token: &str, event: ApiSessionEvent);
 }
 
 /// API evaluator verdict. An allow is still routed through `decide_gate`; it is

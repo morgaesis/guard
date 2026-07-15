@@ -770,6 +770,80 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                 }
             }
         }
+        VerbCommands::Coverage { command } => match command {
+            VerbCoverageCommands::List { socket, json } => {
+                let (client, source) = gate_client(socket);
+                match client
+                    .send_admin(server::AdminRequest::VerbCoverageList)
+                    .await
+                    .map_err(|e| describe_connect_failure(e, &client, source))?
+                {
+                    server::AdminResponse::VerbCoverage { items } => {
+                        if json {
+                            return print_json(&serde_json::json!({
+                                "schema_version": JSON_SCHEMA_VERSION,
+                                "type": "verb_coverage_list",
+                                "items": items,
+                            }));
+                        }
+                        if items.is_empty() {
+                            println!("(no generated API verb coverage)");
+                        }
+                        for item in items {
+                            let session = item
+                                .session_fingerprint
+                                .as_deref()
+                                .map(|value| value.chars().take(12).collect::<String>())
+                                .unwrap_or_else(|| "global".to_string());
+                            let regime = item.regime.chars().take(12).collect::<String>();
+                            println!(
+                                "endpoint={} session={} {} {} {}/{} namespace={} decision={} provenance={:?} regime={} active={} expires={}",
+                                item.endpoint,
+                                session,
+                                item.protocol,
+                                item.verb,
+                                if item.group.is_empty() { "core" } else { &item.group },
+                                item.resource,
+                                item.namespace.as_deref().unwrap_or("cluster"),
+                                item.decision,
+                                item.provenance,
+                                regime,
+                                item.active,
+                                item.expires_at_unix
+                                    .map(|value| value.to_string())
+                                    .unwrap_or_else(|| "never".to_string())
+                            );
+                        }
+                        Ok(())
+                    }
+                    server::AdminResponse::Error { message } => anyhow::bail!(message),
+                    _ => anyhow::bail!("unexpected response"),
+                }
+            }
+            VerbCoverageCommands::Clear { socket, json } => {
+                let (client, source) = gate_client(socket);
+                match client
+                    .send_admin(server::AdminRequest::VerbCoverageClear)
+                    .await
+                    .map_err(|e| describe_connect_failure(e, &client, source))?
+                {
+                    server::AdminResponse::VerbCoverageCleared { removed } => {
+                        if json {
+                            print_json(&serde_json::json!({
+                                "schema_version": JSON_SCHEMA_VERSION,
+                                "type": "verb_coverage_clear",
+                                "removed": removed,
+                            }))
+                        } else {
+                            println!("Cleared {removed} generated API coverage bucket(s).");
+                            Ok(())
+                        }
+                    }
+                    server::AdminResponse::Error { message } => anyhow::bail!(message),
+                    _ => anyhow::bail!("unexpected response"),
+                }
+            }
+        },
     }
 }
 
@@ -2328,6 +2402,8 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
         | server::AdminResponse::ApprovalShow { .. }
         | server::AdminResponse::Verbs { .. }
         | server::AdminResponse::VerbCreated { .. }
+        | server::AdminResponse::VerbCoverage { .. }
+        | server::AdminResponse::VerbCoverageCleared { .. }
         | server::AdminResponse::SavedGrants { .. }
         | server::AdminResponse::SavedGrant { .. }
         | server::AdminResponse::SavedGrantRegenerated { .. }

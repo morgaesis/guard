@@ -89,7 +89,7 @@ mod wire;
 // The named public surface of the server module: the daemon entrypoint
 // (`Server`, `resolve_daemon_principal`) and the wire types shared with the
 // CLI, the MCP server, and `daemon_client`. Everything else stays internal.
-pub(crate) use api_judge::DaemonApiJudge;
+pub(crate) use api_judge::{ApiJudgeSpend, ApiJudgeSpendConfig, DaemonApiJudge};
 #[cfg(windows)]
 pub(crate) use transport::winplat;
 pub use transport::Server;
@@ -186,6 +186,9 @@ struct ServerConfig {
     /// credentials only the daemon holds.
     pub protocol_registry:
         Arc<RwLock<std::collections::HashMap<String, Arc<guard::proxy::ApiProxy>>>>,
+    /// Evaluator-generated API verb coverage shared by all API judges and the
+    /// operator inspection RPCs.
+    pub api_coverage: Option<Arc<RwLock<guard::gating::api_promotion::ApiPromotionStore>>>,
     /// Active filesystem read grants (Unix-only). Time-boxed POSIX ACL read
     /// grants issued by the automatic retry path; the sweeper revokes them at
     /// expiry and startup reconciliation revokes any that expired while the
@@ -265,6 +268,7 @@ impl ServerConfig {
             // this from --child-env / GUARD_CHILD_ENV.
             extra_child_env: Vec::new(),
             protocol_registry: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            api_coverage: None,
             read_grants: Arc::new(RwLock::new(GrantReadRegistry::new())),
             secret_file_root: None,
             notify_hook: None,

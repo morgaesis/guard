@@ -1301,6 +1301,7 @@ fn encode_decision_source(source: SessionDecisionSource) -> &'static str {
         SessionDecisionSource::LearnedDeny => "learned_deny",
         SessionDecisionSource::Validation => "validation",
         SessionDecisionSource::EvaluatorError => "evaluator_error",
+        SessionDecisionSource::ApiProxy => "api_proxy",
     }
 }
 
@@ -1315,6 +1316,7 @@ fn decode_decision_source(value: &str) -> rusqlite::Result<SessionDecisionSource
         "learned_deny" => Ok(SessionDecisionSource::LearnedDeny),
         "validation" => Ok(SessionDecisionSource::Validation),
         "evaluator_error" => Ok(SessionDecisionSource::EvaluatorError),
+        "api_proxy" => Ok(SessionDecisionSource::ApiProxy),
         other => Err(rusqlite::Error::FromSqlConversionFailure(
             other.len(),
             rusqlite::types::Type::Text,
@@ -1353,6 +1355,16 @@ fn decode_exec_status(value: &str) -> rusqlite::Result<SessionExecStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_proxy_decision_source_round_trips() {
+        let encoded = encode_decision_source(SessionDecisionSource::ApiProxy);
+        assert_eq!(encoded, "api_proxy");
+        assert_eq!(
+            decode_decision_source(encoded).unwrap(),
+            SessionDecisionSource::ApiProxy
+        );
+    }
 
     #[tokio::test]
     async fn saved_grants_and_requests_round_trip() {

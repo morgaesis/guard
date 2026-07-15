@@ -9,8 +9,9 @@
 //! operator-authored [`policy`], redact Secret values from responses, and
 //! re-originate the request to the real apiserver with the real credentials the
 //! daemon holds. The agent's brokered kubeconfig (see [`kubeconfig`]) carries no
-//! credential and points only at the proxy, so the proxy is the sole path to the
-//! cluster.
+//! upstream credential and may carry a Guard session bearer that the proxy
+//! consumes without forwarding. It points only at the proxy, so the proxy is
+//! the sole path to the cluster.
 //!
 //! The modules here are pure and unit-tested: the protocol-neutral operation
 //! vocabulary ([`op`]), request parsing/classification ([`k8s`]), the operator
@@ -35,16 +36,19 @@ pub mod upstream;
 pub mod vercel_protocol;
 
 pub use gate::{
-    ApiJudge, ApiJudgeVerdict, ApiMutation, ApiRequestSummary, GateSink, HoldDecision, HttpRevert,
-    RevertConstructible,
+    ApiJudge, ApiJudgeVerdict, ApiMutation, ApiRequestSummary, ApiSessionContext, ApiSessionEvent,
+    ApiSessionSink, GateSink, HoldDecision, HttpRevert, RevertConstructible,
 };
 pub use github_protocol::GithubProtocol;
 pub use k8s_protocol::KubernetesProtocol;
-pub use kubeconfig::{brokered_kubeconfig, validate_brokered_kubeconfig, BrokerError};
+pub use kubeconfig::{
+    brokered_kubeconfig, brokered_kubeconfig_with_session, valid_guard_session_token,
+    validate_brokered_kubeconfig, validate_brokered_kubeconfig_with_session, BrokerError,
+};
 pub use op::{ApiOp, Verb};
 pub use policy::{ApiAction, ApiPolicy, ApiRule};
-pub use protocol::{CreatedIdentity, PlannedRevert, ProtocolConfig};
-pub use server::ApiProxy;
+pub use protocol::{CreatedIdentity, NonResourceRead, PlannedRevert, ProtocolConfig};
+pub use server::{ApiListenerMode, ApiProxy};
 pub use tls::ProxyTls;
 pub use upstream::{Upstream, UpstreamAuth};
 pub use vercel_protocol::VercelProtocol;
