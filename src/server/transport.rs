@@ -780,18 +780,31 @@ impl Server {
 
         if let Some(group) = socket_group {
             if let Err(error) = Self::chown_to_group(socket_path, group).await {
-                let _ = Self::chmod_path(socket_path, 0o600).await;
-                return Err(error);
+                return Err(Self::fail_closed_socket(socket_path, error).await);
             }
             if let Err(error) = Self::chmod_path(socket_path, 0o660).await {
-                let _ = Self::chmod_path(socket_path, 0o600).await;
-                return Err(error);
+                return Err(Self::fail_closed_socket(socket_path, error).await);
             }
             if let Some(parent) = socket_path.parent() {
                 Self::chmod_path(parent, 0o755).await?;
             }
         }
         Ok(listener)
+    }
+
+    #[cfg(unix)]
+    async fn fail_closed_socket(socket_path: &Path, setup_error: anyhow::Error) -> anyhow::Error {
+        match Self::chmod_path(socket_path, 0o600).await {
+            Ok(()) => setup_error,
+            Err(permission_error) => match tokio::fs::remove_file(socket_path).await {
+                Ok(()) => setup_error.context(format!(
+                    "failed to restore owner-only socket permissions; the socket was removed: {permission_error}"
+                )),
+                Err(removal_error) => setup_error.context(format!(
+                    "failed to restore owner-only socket permissions ({permission_error}) and failed to remove the socket ({removal_error})"
+                )),
+            },
+        }
     }
 
     async fn run_tcp_static(port: u16, config: &ServerConfig) -> Result<()> {
