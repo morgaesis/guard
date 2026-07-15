@@ -264,6 +264,9 @@ fn exit_for_execute_response(response: &server::ExecuteResponse) -> ! {
     if !response.allowed {
         std::process::exit(EXIT_GUARD_DENIED);
     }
+    // Executed child codes are intentionally propagated without translation.
+    // In particular, child 1 and 75 must remain distinct from Guard's
+    // operational, denial, and hold codes in the reserved 125..=127 range.
     std::process::exit(response.exit_code.unwrap_or(0));
 }
 

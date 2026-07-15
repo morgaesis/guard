@@ -798,8 +798,9 @@ diagnostics go to stderr. Every envelope carries `schema_version: 1`.
 Exit codes for scripted callers are stable. An executed command propagates the
 child process's exit code, including `1` and `75`. Guard uses `125` for its own
 operational errors, `126` for policy denial, and `127` for a command held for
-operator approval. The structured response retains the exact child status and
-the hold or provisional handle.
+operator approval. Invalid CLI usage follows the conventional exit code `2`.
+The structured response retains the exact child status and the hold or
+provisional handle.
 
 ### MCP server
 
