@@ -365,8 +365,10 @@ impl Upstream {
     /// Produce a bounded, credential-safe diagnostic excerpt for persisted
     /// revert errors and audit messages.
     pub fn redact_error_excerpt(&self, bytes: &[u8], max_chars: usize) -> String {
-        let mut text = String::from_utf8_lossy(bytes).to_string();
-        for secret in self.response_secret_values() {
+        let secrets = self.response_secret_values();
+        let mut text =
+            String::from_utf8_lossy(trim_trailing_secret_prefix(bytes, &secrets)).to_string();
+        for secret in secrets {
             if !secret.is_empty() {
                 text = text.replace(&*String::from_utf8_lossy(&secret), "[REDACTED]");
             }
@@ -378,6 +380,20 @@ impl Upstream {
         }
         excerpt
     }
+}
+
+fn trim_trailing_secret_prefix<'a>(bytes: &'a [u8], secrets: &[Vec<u8>]) -> &'a [u8] {
+    let mut safe_end = bytes.len();
+    for secret in secrets {
+        let max_prefix = secret.len().saturating_sub(1).min(bytes.len());
+        for prefix_len in (1..=max_prefix).rev() {
+            if bytes.ends_with(&secret[..prefix_len]) {
+                safe_end = safe_end.min(bytes.len() - prefix_len);
+                break;
+            }
+        }
+    }
+    &bytes[..safe_end]
 }
 
 fn fingerprint_identity(base: &str, auth: (&str, &[u8])) -> String {
@@ -472,6 +488,24 @@ users:
         assert!(!excerpt.contains("operator-secret-token"));
         assert!(excerpt.contains("[REDACTED]"));
         assert!(excerpt.chars().count() <= 81);
+    }
+
+    #[test]
+    fn revert_error_excerpt_drops_a_credential_prefix_at_the_read_boundary() {
+        let upstream = Upstream::from_base_url(
+            "https://api.example.test",
+            UpstreamAuth::Bearer("operator-secret-token".to_string()),
+        )
+        .unwrap();
+        let mut body = vec![b'x'; 4096 - "operator-secr".len()];
+        body.extend_from_slice(b"operator-secr");
+
+        let secrets = upstream.response_secret_values();
+        let trimmed = trim_trailing_secret_prefix(&body, &secrets);
+        let excerpt = upstream.redact_error_excerpt(&body, 5000);
+
+        assert_eq!(trimmed.len(), 4096 - "operator-secr".len());
+        assert!(!excerpt.contains("operator-secr"));
     }
 
     #[test]

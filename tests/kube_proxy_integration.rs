@@ -988,6 +988,153 @@ async fn hot_reloaded_explicit_deny_is_rechecked_after_evaluator_delay() {
     );
 }
 
+async fn spawn_blocking_snapshot_mock(
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    writes: Arc<AtomicUsize>,
+) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let started = started.clone();
+            let release = release.clone();
+            let writes = writes.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |req: Request<Incoming>| {
+                    let started = started.clone();
+                    let release = release.clone();
+                    let writes = writes.clone();
+                    async move {
+                        if req.method() == hyper::Method::GET {
+                            started.notify_one();
+                            release.notified().await;
+                        } else {
+                            writes.fetch_add(1, Ordering::SeqCst);
+                        }
+                        write_mock_handler(req).await
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_allow_revalidates_session_after_delayed_snapshot() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let writes = Arc::new(AtomicUsize::new(0));
+    let mock_base =
+        spawn_blocking_snapshot_mock(started.clone(), release.clone(), writes.clone()).await;
+    let upstream =
+        Upstream::from_kubeconfig_str(&kubeconfig_for(&mock_base), None).expect("upstream");
+    let tls = ProxyTls::generate().expect("tls");
+    let ca_pem = tls.ca_pem().to_string();
+    let policy = ApiPolicy::from_yaml(
+        "default: deny\nrules:\n  - verbs: [patch]\n    resources: [deployments]\n    namespaces: [dev]\n    action: allow\n",
+    )
+    .unwrap();
+    let port = free_port();
+    let proxy = Arc::new(ApiProxy::new(
+        format!("127.0.0.1:{port}").parse().unwrap(),
+        tls,
+        upstream,
+        policy,
+        None,
+    ));
+    proxy.attach_gate(Arc::new(RecordingSink::default()));
+    let remaining = Arc::new(AtomicUsize::new(2));
+    proxy.attach_session_sink(Arc::new(BudgetSessionSink {
+        remaining_resolutions: remaining.clone(),
+    }));
+    tokio::spawn(proxy.serve());
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    let request = tokio::spawn(async move {
+        client
+            .patch(format!(
+                "https://127.0.0.1:{port}/apis/apps/v1/namespaces/dev/deployments/api"
+            ))
+            .bearer_auth("budget-session")
+            .body("{}")
+            .send()
+            .await
+            .unwrap()
+    });
+    started.notified().await;
+    remaining.store(0, Ordering::SeqCst);
+    release.notify_one();
+
+    assert_eq!(request.await.unwrap().status(), 403);
+    assert_eq!(writes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_allow_rechecks_hot_policy_after_delayed_snapshot() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let writes = Arc::new(AtomicUsize::new(0));
+    let mock_base =
+        spawn_blocking_snapshot_mock(started.clone(), release.clone(), writes.clone()).await;
+    let upstream =
+        Upstream::from_kubeconfig_str(&kubeconfig_for(&mock_base), None).expect("upstream");
+    let tls = ProxyTls::generate().expect("tls");
+    let ca_pem = tls.ca_pem().to_string();
+    let temp = tempfile::tempdir().unwrap();
+    let policy_path = temp.path().join("api-policy.yaml");
+    std::fs::write(
+        &policy_path,
+        "default: deny\nrules:\n  - verbs: [patch]\n    resources: [deployments]\n    namespaces: [dev]\n    action: allow\n",
+    )
+    .unwrap();
+    let policy = ApiPolicy::load_file(&policy_path).unwrap();
+    let port = free_port();
+    let proxy = Arc::new(ApiProxy::new(
+        format!("127.0.0.1:{port}").parse().unwrap(),
+        tls,
+        upstream,
+        policy,
+        Some(policy_path.clone()),
+    ));
+    proxy.attach_gate(Arc::new(RecordingSink::default()));
+    tokio::spawn(proxy.serve());
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    let request = tokio::spawn(async move {
+        client
+            .patch(format!(
+                "https://127.0.0.1:{port}/apis/apps/v1/namespaces/dev/deployments/api"
+            ))
+            .body("{}")
+            .send()
+            .await
+            .unwrap()
+    });
+    started.notified().await;
+    std::fs::write(
+        &policy_path,
+        "default: deny\nrules:\n  - verbs: [patch]\n    resources: [deployments]\n    namespaces: [dev]\n    action: deny\n",
+    )
+    .unwrap();
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    release.notify_one();
+
+    assert_eq!(request.await.unwrap().status(), 403);
+    assert_eq!(writes.load(Ordering::SeqCst), 0);
+}
+
 /// A `SelfSubjectAccessReview` (`kubectl auth can-i`) is forwarded with the same
 /// single upstream credential the proxy injects on every request, so the
 /// self-check reflects the identity that actually performs writes rather than a

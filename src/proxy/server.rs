@@ -1270,9 +1270,24 @@ impl ApiProxy {
         redact: bool,
         op: Option<ApiOp>,
         conn_id: u64,
-        prepared_snapshot: Option<Option<Vec<u8>>>,
+        mut prepared_snapshot: Option<Option<Vec<u8>>>,
         created_cleanup: Option<CreatedMatch>,
     ) -> Response<ProxyBody> {
+        // Snapshot reads can block on the upstream. Acquire any snapshot before
+        // the common final authority checks so a session edit, expiry, or policy
+        // reload during that read is observed immediately before mutation.
+        let track_write = created_cleanup.is_none()
+            && op
+                .as_ref()
+                .is_some_and(|op| self.gate.get().is_some() && self.protocol.tracks_write(op));
+        if prepared_snapshot.is_none()
+            && track_write
+            && self
+                .protocol
+                .wants_prior_snapshot(op.as_ref().expect("tracked write has operation"))
+        {
+            prepared_snapshot = Some(self.fetch_prior_object(path).await);
+        }
         let session_fingerprint = match self.revalidate_session(&parts).await {
             Ok(fingerprint) => fingerprint,
             Err(response) => return response,
@@ -1326,20 +1341,14 @@ impl ApiProxy {
         session_fingerprint: Option<String>,
         created_cleanup: Option<CreatedMatch>,
     ) -> Result<Response<ProxyBody>> {
-        // A recoverable write we will wrap in an auto-revert envelope: fetch
-        // the prior object first (when the protocol wants a restore-style
-        // revert), then forward, then arm.
+        // A recoverable write is wrapped in an auto-revert envelope after the
+        // upstream succeeds. Snapshot acquisition occurs in the caller before
+        // its final authority checks.
         let track_write = created_cleanup.is_none()
             && op
                 .as_ref()
                 .is_some_and(|o| self.gate.get().is_some() && self.protocol.tracks_write(o));
-        let snapshot = if let Some(snapshot) = prepared_snapshot {
-            snapshot
-        } else if track_write && self.protocol.wants_prior_snapshot(op.as_ref().unwrap()) {
-            self.fetch_prior_object(path).await
-        } else {
-            None
-        };
+        let snapshot = prepared_snapshot.flatten();
 
         let url = if query.is_empty() {
             format!("{}{}", self.upstream.base(), path)
@@ -1387,10 +1396,7 @@ impl ApiProxy {
         let upstream_headers = upstream_resp.headers().clone();
         let response_secrets = self.upstream.response_secret_values();
 
-        if upstream_headers
-            .get(header::CONTENT_ENCODING)
-            .is_some_and(|value| value.as_bytes() != b"identity")
-        {
+        if has_unsupported_content_encoding(&upstream_headers) {
             return Ok(self.status_resp(
                 StatusCode::BAD_GATEWAY,
                 "guard api-proxy: refusing an encoded upstream response that cannot be credential-redacted",
@@ -2002,6 +2008,19 @@ fn is_json(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
+fn has_unsupported_content_encoding(headers: &HeaderMap) -> bool {
+    let mut saw_header = false;
+    let mut codings = Vec::new();
+    for value in headers.get_all(header::CONTENT_ENCODING) {
+        saw_header = true;
+        let Ok(value) = value.to_str() else {
+            return true;
+        };
+        codings.extend(value.split(',').map(str::trim));
+    }
+    saw_header && (codings.len() != 1 || !codings[0].eq_ignore_ascii_case("identity"))
+}
+
 /// Depth past which the body shape collapses to a token, bounding prompt size
 /// and recursion depth regardless of how deeply the body nests.
 const MAX_SHAPE_DEPTH: usize = 8;
@@ -2479,6 +2498,34 @@ mod tests {
         assert!(!is_sensitive_response_header(
             &"content-type".parse().unwrap()
         ));
+    }
+
+    #[test]
+    fn response_encoding_requires_one_exact_identity_coding() {
+        let mut headers = HeaderMap::new();
+        assert!(!has_unsupported_content_encoding(&headers));
+        headers.insert(
+            header::CONTENT_ENCODING,
+            HeaderValue::from_static("identity"),
+        );
+        assert!(!has_unsupported_content_encoding(&headers));
+
+        for value in ["gzip", "identity, gzip", "identity, identity", ""] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::CONTENT_ENCODING,
+                HeaderValue::from_str(value).unwrap(),
+            );
+            assert!(has_unsupported_content_encoding(&headers), "{value:?}");
+        }
+
+        let mut duplicate = HeaderMap::new();
+        duplicate.append(
+            header::CONTENT_ENCODING,
+            HeaderValue::from_static("identity"),
+        );
+        duplicate.append(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        assert!(has_unsupported_content_encoding(&duplicate));
     }
 
     #[test]
