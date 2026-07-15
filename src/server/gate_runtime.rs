@@ -6,7 +6,6 @@ use guard::gating::approval::{Approval, ApprovalSnapshot, ApprovalStatus};
 use guard::gating::provisional::{ApiRevertPlan, Provisional, ProvisionalStatus};
 use guard::gating::{decide_gate, Coverage, GateOutcome, Reversibility};
 use guard::principal::PrincipalKey;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::io::AsyncWrite;
 
@@ -367,6 +366,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
             binary: API_PROXY_SENTINEL_BINARY.to_string(),
             args: vec![mutation.label.clone()],
             cwd: None,
+            secret_keys: std::collections::BTreeMap::new(),
             // An API revert is executed from `api_revert`, not the command-shaped
             // revert_binary/revert_args of a shell provisional.
             revert_binary: String::new(),
@@ -759,6 +759,18 @@ pub(super) async fn arm_containment<W: AsyncWrite + Unpin>(
         );
     }
 
+    // A provisional persists across restarts, but plain `--env` values have no
+    // stable store reference to re-resolve. Any such value could be a secret
+    // regardless of its name or shape, so fail closed before persistence or
+    // forward execution and require the reference-based `--secret` path.
+    if !request.env.is_empty() {
+        return ExecuteResult::exec_failed(
+            reason,
+            "command was not run: containment cannot persist plain --env values; store them in the daemon secret backend and pass them with --secret"
+                .to_string(),
+        );
+    }
+
     // The rollback was assessed by the gate router before this point (free-form
     // reverts are policy- and sensibility-checked; a verb revert is the
     // operator-authored slow clock), so the envelope is armed here directly.
@@ -781,6 +793,11 @@ pub(super) async fn arm_containment<W: AsyncWrite + Unpin>(
         binary: request.binary.clone(),
         args: request.args.clone(),
         cwd: request.cwd.clone(),
+        secret_keys: request
+            .secrets
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
         revert_binary: revert.binary.clone(),
         revert_args: revert.args.clone(),
         api_revert: None,
@@ -1326,8 +1343,12 @@ async fn run_provisional_revert(config: &ServerConfig, p: &Provisional) -> Execu
         args: p.revert_args.clone(),
         cwd: p.cwd.clone(),
         auth_token: None,
-        env: HashMap::new(),
-        secrets: HashMap::new(),
+        env: std::collections::HashMap::new(),
+        secrets: p
+            .secret_keys
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
         stream: false,
         session_token: None,
         revert: None,
@@ -1417,6 +1438,34 @@ enum RevertError {
     Failed(String),
 }
 
+async fn defer_revert(
+    config: &ServerConfig,
+    p: &Provisional,
+    caller: &CallerIdentity,
+    kind: &str,
+    detail: String,
+) -> (String, Option<i32>) {
+    let updated = {
+        let mut reg = config.provisional.write().await;
+        reg.set_needs_operator_decision(&p.handle, detail.clone());
+        reg.get(&p.handle).cloned()
+    };
+    if let Some(u) = &updated {
+        persist_provisional(config, u).await;
+    }
+    tracing::error!(target: "guard::audit",
+        "[AUDIT] REVERT_DEFERRED handle={} caller={} kind={} reason={}",
+        p.handle,
+        caller,
+        kind,
+        detail
+    );
+    (
+        format!("provisional {} revert deferred: {}", p.handle, detail),
+        None,
+    )
+}
+
 /// Run a claimed (`Reverting`) provisional's revert and record the outcome.
 /// Returns `(message, exit_code)`.
 pub(super) async fn finish_revert(
@@ -1439,25 +1488,7 @@ pub(super) async fn finish_revert(
             // operator instead of terminal-failing, so a restart or flag change
             // does not silently strand a live mutation.
             Ok(Err(RevertError::Retryable(detail))) => {
-                let updated = {
-                    let mut reg = config.provisional.write().await;
-                    reg.set_needs_operator_decision(&p.handle, detail.clone());
-                    reg.get(&p.handle).cloned()
-                };
-                if let Some(u) = &updated {
-                    persist_provisional(config, u).await;
-                }
-                tracing::error!(target: "guard::audit",
-                    "[AUDIT] REVERT_DEFERRED handle={} caller={} kind={} reason={}",
-                    p.handle,
-                    caller,
-                    kind,
-                    detail
-                );
-                return (
-                    format!("provisional {} revert deferred: {}", p.handle, detail),
-                    None,
-                );
+                return defer_revert(config, p, caller, kind, detail).await;
             }
             Ok(Err(RevertError::Failed(reason))) => (false, None, Some(reason)),
             Err(_) => (
@@ -1480,6 +1511,20 @@ pub(super) async fn finish_revert(
                 ExecOutcome::Completed { exit_code, .. } => {
                     let ok = exit_code.unwrap_or(-1) == 0;
                     (ok, *exit_code, None)
+                }
+                ExecOutcome::Failed {
+                    started: false,
+                    reason,
+                    ..
+                } if !p.secret_keys.is_empty() => {
+                    return defer_revert(
+                        config,
+                        p,
+                        caller,
+                        kind,
+                        format!("revert secret resolution or pre-spawn setup failed: {reason}"),
+                    )
+                    .await;
                 }
                 ExecOutcome::Failed { reason, .. } => (false, None, Some(reason.clone())),
                 _ => (false, None, Some("unexpected revert outcome".to_string())),

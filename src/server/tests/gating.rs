@@ -11,6 +11,8 @@ use crate::server::wire::{
     RevertSpec,
 };
 use crate::server::{ServerConfig, APPROVAL_TTL_SECS};
+#[cfg(unix)]
+use crate::session_store::SessionStore;
 use guard::gating::approval::{Approval, ApprovalSnapshot, ApprovalStatus};
 #[cfg(unix)]
 use guard::gating::provisional::{ApiRevertPlan, Provisional, ProvisionalStatus};
@@ -375,6 +377,207 @@ async fn contain_then_deadline_triggers_sweeper_autorevert() {
     );
 }
 
+/// A persisted provisional keeps only the secret reference. After a simulated
+/// daemon restart, the operator-initiated revert resolves that reference from
+/// the new daemon's live secret manager. A temporarily missing secret defers
+/// the revert for an operator retry instead of burning the rollback.
+#[cfg(unix)]
+#[tokio::test]
+async fn provisional_revert_reresolves_secret_after_restart() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = SessionStore::open(tmp.path().join("state.db"), 24 * 60 * 60)
+        .await
+        .expect("open store");
+    let output = tmp.path().join("revert-output");
+    let agent_uid = 41_111;
+    let agent_principal = PrincipalKey::from_uid(agent_uid);
+    let secret_key = format!("REVERT_PARITY_{}", std::process::id());
+    let initial_value = "forward-only-value";
+    let restart_value = "resolved-after-restart";
+
+    let (mut cfg, _operator, agent) = gating_config(7_016, agent_uid);
+    cfg.session_store = Some(store.clone());
+    cfg.secrets
+        .set(&agent_principal, &secret_key, initial_value)
+        .await
+        .expect("seed forward secret");
+
+    let mut request = contain_request(
+        "true",
+        &[],
+        RevertSpec {
+            binary: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "printf '%s' \"$REVERT_TOKEN\" > \"$1\"".to_string(),
+                "sh".to_string(),
+                output.display().to_string(),
+            ],
+        },
+    );
+    request
+        .secrets
+        .insert("REVERT_TOKEN".to_string(), secret_key.clone());
+
+    let mut sink = tokio::io::sink();
+    let result = arm_containment(
+        request,
+        &cfg,
+        &agent,
+        Some(agent_principal.clone()),
+        "recoverable change".to_string(),
+        0,
+        false,
+        &mut sink,
+    )
+    .await;
+    let handle = match result.exec {
+        ExecOutcome::Provisional { handle, .. } => handle,
+        other => panic!("expected Provisional, got {other:?}"),
+    };
+
+    let persisted = store
+        .load_provisionals()
+        .await
+        .expect("load persisted provisional");
+    assert_eq!(persisted.len(), 1);
+    assert_eq!(
+        persisted[0].secret_keys.get("REVERT_TOKEN"),
+        Some(&secret_key)
+    );
+    let persisted_json = serde_json::to_string(&persisted[0]).expect("serialize persisted row");
+    assert!(!persisted_json.contains(initial_value));
+    assert!(!persisted_json.contains(restart_value));
+
+    cfg.secrets
+        .delete(&agent_principal, &secret_key)
+        .await
+        .expect("remove secret before restart");
+
+    // Simulate a restart with a fresh config and secret-manager cache. Startup
+    // recovery requires an explicit operator revert, which is what
+    // begin_revert models here.
+    let (mut restarted, _operator, _agent) = gating_config(7_016, agent_uid);
+    restarted.session_store = Some(store.clone());
+    let (registry, moved) = guard::gating::provisional::ProvisionalRegistry::from_rows(persisted);
+    assert_eq!(moved, vec![handle.clone()]);
+    *restarted.provisional.write().await = registry;
+
+    let missing_claim = restarted
+        .provisional
+        .write()
+        .await
+        .begin_revert(&handle)
+        .expect("claim recovered provisional");
+    let (message, exit) = finish_revert(
+        &restarted,
+        &missing_claim,
+        &CallerIdentity::Unknown,
+        "operator",
+    )
+    .await;
+    assert_eq!(exit, None);
+    assert!(message.contains("deferred"), "got: {message}");
+    assert_eq!(
+        restarted
+            .provisional
+            .read()
+            .await
+            .get(&handle)
+            .expect("deferred provisional")
+            .status,
+        ProvisionalStatus::NeedsOperatorDecision
+    );
+    assert!(!output.exists());
+
+    restarted
+        .secrets
+        .set(&agent_principal, &secret_key, restart_value)
+        .await
+        .expect("restore live secret after deferred revert");
+    let retry = restarted
+        .provisional
+        .write()
+        .await
+        .begin_revert(&handle)
+        .expect("retry deferred provisional");
+    let (_message, exit) =
+        finish_revert(&restarted, &retry, &CallerIdentity::Unknown, "operator").await;
+    assert_eq!(exit, Some(0));
+    assert_eq!(
+        std::fs::read_to_string(&output).expect("read revert output"),
+        "resolved-after-restart"
+    );
+
+    restarted
+        .secrets
+        .delete(&agent_principal, &secret_key)
+        .await
+        .expect("clean test secret");
+}
+
+/// Plain env values have no live-store reference to resolve at revert time and
+/// cannot be proven non-secret, so containment refuses all of them before
+/// either persistence or the forward command. Callers must use `--secret`.
+#[cfg(unix)]
+#[tokio::test]
+async fn containment_refuses_plain_env_before_forward_exec() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let marker = tmp.path().join("forward-ran");
+    let store = SessionStore::open(tmp.path().join("state.db"), 24 * 60 * 60)
+        .await
+        .expect("open store");
+    let (mut cfg, _operator, agent) = gating_config(7_017, 1_000);
+    cfg.session_store = Some(store.clone());
+    let mut request = contain_request(
+        "sh",
+        &["-c", &format!("touch '{}'", marker.display())],
+        RevertSpec {
+            binary: "true".to_string(),
+            args: Vec::new(),
+        },
+    );
+    request
+        .env
+        .insert("MODE".to_string(), "cleanup".to_string());
+
+    let mut sink = tokio::io::sink();
+    let result = arm_containment(
+        request,
+        &cfg,
+        &agent,
+        agent.principal(),
+        "recoverable change".to_string(),
+        0,
+        false,
+        &mut sink,
+    )
+    .await;
+
+    match result.exec {
+        ExecOutcome::Failed {
+            started, reason, ..
+        } => {
+            assert!(!started);
+            assert!(reason.contains("pass them with --secret"), "got: {reason}");
+        }
+        other => panic!("expected pre-exec failure, got {other:?}"),
+    }
+    assert!(!marker.exists(), "forward command must not have run");
+    assert!(
+        cfg.provisional.read().await.list().is_empty(),
+        "plain env must not reach the provisional registry"
+    );
+    assert!(
+        store
+            .load_provisionals()
+            .await
+            .expect("read persisted provisionals")
+            .is_empty(),
+        "plain env must not reach persisted provisional state"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn api_revert_without_running_proxy_defers_to_operator() {
@@ -387,6 +590,7 @@ async fn api_revert_without_running_proxy_defers_to_operator() {
         binary: "(api-proxy)".to_string(),
         args: vec!["delete labels/bug in o/r".to_string()],
         cwd: None,
+        secret_keys: BTreeMap::new(),
         revert_binary: "(api-proxy)".to_string(),
         revert_args: vec![
             "github".to_string(),
@@ -480,6 +684,7 @@ async fn api_revert_executes_through_registered_proxy_upstream() {
         binary: "(api-proxy)".to_string(),
         args: vec!["delete labels/bug in o/r".to_string()],
         cwd: None,
+        secret_keys: BTreeMap::new(),
         revert_binary: "(api-proxy)".to_string(),
         revert_args: vec![
             "github".to_string(),
@@ -1537,6 +1742,7 @@ async fn provisional_revert_executes_in_snapshotted_cwd() {
         binary: "true".to_string(),
         args: Vec::new(),
         cwd: Some(temp.path().to_path_buf()),
+        secret_keys: BTreeMap::new(),
         revert_binary: "sh".to_string(),
         revert_args: vec![
             "-c".to_string(),

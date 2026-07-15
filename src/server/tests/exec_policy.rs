@@ -998,6 +998,7 @@ async fn extra_child_env_forwards_named_var_to_child() {
 #[cfg(unix)]
 #[tokio::test]
 async fn local_caller_cwd_is_canonicalized_and_used_for_execution() {
+    let _env_guard = TEST_ENV_LOCK.lock().await;
     let (cfg, _) = make_test_config();
     let temp = tempfile::tempdir().unwrap();
     let real = temp.path().join("real");
@@ -1524,7 +1525,13 @@ async fn shim_dir_only_path_fails_without_recursing_into_primary_shim() {
     std::fs::set_permissions(&shim_path, perms).unwrap();
     cfg.shim_dir = Some(shim_dir.path().to_path_buf());
     let _path_restore = EnvRestore::capture("PATH");
-    std::env::set_var("PATH", shim_dir.path());
+    let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+    let test_path = std::env::join_paths(
+        std::iter::once(shim_dir.path().to_path_buf())
+            .chain(std::env::split_paths(&inherited_path)),
+    )
+    .unwrap();
+    std::env::set_var("PATH", test_path);
 
     let token = format!("shim-recursion-{}", std::process::id());
     cfg.sessions.write().await.grant(
@@ -1571,7 +1578,13 @@ async fn allowed_binary_floor_does_not_permit_shim_dir_recursion() {
     cfg.shim_dir = Some(shim_dir.path().to_path_buf());
     cfg.allowed_binaries = Some(vec!["allowed-tool".to_string()]);
     let _path_restore = EnvRestore::capture("PATH");
-    std::env::set_var("PATH", shim_dir.path());
+    let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+    let test_path = std::env::join_paths(
+        std::iter::once(shim_dir.path().to_path_buf())
+            .chain(std::env::split_paths(&inherited_path)),
+    )
+    .unwrap();
+    std::env::set_var("PATH", test_path);
 
     let token = format!("shim-allow-bin-{}", std::process::id());
     cfg.sessions.write().await.grant(
