@@ -1762,7 +1762,7 @@ async fn saved_grant_regeneration_previews_exact_apply_and_enforces_both_cas_key
         .unwrap(),
     ));
     let admin = CallerIdentity::TcpAdmin {
-        token: "test-admin-token".to_string(),
+        token: String::new(),
     };
     let preview = || AdminRequest::SavedGrantRegenerate {
         name: "bounded".to_string(),
