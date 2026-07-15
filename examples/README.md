@@ -46,14 +46,10 @@ regex per parameter, single-argv rendering, no shell), which is what makes
   above) for the commands you also want to skip the LLM on. Still an opt-in;
   the default is LLM-only.
 
-- **[session-profiles.yaml](session-profiles.yaml)** -- Named session-grant
-  profiles. Pre-authors reusable `{ttl, allow, deny, activated_verbs,
-  override_markers, prompt}` bundles so an
-  operator can mint a bounded session for an agent in one round trip
-  (`guard session new --profile <name>`) instead of hand-writing prose, globs,
-  and a ttl each time. A profile is a convenience for authoring a grant ahead
-  of time, not a new bypass: the minted session takes the identical path as a
-  hand-authored one. Load with `--profiles`.
+- **[saved-grants.yaml](saved-grants.yaml)** -- Reusable saved grants that
+  activate typed verbs, set a session evaluation mode and TTL, declare
+  secret-name entitlements, and bound automatic request approval. Issue one
+  with `guard grant issue <name>`. Load with `--grants`.
 
 - **[api-policy.yaml](api-policy.yaml)** -- Kubernetes API proxy policy.
   First-match-wins rules over typed API operations (verb, resource, namespace,

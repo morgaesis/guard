@@ -116,6 +116,13 @@ pub struct Provisional {
     /// token itself is never persisted in the provisional row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_fingerprint: Option<String>,
+    /// Immutable issued-session revision and secret selectors captured before
+    /// the forward command. Rollback and confirmation checks use these even if
+    /// the live bearer is later revoked, so an armed rollback remains viable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_entitlements: Option<Vec<String>>,
     /// Structured API revert plan for proxy-originated provisionals. Command
     /// reverts leave this unset and use `revert_binary` / `revert_args`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -391,6 +398,8 @@ mod tests {
             confirm_check_args: Vec::new(),
             control_path: None,
             session_fingerprint: None,
+            session_revision: None,
+            secret_entitlements: None,
             api_revert: None,
             reason: "restart".into(),
             created_unix: 100,

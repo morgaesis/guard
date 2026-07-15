@@ -72,7 +72,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-use super::verb::{is_kebab_name, ParamSpec, Verb, VerbCommand};
+use super::verb::{
+    is_kebab_name, CoverageAction, CoverageProbe, CoverageProvenance, ParamSpec, Verb, VerbCommand,
+    VerbCoverageCell,
+};
 use super::{Reversibility, EXECUTE_NOW_MAX_RISK, HOLD_RISK_THRESHOLD};
 use crate::env::now_unix;
 use crate::learned_rules::{infer_service_from_binary, looks_dangerous_for_learned_allow};
@@ -593,13 +596,55 @@ pub(crate) fn build_candidate_verb(
     evidence: String,
     promotion_stamp: String,
 ) -> Verb {
+    let fixed_args = args
+        .iter()
+        .filter(|arg| !(arg.starts_with('{') && arg.ends_with('}')))
+        .cloned()
+        .collect::<Vec<_>>();
+    let coverage = vec![VerbCoverageCell {
+        name: "evidence-backed".to_string(),
+        action: CoverageAction::Preauthorized,
+        required_args: fixed_args,
+        forbidden_args: Vec::new(),
+        min_args: None,
+        max_args: None,
+        options: Vec::new(),
+        target: None,
+        inventory: None,
+        namespace: None,
+        fanout: None,
+        override_marker: None,
+        sticky: false,
+        provenance: Some(CoverageProvenance {
+            source: "automatic_evaluator_promotion".to_string(),
+            evidence: vec![evidence.clone()],
+            regime_stamp: promotion_stamp.clone(),
+            prompt_stamp: promotion_stamp.clone(),
+            model_stamp: promotion_stamp.clone(),
+            generated_unix: now_unix(),
+            probes: vec![
+                CoverageProbe {
+                    dimension: "observed_shape".to_string(),
+                    args: args.clone(),
+                    expected_match: true,
+                    observed_match: true,
+                },
+                CoverageProbe {
+                    dimension: "outside_shape".to_string(),
+                    args: vec!["--guard-outside-coverage".to_string()],
+                    expected_match: false,
+                    observed_match: false,
+                },
+            ],
+        }),
+    }];
     Verb {
         name,
         description,
         binary: binary.to_string(),
         args,
         baseline: true,
-        coverage: Vec::new(),
+        coverage,
         credential_plan: None,
         params,
         consequence,

@@ -1,5 +1,5 @@
 use crate::evaluate::Evaluator;
-use crate::grant_profile::ProfileCatalog;
+use crate::grant_profile::SavedGrantCatalog;
 use crate::secrets::SecretManager;
 use crate::session::SessionRegistry;
 use crate::session_store::SessionStore;
@@ -110,6 +110,10 @@ impl Server {
         self.config.gate = gate;
     }
 
+    pub fn set_approval_ttl(&mut self, ttl_secs: u64) {
+        self.config.approval_ttl_secs = ttl_secs;
+    }
+
     /// Configure the optional operator notification command.
     pub fn set_notify_hook(&mut self, command: Vec<String>, timeout_secs: u64) {
         self.config.notify_hook = super::runtime::NotifyHook::new(command, timeout_secs);
@@ -124,10 +128,9 @@ impl Server {
         self.config.verbs = Arc::new(RwLock::new(catalog));
     }
 
-    /// Install the operator-defined session-grant profiles. Must be called
-    /// before `run`.
-    pub fn set_profiles(&mut self, catalog: ProfileCatalog) {
-        self.config.profiles = catalog;
+    /// Install reusable grants. Must be called before `run`.
+    pub fn set_saved_grants(&mut self, catalog: SavedGrantCatalog) {
+        self.config.saved_grants = Arc::new(RwLock::new(catalog));
     }
 
     /// Restrict which binaries may execute. `None` imposes no restriction (the
@@ -158,11 +161,47 @@ impl Server {
     /// become `exec_failed`. Both are surfaced via a high-severity audit line.
     async fn startup_gating(&self) {
         let Some(store) = &self.config.session_store else {
+            self.install_saved_grant_verbs().await;
             tracing::info!(
-                "Consequence gating enabled (no state-db: provisional/approval state is process-local and not recovered across restart)"
+                "No state database configured: saved grants, grant requests, sessions, and gate state are process-local"
             );
             return;
         };
+
+        match (
+            store.load_saved_grants().await,
+            store.load_saved_grant_tombstones().await,
+        ) {
+            (Ok(rows), Ok(tombstones)) => {
+                let mut grants = self.config.saved_grants.write().await;
+                if let Err(error) = grants.overlay_rows(rows) {
+                    tracing::error!("failed to validate saved grants: {}", error);
+                    *grants = crate::grant_profile::SavedGrantCatalog::empty();
+                } else {
+                    grants.apply_tombstones(&tombstones);
+                }
+            }
+            (rows, tombstones) => {
+                tracing::error!(
+                    "failed to load durable saved-grant state: rows={:?}, tombstones={:?}",
+                    rows.err(),
+                    tombstones.err()
+                );
+                *self.config.saved_grants.write().await =
+                    crate::grant_profile::SavedGrantCatalog::empty();
+            }
+        }
+        self.install_saved_grant_verbs().await;
+        match store.load_grant_requests().await {
+            Ok(rows) => {
+                *self.config.grant_requests.write().await = rows
+                    .into_iter()
+                    .map(|request| (request.handle.clone(), request))
+                    .collect();
+                super::admin::prune_grant_requests(&self.config).await;
+            }
+            Err(error) => tracing::error!("failed to load grant requests: {}", error),
+        }
 
         match store.load_provisionals().await {
             Ok(rows) => {
@@ -295,6 +334,24 @@ impl Server {
         }
     }
 
+    async fn install_saved_grant_verbs(&self) {
+        let generated = self
+            .config
+            .saved_grants
+            .read()
+            .await
+            .list()
+            .into_iter()
+            .flat_map(|grant| grant.generated_verbs)
+            .collect::<Vec<_>>();
+        let mut verbs = self.config.verbs.write().await;
+        for verb in generated {
+            if let Err(error) = verbs.upsert_saved_grant_verb(verb) {
+                tracing::error!("failed to install generated saved-grant verb: {}", error);
+            }
+        }
+    }
+
     /// Load persisted read grants at startup. Any grant already past its TTL is
     /// revoked immediately (a read grant only removes access, so this is always
     /// safe to do unattended, unlike a provisional revert); a grant still within
@@ -347,11 +404,12 @@ impl Server {
         tracing::info!("Server::run() called");
         let _process_shutdown = self.config.process_tracker.shutdown_guard();
 
-        // Consequence gating: load persisted state (with boot-safe recovery).
+        // Load durable authorization state. Consequence rows also receive
+        // boot-safe recovery when gating is enabled.
         if self.config.gate.is_on() {
             tracing::info!("Consequence gating: {}", self.config.gate);
-            self.startup_gating().await;
         }
+        self.startup_gating().await;
         // Reconcile persisted read grants (revoke expired, re-arm live).
         #[cfg(unix)]
         self.startup_read_grants().await;
@@ -468,7 +526,7 @@ impl Server {
                 }));
             } else {
                 tracing::info!(
-                    "api-proxy ({}): --gate consequence not set; recoverable writes forwarded without auto-revert and policy 'hold' rules deny fail-closed (no approval queue)",
+                    "api-proxy ({}): --gate consequence not set; recoverable writes forwarded without auto-revert and policy holds deny fail-closed (no approval queue)",
                     proxy.protocol_name()
                 );
             }

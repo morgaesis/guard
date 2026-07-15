@@ -30,12 +30,32 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 
-#[cfg(unix)]
 use super::capture_async;
-use super::{args, capture, make_test_config, paranoid_test_config};
+#[cfg(unix)]
+use super::production_audit_buffer;
+use super::{args, make_test_config, paranoid_test_config};
 
 #[cfg(unix)]
 static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(unix)]
+fn unrestricted_session() -> SessionGrant {
+    SessionGrant {
+        allow: Vec::new(),
+        deny: Vec::new(),
+        allow_exact: Vec::new(),
+        deny_exact: Vec::new(),
+        activated_verbs: Vec::new(),
+        override_markers: Vec::new(),
+        scope: Default::default(),
+        expires_at: None,
+        prompt_append: None,
+        generated_notes: Vec::new(),
+        static_only: false,
+        auto_amend: false,
+        granted_at: 0,
+    }
+}
 
 #[cfg(unix)]
 struct EnvRestore {
@@ -105,8 +125,8 @@ fn audit_session_fingerprint_is_stable_distinct_and_non_reversible() {
     assert_eq!(audit_session_fingerprint(Some("")), "none");
 }
 
-#[test]
-fn cwd_is_included_in_audit_and_evaluation_context() {
+#[tokio::test]
+async fn cwd_is_included_in_audit_and_evaluation_context() {
     let (cfg, buf) = make_test_config();
     let cwd = std::env::current_dir().unwrap();
     let mut req = basic_request("pwd", Vec::new());
@@ -119,7 +139,7 @@ fn cwd_is_included_in_audit_and_evaluation_context() {
     assert!(prompt.contains(&cwd.display().to_string()));
     assert!(prompt.contains("SESSION CONTEXT"));
 
-    let logs = capture(&buf, || {
+    let (_, logs) = capture_async(&buf, async {
         log_audit_policy_for_request(
             &cfg,
             &CallerIdentity::Unix { uid: 1000 },
@@ -127,7 +147,8 @@ fn cwd_is_included_in_audit_and_evaluation_context() {
             true,
             "approved for test",
         );
-    });
+    })
+    .await;
     assert!(logs.contains("[AUDIT] ALLOWED"), "logs={logs}");
     assert!(logs.contains("caller=uid=1000"), "logs={logs}");
     assert!(
@@ -148,38 +169,50 @@ fn cwd_is_included_in_audit_and_evaluation_context() {
 #[cfg(unix)]
 #[tokio::test]
 async fn secret_exposure_is_audited_only_after_successful_spawn() {
+    let _test_lock = TEST_ENV_LOCK.lock().await;
     let caller = CallerIdentity::Unix { uid: 1000 };
     let principal = PrincipalKey::from_uid(1000);
     let token = "opaque-session-token-never-logged";
 
-    let (cfg, buf) = make_test_config();
+    let audit = production_audit_buffer();
+    let (cfg, _) = make_test_config();
+    cfg.sessions
+        .write()
+        .await
+        .grant(token.to_string(), unrestricted_session());
     cfg.secrets
-        .set(&principal, "service/token", "secret-value-never-logged")
+        .set(
+            &principal,
+            "test/secret-exposure-success",
+            "secret-value-never-logged",
+        )
         .await
         .unwrap();
     let mut request = basic_request("/bin/true", Vec::new());
     request.session_token = Some(token.into());
-    request
-        .secret_files
-        .insert("SERVICE_TOKEN_FILE".into(), "service/token".into());
+    request.secret_files.insert(
+        "SERVICE_TOKEN_FILE".into(),
+        "test/secret-exposure-success".into(),
+    );
     let mut sink = tokio::io::sink();
-    let (result, logs) = capture_async(
-        &buf,
-        exec_after_approval(
-            request,
-            &cfg,
-            &caller,
-            "test allow".into(),
-            0,
-            false,
-            &mut sink,
-        ),
+    let result = exec_after_approval(
+        request,
+        &cfg,
+        &caller,
+        "test allow".into(),
+        0,
+        false,
+        &mut sink,
     )
     .await;
     assert_eq!(result.exit_code(), Some(0));
-    assert_eq!(result.exposed_secret_refs(), &["service/token"]);
+    assert_eq!(
+        result.exposed_secret_refs(),
+        &["test/secret-exposure-success"]
+    );
+    let logs = String::from_utf8_lossy(&audit.0.lock().unwrap()).to_string();
     assert!(logs.contains("[AUDIT] SECRET_EXPOSED"), "logs={logs}");
-    assert!(logs.contains("service/token"), "logs={logs}");
+    assert!(logs.contains("test/secret-exposure-success"), "logs={logs}");
     assert!(
         logs.contains(&audit_session_fingerprint(Some(token))),
         "logs={logs}"
@@ -187,40 +220,218 @@ async fn secret_exposure_is_audited_only_after_successful_spawn() {
     assert!(!logs.contains(token));
     assert!(!logs.contains("secret-value-never-logged"));
 
-    let (cfg, buf) = make_test_config();
+    let (cfg, _) = make_test_config();
+    cfg.sessions
+        .write()
+        .await
+        .grant(token.to_string(), unrestricted_session());
     cfg.secrets
-        .set(&principal, "service/token", "another-secret-value")
+        .set(
+            &principal,
+            "test/secret-exposure-failed-spawn",
+            "another-secret-value",
+        )
         .await
         .unwrap();
     let mut request = basic_request("guard-command-that-does-not-exist", Vec::new());
     request.session_token = Some(token.into());
-    request
-        .secrets
-        .insert("SERVICE_TOKEN".into(), "service/token".into());
+    request.secrets.insert(
+        "SERVICE_TOKEN".into(),
+        "test/secret-exposure-failed-spawn".into(),
+    );
     let mut sink = tokio::io::sink();
-    let (result, logs) = capture_async(
-        &buf,
-        exec_after_approval(
-            request,
-            &cfg,
-            &caller,
-            "test allow".into(),
-            0,
-            false,
-            &mut sink,
-        ),
+    let result = exec_after_approval(
+        request,
+        &cfg,
+        &caller,
+        "test allow".into(),
+        0,
+        false,
+        &mut sink,
     )
     .await;
     assert!(result.exposed_secret_refs().is_empty());
-    assert!(!logs.contains("SECRET_EXPOSED"), "logs={logs}");
+    let logs = String::from_utf8_lossy(&audit.0.lock().unwrap()).to_string();
+    assert!(
+        !logs.contains("test/secret-exposure-failed-spawn"),
+        "logs={logs}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn saved_grant_entitlement_covers_tool_config_secret_refs() {
+    let caller = CallerIdentity::Unix { uid: 1000 };
+    let principal = PrincipalKey::from_uid(1000);
+    let (cfg, _) = make_test_config();
+    cfg.secrets
+        .set(&principal, "broker/token", "never-printed")
+        .await
+        .unwrap();
+    let tools = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        tools.path(),
+        "tools:\n  true:\n    secrets:\n      BROKER_TOKEN: broker/token\n",
+    )
+    .unwrap();
+    *cfg.tool_registry.write().await =
+        crate::tool_config::ToolRegistry::load(tools.path()).unwrap();
+    let mut grant = SessionGrant {
+        allow: Vec::new(),
+        deny: Vec::new(),
+        allow_exact: Vec::new(),
+        deny_exact: Vec::new(),
+        activated_verbs: Vec::new(),
+        override_markers: Vec::new(),
+        scope: Default::default(),
+        expires_at: None,
+        prompt_append: None,
+        generated_notes: Vec::new(),
+        static_only: false,
+        auto_amend: false,
+        granted_at: 0,
+    };
+    grant.scope.saved_grant = Some("no-secrets".to_string());
+    grant.scope.secret_names = Vec::new();
+    cfg.sessions
+        .write()
+        .await
+        .grant("tool-secret-session".to_string(), grant);
+    let mut request = basic_request("true", Vec::new());
+    request.session_token = Some("tool-secret-session".to_string());
+    let mut sink = tokio::io::sink();
+    let result = exec_after_approval(
+        request,
+        &cfg,
+        &caller,
+        "test allow".to_string(),
+        0,
+        false,
+        &mut sink,
+    )
+    .await;
+    match result.exec {
+        ExecOutcome::Failed { reason, started } => {
+            assert!(!started);
+            assert!(reason.contains("does not entitle secret 'broker/token'"));
+        }
+        other => panic!("expected tool secret entitlement rejection, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn expired_denial_escalation_does_not_deduplicate_a_fresh_handle() {
+    let (cfg, _) = make_test_config();
+    let token = "denial-escalation-session".to_string();
+    cfg.sessions.write().await.grant(
+        token.clone(),
+        SessionGrant {
+            allow: Vec::new(),
+            deny: vec!["echo *".to_string()],
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            activated_verbs: Vec::new(),
+            override_markers: Vec::new(),
+            scope: Default::default(),
+            expires_at: None,
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            static_only: false,
+            auto_amend: false,
+            granted_at: 0,
+        },
+    );
+    let mut request = basic_request("echo", vec!["blocked".to_string()]);
+    request.session_token = Some(token);
+    let caller = CallerIdentity::Unix { uid: 1000 };
+    let first = execute_command(request.clone(), &cfg, &caller).await;
+    assert!(!first.policy_allowed());
+    let first_handle = cfg
+        .grant_requests
+        .read()
+        .await
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    cfg.grant_requests
+        .write()
+        .await
+        .get_mut(&first_handle)
+        .unwrap()
+        .expires_unix = 1;
+
+    let second = execute_command(request, &cfg, &caller).await;
+    assert!(!second.policy_allowed());
+    let requests = cfg.grant_requests.read().await;
+    assert_eq!(requests.len(), 1);
+    let second_handle = requests.keys().next().unwrap();
+    assert_ne!(second_handle, &first_handle);
+}
+
+#[tokio::test]
+async fn denial_escalation_dedup_is_bound_to_session_revision() {
+    let (cfg, _) = make_test_config();
+    let token = "revision-bound-denial".to_string();
+    cfg.sessions.write().await.grant(
+        token.clone(),
+        SessionGrant {
+            allow: Vec::new(),
+            deny: vec!["echo *".to_string()],
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            activated_verbs: Vec::new(),
+            override_markers: Vec::new(),
+            scope: Default::default(),
+            expires_at: None,
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            static_only: false,
+            auto_amend: false,
+            granted_at: 0,
+        },
+    );
+    let mut request = basic_request("echo", vec!["blocked".to_string()]);
+    request.session_token = Some(token.clone());
+    let caller = CallerIdentity::Unix { uid: 1000 };
+    assert!(!execute_command(request.clone(), &cfg, &caller)
+        .await
+        .policy_allowed());
+    let first_revision = cfg
+        .grant_requests
+        .read()
+        .await
+        .values()
+        .next()
+        .unwrap()
+        .issued_session_revision
+        .clone();
+
+    cfg.sessions
+        .write()
+        .await
+        .set_label(&token, Some("changed-authority".to_string()));
+    assert!(!execute_command(request, &cfg, &caller)
+        .await
+        .policy_allowed());
+    let requests = cfg.grant_requests.read().await;
+    assert_eq!(requests.len(), 2);
+    assert!(requests
+        .values()
+        .any(|request| request.issued_session_revision != first_revision));
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn streaming_secret_exposure_is_recorded_even_on_nonzero_exit() {
+    let _test_lock = TEST_ENV_LOCK.lock().await;
     let caller = CallerIdentity::Unix { uid: 1000 };
     let principal = PrincipalKey::from_uid(1000);
     let (cfg, buf) = make_test_config();
+    cfg.sessions.write().await.grant(
+        "streaming-session-token-never-logged".to_string(),
+        unrestricted_session(),
+    );
     for (name, value) in [
         ("service/primary", "primary-value-never-logged"),
         ("service/secondary", "secondary-value-never-logged"),
@@ -663,7 +874,7 @@ async fn repeated_llm_denials_append_count_hint_at_threshold_only() {
     .await;
     let reason = second.policy_reason();
     assert!(reason.contains("destructive request"));
-    assert!(reason.contains("guard has denied 2 similar echo commands; if this access is needed, ask your operator to broaden the session grant or add a profile"));
+    assert!(reason.contains("guard has denied 2 similar echo commands; if this access is needed, use the escalation handle to request a saved-grant or verb amendment"));
     for forbidden in ["promoted", "learned", "fast path"] {
         assert!(
             !reason.to_ascii_lowercase().contains(forbidden),
@@ -717,15 +928,16 @@ fn safe_allow_disabled_in_paranoid_mode() {
 
 /// Policy denial: only the POLICY event fires, never EXEC_FAILED.
 /// Legacy grep patterns `[AUDIT] DENIED` still match.
-#[test]
-fn audit_policy_denied_emits_only_policy_event() {
+#[tokio::test]
+async fn audit_policy_denied_emits_only_policy_event() {
     let (cfg, buf) = make_test_config();
     let caller = CallerIdentity::Unix { uid: 1000 };
     let result = ExecuteResult::denied("matched deny pattern: rm -rf /");
 
-    let output = capture(&buf, || {
+    let (_, output) = capture_async(&buf, async {
         emit_audit_events(&cfg, &caller, "rm", &["-rf".into(), "/".into()], &result);
-    });
+    })
+    .await;
 
     assert!(
         output.contains("[AUDIT] DENIED"),
@@ -740,8 +952,8 @@ fn audit_policy_denied_emits_only_policy_event() {
 /// Policy allows + exec fails: BOTH events fire. Legacy grep for
 /// `[AUDIT] ALLOWED` still matches, and tooling that wants exec-failure
 /// visibility can filter on EXEC_FAILED.
-#[test]
-fn audit_allowed_then_exec_failed_emits_both_events() {
+#[tokio::test]
+async fn audit_allowed_then_exec_failed_emits_both_events() {
     let (cfg, buf) = make_test_config();
     let caller = CallerIdentity::Unix { uid: 1000 };
     let result = ExecuteResult::exec_failed(
@@ -749,9 +961,10 @@ fn audit_allowed_then_exec_failed_emits_both_events() {
         "failed to execute 'nonexistent-binary-xyz': No such file or directory",
     );
 
-    let output = capture(&buf, || {
+    let (_, output) = capture_async(&buf, async {
         emit_audit_events(&cfg, &caller, "nonexistent-binary-xyz", &[], &result);
-    });
+    })
+    .await;
 
     assert!(
         output.contains("[AUDIT] ALLOWED"),
@@ -772,15 +985,16 @@ fn audit_allowed_then_exec_failed_emits_both_events() {
 }
 
 /// Policy allows + exec succeeds: only the POLICY event fires.
-#[test]
-fn audit_allowed_and_completed_emits_only_policy_event() {
+#[tokio::test]
+async fn audit_allowed_and_completed_emits_only_policy_event() {
     let (cfg, buf) = make_test_config();
     let caller = CallerIdentity::Unix { uid: 42 };
     let result = ExecuteResult::completed("static allow", Some(0), None, None);
 
-    let output = capture(&buf, || {
+    let (_, output) = capture_async(&buf, async {
         emit_audit_events(&cfg, &caller, "echo", &["hi".into()], &result);
-    });
+    })
+    .await;
 
     assert!(output.contains("[AUDIT] ALLOWED"));
     assert!(!output.contains("EXEC_FAILED"));
@@ -969,6 +1183,7 @@ async fn extra_child_env_forwards_named_var_to_child() {
                 deny_exact: Vec::new(),
                 activated_verbs: Vec::new(),
                 override_markers: Vec::new(),
+                scope: Default::default(),
                 expires_at: None,
                 prompt_append: None,
                 generated_notes: Vec::new(),
@@ -1035,6 +1250,7 @@ async fn local_caller_cwd_is_canonicalized_and_used_for_execution() {
             deny_exact: Vec::new(),
             activated_verbs: Vec::new(),
             override_markers: Vec::new(),
+            scope: Default::default(),
             expires_at: None,
             prompt_append: None,
             generated_notes: Vec::new(),
@@ -1077,6 +1293,7 @@ async fn default_service_execution_does_not_forward_ssh_auth_sock() {
             deny_exact: Vec::new(),
             activated_verbs: Vec::new(),
             override_markers: Vec::new(),
+            scope: Default::default(),
             expires_at: None,
             prompt_append: None,
             generated_notes: Vec::new(),
@@ -1118,6 +1335,7 @@ async fn caller_env_cannot_supply_ssh_auth_sock() {
             deny_exact: Vec::new(),
             activated_verbs: Vec::new(),
             override_markers: Vec::new(),
+            scope: Default::default(),
             expires_at: None,
             prompt_append: None,
             generated_notes: Vec::new(),
@@ -1169,6 +1387,7 @@ async fn guard_configured_ssh_auth_sock_is_forwarded_to_child() {
             deny_exact: Vec::new(),
             activated_verbs: Vec::new(),
             override_markers: Vec::new(),
+            scope: Default::default(),
             expires_at: None,
             prompt_append: None,
             generated_notes: Vec::new(),
@@ -1222,6 +1441,7 @@ async fn caller_env_cannot_override_guard_tool_env() {
             deny_exact: Vec::new(),
             activated_verbs: Vec::new(),
             override_markers: Vec::new(),
+            scope: Default::default(),
             expires_at: None,
             prompt_append: None,
             generated_notes: Vec::new(),
@@ -1285,6 +1505,7 @@ async fn caller_secret_cannot_override_guard_tool_env() {
             deny_exact: Vec::new(),
             activated_verbs: Vec::new(),
             override_markers: Vec::new(),
+            scope: Default::default(),
             expires_at: None,
             prompt_append: None,
             generated_notes: Vec::new(),
@@ -1338,6 +1559,7 @@ async fn caller_env_cannot_override_daemon_child_env() {
             deny_exact: Vec::new(),
             activated_verbs: Vec::new(),
             override_markers: Vec::new(),
+            scope: Default::default(),
             expires_at: None,
             prompt_append: None,
             generated_notes: Vec::new(),
@@ -1402,6 +1624,7 @@ async fn redaction_covers_effective_tool_child_and_request_env_values() {
             deny_exact: Vec::new(),
             activated_verbs: Vec::new(),
             override_markers: Vec::new(),
+            scope: Default::default(),
             expires_at: None,
             prompt_append: None,
             generated_notes: Vec::new(),
@@ -1498,6 +1721,7 @@ async fn ansible_discovers_config_from_cwd_without_inherited_ansible_config() {
             deny_exact: Vec::new(),
             activated_verbs: Vec::new(),
             override_markers: Vec::new(),
+            scope: Default::default(),
             expires_at: None,
             prompt_append: None,
             generated_notes: Vec::new(),
@@ -1577,6 +1801,7 @@ async fn shim_dir_only_path_fails_without_recursing_into_primary_shim() {
             deny_exact: Vec::new(),
             activated_verbs: Vec::new(),
             override_markers: Vec::new(),
+            scope: Default::default(),
             expires_at: None,
             prompt_append: None,
             generated_notes: Vec::new(),
@@ -1632,6 +1857,7 @@ async fn allowed_binary_floor_does_not_permit_shim_dir_recursion() {
             deny_exact: Vec::new(),
             activated_verbs: Vec::new(),
             override_markers: Vec::new(),
+            scope: Default::default(),
             expires_at: None,
             prompt_append: None,
             generated_notes: Vec::new(),

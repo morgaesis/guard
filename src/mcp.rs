@@ -17,6 +17,8 @@ const JSONRPC_VERSION: &str = "2.0";
 const DEFAULT_TOOL_NAME: &str = "guard_run";
 const VERB_LIST_TOOL_NAME: &str = "guard_verbs";
 const APPROVAL_LIST_TOOL_NAME: &str = "guard_approvals";
+const EVALUATE_BATCH_TOOL_NAME: &str = "guard_evaluate_batch";
+const SESSION_STATUS_TOOL_NAME: &str = "guard_session_status";
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-03-26", "2024-11-05"];
 
 /// Cap the HTTP request body we will buffer. The MCP request payloads are
@@ -29,6 +31,8 @@ pub struct McpConfig {
     pub socket_path: Option<PathBuf>,
     pub tcp_port: Option<u16>,
     pub auth_token: Option<String>,
+    /// Session bearer owned by this MCP process, sourced from GUARD_SESSION.
+    pub session_token: Option<String>,
     pub tool_name: String,
     /// When set, serve MCP over HTTP on this address instead of stdio.
     pub http_addr: Option<SocketAddr>,
@@ -71,6 +75,7 @@ impl Default for McpConfig {
             socket_path: None,
             tcp_port: None,
             auth_token: None,
+            session_token: None,
             tool_name: DEFAULT_TOOL_NAME.to_string(),
             http_addr: None,
             http_token: None,
@@ -144,6 +149,18 @@ struct GuardToolArgs {
     /// only-existing (ssh's strict checking) when omitted.
     #[serde(default)]
     hostkey: Option<McpSshHostKeyMode>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct EvaluateBatchArgs {
+    #[serde(default)]
+    session: Option<String>,
+    commands: Vec<server::BatchCommand>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SessionStatusArgs {
+    session: String,
 }
 
 #[derive(Debug, Clone)]
@@ -339,7 +356,8 @@ pub async fn serve(config: McpConfig) -> Result<()> {
         tcp_port: config.tcp_port,
         auth_token: config.auth_token.clone(),
     });
-    let server = McpServer::new(executor.clone(), executor, config.tool_name);
+    let server = McpServer::new(executor.clone(), executor, config.tool_name)
+        .with_caller_token(config.session_token);
 
     match config.http_addr {
         Some(addr) => {
@@ -697,6 +715,7 @@ struct McpServer<E: GuardExecutor, A: GuardAdmin> {
     admin: Arc<A>,
     tool_name: String,
     initialize_seen: bool,
+    caller_token: Option<String>,
 }
 
 impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
@@ -706,7 +725,13 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
             admin,
             tool_name,
             initialize_seen: false,
+            caller_token: None,
         }
+    }
+
+    fn with_caller_token(mut self, caller_token: Option<String>) -> Self {
+        self.caller_token = caller_token.filter(|token| !token.is_empty());
+        self
     }
 
     async fn handle_message(&mut self, message: Value) -> Option<Value> {
@@ -774,6 +799,12 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                     jsonrpc_result_response(id, result)
                 } else if tool_call.name == APPROVAL_LIST_TOOL_NAME {
                     let result = self.call_approval_list().await;
+                    jsonrpc_result_response(id, result)
+                } else if tool_call.name == EVALUATE_BATCH_TOOL_NAME {
+                    let result = self.call_evaluate_batch(tool_call.arguments).await;
+                    jsonrpc_result_response(id, result)
+                } else if tool_call.name == SESSION_STATUS_TOOL_NAME {
+                    let result = self.call_session_status(tool_call.arguments).await;
                     jsonrpc_result_response(id, result)
                 } else {
                     jsonrpc_error_response(
@@ -902,7 +933,7 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                             },
                             "reevaluate": {
                                 "type": "boolean",
-                                "description": "Optional: skip the daemon's auto-learned deny-shape fast path and force a fresh policy look at this one command. Never skips an operator-authored deny rule. Use this if you believe an auto-learned shape over-blocked something that should be allowed."
+                                "description": "Optional: skip the daemon's generated deny-shape fast path and force a fresh evaluator look at this command. Never skips operator-authored deny coverage. Use this if generated coverage blocked something that should be allowed."
                             }
                         },
                         "required": ["binary", "args"]
@@ -959,6 +990,53 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                         "idempotentHint": true,
                         "openWorldHint": false
                     }
+                },
+                {
+                    "name": EVALUATE_BATCH_TOOL_NAME,
+                    "title": "Evaluate a Command Batch",
+                    "description": "Evaluate 1 to 64 command shapes without executing them. Results share the active saved-grant revision cache context.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "session": { "type": "string" },
+                            "commands": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": 64,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "binary": { "type": "string" },
+                                        "args": { "type": "array", "items": { "type": "string" } }
+                                    },
+                                    "required": ["binary"]
+                                }
+                            }
+                        },
+                        "required": ["commands"]
+                    },
+                    "annotations": {
+                        "readOnlyHint": true,
+                        "destructiveHint": false,
+                        "idempotentHint": true,
+                        "openWorldHint": true
+                    }
+                },
+                {
+                    "name": SESSION_STATUS_TOOL_NAME,
+                    "title": "Show Session Status",
+                    "description": "Show the caller's live grant, escalations, holds, and provisionals for one session token.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": { "session": { "type": "string" } },
+                        "required": ["session"]
+                    },
+                    "annotations": {
+                        "readOnlyHint": true,
+                        "destructiveHint": false,
+                        "idempotentHint": true,
+                        "openWorldHint": false
+                    }
                 }
             ]
         })
@@ -1005,6 +1083,78 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                 let structured = json!({ "approvals": items });
                 admin_tool_result(render_approvals_text(&items), structured)
             }
+            Ok(server::AdminResponse::Error { message }) => tool_error_result(message),
+            Ok(_) => tool_error_result("unexpected response from guard daemon".to_string()),
+            Err(error) => tool_error_result(format!("{error:#}")),
+        }
+    }
+
+    async fn call_evaluate_batch(&self, arguments: Value) -> Value {
+        let args: EvaluateBatchArgs = match serde_json::from_value(arguments) {
+            Ok(args) => args,
+            Err(error) => return tool_error_result(format!("invalid tool arguments: {error}")),
+        };
+        match self
+            .admin
+            .send_admin(server::AdminRequest::EvaluateBatch {
+                session_token: args.session,
+                caller_token: self.caller_token.clone(),
+                commands: args.commands,
+            })
+            .await
+        {
+            Ok(server::AdminResponse::EvaluationBatch { items }) => {
+                let text = items
+                    .iter()
+                    .map(|item| {
+                        format!(
+                            "{} allowed={} risk={:?} reason={}",
+                            item.command, item.allowed, item.risk, item.reason
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                admin_tool_result(text, json!({ "items": items }))
+            }
+            Ok(server::AdminResponse::Error { message }) => tool_error_result(message),
+            Ok(_) => tool_error_result("unexpected response from guard daemon".to_string()),
+            Err(error) => tool_error_result(format!("{error:#}")),
+        }
+    }
+
+    async fn call_session_status(&self, arguments: Value) -> Value {
+        let args: SessionStatusArgs = match serde_json::from_value(arguments) {
+            Ok(args) => args,
+            Err(error) => return tool_error_result(format!("invalid tool arguments: {error}")),
+        };
+        match self
+            .admin
+            .send_admin(server::AdminRequest::SessionStatus {
+                token: args.session,
+                caller_token: self.caller_token.clone(),
+            })
+            .await
+        {
+            Ok(server::AdminResponse::SessionStatus {
+                report,
+                approvals,
+                provisionals,
+                requests,
+            }) => admin_tool_result(
+                format!(
+                    "active={} approvals={} provisionals={} grant_requests={}",
+                    report.active.is_some(),
+                    approvals.len(),
+                    provisionals.len(),
+                    requests.len()
+                ),
+                json!({
+                    "report": report,
+                    "approvals": approvals,
+                    "provisionals": provisionals,
+                    "requests": requests,
+                }),
+            ),
             Ok(server::AdminResponse::Error { message }) => tool_error_result(message),
             Ok(_) => tool_error_result("unexpected response from guard daemon".to_string()),
             Err(error) => tool_error_result(format!("{error:#}")),
@@ -1305,6 +1455,19 @@ mod tests {
         })
     }
 
+    #[derive(Clone)]
+    struct RecordingAdmin {
+        request: Arc<std::sync::Mutex<Option<server::AdminRequest>>>,
+    }
+
+    #[async_trait]
+    impl GuardAdmin for RecordingAdmin {
+        async fn send_admin(&self, request: server::AdminRequest) -> Result<server::AdminResponse> {
+            *self.request.lock().unwrap() = Some(request);
+            Ok(server::AdminResponse::EvaluationBatch { items: Vec::new() })
+        }
+    }
+
     #[tokio::test]
     async fn initialize_advertises_tools_capability() {
         let executor = Arc::new(FakeExecutor {
@@ -1337,6 +1500,77 @@ mod tests {
 
         assert_eq!(response["result"]["protocolVersion"], "2025-03-26");
         assert!(response["result"]["capabilities"]["tools"].is_object());
+    }
+
+    #[tokio::test]
+    async fn evaluate_batch_sends_mcp_owned_session_separately_from_target() {
+        let executor = Arc::new(FakeExecutor {
+            response: Err("unused".to_string()),
+        });
+        let recorded = Arc::new(std::sync::Mutex::new(None));
+        let admin = Arc::new(RecordingAdmin {
+            request: recorded.clone(),
+        });
+        let mut server = McpServer::new(executor, admin, DEFAULT_TOOL_NAME.to_string())
+            .with_caller_token(Some("mcp-owner".to_string()));
+        server.initialize_seen = true;
+        let response = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 42,
+                "method": "tools/call",
+                "params": {
+                    "name": EVALUATE_BATCH_TOOL_NAME,
+                    "arguments": {
+                        "session": "requested-target",
+                        "commands": [{"binary": "true", "args": []}]
+                    }
+                }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["isError"], false);
+        assert!(matches!(
+            recorded.lock().unwrap().as_ref(),
+            Some(server::AdminRequest::EvaluateBatch {
+                session_token: Some(target),
+                caller_token: Some(owner),
+                ..
+            }) if target == "requested-target" && owner == "mcp-owner"
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_status_sends_mcp_owned_session_separately_from_target() {
+        let executor = Arc::new(FakeExecutor {
+            response: Err("unused".to_string()),
+        });
+        let recorded = Arc::new(std::sync::Mutex::new(None));
+        let admin = Arc::new(RecordingAdmin {
+            request: recorded.clone(),
+        });
+        let mut server = McpServer::new(executor, admin, DEFAULT_TOOL_NAME.to_string())
+            .with_caller_token(Some("mcp-owner".to_string()));
+        server.initialize_seen = true;
+        let _ = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 43,
+                "method": "tools/call",
+                "params": {
+                    "name": SESSION_STATUS_TOOL_NAME,
+                    "arguments": { "session": "requested-target" }
+                }
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            recorded.lock().unwrap().as_ref(),
+            Some(server::AdminRequest::SessionStatus {
+                token: target,
+                caller_token: Some(owner),
+            }) if target == "requested-target" && owner == "mcp-owner"
+        ));
     }
 
     #[tokio::test]
@@ -1747,6 +1981,7 @@ mod tests {
             socket_path: Some(PathBuf::from("/run/guard/guard.sock")),
             tcp_port: None,
             auth_token: None,
+            session_token: None,
             tool_name: DEFAULT_TOOL_NAME.to_string(),
             http_addr: Some("127.0.0.1:0".parse().unwrap()),
             http_token: None,

@@ -114,8 +114,8 @@ rules are unchanged) and additionally classifies the reversibility of commands i
 approves. The daemon routes on that class. Classification is **fail-safe**:
 reversibility can only *raise* the gate, never lower it, and a missing or
 uncertain class is held, never run. LLM approvals route on the evaluator's
-class, trusted verbs route on their declared class, and session allows without a
-matched verb are unclassified and held. Static policy in the `--no-llm` fallback
+class, trusted verbs route on their declared class, and approved requests without
+a matched verb are unclassified and held. Static policy in the `--no-evaluator` fallback
 mode is the deterministic direct-exec path.
 
 Gating is meaningful only where the daemon's principal differs from the agent's
@@ -179,7 +179,8 @@ and return an explicit denial or hold reason. Inspect state with `guard
 provisionals` and `guard approvals`.
 
 An optional operator notification hook receives lifecycle JSON on standard input
-for `hold_created`, `provisional_armed`, `provisional_due`, and `decision_made`.
+for holds, provisionals, decisions, session behavior, and grant-request creation
+or resolution.
 Configure it with `--notify-cmd` or `GUARD_NOTIFY_CMD`; Guard supplies no webhook
 or delivery credentials. Hook processes have a bounded timeout, a concurrency
 ceiling, a cleared environment, and no effect on the gate decision.
@@ -377,25 +378,22 @@ model chain is active. This default is production-ready for the common case.
 
 Two opt-in features exist for deployments with specific constraints:
 
-- **Static deny list** via `--policy <yaml>`. Fast-rejects deterministically
-  unsafe patterns before the LLM is called. See
+- **Static deny policy** via `--policy <yaml>`. Fast-rejects deterministically
+  unsafe patterns before the evaluator is called. See
   [`examples/`](examples/README.md) for `deny-policy.yaml` and
   `hybrid-policy.yaml`. `commands.allow` is also parsed (for the
-  `--no-llm` fallback mode and backward compatibility) but, while the LLM is
-  enabled, an allow pattern never skips it. Static and session policy patterns
-  are shell-style globs over a flat reconstructed command line. They remain for
-  compatibility, while typed verbs are the structured path: verb parameters are
-  anchored regexes rendered as single argv elements, and reverse matching lets
-  normal tool invocations pick up a verb's consequence class. Use `guard verb`
-  for a deterministic, LLM-skipping allow.
+  `--no-evaluator` fallback mode and backward compatibility) but, while the
+  evaluator is enabled, an allow pattern never skips it. Typed verbs are the
+  public authorization language: verb parameters are anchored regexes rendered
+  as single argv elements, and reverse matching lets normal tool invocations
+  pick up a verb's coverage and consequence class.
 - **Fallback model chain** via `GUARD_LLM_MODELS`. Fails over to
   alternate providers after the primary exhausts its retries. See
   [`examples/fallback-models.env`](examples/fallback-models.env).
-- **Learned-rule candidates** via `--learn-rules`. Repeated low-risk LLM
-  approvals surface as a candidate in the policy reason text, with a
-  ready-to-run `guard verb create --prompt` suggestion. Candidates do not
-  grant themselves a bypass. Only an operator running that command can,
-  through the same synthesis safety gate as any other verb.
+- **Automatic verb promotion** via `--learn-allow`, enabled by default with
+  consequence gating. Repeated eligible evaluator approvals promote bounded
+  typed coverage with evidence, boundary probes, and evaluator-regime stamps.
+  Promotion never creates an implicit deny for the surrounding command space.
 
 Enable either only when a concrete latency or uptime constraint forces it.
 
@@ -421,15 +419,10 @@ Unless marked "(client)", a variable is read by the daemon at startup; setting i
 | `GUARD_SOCKET` | (none) | (client) Endpoint override: Unix-domain socket path (Unix) or named-pipe name (Windows) to connect to. |
 | `GUARD_MODE` | `readonly` | `readonly`, `safe`, or `paranoid` |
 | `GUARD_DRY_RUN` | `false` | Evaluate policy but do not execute approved commands. Useful for prompt and policy testing. |
-| `GUARD_LEARN_RULES` | `false` | Learn static allows from repeated low-risk LLM approvals. |
-| `GUARD_LEARNED_RULES` | `<state dir>/learned-rules.yaml` | Path to the learned static rules YAML (used with `GUARD_LEARN_RULES`). |
-| `GUARD_LEARN_MIN_APPROVALS` | `2` | Approvals required before promotion. |
-| `GUARD_LEARN_MAX_RISK` | `2` | Highest LLM risk score eligible for promotion. |
-| `GUARD_LEARN_SHIMS` | `suggest` | `off`, `suggest`, or `create` service shims for learned SSH/API wrappers. |
-| `GUARD_LEARN_DENY` | `true` | Auto-learn deny shapes from repeated LLM denials and fast-reject matching commands without another LLM call. On by default -- unlike `GUARD_LEARN_RULES`, this never grants anything, so it needs no operator promotion step. |
+| `GUARD_LEARN_DENY` | `true` | Auto-learn deny shapes from repeated evaluator denials and fast-reject matching commands without another evaluator call. |
 | `GUARD_DENY_SHAPES` | `<state dir>/learned-deny.yaml` | Path to the auto-learned deny-shape state YAML. |
 | `GUARD_LEARN_DENY_MIN_DENIALS` | `3` | LLM denials of the same shape required before attempting to synthesize an auto-learned deny fast path. |
-| `GUARD_LEARN_ALLOW` | `true` | Auto-promote trusted verbs from repeated low-risk LLM approvals (requires `--gate consequence`). On by default; needs no operator step, unlike `GUARD_LEARN_RULES` -- restricted to reversible/recoverable-with-a-validated-revert shapes, never irreversible. |
+| `GUARD_LEARN_ALLOW` | `true` | Auto-promote trusted verbs from repeated low-risk evaluator approvals. Requires consequence gating; restricted to reversible operations or recoverable operations with a validated revert. |
 | `GUARD_LEARN_ALLOW_STATE` | `<state dir>/learned-allow.yaml` | Path to the auto-verb-promotion observation state YAML (bookkeeping only; promoted verbs land in `GUARD_VERBS`). |
 | `GUARD_LEARN_ALLOW_MIN_APPROVALS` | `5` | LLM approvals of the same shape required before attempting to promote a trusted verb. |
 | `GUARD_API_PROMOTION` | `true` | Auto-learn exact API request shapes from repeated evaluator allows and denies on proxied `evaluate` traffic. |
@@ -443,7 +436,8 @@ Unless marked "(client)", a variable is read by the daemon at startup; setting i
 | `GUARD_ALLOW_BIN` | (none) | Comma-separated binary allow-list. When set, only these binaries may execute, on every route, regardless of the LLM decision. Bare names match by command name via the daemon PATH; path-qualified entries must match exactly. |
 | `GUARD_GATE` | `off` | Consequence gating: `off` or `consequence`. Requires a local listener (`--socket`: a Unix-domain socket on Unix, a named pipe on Windows); refused over TCP. |
 | `GUARD_VERBS` | (none) | Path to the verb catalog YAML. Hot-reloaded on change. |
-| `GUARD_PROFILES` | (none) | Path to the session-profile YAML (named `{ttl, allow, deny, activated_verbs, override_markers, prompt}` bundles for `guard session new --profile <name>`; see `examples/session-profiles.yaml`). |
+| `GUARD_GRANTS` | (none) | Path to the saved-grant YAML for `guard grant issue <name>`; see `examples/saved-grants.yaml`. `GUARD_PROFILES` is a migration alias. |
+| `GUARD_APPROVAL_TTL` | `900` | Hold lifetime in seconds, or `unbounded`, for consequence-gated operator approvals. |
 | `GUARD_PREFLIGHT` | `false` | Deterministic pre-LLM checks: reject binaries not on the daemon `PATH` and known credential-disclosure patterns before any LLM call. Coarse by design; enable where LLM cost/latency dominates over false positives. Flag: `--preflight`. |
 | `GUARD_CACHE` | `true` | In-memory cache of LLM decisions keyed on the exact command line. Disable with `--no-cache` or `GUARD_CACHE=false`. |
 | `GUARD_CACHE_CAPACITY` | `1024` | Maximum cached decisions (`--cache-capacity`). |
@@ -607,34 +601,25 @@ explicit approved argv flag such as `-i`/`--inventory` for a non-default path.
 A broker-owned socket can be supplied through Guard tool configuration or daemon
 `--child-env SSH_AUTH_SOCK`; caller `--env SSH_AUTH_SOCK=...` is rejected.
 
-### Learned static rules
+### Automatic verb promotion
 
-For services with repetitive low-risk calls, enable learned rules:
+Automatic promotion is enabled with consequence gating. It can also be
+configured explicitly:
 
 ```bash
 guard server start \
-  --learn-rules \
-  --learn-min-approvals 2 \
-  --learn-max-risk 2 \
-  --learn-shims suggest \
+  --learn-allow \
+  --learn-allow-min-approvals 5 \
   --socket .cache/guard.sock &
 ```
 
-When the LLM repeatedly approves the same low-risk command shape, guard
-records the observation to the state directory; once it crosses
-`--learn-min-approvals`, the policy reason returned to the caller includes a
-candidate notice with a ready-to-run `guard verb create --prompt "..."`
-command. Crossing the threshold does NOT bypass the LLM by itself -- every
-future identical call is still evaluated normally, because granting that
-bypass automatically would let an agent promote itself past the evaluator
-just by repeating a borderline command. Only an operator running the
-suggested `guard verb create` command (or hand-authoring a verb) can turn a
-candidate into an actual LLM-skipping allow, through the same synthesis
-safety gate as any other verb. For SSH API wrappers, guard may also mention a
-shorter service shim such as `opnsense-api`; with `--learn-shims create`, a
-candidate creates that wrapper in the configured shim directory (a command
-alias, not a bypass -- it still runs through normal evaluation) once it
-reaches the approval threshold.
+Guard groups repeated eligible approvals by command shape and promotes only
+reversible operations, or recoverable operations with a validated revert. The
+generated verb contains exact escaped evidence patterns, positive and negative
+coverage probes, and a model and prompt stamp. A changed evaluator regime makes
+the promoted allow evaluator-routed until fresh evidence establishes it again.
+Explicit sticky deny and always-evaluate cells cannot be replaced by generated
+coverage.
 
 ### Custom system prompt
 
@@ -670,19 +655,24 @@ Additional rules for this environment:
 
 The additive prompt is appended to whichever base prompt is active (readonly, safe, paranoid, or custom), letting operators customize behavior without maintaining a full prompt fork.
 
-## Session grants
+## Saved grants and sessions
 
-Session grants hand a specific agent narrow permissions for a specific run. The agent identifies its session by the `GUARD_SESSION` env var; every `guard run` (and `guard server connect`) reads that env var and forwards it as the session token in the request. Operators can activate typed verbs, carry exact declared override markers, or attach legacy allow/deny patterns, prose intent, and evaluator context to that token. An override replaces only its matching baseline verb region; server hard invariants remain active. The token is a bearer credential; treat it like access to the scoped session itself.
+A saved grant is a reusable authorization bundle. It activates typed verbs,
+selects an evaluation mode, carries evaluator context and secret-name
+entitlements, declares a default TTL, and can bound automatic expansion with a
+ceiling. Issuing a saved grant creates a live session. The agent identifies its
+session through `GUARD_SESSION`; every `guard run` and MCP evaluation forwards
+that token. Treat it as a bearer credential.
 
 The simplest flow is `guard session new`, which mints a token and (optionally) grants it in one round trip, printing an eval-friendly export line:
 
 ```bash
-# Operator: mint a session, grant it, capture the token in the current shell
-eval "$(guard session new \
-  --allow 'mkdir /tmp/job-42*' \
-  --allow 'rm /tmp/job-42/scratch*' \
-  --prompt 'This session is preparing /tmp/job-42 as scratch space.' \
-  --ttl 3600)"
+# Operator: create and issue reusable authority
+guard grant save scratch-prep \
+  --verb prepare-job-scratch \
+  --prompt 'Prepare and clean the bounded job scratch directory.' \
+  --ttl 3600
+eval "$(guard grant issue scratch-prep)"
 
 # Now any agent launched from this shell inherits GUARD_SESSION
 claude
@@ -692,40 +682,62 @@ GUARD_SESSION="$GUARD_SESSION" my-agent
 
 Inside the agent's process tree, every `guard run` call automatically picks up `GUARD_SESSION` from the inherited environment, so the model itself does not need to know or pass the token explicitly. The scope is bound to the shell that launched the agent.
 
-To grant legacy rules or activate typed verbs for an existing token (e.g. one
-the agent already has):
+Saved grants have a complete lifecycle:
 
 ```bash
-guard session grant <token> \
-  --verb deploy-host-a \
-  --override-marker operator:apply-host-a \
-  [--allow '<glob>'] [--deny '<glob>'] [--ttl N] [--prompt TEXT]
+guard grant list
+guard grant show scratch-prep
+guard grant edit scratch-prep --prompt 'Updated task boundary.'
+guard grant regenerate scratch-prep
+guard grant delete scratch-prep
 ```
 
-`--verb` activates a catalog verb whose `baseline` field is false. An override
-marker applies only to a matching baseline `evaluate` or `deny` coverage cell
-that declares the same marker. It does not bypass the server binary allow-list,
-credential checks, consequence routing, or any other hard invariant. Active and
-historical session records persist both fields in the state database.
+Save rejects an existing name. Edit changes only the fields supplied and
+preserves generated verbs; this makes `guard grant edit <name> --prompt ...`
+the direct prompt-update path. Regenerate asks the evaluator to
+produce typed coverage, preserves sticky operator boundaries, stamps the
+evidence regime, and increments the grant revision. Issue snapshots that
+revision into the session so grant changes invalidate cached evaluator results.
 
-There is also a top-level shorthand. With a quoted prose description it mints and
-grants a fresh session, again printing an eval-friendly export line:
+Session-grant coverage overrides ordinary global read-only or evaluator cells
+inside the activated verb region. A baseline cell that declares an explicit
+override marker requires the matching marker on the session. Sticky baseline
+cells are hard boundaries and never yield to a session or generated verb. Two
+compatible matches compose deterministically; incomparable execution plans go
+to the evaluator, while unresolved allow and deny ambiguity fails closed with
+a durable escalation handle.
+
+Evaluation modes are scoped per saved grant and issued session:
 
 ```bash
-eval "$(guard grant --ttl 3600 --static-only 'readonly access to grafana resources in the staging kube cluster, not secrets, with write access for scaling replicas and editing ingresses')"
+guard grant save inspection --evaluation-mode read-only --verb host-status
+guard grant save bounded-apply --evaluation-mode evaluator --verb ansible-host-a-apply
 ```
 
-For an existing token, pass the token first:
+`read-only` denies mutations unless activated session coverage authorizes the
+specific region. `policy-only` never calls the evaluator. `evaluator` uses the
+normal policy and evaluator path for uncovered operations. Every verb match
+still passes through the binary allow-list, credential checks, consequence
+routing, held-command value binding, audit, and session history.
+
+When guard denies a session command, the response includes the matching verb
+when one participated and a durable grant-request handle with exact next steps:
 
 ```bash
-guard grant <token> "readonly access to grafana resources in the staging kube cluster, not secrets, with write access for scaling replicas and editing ingresses"
+guard grant request show gr-...
+guard grant request approve gr-...
 ```
 
-Prose grants are compiled at grant time into conservative static rules when guard recognizes the domain. The first compiler handles Kubernetes: it infers namespaces such as `grafana`, optional contexts such as `staging`, adds hard denies for shell-control, secret access, token creation, raw kubeconfig reads, `exec`, `cp`, `port-forward`, and deletes, then adds namespace-scoped read, scale, and ingress/reverse-proxy rules implied by the prose. Safe command examples in backticks are added as exact static allows. Unrecognized prose is still stored as session LLM context, but does not create broad static globs. Generated static-grant notes are stored and displayed separately from the evaluator prompt so operators can audit which compiler output explains the generated rules without expanding the model context.
+Agents can submit or withdraw their own requested expansion. Requests inside a
+saved grant's auto-approval ceiling apply immediately. Other requests remain
+pending for the operator. A denial points the agent to the operator instead of
+requiring routine review of an untrusted generated-verb queue.
 
-Session allow/deny patterns use guard's shell-style glob matcher, not regex. `*`, `?`, and bracket classes are supported, but the match is against the flat reconstructed command line; it does not understand shell quoting, Kubernetes resource schemas, or argument semantics. Generated rules therefore use broad globs sparingly: for example, Kubernetes prose grants may add namespace-bounded `get * -n grafana` and `describe * -n grafana` read globs, backed by explicit secret and mutating-resource denies. Automatic amendments do not add globs at all; they add exact `binary + argv` rules, so literal `*` or `[` characters in an appealed command do not become wildcards. New structured constraints belong on typed verbs and capability coverage, with sessions or named profiles selecting those capabilities rather than growing another glob language.
-
-Matching deny patterns win over allow patterns, and by default everything that does not match a session rule falls through to the normal evaluator with the session prose and optional `--prompt` context appended. A matching session allow skips the evaluator only; it still stays inside the server binary allow-list, consequence routing, held-command snapshot binding, read-grant retry path, audit log, and session history. Legacy allow globs do not short-circuit cwd-bearing requests, because relative files and tool discovery can change meaning by directory; use a typed verb or a cwd-bound exact session allow for those commands. Prose grants enable `auto_amend` by default so fresh low-risk LLM fallback approvals can add exact session allows bound to the canonical cwd when one is present, and fresh high-risk LLM denials can add exact session denies. Use `--no-auto-amend` to keep fallback non-mutating, or `--auto-amend` to opt a manual `--allow`/`--deny` grant into the same behavior. Cache hits, static policy hits, and learned-rule hits never amend a session; session fallback also does not promote global learned rules. Add `--static-only` (alias `--no-llm-fallback`) to `guard grant`, `guard session grant`, or `guard session new` to deny any session-rule miss instead of falling through to the LLM; static-only grants disable auto-amend.
+Legacy `--profile`, `--profiles`, GUARD_PROFILES, and top-level `profiles:`
+catalogs remain migration aliases. Exact legacy command patterns and exact
+prefixes ending in a separate `*` token convert deterministically to typed verb
+coverage. Ambiguous shell globs fail loading rather than remain a second
+authorization language or create complement denies.
 
 To ask for a one-off amendment without executing the command, appeal it:
 
@@ -737,7 +749,9 @@ guard appeal kubectl get httproute -n grafana
 guard session appeal <token> kubectl get httproute -n grafana
 ```
 
-An appeal runs the evaluator with the session context and then either amends an exact allow, amends an exact deny for a high-risk denial, or refuses to amend. It exits nonzero when the appealed command remains denied. Appeals are admin RPCs, like grant and revoke, because they can change durable authorization state.
+The appeal command is a compatibility path. New clients use durable grant
+requests so a denied operation has a stable handle, can be withdrawn by its
+requester, and can be approved or denied by the operator.
 
 Session grants are persisted in the daemon state database and survive daemon restarts by default. The default path is the XDG state dir (`$XDG_STATE_HOME/guard/state.db` or `~/.local/state/guard/state.db`); override it with `--state-db` or `GUARD_STATE_DB`. `guard session revoke <token>` is restricted to the daemon principal. `guard session list` is visible over a local listener to exec-allowed callers: non-admin callers see redacted tokens, hidden rule bodies, hidden verb activations, hidden override markers, hidden generated notes, and hidden prompt text for other sessions. If `GUARD_SESSION` matches an active or historical grant, that row is shown as `token=(current)` with its own permissions, prompt context, and generated notes visible, but the raw token is still not printed.
 
@@ -787,7 +801,7 @@ transparent retry path.
 When a brokered command fails naming a file it could not read, the daemon runs
 the read-grant pipeline on that path automatically. The pipeline applies a hard
 credential-path deny-list (key material, kubeconfigs, env files) before the
-evaluator sees the request, then session allow/deny rules, then the LLM. On an
+evaluator sees the request, then saved-grant verb coverage, then the evaluator. On an
 allow, guard applies a short-TTL ACL grant to its brokering account (or the
 caller account under `--exec-as-caller`) and retries the original command.
 
@@ -796,7 +810,7 @@ home. The apply is pinned to the inode vetted at evaluation time (multi-hardlink
 targets are refused, and a path swapped for a symlink in between aborts the
 grant), grants persist in the state database, and the sweeper revokes them at
 TTL or on startup if the daemon was down when one expired. A denied path
-(credential file, session deny, evaluator deny) returns the command's own
+(credential file, verb deny, evaluator deny) returns the command's own
 failure unchanged, and every grant and retry is audited.
 
 ## Per-run secret injection
@@ -881,13 +895,25 @@ guard run --env OPNSENSE_HOST=opnsense-host --secret OPNSENSE_API_KEY \
 
 ## Admin authorization
 
-Session mutating RPCs (`grant`, grant-installing `session new`, `appeal`, and `revoke`, plus the privileged subset of `status`) are restricted to **the daemon's own principal** over a local listener: its uid over a Unix-domain socket, its SID over a Windows named pipe. Token-only `session new` runs locally and does not contact the daemon. `session list` is visible to exec-allowed local callers with redaction. Non-admin callers see that grants exist, when they were granted, and when they expire, but tokens, rule bodies, generated notes, and prompt text are hidden for other sessions. If `GUARD_SESSION` names a session the caller already has, that row is shown as `token=(current)` and includes its own rules, generated notes, and prompt context without printing the raw token. `session show <token>` accepts a known token from an exec-allowed local caller and prints details with token output hidden as `(provided)`. On TCP transports, non-Ping admin RPCs require the separate `GUARD_ADMIN_TOKEN`; the ordinary TCP exec `GUARD_AUTH_TOKEN` is not enough to mint grants.
+Saved-grant mutations, issuance, request decisions, session mutation, verb
+mutation, and privileged status are restricted to **the daemon's own
+principal** over a local listener: its uid over a Unix-domain socket or its SID
+over a Windows named pipe. Request submission, withdrawal, and scoped reads are
+available to the session holder. Other session tokens, activated verbs, secret
+names, and prompt context are redacted. TCP admin RPCs require the separate
+GUARD_ADMIN_TOKEN; the ordinary GUARD_AUTH_TOKEN cannot mint authority.
 
 The non-privileged `guard status` (run as your normal user or any other exec-allowed UID, or over TCP without the admin token) returns only client + server version, uptime, evaluation mode, and dry-run state. It is a liveness probe, enough to confirm the connection works and what mode the evaluator is in without exposing deployment detail. The daemon principal also sees queue depths, learned-store counts, the verb-catalog content hash and change time, and the resolved server configuration. A client/server version mismatch is reported explicitly.
 
-The `--prompt` / `--prompt-file` flags attach a free-form context fragment that is appended to the LLM system prompt under a `Session context:` heading for evaluator calls made under that token. Prose grants use the same context path after static rule synthesis. Use prompt/prose for guidance the static glob patterns cannot express. The decision cache is bypassed when a session prompt is in play, because cached verdicts were made under the base prompt and may not hold under the extended context.
+The `--prompt` and `--prompt-file` flags attach evaluator context to a saved or
+live grant. The effective saved-grant and session revision is part of the cache
+context, so edits, regeneration, expansion, expiry, and revocation invalidate
+affected decisions.
 
-Durable grants deserve the same care as any other persistent authorization state. Prefer explicit TTLs for elevated sessions, and treat `allow=["*"]` as a legacy operator override that must be revoked intentionally rather than something a daemon restart clears. Generated prose rules intentionally stay narrow; if guard cannot infer a safe static rule, it relies on LLM fallback or denies under `--static-only`.
+Durable grants deserve the same care as any other persistent authorization
+state. Prefer explicit TTLs for elevated sessions. Generated coverage remains
+silent outside its evidenced cells and routes uncovered operations to the
+selected evaluation mode.
 
 ## Execution identity
 
@@ -923,8 +949,9 @@ guard config set-server ~/.guard/guard.sock
 guard mcp serve
 ```
 
-The server exposes three tools: `guard_run`, `guard_verbs`, and
-`guard_approvals`. `guard_run` executes a command through the daemon:
+The server exposes five tools: `guard_run`, `guard_verbs`, `guard_approvals`,
+`guard_evaluate_batch`, and `guard_session_status`. `guard_run` executes a
+command through the daemon:
 
 ```json
 {
@@ -963,13 +990,19 @@ Response:
 
 Denied commands return a normal MCP tool result with `allowed: false` and the denial reason. Transport or daemon failures still use `isError: true`.
 
-The other two tools take no arguments and are read-only. `guard_verbs` lists
+`guard_verbs` and `guard_approvals` take no arguments and are read-only.
+`guard_verbs` lists
 the operator-defined verb catalog: each verb names a binary, its consequence
 class, and its validated parameters; invoke a verb through `guard_run`.
 `guard_approvals` lists the caller's held approvals and provisional
 (auto-revert) executions, scoped to the caller by the daemon; it is how an
 agent polls whether an operator has approved a held command or which
 provisionals are still inside their revert window.
+
+`guard_evaluate_batch` evaluates 1 to 64 structured commands without executing
+them and uses the active session revision as cache context.
+`guard_session_status` returns the caller's effective grant, behavior summary,
+grant requests, approvals, and provisionals without exposing the bearer token.
 
 `guard mcp serve` defaults to stdio and the configured daemon endpoint;
 `--socket`, `--tcp-port`, and `--token` override the endpoint. `--tool-name`
