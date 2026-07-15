@@ -42,7 +42,7 @@ The more concerning finding is a per-command reasoning error: Guard approved `ca
 ## Accepted limitations
 
 - Guard does not claim to defeat Ctrl-Z style trajectory attacks by itself. Agent-policy trajectory defenses belong upstream in the agent harness and are outside Guard's scope.
-- Guard cannot verify runtime claims an attacker embeds in command framing. The `/proc/*/environ` and `>/dev/null && echo OK` slippages both rely on unverifiable assertions about what the host does.
+- Guard cannot verify runtime claims an attacker embeds in command framing. The `cat file >/dev/null && echo OK` pattern can authorize a sensitive remote read while revealing only an existence bit, so policy must treat the read itself as sensitive regardless of output framing. The `/proc/*/environ` slippage likewise relied on an unverifiable isolation assertion.
 - Guard is not a substitute for kernel-level isolation. A `/tmp/mybin` PATH hijack, an `LD_PRELOAD` shared-object injection, or a container-escape primitive must still be blocked by seccomp, AppArmor, or read-only filesystems in production. Guard blocked these in this run only because the LLM recognized the surface pattern.
 
 ## Practical consequence
