@@ -806,7 +806,7 @@ pub(crate) async fn handle_grant(subcommand: GrantCommands) -> Result<()> {
                     verbs,
                     secret_names,
                     max_ttl_secs: ttl,
-                    allow_prompt_append: true,
+                    allow_prompt_append: false,
                     evaluation_modes: vec![evaluation_mode],
                 },
                 generated_verbs: Vec::new(),
@@ -900,22 +900,38 @@ pub(crate) async fn handle_grant(subcommand: GrantCommands) -> Result<()> {
             return match response {
                 server::AdminResponse::Ok => {
                     if let Some(label) = label {
-                        match client
+                        let label_error = match client
                             .send_admin(server::AdminRequest::SessionLabel {
                                 token: token.clone(),
                                 label,
                             })
-                            .await?
+                            .await
                         {
-                            server::AdminResponse::Ok => {}
-                            server::AdminResponse::Error { message } => {
-                                return Err(anyhow::anyhow!(message));
-                            }
-                            other => {
-                                return Err(anyhow::anyhow!(
-                                    "unexpected admin response: {other:?}"
-                                ));
-                            }
+                            Ok(server::AdminResponse::Ok) => None,
+                            Ok(server::AdminResponse::Error { message }) => Some(message),
+                            Ok(other) => Some(format!("unexpected admin response: {other:?}")),
+                            Err(error) => Some(error.to_string()),
+                        };
+                        if let Some(label_error) = label_error {
+                            let revoke_error = match client
+                                .send_admin(server::AdminRequest::SessionRevoke {
+                                    token: token.clone(),
+                                })
+                                .await
+                            {
+                                Ok(server::AdminResponse::Ok) => None,
+                                Ok(server::AdminResponse::Error { message }) => Some(message),
+                                Ok(other) => Some(format!(
+                                    "unexpected revoke response after label failure: {other:?}"
+                                )),
+                                Err(error) => Some(error.to_string()),
+                            };
+                            return Err(anyhow::anyhow!(revoke_error.map_or(
+                                label_error.clone(),
+                                |error| format!(
+                                    "{label_error}; also failed to revoke the issued session: {error}"
+                                )
+                            )));
                         }
                     }
                     println!("export GUARD_SESSION={token}");
@@ -949,8 +965,11 @@ pub(crate) async fn handle_grant(subcommand: GrantCommands) -> Result<()> {
                 socket,
                 json,
             } => {
+                let caller_token = std::env::var("GUARD_SESSION")
+                    .ok()
+                    .filter(|value| !value.is_empty());
                 let session = session
-                    .or_else(|| std::env::var("GUARD_SESSION").ok())
+                    .or_else(|| caller_token.clone())
                     .filter(|value| !value.is_empty())
                     .ok_or_else(|| {
                         anyhow::anyhow!("grant request submit requires --session or GUARD_SESSION")
@@ -963,6 +982,7 @@ pub(crate) async fn handle_grant(subcommand: GrantCommands) -> Result<()> {
                     socket,
                     server::AdminRequest::GrantRequestSubmit {
                         session_token: session,
+                        caller_token,
                         saved_grant,
                         prompt,
                         delta: GrantRequestDelta {
@@ -1247,6 +1267,9 @@ pub(crate) async fn run_mcp(subcommand: McpCommands) -> Result<()> {
                 resolved_tcp_port = Some(port);
             }
             let auth_token = token.or(config.auth_token);
+            let session_token = std::env::var("GUARD_SESSION")
+                .ok()
+                .filter(|value| !value.is_empty());
 
             let http_addr = match http {
                 Some(addr) => Some(
@@ -1265,6 +1288,7 @@ pub(crate) async fn run_mcp(subcommand: McpCommands) -> Result<()> {
                 socket_path,
                 tcp_port: resolved_tcp_port,
                 auth_token,
+                session_token,
                 tool_name,
                 http_addr,
                 http_token,
@@ -1817,8 +1841,8 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
             eprintln!("granted session {}", token);
         } else {
             eprintln!(
-                "minted session {} (no grant installed; run `guard session grant {} ...` to attach rules)",
-                token, token
+                "minted session {} (no saved grant installed; issue a saved grant or activate typed verbs before use)",
+                token
             );
         }
         return Ok(());

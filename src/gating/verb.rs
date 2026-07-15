@@ -335,6 +335,12 @@ impl VerbCatalog {
             serde_yaml_ng::from_str(text).context("failed to parse verb catalog")?;
         let mut verbs = BTreeMap::new();
         for mut verb in file.verbs {
+            if verb.name.starts_with("grant-") {
+                bail!(
+                    "verb name '{}' uses the reserved saved-grant namespace",
+                    verb.name
+                );
+            }
             normalize_operator_boundaries(&mut verb);
             validate_verb(&verb)?;
             if verbs.insert(verb.name.clone(), verb.clone()).is_some() {
@@ -2440,6 +2446,20 @@ verbs:
             .unwrap_err()
             .to_string()
             .contains("baseline deny coverage must be sticky"));
+    }
+
+    #[test]
+    fn operator_catalog_cannot_occupy_saved_grant_namespace() {
+        let error = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: grant-collision-generated
+    binary: "true"
+    consequence: reversible
+"#,
+        )
+        .expect_err("reserved namespace must fail");
+        assert!(error.to_string().contains("reserved saved-grant namespace"));
     }
 
     fn args_vec(v: &[&str]) -> Vec<String> {

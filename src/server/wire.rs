@@ -543,6 +543,8 @@ pub enum AdminRequest {
     GrantRequestSubmit {
         session_token: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_token: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         saved_grant: Option<String>,
         prompt: String,
         delta: GrantRequestDelta,
@@ -571,6 +573,8 @@ pub enum AdminRequest {
     EvaluateBatch {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_token: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_token: Option<String>,
         commands: Vec<BatchCommand>,
     },
 }

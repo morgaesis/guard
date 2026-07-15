@@ -183,6 +183,7 @@ impl Server {
                     .into_iter()
                     .map(|request| (request.handle.clone(), request))
                     .collect();
+                super::admin::prune_grant_requests(&self.config).await;
             }
             Err(error) => tracing::error!("failed to load grant requests: {}", error),
         }
@@ -510,7 +511,7 @@ impl Server {
                 }));
             } else {
                 tracing::info!(
-                    "api-proxy ({}): --gate consequence not set; recoverable writes forwarded without auto-revert and policy 'hold' rules deny fail-closed (no approval queue)",
+                    "api-proxy ({}): --gate consequence not set; recoverable writes forwarded without auto-revert and policy holds deny fail-closed (no approval queue)",
                     proxy.protocol_name()
                 );
             }

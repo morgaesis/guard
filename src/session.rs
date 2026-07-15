@@ -1,13 +1,11 @@
 //! Session grant registry and reporting model.
 //!
-//! A session is an opaque token the caller includes in `ExecuteRequest`.
-//! Grants attach extra allow/deny glob patterns to that token. Session
-//! denies short-circuit to DENY before the evaluator. Session allows skip only
-//! the evaluator: the command still stays inside the server binary floor,
-//! consequence routing, held-command snapshot binding, audit logging, and
-//! session recording. This lets an operator hand a specific agent narrow extra
-//! permissions (e.g. "mkdir /tmp/work/*", "rm /tmp/work/scratch.txt") without
-//! relaxing the global mode.
+//! A session is an opaque bearer token the caller includes in `ExecuteRequest`.
+//! Saved grants attach typed verb coverage, evaluator context, secret-name
+//! entitlements, and an evaluation mode to that token. Session-scoped coverage
+//! remains inside the server binary floor, consequence routing, held-command
+//! snapshot binding, audit logging, and session recording. Legacy allow and
+//! deny patterns remain serialized only for migration compatibility.
 //!
 //! The daemon keeps a live in-memory registry for fast decision checks,
 //! while `session_store.rs` persists grants and bounded interaction
@@ -50,22 +48,20 @@ pub struct SessionGrant {
     pub expires_at: Option<u64>,
     /// Free-form text appended to the LLM system prompt for evaluator
     /// calls made under this session token. Use to give the model
-    /// context the static glob patterns cannot express, e.g. "this
+    /// task context typed verb coverage does not encode, e.g. "this
     /// session is restoring a Postgres backup; treat pg_restore and
     /// related psql copy commands as expected".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_append: Option<String>,
-    /// Notes produced by static grant synthesis. These explain generated
-    /// allow/deny rules for display, but are not appended to the evaluator
-    /// prompt.
+    /// Human-readable migration notes. These are displayed to the operator but
+    /// are not appended to the evaluator prompt.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub generated_notes: Vec<String>,
-    /// If true, commands that miss the grant's static allow/deny rules are
-    /// denied instead of falling through to the normal evaluator.
+    /// If true, commands outside activated verb coverage are denied instead of
+    /// falling through to the evaluator.
     #[serde(default)]
     pub static_only: bool,
-    /// If true, fresh low-risk LLM fallback decisions may amend this grant
-    /// with exact allow/deny rules for future calls.
+    /// Legacy compatibility bit for exact session amendments.
     #[serde(default)]
     pub auto_amend: bool,
     /// Unix seconds when the grant was installed. Used by `session
@@ -744,23 +740,6 @@ impl SessionRegistry {
         (!grant.is_expired(now_unix())).then_some(grant.expires_at)
     }
 
-    pub fn secret_name_allowed(&self, token: &str, name: &str) -> Option<bool> {
-        let grant = self.grants.get(token)?;
-        if grant.is_expired(now_unix()) {
-            return None;
-        }
-        if grant.scope.saved_grant.is_none() {
-            return Some(true);
-        }
-        Some(grant.scope.secret_names.iter().any(|selector| {
-            selector == name
-                || selector == "*"
-                || selector
-                    .strip_suffix('*')
-                    .is_some_and(|prefix| name.starts_with(prefix))
-        }))
-    }
-
     /// Immutable authority captured when a hold or containment envelope is
     /// created. `None` selectors mean the session is not saved-grant scoped.
     pub fn authority_snapshot(&self, token: &str) -> Option<(String, Option<Vec<String>>)> {
@@ -818,13 +797,13 @@ impl SessionRegistry {
         Some(expires_at)
     }
 
-    pub fn set_label(&mut self, token: &str, label: String) -> Option<bool> {
+    pub fn set_label(&mut self, token: &str, label: Option<String>) -> Option<bool> {
         let grant = self.grants.get_mut(token)?;
         if grant.is_expired(now_unix()) {
             return None;
         }
-        let changed = grant.scope.label.as_deref() != Some(label.as_str());
-        grant.scope.label = Some(label);
+        let changed = grant.scope.label != label;
+        grant.scope.label = label;
         if changed {
             self.revision = self.revision.saturating_add(1);
         }
@@ -1661,5 +1640,25 @@ mod tests {
             .suspension_reason("tok", &ratio_limits)
             .unwrap()
             .contains("25% denials"));
+    }
+
+    #[test]
+    fn session_label_can_be_cleared() {
+        let mut registry = reg_with("tok", &[], &[]);
+        assert_eq!(
+            registry.set_label("tok", Some("incident".to_string())),
+            Some(true)
+        );
+        assert_eq!(registry.set_label("tok", None), Some(true));
+        assert_eq!(
+            registry
+                .show_with_limits("tok", 1, &SessionBehaviorLimits::default())
+                .unwrap()
+                .active
+                .unwrap()
+                .scope
+                .label,
+            None
+        );
     }
 }

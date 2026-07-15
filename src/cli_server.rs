@@ -193,15 +193,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             }
             let approval_ttl = approval_ttl
                 .or_else(|| guard_env("APPROVAL_TTL").filter(|value| !value.is_empty()))
-                .map(|value| {
-                    if value.eq_ignore_ascii_case("unbounded") {
-                        Ok(u64::MAX)
-                    } else {
-                        value
-                            .parse::<u64>()
-                            .context("invalid approval TTL (expected seconds or 'unbounded')")
-                    }
-                })
+                .map(|value| crate::parse_unbounded_secs(&value).map_err(anyhow::Error::msg))
                 .transpose()?
                 .unwrap_or(crate::server::APPROVAL_TTL_SECS);
 

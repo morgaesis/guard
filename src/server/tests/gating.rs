@@ -15,11 +15,12 @@ use crate::server::wire::{
     RevertSpec,
 };
 use crate::server::{ServerConfig, APPROVAL_TTL_SECS};
-#[cfg(unix)]
 use crate::session::SessionGrant;
 #[cfg(unix)]
 use crate::session_store::SessionStore;
 use guard::gating::approval::{Approval, ApprovalSnapshot, ApprovalStatus};
+#[cfg(unix)]
+use guard::gating::approval::{SecretBinding, ToolSecretBinding};
 #[cfg(unix)]
 use guard::gating::provisional::{ApiRevertPlan, Provisional, ProvisionalStatus};
 use guard::gating::{Coverage, GateMode, Reversibility};
@@ -87,6 +88,24 @@ fn contain_request(binary: &str, args: &[&str], revert: RevertSpec) -> ExecuteRe
         require_approval: None,
         wait_approval_secs: None,
         verb: None,
+    }
+}
+
+fn active_session() -> SessionGrant {
+    SessionGrant {
+        allow: Vec::new(),
+        deny: Vec::new(),
+        allow_exact: Vec::new(),
+        deny_exact: Vec::new(),
+        activated_verbs: Vec::new(),
+        override_markers: Vec::new(),
+        scope: Default::default(),
+        expires_at: None,
+        prompt_append: None,
+        generated_notes: Vec::new(),
+        static_only: false,
+        auto_amend: false,
+        granted_at: 0,
     }
 }
 
@@ -407,6 +426,10 @@ async fn due_confirm_check_reuses_secret_bindings_and_keeps_the_change() {
     let revert_marker = temp.path().join("revert-ran");
     let (cfg, _operator, agent) = gating_config(7_021, 1_000);
     let principal = agent.principal().expect("agent principal");
+    cfg.sessions
+        .write()
+        .await
+        .grant("check-session".to_string(), active_session());
     cfg.secrets
         .set(&principal, "check-token", "expected-check-secret")
         .await
@@ -941,6 +964,7 @@ async fn recoverable_with_unaffirmable_revert_is_held_for_review() {
         revert_preauthorized: false,
         verb: None,
         bypass: false,
+        authority: None,
     };
     let mut sink = tokio::io::sink();
     let result = route_gated_allow(request, &cfg, &agent, inputs, 0, false, &mut sink).await;
@@ -964,6 +988,141 @@ async fn recoverable_with_unaffirmable_revert_is_held_for_review() {
         ApprovalStatus::Pending,
         "the forward command must be queued for an operator decision"
     );
+}
+
+#[tokio::test]
+async fn post_evaluator_session_revoke_or_expiry_fails_before_arm_or_hold() {
+    let (cfg, _operator, agent) = gating_config(7022, 1000);
+    cfg.sessions
+        .write()
+        .await
+        .grant("revoked-during-eval".to_string(), active_session());
+    let revoked_authority = cfg
+        .sessions
+        .read()
+        .await
+        .authority_snapshot("revoked-during-eval")
+        .unwrap()
+        .into();
+    assert!(cfg.sessions.write().await.revoke("revoked-during-eval"));
+    let mut contained = contain_request("true", &[], RevertSpec::new("true", Vec::new()));
+    contained.session_token = Some("revoked-during-eval".to_string());
+    let mut sink = tokio::io::sink();
+    let denied = route_gated_allow(
+        contained,
+        &cfg,
+        &agent,
+        GateInputs {
+            reason: "evaluator approved before revoke".to_string(),
+            risk: Some(2),
+            reversibility: Some(Reversibility::Recoverable),
+            revert_preauthorized: true,
+            verb: None,
+            bypass: false,
+            authority: Some(revoked_authority),
+        },
+        0,
+        false,
+        &mut sink,
+    )
+    .await;
+    assert!(!denied.policy_allowed());
+    assert!(denied.policy_reason().contains("revoked"));
+    assert_eq!(cfg.provisional.read().await.outstanding(), 0);
+
+    cfg.sessions
+        .write()
+        .await
+        .grant("expired-during-eval".to_string(), active_session());
+    let expired_authority = cfg
+        .sessions
+        .read()
+        .await
+        .authority_snapshot("expired-during-eval")
+        .unwrap()
+        .into();
+    let mut expired = active_session();
+    expired.expires_at = Some(now_unix().saturating_sub(1));
+    cfg.sessions
+        .write()
+        .await
+        .grant("expired-during-eval".to_string(), expired);
+    let mut held = contain_request("true", &[], RevertSpec::new("true", Vec::new()));
+    held.revert = None;
+    held.session_token = Some("expired-during-eval".to_string());
+    let denied = route_gated_allow(
+        held,
+        &cfg,
+        &agent,
+        GateInputs {
+            reason: "evaluator approved before expiry".to_string(),
+            risk: Some(9),
+            reversibility: Some(Reversibility::Irreversible),
+            revert_preauthorized: false,
+            verb: None,
+            bypass: false,
+            authority: Some(expired_authority),
+        },
+        0,
+        false,
+        &mut sink,
+    )
+    .await;
+    assert!(!denied.policy_allowed());
+    assert!(denied.policy_reason().contains("expired"));
+    assert_eq!(cfg.approvals.read().await.outstanding(), 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn session_status_does_not_cross_expose_same_principal_provisionals() {
+    let (cfg, _operator, agent) = gating_config(7024, 1000);
+    for token in ["status-session-a", "status-session-b"] {
+        cfg.sessions
+            .write()
+            .await
+            .grant(token.to_string(), active_session());
+        cfg.provisional.write().await.insert(Provisional {
+            handle: format!("provisional-{token}"),
+            principal: agent.principal(),
+            binary: "true".to_string(),
+            args: Vec::new(),
+            cwd: None,
+            secret_keys: BTreeMap::new(),
+            secret_file_keys: BTreeMap::new(),
+            revert_binary: "true".to_string(),
+            revert_args: Vec::new(),
+            confirm_check_binary: None,
+            confirm_check_args: Vec::new(),
+            control_path: Some("test".to_string()),
+            session_fingerprint: Some(audit_session_fingerprint(Some(token))),
+            session_revision: cfg.sessions.read().await.effective_revision_key(token),
+            secret_entitlements: None,
+            api_revert: None,
+            reason: "test".to_string(),
+            created_unix: now_unix(),
+            deadline_unix: now_unix().saturating_add(60),
+            forward_done: true,
+            status: ProvisionalStatus::Armed,
+            revert_exit: None,
+            revert_detail: None,
+        });
+    }
+
+    let response = handle_admin_request(
+        &cfg,
+        &agent,
+        AdminRequest::SessionStatus {
+            token: "status-session-a".to_string(),
+            caller_token: Some("status-session-a".to_string()),
+        },
+    )
+    .await;
+    let AdminResponse::SessionStatus { provisionals, .. } = response else {
+        panic!("expected session status, got {response:?}");
+    };
+    assert_eq!(provisionals.len(), 1);
+    assert_eq!(provisionals[0].handle, "provisional-status-session-a");
 }
 
 /// hold -> operator approve executes from the bound snapshot; a non-operator
@@ -1057,6 +1216,133 @@ async fn hold_then_operator_approve_executes_snapshot_nonoperator_refused() {
         cfg.approvals.read().await.get(&handle).unwrap().status,
         ApprovalStatus::Approved
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn approval_rejects_tool_secret_rotated_after_hold() {
+    let (cfg, operator, agent) = gating_config(7023, 1000);
+    let principal = agent.principal().unwrap();
+    cfg.secrets
+        .set(&principal, "broker/token", "held-value")
+        .await
+        .unwrap();
+    let tools = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        tools.path(),
+        "tools:\n  true:\n    secrets:\n      BROKER_TOKEN: broker/token\n",
+    )
+    .unwrap();
+    *cfg.tool_registry.write().await =
+        crate::tool_config::ToolRegistry::load(tools.path()).unwrap();
+    let request = ExecuteRequest {
+        binary: "true".to_string(),
+        args: Vec::new(),
+        auth_token: None,
+        env: HashMap::new(),
+        secrets: HashMap::new(),
+        secret_files: HashMap::new(),
+        stream: false,
+        session_token: None,
+        revert: None,
+        confirm_within_secs: None,
+        reevaluate: false,
+        ssh_hostkey: None,
+        cwd: None,
+        require_approval: None,
+        wait_approval_secs: None,
+        verb: None,
+    };
+    let mut sink = tokio::io::sink();
+    let held = hold_for_approval(
+        request,
+        &cfg,
+        &agent,
+        Some(principal.clone()),
+        "tool secret hold".to_string(),
+        Some(9),
+        Some(Reversibility::Irreversible),
+        None,
+        false,
+        &mut sink,
+    )
+    .await;
+    let ExecOutcome::Held { handle, .. } = held.exec else {
+        panic!("expected held command")
+    };
+    let snapshot = cfg
+        .approvals
+        .read()
+        .await
+        .get(&handle)
+        .unwrap()
+        .snapshot
+        .clone();
+    let binding = snapshot.secret_binding.as_ref().unwrap();
+    let tool_binding = binding
+        .tool_hashes
+        .as_ref()
+        .unwrap()
+        .get("BROKER_TOKEN")
+        .unwrap();
+    assert_eq!(tool_binding.secret_name, "broker/token");
+
+    let mut legacy_snapshot = snapshot.clone();
+    legacy_snapshot.secret_binding = None;
+    let legacy_result = execute_snapshot(&cfg, &legacy_snapshot, "operator approved").await;
+    assert!(matches!(
+        legacy_result.exec,
+        ExecOutcome::Failed { started: false, ref reason }
+            if reason.contains("secrets were not bound")
+    ));
+
+    std::fs::write(
+        tools.path(),
+        "tools:\n  true:\n    secrets:\n      RENAMED_TOKEN: broker/token\n",
+    )
+    .unwrap();
+    *cfg.tool_registry.write().await =
+        crate::tool_config::ToolRegistry::load(tools.path()).unwrap();
+    let remapped_result = execute_snapshot(&cfg, &snapshot, "operator approved").await;
+    assert!(matches!(
+        remapped_result.exec,
+        ExecOutcome::Failed { started: false, ref reason }
+            if reason.contains("tool secret mappings changed")
+    ));
+
+    std::fs::write(
+        tools.path(),
+        "tools:\n  true:\n    secrets:\n      BROKER_TOKEN: broker/token\n",
+    )
+    .unwrap();
+    *cfg.tool_registry.write().await =
+        crate::tool_config::ToolRegistry::load(tools.path()).unwrap();
+    cfg.secrets
+        .set(&principal, "broker/token", "rotated-value")
+        .await
+        .unwrap();
+    let response = handle_admin_request(
+        &cfg,
+        &operator,
+        AdminRequest::Approve {
+            handle: handle.clone(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        response,
+        AdminResponse::GateAction {
+            exit_code: None,
+            ..
+        }
+    ));
+    let approval = cfg.approvals.read().await.get(&handle).cloned().unwrap();
+    assert_eq!(approval.status, ApprovalStatus::ExecFailed);
+    assert!(approval
+        .decided_reason
+        .as_deref()
+        .unwrap_or_default()
+        .contains("tool-configured secret value changed"));
 }
 
 /// Wait (bounded) for a pending approval row to appear and return its handle.
@@ -1252,6 +1538,10 @@ async fn hold_then_ttl_expiry_denies_fail_closed() {
     let (cfg, _operator, agent) = gating_config(7006, 1000);
     let agent_principal = agent.principal();
     let session_token = new_handle();
+    cfg.sessions
+        .write()
+        .await
+        .grant(session_token.clone(), active_session());
 
     let request = ExecuteRequest {
         binary: "rm".to_string(),
@@ -1824,7 +2114,17 @@ async fn stored_entitlements_cover_tool_secrets_for_approval_check_and_revert() 
         verb_params: BTreeMap::new(),
         catalog_version: None,
         principal: Some(principal.clone()),
-        secret_binding: None,
+        secret_binding: Some(SecretBinding {
+            salt: "test-salt".to_string(),
+            hashes: BTreeMap::new(),
+            tool_hashes: Some(BTreeMap::from([(
+                "BROKER_TOKEN".to_string(),
+                ToolSecretBinding {
+                    secret_name: "broker/token".to_string(),
+                    hash: hash_secret_value("test-salt", "never-printed"),
+                },
+            )])),
+        }),
     };
     let approved = execute_snapshot(&cfg, &snapshot, "operator approved").await;
     assert!(matches!(

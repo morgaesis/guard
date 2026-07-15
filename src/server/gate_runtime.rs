@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use tokio::io::AsyncWrite;
 
 use super::execute::{
-    audit_command_line, audit_session_fingerprint, exec_after_approval,
-    exec_after_approval_with_secret_authority, exec_with_read_grant_retry,
+    audit_command_line, audit_session_fingerprint, exec_after_approval_with_secret_authority,
+    exec_with_read_grant_retry_with_secret_authority,
 };
 use super::grants::{delete_read_grant_row, finish_read_grant_revert, persist_read_grant};
 use super::runtime::NotifyEvent;
@@ -755,6 +755,42 @@ pub(super) struct GateInputs {
     /// operator-authored deterministic allows (static policy), already vetted and
     /// carrying no reversibility class.
     pub(super) bypass: bool,
+    /// Session authority captured before evaluation or deterministic routing.
+    /// Its revision is rechecked before routing and its immutable entitlements
+    /// govern the forward command, confirmation check, and rollback.
+    pub(super) authority: Option<SessionAuthoritySnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SessionAuthoritySnapshot {
+    pub(super) revision: String,
+    pub(super) secret_entitlements: Option<Vec<String>>,
+}
+
+impl From<(String, Option<Vec<String>>)> for SessionAuthoritySnapshot {
+    fn from((revision, secret_entitlements): (String, Option<Vec<String>>)) -> Self {
+        Self {
+            revision,
+            secret_entitlements,
+        }
+    }
+}
+
+async fn session_authority_is_current(
+    config: &ServerConfig,
+    request: &ExecuteRequest,
+    expected: Option<&SessionAuthoritySnapshot>,
+) -> bool {
+    let Some(token) = request.session_token.as_deref() else {
+        return expected.is_none();
+    };
+    let current = config
+        .sessions
+        .read()
+        .await
+        .authority_snapshot(token)
+        .map(SessionAuthoritySnapshot::from);
+    current.as_ref() == expected
 }
 
 /// Route an approved command through the consequence gate.
@@ -767,9 +803,26 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
     stream_output: bool,
     stream_writer: &mut W,
 ) -> ExecuteResult {
+    if request.session_token.is_some() {
+        let Some(expected) = inputs.authority.as_ref() else {
+            return ExecuteResult::denied(
+                "session authority was not captured before execution routing",
+            );
+        };
+        if !session_authority_is_current(config, &request, Some(expected)).await {
+            return ExecuteResult::denied(
+                "session expired, was revoked, or changed while the command was being evaluated",
+            );
+        }
+    }
+    let secret_authority = inputs
+        .authority
+        .as_ref()
+        .map(|snapshot| snapshot.secret_entitlements.clone());
+
     // Gating off, or an operator-authored static-policy allow: execute directly.
     if !config.gate.is_on() || inputs.bypass {
-        return exec_with_read_grant_retry(
+        return exec_with_read_grant_retry_with_secret_authority(
             request,
             config,
             caller,
@@ -777,6 +830,7 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
             depth,
             stream_output,
             stream_writer,
+            secret_authority,
         )
         .await;
     }
@@ -795,7 +849,7 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
 
     match outcome {
         GateOutcome::ExecuteNow => {
-            exec_with_read_grant_retry(
+            exec_with_read_grant_retry_with_secret_authority(
                 request,
                 config,
                 caller,
@@ -803,6 +857,7 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
                 depth,
                 stream_output,
                 stream_writer,
+                secret_authority,
             )
             .await
         }
@@ -825,7 +880,7 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
                             "{} [held for operator review: containment envelope not validated: {}]",
                             inputs.reason, why
                         );
-                        return hold_for_approval(
+                        return hold_for_approval_with_authority(
                             request,
                             config,
                             caller,
@@ -836,12 +891,13 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
                             inputs.verb,
                             stream_output,
                             stream_writer,
+                            inputs.authority,
                         )
                         .await;
                     }
                 }
             }
-            arm_containment(
+            arm_containment_with_authority(
                 request,
                 config,
                 caller,
@@ -850,11 +906,12 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
                 depth,
                 stream_output,
                 stream_writer,
+                inputs.authority,
             )
             .await
         }
         GateOutcome::Hold => {
-            hold_for_approval(
+            hold_for_approval_with_authority(
                 request,
                 config,
                 caller,
@@ -865,6 +922,7 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
                 inputs.verb,
                 stream_output,
                 stream_writer,
+                inputs.authority,
             )
             .await
         }
@@ -874,6 +932,7 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
 /// Arm a containment envelope: persist the provisional, run the forward command,
 /// then mark it armed with an auto-revert deadline.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(super) async fn arm_containment<W: AsyncWrite + Unpin>(
     request: ExecuteRequest,
     config: &ServerConfig,
@@ -883,6 +942,41 @@ pub(super) async fn arm_containment<W: AsyncWrite + Unpin>(
     depth: u32,
     stream_output: bool,
     stream_writer: &mut W,
+) -> ExecuteResult {
+    let authority = match request.session_token.as_deref() {
+        Some(token) => config
+            .sessions
+            .read()
+            .await
+            .authority_snapshot(token)
+            .map(SessionAuthoritySnapshot::from),
+        None => None,
+    };
+    arm_containment_with_authority(
+        request,
+        config,
+        caller,
+        caller_principal,
+        reason,
+        depth,
+        stream_output,
+        stream_writer,
+        authority,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn arm_containment_with_authority<W: AsyncWrite + Unpin>(
+    request: ExecuteRequest,
+    config: &ServerConfig,
+    caller: &CallerIdentity,
+    caller_principal: Option<PrincipalKey>,
+    reason: String,
+    depth: u32,
+    stream_output: bool,
+    stream_writer: &mut W,
+    authority: Option<SessionAuthoritySnapshot>,
 ) -> ExecuteResult {
     // decide_gate only returns Contain when a revert is present.
     let revert = match request.revert.clone() {
@@ -953,6 +1047,7 @@ pub(super) async fn arm_containment<W: AsyncWrite + Unpin>(
 
     let handle = new_handle();
     let now = now_unix();
+
     // The window is caller-supplied, so cap it: a contained change always
     // auto-reverts within MAX_CONFIRM_WITHIN_SECS even if the caller asks for
     // longer. The caller can still shorten it.
@@ -960,13 +1055,20 @@ pub(super) async fn arm_containment<W: AsyncWrite + Unpin>(
         .confirm_within_secs
         .unwrap_or(DEFAULT_CONFIRM_WITHIN_SECS)
         .clamp(1, MAX_CONFIRM_WITHIN_SECS);
+    if !session_authority_is_current(config, &request, authority.as_ref()).await {
+        return ExecuteResult::denied(
+            "session expired, was revoked, or changed before containment could be armed",
+        );
+    }
     let (session_revision, secret_entitlements) = match request.session_token.as_deref() {
-        Some(token) => config
-            .sessions
-            .read()
-            .await
-            .authority_snapshot(token)
-            .unwrap_or((String::new(), None)),
+        Some(_) => match authority {
+            Some(snapshot) => (snapshot.revision, snapshot.secret_entitlements),
+            None => {
+                return ExecuteResult::denied(
+                    "session expired or was revoked before containment could be armed",
+                )
+            }
+        },
         None => (String::new(), None),
     };
     let provisional = Provisional {
@@ -1024,7 +1126,7 @@ pub(super) async fn arm_containment<W: AsyncWrite + Unpin>(
     config.provisional.write().await.insert(provisional.clone());
 
     let session_fingerprint = audit_session_fingerprint(request.session_token.as_deref());
-    let result = exec_after_approval(
+    let result = exec_after_approval_with_secret_authority(
         request,
         config,
         caller,
@@ -1032,6 +1134,7 @@ pub(super) async fn arm_containment<W: AsyncWrite + Unpin>(
         depth,
         stream_output,
         stream_writer,
+        Some(provisional.secret_entitlements.clone()),
     )
     .await;
     let exposed_secret_refs = result.exposed_secret_refs().to_vec();
@@ -1113,6 +1216,7 @@ pub(super) async fn arm_containment<W: AsyncWrite + Unpin>(
 
 /// Hold an irreversible/uncertain/high-risk command for operator approval.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(super) async fn hold_for_approval<W: AsyncWrite + Unpin>(
     request: ExecuteRequest,
     config: &ServerConfig,
@@ -1124,6 +1228,45 @@ pub(super) async fn hold_for_approval<W: AsyncWrite + Unpin>(
     verb: Option<VerbContext>,
     stream_output: bool,
     stream_writer: &mut W,
+) -> ExecuteResult {
+    let authority = match request.session_token.as_deref() {
+        Some(token) => config
+            .sessions
+            .read()
+            .await
+            .authority_snapshot(token)
+            .map(SessionAuthoritySnapshot::from),
+        None => None,
+    };
+    hold_for_approval_with_authority(
+        request,
+        config,
+        caller,
+        caller_principal,
+        reason,
+        risk,
+        reversibility,
+        verb,
+        stream_output,
+        stream_writer,
+        authority,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn hold_for_approval_with_authority<W: AsyncWrite + Unpin>(
+    request: ExecuteRequest,
+    config: &ServerConfig,
+    caller: &CallerIdentity,
+    caller_principal: Option<PrincipalKey>,
+    reason: String,
+    risk: Option<i32>,
+    reversibility: Option<Reversibility>,
+    verb: Option<VerbContext>,
+    stream_output: bool,
+    stream_writer: &mut W,
+    authority: Option<SessionAuthoritySnapshot>,
 ) -> ExecuteResult {
     if config.dry_run {
         return ExecuteResult::dry_run_gated(
@@ -1141,6 +1284,28 @@ pub(super) async fn hold_for_approval<W: AsyncWrite + Unpin>(
     let handle = new_handle();
     let now = now_unix();
 
+    let tool_secret_sources = {
+        let mut registry = config.tool_registry.write().await;
+        let _ = registry.reload_if_stale();
+        match registry
+            .resolve_env(
+                &request.binary,
+                &config.secrets,
+                caller_principal.as_ref(),
+                caller.user_key().as_deref(),
+            )
+            .await
+        {
+            Ok(resolved) => resolved.secret_sources,
+            Err(error) => {
+                return ExecuteResult::exec_failed(
+                    reason,
+                    format!("approval hold rejected: tool secret resolution failed: {error}"),
+                )
+            }
+        }
+    };
+
     // Secret-value binding: hash each referenced secret value NOW so a
     // same-principal caller cannot swap its mapped values between this hold and
     // the operator's approval. The binding is MANDATORY when there are secrets
@@ -1150,7 +1315,7 @@ pub(super) async fn hold_for_approval<W: AsyncWrite + Unpin>(
     // (so it would otherwise be unbound) and then creates it with a chosen value
     // before approval. Verification at approve time fails closed on any change.
     let secret_binding = match caller_principal.clone() {
-        Some(principal) if !request.secrets.is_empty() || !request.secret_files.is_empty() => {
+        Some(principal) => {
             let salt = hex_encode(&rand::random::<u128>().to_le_bytes());
             let mut hashes = std::collections::BTreeMap::new();
             for (env_var, secret_name) in request.secrets.iter().chain(&request.secret_files) {
@@ -1160,18 +1325,44 @@ pub(super) async fn hold_for_approval<W: AsyncWrite + Unpin>(
                 };
                 hashes.insert(env_var.clone(), entry);
             }
-            Some(guard::gating::approval::SecretBinding { salt, hashes })
+            let mut tool_hashes = std::collections::BTreeMap::new();
+            for (env_var, secret_name) in tool_secret_sources {
+                let entry = match config.secrets.get(&principal, &secret_name).await {
+                    Ok(Some(value)) => hash_secret_value(&salt, &value),
+                    _ => SECRET_BINDING_UNRESOLVED.to_string(),
+                };
+                tool_hashes.insert(
+                    env_var,
+                    guard::gating::approval::ToolSecretBinding {
+                        secret_name,
+                        hash: entry,
+                    },
+                );
+            }
+            Some(guard::gating::approval::SecretBinding {
+                salt,
+                hashes,
+                tool_hashes: Some(tool_hashes),
+            })
         }
         _ => None,
     };
 
+    if !session_authority_is_current(config, &request, authority.as_ref()).await {
+        return ExecuteResult::denied(
+            "session expired, was revoked, or changed before approval hold creation",
+        );
+    }
+
     let (session_revision, secret_entitlements) = match request.session_token.as_deref() {
-        Some(token) => config
-            .sessions
-            .read()
-            .await
-            .authority_snapshot(token)
-            .unwrap_or((String::new(), None)),
+        Some(_) => match authority {
+            Some(snapshot) => (snapshot.revision, snapshot.secret_entitlements),
+            None => {
+                return ExecuteResult::denied(
+                    "session expired or was revoked before approval hold creation",
+                )
+            }
+        },
         None => (String::new(), None),
     };
     let snapshot = ApprovalSnapshot {
@@ -1363,9 +1554,10 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 /// Salted SHA-256 of a secret value, hex-encoded. The salt and a 0x00 domain
-/// separator ensure the stored digest is not a plain hash of the value, so a
-/// persisted binding does not expose a brute-forceable fingerprint of the
-/// secret. Used only to detect a value change between hold and approval.
+/// separator ensure the stored digest is not a reusable plain hash of the
+/// value. The persisted salt does not make a weak secret resistant to offline
+/// guessing, so approval state remains daemon-private. Used only to detect a
+/// value change between hold and approval.
 pub(super) fn hash_secret_value(salt_hex: &str, value: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -1407,6 +1599,43 @@ pub(super) async fn execute_snapshot(
                     .to_string(),
             );
         }
+    }
+
+    let caller = reconstruct_caller(snapshot.principal.clone(), &CallerIdentity::Unknown);
+
+    let current_tool_sources = {
+        let mut registry = config.tool_registry.write().await;
+        let _ = registry.reload_if_stale();
+        match registry
+            .resolve_env(
+                &snapshot.binary,
+                &config.secrets,
+                snapshot.principal.as_ref(),
+                caller.user_key().as_deref(),
+            )
+            .await
+        {
+            Ok(resolved) => resolved.secret_sources,
+            Err(error) => {
+                return ExecuteResult::exec_failed(
+                    reason.to_string(),
+                    format!("approval rejected: failed to re-resolve tool secrets: {error}"),
+                )
+            }
+        }
+    };
+
+    // Legacy holds cannot safely use live secret mappings because no value or
+    // tool-environment binding exists for the operator-reviewed snapshot.
+    if snapshot.secret_binding.is_none()
+        && (!snapshot.secret_keys.is_empty()
+            || !snapshot.secret_file_keys.is_empty()
+            || !current_tool_sources.is_empty())
+    {
+        return ExecuteResult::exec_failed(
+            reason.to_string(),
+            "approval rejected: secrets were not bound by the held snapshot".to_string(),
+        );
     }
 
     // Verify the secret-value binding captured at hold time. A same-principal
@@ -1468,9 +1697,66 @@ pub(super) async fn execute_snapshot(
                 );
             }
         }
+        let Some(tool_hashes) = binding.tool_hashes.as_ref() else {
+            if !current_tool_sources.is_empty() {
+                return ExecuteResult::exec_failed(
+                    reason.to_string(),
+                    "approval rejected: tool secrets were not bound by the held snapshot"
+                        .to_string(),
+                );
+            }
+            return execute_snapshot_request(config, snapshot, reason, &caller).await;
+        };
+        if current_tool_sources.len() != tool_hashes.len()
+            || current_tool_sources.iter().any(|(env_var, secret_name)| {
+                tool_hashes
+                    .get(env_var)
+                    .is_none_or(|bound| bound.secret_name != *secret_name)
+            })
+        {
+            return ExecuteResult::exec_failed(
+                reason.to_string(),
+                "approval rejected: tool secret mappings changed since the command was held"
+                    .to_string(),
+            );
+        }
+        for bound in tool_hashes.values() {
+            let resolved = match config.secrets.get(&principal, &bound.secret_name).await {
+                Ok(value) => value,
+                Err(error) => {
+                    return ExecuteResult::exec_failed(
+                        reason.to_string(),
+                        format!(
+                            "approval rejected: failed to re-resolve tool secret '{}': {error}",
+                            bound.secret_name
+                        ),
+                    )
+                }
+            };
+            let consistent = match (bound.hash.as_str(), resolved) {
+                (SECRET_BINDING_UNRESOLVED, None) => true,
+                (SECRET_BINDING_UNRESOLVED, Some(_)) => false,
+                (hash, Some(value)) => hash_secret_value(&binding.salt, &value) == hash,
+                (_, None) => false,
+            };
+            if !consistent {
+                return ExecuteResult::exec_failed(
+                    reason.to_string(),
+                    "approval rejected: a tool-configured secret value changed since the command was held"
+                        .to_string(),
+                );
+            }
+        }
     }
+    execute_snapshot_request(config, snapshot, reason, &caller).await
+}
 
-    let caller = reconstruct_caller(snapshot.principal.clone(), &CallerIdentity::Unknown);
+async fn execute_snapshot_request(
+    config: &ServerConfig,
+    snapshot: &ApprovalSnapshot,
+    reason: &str,
+    caller: &CallerIdentity,
+) -> ExecuteResult {
     let request = ExecuteRequest {
         binary: snapshot.binary.clone(),
         args: snapshot.args.clone(),
@@ -1505,7 +1791,7 @@ pub(super) async fn execute_snapshot(
     exec_after_approval_with_secret_authority(
         request,
         config,
-        &caller,
+        caller,
         reason.to_string(),
         0,
         false,

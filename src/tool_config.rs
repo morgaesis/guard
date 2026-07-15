@@ -2,6 +2,7 @@ use crate::secrets::SecretManager;
 use anyhow::{Context, Result};
 use guard::principal::PrincipalKey;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -12,6 +13,9 @@ pub struct ResolvedToolEnv {
     /// Secret-store keys that contributed values to `env`. Values are never
     /// retained here, so callers can audit provenance without exposing them.
     pub secret_refs: Vec<String>,
+    /// Environment variable -> secret-store key after applying user overrides.
+    /// Values are references only; secret values remain in `env` for execution.
+    pub secret_sources: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -173,7 +177,7 @@ impl ToolRegistry {
         };
 
         let mut env = tool_config.env.clone();
-        let mut secret_sources = HashMap::new();
+        let mut secret_sources = BTreeMap::new();
 
         for (env_var, secret_key) in &tool_config.secrets {
             let principal = principal.ok_or_else(|| {
@@ -226,10 +230,14 @@ impl ToolRegistry {
             }
         }
 
-        let mut secret_refs: Vec<String> = secret_sources.into_values().collect();
+        let mut secret_refs: Vec<String> = secret_sources.values().cloned().collect();
         secret_refs.sort();
         secret_refs.dedup();
-        Ok(ResolvedToolEnv { env, secret_refs })
+        Ok(ResolvedToolEnv {
+            env,
+            secret_refs,
+            secret_sources,
+        })
     }
 
     fn save(&self) -> Result<()> {

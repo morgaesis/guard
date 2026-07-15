@@ -15,6 +15,31 @@ fn execute_wire_shape_parses_to_execute_variant() {
     assert!(matches!(msg, IncomingMessage::Execute(_)));
 }
 
+#[test]
+fn session_scoped_public_rpcs_carry_distinct_owner_bearers() {
+    let batch = crate::server::wire::AdminRequest::EvaluateBatch {
+        session_token: Some("target".to_string()),
+        caller_token: Some("owner".to_string()),
+        commands: vec![crate::server::BatchCommand {
+            binary: "true".to_string(),
+            args: Vec::new(),
+        }],
+    };
+    assert!(!batch.requires_daemon_uid());
+    let json = serde_json::to_value(&batch).unwrap();
+    assert_eq!(json["session_token"], "target");
+    assert_eq!(json["caller_token"], "owner");
+
+    let submit = crate::server::wire::AdminRequest::GrantRequestSubmit {
+        session_token: "target".to_string(),
+        caller_token: Some("owner".to_string()),
+        saved_grant: None,
+        prompt: "request".to_string(),
+        delta: Default::default(),
+    };
+    assert!(!submit.requires_daemon_uid());
+}
+
 // ---- Audit-line redaction helpers ---------------------------------------
 
 /// Argv rendered into audit lines must have inline credentials masked:

@@ -38,6 +38,25 @@ use super::{args, capture, make_test_config, paranoid_test_config};
 static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(unix)]
+fn unrestricted_session() -> SessionGrant {
+    SessionGrant {
+        allow: Vec::new(),
+        deny: Vec::new(),
+        allow_exact: Vec::new(),
+        deny_exact: Vec::new(),
+        activated_verbs: Vec::new(),
+        override_markers: Vec::new(),
+        scope: Default::default(),
+        expires_at: None,
+        prompt_append: None,
+        generated_notes: Vec::new(),
+        static_only: false,
+        auto_amend: false,
+        granted_at: 0,
+    }
+}
+
+#[cfg(unix)]
 struct EnvRestore {
     key: &'static str,
     value: Option<OsString>,
@@ -148,11 +167,16 @@ fn cwd_is_included_in_audit_and_evaluation_context() {
 #[cfg(unix)]
 #[tokio::test]
 async fn secret_exposure_is_audited_only_after_successful_spawn() {
+    let _test_lock = TEST_ENV_LOCK.lock().await;
     let caller = CallerIdentity::Unix { uid: 1000 };
     let principal = PrincipalKey::from_uid(1000);
     let token = "opaque-session-token-never-logged";
 
     let (cfg, buf) = make_test_config();
+    cfg.sessions
+        .write()
+        .await
+        .grant(token.to_string(), unrestricted_session());
     cfg.secrets
         .set(&principal, "service/token", "secret-value-never-logged")
         .await
@@ -188,6 +212,10 @@ async fn secret_exposure_is_audited_only_after_successful_spawn() {
     assert!(!logs.contains("secret-value-never-logged"));
 
     let (cfg, buf) = make_test_config();
+    cfg.sessions
+        .write()
+        .await
+        .grant(token.to_string(), unrestricted_session());
     cfg.secrets
         .set(&principal, "service/token", "another-secret-value")
         .await
@@ -276,12 +304,67 @@ async fn saved_grant_entitlement_covers_tool_config_secret_refs() {
     }
 }
 
+#[tokio::test]
+async fn expired_denial_escalation_does_not_deduplicate_a_fresh_handle() {
+    let (cfg, _) = make_test_config();
+    let token = "denial-escalation-session".to_string();
+    cfg.sessions.write().await.grant(
+        token.clone(),
+        SessionGrant {
+            allow: Vec::new(),
+            deny: vec!["echo *".to_string()],
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            activated_verbs: Vec::new(),
+            override_markers: Vec::new(),
+            scope: Default::default(),
+            expires_at: None,
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            static_only: false,
+            auto_amend: false,
+            granted_at: 0,
+        },
+    );
+    let mut request = basic_request("echo", vec!["blocked".to_string()]);
+    request.session_token = Some(token);
+    let caller = CallerIdentity::Unix { uid: 1000 };
+    let first = execute_command(request.clone(), &cfg, &caller).await;
+    assert!(!first.policy_allowed());
+    let first_handle = cfg
+        .grant_requests
+        .read()
+        .await
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    cfg.grant_requests
+        .write()
+        .await
+        .get_mut(&first_handle)
+        .unwrap()
+        .expires_unix = 1;
+
+    let second = execute_command(request, &cfg, &caller).await;
+    assert!(!second.policy_allowed());
+    let requests = cfg.grant_requests.read().await;
+    assert_eq!(requests.len(), 1);
+    let second_handle = requests.keys().next().unwrap();
+    assert_ne!(second_handle, &first_handle);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn streaming_secret_exposure_is_recorded_even_on_nonzero_exit() {
+    let _test_lock = TEST_ENV_LOCK.lock().await;
     let caller = CallerIdentity::Unix { uid: 1000 };
     let principal = PrincipalKey::from_uid(1000);
     let (cfg, buf) = make_test_config();
+    cfg.sessions.write().await.grant(
+        "streaming-session-token-never-logged".to_string(),
+        unrestricted_session(),
+    );
     for (name, value) in [
         ("service/primary", "primary-value-never-logged"),
         ("service/secondary", "secondary-value-never-logged"),

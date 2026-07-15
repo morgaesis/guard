@@ -1037,8 +1037,8 @@ enum ServerCommands {
         #[arg(long, value_name = "PATH")]
         verbs: Option<PathBuf>,
 
-        /// Compatibility YAML to migrate into saved grants at startup.
-        /// Env: GUARD_GRANTS. `--profiles` and GUARD_PROFILES are aliases.
+        /// YAML catalog of reusable saved grants.
+        /// Env: GUARD_GRANTS.
         #[arg(long, alias = "profiles", value_name = "PATH")]
         grants: Option<PathBuf>,
 

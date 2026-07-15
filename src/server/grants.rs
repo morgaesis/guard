@@ -136,7 +136,8 @@ pub(super) async fn handle_grant_read(
             }
             Some((SessionDecision::Allow, reason)) => allow_reason = Some(reason),
             None if static_only => {
-                let reason = "session static-only: no matching session allow rule".to_string();
+                let reason =
+                    "session policy-only mode: read is outside active verb coverage".to_string();
                 config.log_audit_policy(
                     caller,
                     session_token.as_deref(),

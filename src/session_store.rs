@@ -528,7 +528,7 @@ impl SessionStore {
     }
 
     /// Repair columns that belong to the current schema version. This keeps
-    /// startup safe after an interrupted or partially applied v3 migration.
+    /// startup safe after an interrupted or partially applied current migration.
     fn repair_current_schema(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS saved_grants (
@@ -641,6 +641,28 @@ impl SessionStore {
     pub async fn load_grant_requests(&self) -> Result<Vec<GrantRequest>> {
         self.load_json_rows("SELECT json FROM grant_requests", "grant request")
             .await
+    }
+
+    pub async fn delete_grant_requests(&self, handles: Vec<String>) -> Result<()> {
+        if handles.is_empty() {
+            return Ok(());
+        }
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = Self::open_connection(&path)?;
+            Self::init_schema(&conn)?;
+            let tx = conn.transaction()?;
+            for handle in handles {
+                tx.execute(
+                    "DELETE FROM grant_requests WHERE handle = ?1",
+                    params![handle],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .context("delete grant requests task failed")?
     }
 
     async fn load_json_rows<T>(&self, query: &'static str, kind: &'static str) -> Result<Vec<T>>

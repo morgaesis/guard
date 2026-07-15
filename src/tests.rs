@@ -1,5 +1,12 @@
 use super::*;
 
+#[test]
+fn bounded_durations_reject_zero() {
+    assert!(parse_unbounded_secs("0").is_err());
+    assert_eq!(parse_unbounded_secs("1").unwrap(), 1);
+    assert_eq!(parse_unbounded_secs("unbounded").unwrap(), u64::MAX);
+}
+
 fn parse_start(args: &[&str]) -> ServerCommands {
     match MainArgs::parse_from(args) {
         MainArgs::Server(ServerCommands::Start {

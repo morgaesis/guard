@@ -230,6 +230,8 @@ pub struct GrantRequest {
     pub saved_grant: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issued_saved_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issued_session_revision: Option<String>,
     pub delta: GrantRequestDelta,
     pub justification: String,
     pub status: GrantRequestStatus,
@@ -272,6 +274,7 @@ impl GrantRequest {
             session_token,
             saved_grant,
             issued_saved_revision: None,
+            issued_session_revision: None,
             delta,
             justification,
             status: GrantRequestStatus::Pending,
@@ -407,7 +410,7 @@ fn migrate_profile(profile: LegacyProfile) -> Result<SavedGrant> {
             &profile.name,
             index,
             pattern,
-            CoverageAction::Evaluate,
+            CoverageAction::Preauthorized,
         )?);
     }
     let offset = generated_verbs.len();
@@ -490,7 +493,7 @@ fn migrate_legacy_pattern(
         name: if action == CoverageAction::Deny {
             "explicit-deny".to_string()
         } else {
-            "always-evaluate".to_string()
+            "explicit-allow".to_string()
         },
         action,
         required_args: Vec::new(),
@@ -666,8 +669,9 @@ mod tests {
         assert_eq!(grant.generated_verbs[0].coverage.len(), 1);
         assert_eq!(
             grant.generated_verbs[0].coverage[0].action,
-            CoverageAction::Evaluate
+            CoverageAction::Preauthorized
         );
+        assert!(grant.generated_verbs[0].trusted);
         assert!(grant.generated_verbs[0].coverage[0].sticky);
         assert_eq!(
             grant.generated_verbs[1].coverage[0].action,

@@ -258,7 +258,7 @@ async fn cwd_request_does_not_match_legacy_session_allow_glob() {
     let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
     assert!(!result.policy_allowed());
     assert!(
-        result.policy_reason().contains("session static-only"),
+        result.policy_reason().contains("session policy-only mode"),
         "expected cwd-bearing legacy allow to miss, got {}",
         result.policy_reason()
     );
@@ -372,7 +372,7 @@ async fn static_only_session_miss_denies_before_evaluator() {
 
     let result = execute_command(req, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
     assert!(!result.policy_allowed());
-    assert!(result.policy_reason().contains("static-only"));
+    assert!(result.policy_reason().contains("policy-only mode"));
 }
 
 #[test]
@@ -979,6 +979,7 @@ async fn grant_requests_use_the_issued_ceiling_and_redact_session_tokens() {
         &worker,
         AdminRequest::GrantRequestSubmit {
             session_token: token.clone(),
+            caller_token: Some(token.clone()),
             saved_grant: Some("other".to_string()),
             prompt: "extend work".to_string(),
             delta: crate::grant_profile::GrantRequestDelta {
@@ -998,6 +999,7 @@ async fn grant_requests_use_the_issued_ceiling_and_redact_session_tokens() {
         &worker,
         AdminRequest::GrantRequestSubmit {
             session_token: token.clone(),
+            caller_token: Some(token.clone()),
             saved_grant: None,
             prompt: "extend work".to_string(),
             delta: crate::grant_profile::GrantRequestDelta {
@@ -1122,11 +1124,53 @@ async fn grant_request_show_and_withdraw_require_the_issuing_session() {
         "owner-session".to_string(),
         granted_session(Vec::new(), Vec::new()),
     );
+    cfg.sessions.write().await.grant(
+        "victim-session".to_string(),
+        granted_session(Vec::new(), Vec::new()),
+    );
+    let cross_session = handle_admin_request(
+        &cfg,
+        &worker,
+        AdminRequest::GrantRequestSubmit {
+            session_token: "victim-session".to_string(),
+            caller_token: Some("owner-session".to_string()),
+            saved_grant: None,
+            prompt: "modify another session".to_string(),
+            delta: crate::grant_profile::GrantRequestDelta {
+                activated_verbs: vec!["inspect".to_string()],
+                ..Default::default()
+            },
+        },
+    )
+    .await;
+    assert!(matches!(
+        cross_session,
+        AdminResponse::Error { message } if message.contains("only request changes to itself")
+    ));
+    assert!(matches!(
+        handle_admin_request(
+            &cfg,
+            &daemon,
+            AdminRequest::GrantRequestSubmit {
+                session_token: "victim-session".to_string(),
+                caller_token: None,
+                saved_grant: None,
+                prompt: "operator amendment".to_string(),
+                delta: crate::grant_profile::GrantRequestDelta {
+                    activated_verbs: vec!["inspect".to_string()],
+                    ..Default::default()
+                },
+            },
+        )
+        .await,
+        AdminResponse::GrantRequest { .. }
+    ));
     let submitted = handle_admin_request(
         &cfg,
         &worker,
         AdminRequest::GrantRequestSubmit {
             session_token: "owner-session".to_string(),
+            caller_token: Some("owner-session".to_string()),
             saved_grant: None,
             prompt: "request one verb".to_string(),
             delta: crate::grant_profile::GrantRequestDelta {
@@ -1193,6 +1237,84 @@ async fn grant_request_show_and_withdraw_require_the_issuing_session() {
 }
 
 #[tokio::test]
+async fn evaluate_batch_requires_owned_live_unsuspended_session_or_admin() {
+    let (mut cfg, _) = make_test_config();
+    cfg.daemon_uid = 777;
+    cfg.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.behavior_limits.max_denials = Some(1);
+    let daemon = CallerIdentity::Unix { uid: 777 };
+    let worker = CallerIdentity::Unix { uid: 778 };
+    for token in ["batch-owner", "batch-victim"] {
+        cfg.sessions
+            .write()
+            .await
+            .grant(token.to_string(), granted_session(Vec::new(), Vec::new()));
+    }
+    let commands = vec![crate::server::BatchCommand {
+        binary: "true".to_string(),
+        args: Vec::new(),
+    }];
+    let evaluate = |session_token, caller_token| AdminRequest::EvaluateBatch {
+        session_token,
+        caller_token,
+        commands: commands.clone(),
+    };
+    assert!(matches!(
+        handle_admin_request(&cfg, &worker, evaluate(None, None)).await,
+        AdminResponse::Error { message } if message.contains("caller-owned session")
+    ));
+    assert!(matches!(
+        handle_admin_request(
+            &cfg,
+            &worker,
+            evaluate(Some("batch-victim".to_string()), Some("batch-owner".to_string())),
+        )
+        .await,
+        AdminResponse::Error { message } if message.contains("only batch-evaluate for itself")
+    ));
+    assert!(matches!(
+        handle_admin_request(
+            &cfg,
+            &worker,
+            evaluate(
+                Some("batch-owner".to_string()),
+                Some("batch-owner".to_string())
+            ),
+        )
+        .await,
+        AdminResponse::EvaluationBatch { .. }
+    ));
+    assert!(matches!(
+        handle_admin_request(&cfg, &daemon, evaluate(None, None)).await,
+        AdminResponse::EvaluationBatch { .. }
+    ));
+
+    cfg.sessions.write().await.record_interaction(
+        "batch-owner",
+        SessionInteraction {
+            command: "denied".to_string(),
+            allowed: false,
+            source: SessionDecisionSource::Llm,
+            reason: "denied".to_string(),
+            risk: Some(5),
+            exec_status: SessionExecStatus::NotAttempted,
+            exit_code: None,
+            at_unix: guard::env::now_unix(),
+            exposed_secret_refs: Vec::new(),
+        },
+    );
+    assert!(matches!(
+        handle_admin_request(
+            &cfg,
+            &worker,
+            evaluate(Some("batch-owner".to_string()), Some("batch-owner".to_string())),
+        )
+        .await,
+        AdminResponse::Error { message } if message.contains("suspended")
+    ));
+}
+
+#[tokio::test]
 async fn grant_request_approval_rejects_expiry_and_stale_saved_revision() {
     let (mut cfg, _) = make_test_config();
     cfg.daemon_uid = 777;
@@ -1231,6 +1353,7 @@ async fn grant_request_approval_rejects_expiry_and_stale_saved_revision() {
     ));
     let submit = |prompt: &str| AdminRequest::GrantRequestSubmit {
         session_token: token.clone(),
+        caller_token: Some(token.clone()),
         saved_grant: None,
         prompt: prompt.to_string(),
         delta: crate::grant_profile::GrantRequestDelta {
@@ -1282,6 +1405,154 @@ async fn grant_request_approval_rejects_expiry_and_stale_saved_revision() {
         handle_admin_request(&cfg, &daemon, AdminRequest::GrantRequestApprove { handle: request.handle }).await,
         AdminResponse::Error { message } if message.contains("changed after request issuance")
     ));
+}
+
+#[tokio::test]
+async fn grant_request_binds_unsaved_session_revision_and_prunes_expired_rows() {
+    let (mut cfg, _) = make_test_config();
+    cfg.daemon_uid = 777;
+    cfg.daemon_principal = PrincipalKey::from_uid(777);
+    let tmp = tempfile::tempdir().unwrap();
+    cfg.session_store = Some(
+        SessionStore::open(tmp.path().join("state.db"), 3600)
+            .await
+            .unwrap(),
+    );
+    let daemon = CallerIdentity::Unix { uid: 777 };
+    let worker = CallerIdentity::Unix { uid: 778 };
+    let token = "unsaved-revision".to_string();
+    cfg.sessions
+        .write()
+        .await
+        .grant(token.clone(), granted_session(Vec::new(), Vec::new()));
+    let submit = |prompt: &str| AdminRequest::GrantRequestSubmit {
+        session_token: token.clone(),
+        caller_token: Some(token.clone()),
+        saved_grant: None,
+        prompt: prompt.to_string(),
+        delta: crate::grant_profile::GrantRequestDelta {
+            activated_verbs: vec!["inspect".to_string()],
+            ..Default::default()
+        },
+    };
+
+    let stale = handle_admin_request(&cfg, &worker, submit("stale")).await;
+    let AdminResponse::GrantRequest { request } = stale else {
+        panic!()
+    };
+    cfg.sessions
+        .write()
+        .await
+        .set_label(&token, Some("changed".to_string()));
+    assert!(matches!(
+        handle_admin_request(
+            &cfg,
+            &daemon,
+            AdminRequest::GrantRequestApprove { handle: request.handle },
+        )
+        .await,
+        AdminResponse::Error { message } if message.contains("session revision")
+    ));
+
+    let expired = handle_admin_request(&cfg, &worker, submit("expire")).await;
+    let AdminResponse::GrantRequest { request } = expired else {
+        panic!()
+    };
+    let mut expired_row = cfg
+        .grant_requests
+        .write()
+        .await
+        .get_mut(&request.handle)
+        .unwrap()
+        .clone();
+    expired_row.expires_unix = 1;
+    cfg.grant_requests
+        .write()
+        .await
+        .insert(request.handle.clone(), expired_row.clone());
+    cfg.session_store
+        .as_ref()
+        .unwrap()
+        .save_grant_request(expired_row)
+        .await
+        .unwrap();
+    let _ = handle_admin_request(
+        &cfg,
+        &worker,
+        AdminRequest::GrantRequestList {
+            session_token: Some(token),
+        },
+    )
+    .await;
+    assert!(!cfg
+        .grant_requests
+        .read()
+        .await
+        .contains_key(&request.handle));
+    assert!(cfg
+        .session_store
+        .as_ref()
+        .unwrap()
+        .load_grant_requests()
+        .await
+        .unwrap()
+        .iter()
+        .all(|row| row.handle != request.handle));
+}
+
+#[tokio::test]
+async fn grant_request_queue_is_bounded_and_recovers_capacity_from_expiry() {
+    let (mut cfg, _) = make_test_config();
+    cfg.daemon_uid = 777;
+    cfg.daemon_principal = PrincipalKey::from_uid(777);
+    let worker = CallerIdentity::Unix { uid: 778 };
+    let token = "bounded-queue".to_string();
+    cfg.sessions
+        .write()
+        .await
+        .grant(token.clone(), granted_session(Vec::new(), Vec::new()));
+    for index in 0..1024 {
+        let request = crate::grant_profile::GrantRequest::new(
+            token.clone(),
+            None,
+            crate::grant_profile::GrantRequestDelta {
+                activated_verbs: vec![format!("verb-{index}")],
+                ..Default::default()
+            },
+            "queued".to_string(),
+        )
+        .unwrap();
+        cfg.grant_requests
+            .write()
+            .await
+            .insert(request.handle.clone(), request);
+    }
+    let submit = || AdminRequest::GrantRequestSubmit {
+        session_token: token.clone(),
+        caller_token: Some(token.clone()),
+        saved_grant: None,
+        prompt: "one more".to_string(),
+        delta: crate::grant_profile::GrantRequestDelta {
+            activated_verbs: vec!["one-more".to_string()],
+            ..Default::default()
+        },
+    };
+    assert!(matches!(
+        handle_admin_request(&cfg, &worker, submit()).await,
+        AdminResponse::Error { message } if message.contains("queue is full")
+    ));
+    cfg.grant_requests
+        .write()
+        .await
+        .values_mut()
+        .next()
+        .unwrap()
+        .expires_unix = 1;
+    assert!(matches!(
+        handle_admin_request(&cfg, &worker, submit()).await,
+        AdminResponse::GrantRequest { .. }
+    ));
+    assert_eq!(cfg.grant_requests.read().await.len(), 1024);
 }
 
 #[tokio::test]

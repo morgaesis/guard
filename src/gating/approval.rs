@@ -40,6 +40,18 @@ pub struct SecretBinding {
     pub salt: String,
     /// env-var -> hex SHA-256(salt-bytes, 0x00, value-bytes).
     pub hashes: BTreeMap<String, String>,
+    /// Secret-store names injected by the tool configuration. `None` marks a
+    /// legacy hold that did not capture tool-level secret provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_hashes: Option<BTreeMap<String, ToolSecretBinding>>,
+}
+
+/// Secret reference and value digest bound to one tool-configured environment
+/// variable at hold time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
+pub struct ToolSecretBinding {
+    pub secret_name: String,
+    pub hash: String,
 }
 
 /// The immutable execution inputs an approval is bound to. Stored at enqueue and
