@@ -11,6 +11,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+const SCHEMA_VERSION: i64 = 1;
+const VACUUM_MIN_PAGES: u64 = 512;
+const VACUUM_MIN_FREE_PAGES: u64 = 128;
+
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     path: PathBuf,
@@ -147,7 +151,7 @@ impl SessionStore {
         let mut interactions = Vec::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT token, at_unix, command, allowed, source, reason, risk, exec_status
+                "SELECT token, at_unix, command, allowed, source, reason, risk, exec_status, exit_code, secret_refs_json
                  FROM session_interactions
                  ORDER BY at_unix ASC, id ASC",
             )?;
@@ -164,6 +168,8 @@ impl SessionStore {
                         reason: row.get(5)?,
                         risk: row.get(6)?,
                         exec_status: decode_exec_status(&exec_status)?,
+                        exit_code: row.get(8)?,
+                        secret_refs: decode_vec(&row.get::<_, String>(9)?)?,
                     },
                 ))
             })?;
@@ -243,8 +249,8 @@ impl SessionStore {
         for (token, interaction) in snapshot.interactions_snapshot() {
             tx.execute(
                 "INSERT INTO session_interactions
-                 (token, at_unix, command, allowed, source, reason, risk, exec_status)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 (token, at_unix, command, allowed, source, reason, risk, exec_status, exit_code, secret_refs_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     token,
                     encode_u64(interaction.at_unix)?,
@@ -253,13 +259,42 @@ impl SessionStore {
                     encode_decision_source(interaction.source),
                     interaction.reason,
                     interaction.risk,
-                    encode_exec_status(interaction.exec_status)
+                    encode_exec_status(interaction.exec_status),
+                    interaction.exit_code,
+                    encode_vec(&interaction.secret_refs)?
                 ],
             )?;
         }
 
         tx.commit()?;
         Ok(())
+    }
+
+    /// Reclaim storage only when deleted pages are both substantial and a
+    /// meaningful share of the database. Compaction runs outside command audit
+    /// writes, so lock contention delays maintenance rather than losing an
+    /// interaction.
+    pub async fn compact_if_needed(&self) -> Result<bool> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = Self::open_connection(&path)?;
+            Self::init_schema(&conn)?;
+            let page_count = conn
+                .query_row("PRAGMA page_count", [], |row| row.get::<_, i64>(0))?
+                .try_into()
+                .context("negative sqlite page_count")?;
+            let free_pages = conn
+                .query_row("PRAGMA freelist_count", [], |row| row.get::<_, i64>(0))?
+                .try_into()
+                .context("negative sqlite freelist_count")?;
+            if !should_vacuum(page_count, free_pages) {
+                return Ok(false);
+            }
+            conn.execute_batch("VACUUM")?;
+            Ok(true)
+        })
+        .await
+        .context("session store compaction task failed")?
     }
 
     fn open_connection(path: &Path) -> Result<Connection> {
@@ -274,7 +309,20 @@ impl SessionStore {
     }
 
     fn init_schema(conn: &Connection) -> Result<()> {
-        conn.execute_batch(
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version > SCHEMA_VERSION {
+            anyhow::bail!(
+                "state database schema version {} is newer than supported version {}",
+                version,
+                SCHEMA_VERSION
+            );
+        }
+        if version == SCHEMA_VERSION {
+            return Ok(());
+        }
+
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS session_grants (
                 token TEXT PRIMARY KEY,
                 allow_json TEXT NOT NULL,
@@ -315,7 +363,9 @@ impl SessionStore {
                 source TEXT NOT NULL,
                 reason TEXT NOT NULL,
                 risk INTEGER,
-                exec_status TEXT NOT NULL
+                exec_status TEXT NOT NULL,
+                exit_code INTEGER,
+                secret_refs_json TEXT NOT NULL DEFAULT '[]'
             );
             CREATE INDEX IF NOT EXISTS idx_session_interactions_token ON session_interactions(token);
             CREATE INDEX IF NOT EXISTS idx_session_interactions_at ON session_interactions(at_unix);
@@ -339,65 +389,74 @@ impl SessionStore {
             );",
         )?;
         ensure_column(
-            conn,
+            &tx,
             "session_grants",
             "generated_notes_json",
             "TEXT NOT NULL DEFAULT '[]'",
         )?;
         ensure_column(
-            conn,
+            &tx,
             "session_grants",
             "static_only",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
         ensure_column(
-            conn,
+            &tx,
             "session_grants",
             "auto_amend",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
         ensure_column(
-            conn,
+            &tx,
             "session_grants",
             "allow_exact_json",
             "TEXT NOT NULL DEFAULT '[]'",
         )?;
         ensure_column(
-            conn,
+            &tx,
             "session_grants",
             "deny_exact_json",
             "TEXT NOT NULL DEFAULT '[]'",
         )?;
         ensure_column(
-            conn,
+            &tx,
             "session_history",
             "generated_notes_json",
             "TEXT NOT NULL DEFAULT '[]'",
         )?;
         ensure_column(
-            conn,
+            &tx,
             "session_history",
             "static_only",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
         ensure_column(
-            conn,
+            &tx,
             "session_history",
             "auto_amend",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
         ensure_column(
-            conn,
+            &tx,
             "session_history",
             "allow_exact_json",
             "TEXT NOT NULL DEFAULT '[]'",
         )?;
         ensure_column(
-            conn,
+            &tx,
             "session_history",
             "deny_exact_json",
             "TEXT NOT NULL DEFAULT '[]'",
         )?;
+        ensure_column(&tx, "session_interactions", "exit_code", "INTEGER")?;
+        ensure_column(
+            &tx,
+            "session_interactions",
+            "secret_refs_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -586,6 +645,12 @@ impl SessionStore {
         .await
         .context("load_read_grants task failed")?
     }
+}
+
+fn should_vacuum(page_count: u64, free_pages: u64) -> bool {
+    page_count >= VACUUM_MIN_PAGES
+        && free_pages >= VACUUM_MIN_FREE_PAGES
+        && free_pages.saturating_mul(4) >= page_count
 }
 
 fn encode_vec(values: &[String]) -> Result<String> {
@@ -790,6 +855,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migrates_legacy_schema_and_rejects_future_versions() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let legacy_path = tmp.path().join("legacy.db");
+        let now = guard::env::now_unix();
+        {
+            let conn = Connection::open(&legacy_path).expect("open legacy db");
+            conn.execute_batch(
+                "CREATE TABLE session_interactions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    token TEXT NOT NULL,
+                    at_unix INTEGER NOT NULL,
+                    command TEXT NOT NULL,
+                    allowed INTEGER NOT NULL,
+                    source TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    risk INTEGER,
+                    exec_status TEXT NOT NULL
+                );",
+            )
+            .expect("create legacy schema");
+            conn.execute(
+                "INSERT INTO session_interactions
+                 (token, at_unix, command, allowed, source, reason, risk, exec_status)
+                 VALUES (?1, ?2, 'true', 1, 'static_policy', 'legacy', 0, 'completed')",
+                params!["legacy-token", encode_u64(now).unwrap()],
+            )
+            .expect("insert legacy interaction");
+        }
+
+        let store = SessionStore::open(legacy_path.clone(), 3600)
+            .await
+            .expect("migrate legacy store");
+        let registry = store.load_registry().await.expect("load migrated store");
+        let report = registry.show("legacy-token", 10).expect("legacy report");
+        assert_eq!(report.recent[0].exit_code, None);
+        assert!(report.recent[0].secret_refs.is_empty());
+        let conn = Connection::open(&legacy_path).expect("reopen migrated db");
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        drop(conn);
+
+        let future_path = tmp.path().join("future.db");
+        let conn = Connection::open(&future_path).expect("open future db");
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+        drop(conn);
+        let error = SessionStore::open(future_path, 3600)
+            .await
+            .expect_err("future schema must fail closed");
+        assert!(error.to_string().contains("newer than supported"));
+    }
+
+    #[test]
+    fn vacuum_threshold_requires_absolute_and_relative_free_space() {
+        assert!(!should_vacuum(511, 200));
+        assert!(!should_vacuum(1024, 127));
+        assert!(!should_vacuum(1024, 255));
+        assert!(should_vacuum(1024, 256));
+    }
+
+    #[tokio::test]
+    async fn compaction_reclaims_a_database_above_the_threshold() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3600)
+            .await
+            .expect("open store");
+        {
+            let mut conn = Connection::open(&path).expect("open filler db");
+            conn.execute("CREATE TABLE filler (body BLOB NOT NULL)", [])
+                .unwrap();
+            let tx = conn.transaction().unwrap();
+            for _ in 0..700 {
+                tx.execute("INSERT INTO filler VALUES (zeroblob(4096))", [])
+                    .unwrap();
+            }
+            tx.commit().unwrap();
+            conn.execute("DELETE FROM filler", []).unwrap();
+        }
+        let before = std::fs::metadata(&path).unwrap().len();
+        assert!(store.compact_if_needed().await.unwrap());
+        let after = std::fs::metadata(&path).unwrap().len();
+        assert!(after < before, "before={before} after={after}");
+    }
+
+    #[tokio::test]
+    async fn configured_retention_prunes_expired_interactions_on_persist() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 1)
+            .await
+            .expect("open store");
+        let registry = SessionRegistry::from_parts(
+            HashMap::new(),
+            Vec::new(),
+            vec![(
+                "expired-token".into(),
+                SessionInteraction {
+                    at_unix: guard::env::now_unix().saturating_sub(60),
+                    command: "true".into(),
+                    allowed: true,
+                    source: SessionDecisionSource::StaticPolicy,
+                    reason: "test".into(),
+                    risk: Some(0),
+                    exec_status: SessionExecStatus::Completed,
+                    exit_code: Some(0),
+                    secret_refs: Vec::new(),
+                },
+            )],
+            1,
+        );
+        store.persist_registry(&registry).await.expect("persist");
+        let conn = Connection::open(path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_interactions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
     async fn session_store_round_trips_registry() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let store = SessionStore::open(tmp.path().join("state.db"), 24 * 60 * 60)
@@ -846,6 +1035,8 @@ mod tests {
                     reason: "safe".into(),
                     risk: Some(1),
                     exec_status: SessionExecStatus::Completed,
+                    exit_code: Some(0),
+                    secret_refs: vec!["service/token".into()],
                 },
             )],
             24 * 60 * 60,
@@ -861,6 +1052,8 @@ mod tests {
         let report = loaded.show("tok", 10).expect("session report");
         assert_eq!(report.stats.total, 1);
         assert_eq!(report.stats.risk_histogram[1], 1);
+        assert_eq!(report.recent[0].exit_code, Some(0));
+        assert_eq!(report.recent[0].secret_refs, vec!["service/token"]);
         assert_eq!(
             report.active.and_then(|grant| grant.prompt_append),
             Some("persistent".into())

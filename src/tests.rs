@@ -39,6 +39,7 @@ fn parse_start(args: &[&str]) -> ServerCommands {
             learn_allow_min_approvals,
             dry_run,
             state_db,
+            history_retention,
             exec_as_caller,
             system_prompt,
             system_prompt_append,
@@ -102,6 +103,7 @@ fn parse_start(args: &[&str]) -> ServerCommands {
             learn_allow_min_approvals,
             dry_run,
             state_db,
+            history_retention,
             exec_as_caller,
             system_prompt,
             system_prompt_append,
@@ -170,6 +172,23 @@ fn test_server_start_llm_retries_flag() {
         panic!("expected start");
     };
     assert_eq!(llm_retries, Some(1));
+}
+
+#[test]
+fn test_history_retention_flag_and_environment_resolution() {
+    let ServerCommands::Start {
+        history_retention, ..
+    } = parse_start(&["guard", "server", "start", "--history-retention", "7200"])
+    else {
+        panic!("expected start");
+    };
+    assert_eq!(history_retention, Some(7200));
+    assert_eq!(
+        cli_server::resolve_history_retention(None, Some("3600".into())).unwrap(),
+        3600
+    );
+    assert!(cli_server::resolve_history_retention(None, Some("0".into())).is_err());
+    assert!(cli_server::resolve_history_retention(None, Some("bad".into())).is_err());
 }
 
 fn resolved_learn_deny(args: &[&str]) -> bool {

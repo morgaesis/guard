@@ -10,7 +10,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::io::AsyncWrite;
 
-use super::execute::{audit_command_line, exec_after_approval, exec_with_read_grant_retry};
+use super::execute::{
+    audit_command_line, audit_session_ref, exec_after_approval, exec_with_read_grant_retry,
+};
 use super::grants::{delete_read_grant_row, finish_read_grant_revert, persist_read_grant};
 use super::transport::write_stream_message;
 use super::wire::{
@@ -265,7 +267,7 @@ impl Drop for ProxyHoldOrphanGuard {
             if let Some(a) = config.approvals.read().await.get(&handle).cloned() {
                 persist_approval(&config, &a).await;
             }
-            tracing::info!(
+            tracing::info!(target: "guard::audit",
                 "[AUDIT] HOLD_ORPHANED handle={} (api-proxy client disconnected)",
                 handle
             );
@@ -401,6 +403,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
             cwd: None,
             env: std::collections::BTreeMap::new(),
             secret_keys: std::collections::BTreeMap::new(),
+            session_ref: None,
             verb_name: None,
             verb_params: std::collections::BTreeMap::new(),
             catalog_version: None,
@@ -430,8 +433,8 @@ impl guard::proxy::GateSink for DaemonGateSink {
             .await
             .enqueue(approval.clone());
         persist_approval(&self.config, &approval).await;
-        tracing::info!(
-            "[AUDIT] HELD handle={} caller=(api-proxy) api=\"{}\" ttl={}s",
+        tracing::info!(target: "guard::audit",
+            "[AUDIT] HELD handle={} caller=(api-proxy) session=none api=\"{}\" ttl={}s",
             handle,
             label,
             APPROVAL_TTL_SECS
@@ -795,6 +798,7 @@ pub(super) async fn arm_containment<W: AsyncWrite + Unpin>(
     persist_provisional(config, &provisional).await;
     config.provisional.write().await.insert(provisional.clone());
 
+    let session_ref = audit_session_ref(request.session_token.as_deref());
     let result = exec_after_approval(
         request,
         config,
@@ -805,6 +809,7 @@ pub(super) async fn arm_containment<W: AsyncWrite + Unpin>(
         stream_writer,
     )
     .await;
+    let secret_refs = result.secret_refs().to_vec();
 
     match result.exec {
         ExecOutcome::Completed {
@@ -820,10 +825,11 @@ pub(super) async fn arm_containment<W: AsyncWrite + Unpin>(
             if let Some(u) = updated {
                 persist_provisional(config, &u).await;
             }
-            tracing::info!(
-                "[AUDIT] PROVISIONAL handle={} caller={} deadline={} window={}s revert=\"{}\"",
+            tracing::info!(target: "guard::audit",
+                "[AUDIT] PROVISIONAL handle={} caller={} session={} deadline={} window={}s revert=\"{}\"",
                 handle,
                 caller,
+                session_ref,
                 now.saturating_add(window),
                 window,
                 audit_command_line(&revert.binary, &revert.args)
@@ -836,6 +842,7 @@ pub(super) async fn arm_containment<W: AsyncWrite + Unpin>(
                 stdout,
                 stderr,
             )
+            .with_secret_refs(secret_refs)
         }
         // The child was launched and then failed (e.g. the client stream dropped
         // mid-run). It may already have applied its mutation, so keep the
@@ -851,10 +858,11 @@ pub(super) async fn arm_containment<W: AsyncWrite + Unpin>(
             if let Some(u) = updated {
                 persist_provisional(config, &u).await;
             }
-            tracing::warn!(
-                "[AUDIT] PROVISIONAL_INTERRUPTED handle={} caller={} deadline={} (forward launched then failed; auto-revert armed)",
+            tracing::warn!(target: "guard::audit",
+                "[AUDIT] PROVISIONAL_INTERRUPTED handle={} caller={} session={} deadline={} (forward launched then failed; auto-revert armed)",
                 handle,
                 caller,
+                session_ref,
                 now.saturating_add(window)
             );
             result
@@ -937,6 +945,10 @@ pub(super) async fn hold_for_approval<W: AsyncWrite + Unpin>(
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
+        session_ref: request
+            .session_token
+            .as_deref()
+            .map(|token| audit_session_ref(Some(token))),
         verb_name: verb.as_ref().map(|v| v.name.clone()),
         verb_params: verb.as_ref().map(|v| v.params.clone()).unwrap_or_default(),
         catalog_version: verb.as_ref().map(|v| v.catalog_version),
@@ -962,10 +974,11 @@ pub(super) async fn hold_for_approval<W: AsyncWrite + Unpin>(
 
     let notify = config.approvals.write().await.enqueue(approval.clone());
     persist_approval(config, &approval).await;
-    tracing::info!(
-        "[AUDIT] HELD handle={} caller={} risk={:?} class={:?} cmd=\"{}\" ttl={}s",
+    tracing::info!(target: "guard::audit",
+        "[AUDIT] HELD handle={} caller={} session={} risk={:?} class={:?} cmd=\"{}\" ttl={}s",
         handle,
         caller,
+        audit_session_ref(request.session_token.as_deref()),
         risk,
         reversibility.map(|r| r.as_str()),
         audit_command_line(&request.binary, &request.args),
@@ -1230,7 +1243,11 @@ pub(super) async fn gating_sweeper(config: ServerConfig) {
             let row = config.approvals.read().await.get(h).cloned();
             if let Some(a) = row {
                 persist_approval(&config, &a).await;
-                tracing::warn!("[AUDIT] APPROVAL_EXPIRED handle={} (fail-closed deny)", h);
+                tracing::warn!(target: "guard::audit",
+                    "[AUDIT] APPROVAL_EXPIRED handle={} session={} (fail-closed deny)",
+                    h,
+                    a.snapshot.session_ref.as_deref().unwrap_or("none")
+                );
             }
         }
 
@@ -1430,7 +1447,7 @@ pub(super) async fn finish_revert(
                 if let Some(u) = &updated {
                     persist_provisional(config, u).await;
                 }
-                tracing::error!(
+                tracing::error!(target: "guard::audit",
                     "[AUDIT] REVERT_DEFERRED handle={} caller={} kind={} reason={}",
                     p.handle,
                     caller,
@@ -1502,7 +1519,7 @@ pub(super) async fn finish_revert(
     forget_proxy_provenance(config, &p.handle).await;
     remove_revert_body(p);
     if status_ok {
-        tracing::info!(
+        tracing::info!(target: "guard::audit",
             "[AUDIT] REVERT handle={} caller={} kind={} exit={:?}",
             p.handle,
             caller,
@@ -1514,7 +1531,7 @@ pub(super) async fn finish_revert(
             exit,
         )
     } else {
-        tracing::error!(
+        tracing::error!(target: "guard::audit",
             "[AUDIT] REVERT_FAILED handle={} caller={} kind={} exit={:?} detail={:?}",
             p.handle,
             caller,

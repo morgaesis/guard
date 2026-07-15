@@ -483,6 +483,8 @@ async fn session_show_reports_recent_stats() {
                 reason: "safe".into(),
                 risk: Some(1),
                 exec_status: SessionExecStatus::Completed,
+                exit_code: Some(0),
+                secret_refs: vec!["service/token".into()],
             },
         );
         reg.record_interaction(
@@ -495,6 +497,8 @@ async fn session_show_reports_recent_stats() {
                 reason: "session deny pattern: rm*".into(),
                 risk: None,
                 exec_status: SessionExecStatus::NotAttempted,
+                exit_code: None,
+                secret_refs: Vec::new(),
             },
         );
     }

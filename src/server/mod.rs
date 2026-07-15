@@ -45,6 +45,9 @@ const SESSION_EXACT_RULE_MAX_ARG_LEN: usize = 1024;
 // --- Consequence-gating tuning (operator-overridable where noted) ---
 /// How often the sweeper checks for due auto-reverts and expired holds.
 const SWEEPER_TICK_SECS: u64 = 1;
+/// Bound session-history pruning and storage compaction even when no command
+/// writes occur.
+const SESSION_MAINTENANCE_INTERVAL_SECS: u64 = 5 * 60;
 /// Delay after daemon start before the sweeper begins. Startup recovery (which
 /// moves past-deadline provisionals to needs_operator_decision) runs
 /// synchronously *before* the sweeper is spawned, so this grace is belt-and-
@@ -93,7 +96,7 @@ pub use wire::{
 };
 pub(crate) use wire::{ExecuteStreamMessage, IncomingMessage};
 
-use execute::audit_command_line;
+use execute::{audit_command_line, audit_session_ref};
 use wire::CallerIdentity;
 
 #[derive(Clone)]
@@ -320,16 +323,18 @@ impl ServerConfig {
     fn log_audit_policy(
         &self,
         caller: &CallerIdentity,
+        session_token: Option<&str>,
         binary: &str,
         args: &[String],
         allowed: bool,
         reason: &str,
     ) {
         let action = if allowed { "ALLOWED" } else { "DENIED" };
-        tracing::info!(
-            "[AUDIT] {} caller={} cmd=\"{}\" reason=\"{}\"",
+        tracing::info!(target: "guard::audit",
+            "[AUDIT] {} caller={} session={} cmd=\"{}\" reason=\"{}\"",
             action,
             caller,
+            audit_session_ref(session_token),
             audit_command_line(binary, args),
             reason
         );
@@ -343,13 +348,15 @@ impl ServerConfig {
     fn log_audit_exec_failed(
         &self,
         caller: &CallerIdentity,
+        session_token: Option<&str>,
         binary: &str,
         args: &[String],
         reason: &str,
     ) {
-        tracing::info!(
-            "[AUDIT] EXEC_FAILED caller={} cmd=\"{}\" reason=\"{}\"",
+        tracing::info!(target: "guard::audit",
+            "[AUDIT] EXEC_FAILED caller={} session={} cmd=\"{}\" reason=\"{}\"",
             caller,
+            audit_session_ref(session_token),
             audit_command_line(binary, args),
             reason
         );

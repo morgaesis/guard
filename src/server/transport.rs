@@ -38,7 +38,9 @@ use super::wire::{
     AdminRequest, AdminResponse, CallerIdentity, ExecOutcome, ExecuteResponse, ExecuteResult,
     ExecuteStreamMessage, IncomingMessage,
 };
-use super::{ServerConfig, DEFAULT_CONFIRM_WITHIN_SECS, MAX_REQUEST_BYTES};
+use super::{
+    ServerConfig, DEFAULT_CONFIRM_WITHIN_SECS, MAX_REQUEST_BYTES, SESSION_MAINTENANCE_INTERVAL_SECS,
+};
 
 #[derive(Clone)]
 pub struct Server {
@@ -144,7 +146,7 @@ impl Server {
             Ok(rows) => {
                 let (reg, moved) = ProvisionalRegistry::from_rows(rows);
                 if !moved.is_empty() {
-                    tracing::warn!(
+                    tracing::warn!(target: "guard::audit",
                         "[AUDIT] STARTUP_RECOVERY provisionals_needing_decision={} handles={:?} (no revert runs unattended at boot)",
                         moved.len(),
                         moved
@@ -171,7 +173,7 @@ impl Server {
                 let now = now_unix();
                 let (mut reg, recovered) = ApprovalRegistry::from_rows(rows, now);
                 if !recovered.is_empty() {
-                    tracing::warn!(
+                    tracing::warn!(target: "guard::audit",
                         "[AUDIT] STARTUP_RECOVERY approvals_exec_failed={} handles={:?} (exec interrupted by restart)",
                         recovered.len(),
                         recovered
@@ -214,7 +216,7 @@ impl Server {
                     }
                 }
                 if !orphaned.is_empty() {
-                    tracing::warn!(
+                    tracing::warn!(target: "guard::audit",
                         "[AUDIT] STARTUP_RECOVERY api_proxy_holds_retired={} handles={:?}",
                         orphaned.len(),
                         orphaned
@@ -250,7 +252,7 @@ impl Server {
             if grant.status == ReadGrantStatus::Active && now >= grant.expires_unix {
                 match revoke_read_grant_acls(&grant).await {
                     Ok(()) => {
-                        tracing::warn!(
+                        tracing::warn!(target: "guard::audit",
                             "[AUDIT] READ_GRANT_REVOKED handle={} path=\"{}\" source=startup-expired",
                             grant.handle,
                             grant.target_path
@@ -258,7 +260,7 @@ impl Server {
                         delete_read_grant_row(&self.config, &grant.target_path).await;
                     }
                     Err(e) => {
-                        tracing::warn!(
+                        tracing::warn!(target: "guard::audit",
                             "[AUDIT] READ_GRANT_REVOKE_FAILED handle={} path=\"{}\" source=startup-expired detail=\"{}\"",
                             grant.handle,
                             grant.target_path,
@@ -293,6 +295,10 @@ impl Server {
         if self.config.gate.is_on() || cfg!(unix) {
             let config = self.config.clone();
             tokio::spawn(async move { gating_sweeper(config).await });
+        }
+        if self.config.session_store.is_some() {
+            let config = self.config.clone();
+            tokio::spawn(async move { session_maintenance(config).await });
         }
 
         let mut futures = Vec::new();
@@ -377,7 +383,7 @@ impl Server {
                 #[cfg(not(unix))]
                 let snapshot_dir_safe = true;
                 if !snapshot_dir_safe {
-                    tracing::error!(
+                    tracing::error!(target: "guard::audit",
                         "[AUDIT] API_REVERT_DIR_UNSAFE path=\"{}\" (not owner-only; body-bearing auto-reverts are disabled)",
                         snapshot_dir.display()
                     );
@@ -875,6 +881,7 @@ where
         if let Err(_e) = config.validate_token(request.auth_token.as_deref()) {
             config.log_audit_policy(
                 &caller,
+                request.session_token.as_deref(),
                 &request.binary,
                 &request.args,
                 false,
@@ -902,7 +909,14 @@ where
         } else {
             execute_command(request.clone(), config, &caller).await
         };
-        emit_exec_audit_events(config, &caller, &request.binary, &request.args, &result);
+        emit_exec_audit_events(
+            config,
+            &caller,
+            request.session_token.as_deref(),
+            &request.binary,
+            &request.args,
+            &result,
+        );
 
         let resp = result.into_response();
         if request.stream {
@@ -937,6 +951,7 @@ pub(super) fn emit_audit_events(
     // grep patterns (`[AUDIT] ALLOWED` / `[AUDIT] DENIED`) key on.
     config.log_audit_policy(
         caller,
+        None,
         binary,
         args,
         result.policy_allowed(),
@@ -947,19 +962,49 @@ pub(super) fn emit_audit_events(
     // audit stream can distinguish "LLM denied" from "LLM approved but
     // exec failed". Ignored by legacy grep patterns.
     if let ExecOutcome::Failed { reason, .. } = &result.exec {
-        config.log_audit_exec_failed(caller, binary, args, reason);
+        config.log_audit_exec_failed(caller, None, binary, args, reason);
     }
 }
 
 fn emit_exec_audit_events(
     config: &ServerConfig,
     caller: &CallerIdentity,
+    session_token: Option<&str>,
     binary: &str,
     args: &[String],
     result: &ExecuteResult,
 ) {
     if let ExecOutcome::Failed { reason, .. } = &result.exec {
-        config.log_audit_exec_failed(caller, binary, args, reason);
+        config.log_audit_exec_failed(caller, session_token, binary, args, reason);
+    }
+}
+
+async fn session_maintenance(config: ServerConfig) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(
+        SESSION_MAINTENANCE_INTERVAL_SECS,
+    ));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // `interval` ticks immediately. Consume that tick because opening the store
+    // already performs the startup prune.
+    tick.tick().await;
+    loop {
+        tick.tick().await;
+        let snapshot = {
+            let mut sessions = config.sessions.write().await;
+            sessions.purge_expired();
+            sessions.clone()
+        };
+        if let Some(store) = &config.session_store {
+            if let Err(error) = store.persist_registry(&snapshot).await {
+                tracing::warn!("failed to prune session history: {}", error);
+                continue;
+            }
+            match store.compact_if_needed().await {
+                Ok(true) => tracing::info!("compacted session state database"),
+                Ok(false) => {}
+                Err(error) => tracing::warn!("session state compaction deferred: {}", error),
+            }
+        }
     }
 }
 
@@ -1027,6 +1072,7 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
             let caller = CallerIdentity::Unknown;
             config.log_audit_policy(
                 &caller,
+                request.session_token.as_deref(),
                 &request.binary,
                 &request.args,
                 false,
@@ -1060,7 +1106,14 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
         } else {
             execute_command(request.clone(), config, &caller).await
         };
-        emit_exec_audit_events(config, &caller, &request.binary, &request.args, &result);
+        emit_exec_audit_events(
+            config,
+            &caller,
+            request.session_token.as_deref(),
+            &request.binary,
+            &request.args,
+            &result,
+        );
 
         let resp = result.into_response();
         if request.stream {

@@ -216,7 +216,7 @@ impl ApiPromotionStore {
                     Err(e) => {
                         let quarantine = config.path.with_extension("corrupt");
                         let _ = std::fs::rename(&config.path, &quarantine);
-                        tracing::error!(
+                        tracing::error!(target: "guard::audit",
                             "[AUDIT] API_PROMOTION_CORRUPT path=\"{}\" quarantined=\"{}\" error={} (starting from an empty store)",
                             config.path.display(),
                             quarantine.display(),

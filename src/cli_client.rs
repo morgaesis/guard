@@ -1732,7 +1732,7 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                         paint("false", AnsiColor::Red, color)
                     };
                     println!(
-                        "recent at={} allowed={} source={:?} risk={} exec={} cmd={:?} reason={:?}",
+                        "recent at={} allowed={} source={:?} risk={} exec={} exit={} secrets={:?} cmd={:?} reason={:?}",
                         format_timestamp(interaction.at_unix),
                         allowed,
                         interaction.source,
@@ -1741,6 +1741,11 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                             .map(|risk| risk.to_string())
                             .unwrap_or_else(|| "-".to_string()),
                         exec,
+                        interaction
+                            .exit_code
+                            .map(|code| code.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
+                        interaction.secret_refs,
                         interaction.command,
                         interaction.reason,
                     );

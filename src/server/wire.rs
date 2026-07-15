@@ -830,6 +830,9 @@ pub(super) enum ExecOutcome {
 pub(super) struct ExecuteResult {
     policy: PolicyOutcome,
     pub(super) exec: ExecOutcome,
+    /// Secret-store key names whose values reached a successfully spawned
+    /// child. Values are never retained.
+    secret_refs: Vec<String>,
 }
 
 impl ExecuteResult {
@@ -839,6 +842,7 @@ impl ExecuteResult {
                 reason: reason.into(),
             },
             exec: ExecOutcome::NotAttempted,
+            secret_refs: Vec::new(),
         }
     }
 
@@ -858,6 +862,7 @@ impl ExecuteResult {
                 stdout,
                 stderr,
             },
+            secret_refs: Vec::new(),
         }
     }
 
@@ -875,6 +880,7 @@ impl ExecuteResult {
                 reason: exec_reason.into(),
                 started: false,
             },
+            secret_refs: Vec::new(),
         }
     }
 
@@ -893,6 +899,7 @@ impl ExecuteResult {
                 reason: exec_reason.into(),
                 started: true,
             },
+            secret_refs: Vec::new(),
         }
     }
 
@@ -901,6 +908,7 @@ impl ExecuteResult {
             policy: PolicyOutcome::Allowed {
                 reason: reason.into(),
             },
+            secret_refs: Vec::new(),
             exec: ExecOutcome::DryRun { coverage: None },
         }
     }
@@ -915,6 +923,7 @@ impl ExecuteResult {
             exec: ExecOutcome::DryRun {
                 coverage: Some(coverage),
             },
+            secret_refs: Vec::new(),
         }
     }
 
@@ -926,6 +935,7 @@ impl ExecuteResult {
                 reason: reason.into(),
             },
             exec: ExecOutcome::Held { handle, coverage },
+            secret_refs: Vec::new(),
         }
     }
 
@@ -949,6 +959,26 @@ impl ExecuteResult {
                 stdout,
                 stderr,
             },
+            secret_refs: Vec::new(),
+        }
+    }
+
+    pub(super) fn with_secret_refs(mut self, mut secret_refs: Vec<String>) -> Self {
+        secret_refs.sort();
+        secret_refs.dedup();
+        self.secret_refs = secret_refs;
+        self
+    }
+
+    pub(super) fn secret_refs(&self) -> &[String] {
+        &self.secret_refs
+    }
+
+    pub(super) fn exit_code(&self) -> Option<i32> {
+        match &self.exec {
+            ExecOutcome::Completed { exit_code, .. }
+            | ExecOutcome::Provisional { exit_code, .. } => *exit_code,
+            _ => None,
         }
     }
 

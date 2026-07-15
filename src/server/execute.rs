@@ -14,6 +14,7 @@ use anyhow::Context;
 use anyhow::{bail, Result};
 use guard::gating::{Coverage, Reversibility};
 use guard::learned_rules::{AutoShimMode, LearningOutcome};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 #[cfg(unix)]
 use std::ffi::CString;
@@ -56,17 +57,40 @@ pub(super) fn log_audit_policy_for_request(
 ) {
     if let Some(cwd) = &request.cwd {
         let action = if allowed { "ALLOWED" } else { "DENIED" };
-        tracing::info!(
-            "[AUDIT] {} caller={} cwd=\"{}\" cmd=\"{}\" reason=\"{}\"",
+        tracing::info!(target: "guard::audit",
+            "[AUDIT] {} caller={} session={} cwd=\"{}\" cmd=\"{}\" reason=\"{}\"",
             action,
             caller,
+            audit_session_ref(request.session_token.as_deref()),
             cwd.display(),
             audit_command_line(&request.binary, &request.args),
             reason
         );
     } else {
-        config.log_audit_policy(caller, &request.binary, &request.args, allowed, reason);
+        config.log_audit_policy(
+            caller,
+            request.session_token.as_deref(),
+            &request.binary,
+            &request.args,
+            allowed,
+            reason,
+        );
     }
+}
+
+/// Stable correlation identifier for a session without exposing any bearer
+/// token bytes. This can be joined to persisted session interactions by hashing
+/// the operator-held token with the same function.
+pub(super) fn audit_session_ref(token: Option<&str>) -> String {
+    let Some(token) = token.filter(|token| !token.is_empty()) else {
+        return "none".to_string();
+    };
+    let digest = Sha256::digest(token.as_bytes());
+    let short = digest[..6]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("sha256:{short}")
 }
 
 pub(super) async fn execute_command(
@@ -319,6 +343,8 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
             reason: reason.clone(),
             risk,
             exec_status: SessionExecStatus::NotAttempted,
+            exit_code: None,
+            secret_refs: Vec::new(),
         },
     )
     .await;
@@ -359,6 +385,8 @@ async fn route_allow_and_record<W: AsyncWrite + Unpin>(
             reason,
             risk,
             exec_status: result.session_exec_status(),
+            exit_code: result.exit_code(),
+            secret_refs: result.secret_refs().to_vec(),
         },
     )
     .await;
@@ -413,7 +441,14 @@ async fn resolve_verb_context<W: AsyncWrite + Unpin>(
             }
             Err(e) => {
                 let reason = format!("verb error: {}", e);
-                config.log_audit_policy(phase.caller, &invocation.name, &[], false, &reason);
+                config.log_audit_policy(
+                    phase.caller,
+                    phase.session_token.as_deref(),
+                    &invocation.name,
+                    &[],
+                    false,
+                    &reason,
+                );
                 let _ = write_policy_decision(
                     phase.stream_output,
                     &mut *phase.stream_writer,
@@ -569,7 +604,14 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
                 "unknown session token: '{}' is revoked, expired, or never existed",
                 token
             );
-            config.log_audit_policy(phase.caller, &request.binary, &request.args, false, &reason);
+            config.log_audit_policy(
+                phase.caller,
+                phase.session_token.as_deref(),
+                &request.binary,
+                &request.args,
+                false,
+                &reason,
+            );
             let _ = write_policy_decision(
                 phase.stream_output,
                 &mut *phase.stream_writer,
@@ -1077,19 +1119,9 @@ pub(super) fn audit_command_line(binary: &str, args: &[String]) -> String {
     redact_output(&command_line(binary, args))
 }
 
-/// Truncate a token for an audit log entry. Tokens are bearer capabilities;
-/// the log needs enough of one to correlate events against
-/// `guard session list`, not the full value. Char-based slicing: the value is
-/// caller-supplied, so byte indexing could split a UTF-8 sequence and panic.
+/// Hash a bearer token for audit correlation without exposing any token bytes.
 pub(super) fn audit_token(token: &str) -> String {
-    let chars: Vec<char> = token.chars().collect();
-    if chars.len() > 8 {
-        let head: String = chars[..4].iter().collect();
-        let tail: String = chars[chars.len() - 4..].iter().collect();
-        format!("{head}...{tail}")
-    } else {
-        "***".to_string()
-    }
+    audit_session_ref(Some(token))
 }
 
 pub(super) fn validate_session_exact_rule_candidate(
@@ -1282,7 +1314,7 @@ async fn maybe_promote_deny_shape(
     tokio::spawn(async move {
         match evaluator.try_promote_deny_shape(&outcome).await {
             Ok(true) => {
-                tracing::info!(
+                tracing::info!(target: "guard::audit",
                     "[AUDIT] DENY_SHAPE_LEARNED service={} binary={} denials={}",
                     outcome.service,
                     outcome.binary,
@@ -1384,7 +1416,7 @@ async fn maybe_promote_allow_verb(
         let mut cat = verbs.write().await;
         match cat.append_verb(&verb) {
             Ok(()) => {
-                tracing::info!(
+                tracing::info!(target: "guard::audit",
                     "[AUDIT] VERB_AUTO_PROMOTED name={} binary={} consequence={} approvals={}",
                     verb.name,
                     verb.binary,
@@ -1870,9 +1902,10 @@ pub(super) async fn exec_with_read_grant_retry<W: AsyncWrite + Unpin>(
                 // failed to apply: surface the command's own failure.
                 break;
             }
-            tracing::info!(
-                "[AUDIT] READ_GRANT_AUTO caller={} path=\"{}\" ttl={}s (retrying after permission denied)",
+            tracing::info!(target: "guard::audit",
+                "[AUDIT] READ_GRANT_AUTO caller={} session={} path=\"{}\" ttl={}s (retrying after permission denied)",
                 caller,
+                audit_session_ref(request.session_token.as_deref()),
                 path,
                 AUTO_READ_GRANT_TTL_SECS
             );
@@ -1935,7 +1968,11 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
             return ExecuteResult::exec_failed(allow_reason, format!("tool config error: {}", e));
         }
     };
-    let trusted_tool_env = tool_env;
+    let trusted_tool_env = tool_env.env;
+    let mut used_secret_refs = tool_env.secret_refs;
+    used_secret_refs.extend(request.secrets.values().cloned());
+    used_secret_refs.sort();
+    used_secret_refs.dedup();
     let mut request_env = HashMap::new();
 
     for key in request.env.keys().chain(request.secrets.keys()) {
@@ -2141,22 +2178,39 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
     if stream_output {
         return execute_spawn_streaming(
             cmd,
-            &request.binary,
             allow_reason,
             config,
             &redaction_env,
+            SpawnAuditContext {
+                caller,
+                request: &request,
+                secret_refs: used_secret_refs,
+            },
             stream_writer,
         )
         .await;
     }
 
-    let output = match cmd.output().await {
-        Ok(o) => o,
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let child = match cmd.spawn() {
+        Ok(child) => child,
         Err(e) => {
             return ExecuteResult::exec_failed(
                 allow_reason,
                 format!("failed to execute '{}': {}", request.binary, e),
             );
+        }
+    };
+    audit_secret_use(caller, &request, &used_secret_refs);
+    let output = match child.wait_with_output().await {
+        Ok(output) => output,
+        Err(e) => {
+            return ExecuteResult::exec_failed_after_start(
+                allow_reason,
+                format!("failed to wait for '{}': {}", request.binary, e),
+            )
+            .with_secret_refs(used_secret_refs);
         }
     };
 
@@ -2177,6 +2231,7 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
     };
 
     ExecuteResult::completed(allow_reason, output.status.code(), stdout, stderr)
+        .with_secret_refs(used_secret_refs)
 }
 
 #[derive(Debug)]
@@ -2187,10 +2242,10 @@ struct StreamChunk {
 
 async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
     mut cmd: Command,
-    binary: &str,
     allow_reason: String,
     config: &ServerConfig,
     tool_env: &HashMap<String, String>,
+    audit: SpawnAuditContext<'_>,
     writer: &mut W,
 ) -> ExecuteResult {
     cmd.stdout(Stdio::piped());
@@ -2201,10 +2256,11 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
         Err(e) => {
             return ExecuteResult::exec_failed(
                 allow_reason,
-                format!("failed to execute '{}': {}", binary, e),
+                format!("failed to execute '{}': {}", audit.request.binary, e),
             );
         }
     };
+    audit_secret_use(audit.caller, audit.request, &audit.secret_refs);
 
     let (tx, mut rx) = mpsc::channel::<StreamChunk>(32);
     let mut stream_tasks = Vec::new();
@@ -2248,7 +2304,8 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
                         return ExecuteResult::exec_failed_after_start(
                             allow_reason,
                             format!("client stream error: {}", e),
-                        );
+                        )
+                        .with_secret_refs(audit.secret_refs);
                     }
                     }
                     None => break,
@@ -2260,7 +2317,8 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
                     return ExecuteResult::exec_failed_after_start(
                         allow_reason,
                         format!("client stream error: {}", e),
-                    );
+                    )
+                    .with_secret_refs(audit.secret_refs);
                 }
             }
         }
@@ -2273,14 +2331,36 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
     let status = match child.wait().await {
         Ok(status) => status,
         Err(e) => {
-            return ExecuteResult::exec_failed(
+            return ExecuteResult::exec_failed_after_start(
                 allow_reason,
-                format!("failed to wait for '{}': {}", binary, e),
-            );
+                format!("failed to wait for '{}': {}", audit.request.binary, e),
+            )
+            .with_secret_refs(audit.secret_refs);
         }
     };
 
     ExecuteResult::completed(allow_reason, status.code(), None, None)
+        .with_secret_refs(audit.secret_refs)
+}
+
+struct SpawnAuditContext<'a> {
+    caller: &'a CallerIdentity,
+    request: &'a ExecuteRequest,
+    secret_refs: Vec<String>,
+}
+
+fn audit_secret_use(caller: &CallerIdentity, request: &ExecuteRequest, secret_refs: &[String]) {
+    for secret_ref in secret_refs {
+        let secret_name = serde_json::to_string(secret_ref)
+            .unwrap_or_else(|_| "\"<invalid-secret-name>\"".to_string());
+        tracing::info!(target: "guard::audit",
+            "[AUDIT] SECRET_USE caller={} session={} secret={} cmd=\"{}\"",
+            caller,
+            audit_session_ref(request.session_token.as_deref()),
+            secret_name,
+            audit_command_line(&request.binary, &request.args)
+        );
+    }
 }
 
 async fn forward_stream_lines<R>(reader: R, stream: OutputStream, tx: mpsc::Sender<StreamChunk>)

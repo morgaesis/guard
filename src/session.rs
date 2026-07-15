@@ -237,6 +237,14 @@ pub struct SessionInteraction {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub risk: Option<i32>,
     pub exec_status: SessionExecStatus,
+    /// Child exit status when the command reached a terminal process result.
+    /// `None` also covers signals and paths where no child was started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Secret-store key names used by the spawned child. Values are never
+    /// persisted. Empty for commands that did not start.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_refs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1124,6 +1132,8 @@ mod tests {
                 reason: "safe".into(),
                 risk: Some(2),
                 exec_status: SessionExecStatus::Completed,
+                exit_code: Some(0),
+                secret_refs: Vec::new(),
             },
         );
         reg.record_interaction(
@@ -1136,6 +1146,8 @@ mod tests {
                 reason: "session deny pattern: rm*".into(),
                 risk: None,
                 exec_status: SessionExecStatus::NotAttempted,
+                exit_code: None,
+                secret_refs: Vec::new(),
             },
         );
         reg.record_interaction(
@@ -1148,6 +1160,8 @@ mod tests {
                 reason: "ok".into(),
                 risk: Some(1),
                 exec_status: SessionExecStatus::Failed,
+                exit_code: None,
+                secret_refs: Vec::new(),
             },
         );
 

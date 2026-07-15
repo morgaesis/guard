@@ -435,7 +435,7 @@ impl ApiProxy {
         if op.verb == Verb::Delete && op.subresource.is_none() {
             if let Some(handle) = self.take_created_provenance(&op, conn_id) {
                 tracing::info!(
-                    target: "guard::apiproxy",
+                    target: "guard::audit",
                     "ALLOW {} (contained: guard-created this session, resolving auto-revert {})",
                     label,
                     handle
@@ -566,7 +566,7 @@ impl ApiProxy {
         match judge.judge(&summary).await {
             ApiJudgeVerdict::Deny { reason } => {
                 tracing::info!(
-                    target: "guard::apiproxy",
+                    target: "guard::audit",
                     "[AUDIT] EVALUATE decision=deny risk=none reversibility=none reason={} label={}",
                     reason,
                     label
@@ -587,7 +587,7 @@ impl ApiProxy {
                 // could usefully make, so denying fails closed without flooding
                 // the queue.
                 tracing::info!(
-                    target: "guard::apiproxy",
+                    target: "guard::audit",
                     "[AUDIT] EVALUATE decision=error risk=none reversibility=none reason={} label={}",
                     error,
                     label
@@ -607,7 +607,7 @@ impl ApiProxy {
                 reversibility,
             } => {
                 tracing::info!(
-                    target: "guard::apiproxy",
+                    target: "guard::audit",
                     "[AUDIT] EVALUATE decision=allow risk={:?} reversibility={:?} reason={} label={}",
                     risk,
                     reversibility,

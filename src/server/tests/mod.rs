@@ -11,6 +11,8 @@ use crate::secrets::{EnvBackend, SecretManager};
 use crate::session::SessionRegistry;
 use crate::tool_config::ToolRegistry;
 use guard::policy::PolicyMode;
+#[cfg(unix)]
+use std::future::Future;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 use tracing::subscriber::with_default;
@@ -113,4 +115,22 @@ fn capture<F: FnOnce()>(buf: &SharedBuf, f: F) -> String {
     with_default(subscriber, f);
     let bytes = buf.0.lock().unwrap().clone();
     String::from_utf8_lossy(&bytes).to_string()
+}
+
+#[cfg(unix)]
+async fn capture_async<F>(buf: &SharedBuf, future: F) -> (F::Output, String)
+where
+    F: Future,
+{
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(buf.clone())
+        .with_max_level(tracing::Level::INFO)
+        .with_target(false)
+        .with_ansi(false)
+        .without_time()
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let output = future.await;
+    let bytes = buf.0.lock().unwrap().clone();
+    (output, String::from_utf8_lossy(&bytes).to_string())
 }

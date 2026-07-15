@@ -411,6 +411,7 @@ Unless marked "(client)", a variable is read by the daemon at startup; setting i
 | `GUARD_CACHE_CAPACITY` | `1024` | Maximum cached decisions (`--cache-capacity`). |
 | `GUARD_CACHE_TTL` | `3600` | Cache entry TTL in seconds (`--cache-ttl`). |
 | `GUARD_STATE_DB` | XDG state dir | Path to the SQLite state database (sessions, holds, provisionals, read grants). |
+| `GUARD_HISTORY_RETENTION_SECS` | `86400` | Retention window for ended grants and session interactions. Flag: `--history-retention`. Scheduled maintenance prunes expired rows and compacts the database after substantial free space accumulates. |
 | `GUARD_CHILD_ENV` | (none) | Comma-separated daemon env vars forwarded to brokered children (e.g. a `KUBECONFIG` only the daemon can read). Values come from the daemon's environment, never the caller's. |
 | `GUARD_EXEC_AS_CALLER` | `false` | Run brokered children as the calling uid instead of the daemon account (Unix). |
 | `GUARD_API_PROXY` | (none) | API proxy listen address (loopback only); see the API proxy section. Companions: `GUARD_API_PROTOCOL`, `GUARD_API_UPSTREAM`, `GUARD_API_TOKEN_ENV`, `GUARD_API_TOKEN_FILE`, `GUARD_API_CA_OUT`, `GUARD_API_POLICY`. |
@@ -692,7 +693,7 @@ An appeal runs the evaluator with the session context and then either amends an 
 
 Session grants are persisted in the daemon state database and survive daemon restarts by default. The default path is the XDG state dir (`$XDG_STATE_HOME/guard/state.db` or `~/.local/state/guard/state.db`); override it with `--state-db` or `GUARD_STATE_DB`. `guard session revoke <token>` is restricted to the daemon principal. `guard session list` is visible over a local listener to exec-allowed callers: non-admin callers see redacted tokens, hidden rule bodies, hidden generated notes, and hidden prompt text for other sessions. If `GUARD_SESSION` matches an active or historical grant, that row is shown as `token=(current)` with its own rules, prompt context, and generated notes visible, but the raw token is still not printed.
 
-For forensics, `guard session show <token>` prints prompt context, generated notes, aggregate allow/deny and exec outcome counts, source breakdown (`llm`, `cache`, `static_policy`, `session_allow`, `session_deny`, `session_static_only`, `validation`), a risk histogram for LLM-evaluated calls, and a bounded recent interaction log. Daemon-principal and TCP admin-token callers see the raw token. Non-admin local callers may show a session only by presenting its token and receive the same session details with tokens rendered as `(provided)`. Those summaries are loaded from the state database, so they remain available after a service restart within the configured retention window.
+For forensics, `guard session show <token>` prints prompt context, generated notes, aggregate allow/deny and exec outcome counts, source breakdown (`llm`, `cache`, `static_policy`, `session_allow`, `session_deny`, `session_static_only`, `validation`), a risk histogram for LLM-evaluated calls, and a bounded recent interaction log. Each interaction includes an optional child exit code and the names, never values, of secrets that reached a successfully spawned child. Daemon-principal and TCP admin-token callers see the raw token. Non-admin local callers may show a session only by presenting its token and receive the same session details with tokens rendered as `(provided)`. Those summaries are loaded from the state database, so they remain available after a service restart within the configured retention window.
 
 ## Scoped file read grants
 
@@ -922,10 +923,10 @@ Guard provides defense in depth through three layers:
 
 ## Audit logging
 
-Guard logs all decisions via `tracing`. Configure log level with `RUST_LOG`:
+Guard logs audit events through the dedicated `guard::audit` tracing target. The audit sink remains active when `RUST_LOG` or `GUARD_LOG_LEVEL` suppresses ordinary diagnostics. Configure ordinary diagnostic and evaluator-usage verbosity with `RUST_LOG`:
 
 ```bash
-RUST_LOG=info guard server start    # decisions + token usage
+RUST_LOG=info guard server start    # diagnostics + token usage
 RUST_LOG=debug guard server start   # verbose request/response logging
 ```
 
@@ -935,7 +936,9 @@ LLM token usage is logged per evaluation:
 [LLM_USAGE] model=openai/gpt-5.4-mini attempt=1 prompt_tokens=3594 completion_tokens=47 total_tokens=3641 status=ok
 ```
 
-For this local deployment model, the audit source of truth is the daemon's structured `tracing` output, typically collected by journald. The SQLite state database is for session state and queryable session history, not for replacing your log pipeline. `guard session show` is an operator view over that persisted session history; it should complement journald, not replace it.
+Per-command audit records use stable hashed session fingerprints, so events correlate without exposing bearer token bytes. `SECRET_USE` records are emitted only after a child starts and contain the secret name, session fingerprint, and masked command, never the value.
+
+For this local deployment model, the audit source of truth is the daemon's structured `tracing` output, typically collected by journald. The SQLite state database is for session state and queryable session history, not for replacing your log pipeline. `guard session show` is an operator view over that persisted session history; it complements journald.
 
 ## Limitations
 
