@@ -1277,6 +1277,161 @@ async fn auto_and_operator_approval_fail_without_partial_session_authority() {
 }
 
 #[tokio::test]
+async fn terminal_grant_request_races_have_one_durable_authority_outcome() {
+    for competing_status in [
+        crate::grant_profile::GrantRequestStatus::Withdrawn,
+        crate::grant_profile::GrantRequestStatus::Denied,
+    ] {
+        let (mut cfg, _) = make_test_config();
+        cfg.daemon_uid = 777;
+        cfg.daemon_principal = PrincipalKey::from_uid(777);
+        cfg.saved_grants = Arc::new(RwLock::new(
+            SavedGrantCatalog::from_yaml(
+                "grants:\n  - name: reviewed\n    ttl_secs: 300\n    prompt_append: reviewed work\n    auto_approve_requests: false\n",
+            )
+            .unwrap(),
+        ));
+        let tmp = tempfile::tempdir().unwrap();
+        cfg.session_store = Some(
+            SessionStore::open(tmp.path().join("state.db"), 3600)
+                .await
+                .unwrap(),
+        );
+        let token = format!("terminal-race-{}", competing_status.as_str());
+        let daemon = CallerIdentity::Unix { uid: 777 };
+        let worker = CallerIdentity::Unix { uid: 778 };
+        assert!(matches!(
+            handle_admin_request(
+                &cfg,
+                &daemon,
+                AdminRequest::SessionGrant {
+                    token: token.clone(),
+                    allow: Vec::new(),
+                    deny: Vec::new(),
+                    activated_verbs: Vec::new(),
+                    override_markers: Vec::new(),
+                    ttl_secs: None,
+                    prompt_append: None,
+                    prose: None,
+                    saved_grant: Some("reviewed".to_string()),
+                    profile: None,
+                    evaluation_mode: None,
+                    static_only: false,
+                    auto_amend: false,
+                },
+            )
+            .await,
+            AdminResponse::Ok
+        ));
+        let issued_revision = cfg.sessions.read().await.effective_revision_key(&token);
+        let submitted = handle_admin_request(
+            &cfg,
+            &worker,
+            AdminRequest::GrantRequestSubmit {
+                session_token: token.clone(),
+                caller_token: Some(token.clone()),
+                saved_grant: None,
+                prompt: "shorten bounded work".to_string(),
+                delta: crate::grant_profile::GrantRequestDelta {
+                    ttl_secs: Some(120),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+        let AdminResponse::GrantRequest { request } = submitted else {
+            panic!("expected pending request, got {submitted:?}");
+        };
+        let handle = request.handle;
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let approve_cfg = cfg.clone();
+        let approve_handle = handle.clone();
+        let approve_barrier = barrier.clone();
+        let approve = tokio::spawn(async move {
+            approve_barrier.wait().await;
+            handle_admin_request(
+                &approve_cfg,
+                &CallerIdentity::Unix { uid: 777 },
+                AdminRequest::GrantRequestApprove {
+                    handle: approve_handle,
+                },
+            )
+            .await
+        });
+        let competing_cfg = cfg.clone();
+        let competing_handle = handle.clone();
+        let competing_token = token.clone();
+        let competing_barrier = barrier.clone();
+        let competing = tokio::spawn(async move {
+            competing_barrier.wait().await;
+            let request = match competing_status {
+                crate::grant_profile::GrantRequestStatus::Withdrawn => {
+                    AdminRequest::GrantRequestWithdraw {
+                        handle: competing_handle,
+                        session_token: Some(competing_token),
+                    }
+                }
+                crate::grant_profile::GrantRequestStatus::Denied => {
+                    AdminRequest::GrantRequestDeny {
+                        handle: competing_handle,
+                        reason: "operator denied".to_string(),
+                    }
+                }
+                _ => unreachable!(),
+            };
+            handle_admin_request(&competing_cfg, &CallerIdentity::Unix { uid: 777 }, request).await
+        });
+        barrier.wait().await;
+        let responses = [approve.await.unwrap(), competing.await.unwrap()];
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|response| matches!(response, AdminResponse::GrantRequest { .. }))
+                .count(),
+            1,
+            "exactly one terminal transition must win: {responses:?}"
+        );
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|response| matches!(response, AdminResponse::Error { .. }))
+                .count(),
+            1,
+            "the losing transition must report a conflict: {responses:?}"
+        );
+
+        let store = cfg.session_store.as_ref().unwrap();
+        let durable = store
+            .load_grant_request(handle.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            durable.status,
+            crate::grant_profile::GrantRequestStatus::Approved
+                | crate::grant_profile::GrantRequestStatus::Denied
+                | crate::grant_profile::GrantRequestStatus::Withdrawn
+        ));
+        assert_eq!(
+            cfg.grant_requests.read().await[&handle].status,
+            durable.status
+        );
+        let live_revision = cfg.sessions.read().await.effective_revision_key(&token);
+        let durable_revision = store
+            .load_registry()
+            .await
+            .unwrap()
+            .effective_revision_key(&token);
+        assert_eq!(live_revision, durable_revision);
+        assert_eq!(
+            live_revision != issued_revision,
+            durable.status == crate::grant_profile::GrantRequestStatus::Approved,
+            "session authority must change if and only if approval wins"
+        );
+    }
+}
+
+#[tokio::test]
 async fn saved_grant_edit_uses_explicit_clear_and_tristate_operations() {
     let (mut cfg, _) = make_test_config();
     cfg.daemon_uid = 777;

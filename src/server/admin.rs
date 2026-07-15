@@ -1573,6 +1573,7 @@ pub(super) async fn handle_admin_request(
                     && grant.auto_approve_requests
                     && grant.contains_delta(&request.delta)
             });
+            let _transition = config.grant_request_transition_gate.lock().await;
             {
                 let mut requests = config.grant_requests.write().await;
                 if requests.len() >= MAX_GRANT_REQUESTS {
@@ -1704,8 +1705,9 @@ pub(super) async fn handle_admin_request(
             session_token,
         } => {
             prune_grant_requests(config).await;
-            let mut requests = config.grant_requests.write().await;
-            let Some(current) = requests.get(&handle) else {
+            let _transition = config.grant_request_transition_gate.lock().await;
+            let current = config.grant_requests.read().await.get(&handle).cloned();
+            let Some(current) = current else {
                 return AdminResponse::Error {
                     message: format!("unknown grant request: '{handle}'"),
                 };
@@ -1721,7 +1723,10 @@ pub(super) async fn handle_admin_request(
             }
             if current.status != GrantRequestStatus::Pending {
                 return AdminResponse::Error {
-                    message: format!("grant request '{handle}' is not pending"),
+                    message: format!(
+                        "grant request transition conflict: '{handle}' is already {}",
+                        current.status.as_str()
+                    ),
                 };
             }
             let mut request = current.clone();
@@ -1729,14 +1734,21 @@ pub(super) async fn handle_admin_request(
             request.decided_unix = Some(now_unix());
             request.next_action = format!("guard grant request show {handle}");
             if let Some(store) = &config.session_store {
-                if let Err(error) = store.save_grant_request(request.clone()).await {
+                if let Err(error) = store
+                    .compare_and_swap_grant_request(current.clone(), request.clone())
+                    .await
+                {
+                    reconcile_grant_request_from_store(config, &handle).await;
                     return AdminResponse::Error {
-                        message: format!("failed to persist grant request: {error}"),
+                        message: format!("grant request transition conflict: {error}"),
                     };
                 }
             }
-            requests.insert(handle, request.clone());
-            drop(requests);
+            config
+                .grant_requests
+                .write()
+                .await
+                .insert(handle, request.clone());
             emit_grant_request_event(config, &request, "grant_request_withdrawn");
             AdminResponse::GrantRequest {
                 request: redact_grant_request(request),
@@ -1919,6 +1931,7 @@ async fn decide_grant_request(
     approve: bool,
     reason: &str,
 ) -> AdminResponse {
+    let _transition = config.grant_request_transition_gate.lock().await;
     let request = config.grant_requests.read().await.get(handle).cloned();
     let Some(mut request) = request else {
         return AdminResponse::Error {
@@ -1927,7 +1940,10 @@ async fn decide_grant_request(
     };
     if request.status != GrantRequestStatus::Pending {
         return AdminResponse::Error {
-            message: format!("grant request '{handle}' is not pending"),
+            message: format!(
+                "grant request transition conflict: '{handle}' is already {}",
+                request.status.as_str()
+            ),
         };
     }
     if request.expires_unix == 0 || now_unix() >= request.expires_unix {
@@ -1962,12 +1978,17 @@ async fn decide_grant_request(
         if let Err(message) =
             apply_and_persist_grant_request_delta_if_current(config, &pending, &request).await
         {
+            reconcile_grant_request_from_store(config, handle).await;
             return AdminResponse::Error { message };
         }
     } else if let Some(store) = &config.session_store {
-        if let Err(error) = store.save_grant_request(request.clone()).await {
+        if let Err(error) = store
+            .compare_and_swap_grant_request(pending, request.clone())
+            .await
+        {
+            reconcile_grant_request_from_store(config, handle).await;
             return AdminResponse::Error {
-                message: format!("failed to persist grant request decision: {error}"),
+                message: format!("grant request transition conflict: {error}"),
             };
         }
     }
@@ -1979,6 +2000,29 @@ async fn decide_grant_request(
     emit_grant_request_event(config, &request, "grant_request_decided");
     AdminResponse::GrantRequest {
         request: redact_grant_request(request),
+    }
+}
+
+async fn reconcile_grant_request_from_store(config: &ServerConfig, handle: &str) {
+    let Some(store) = &config.session_store else {
+        return;
+    };
+    match store.load_grant_request(handle.to_string()).await {
+        Ok(Some(durable)) => {
+            config
+                .grant_requests
+                .write()
+                .await
+                .insert(handle.to_string(), durable);
+        }
+        Ok(None) => {
+            config.grant_requests.write().await.remove(handle);
+        }
+        Err(error) => tracing::warn!(
+            "failed to reconcile grant request '{}' after transition conflict: {}",
+            handle,
+            error
+        ),
     }
 }
 

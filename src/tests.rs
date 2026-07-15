@@ -540,6 +540,51 @@ fn saved_grant_issue_parses_canonical_command() {
 }
 
 #[test]
+fn legacy_grant_prompt_routes_to_session_issue() {
+    let args = preprocess_legacy_grant_args(vec![
+        "guard".to_string(),
+        "grant".to_string(),
+        "allow only --check mode".to_string(),
+    ]);
+    match MainArgs::try_parse_from(args) {
+        Ok(MainArgs::Session(SessionCommands::New { prose, .. })) => {
+            assert_eq!(prose.as_deref(), Some("allow only --check mode"));
+        }
+        Ok(_) => panic!("expected legacy grant prompt to issue a session"),
+        Err(error) => panic!("expected legacy grant prompt to parse, got {error}"),
+    }
+}
+
+#[test]
+fn legacy_grant_token_prompt_routes_to_session_amendment() {
+    let args = preprocess_legacy_grant_args(vec![
+        "guard".to_string(),
+        "grant".to_string(),
+        "session-token".to_string(),
+        "allow only --check mode".to_string(),
+    ]);
+    match MainArgs::try_parse_from(args) {
+        Ok(MainArgs::Session(SessionCommands::Grant { token, prose, .. })) => {
+            assert_eq!(token, "session-token");
+            assert_eq!(prose.as_deref(), Some("allow only --check mode"));
+        }
+        Ok(_) => panic!("expected legacy token grant to amend a session"),
+        Err(error) => panic!("expected legacy token grant to parse, got {error}"),
+    }
+}
+
+#[test]
+fn canonical_grant_commands_bypass_legacy_preprocessing() {
+    let args = vec![
+        "guard".to_string(),
+        "grant".to_string(),
+        "issue".to_string(),
+        "readonly-kube".to_string(),
+    ];
+    assert_eq!(preprocess_legacy_grant_args(args.clone()), args);
+}
+
+#[test]
 fn guard_mode_env_resolution() {
     use guard::policy::PolicyMode;
 

@@ -33,7 +33,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 const MAX_GUARD_DEPTH: u32 = 5;
 const MAX_REQUEST_BYTES: usize = 1_048_576; // 1MB
@@ -164,6 +164,9 @@ struct ServerConfig {
     pub saved_grants: Arc<RwLock<SavedGrantCatalog>>,
     /// Durable requests to amend a live or saved grant.
     pub grant_requests: Arc<RwLock<std::collections::BTreeMap<String, GrantRequest>>>,
+    /// Serializes terminal transitions so memory and durable state observe one
+    /// winner for approve, deny, and withdraw races.
+    pub grant_request_transition_gate: Arc<Mutex<()>>,
     /// Optional server-wide binary allow-list. `None` (the default) imposes no
     /// restriction. When `Some`, only binaries permitted by [`binary_allowed`]
     /// may execute, on every route (raw run, verb, and gated approval), as a
@@ -254,6 +257,7 @@ impl ServerConfig {
             verbs: Arc::new(RwLock::new(VerbCatalog::empty())),
             saved_grants: Arc::new(RwLock::new(SavedGrantCatalog::empty())),
             grant_requests: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
+            grant_request_transition_gate: Arc::new(Mutex::new(())),
             // No binary restriction by default; the entrypoint sets this from
             // --allow-bin / GUARD_ALLOW_BIN, like the gate fields above.
             allowed_binaries: None,

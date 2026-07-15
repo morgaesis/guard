@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use guard::gating::approval::Approval;
 use guard::gating::provisional::Provisional;
 use guard::gating::read_grant::ReadGrant;
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -724,6 +724,99 @@ impl SessionStore {
         .context("save grant request task failed")?
     }
 
+    /// Replace a pending grant request with one terminal outcome. The durable
+    /// row must still exactly match the caller's pending snapshot.
+    pub async fn compare_and_swap_grant_request(
+        &self,
+        pending: GrantRequest,
+        terminal: GrantRequest,
+    ) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("simulated session-store write failure");
+        }
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            Self::compare_and_swap_grant_request_sync(&path, &pending, &terminal)
+        })
+        .await
+        .context("grant request transition task failed")?
+    }
+
+    fn compare_and_swap_grant_request_sync(
+        path: &Path,
+        pending: &GrantRequest,
+        terminal: &GrantRequest,
+    ) -> Result<()> {
+        if pending.status != crate::grant_profile::GrantRequestStatus::Pending
+            || !matches!(
+                terminal.status,
+                crate::grant_profile::GrantRequestStatus::Denied
+                    | crate::grant_profile::GrantRequestStatus::Withdrawn
+            )
+            || terminal.handle != pending.handle
+            || terminal.session_token != pending.session_token
+            || terminal.saved_grant != pending.saved_grant
+            || terminal.issued_saved_revision != pending.issued_saved_revision
+            || terminal.issued_session_revision != pending.issued_session_revision
+            || terminal.delta != pending.delta
+        {
+            anyhow::bail!("invalid grant request terminal transition");
+        }
+
+        let mut conn = Self::open_connection(path)?;
+        Self::init_schema(&conn)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let durable_json = tx
+            .query_row(
+                "SELECT json FROM grant_requests WHERE handle = ?1",
+                params![pending.handle],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .context("durable pending grant request is missing")?;
+        let durable: GrantRequest =
+            serde_json::from_str(&durable_json).context("decode durable pending grant request")?;
+        if durable != *pending {
+            anyhow::bail!("durable grant request already has a terminal outcome");
+        }
+        let terminal_json =
+            serde_json::to_string(terminal).context("encode terminal grant request")?;
+        tx.execute(
+            "UPDATE grant_requests SET json = ?1, status = ?2, created_unix = ?3 WHERE handle = ?4",
+            params![
+                terminal_json,
+                terminal.status.as_str(),
+                encode_u64(terminal.created_unix)?,
+                terminal.handle
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub async fn load_grant_request(&self, handle: String) -> Result<Option<GrantRequest>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = Self::open_connection(&path)?;
+            Self::init_schema(&conn)?;
+            let json = conn
+                .query_row(
+                    "SELECT json FROM grant_requests WHERE handle = ?1",
+                    params![handle],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            json.map(|json| serde_json::from_str(&json).context("decode grant request"))
+                .transpose()
+        })
+        .await
+        .context("load grant request task failed")?
+    }
+
     /// Commit an approved request and the session authority it changes in one
     /// SQLite transaction. The durable pending request and session revision
     /// are rechecked inside that transaction before either row set changes.
@@ -784,9 +877,9 @@ impl SessionStore {
             anyhow::bail!("invalid grant request approval transition");
         }
 
-        let conn = Self::open_connection(path)?;
+        let mut conn = Self::open_connection(path)?;
         Self::init_schema(&conn)?;
-        let tx = conn.unchecked_transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let durable_json = tx
             .query_row(
                 "SELECT json FROM grant_requests WHERE handle = ?1",

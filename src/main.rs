@@ -59,6 +59,34 @@ fn parse_unbounded_secs(value: &str) -> Result<u64, String> {
     Ok(seconds)
 }
 
+/// Preserve the original top-level grant shorthand without adding it back to
+/// the public command tree. Canonical saved-grant subcommands pass through.
+fn preprocess_legacy_grant_args(mut args: Vec<String>) -> Vec<String> {
+    if args.len() < 3 || args.get(1).map(String::as_str) != Some("grant") {
+        return args;
+    }
+    const CANONICAL: &[&str] = &[
+        "save",
+        "edit",
+        "regenerate",
+        "issue",
+        "list",
+        "show",
+        "delete",
+        "request",
+        "help",
+    ];
+    if CANONICAL.contains(&args[2].as_str()) || args[2].starts_with('-') {
+        return args;
+    }
+    match args.len() {
+        3 => args.splice(1..2, ["session".to_string(), "new".to_string()]),
+        4 => args.splice(1..2, ["session".to_string(), "grant".to_string()]),
+        _ => return args,
+    };
+    args
+}
+
 fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
@@ -1437,7 +1465,7 @@ async fn run_main() -> Result<()> {
         return print_nested_help(&path, bin_name);
     }
 
-    let result = MainArgs::try_parse_from(std::env::args());
+    let result = MainArgs::try_parse_from(preprocess_legacy_grant_args(std::env::args().collect()));
 
     match result {
         Ok(MainArgs::Run {
