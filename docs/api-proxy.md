@@ -45,6 +45,11 @@ The session is revalidated immediately before forwarding, including after a
 slow snapshot or held approval. Expiry, revocation, suspension, or a changed
 immutable authority snapshot fails closed.
 
+Each request also binds the complete API policy and evaluator-intent generation
+before classification. A hot reload that changes any policy field or evaluator
+intent invalidates every in-flight request before its next upstream operation.
+The client submits a fresh request under the new authority.
+
 ## Policy
 
 Load a hot-reloaded YAML policy with `--api-policy`; absence is default deny.

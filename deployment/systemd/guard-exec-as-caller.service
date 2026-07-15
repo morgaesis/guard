@@ -20,7 +20,6 @@ StateDirectoryMode=0700
 # accounts on this host. --exec-as-caller then runs each
 # approved command as that connecting UID and requires a Unix socket (it is
 # incompatible with a TCP listener, which carries no trusted local UID).
-Environment=GUARD_ALLOWED_USERS=
 UMask=0077
 ExecStart=/usr/local/bin/guard server start --socket /run/guard/guard.sock --socket-group guard-clients --state-db /var/lib/guard/state.db ${GUARD_ALLOWED_USERS} --exec-as-caller
 Restart=on-failure

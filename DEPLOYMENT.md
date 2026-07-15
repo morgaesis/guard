@@ -43,7 +43,14 @@ The standard unprivileged model runs `guard` as a dedicated account and exposes
 `/run/guard/guard.sock` to the permitted agent group. Protect the state directory,
 environment file, catalogs, SSH material, and secret backend from that group.
 
+Create the dedicated socket group and add only agent accounts that may submit
+requests. The daemon creates the socket as `0600`, or `0660` after it
+successfully assigns the configured group. It never makes the socket
+world-accessible.
+
 ```bash
+groupadd --system guard-clients
+usermod --append --groups guard-clients agent-account
 install -m 0755 target/release/guard /usr/local/bin/guard
 install -m 0644 deployment/systemd/guard.service /etc/systemd/system/
 install -m 0644 deployment/systemd/guard.socket /etc/systemd/system/
@@ -58,7 +65,9 @@ tokens out of unit command lines. `systemctl cat guard.service` shows the exact
 merged hardening and environment configuration.
 
 Use `--users` to restrict submitting Unix uids when the socket group is broader
-than the intended agent account. `NoNewPrivileges=true` prevents approved
+than the intended agent account. Set
+`GUARD_ALLOWED_USERS="--users 1000,1001"` in `/etc/default/guard` when using the
+packaged service. `NoNewPrivileges=true` prevents approved
 children from gaining privilege through setuid helpers. A daemon that must act
 as root is a sudo-like trust boundary and needs narrow callers, binary floors,
 short grants, consequence gating, audit shipping, and separate agent identity.
@@ -129,6 +138,10 @@ and persists cleanup state. Windows does not modify caller file ACLs.
 Use `--secret-file ENV=NAME` when a child accepts credential material by path.
 The value remains in a daemon-owned child-lifetime file and is incompatible with
 `--exec-as-caller`.
+
+On Unix, Guard creates private state directories as `0700` and the SQLite
+database and sidecars as `0600`. It rejects symlinked or non-regular database
+paths and unsafe writable parent directories instead of opening them.
 
 ## Remote command credentials
 

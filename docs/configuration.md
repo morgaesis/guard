@@ -117,6 +117,12 @@ operator-selected `GUARD_CHILD_ENV` values come from the daemon, not the caller.
 `--secret-file ENV=NAME` creates a daemon-only child-lifetime file and exposes
 only its path. The file mode is incompatible with `--exec-as-caller`.
 
+Caller-requested `--env`, `--secret`, and `--secret-file` bindings are part of
+the evaluator subject and cache authority. Raw environment values stay out of
+prompts and audit; Guard binds them with a value digest. Secret bindings expose
+only environment and store names to policy, while resolved values remain inside
+the daemon.
+
 ## API proxy
 
 | Variable | Default | Meaning |

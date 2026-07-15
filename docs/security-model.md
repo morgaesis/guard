@@ -65,6 +65,12 @@ pipes authenticate caller SID and use a restricted pipe ACL. The daemon's own
 uid or SID is the operator principal for holds, provisionals, saved grants,
 verbs, and detailed status.
 
+On Unix, the local socket is private to the daemon unless an operator configures
+a group, in which case it is group-readable and group-writable. SQLite state and
+sidecars are owner-only regular files beneath private, non-symlinked state
+directories. Socket membership controls who may submit requests; session and
+uid authorization remain separate boundaries.
+
 Loopback TCP carries execution and admin bearer tokens but no kernel-authenticated
 local principal. It therefore refuses consequence gating and per-principal
 credential injection. The execution token cannot perform admin RPCs.
