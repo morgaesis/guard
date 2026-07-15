@@ -16,6 +16,7 @@ use super::op::ApiOp;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NonResourceRead {
     Discovery,
+    Health,
 }
 
 /// Identity of an object a tracked write created. The proxy records it (scoped

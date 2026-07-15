@@ -70,8 +70,11 @@ const GUARD_SESSION_HEADER: &str = "x-guard-session";
 #[derive(Debug, Clone)]
 struct GuardRejected;
 
-#[derive(Debug, Clone)]
-struct GuardHeld;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuardHoldOutcome {
+    Approved,
+    Denied,
+}
 
 #[derive(Debug)]
 enum RequestBodyError {
@@ -615,14 +618,16 @@ impl ApiProxy {
         }
         let response = self.route_inner(req, conn_id, session_context).await;
         if let (Some(token), Some(sink)) = (session_token.as_deref(), self.session_sink.get()) {
+            let hold_outcome = response.extensions().get::<GuardHoldOutcome>().copied();
             sink.record(
                 token,
                 ApiSessionEvent {
                     endpoint: self.endpoint.clone(),
                     operation: format!("{} {}", method, path),
-                    allowed: response.extensions().get::<GuardRejected>().is_none(),
+                    allowed: hold_outcome != Some(GuardHoldOutcome::Denied)
+                        && response.extensions().get::<GuardRejected>().is_none(),
                     status: response.status().as_u16(),
-                    held: response.extensions().get::<GuardHeld>().is_some(),
+                    held: hold_outcome.is_some(),
                     credential_ref: self.credential_ref.clone(),
                 },
             )
@@ -1265,41 +1270,45 @@ impl ApiProxy {
             .extensions
             .get::<SessionAuth>()
             .map(|auth| &auth.context);
-        let mut response = match gate.hold_request(&snapshot, reason, session_context).await {
-            HoldDecision::Approved { handle } => {
-                let redact = self.protocol.redactable_read(op);
-                tracing::info!(
-                    target: "guard::apiproxy",
-                    "ALLOW {} (operator approved hold {}){}",
-                    label,
-                    handle,
-                    if redact { " (redacting)" } else { "" }
-                );
-                self.forward_buffered(
-                    parts,
-                    body,
-                    path,
-                    query,
-                    redact,
-                    Some(op.clone()),
-                    conn_id,
-                    None,
-                )
-                .await
-            }
-            HoldDecision::Denied { reason } => {
-                tracing::info!(target: "guard::apiproxy", "DENY {} (held: {})", label, reason);
-                self.status_resp(
-                    StatusCode::FORBIDDEN,
-                    &format!(
-                        "guard api-proxy ({}): {label} held for operator approval: {reason}",
-                        self.protocol.name()
-                    ),
-                    "Forbidden",
-                )
-            }
-        };
-        response.extensions_mut().insert(GuardHeld);
+        let (mut response, outcome) =
+            match gate.hold_request(&snapshot, reason, session_context).await {
+                HoldDecision::Approved { handle } => {
+                    let redact = self.protocol.redactable_read(op);
+                    tracing::info!(
+                        target: "guard::apiproxy",
+                        "ALLOW {} (operator approved hold {}){}",
+                        label,
+                        handle,
+                        if redact { " (redacting)" } else { "" }
+                    );
+                    let response = self
+                        .forward_buffered(
+                            parts,
+                            body,
+                            path,
+                            query,
+                            redact,
+                            Some(op.clone()),
+                            conn_id,
+                            None,
+                        )
+                        .await;
+                    (response, GuardHoldOutcome::Approved)
+                }
+                HoldDecision::Denied { reason } => {
+                    tracing::info!(target: "guard::apiproxy", "DENY {} (held: {})", label, reason);
+                    let response = self.status_resp(
+                        StatusCode::FORBIDDEN,
+                        &format!(
+                            "guard api-proxy ({}): {label} held for operator approval: {reason}",
+                            self.protocol.name()
+                        ),
+                        "Forbidden",
+                    );
+                    (response, GuardHoldOutcome::Denied)
+                }
+            };
+        response.extensions_mut().insert(outcome);
         response
     }
 
