@@ -331,6 +331,53 @@ impl Upstream {
     pub fn identity_fingerprint(&self) -> &str {
         &self.identity_fingerprint
     }
+
+    /// Exact byte sequences derived from the authentication material this
+    /// proxy injects. Response filtering uses them to prevent a cooperative or
+    /// hostile upstream from reflecting daemon-held credentials to the client.
+    pub fn response_secret_values(&self) -> Vec<Vec<u8>> {
+        let mut values = Vec::new();
+        if let Some(token) = self.bearer.as_deref() {
+            if !token.is_empty() {
+                values.push(token.as_bytes().to_vec());
+                values.push(format!("Bearer {token}").into_bytes());
+            }
+        }
+        if let Some((username, password)) = self.basic.as_ref() {
+            let joined = format!("{username}:{password}");
+            if !password.is_empty() {
+                values.push(password.as_bytes().to_vec());
+            }
+            values.push(joined.as_bytes().to_vec());
+            values.push(
+                format!(
+                    "Basic {}",
+                    base64::engine::general_purpose::STANDARD.encode(joined.as_bytes())
+                )
+                .into_bytes(),
+            );
+        }
+        values.sort();
+        values.dedup();
+        values
+    }
+
+    /// Produce a bounded, credential-safe diagnostic excerpt for persisted
+    /// revert errors and audit messages.
+    pub fn redact_error_excerpt(&self, bytes: &[u8], max_chars: usize) -> String {
+        let mut text = String::from_utf8_lossy(bytes).to_string();
+        for secret in self.response_secret_values() {
+            if !secret.is_empty() {
+                text = text.replace(&*String::from_utf8_lossy(&secret), "[REDACTED]");
+            }
+        }
+        text = crate::redact::redact_output_text(&text);
+        let mut excerpt = text.chars().take(max_chars).collect::<String>();
+        if text.chars().count() > max_chars {
+            excerpt.push('~');
+        }
+        excerpt
+    }
 }
 
 fn fingerprint_identity(base: &str, auth: (&str, &[u8])) -> String {
@@ -408,6 +455,23 @@ users:
         )
         .unwrap();
         assert_ne!(first.identity_fingerprint(), second.identity_fingerprint());
+    }
+
+    #[test]
+    fn revert_error_excerpt_is_bounded_and_redacts_injected_credentials() {
+        let upstream = Upstream::from_base_url(
+            "https://api.example.test",
+            UpstreamAuth::Bearer("operator-secret-token".to_string()),
+        )
+        .unwrap();
+        let body = format!(
+            "upstream reflected Bearer operator-secret-token {}",
+            "x".repeat(2000)
+        );
+        let excerpt = upstream.redact_error_excerpt(body.as_bytes(), 80);
+        assert!(!excerpt.contains("operator-secret-token"));
+        assert!(excerpt.contains("[REDACTED]"));
+        assert!(excerpt.chars().count() <= 81);
     }
 
     #[test]

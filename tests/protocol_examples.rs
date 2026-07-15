@@ -261,6 +261,15 @@ async fn github_allowed_read_forwards_and_writes_default_deny() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 403);
+    for path in ["/search/issues?q=guard", "/gists", "/notifications"] {
+        let resp = p
+            .client
+            .get(format!("{}{}", p.base, path))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403, "unknown GitHub read {path} must deny");
+    }
     assert_eq!(p.hit_count(), 1, "denied writes never reach the upstream");
 }
 
@@ -601,6 +610,13 @@ async fn vercel_log_streams_and_unknown_writes_never_reach_upstream() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 403);
+    let resp = p
+        .client
+        .get(format!("{}/login", p.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "unversioned Vercel reads must deny");
     assert_eq!(p.hit_count(), 0);
 }
 

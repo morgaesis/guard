@@ -47,7 +47,7 @@ pub use kubeconfig::{
 };
 pub use op::{ApiOp, Verb};
 pub use policy::{ApiAction, ApiPolicy, ApiRule};
-pub use protocol::{CreatedIdentity, PlannedRevert, ProtocolConfig};
+pub use protocol::{CreatedIdentity, NonResourceRead, PlannedRevert, ProtocolConfig};
 pub use server::{ApiListenerMode, ApiProxy};
 pub use tls::ProxyTls;
 pub use upstream::{Upstream, UpstreamAuth};

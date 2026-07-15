@@ -1845,12 +1845,27 @@ async fn run_api_revert(
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body);
     }
-    let resp = rb.send().await.map_err(|e| {
-        RevertError::Failed(format!("send api revert for provisional {}: {e}", p.handle))
+    let mut resp = rb.send().await.map_err(|error| {
+        let detail = upstream.redact_error_excerpt(error.to_string().as_bytes(), 512);
+        RevertError::Failed(format!(
+            "send api revert for provisional {}: {detail}",
+            p.handle
+        ))
     })?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        const MAX_REVERT_ERROR_BYTES: usize = 4096;
+        const MAX_REVERT_ERROR_CHARS: usize = 512;
+        let mut bytes = Vec::new();
+        while bytes.len() < MAX_REVERT_ERROR_BYTES {
+            let chunk = match resp.chunk().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) | Err(_) => break,
+            };
+            let remaining = MAX_REVERT_ERROR_BYTES - bytes.len();
+            bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        }
+        let text = upstream.redact_error_excerpt(&bytes, MAX_REVERT_ERROR_CHARS);
         return Err(RevertError::Failed(format!(
             "api revert returned HTTP {status}: {text}"
         )));

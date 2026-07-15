@@ -1221,13 +1221,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 let listen: std::net::SocketAddr = addr_str
                     .parse()
                     .with_context(|| format!("invalid API proxy address '{addr_str}'"))?;
-                if !listen.ip().is_loopback() {
-                    anyhow::bail!(
-                        "--api-proxy must bind a loopback address (got {listen}): a Guard session \
-                         bearer is not bound to a network client identity, so a non-loopback bind \
-                         would expose the daemon's upstream authority to the network"
-                    );
-                }
+                validate_api_listener(listen, "--api-proxy")?;
 
                 let protocol_name = api_protocol
                     .or(env_api_protocol)
@@ -1597,6 +1591,18 @@ fn write_brokered_kubeconfig_output(
         .with_context(|| format!("write brokered kubeconfig to {}", path.display()))
 }
 
+fn validate_api_listener(listen: std::net::SocketAddr, label: &str) -> Result<()> {
+    if listen.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) {
+        anyhow::bail!(
+            "{label} must bind exactly 127.0.0.1 because the generated TLS certificate and brokered URL use that address (got {listen})"
+        );
+    }
+    if listen.port() == 0 {
+        anyhow::bail!("{label} must use an explicit nonzero listener port");
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_named_api_proxy(
     spec: ApiEndpointSpec,
@@ -1619,19 +1625,7 @@ fn build_named_api_proxy(
         .listen
         .parse()
         .with_context(|| format!("invalid listen address for API endpoint '{}'", spec.name))?;
-    if !listen.ip().is_loopback() {
-        anyhow::bail!(
-            "API endpoint '{}' must bind a loopback address (got {})",
-            spec.name,
-            listen
-        );
-    }
-    if listen.port() == 0 {
-        anyhow::bail!(
-            "API endpoint '{}' must use an explicit nonzero listener port",
-            spec.name
-        );
-    }
+    validate_api_listener(listen, &format!("API endpoint '{}'", spec.name))?;
     let protocol_name = spec.protocol.to_ascii_lowercase();
     let is_kubernetes = matches!(protocol_name.as_str(), "kubernetes" | "k8s");
     if !is_kubernetes && (spec.kubeconfig.is_some() || spec.kube_context.is_some()) {
@@ -1848,6 +1842,17 @@ mod api_endpoint_tests {
             brokered_kubeconfig_out: None,
             session_env: None,
             rarity_escalation: 0,
+        }
+    }
+
+    #[test]
+    fn listener_validation_matches_generated_url_and_tls_san() {
+        assert!(validate_api_listener("127.0.0.1:8443".parse().unwrap(), "test").is_ok());
+        for address in ["127.0.0.1:0", "127.0.0.2:8443", "[::1]:8443"] {
+            assert!(
+                validate_api_listener(address.parse().unwrap(), "test").is_err(),
+                "{address} must be rejected"
+            );
         }
     }
 

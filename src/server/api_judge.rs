@@ -52,6 +52,7 @@ struct SpendState {
     tokens: f64,
     refilled_at: Instant,
     last_touched: Instant,
+    concurrency: Arc<Semaphore>,
     consecutive_errors: u32,
     circuit_open_until: Option<Instant>,
 }
@@ -71,6 +72,7 @@ pub(crate) struct ApiJudgeSpend {
 
 struct ApiJudgeSpendPermit {
     _global: tokio::sync::OwnedSemaphorePermit,
+    _scope: tokio::sync::OwnedSemaphorePermit,
     _baseline: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
@@ -116,6 +118,41 @@ impl ApiJudgeSpend {
         session_fingerprint: Option<&str>,
     ) -> Result<ApiJudgeSpendPermit, &'static str> {
         self.attempted.fetch_add(1, Ordering::Relaxed);
+        let now = Instant::now();
+        let scope = Self::scope(endpoint, session_fingerprint);
+        let scope_concurrency = {
+            let mut states = self.states.lock().expect("API judge spend lock");
+            if !states.contains_key(&scope) && states.len() >= MAX_API_JUDGE_SCOPES {
+                if let Some(oldest) = states
+                    .iter()
+                    .filter(|(_, state)| Arc::strong_count(&state.concurrency) == 1)
+                    .min_by_key(|(_, state)| state.last_touched)
+                    .map(|(scope, _)| scope.clone())
+                {
+                    states.remove(&oldest);
+                } else {
+                    self.concurrency_limited.fetch_add(1, Ordering::Relaxed);
+                    self.audit("scope_capacity");
+                    return Err("API evaluator scope capacity reached");
+                }
+            }
+            let per_scope = self.config.max_concurrency.saturating_sub(1).max(1);
+            let state = states.entry(scope.clone()).or_insert_with(|| SpendState {
+                tokens: f64::from(self.config.burst),
+                refilled_at: now,
+                last_touched: now,
+                concurrency: Arc::new(Semaphore::new(per_scope)),
+                consecutive_errors: 0,
+                circuit_open_until: None,
+            });
+            state.last_touched = now;
+            state.concurrency.clone()
+        };
+        let scope_permit = scope_concurrency.try_acquire_owned().map_err(|_| {
+            self.concurrency_limited.fetch_add(1, Ordering::Relaxed);
+            self.audit("scope_concurrency_limited");
+            "API evaluator per-session concurrency limit reached"
+        })?;
         let baseline = if session_fingerprint.is_none() {
             Some(
                 self.baseline_concurrency
@@ -135,26 +172,11 @@ impl ApiJudgeSpend {
             self.audit("concurrency_limited");
             "API evaluator concurrency limit reached"
         })?;
-        let now = Instant::now();
         {
-            let scope = Self::scope(endpoint, session_fingerprint);
             let mut states = self.states.lock().expect("API judge spend lock");
-            if !states.contains_key(&scope) && states.len() >= MAX_API_JUDGE_SCOPES {
-                if let Some(oldest) = states
-                    .iter()
-                    .min_by_key(|(_, state)| state.last_touched)
-                    .map(|(scope, _)| scope.clone())
-                {
-                    states.remove(&oldest);
-                }
-            }
-            let state = states.entry(scope).or_insert_with(|| SpendState {
-                tokens: f64::from(self.config.burst),
-                refilled_at: now,
-                last_touched: now,
-                consecutive_errors: 0,
-                circuit_open_until: None,
-            });
+            let state = states
+                .get_mut(&scope)
+                .expect("admitted API judge scope remains registered");
             state.last_touched = now;
             if state.circuit_open_until.is_some_and(|until| now < until) {
                 self.circuit_rejections.fetch_add(1, Ordering::Relaxed);
@@ -177,6 +199,7 @@ impl ApiJudgeSpend {
         self.admitted.fetch_add(1, Ordering::Relaxed);
         Ok(ApiJudgeSpendPermit {
             _global: global,
+            _scope: scope_permit,
             _baseline: baseline,
         })
     }
@@ -187,10 +210,14 @@ impl ApiJudgeSpend {
         if !states.contains_key(&scope) && states.len() >= MAX_API_JUDGE_SCOPES {
             if let Some(oldest) = states
                 .iter()
+                .filter(|(_, state)| Arc::strong_count(&state.concurrency) == 1)
                 .min_by_key(|(_, state)| state.last_touched)
                 .map(|(scope, _)| scope.clone())
             {
                 states.remove(&oldest);
+            } else {
+                tracing::warn!(target: "guard::audit", "[AUDIT] API_JUDGE_SPEND event=completion_scope_capacity");
+                return;
             }
         }
         let now = Instant::now();
@@ -198,6 +225,9 @@ impl ApiJudgeSpend {
             tokens: f64::from(self.config.burst),
             refilled_at: now,
             last_touched: now,
+            concurrency: Arc::new(Semaphore::new(
+                self.config.max_concurrency.saturating_sub(1).max(1),
+            )),
             consecutive_errors: 0,
             circuit_open_until: None,
         });
@@ -1002,7 +1032,7 @@ mod tests {
             .expect("first call admitted");
         assert_eq!(
             spend.admit("endpoint", Some("session")).unwrap_err(),
-            "API evaluator concurrency limit reached"
+            "API evaluator per-session concurrency limit reached"
         );
         drop(first);
         let second = spend
@@ -1065,16 +1095,35 @@ mod tests {
             ..ApiJudgeSpendConfig::default()
         });
         let baseline = spend
-            .admit("endpoint", None)
+            .admit("endpoint-a", None)
             .expect("baseline slot admitted");
         assert_eq!(
-            spend.admit("endpoint", None).unwrap_err(),
+            spend.admit("endpoint-b", None).unwrap_err(),
             "API evaluator session reserve is unavailable to unattributed traffic"
         );
         let session = spend
-            .admit("endpoint", Some("session"))
+            .admit("endpoint-b", Some("session"))
             .expect("reserved session slot admitted");
         drop((baseline, session));
+    }
+
+    #[test]
+    fn one_session_cannot_starve_a_peer_of_global_concurrency() {
+        let spend = ApiJudgeSpend::new(ApiJudgeSpendConfig {
+            max_concurrency: 4,
+            ..ApiJudgeSpendConfig::default()
+        });
+        let first = spend.admit("endpoint", Some("greedy")).unwrap();
+        let second = spend.admit("endpoint", Some("greedy")).unwrap();
+        let third = spend.admit("endpoint", Some("greedy")).unwrap();
+        assert_eq!(
+            spend.admit("endpoint", Some("greedy")).unwrap_err(),
+            "API evaluator per-session concurrency limit reached"
+        );
+        let peer = spend
+            .admit("endpoint", Some("peer"))
+            .expect("peer retains one global evaluator slot");
+        drop((first, second, third, peer));
     }
 
     #[test]

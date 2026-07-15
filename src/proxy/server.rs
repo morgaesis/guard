@@ -20,17 +20,18 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock as StdRwLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use futures::TryStreamExt;
+use futures::{Stream, TryStreamExt};
 use http_body_util::{combinators::BoxBody, BodyExt, Full, Limited, StreamBody};
 use hyper::body::{Bytes, Frame, Incoming};
-use hyper::http::request::Parts;
+use hyper::http::{request::Parts, HeaderValue};
 use hyper::service::service_fn;
-use hyper::{header, HeaderMap, Method, Request, Response, StatusCode};
+use hyper::{header, HeaderMap, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use tokio::net::TcpListener;
@@ -56,7 +57,11 @@ const MAX_REQ_BODY: usize = 16 * 1024 * 1024;
 /// How often the policy file is checked for changes (the operator "slow clock").
 const POLICY_RELOAD_SECS: u64 = 5;
 
+const RESPONSE_REDACTION_MARKER: &[u8] = b"[REDACTED]";
+
 type ProxyBody = BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
+type ReqwestByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + Sync>>;
+type RedactingStreamState = (ReqwestByteStream, ExactSecretRedactor, bool);
 type JudgeBuilder = dyn Fn(Option<String>) -> Option<Arc<dyn ApiJudge>> + Send + Sync;
 const GUARD_SESSION_HEADER: &str = "x-guard-session";
 
@@ -70,6 +75,69 @@ struct GuardHeld;
 struct SessionAuth {
     token: String,
     context: ApiSessionContext,
+}
+
+struct ExactSecretRedactor {
+    secrets: Vec<Vec<u8>>,
+    carry: Vec<u8>,
+    keep: usize,
+}
+
+impl ExactSecretRedactor {
+    fn new(mut secrets: Vec<Vec<u8>>) -> Self {
+        secrets.retain(|secret| !secret.is_empty());
+        secrets.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+        secrets.dedup();
+        let keep = secrets
+            .iter()
+            .map(Vec::len)
+            .max()
+            .unwrap_or(1)
+            .saturating_sub(1);
+        Self {
+            secrets,
+            carry: Vec::new(),
+            keep,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
+        self.carry.extend_from_slice(chunk);
+        let safe_end = self.carry.len().saturating_sub(self.keep);
+        self.emit_through(safe_end)
+    }
+
+    fn finish(&mut self) -> Vec<u8> {
+        let end = self.carry.len();
+        self.emit_through(end)
+    }
+
+    fn emit_through(&mut self, safe_end: usize) -> Vec<u8> {
+        let mut output = Vec::new();
+        let mut position = 0;
+        while position < safe_end {
+            if let Some(secret) = self
+                .secrets
+                .iter()
+                .find(|secret| self.carry[position..].starts_with(secret))
+            {
+                output.extend_from_slice(RESPONSE_REDACTION_MARKER);
+                position += secret.len();
+            } else {
+                output.push(self.carry[position]);
+                position += 1;
+            }
+        }
+        self.carry.drain(..position);
+        output
+    }
+
+    fn redact_all(secrets: Vec<Vec<u8>>, bytes: &[u8]) -> Bytes {
+        let mut redactor = Self::new(secrets);
+        let mut output = redactor.push(bytes);
+        output.extend_from_slice(&redactor.finish());
+        Bytes::from(output)
+    }
 }
 
 /// A configured API proxy: TLS identity, upstream connection, the attached
@@ -201,6 +269,12 @@ struct CreatedKey {
     name: String,
 }
 
+#[derive(Debug, Clone)]
+struct CreatedMatch {
+    key: CreatedKey,
+    handle: String,
+}
+
 /// Tracks resources the proxy forwarded a create for (and armed an auto-revert
 /// on), each mapped to its auto-revert handle. Pure: no clock, no I/O.
 #[derive(Debug, Default)]
@@ -217,8 +291,17 @@ impl CreatedRegistry {
     /// Consume and return the auto-revert handle for a created resource, if the
     /// delete's key (connection included) matches a recorded create. Consuming
     /// ensures a resource is only ever contained-deleted once.
-    fn take(&mut self, key: &CreatedKey) -> Option<String> {
-        self.items.remove(key)
+    fn find(&self, key: &CreatedKey) -> Option<String> {
+        self.items.get(key).cloned()
+    }
+
+    fn take_if_handle(&mut self, key: &CreatedKey, handle: &str) -> bool {
+        if self.items.get(key).is_some_and(|stored| stored == handle) {
+            self.items.remove(key);
+            true
+        } else {
+            false
+        }
     }
 
     /// Drop any provenance entry whose auto-revert resolved (confirmed or
@@ -384,6 +467,7 @@ impl ApiProxy {
     /// fatal bind error, so the daemon's listener supervision restarts the
     /// process the same way the gate socket does.
     pub async fn serve(self: Arc<Self>) -> Result<()> {
+        validate_listener_identity(self.listen)?;
         let listener = TcpListener::bind(self.listen).await.with_context(|| {
             format!(
                 "bind api-proxy listener for {} on {}",
@@ -399,6 +483,7 @@ impl ApiProxy {
     /// bind first, construct the proxy with `listener.local_addr()`, and pass
     /// the listener here without a release-and-rebind race.
     pub async fn serve_on(self: Arc<Self>, listener: TcpListener) -> Result<()> {
+        validate_listener_identity(self.listen)?;
         let actual = listener
             .local_addr()
             .context("read pre-bound api-proxy listener address")?;
@@ -536,14 +621,19 @@ impl ApiProxy {
         }
 
         let Some(op) = self.protocol.parse_op(method.as_str(), &path, &query) else {
-            // Non-resource paths: discovery, /version, /openapi, /healthz. Clients
-            // need these. Allow safe reads; reject everything else.
-            if method == Method::GET || method == Method::HEAD {
+            // Unknown paths are denied by default. A protocol can explicitly
+            // recognize the small non-resource discovery surface its clients
+            // require; method alone never grants forwarding authority.
+            if self
+                .protocol
+                .classify_non_resource_read(method.as_str(), &path, &query)
+                .is_some()
+            {
                 return self.forward(req, &path, &query, false, None, conn_id).await;
             }
             return self.status_resp(
                 StatusCode::FORBIDDEN,
-                "guard api-proxy: non-resource write rejected",
+                "guard api-proxy: unknown or unapproved non-resource path rejected",
                 "Forbidden",
             );
         };
@@ -575,11 +665,11 @@ impl ApiProxy {
         let decision = self.policy.read().await.decide(&op);
 
         // A delete of a resource guard itself created (and is still tracking for
-        // auto-revert) in this process is contained cleanup — e.g. a Helm
-        // post-install hook deleting its own check resource. Allow it and cancel
-        // the now-moot create-revert, rather than holding or denying it like an
-        // untracked delete. Provenance is evidence-based: only a resource the
-        // proxy forwarded a create for matches, so deletes of resources with no
+        // auto-revert) in this process is contained cleanup, such as a Helm
+        // post-install hook deleting its own check resource. Allow it without
+        // resolving the revert until the upstream returns a complete 2xx
+        // response. Provenance is evidence-based: only a resource the proxy
+        // forwarded a create for matches, so deletes of resources with no
         // creation record keep the standard policy handling.
         // Explicit policy denies remain absolute. Provenance can simplify a
         // permitted cleanup, but it never overrides an operator deny.
@@ -587,7 +677,7 @@ impl ApiProxy {
             && op.verb == Verb::Delete
             && op.subresource.is_none()
         {
-            if let Some(handle) = self.take_created_provenance(
+            if let Some(created) = self.created_provenance(
                 &op,
                 conn_id,
                 session_context
@@ -596,14 +686,13 @@ impl ApiProxy {
             ) {
                 tracing::info!(
                     target: "guard::audit",
-                    "ALLOW {} (contained: guard-created this session, resolving auto-revert {})",
+                    "ALLOW {} (contained: guard-created this session, auto-revert {} remains armed until delete succeeds)",
                     label,
-                    handle
+                    created.handle
                 );
-                if let Some(gate) = self.gate.get() {
-                    gate.resolve(&handle).await;
-                }
-                return self.forward(req, &path, &query, false, None, conn_id).await;
+                return self
+                    .forward_contained_cleanup(req, &path, &query, op, conn_id, created)
+                    .await;
             }
         }
 
@@ -831,6 +920,17 @@ impl ApiProxy {
                     // mutation. The validated snapshot is threaded to the forward
                     // so arming uses exactly what was checked (no third fetch).
                     GateOutcome::Contain if prepared.is_constructible() => {
+                        // The evaluator may have taken arbitrarily long. Refresh
+                        // both session authority and explicit policy before the
+                        // snapshot fetch, which is itself upstream I/O. The
+                        // forwarding path repeats these checks immediately
+                        // before the mutation.
+                        if let Err(response) = self.revalidate_session(&parts).await {
+                            return response;
+                        }
+                        if let Some(response) = self.recheck_final_authority(op).await {
+                            return response;
+                        }
                         // Contain was chosen over Hold only because a revert was
                         // promised, so the sink must actually be able to arm one
                         // right now (capacity, and a safe revert store). If not,
@@ -1098,6 +1198,42 @@ impl ApiProxy {
             .await
     }
 
+    async fn forward_contained_cleanup(
+        &self,
+        req: Request<Incoming>,
+        path: &str,
+        query: &str,
+        op: ApiOp,
+        conn_id: u64,
+        created: CreatedMatch,
+    ) -> Response<ProxyBody> {
+        let (parts, body) = match collect_request_body(req).await {
+            Ok(buffered) => buffered,
+            Err(error) => {
+                return self.status_resp(
+                    StatusCode::BAD_GATEWAY,
+                    &format!(
+                        "guard api-proxy ({}): request body error: {error}",
+                        self.protocol.name()
+                    ),
+                    "InternalError",
+                );
+            }
+        };
+        self.forward_buffered_with_cleanup(
+            parts,
+            body,
+            path,
+            query,
+            false,
+            Some(op),
+            conn_id,
+            None,
+            Some(created),
+        )
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn forward_buffered(
         &self,
@@ -1110,10 +1246,42 @@ impl ApiProxy {
         conn_id: u64,
         prepared_snapshot: Option<Option<Vec<u8>>>,
     ) -> Response<ProxyBody> {
+        self.forward_buffered_with_cleanup(
+            parts,
+            body,
+            path,
+            query,
+            redact,
+            op,
+            conn_id,
+            prepared_snapshot,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_buffered_with_cleanup(
+        &self,
+        parts: Parts,
+        body: Bytes,
+        path: &str,
+        query: &str,
+        redact: bool,
+        op: Option<ApiOp>,
+        conn_id: u64,
+        prepared_snapshot: Option<Option<Vec<u8>>>,
+        created_cleanup: Option<CreatedMatch>,
+    ) -> Response<ProxyBody> {
         let session_fingerprint = match self.revalidate_session(&parts).await {
             Ok(fingerprint) => fingerprint,
             Err(response) => return response,
         };
+        if let Some(op) = op.as_ref() {
+            if let Some(response) = self.recheck_final_authority(op).await {
+                return response;
+            }
+        }
         match self
             .forward_inner(
                 parts,
@@ -1125,6 +1293,7 @@ impl ApiProxy {
                 conn_id,
                 prepared_snapshot,
                 session_fingerprint,
+                created_cleanup,
             )
             .await
         {
@@ -1155,13 +1324,15 @@ impl ApiProxy {
         conn_id: u64,
         prepared_snapshot: Option<Option<Vec<u8>>>,
         session_fingerprint: Option<String>,
+        created_cleanup: Option<CreatedMatch>,
     ) -> Result<Response<ProxyBody>> {
         // A recoverable write we will wrap in an auto-revert envelope: fetch
         // the prior object first (when the protocol wants a restore-style
         // revert), then forward, then arm.
-        let track_write = op
-            .as_ref()
-            .is_some_and(|o| self.gate.get().is_some() && self.protocol.tracks_write(o));
+        let track_write = created_cleanup.is_none()
+            && op
+                .as_ref()
+                .is_some_and(|o| self.gate.get().is_some() && self.protocol.tracks_write(o));
         let snapshot = if let Some(snapshot) = prepared_snapshot {
             snapshot
         } else if track_write && self.protocol.wants_prior_snapshot(op.as_ref().unwrap()) {
@@ -1182,6 +1353,7 @@ impl ApiProxy {
                 || name == header::HOST
                 || name == header::AUTHORIZATION
                 || name == header::COOKIE
+                || name == header::ACCEPT_ENCODING
                 || name == header::CONTENT_LENGTH
                 || is_identity_header(name)
             {
@@ -1197,6 +1369,10 @@ impl ApiProxy {
         if redact {
             rb = rb.header(header::ACCEPT, "application/json");
         }
+        // Exact credential redaction operates on response bytes. Ask the
+        // upstream for an identity representation so compression cannot hide a
+        // reflected credential across the trust boundary.
+        rb = rb.header(header::ACCEPT_ENCODING, "identity");
         if let Some(token) = self.upstream.bearer() {
             rb = rb.bearer_auth(token);
         } else if let Some((user, pass)) = self.upstream.basic_auth() {
@@ -1209,21 +1385,70 @@ impl ApiProxy {
         let upstream_resp = rb.send().await.context("forward to apiserver")?;
         let status = upstream_resp.status();
         let upstream_headers = upstream_resp.headers().clone();
+        let response_secrets = self.upstream.response_secret_values();
+
+        if upstream_headers
+            .get(header::CONTENT_ENCODING)
+            .is_some_and(|value| value.as_bytes() != b"identity")
+        {
+            return Ok(self.status_resp(
+                StatusCode::BAD_GATEWAY,
+                "guard api-proxy: refusing an encoded upstream response that cannot be credential-redacted",
+                "InternalError",
+            ));
+        }
 
         let mut builder = Response::builder().status(status);
         if let Some(hdrs) = builder.headers_mut() {
             for (name, value) in upstream_headers.iter() {
-                // Strip hop-by-hop and framing headers; hyper re-frames the body.
+                // A strict allowlist prevents an upstream from inventing a
+                // credential-reflection header. Values are also scanned for the
+                // exact credential material Guard injected.
                 if is_hop_by_hop(name)
                     || name == header::CONTENT_LENGTH
                     || name == header::TRANSFER_ENCODING
-                    || (is_sensitive_response_header(name)
-                        && !self.protocol.allow_sensitive_response_header(name))
+                    || is_sensitive_response_header(name)
+                    || header_contains_secret(value.as_bytes(), &response_secrets)
                 {
+                    continue;
+                }
+                if name == header::LOCATION {
+                    if let Some(location) = self.safe_location(value, &response_secrets) {
+                        hdrs.append(name, location);
+                    }
+                    continue;
+                }
+                if !is_safe_response_header(name) {
                     continue;
                 }
                 hdrs.append(name, value.clone());
             }
+        }
+
+        // A contained cleanup is only proven complete once the entire upstream
+        // response succeeds. A 2xx header followed by a body disconnect keeps
+        // the revert armed because the outcome is no longer trustworthy.
+        if let Some(created) = created_cleanup {
+            let bytes = upstream_resp
+                .bytes()
+                .await
+                .context("read contained cleanup response")?;
+            if status.is_success() {
+                let consumed = self
+                    .created
+                    .lock()
+                    .unwrap()
+                    .take_if_handle(&created.key, &created.handle);
+                if consumed {
+                    if let Some(gate) = self.gate.get() {
+                        gate.resolve(&created.handle).await;
+                    }
+                }
+            }
+            let bytes = ExactSecretRedactor::redact_all(response_secrets, &bytes);
+            return Ok(builder
+                .body(full_body(bytes))
+                .expect("build contained cleanup response"));
         }
 
         // A Secret read must never reach the raw-stream path below with values
@@ -1236,6 +1461,7 @@ impl ApiProxy {
                     .bytes()
                     .await
                     .context("read Secret error response")?;
+                let bytes = ExactSecretRedactor::redact_all(response_secrets, &bytes);
                 return Ok(builder
                     .body(full_body(bytes))
                     .expect("build Secret error response"));
@@ -1265,8 +1491,9 @@ impl ApiProxy {
             let n = self.protocol.redact_response(&mut value);
             tracing::info!(target: "guard::apiproxy", "redacted {n} Secret object(s) on {path}");
             let out = serde_json::to_vec(&value).context("re-serialize redacted Secret")?;
+            let out = ExactSecretRedactor::redact_all(response_secrets, &out);
             return Ok(builder
-                .body(full_body(Bytes::from(out)))
+                .body(full_body(out))
                 .expect("build redacted response"));
         }
 
@@ -1280,16 +1507,51 @@ impl ApiProxy {
                         .await;
                 }
             }
+            let bytes = ExactSecretRedactor::redact_all(response_secrets, &bytes);
             return Ok(builder
                 .body(full_body(bytes))
                 .expect("build write response"));
         }
 
-        // Stream the response body through unchanged (lists, gets, watches).
-        let stream = upstream_resp
-            .bytes_stream()
-            .map_ok(Frame::data)
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
+        // Stream ordinary response bodies through exact credential redaction
+        // while preserving chunked delivery for lists, gets, and watches.
+        let source: ReqwestByteStream = Box::pin(upstream_resp.bytes_stream());
+        let redactor = ExactSecretRedactor::new(response_secrets);
+        let stream = futures::stream::try_unfold(
+            (source, redactor, false),
+            |(mut source, mut redactor, finished)| async move {
+                if finished {
+                    return Ok::<Option<(Frame<Bytes>, RedactingStreamState)>, reqwest::Error>(
+                        None,
+                    );
+                }
+                loop {
+                    match source.as_mut().try_next().await? {
+                        Some(chunk) => {
+                            let output = redactor.push(&chunk);
+                            if output.is_empty() {
+                                continue;
+                            }
+                            return Ok(Some((
+                                Frame::data(Bytes::from(output)),
+                                (source, redactor, false),
+                            )));
+                        }
+                        None => {
+                            let output = redactor.finish();
+                            if output.is_empty() {
+                                return Ok(None);
+                            }
+                            return Ok(Some((
+                                Frame::data(Bytes::from(output)),
+                                (source, redactor, true),
+                            )));
+                        }
+                    }
+                }
+            },
+        )
+        .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>);
         let body = StreamBody::new(stream).boxed();
         Ok(builder.body(body).expect("build streamed response"))
     }
@@ -1320,6 +1582,30 @@ impl ApiProxy {
             ));
         }
         Ok(Some(auth.context.fingerprint.clone()))
+    }
+
+    /// Re-read immutable protocol floors and the hot-reloaded explicit policy
+    /// after any evaluator or operator delay and immediately before upstream
+    /// I/O. An intervening deny invalidates the earlier authorization.
+    async fn recheck_final_authority(&self, op: &ApiOp) -> Option<Response<ProxyBody>> {
+        if let Some(reason) = self.protocol.deny_outright(op) {
+            return Some(self.status_resp(StatusCode::FORBIDDEN, &reason, "Forbidden"));
+        }
+        let decision = self.policy.read().await.decide(op);
+        if decision.action == ApiAction::Deny {
+            return Some(self.status_resp(
+                StatusCode::FORBIDDEN,
+                &format!(
+                    "guard api-proxy ({}) denied {} {} during final authority check: {}",
+                    self.protocol.name(),
+                    op.verb.as_str(),
+                    op.resource,
+                    decision.reason
+                ),
+                "Forbidden",
+            ));
+        }
+        None
     }
 
     /// Fetch the current object at `path` before a mutation, so the protocol
@@ -1444,15 +1730,15 @@ impl ApiProxy {
     }
 
     /// If this delete targets a resource the proxy forwarded a create for in
-    /// this process, remove and return its auto-revert handle — evidence the
-    /// delete is guard's own creation being cleaned up. Consumes the record so a
-    /// resource is only ever contained-deleted once.
-    fn take_created_provenance(
+    /// this process, return its auto-revert handle without consuming it. The
+    /// record and revert remain live until a revalidated upstream delete
+    /// succeeds with a 2xx response.
+    fn created_provenance(
         &self,
         op: &ApiOp,
         conn_id: u64,
         session_fingerprint: Option<&str>,
-    ) -> Option<String> {
+    ) -> Option<CreatedMatch> {
         let name = op.name.clone()?;
         let key = CreatedKey {
             conn: conn_id,
@@ -1462,7 +1748,8 @@ impl ApiProxy {
             namespace: op.namespace.clone(),
             name,
         };
-        self.created.lock().unwrap().take(&key)
+        let handle = self.created.lock().unwrap().find(&key)?;
+        Some(CreatedMatch { key, handle })
     }
 
     pub fn upstream_identity_fingerprint(&self) -> String {
@@ -1490,6 +1777,34 @@ impl ApiProxy {
             && self.protocol.name() == protocol
             && self.upstream.base() == target
             && self.upstream_identity_fingerprint() == identity
+    }
+
+    fn safe_location(&self, value: &HeaderValue, secrets: &[Vec<u8>]) -> Option<HeaderValue> {
+        let raw = value.to_str().ok()?;
+        if header_contains_secret(value.as_bytes(), secrets)
+            || (!secrets.is_empty() && raw.contains('%'))
+        {
+            return None;
+        }
+        if raw.starts_with('/') && !raw.starts_with("//") && !raw.contains('\\') {
+            return HeaderValue::from_str(raw).ok();
+        }
+        let location = reqwest::Url::parse(raw).ok()?;
+        let upstream = reqwest::Url::parse(self.upstream.base()).ok()?;
+        if !location.username().is_empty()
+            || location.password().is_some()
+            || location.scheme() != upstream.scheme()
+            || location.host_str() != upstream.host_str()
+            || location.port_or_known_default() != upstream.port_or_known_default()
+        {
+            return None;
+        }
+        let mut rewritten = format!("{}{}", self.proxy_url, location.path());
+        if let Some(query) = location.query() {
+            rewritten.push('?');
+            rewritten.push_str(query);
+        }
+        HeaderValue::from_str(&rewritten).ok()
     }
 
     fn status_resp(&self, code: StatusCode, message: &str, reason: &str) -> Response<ProxyBody> {
@@ -1636,6 +1951,47 @@ fn is_sensitive_response_header(name: &header::HeaderName) -> bool {
             | "set-cookie"
             | "set-cookie2"
     )
+}
+
+fn is_safe_response_header(name: &header::HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "accept-ranges"
+            | "cache-control"
+            | "content-disposition"
+            | "content-language"
+            | "content-range"
+            | "content-type"
+            | "etag"
+            | "expires"
+            | "last-modified"
+            | "retry-after"
+            | "vary"
+            | "warning"
+    )
+}
+
+fn header_contains_secret(value: &[u8], secrets: &[Vec<u8>]) -> bool {
+    secrets.iter().any(|secret| {
+        !secret.is_empty()
+            && value
+                .windows(secret.len())
+                .any(|window| window == secret.as_slice())
+    })
+}
+
+fn validate_listener_identity(listen: SocketAddr) -> Result<()> {
+    if listen.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) {
+        return Err(anyhow!(
+            "api-proxy listener must bind exactly 127.0.0.1 (got {listen})"
+        ));
+    }
+    if listen.port() == 0 {
+        return Err(anyhow!(
+            "api-proxy listener must use an explicit nonzero port"
+        ));
+    }
+    Ok(())
 }
 
 fn is_json(headers: &HeaderMap) -> bool {
@@ -1798,6 +2154,55 @@ mod tests {
         assert!(shape.len() < 120, "over-long key must be capped: {shape}");
     }
 
+    #[test]
+    fn exact_response_redaction_spans_chunk_boundaries() {
+        let mut redactor = ExactSecretRedactor::new(vec![b"operator-secret-token".to_vec()]);
+        let mut output = redactor.push(b"prefix operator-secr");
+        output.extend_from_slice(&redactor.push(b"et-token suffix"));
+        output.extend_from_slice(&redactor.finish());
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output, "prefix [REDACTED] suffix");
+        assert!(!output.contains("operator-secret-token"));
+    }
+
+    #[test]
+    fn listener_identity_is_exact_nonzero_ipv4_loopback() {
+        assert!(validate_listener_identity("127.0.0.1:8443".parse().unwrap()).is_ok());
+        for address in ["127.0.0.1:0", "127.0.0.2:8443", "[::1]:8443"] {
+            assert!(validate_listener_identity(address.parse().unwrap()).is_err());
+        }
+    }
+
+    #[test]
+    fn location_rewrites_only_same_origin_credential_free_targets() {
+        let proxy = test_proxy();
+        let secrets = vec![b"operator-secret-token".to_vec()];
+        assert!(proxy
+            .safe_location(
+                &HeaderValue::from_static("https://attacker.invalid/collect"),
+                &secrets,
+            )
+            .is_none());
+        assert!(proxy
+            .safe_location(
+                &HeaderValue::from_static("https://x:6443/path?token=operator-secret-token"),
+                &secrets,
+            )
+            .is_none());
+        assert_eq!(
+            proxy
+                .safe_location(&HeaderValue::from_static("https://x:6443/path"), &secrets)
+                .unwrap(),
+            HeaderValue::from_static("https://127.0.0.1:0/path")
+        );
+        assert_eq!(
+            proxy
+                .safe_location(&HeaderValue::from_static("/api/v1"), &secrets)
+                .unwrap(),
+            HeaderValue::from_static("/api/v1")
+        );
+    }
+
     fn created_key(conn: u64, name: &str) -> CreatedKey {
         CreatedKey {
             conn,
@@ -1826,7 +2231,7 @@ mod tests {
         // Caller B on a different connection deletes the same
         // group/resource/namespace/name: no provenance match, so the delete
         // falls through to normal (strict) policy instead of the shortcut.
-        assert_eq!(reg.take(&created_key(2, "foo")), None);
+        assert_eq!(reg.find(&created_key(2, "foo")), None);
         assert_eq!(
             reg.len(),
             1,
@@ -1835,9 +2240,10 @@ mod tests {
 
         // Caller A deleting its own creation still matches and is contained.
         assert_eq!(
-            reg.take(&created_key(1, "foo")),
+            reg.find(&created_key(1, "foo")),
             Some("handle-A".to_string())
         );
+        assert!(reg.take_if_handle(&created_key(1, "foo"), "handle-A"));
         assert_eq!(reg.len(), 0, "a matching take consumes the entry once");
     }
 
@@ -1849,10 +2255,10 @@ mod tests {
             "handle-a".to_string(),
         );
 
-        assert_eq!(reg.take(&created_key(1, "foo")), None);
-        assert_eq!(reg.take(&session_created_key(1, "foo", "session-b")), None);
+        assert_eq!(reg.find(&created_key(1, "foo")), None);
+        assert_eq!(reg.find(&session_created_key(1, "foo", "session-b")), None);
         assert_eq!(
-            reg.take(&session_created_key(1, "foo", "session-a")),
+            reg.find(&session_created_key(1, "foo", "session-a")),
             Some("handle-a".to_string())
         );
     }
@@ -1870,7 +2276,7 @@ mod tests {
         // A later delete of a same-named resource (e.g. one an operator recreated
         // outside guard) no longer matches the stale entry and goes through
         // normal policy.
-        assert_eq!(reg.take(&created_key(1, "foo")), None);
+        assert_eq!(reg.find(&created_key(1, "foo")), None);
     }
 
     fn test_proxy() -> ApiProxy {
@@ -1956,10 +2362,16 @@ mod tests {
 
     #[tokio::test]
     async fn serve_on_rejects_a_listener_for_another_address() {
-        let proxy = Arc::new(test_proxy());
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test listener");
+        let different = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind different test listener");
+        let mut proxy = test_proxy();
+        proxy.listen = different.local_addr().unwrap();
+        drop(different);
+        let proxy = Arc::new(proxy);
 
         let error = proxy
             .serve_on(listener)
@@ -1975,7 +2387,7 @@ mod tests {
     }
 
     #[test]
-    fn take_created_provenance_matches_only_the_creating_connection() {
+    fn created_provenance_matches_without_consuming() {
         let proxy = test_proxy();
         proxy
             .created
@@ -1985,13 +2397,11 @@ mod tests {
 
         let op = delete_op("foo");
         // A delete on a different connection does not match.
-        assert_eq!(proxy.take_created_provenance(&op, 2, None), None);
-        // The creating connection matches and consumes the record.
-        assert_eq!(
-            proxy.take_created_provenance(&op, 1, None),
-            Some("h1".to_string())
-        );
-        assert_eq!(proxy.take_created_provenance(&op, 1, None), None);
+        assert!(proxy.created_provenance(&op, 2, None).is_none());
+        // The creating connection matches but does not consume before a
+        // successful upstream delete.
+        assert_eq!(proxy.created_provenance(&op, 1, None).unwrap().handle, "h1");
+        assert!(proxy.created_provenance(&op, 1, None).is_some());
     }
 
     #[test]
@@ -2095,9 +2505,8 @@ mod tests {
 
         proxy.forget_created_by_handle("h1");
 
-        assert_eq!(
-            proxy.take_created_provenance(&delete_op("foo"), 1, None),
-            None
-        );
+        assert!(proxy
+            .created_provenance(&delete_op("foo"), 1, None)
+            .is_none());
     }
 }
