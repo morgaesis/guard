@@ -2296,6 +2296,9 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                     let exec = match interaction.exec_status {
                         session::SessionExecStatus::NotAttempted => "not_attempted",
                         session::SessionExecStatus::Completed => "completed",
+                        session::SessionExecStatus::CompletedAfterApproval => {
+                            "completed_after_approval"
+                        }
                         session::SessionExecStatus::Failed => "failed",
                         session::SessionExecStatus::DryRun => "dry_run",
                         session::SessionExecStatus::Held => "held",
