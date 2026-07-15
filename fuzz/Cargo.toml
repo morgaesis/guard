@@ -1,0 +1,22 @@
+[package]
+name = "guard-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1.0.150"
+
+[dependencies.guard]
+path = ".."
+
+[[bin]]
+name = "security_boundaries"
+path = "fuzz_targets/security_boundaries.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,8 @@
+Ppolicy:
+  commands:
+    allow:
+      - "ssh * uptime"
+    deny:
+      - "rm -rf *"
+===
+ssh host uptime
