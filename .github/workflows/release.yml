@@ -165,8 +165,15 @@ jobs:
         run: |
           mapfile -d '' archives < <(find artifacts -type f -name '*.tar.gz' -print0)
           test "${#archives[@]}" -gt 0
-          gh release create "$RELEASE_TAG" \
-            --generate-notes \
-            --verify-tag \
-            "${archives[@]}" \
-            SHA256SUMS
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" \
+              --clobber \
+              "${archives[@]}" \
+              SHA256SUMS
+          else
+            gh release create "$RELEASE_TAG" \
+              --generate-notes \
+              --verify-tag \
+              "${archives[@]}" \
+              SHA256SUMS
+          fi
