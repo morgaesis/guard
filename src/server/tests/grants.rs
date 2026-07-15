@@ -275,6 +275,8 @@ async fn read_grant_retry_grants_and_reruns_after_permission_denied() {
             deny: Vec::new(),
             allow_exact: Vec::new(),
             deny_exact: Vec::new(),
+            activated_verbs: Vec::new(),
+            override_markers: Vec::new(),
             expires_at: None,
             prompt_append: None,
             generated_notes: Vec::new(),

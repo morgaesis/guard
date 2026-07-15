@@ -124,7 +124,7 @@ impl Client {
             AdminRequest::VerbCreate { .. } => "verb_create",
         };
         let envelope = IncomingMessage::Admin {
-            admin: request,
+            admin: Box::new(request),
             admin_token: self.admin_token.clone(),
         };
         let line = serde_json::to_string(&envelope)?;

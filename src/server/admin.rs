@@ -5,6 +5,7 @@ use crate::session::{
     HistoricalGrant, SessionAmendment, SessionDecision, SessionDecisionSource, SessionExecStatus,
     SessionGrant, SessionGrantSummary, SessionInteraction, SessionReport,
 };
+use guard::gating::verb::CoverageAction;
 use guard::principal::{scope_eq, PrincipalKey};
 
 use super::execute::{
@@ -79,6 +80,8 @@ fn redact_session_summary_for_list(grant: &mut SessionGrantSummary, admin: bool,
         grant.deny.clear();
         grant.allow_exact.clear();
         grant.deny_exact.clear();
+        grant.activated_verbs.clear();
+        grant.override_markers.clear();
         grant.generated_notes.clear();
         if grant.prompt_append.is_some() {
             grant.prompt_append = Some("(hidden)".to_string());
@@ -99,6 +102,8 @@ fn redact_historical_grant_for_list(grant: &mut HistoricalGrant, admin: bool, ca
         grant.deny.clear();
         grant.allow_exact.clear();
         grant.deny_exact.clear();
+        grant.activated_verbs.clear();
+        grant.override_markers.clear();
         grant.generated_notes.clear();
         if grant.prompt_append.is_some() {
             grant.prompt_append = Some("(hidden)".to_string());
@@ -381,6 +386,8 @@ pub(super) async fn handle_admin_request(
             token,
             mut allow,
             mut deny,
+            mut activated_verbs,
+            mut override_markers,
             mut ttl_secs,
             prompt_append,
             prose,
@@ -404,12 +411,55 @@ pub(super) async fn handle_admin_request(
                     Some(p) => {
                         merge_unique(&mut allow, p.allow.clone());
                         merge_unique(&mut deny, p.deny.clone());
+                        merge_unique(&mut activated_verbs, p.activated_verbs.clone());
+                        merge_unique(&mut override_markers, p.override_markers.clone());
                         ttl_secs = ttl_secs.or(p.ttl_secs);
                         profile_prompt = p.prompt_append.clone();
                     }
                     None => {
                         return AdminResponse::Error {
                             message: format!("unknown session profile: '{}'", name),
+                        };
+                    }
+                }
+            }
+            if !activated_verbs.is_empty() || !override_markers.is_empty() {
+                let mut catalog = config.verbs.write().await;
+                if let Err(error) = catalog.reload_if_stale() {
+                    tracing::warn!("verb catalog reload failed, using previous: {}", error);
+                }
+                for name in &activated_verbs {
+                    let Some(verb) = catalog.get(name) else {
+                        return AdminResponse::Error {
+                            message: format!("unknown session verb: '{}'", name),
+                        };
+                    };
+                    if verb.baseline {
+                        return AdminResponse::Error {
+                            message: format!(
+                                "session verb '{}' is already baseline; only baseline: false verbs can be activated",
+                                name
+                            ),
+                        };
+                    }
+                }
+                let declared_markers = catalog
+                    .list()
+                    .into_iter()
+                    .filter(|verb| verb.baseline)
+                    .flat_map(|verb| verb.coverage)
+                    .filter(|cell| {
+                        matches!(cell.action, CoverageAction::Evaluate | CoverageAction::Deny)
+                    })
+                    .filter_map(|cell| cell.override_marker)
+                    .collect::<std::collections::BTreeSet<_>>();
+                for marker in &override_markers {
+                    if !declared_markers.contains(marker) {
+                        return AdminResponse::Error {
+                            message: format!(
+                                "unknown verb override marker: '{}'; the marker must be declared by a baseline evaluate or deny coverage cell",
+                                marker
+                            ),
                         };
                     }
                 }
@@ -437,6 +487,8 @@ pub(super) async fn handle_admin_request(
                 deny,
                 allow_exact: Vec::new(),
                 deny_exact: Vec::new(),
+                activated_verbs,
+                override_markers,
                 expires_at,
                 prompt_append,
                 generated_notes,
@@ -870,6 +922,9 @@ pub(super) async fn handle_admin_request(
                         name: v.name.clone(),
                         description: v.description.clone(),
                         binary: v.binary.clone(),
+                        baseline: v.baseline,
+                        coverage: v.coverage.clone(),
+                        credential_plan: v.credential_plan.clone(),
                         consequence: v.consequence.as_str().to_string(),
                         trusted: verb_effective_trust(v, current_stamp),
                         has_revert: v.revert.is_some(),

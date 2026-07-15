@@ -47,7 +47,8 @@ regex per parameter, single-argv rendering, no shell), which is what makes
   the default is LLM-only.
 
 - **[session-profiles.yaml](session-profiles.yaml)** -- Named session-grant
-  profiles. Pre-authors reusable `{ttl, allow, deny, prompt}` bundles so an
+  profiles. Pre-authors reusable `{ttl, allow, deny, activated_verbs,
+  override_markers, prompt}` bundles so an
   operator can mint a bounded session for an agent in one round trip
   (`guard session new --profile <name>`) instead of hand-writing prose, globs,
   and a ttl each time. A profile is a convenience for authoring a grant ahead

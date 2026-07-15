@@ -63,6 +63,34 @@ fn print_coverage(coverage: &Option<guard::gating::Coverage>) {
     }
 }
 
+fn print_verb_guidance(response: &server::ExecuteResponse) {
+    if response.verb_matches.is_empty() && response.verb_guidance.is_none() {
+        return;
+    }
+    for matched in &response.verb_matches {
+        eprintln!(
+            "  matched verb: {} / {} ({:?}, {:?}, {}{})",
+            matched.verb,
+            matched.cell,
+            matched.scope,
+            matched.action,
+            if matched.selected {
+                "selected"
+            } else {
+                "not selected"
+            },
+            if matched.overridden {
+                ", overridden"
+            } else {
+                ""
+            }
+        );
+    }
+    if let Some(guidance) = &response.verb_guidance {
+        eprintln!("  guidance: {}", guidance);
+    }
+}
+
 pub(crate) async fn run_exec(
     binary: String,
     args: Vec<String>,
@@ -156,6 +184,7 @@ pub(crate) async fn run_exec(
             eprintln!("  poll:    guard approvals {}", handle);
             eprintln!("  result:  not executed until approved");
             print_coverage(&resp.coverage);
+            print_verb_guidance(&resp);
             // Not executed; exit non-zero so callers do not treat it as success.
             std::process::exit(EXIT_GUARD_HELD);
         }
@@ -227,6 +256,7 @@ pub(crate) async fn run_exec(
             paint("DENIED", AnsiColor::Red, color),
             resp.reason
         );
+        print_verb_guidance(&resp);
         std::process::exit(EXIT_GUARD_DENIED);
     }
 }
@@ -493,9 +523,10 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                     }
                     for v in &items {
                         println!(
-                            "{} [{}]{}{}{} - {}",
+                            "{} [{}]{}{}{}{} - {}",
                             v.name,
                             v.consequence,
+                            if v.baseline { "" } else { " session-scoped" },
                             if v.trusted { " trusted" } else { "" },
                             if v.has_revert { " revertable" } else { "" },
                             if v.auto_promoted {
@@ -507,6 +538,24 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                         );
                         for (p, pattern) in &v.params {
                             println!("    --param {}=<{}>", p, pattern);
+                        }
+                        if let Some(plan) = &v.credential_plan {
+                            println!("    credential_plan: {}", plan);
+                        }
+                        for cell in &v.coverage {
+                            println!(
+                                "    coverage {}: {:?} required={:?} forbidden={:?} options={:?} target={:?} inventory={:?} namespace={:?} fanout={:?} override_marker={:?}",
+                                cell.name,
+                                cell.action,
+                                cell.required_args,
+                                cell.forbidden_args,
+                                cell.options,
+                                cell.target,
+                                cell.inventory,
+                                cell.namespace,
+                                cell.fanout,
+                                cell.override_marker,
+                            );
                         }
                         if let Some(evidence) = &v.evidence {
                             println!("    evidence: {}", evidence);
@@ -1274,6 +1323,8 @@ pub(crate) fn top_level_grant_to_session_command(
     prose: Option<String>,
     allow: Vec<String>,
     deny: Vec<String>,
+    activated_verbs: Vec<String>,
+    override_markers: Vec<String>,
     ttl: Option<u64>,
     prompt: Option<String>,
     prompt_file: Option<PathBuf>,
@@ -1296,6 +1347,8 @@ pub(crate) fn top_level_grant_to_session_command(
             prose,
             allow,
             deny,
+            activated_verbs,
+            override_markers,
             ttl,
             prompt,
             prompt_file,
@@ -1311,6 +1364,8 @@ pub(crate) fn top_level_grant_to_session_command(
                 profile: None,
                 allow,
                 deny,
+                activated_verbs,
+                override_markers,
                 ttl,
                 prompt,
                 prompt_file,
@@ -1356,6 +1411,8 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
         profile,
         allow,
         deny,
+        activated_verbs,
+        override_markers,
         ttl,
         prompt,
         prompt_file,
@@ -1370,6 +1427,8 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
             || profile.is_some()
             || !allow.is_empty()
             || !deny.is_empty()
+            || !activated_verbs.is_empty()
+            || !override_markers.is_empty()
             || ttl.is_some()
             || prompt.is_some()
             || prompt_file.is_some()
@@ -1391,6 +1450,8 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                 token: token.clone(),
                 allow: allow.clone(),
                 deny: deny.clone(),
+                activated_verbs: activated_verbs.clone(),
+                override_markers: override_markers.clone(),
                 ttl_secs: *ttl,
                 prompt_append,
                 prose: prose.clone(),
@@ -1439,6 +1500,8 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
             prose,
             allow,
             deny,
+            activated_verbs,
+            override_markers,
             ttl,
             prompt,
             prompt_file,
@@ -1460,6 +1523,8 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                     token,
                     allow,
                     deny,
+                    activated_verbs,
+                    override_markers,
                     ttl_secs: ttl,
                     prompt_append,
                     prose,
@@ -1581,13 +1646,15 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                 for g in &grants {
                     let label = paint("[active]", AnsiColor::Green, color);
                     println!(
-                        "{}  token={} allow={:?} deny={:?} allow_exact={:?} deny_exact={:?} static_only={} auto_amend={} granted_at={} expires_at={} prompt={} notes={:?}",
+                        "{}  token={} allow={:?} deny={:?} allow_exact={:?} deny_exact={:?} verbs={:?} overrides={:?} static_only={} auto_amend={} granted_at={} expires_at={} prompt={} notes={:?}",
                         label,
                         g.token,
                         g.allow,
                         g.deny,
                         g.allow_exact,
                         g.deny_exact,
+                        g.activated_verbs,
+                        g.override_markers,
                         g.static_only,
                         g.auto_amend,
                         format_timestamp(g.granted_at),
@@ -1606,13 +1673,15 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                         }
                     };
                     println!(
-                        "{} token={} allow={:?} deny={:?} allow_exact={:?} deny_exact={:?} static_only={} auto_amend={} granted_at={} ended_at={} expires_at={} prompt={} notes={:?}",
+                        "{} token={} allow={:?} deny={:?} allow_exact={:?} deny_exact={:?} verbs={:?} overrides={:?} static_only={} auto_amend={} granted_at={} ended_at={} expires_at={} prompt={} notes={:?}",
                         label,
                         h.token,
                         h.allow,
                         h.deny,
                         h.allow_exact,
                         h.deny_exact,
+                        h.activated_verbs,
+                        h.override_markers,
                         h.static_only,
                         h.auto_amend,
                         format_timestamp(h.granted_at),
@@ -1634,7 +1703,7 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
             }
             if let Some(active) = report.active {
                 println!(
-                    "token={} status=active static_only={} auto_amend={} granted_at={} expires_at={} allow={:?} deny={:?} allow_exact={:?} deny_exact={:?}",
+                    "token={} status=active static_only={} auto_amend={} granted_at={} expires_at={} allow={:?} deny={:?} allow_exact={:?} deny_exact={:?} verbs={:?} overrides={:?}",
                     active.token,
                     active.static_only,
                     active.auto_amend,
@@ -1644,6 +1713,8 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                     active.deny,
                     active.allow_exact,
                     active.deny_exact,
+                    active.activated_verbs,
+                    active.override_markers,
                 );
                 println!(
                     "prompt={}",
@@ -1660,7 +1731,7 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                     server::HistoricalStatus::Expired => "expired",
                 };
                 println!(
-                    "history status={} static_only={} auto_amend={} granted_at={} ended_at={} expires_at={} allow={:?} deny={:?} allow_exact={:?} deny_exact={:?} prompt={} notes={:?}",
+                    "history status={} static_only={} auto_amend={} granted_at={} ended_at={} expires_at={} allow={:?} deny={:?} allow_exact={:?} deny_exact={:?} verbs={:?} overrides={:?} prompt={} notes={:?}",
                     label,
                     entry.static_only,
                     entry.auto_amend,
@@ -1671,6 +1742,8 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                     entry.deny,
                     entry.allow_exact,
                     entry.deny_exact,
+                    entry.activated_verbs,
+                    entry.override_markers,
                     format_prompt(entry.prompt_append.as_deref(), true),
                     entry.generated_notes,
                 );
@@ -2048,6 +2121,8 @@ mod tests {
             status: Some(server::GateStatus::Executed),
             handle: None,
             coverage: None,
+            verb_matches: Vec::new(),
+            verb_guidance: None,
         };
         let envelope = execute_response_envelope(
             "run_result",

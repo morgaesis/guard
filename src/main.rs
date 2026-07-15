@@ -170,7 +170,7 @@ enum MainArgs {
     /// Expose guard as an MCP server over stdio
     #[clap(subcommand)]
     Mcp(McpCommands),
-    /// Manage session grants (extra allow/deny for a specific session token)
+    /// Manage scoped session permissions
     #[clap(subcommand)]
     Session(SessionCommands),
     /// Shorthand for `guard session new <prose>` or `guard session grant <token> ...`.
@@ -189,6 +189,13 @@ enum MainArgs {
         /// Glob pattern to deny in this session (repeatable, beats allow)
         #[arg(long = "deny", value_name = "GLOB")]
         deny: Vec<String>,
+        /// Activate a non-baseline catalog verb for this session (repeatable).
+        #[arg(long = "verb", value_name = "NAME")]
+        activated_verbs: Vec<String>,
+        /// Carry an exact marker that lets matching session permission replace
+        /// a baseline evaluate/deny cell (repeatable).
+        #[arg(long = "override-marker", value_name = "MARKER")]
+        override_markers: Vec<String>,
         /// Time-to-live in seconds; omit for no expiry
         #[arg(long, value_name = "SECONDS")]
         ttl: Option<u64>,
@@ -374,7 +381,7 @@ enum SessionCommands {
         #[arg(value_name = "PROSE")]
         prose: Option<String>,
         /// Mint this grant from an operator-defined profile (see --profiles on
-        /// `guard server start`): a named {ttl, allow, deny, prompt} bundle.
+        /// `guard server start`): a named grant-field bundle.
         /// Works standalone; an unknown name is rejected by the daemon.
         #[arg(long, value_name = "NAME")]
         profile: Option<String>,
@@ -384,6 +391,13 @@ enum SessionCommands {
         /// Glob pattern to deny in this session (repeatable, beats allow)
         #[arg(long = "deny", value_name = "GLOB")]
         deny: Vec<String>,
+        /// Activate a non-baseline catalog verb for this session (repeatable).
+        #[arg(long = "verb", value_name = "NAME")]
+        activated_verbs: Vec<String>,
+        /// Carry an exact marker that lets matching session permission replace
+        /// a baseline evaluate/deny cell (repeatable).
+        #[arg(long = "override-marker", value_name = "MARKER")]
+        override_markers: Vec<String>,
         /// Time-to-live in seconds; omit for no expiry (grants persist in the
         /// state DB and are reloaded on daemon restart)
         #[arg(long, value_name = "SECONDS")]
@@ -407,7 +421,7 @@ enum SessionCommands {
         #[arg(long, value_name = "PATH")]
         socket: Option<String>,
     },
-    /// Grant a session token extra allow/deny patterns.
+    /// Install scoped permissions for a session token.
     /// Daemon-principal or TCP admin-token only.
     Grant {
         /// Opaque session token; the agent passes this as GUARD_SESSION or --session
@@ -423,6 +437,13 @@ enum SessionCommands {
         /// Glob pattern to deny in this session (repeatable, beats allow)
         #[arg(long = "deny", value_name = "GLOB")]
         deny: Vec<String>,
+        /// Activate a non-baseline catalog verb for this session (repeatable).
+        #[arg(long = "verb", value_name = "NAME")]
+        activated_verbs: Vec<String>,
+        /// Carry an exact marker that lets matching session permission replace
+        /// a baseline evaluate/deny cell (repeatable).
+        #[arg(long = "override-marker", value_name = "MARKER")]
+        override_markers: Vec<String>,
         /// Time-to-live in seconds; omit for no expiry (grants persist in the
         /// state DB and are reloaded on daemon restart)
         #[arg(long, value_name = "SECONDS")]
@@ -1258,6 +1279,8 @@ async fn run_main() -> Result<()> {
             prose,
             allow,
             deny,
+            activated_verbs,
+            override_markers,
             ttl,
             prompt,
             prompt_file,
@@ -1271,6 +1294,8 @@ async fn run_main() -> Result<()> {
                 prose,
                 allow,
                 deny,
+                activated_verbs,
+                override_markers,
                 ttl,
                 prompt,
                 prompt_file,

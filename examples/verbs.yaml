@@ -23,8 +23,67 @@
 # skip the LLM; see examples/deny-policy.yaml). The declared class still
 # drives the gate. Leave `trusted` false (default) to keep the LLM as a
 # backstop on the rendered command.
+#
+# A verb may instead leave `args` empty and divide the observed argv into typed
+# coverage cells. A cell that does not match has no effect. Use
+# `baseline: false` for a capability that only a session `--verb` activates.
 
 verbs:
+  # Baseline Ansible policy. Check mode is preauthorized for at most two
+  # explicitly limited hosts. Apply mode always reaches the evaluator unless
+  # an operator grant activates a matching session verb and exact marker.
+  - name: ansible-baseline
+    description: Run bounded Ansible checks and evaluate apply mode
+    binary: ansible
+    consequence: reversible
+    credential_plan: ansible-managed-ssh
+    trusted: true
+    coverage:
+      - name: bounded-check
+        action: preauthorized
+        required_args: ["--check"]
+        inventory:
+          options: ["-i", "--inventory"]
+          values: ["inventory/production"]
+        fanout:
+          options: ["--limit"]
+          max: 2
+      - name: bounded-apply
+        action: evaluate
+        forbidden_args: ["--check"]
+        inventory:
+          options: ["-i", "--inventory"]
+          values: ["inventory/production"]
+        fanout:
+          options: ["--limit"]
+          max: 1
+        override_marker: operator:ansible-apply
+
+  - name: ansible-host-a-apply
+    description: Apply Ansible changes to host-a with a fixed rollback playbook
+    binary: ansible
+    baseline: false
+    consequence: recoverable
+    credential_plan: ansible-managed-ssh
+    revert:
+      binary: ansible-playbook
+      args: ["rollback-host-a.yml", "-i", "inventory/production", "--limit", "host-a"]
+    trusted: true
+    coverage:
+      - name: host-a-apply
+        action: preauthorized
+        forbidden_args: ["--check"]
+        target:
+          position: 0
+          values: ["host-a"]
+        inventory:
+          options: ["-i", "--inventory"]
+          values: ["inventory/production"]
+        fanout:
+          options: ["--limit"]
+          values: ["host-a"]
+          max: 1
+
   # Read-only inspection: runs immediately.
   - name: service-status
     description: Show a systemd unit's status (read-only)
