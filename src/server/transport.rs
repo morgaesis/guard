@@ -116,6 +116,7 @@ impl guard::proxy::ApiSessionSink for DaemonApiSessionSink {
                 } else {
                     Vec::new()
                 },
+                decision_trace: Some(guard::gating::DecisionTrace::source("api_proxy")),
             },
         )
         .await;
@@ -261,6 +262,7 @@ mod api_session_event_tests {
             secret_entitlements: None,
             api_revert: None,
             reason: "test".to_string(),
+            decision_trace: None,
             created_unix: 1,
             deadline_unix: u64::MAX,
             forward_done: true,
@@ -1127,7 +1129,7 @@ async fn shutdown_signal() {
 }
 
 /// Windows-only helpers: named-pipe name normalization and peer-SID resolution.
-/// The SID is the Windows analog of a Unix peer UID — the kernel-verified
+/// The SID is the Windows analog of a Unix peer UID - the kernel-verified
 /// identity of the process on the other end of the local pipe.
 #[cfg(windows)]
 pub(crate) mod winplat {
@@ -1413,6 +1415,8 @@ where
                     coverage: None,
                     verb_matches: Vec::new(),
                     verb_guidance: None,
+                    decision_source: "validation".to_string(),
+                    decision_trace: Some(guard::gating::DecisionTrace::source("validation")),
                 };
                 writer
                     .write_all(serde_json::to_string(&resp)?.as_bytes())
@@ -1454,6 +1458,8 @@ where
                 coverage: None,
                 verb_matches: Vec::new(),
                 verb_guidance: None,
+                decision_source: "validation".to_string(),
+                decision_trace: Some(guard::gating::DecisionTrace::source("validation")),
             };
             writer
                 .write_all(serde_json::to_string(&resp)?.as_bytes())
@@ -1505,7 +1511,7 @@ pub(super) fn emit_audit_events(
     args: &[String],
     result: &ExecuteResult,
 ) {
-    // Always emit the policy decision — this is the event historical
+    // Always emit the policy decision - this is the event historical
     // grep patterns (`[AUDIT] ALLOWED` / `[AUDIT] DENIED`) key on.
     config.log_audit_policy(
         caller,
@@ -1606,6 +1612,8 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
                     coverage: None,
                     verb_matches: Vec::new(),
                     verb_guidance: None,
+                    decision_source: "validation".to_string(),
+                    decision_trace: Some(guard::gating::DecisionTrace::source("validation")),
                 };
                 writer
                     .write_all(serde_json::to_string(&resp)?.as_bytes())
@@ -1666,6 +1674,8 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
                 coverage: None,
                 verb_matches: Vec::new(),
                 verb_guidance: None,
+                decision_source: "validation".to_string(),
+                decision_trace: Some(guard::gating::DecisionTrace::source("validation")),
             };
             writer
                 .write_all(serde_json::to_string(&resp)?.as_bytes())

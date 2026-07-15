@@ -154,7 +154,7 @@ impl AsyncWrite for FlakyWriter {
 
 /// CONTAINMENT-LEAK (regression for the just-landed disconnect fix): a
 /// contained forward command that LAUNCHES and then fails because the client
-/// stream drops mid-run must STAY ARMED — the provisional stays in the
+/// stream drops mid-run must STAY ARMED - the provisional stays in the
 /// registry with `forward_done` set so the auto-revert can still fire. A
 /// leak here would let an unconfirmed mutation persist past its deadline.
 #[cfg(unix)]
@@ -246,7 +246,7 @@ async fn containment_stays_armed_when_client_stream_drops_after_launch() {
 
 /// Counterpart to the leak test: a contained forward command that FAILS TO
 /// SPAWN (nonexistent binary, started=false) has no observable effect, so
-/// the provisional is DROPPED — there is nothing to revert.
+/// the provisional is DROPPED - there is nothing to revert.
 #[cfg(unix)]
 #[tokio::test]
 async fn containment_dropped_when_forward_fails_to_spawn() {
@@ -812,6 +812,7 @@ async fn api_revert_without_running_proxy_defers_to_operator() {
             body_file: None,
         }),
         reason: "delete labels/bug in o/r".to_string(),
+        decision_trace: None,
         created_unix: now,
         deadline_unix: now,
         forward_done: true,
@@ -918,6 +919,7 @@ async fn api_revert_executes_through_registered_proxy_upstream() {
             body_file: Some(body_file.clone()),
         }),
         reason: "delete labels/bug in o/r".to_string(),
+        decision_trace: None,
         created_unix: now,
         deadline_unix: now,
         forward_done: true,
@@ -1155,6 +1157,7 @@ async fn session_status_does_not_cross_expose_same_principal_provisionals() {
             secret_entitlements: None,
             api_revert: None,
             reason: "test".to_string(),
+            decision_trace: None,
             created_unix: now_unix(),
             deadline_unix: now_unix().saturating_add(60),
             forward_done: true,
@@ -1875,7 +1878,7 @@ async fn approve_passes_binding_when_secret_value_unchanged() {
 
     // Value unchanged -> the binding check must NOT reject. The subsequent
     // exec of `true` succeeds on Unix; on Windows there is no `true` binary,
-    // so it may fail to spawn — either way it is not the binding rejection,
+    // so it may fail to spawn - either way it is not the binding rejection,
     // which is what this test asserts.
     let result = execute_snapshot(&cfg, &snapshot, "operator approved").await;
     if let ExecOutcome::Failed { reason, .. } = &result.exec {
@@ -2112,6 +2115,7 @@ async fn approve_voided_when_verb_catalog_version_changed() {
         reason: "verb hold".to_string(),
         risk: Some(8),
         reversibility: Some(Reversibility::Irreversible),
+        decision_trace: None,
         created_unix: now_unix(),
         ttl_secs: APPROVAL_TTL_SECS,
         status: ApprovalStatus::Pending,
@@ -2256,6 +2260,7 @@ async fn stored_entitlements_cover_tool_secrets_for_approval_check_and_revert() 
         secret_entitlements: Some(Vec::new()),
         api_revert: None,
         reason: "test".to_string(),
+        decision_trace: None,
         created_unix: now_unix(),
         deadline_unix: now_unix(),
         forward_done: true,
@@ -2546,6 +2551,7 @@ async fn provisional_revert_executes_in_snapshotted_cwd() {
         secret_entitlements: None,
         api_revert: None,
         reason: "cwd revert".to_string(),
+        decision_trace: None,
         created_unix: now_unix(),
         deadline_unix: now_unix(),
         forward_done: true,

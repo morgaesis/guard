@@ -60,6 +60,15 @@ jobs:
       - name: Rustfmt check
         run: cargo fmt --all -- --check
 
+      - name: User-facing style check
+        shell: bash
+        run: |
+          em_dash=$(printf '\342\200\224')
+          if git grep -n "$em_dash"; then
+            echo "Em dash characters are not permitted in repository content."
+            exit 1
+          fi
+
       - name: Clippy lint
         run: cargo clippy --all-targets --all-features -- -D warnings
 

@@ -739,13 +739,37 @@ fn legacy_grant_options_only_issue_a_session() {
 }
 
 #[test]
-fn bare_legacy_grant_issues_a_session() {
+fn bare_grant_uses_canonical_saved_grant_tree() {
     let args =
         preprocess_legacy_grant_args(["guard", "grant"].into_iter().map(str::to_string).collect());
-    assert!(matches!(
-        MainArgs::try_parse_from(args),
-        Ok(MainArgs::Session(SessionCommands::New { .. }))
-    ));
+    let error = match MainArgs::try_parse_from(args) {
+        Err(error) => error,
+        Ok(_) => panic!("bare grant unexpectedly parsed"),
+    };
+    assert_eq!(
+        error.kind(),
+        clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+    );
+}
+
+#[test]
+fn grant_help_uses_canonical_saved_grant_tree() {
+    for flag in ["-h", "--help"] {
+        let args = ["guard", "grant", flag]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(preprocess_legacy_grant_args(args.clone()), args);
+        let error = match MainArgs::try_parse_from(args) {
+            Err(error) => error,
+            Ok(_) => panic!("grant help unexpectedly parsed"),
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        let rendered = error.to_string();
+        assert!(rendered.contains("save"));
+        assert!(rendered.contains("regenerate"));
+        assert!(!rendered.contains("GUARD_SESSION="));
+    }
 }
 
 #[test]
@@ -768,6 +792,79 @@ fn canonical_grant_commands_bypass_legacy_preprocessing() {
         "readonly-kube".to_string(),
     ];
     assert_eq!(preprocess_legacy_grant_args(args.clone()), args);
+}
+
+#[test]
+fn saved_grant_authority_commands_parse_as_one_canonical_tree() {
+    assert!(matches!(
+        MainArgs::try_parse_from([
+            "guard",
+            "grant",
+            "save",
+            "bounded",
+            "--verb",
+            "inspect",
+            "--override-marker",
+            "operator:apply",
+            "--secret",
+            "service/readonly/*",
+            "--ceiling-verb",
+            "restart-one",
+            "--ceiling-secret",
+            "service/readonly/*",
+            "--ceiling-ttl",
+            "300",
+            "--ceiling-mode",
+            "policy-only",
+            "--allow-prompt-append",
+            "--prompt",
+            "bounded work",
+        ]),
+        Ok(MainArgs::Grant(GrantCommands::Save { .. }))
+    ));
+    assert!(matches!(
+        MainArgs::try_parse_from([
+            "guard",
+            "grant",
+            "edit",
+            "bounded",
+            "--clear-override-markers",
+            "--clear-ceiling-verbs",
+            "--allow-prompt-append=false",
+            "--auto-approve=false",
+        ]),
+        Ok(MainArgs::Grant(GrantCommands::Edit { .. }))
+    ));
+    assert!(matches!(
+        MainArgs::try_parse_from([
+            "guard",
+            "grant",
+            "regenerate",
+            "bounded",
+            "--apply",
+            "rg1-proposal",
+        ]),
+        Ok(MainArgs::Grant(GrantCommands::Regenerate { .. }))
+    ));
+    assert!(matches!(
+        MainArgs::try_parse_from([
+            "guard",
+            "grant",
+            "request",
+            "submit",
+            "--session",
+            "session-token",
+            "--justification",
+            "pager alert",
+            "--prompt-append",
+            "evaluate one service",
+            "--override-marker",
+            "operator:apply",
+        ]),
+        Ok(MainArgs::Grant(GrantCommands::Request(
+            GrantRequestCommands::Submit { .. }
+        )))
+    ));
 }
 
 #[test]
@@ -842,6 +939,49 @@ fn session_grant_parses_auto_amend_flags() {
         Ok(_) => panic!("expected session grant"),
         Err(err) => panic!("expected session grant parse, got {err}"),
     }
+}
+
+#[test]
+fn session_authority_input_treats_mode_and_behavior_flags_as_live_authority() {
+    let none = None;
+    let strings = Vec::<String>::new();
+    let mode = Some("read-only".to_string());
+    let empty = cli_client::SessionAuthorityInput {
+        prose: &none,
+        saved_grant: &none,
+        allow: &strings,
+        deny: &strings,
+        activated_verbs: &strings,
+        override_markers: &strings,
+        ttl: &None,
+        prompt: &none,
+        evaluation_mode: &none,
+        prompt_file: &None,
+        static_only: false,
+        auto_amend: false,
+        no_auto_amend: false,
+    };
+    assert!(empty.is_empty());
+
+    let mode_only = cli_client::SessionAuthorityInput {
+        evaluation_mode: &mode,
+        ..empty
+    };
+    assert!(!mode_only.is_empty());
+
+    let auto_only = cli_client::SessionAuthorityInput {
+        auto_amend: true,
+        evaluation_mode: &none,
+        ..mode_only
+    };
+    assert!(!auto_only.is_empty());
+
+    let no_auto_only = cli_client::SessionAuthorityInput {
+        no_auto_amend: true,
+        auto_amend: false,
+        ..auto_only
+    };
+    assert!(!no_auto_only.is_empty());
 }
 
 #[test]

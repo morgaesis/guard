@@ -3,7 +3,7 @@
 //!
 //! A held command does not execute. It is enqueued with an immutable execution
 //! snapshot, and only an operator (daemon UID) can approve it. Approval executes
-//! strictly from the stored snapshot — no fields are accepted at approve time —
+//! strictly from the stored snapshot - no fields are accepted at approve time -
 //! so the approval is bound to exactly what was reviewed (gate on prediction).
 //! An unattended queue fails closed: holds past their TTL transition to
 //! `Expired` (a denial), they never stall forever.
@@ -20,12 +20,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Notify;
 
-use super::{GateError, Reversibility};
+use super::{DecisionTrace, GateError, Reversibility};
 use crate::principal::{scope_eq, PrincipalKey};
 
 /// Optional binding of held secret VALUES to the artifact the operator reviewed.
 /// Captured at hold time, keyed by the injected env-var name: every referenced
-/// secret is bound — a resolved one by a salted SHA-256 hash of its value (never
+/// secret is bound - a resolved one by a salted SHA-256 hash of its value (never
 /// the value itself), an unresolved one by a sentinel. Verified at approve time:
 /// if a mapped value changed, a bound-resolved secret vanished, or a
 /// bound-unresolved secret now resolves, approval fails closed. This closes the
@@ -55,7 +55,7 @@ pub struct ToolSecretBinding {
 }
 
 /// The immutable execution inputs an approval is bound to. Stored at enqueue and
-/// replayed verbatim at approve time. Secret *values* are never stored — only the
+/// replayed verbatim at approve time. Secret *values* are never stored - only the
 /// env-var -> secret-key mappings for environment and file injection, resolved
 /// at exec under the original caller's namespace, plus an optional salted-hash
 /// [`SecretBinding`] used to detect a value swap between hold and approval.
@@ -123,8 +123,8 @@ impl ApprovalSnapshot {
     }
 
     /// Short, stable fingerprint shown to the operator so two visually-similar
-    /// holds are distinguishable. Not a security boundary — the binding is the
-    /// stored snapshot itself, executed verbatim — just an operator aid.
+    /// holds are distinguishable. Not a security boundary - the binding is the
+    /// stored snapshot itself, executed verbatim - just an operator aid.
     pub fn fingerprint(&self) -> String {
         let mut h = DefaultHasher::new();
         self.hash(&mut h);
@@ -145,7 +145,7 @@ pub enum ApprovalStatus {
     Approved,
     /// Operator denied it.
     Denied,
-    /// TTL elapsed with no decision — a fail-closed denial.
+    /// TTL elapsed with no decision - a fail-closed denial.
     Expired,
     /// Approved but the command could not run (spawn error, or interrupted).
     ExecFailed,
@@ -196,6 +196,9 @@ pub struct Approval {
     pub reason: String,
     pub risk: Option<i32>,
     pub reversibility: Option<Reversibility>,
+    /// Admission explanation captured with the immutable held artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_trace: Option<DecisionTrace>,
     pub created_unix: u64,
     pub ttl_secs: u64,
     pub status: ApprovalStatus,
@@ -268,6 +271,12 @@ impl ApprovalRegistry {
 
     pub fn get(&self, handle: &str) -> Option<&Approval> {
         self.items.get(handle)
+    }
+
+    pub fn set_decision_trace(&mut self, handle: &str, trace: DecisionTrace) -> Option<Approval> {
+        let approval = self.items.get_mut(handle)?;
+        approval.decision_trace = Some(trace);
+        Some(approval.clone())
     }
 
     pub fn notifier(&self, handle: &str) -> Option<Arc<Notify>> {
@@ -475,6 +484,7 @@ mod tests {
             reason: "destructive".into(),
             risk: Some(9),
             reversibility: Some(Reversibility::Irreversible),
+            decision_trace: None,
             created_unix: created,
             ttl_secs: ttl,
             status: ApprovalStatus::Pending,

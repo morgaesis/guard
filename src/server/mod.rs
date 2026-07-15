@@ -97,7 +97,7 @@ pub use transport::Server;
 pub use wire::{
     AdminRequest, AdminResponse, ApprovalSummary, BatchCommand, CommandSpec, ExecuteRequest,
     ExecuteResponse, GateStatus, OutputStream, RevertSpec, SshHostKeyMode, VerbInvocation,
-    VerbSummary,
+    VerbMatchInfo, VerbSummary,
 };
 pub(crate) use wire::{ExecuteStreamMessage, IncomingMessage};
 
@@ -121,6 +121,9 @@ struct ServerConfig {
     pub allowed_uids: Option<Vec<u32>>,
     pub shim_dir: Option<PathBuf>,
     pub dry_run: bool,
+    /// Internal non-executing admission preview. It shares evaluator cache
+    /// reads/writes but suppresses every other learned or durable side effect.
+    pub admission_preview: bool,
     pub tool_registry: Arc<RwLock<ToolRegistry>>,
     /// Known secret values for exact-match output redaction.
     pub redact_secrets: Vec<String>,
@@ -146,7 +149,7 @@ struct ServerConfig {
     pub daemon_uid: u32,
     /// The daemon's own cross-platform principal: its uid on Unix, its process
     /// SID on Windows. Operator/admin RPCs require the caller's principal to
-    /// equal this — the single "is the operator" source of truth on both
+    /// equal this - the single "is the operator" source of truth on both
     /// platforms.
     pub daemon_principal: PrincipalKey,
     pub state_db_path: Option<PathBuf>,
@@ -168,6 +171,10 @@ struct ServerConfig {
     /// Serializes terminal transitions so memory and durable state observe one
     /// winner for approve, deny, and withdraw races.
     pub grant_request_transition_gate: Arc<Mutex<()>>,
+    /// Daemon-lifetime authentication key for stateless regeneration
+    /// proposals. Cloned configurations share the same key so internal preview
+    /// configurations can verify proposals without exposing authority.
+    pub regeneration_proposal_key: Arc<[u8; 32]>,
     /// Optional server-wide binary allow-list. `None` (the default) imposes no
     /// restriction. When `Some`, only binaries permitted by [`binary_allowed`]
     /// may execute, on every route (raw run, verb, and gated approval), as a
@@ -178,7 +185,7 @@ struct ServerConfig {
     /// environment to executed children, in addition to the built-in
     /// platform allowlist. Operator-declared via `--child-env` /
     /// `GUARD_CHILD_ENV`, this is how brokered credentials reach a tool
-    /// generically without per-tool code — e.g. `KUBECONFIG` so brokered
+    /// generically without per-tool code - e.g. `KUBECONFIG` so brokered
     /// kubectl/helm read a config the agent cannot see.
     pub extra_child_env: Vec<String>,
     /// Optional API proxies hosted alongside the gate socket. When set,
@@ -231,6 +238,9 @@ impl ServerConfig {
         exec_as_caller: bool,
         state_db_path: Option<PathBuf>,
     ) -> Self {
+        use rand::Rng;
+        let mut regeneration_proposal_key = [0u8; 32];
+        rand::rng().fill_bytes(&mut regeneration_proposal_key);
         Self {
             socket_path,
             tcp_port,
@@ -243,6 +253,7 @@ impl ServerConfig {
             allowed_uids,
             shim_dir,
             dry_run,
+            admission_preview: false,
             tool_registry: Arc::new(RwLock::new(tool_registry)),
             redact_secrets,
             preflight,
@@ -264,6 +275,7 @@ impl ServerConfig {
             saved_grants: Arc::new(RwLock::new(SavedGrantCatalog::empty())),
             grant_requests: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
             grant_request_transition_gate: Arc::new(Mutex::new(())),
+            regeneration_proposal_key: Arc::new(regeneration_proposal_key),
             // No binary restriction by default; the entrypoint sets this from
             // --allow-bin / GUARD_ALLOW_BIN, like the gate fields above.
             allowed_binaries: None,
@@ -406,7 +418,7 @@ impl ServerConfig {
 }
 
 /// The daemon's own principal: its uid on Unix, its process SID on Windows.
-/// On Windows, if the SID cannot be resolved (effectively impossible — a
+/// On Windows, if the SID cannot be resolved (effectively impossible - a
 /// process always has a token), fall back to a sentinel that no caller can ever
 /// match, so operator authorization fails closed (commands stay held) rather
 /// than open.
@@ -641,7 +653,7 @@ fn has_token(tokens: &[String], needle: &str) -> bool {
 /// into arbitrary code execution: dynamic-linker preload/audit hooks, per-
 /// language startup-file/option hooks, and git's command/config
 /// overrides. Blocked from `--env`/`--secret` injection regardless of the
-/// target binary — a value under any of these names is code, not data, and
+/// target binary - a value under any of these names is code, not data, and
 /// the child would run it before its own logic. Compared case-insensitively;
 /// the `_KEY_`/`_VALUE_` git-config families and `LD_AUDIT*` are prefix
 /// matches because they are numbered/suffixed.
@@ -726,7 +738,7 @@ fn deterministic_safe_allow_reason(
 /// The scan covers the whole "option zone", not just the options before the
 /// destination. ssh honors options that appear *between* the destination and
 /// the remote command (e.g. `ssh host -o ProxyCommand=... id`), so scanning
-/// stops only at the command itself — the second positional (non-option)
+/// stops only at the command itself - the second positional (non-option)
 /// token. Everything from there on is the remote command's own arguments,
 /// which ssh does not re-parse as options. (Verified against ssh's own
 /// `-G` dry run: an `-o` before the command token is applied; one after it is
@@ -822,9 +834,9 @@ fn is_safe_ssh_flag(arg: &str) -> bool {
 
 /// True only for an `-o keyword[=value]` directive whose keyword is on a small
 /// vetted set (batch/non-interactive behavior, connection timeouts, keepalive,
-/// and host-key handling). Everything else — ProxyCommand, ProxyJump,
+/// and host-key handling). Everything else - ProxyCommand, ProxyJump,
 /// LocalCommand, RemoteCommand, *Forward, Tunnel, Include, IdentityFile,
-/// ControlPath, and any unknown keyword — is rejected. A value containing a
+/// ControlPath, and any unknown keyword - is rejected. A value containing a
 /// newline is rejected outright so a second directive cannot be introduced on
 /// a later line past the first-keyword check.
 fn ssh_o_directive_readonly_safe(value: &str) -> bool {

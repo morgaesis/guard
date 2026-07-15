@@ -821,7 +821,7 @@ async fn invalid_secret_shell_reference_denies_before_policy_evaluation() {
         .contains("invalid secret environment reference"));
 }
 
-async fn run_denying_llm(listener: tokio::net::TcpListener) {
+pub(super) async fn run_denying_llm(listener: tokio::net::TcpListener) {
     loop {
         let (mut stream, _) = match listener.accept().await {
             Ok(stream) => stream,

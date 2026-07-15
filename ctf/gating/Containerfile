@@ -12,7 +12,7 @@ ARG CARGO_BUILD_JOBS=1
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 # Copy only what the build needs (keeps the Windows target/ out of the image).
 # `tests/` is required so `run.sh test` actually compiles and runs the
-# integration test binaries (e.g. mcp_integration) — without it the suite
+# integration test binaries (e.g. mcp_integration) - without it the suite
 # silently covers only the lib/bin unit tests. `examples/` is required because
 # policy_tests embeds example policy files via include_str!("../examples/...").
 COPY Cargo.toml Cargo.lock build.rs deny.toml ./

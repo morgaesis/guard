@@ -1,3 +1,4 @@
+use crate::evaluate::{EvalConfig, Evaluator};
 use crate::grant_profile::{EvaluationMode, SavedGrantCatalog};
 use crate::server::admin::handle_admin_request;
 use crate::server::execute::{
@@ -16,6 +17,7 @@ use guard::gating::GateMode;
 use guard::principal::PrincipalKey;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 
 use super::{capture_async, make_test_config};
@@ -35,6 +37,73 @@ fn granted_session(allow: Vec<String>, allow_exact: Vec<SessionExactRule>) -> Se
         static_only: true,
         auto_amend: false,
         granted_at: 0,
+    }
+}
+
+async fn run_verb_synthesis_llm(listener: tokio::net::TcpListener) {
+    loop {
+        let (mut stream, _) = match listener.accept().await {
+            Ok(stream) => stream,
+            Err(_) => return,
+        };
+        tokio::spawn(async move {
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 2048];
+            while let Ok(read) = stream.read(&mut chunk).await {
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .split("\r\n")
+                        .find_map(|line| {
+                            line.strip_prefix("Content-Length: ")
+                                .or_else(|| line.strip_prefix("content-length: "))
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
+            }
+            let arguments = serde_json::json!({
+                "name": "check-host",
+                "description": "Inspect one host",
+                "binary": "uptime",
+                "args": [],
+                "params": {},
+                "consequence": "reversible",
+                "trusted": false,
+                "evidence": "The exact uptime command is read only."
+            })
+            .to_string();
+            let body = serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "tool_calls": [{
+                            "id": "verb-1",
+                            "type": "function",
+                            "function": {
+                                "name": "create_verb",
+                                "arguments": arguments
+                            }
+                        }]
+                    }
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
     }
 }
 
@@ -703,6 +772,7 @@ async fn session_show_reports_recent_stats() {
                 exec_status: SessionExecStatus::Completed,
                 exit_code: Some(0),
                 exposed_secret_refs: vec!["service/token".into()],
+                decision_trace: None,
             },
         );
         reg.record_interaction(
@@ -717,6 +787,7 @@ async fn session_show_reports_recent_stats() {
                 exec_status: SessionExecStatus::NotAttempted,
                 exit_code: None,
                 exposed_secret_refs: Vec::new(),
+                decision_trace: None,
             },
         );
     }
@@ -808,6 +879,57 @@ async fn session_show_self_token_sees_full_grant() {
         }
         other => panic!("unexpected {:?}", other),
     }
+}
+
+#[tokio::test]
+async fn session_status_self_view_redacts_bearer_and_keeps_decision_trace() {
+    let (mut cfg, _) = make_test_config();
+    cfg.daemon_uid = 777;
+    cfg.daemon_principal = PrincipalKey::from_uid(777);
+    let token = "status-bearer-must-not-be-returned".to_string();
+    cfg.sessions
+        .write()
+        .await
+        .grant(token.clone(), granted_session(Vec::new(), Vec::new()));
+    cfg.sessions.write().await.record_interaction(
+        &token,
+        SessionInteraction {
+            at_unix: guard::env::now_unix(),
+            command: "uptime".to_string(),
+            allowed: true,
+            source: SessionDecisionSource::StaticPolicy,
+            reason: "read-only check".to_string(),
+            risk: Some(0),
+            exec_status: SessionExecStatus::Completed,
+            exit_code: Some(0),
+            exposed_secret_refs: Vec::new(),
+            decision_trace: Some(guard::gating::DecisionTrace::source("static_policy")),
+        },
+    );
+
+    let response = handle_admin_request(
+        &cfg,
+        &CallerIdentity::Unix { uid: 1000 },
+        AdminRequest::SessionStatus {
+            token: token.clone(),
+            caller_token: Some(token.clone()),
+        },
+    )
+    .await;
+    let AdminResponse::SessionStatus { report, .. } = &response else {
+        panic!("expected session status, got {response:?}");
+    };
+    assert_eq!(report.active.as_ref().unwrap().token, "(current)");
+    assert_eq!(
+        report.recent[0]
+            .decision_trace
+            .as_ref()
+            .map(|trace| trace.decision_source.as_str()),
+        Some("static_policy")
+    );
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(!json.contains(&token));
+    assert!(json.contains("decision_trace"));
 }
 
 #[tokio::test]
@@ -1187,6 +1309,7 @@ async fn grant_request_submit_enforces_suspension_quota_and_aggregate_size() {
             exit_code: None,
             at_unix: guard::env::now_unix(),
             exposed_secret_refs: Vec::new(),
+            decision_trace: None,
         },
     );
     let submit =
@@ -1547,6 +1670,15 @@ async fn saved_grant_edit_uses_explicit_clear_and_tristate_operations() {
             clear_override_markers: true,
             secret_names: Vec::new(),
             clear_secrets: true,
+            ceiling_verbs: Vec::new(),
+            clear_ceiling_verbs: false,
+            ceiling_secrets: Vec::new(),
+            clear_ceiling_secrets: false,
+            ceiling_ttl_secs: None,
+            clear_ceiling_ttl: false,
+            ceiling_modes: Vec::new(),
+            clear_ceiling_modes: false,
+            allow_prompt_append: None,
             ttl_secs: None,
             clear_ttl: true,
             prompt_append: None,
@@ -1580,6 +1712,15 @@ async fn saved_grant_edit_uses_explicit_clear_and_tristate_operations() {
             clear_override_markers: false,
             secret_names: Vec::new(),
             clear_secrets: false,
+            ceiling_verbs: Vec::new(),
+            clear_ceiling_verbs: false,
+            ceiling_secrets: Vec::new(),
+            clear_ceiling_secrets: false,
+            ceiling_ttl_secs: None,
+            clear_ceiling_ttl: false,
+            ceiling_modes: Vec::new(),
+            clear_ceiling_modes: false,
+            allow_prompt_append: None,
             ttl_secs: None,
             clear_ttl: false,
             prompt_append: Some(String::new()),
@@ -1595,6 +1736,132 @@ async fn saved_grant_edit_uses_explicit_clear_and_tristate_operations() {
     assert_eq!(grant.activated_verbs, vec!["inspect"]);
     assert!(!grant.auto_approve_requests);
     assert_eq!(grant.revision, 3);
+}
+
+#[tokio::test]
+async fn saved_grant_regeneration_previews_exact_apply_and_enforces_both_cas_keys() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(run_verb_synthesis_llm(listener));
+    let evaluator = |model: &str| {
+        Evaluator::new(
+            EvalConfig::default()
+                .llm_api_key("test-key".to_string())
+                .llm_api_url(url.clone())
+                .llm_model(model.to_string())
+                .llm_retries(0),
+        )
+        .unwrap()
+    };
+    let (mut cfg, _) = make_test_config();
+    cfg.evaluator = Arc::new(evaluator("regime-a"));
+    cfg.saved_grants = Arc::new(RwLock::new(
+        SavedGrantCatalog::from_yaml(
+            "grants:\n  - name: bounded\n    prompt_append: inspect one host\n",
+        )
+        .unwrap(),
+    ));
+    cfg.daemon_principal = PrincipalKey::from_uid(cfg.daemon_uid);
+    let daemon = CallerIdentity::Unix {
+        uid: cfg.daemon_uid,
+    };
+    let preview = || AdminRequest::SavedGrantRegenerate {
+        name: "bounded".to_string(),
+        prompt: None,
+        proposal_id: None,
+    };
+    let apply = |proposal_id: String| AdminRequest::SavedGrantRegenerate {
+        name: "bounded".to_string(),
+        prompt: None,
+        proposal_id: Some(proposal_id),
+    };
+    let edit_description = || AdminRequest::SavedGrantEdit {
+        name: "bounded".to_string(),
+        description: Some("changed after preview".to_string()),
+        activated_verbs: Vec::new(),
+        clear_verbs: false,
+        override_markers: Vec::new(),
+        clear_override_markers: false,
+        secret_names: Vec::new(),
+        clear_secrets: false,
+        ceiling_verbs: Vec::new(),
+        clear_ceiling_verbs: false,
+        ceiling_secrets: Vec::new(),
+        clear_ceiling_secrets: false,
+        ceiling_ttl_secs: None,
+        clear_ceiling_ttl: false,
+        ceiling_modes: Vec::new(),
+        clear_ceiling_modes: false,
+        allow_prompt_append: None,
+        ttl_secs: None,
+        clear_ttl: false,
+        prompt_append: None,
+        evaluation_mode: None,
+        auto_approve_requests: None,
+    };
+
+    let response = handle_admin_request(&cfg, &daemon, preview()).await;
+    let AdminResponse::SavedGrantRegenerationProposal {
+        proposal_id,
+        candidate,
+        source_revision,
+        regime,
+        ..
+    } = response
+    else {
+        panic!("expected regeneration proposal, got {response:?}");
+    };
+    assert_eq!(source_revision, 1);
+    assert_eq!(regime, cfg.evaluator.verb_promotion_stamp());
+    assert!(cfg
+        .saved_grants
+        .read()
+        .await
+        .get("bounded")
+        .unwrap()
+        .generated_verbs
+        .is_empty());
+    let applied = handle_admin_request(&cfg, &daemon, apply(proposal_id)).await;
+    let AdminResponse::SavedGrantRegenerated { grant, .. } = applied else {
+        panic!("expected exact regeneration apply, got {applied:?}");
+    };
+    assert_eq!(grant.revision, 2);
+    assert_eq!(
+        serde_json::to_value(&grant.generated_verbs[0]).unwrap(),
+        serde_json::to_value(&candidate).unwrap(),
+        "apply must install the exact previewed candidate"
+    );
+
+    let revision_preview = handle_admin_request(&cfg, &daemon, preview()).await;
+    let AdminResponse::SavedGrantRegenerationProposal {
+        proposal_id: stale_revision,
+        ..
+    } = revision_preview
+    else {
+        panic!()
+    };
+    assert!(matches!(
+        handle_admin_request(&cfg, &daemon, edit_description()).await,
+        AdminResponse::SavedGrant { .. }
+    ));
+    assert!(matches!(
+        handle_admin_request(&cfg, &daemon, apply(stale_revision)).await,
+        AdminResponse::Error { message } if message.contains("revision changed")
+    ));
+
+    let regime_preview = handle_admin_request(&cfg, &daemon, preview()).await;
+    let AdminResponse::SavedGrantRegenerationProposal {
+        proposal_id: stale_regime,
+        ..
+    } = regime_preview
+    else {
+        panic!()
+    };
+    cfg.evaluator = Arc::new(evaluator("regime-b"));
+    assert!(matches!(
+        handle_admin_request(&cfg, &daemon, apply(stale_regime)).await,
+        AdminResponse::Error { message } if message.contains("evaluator regime changed")
+    ));
 }
 
 #[tokio::test]
@@ -1808,6 +2075,10 @@ async fn evaluate_batch_requires_owned_live_unsuspended_session_or_admin() {
     let commands = vec![crate::server::BatchCommand {
         binary: "true".to_string(),
         args: Vec::new(),
+        env: std::collections::HashMap::new(),
+        secrets: std::collections::HashMap::new(),
+        secret_files: std::collections::HashMap::new(),
+        cwd: None,
     }];
     let evaluate = |session_token, caller_token| AdminRequest::EvaluateBatch {
         session_token,
@@ -1827,6 +2098,14 @@ async fn evaluate_batch_requires_owned_live_unsuspended_session_or_admin() {
         .await,
         AdminResponse::Error { message } if message.contains("only batch-evaluate for itself")
     ));
+    let before = (
+        cfg.approvals.read().await.list().len(),
+        cfg.provisional.read().await.list().len(),
+        cfg.read_grants.read().await.list().len(),
+        cfg.grant_requests.read().await.len(),
+        cfg.verbs.read().await.list().len(),
+        cfg.sessions.read().await.interactions_snapshot().len(),
+    );
     assert!(matches!(
         handle_admin_request(
             &cfg,
@@ -1839,6 +2118,18 @@ async fn evaluate_batch_requires_owned_live_unsuspended_session_or_admin() {
         .await,
         AdminResponse::EvaluationBatch { .. }
     ));
+    let after = (
+        cfg.approvals.read().await.list().len(),
+        cfg.provisional.read().await.list().len(),
+        cfg.read_grants.read().await.list().len(),
+        cfg.grant_requests.read().await.len(),
+        cfg.verbs.read().await.list().len(),
+        cfg.sessions.read().await.interactions_snapshot().len(),
+    );
+    assert_eq!(
+        after, before,
+        "batch preview must have no durable side effects"
+    );
     assert!(matches!(
         handle_admin_request(&cfg, &daemon, evaluate(None, None)).await,
         AdminResponse::EvaluationBatch { .. }
@@ -1856,6 +2147,7 @@ async fn evaluate_batch_requires_owned_live_unsuspended_session_or_admin() {
             exit_code: None,
             at_unix: guard::env::now_unix(),
             exposed_secret_refs: Vec::new(),
+            decision_trace: None,
         },
     );
     assert!(matches!(
@@ -1867,6 +2159,113 @@ async fn evaluate_batch_requires_owned_live_unsuspended_session_or_admin() {
         .await,
         AdminResponse::Error { message } if message.contains("suspended")
     ));
+}
+
+#[tokio::test]
+async fn evaluate_batch_seeds_the_identical_real_run_cache_key() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(super::exec_policy::run_denying_llm(listener));
+
+    let evaluator = Evaluator::new(
+        EvalConfig::default()
+            .llm_api_key("test-key".to_string())
+            .llm_api_url(url)
+            .llm_retries(0),
+    )
+    .unwrap();
+    let (mut cfg, _) = make_test_config();
+    cfg.evaluator = Arc::new(evaluator);
+    let token = "batch-cache-owner".to_string();
+    let mut grant = granted_session(Vec::new(), Vec::new());
+    grant.static_only = false;
+    cfg.sessions.write().await.grant(token.clone(), grant);
+    let cwd = tempfile::tempdir().unwrap();
+    let cwd = cwd.path().canonicalize().unwrap();
+    let command = crate::server::BatchCommand {
+        binary: "echo".to_string(),
+        args: vec!["delete-prod".to_string()],
+        env: HashMap::from([("DEPLOY_SCOPE".to_string(), "alpha".to_string())]),
+        secrets: HashMap::new(),
+        secret_files: HashMap::new(),
+        cwd: Some(cwd.clone()),
+    };
+    let worker = CallerIdentity::Unix { uid: 1000 };
+
+    let response = handle_admin_request(
+        &cfg,
+        &worker,
+        AdminRequest::EvaluateBatch {
+            session_token: Some(token.clone()),
+            caller_token: Some(token.clone()),
+            commands: vec![command.clone()],
+        },
+    )
+    .await;
+    let AdminResponse::EvaluationBatch { items } = response else {
+        panic!("expected batch evaluation")
+    };
+    assert_eq!(items[0].decision_source, "llm");
+
+    let result = execute_command(
+        ExecuteRequest {
+            binary: command.binary.clone(),
+            args: command.args.clone(),
+            auth_token: None,
+            env: command.env.clone(),
+            secrets: command.secrets.clone(),
+            secret_files: command.secret_files.clone(),
+            stream: false,
+            session_token: Some(token),
+            revert: None,
+            confirm_within_secs: None,
+            reevaluate: false,
+            ssh_hostkey: None,
+            cwd: command.cwd.clone(),
+            require_approval: None,
+            wait_approval_secs: None,
+            verb: None,
+        },
+        &cfg,
+        &worker,
+    )
+    .await
+    .into_response();
+    assert_eq!(result.decision_source, "cache");
+
+    let mut changed_environment = command.env;
+    changed_environment.insert("DEPLOY_SCOPE".to_string(), "beta".to_string());
+    let changed = execute_command(
+        ExecuteRequest {
+            binary: command.binary,
+            args: command.args,
+            auth_token: None,
+            env: changed_environment,
+            secrets: command.secrets,
+            secret_files: command.secret_files,
+            stream: false,
+            session_token: Some("batch-cache-owner".to_string()),
+            revert: None,
+            confirm_within_secs: None,
+            reevaluate: false,
+            ssh_hostkey: None,
+            cwd: command.cwd,
+            require_approval: None,
+            wait_approval_secs: None,
+            verb: None,
+        },
+        &cfg,
+        &worker,
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        changed.decision_source, "llm",
+        "a different plain environment value must not reuse the preview cache entry"
+    );
+    let admission = cfg.command_admission.snapshot();
+    assert_eq!(admission.handler_admitted, 3);
+    assert_eq!(admission.evaluator_admitted, 3);
 }
 
 #[tokio::test]
@@ -1948,6 +2347,15 @@ async fn grant_request_approval_rejects_expiry_and_stale_saved_revision() {
                 clear_override_markers: false,
                 secret_names: Vec::new(),
                 clear_secrets: false,
+                ceiling_verbs: Vec::new(),
+                clear_ceiling_verbs: false,
+                ceiling_secrets: Vec::new(),
+                clear_ceiling_secrets: false,
+                ceiling_ttl_secs: None,
+                clear_ceiling_ttl: false,
+                ceiling_modes: Vec::new(),
+                clear_ceiling_modes: false,
+                allow_prompt_append: None,
                 ttl_secs: None,
                 clear_ttl: false,
                 prompt_append: None,

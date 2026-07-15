@@ -137,7 +137,7 @@ impl Evaluator {
         };
 
         // Redact secret-shaped substrings BEFORE the command text enters any LLM
-        // payload. The audit log, on the other hand, sees the original — that
+        // payload. The audit log, on the other hand, sees the original - that
         // happens in the caller's layer, not here.
         let redacted_command = redact_for_llm(command);
         if redacted_command != command {
@@ -196,7 +196,7 @@ impl Evaluator {
                 }
                 Err(e) => {
                     tracing::warn!(
-                        "model {} exhausted retry budget: {} — trying next in chain",
+                        "model {} exhausted retry budget: {} - trying next in chain",
                         model,
                         e
                     );

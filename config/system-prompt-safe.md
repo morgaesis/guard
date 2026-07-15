@@ -72,7 +72,7 @@ nginx front-end via an OPNsense API call, restarting a named service via a
 management endpoint, or creating/updating a record for a named zone). The
 env-var references (`$VAR`, `${VAR}`) are resolved at exec time and are not
 secrets in the command text. The same rules apply when the authenticated
-request is wrapped in `ssh host 'curl -u "$USER:$PASS" ...'` — evaluate the
+request is wrapped in `ssh host 'curl -u "$USER:$PASS" ...'` - evaluate the
 effective remote operation.
 
 Authenticated remote appliance and service-management APIs are ordinary admin

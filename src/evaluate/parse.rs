@@ -39,7 +39,7 @@ pub(super) fn parse_decision_response(
 }
 
 /// Structural description of a response that failed to parse: key names,
-/// counts, and kinds only — never message content, so a provider echo of the
+/// counts, and kinds only - never message content, so a provider echo of the
 /// (already redacted) command cannot ride an error string into logs.
 pub(super) fn response_shape_summary(parsed: &serde_json::Value) -> String {
     let top_keys = parsed
@@ -449,7 +449,7 @@ mod tests {
 
     #[test]
     fn test_lax_extract_json_with_prose() {
-        let s = r#"Sure! Here is the answer: {"decision": "DENY", "reason": "bad", "risk": 8} — hope that helps."#;
+        let s = r#"Sure! Here is the answer: {"decision": "DENY", "reason": "bad", "risk": 8} - hope that helps."#;
         let out = lax_extract_json(s).unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["decision"], "DENY");

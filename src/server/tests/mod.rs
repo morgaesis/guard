@@ -83,6 +83,10 @@ fn make_test_config() -> (ServerConfig, SharedBuf) {
     (cfg, buf)
 }
 
+pub(super) fn config_for_proposal_test() -> ServerConfig {
+    make_test_config().0
+}
+
 fn paranoid_test_config() -> ServerConfig {
     let eval_config = EvalConfig::default()
         .llm_enabled(false)

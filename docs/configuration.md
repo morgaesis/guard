@@ -105,7 +105,7 @@ to the consequence floor, regime stamps, and declared coverage boundaries.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `GUARD_BACKEND` | automatic | `pass`, `env`, `local`, `vault`, or `infisical`. |
+| `GUARD_BACKEND` | automatic | `pass` (Unix only), `env`, `local`, `vault`, or `infisical`. |
 | `GUARD_GPG_RECIPIENT` | none | GPG recipient for the local backend. |
 | `GUARD_SERVER_UID` | daemon principal | Owner namespace for the daemon's backend `LLM_API_KEY`. |
 | `GUARD_CHILD_ENV` | unset | Daemon environment names copied into approved children. |

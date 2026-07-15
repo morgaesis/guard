@@ -67,7 +67,7 @@ pub trait ProtocolConfig: Send + Sync {
         None
     }
 
-    /// The client-facing reason an operation is denied regardless of policy —
+    /// The client-facing reason an operation is denied regardless of policy -
     /// streams the request-level gate cannot inspect or redact per object.
     /// `None` leaves the decision to policy.
     fn deny_outright(&self, op: &ApiOp) -> Option<String>;
@@ -104,7 +104,7 @@ pub trait ProtocolConfig: Send + Sync {
     /// Build the revert for a tracked write that succeeded upstream.
     /// `prior_object` is the raw body of the pre-write fetch (when one was
     /// taken); `response` is the upstream response body. `Err` carries the
-    /// reason no revert could be built, which the server logs — the write is
+    /// reason no revert could be built, which the server logs - the write is
     /// already live either way, so an `Err` only means it will not auto-revert.
     fn plan_revert(
         &self,

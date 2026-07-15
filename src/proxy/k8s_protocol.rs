@@ -1,4 +1,4 @@
-//! The Kubernetes [`ProtocolConfig`] — the reference protocol plug-in.
+//! The Kubernetes [`ProtocolConfig`] - the reference protocol plug-in.
 //! Delegates parsing and Secret redaction to the pure functions in
 //! [`super::k8s`] and keeps every Kubernetes-specific judgment (interactive
 //! subresources, Secret stream semantics, dry-run writes, Kubernetes metadata

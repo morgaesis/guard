@@ -13,7 +13,7 @@ use crate::shim::ShimGenerator;
 use anyhow::Context;
 use anyhow::{bail, Result};
 use guard::gating::verb::{CoverageAction, CoverageMatch, CoverageSpecificity, ValueDomain};
-use guard::gating::{Coverage, Reversibility};
+use guard::gating::{Coverage, DecisionTrace, DecisionVerbMatch, Reversibility};
 use guard::learned_rules::{AutoShimMode, LearningOutcome};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -40,7 +40,6 @@ use super::grants::handle_grant_read;
 use super::path_with_shim_dir;
 use super::runtime::NotifyEvent;
 use super::transport::{write_policy_decision, write_stream_message};
-#[cfg(unix)]
 use super::wire::ExecOutcome;
 use super::wire::{
     verb_trust_is_current, CallerIdentity, ExecuteRequest, ExecuteResult, ExecuteStreamMessage,
@@ -139,12 +138,16 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         stream_output,
         stream_writer,
         session_token: request.session_token.clone(),
+        verb_matches: Vec::new(),
+        verb_guidance: None,
     };
 
     let verb_resolution = match resolve_verb_context(&mut phase, &mut request).await {
         Ok(resolution) => resolution,
         Err(result) => return result,
     };
+    phase.verb_matches = verb_resolution.matches.clone();
+    phase.verb_guidance = verb_resolution.guidance.clone();
 
     if let Err(result) = canonicalize_request_cwd(&mut phase, &mut request).await {
         return result.with_verb_resolution(
@@ -394,6 +397,49 @@ struct ExecPhase<'a, W> {
     stream_output: bool,
     stream_writer: &'a mut W,
     session_token: Option<String>,
+    verb_matches: Vec<VerbMatchInfo>,
+    verb_guidance: Option<String>,
+}
+
+fn decision_trace_for_phase<W: AsyncWrite + Unpin>(
+    phase: &ExecPhase<'_, W>,
+    source: SessionDecisionSource,
+    allowed: bool,
+) -> DecisionTrace {
+    let decision_source = source.as_str().to_string();
+    DecisionTrace {
+        version: DecisionTrace::VERSION,
+        decision_source: decision_source.clone(),
+        verb_matches: phase
+            .verb_matches
+            .iter()
+            .map(|matched| DecisionVerbMatch {
+                verb: matched.verb.clone(),
+                cell: matched.cell.clone(),
+                scope: format!("{:?}", matched.scope).to_ascii_lowercase(),
+                action: format!("{:?}", matched.action).to_ascii_lowercase(),
+                features: matched.features.clone(),
+                selected: matched.selected,
+                overridden: matched.overridden,
+            })
+            .collect(),
+        failed_dimensions: if allowed {
+            Vec::new()
+        } else {
+            vec![decision_source]
+        },
+        conflict: phase
+            .verb_guidance
+            .as_ref()
+            .filter(|guidance| guidance.to_ascii_lowercase().contains("conflict"))
+            .cloned(),
+        guidance: phase.verb_guidance.clone(),
+        suggested_grant_delta: phase
+            .verb_guidance
+            .as_ref()
+            .filter(|guidance| guidance.contains("grant"))
+            .cloned(),
+    }
 }
 
 /// Deny bookkeeping shared by the policy phases: audit the decision, notify a
@@ -407,114 +453,122 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
     risk: Option<i32>,
     mut reason: String,
 ) -> ExecuteResult {
-    if let Some(token) = phase.session_token.as_deref() {
-        super::admin::prune_grant_requests(phase.config).await;
-        let now = guard::env::now_unix();
-        let (saved_grant, session_revision, session_expires_at) = {
-            let sessions = phase.config.sessions.read().await;
-            (
-                sessions.saved_grant_for(token),
-                sessions.effective_revision_key(token),
-                sessions.expires_at_for(token).flatten(),
-            )
-        };
-        let delta = crate::grant_profile::GrantRequestDelta {
-            prompt_append: Some(format!(
+    if !phase.config.admission_preview {
+        if let Some(token) = phase.session_token.as_deref() {
+            super::admin::prune_grant_requests(phase.config).await;
+            let now = guard::env::now_unix();
+            let (saved_grant, session_revision, session_expires_at) = {
+                let sessions = phase.config.sessions.read().await;
+                (
+                    sessions.saved_grant_for(token),
+                    sessions.effective_revision_key(token),
+                    sessions.expires_at_for(token).flatten(),
+                )
+            };
+            let delta = crate::grant_profile::GrantRequestDelta {
+                prompt_append: Some(format!(
                 "Evaluate this denied operation within the operator-approved task scope: {command}"
             )),
-            ..crate::grant_profile::GrantRequestDelta::default()
-        };
-        let candidate = session_revision.as_ref().and_then(|session_revision| {
-            crate::grant_profile::GrantRequest::new(
-                token.to_string(),
-                saved_grant.as_ref().map(|(name, _)| name.clone()),
-                delta,
-                command.clone(),
-            )
-            .ok()
-            .map(|mut request| {
-                request.issued_saved_revision = saved_grant.map(|(_, revision)| revision);
-                request.issued_session_revision = Some(session_revision.clone());
-                if let Some(session_expires_at) = session_expires_at {
-                    request.expires_unix = request.expires_unix.min(session_expires_at);
-                }
-                request
-            })
-        });
-        let (request, created) = {
-            let mut requests = phase.config.grant_requests.write().await;
-            let queue_full = requests.len() >= super::admin::MAX_GRANT_REQUESTS
-                || requests
+                ..crate::grant_profile::GrantRequestDelta::default()
+            };
+            let candidate = session_revision.as_ref().and_then(|session_revision| {
+                crate::grant_profile::GrantRequest::new(
+                    token.to_string(),
+                    saved_grant.as_ref().map(|(name, _)| name.clone()),
+                    delta,
+                    command.clone(),
+                )
+                .ok()
+                .map(|mut request| {
+                    request.issued_saved_revision = saved_grant.map(|(_, revision)| revision);
+                    request.issued_session_revision = Some(session_revision.clone());
+                    if let Some(session_expires_at) = session_expires_at {
+                        request.expires_unix = request.expires_unix.min(session_expires_at);
+                    }
+                    request
+                })
+            });
+            let (request, created) = {
+                let mut requests = phase.config.grant_requests.write().await;
+                let queue_full = requests.len() >= super::admin::MAX_GRANT_REQUESTS
+                    || requests
+                        .values()
+                        .filter(|request| {
+                            request.session_token == token
+                                && request.status
+                                    == crate::grant_profile::GrantRequestStatus::Pending
+                        })
+                        .count()
+                        >= super::admin::MAX_PENDING_GRANT_REQUESTS_PER_SESSION;
+                if let Some(existing) = requests
                     .values()
-                    .filter(|request| {
+                    .find(|request| {
                         request.session_token == token
                             && request.status == crate::grant_profile::GrantRequestStatus::Pending
+                            && request.expires_unix > now
+                            && request.justification == command
+                            && request.issued_session_revision == session_revision
                     })
-                    .count()
-                    >= super::admin::MAX_PENDING_GRANT_REQUESTS_PER_SESSION;
-            if let Some(existing) = requests
-                .values()
-                .find(|request| {
-                    request.session_token == token
-                        && request.status == crate::grant_profile::GrantRequestStatus::Pending
-                        && request.expires_unix > now
-                        && request.justification == command
-                        && request.issued_session_revision == session_revision
-                })
-                .cloned()
-            {
-                (Some(existing), false)
-            } else if queue_full {
-                (None, false)
-            } else if let Some(candidate) = candidate {
-                if super::admin::grant_request_payload_bytes(&candidate)
-                    > super::admin::MAX_GRANT_REQUEST_PAYLOAD_BYTES
+                    .cloned()
                 {
+                    (Some(existing), false)
+                } else if queue_full {
                     (None, false)
-                } else {
-                    let persisted = if let Some(store) = &phase.config.session_store {
-                        match store.save_grant_request(candidate.clone()).await {
-                            Ok(()) => true,
-                            Err(error) => {
-                                tracing::warn!("failed to persist denial escalation: {}", error);
-                                false
-                            }
-                        }
-                    } else {
-                        true
-                    };
-                    if persisted {
-                        requests.insert(candidate.handle.clone(), candidate.clone());
-                        (Some(candidate), true)
-                    } else {
+                } else if let Some(candidate) = candidate {
+                    if super::admin::grant_request_payload_bytes(&candidate)
+                        > super::admin::MAX_GRANT_REQUEST_PAYLOAD_BYTES
+                    {
                         (None, false)
+                    } else {
+                        let persisted = if let Some(store) = &phase.config.session_store {
+                            match store.save_grant_request(candidate.clone()).await {
+                                Ok(()) => true,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        "failed to persist denial escalation: {}",
+                                        error
+                                    );
+                                    false
+                                }
+                            }
+                        } else {
+                            true
+                        };
+                        if persisted {
+                            requests.insert(candidate.handle.clone(), candidate.clone());
+                            (Some(candidate), true)
+                        } else {
+                            (None, false)
+                        }
                     }
+                } else {
+                    (None, false)
                 }
-            } else {
-                (None, false)
-            }
-        };
-        if let Some(request) = request {
-            reason.push_str(&format!(
+            };
+            if let Some(request) = request {
+                reason.push_str(&format!(
                 "; escalation={} next=`guard grant request show {}` operator=`guard grant request approve {}`",
                 request.handle, request.handle, request.handle
             ));
-            if created {
-                tracing::warn!(
-                    target: "guard::audit",
-                    "[AUDIT] OPERATOR_NOTIFICATION kind=grant_request handle={} session={}",
-                    request.handle,
-                    audit_session_fingerprint(Some(token))
-                );
-                phase.config.emit_event(NotifyEvent {
-                    event: "grant_request_created",
-                    at_unix: guard::env::now_unix(),
-                    handle: Some(request.handle.clone()),
-                    session_fingerprint: Some(audit_session_fingerprint(Some(token))),
-                    reason: Some("session command denied; grant expansion requested".to_string()),
-                    status: Some("pending".to_string()),
-                    behavior: None,
-                });
+                if created {
+                    tracing::warn!(
+                        target: "guard::audit",
+                        "[AUDIT] OPERATOR_NOTIFICATION kind=grant_request handle={} session={}",
+                        request.handle,
+                        audit_session_fingerprint(Some(token))
+                    );
+                    phase.config.emit_event(NotifyEvent {
+                        event: "grant_request_created",
+                        at_unix: guard::env::now_unix(),
+                        handle: Some(request.handle.clone()),
+                        session_fingerprint: Some(audit_session_fingerprint(Some(token))),
+                        reason: Some(
+                            "session command denied; grant expansion requested".to_string(),
+                        ),
+                        status: Some("pending".to_string()),
+                        behavior: None,
+                    });
+                }
             }
         }
     }
@@ -539,10 +593,11 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
             exec_status: SessionExecStatus::NotAttempted,
             exit_code: None,
             exposed_secret_refs: Vec::new(),
+            decision_trace: Some(decision_trace_for_phase(phase, source, false)),
         },
     )
     .await;
-    ExecuteResult::denied(reason)
+    ExecuteResult::denied(reason).with_decision_source(source)
 }
 
 /// Allow bookkeeping shared by the gate-routed allow paths: route the
@@ -568,6 +623,36 @@ async fn route_allow_and_record<W: AsyncWrite + Unpin>(
         &mut *phase.stream_writer,
     )
     .await;
+    let trace = decision_trace_for_phase(phase, source, true);
+    match &result.exec {
+        ExecOutcome::Held { handle, .. } => {
+            let updated = phase
+                .config
+                .approvals
+                .write()
+                .await
+                .set_decision_trace(handle, trace.clone());
+            if let (Some(store), Some(approval)) = (&phase.config.session_store, updated) {
+                if let Err(error) = store.save_approval(approval).await {
+                    tracing::error!("failed to persist held decision trace: {error}");
+                }
+            }
+        }
+        ExecOutcome::Provisional { handle, .. } => {
+            let updated = phase
+                .config
+                .provisional
+                .write()
+                .await
+                .set_decision_trace(handle, trace.clone());
+            if let (Some(store), Some(provisional)) = (&phase.config.session_store, updated) {
+                if let Err(error) = store.save_provisional(provisional).await {
+                    tracing::error!("failed to persist provisional decision trace: {error}");
+                }
+            }
+        }
+        _ => {}
+    }
     record_live_session_interaction(
         phase.config,
         phase.session_token.as_deref(),
@@ -581,10 +666,11 @@ async fn route_allow_and_record<W: AsyncWrite + Unpin>(
             exec_status: result.session_exec_status(),
             exit_code: result.exit_code(),
             exposed_secret_refs: result.exposed_secret_refs().to_vec(),
+            decision_trace: Some(trace),
         },
     )
     .await;
-    result
+    result.with_decision_source(source)
 }
 
 async fn capture_session_authority(
@@ -1652,8 +1738,8 @@ async fn validate_exec_request<W: AsyncWrite + Unpin>(
 ///
 /// If the caller passes a session_token that the daemon does not know
 /// about (revoked, expired, or never existed), the request is rejected
-/// — silently falling through to base policy would let an agent run
-/// with surprise rules when its operator-issued grant is gone.
+/// - silently falling through to base policy would let an agent run
+///   with surprise rules when its operator-issued grant is gone.
 async fn apply_session_rules<W: AsyncWrite + Unpin>(
     phase: &mut ExecPhase<'_, W>,
     request: ExecuteRequest,
@@ -2124,7 +2210,7 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
             risk,
         } => {
             let mut reason = reason;
-            if matches!(source, crate::evaluate::EvalSource::Llm) {
+            if matches!(source, crate::evaluate::EvalSource::Llm) && !config.admission_preview {
                 if let Some(notice) = maybe_auto_amend_session_after_llm(
                     config,
                     session_token.as_deref(),
@@ -2181,6 +2267,7 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
         } => {
             let mut reason = reason;
             if matches!(source, crate::evaluate::EvalSource::Llm)
+                && !config.admission_preview
                 && !session_prompt_active
                 && session_token.is_none()
             {
@@ -2216,7 +2303,7 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
                 )
                 .await;
             }
-            if matches!(source, crate::evaluate::EvalSource::Llm) {
+            if matches!(source, crate::evaluate::EvalSource::Llm) && !config.admission_preview {
                 if let Some(notice) = maybe_auto_amend_session_after_llm(
                     config,
                     session_token.as_deref(),

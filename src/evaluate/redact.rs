@@ -4,7 +4,7 @@ use regex::Regex;
 use std::sync::OnceLock;
 
 /// Credential/secret patterns redacted from command text BEFORE it is sent to
-/// the LLM. The audit log still sees the original command — redaction is a
+/// the LLM. The audit log still sees the original command - redaction is a
 /// pre-LLM transform, not an output transform.
 ///
 /// This list holds ONLY the LLM-path delta over the shared engine in
@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 /// across lines, where the line-oriented output engine matches the header
 /// line only. Named `KEY=value` pairs, provider key prefixes (`sk-*`,
 /// `AKIA*`), JWTs, `Bearer`/`Basic` tokens, and high-entropy values are all
-/// covered by the shared engine — do not re-add them here.
+/// covered by the shared engine - do not re-add them here.
 fn llm_redaction_patterns() -> &'static Vec<(Regex, &'static str)> {
     static P: OnceLock<Vec<(Regex, &str)>> = OnceLock::new();
     P.get_or_init(|| {

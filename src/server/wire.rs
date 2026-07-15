@@ -1,9 +1,11 @@
 use crate::grant_profile::{EvaluationMode, GrantRequest, GrantRequestDelta, SavedGrant};
-use crate::session::{HistoricalGrant, SessionExecStatus, SessionGrantSummary, SessionReport};
+use crate::session::{
+    HistoricalGrant, SessionDecisionSource, SessionExecStatus, SessionGrantSummary, SessionReport,
+};
 use guard::gating::approval::Approval;
 use guard::gating::provisional::Provisional;
 use guard::gating::verb::CoverageAction;
-use guard::gating::{Coverage, Reversibility};
+use guard::gating::{Coverage, DecisionTrace, DecisionVerbMatch, Reversibility};
 use guard::principal::PrincipalKey;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -57,7 +59,7 @@ impl CallerIdentity {
         self.user_key().map(PrincipalKey::from_raw)
     }
 
-    /// True only for a kernel-verified LOCAL peer — a Unix-socket uid or a
+    /// True only for a kernel-verified LOCAL peer - a Unix-socket uid or a
     /// Windows named-pipe SID. A bearer-token TCP caller (`Tcp`/`TcpAdmin`) and
     /// `Unknown` are NOT local peers, even though a TCP caller carries a token
     /// as its principal. Credential and environment injection are gated on this
@@ -541,6 +543,24 @@ pub enum AdminRequest {
         secret_names: Vec<String>,
         #[serde(default)]
         clear_secrets: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ceiling_verbs: Vec<String>,
+        #[serde(default)]
+        clear_ceiling_verbs: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ceiling_secrets: Vec<String>,
+        #[serde(default)]
+        clear_ceiling_secrets: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ceiling_ttl_secs: Option<u64>,
+        #[serde(default)]
+        clear_ceiling_ttl: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ceiling_modes: Vec<EvaluationMode>,
+        #[serde(default)]
+        clear_ceiling_modes: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        allow_prompt_append: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ttl_secs: Option<u64>,
         #[serde(default)]
@@ -559,6 +579,8 @@ pub enum AdminRequest {
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proposal_id: Option<String>,
     },
     GrantRequestSubmit {
         session_token: String,
@@ -566,6 +588,9 @@ pub enum AdminRequest {
         caller_token: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         saved_grant: Option<String>,
+        /// Human rationale for the requested change. Kept as `prompt` on the
+        /// wire for backward compatibility; requested evaluator prose lives in
+        /// `delta.prompt_append`.
         prompt: String,
         delta: GrantRequestDelta,
     },
@@ -745,6 +770,16 @@ pub enum AdminResponse {
         removed: Vec<String>,
         changed: Vec<String>,
     },
+    SavedGrantRegenerationProposal {
+        name: String,
+        source_revision: u64,
+        regime: String,
+        proposal_id: String,
+        candidate: guard::gating::verb::Verb,
+        added: Vec<String>,
+        removed: Vec<String>,
+        changed: Vec<String>,
+    },
     GrantRequests {
         items: Vec<GrantRequest>,
     },
@@ -764,6 +799,14 @@ pub struct BatchCommand {
     pub binary: String,
     #[serde(default)]
     pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub env: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub secrets: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub secret_files: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -773,6 +816,11 @@ pub struct BatchEvaluation {
     pub reason: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub risk: Option<i32>,
+    pub decision_source: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verb_matches: Vec<VerbMatchInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guidance: Option<String>,
 }
 
 /// Agent-facing view of a catalog verb (its menu entry).
@@ -839,6 +887,8 @@ pub struct ProvisionalSummary {
     pub revert_exit: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revert_detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_trace: Option<DecisionTrace>,
 }
 
 /// Operator-facing view of a held/decided approval.
@@ -868,6 +918,8 @@ pub struct ApprovalSummary {
     /// Approval discussion thread (operator <-> requester).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<guard::gating::approval::ApprovalNote>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_trace: Option<DecisionTrace>,
 }
 
 impl ProvisionalSummary {
@@ -905,6 +957,7 @@ impl ProvisionalSummary {
             principal: p.principal.as_ref().map(|p| p.as_str().to_string()),
             revert_exit: p.revert_exit,
             revert_detail: p.revert_detail.clone(),
+            decision_trace: p.decision_trace.clone(),
         }
     }
 }
@@ -931,6 +984,7 @@ impl ApprovalSummary {
             stderr: a.result_stderr.clone(),
             decided_reason: a.decided_reason.clone(),
             notes: a.notes.clone(),
+            decision_trace: a.decision_trace.clone(),
         }
     }
 }
@@ -1066,6 +1120,16 @@ pub struct ExecuteResponse {
     /// Actionable guidance for denied or held coverage decisions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verb_guidance: Option<String>,
+    /// Stable source label for the admission decision.
+    #[serde(default = "default_decision_source")]
+    pub decision_source: String,
+    /// Complete versioned explanation of the admission decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_trace: Option<DecisionTrace>,
+}
+
+fn default_decision_source() -> String {
+    "validation".to_string()
 }
 
 /// Wire-level consequence-gate outcome.
@@ -1086,6 +1150,7 @@ pub enum GateStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum ExecuteStreamMessage {
     Stdout { data: String },
     Stderr { data: String },
@@ -1153,6 +1218,7 @@ pub(super) struct ExecuteResult {
     exposed_secret_refs: Vec<String>,
     verb_matches: Vec<VerbMatchInfo>,
     verb_guidance: Option<String>,
+    decision_source: SessionDecisionSource,
 }
 
 impl ExecuteResult {
@@ -1165,6 +1231,7 @@ impl ExecuteResult {
             exposed_secret_refs: Vec::new(),
             verb_matches: Vec::new(),
             verb_guidance: None,
+            decision_source: SessionDecisionSource::Validation,
         }
     }
 
@@ -1187,6 +1254,7 @@ impl ExecuteResult {
             exposed_secret_refs: Vec::new(),
             verb_matches: Vec::new(),
             verb_guidance: None,
+            decision_source: SessionDecisionSource::Validation,
         }
     }
 
@@ -1207,6 +1275,7 @@ impl ExecuteResult {
             exposed_secret_refs: Vec::new(),
             verb_matches: Vec::new(),
             verb_guidance: None,
+            decision_source: SessionDecisionSource::Validation,
         }
     }
 
@@ -1228,6 +1297,7 @@ impl ExecuteResult {
             exposed_secret_refs: Vec::new(),
             verb_matches: Vec::new(),
             verb_guidance: None,
+            decision_source: SessionDecisionSource::Validation,
         }
     }
 
@@ -1240,6 +1310,7 @@ impl ExecuteResult {
             exec: ExecOutcome::DryRun { coverage: None },
             verb_matches: Vec::new(),
             verb_guidance: None,
+            decision_source: SessionDecisionSource::Validation,
         }
     }
 
@@ -1256,6 +1327,7 @@ impl ExecuteResult {
             exposed_secret_refs: Vec::new(),
             verb_matches: Vec::new(),
             verb_guidance: None,
+            decision_source: SessionDecisionSource::Validation,
         }
     }
 
@@ -1270,6 +1342,7 @@ impl ExecuteResult {
             exposed_secret_refs: Vec::new(),
             verb_matches: Vec::new(),
             verb_guidance: None,
+            decision_source: SessionDecisionSource::Validation,
         }
     }
 
@@ -1296,6 +1369,7 @@ impl ExecuteResult {
             exposed_secret_refs: Vec::new(),
             verb_matches: Vec::new(),
             verb_guidance: None,
+            decision_source: SessionDecisionSource::Validation,
         }
     }
 
@@ -1328,8 +1402,13 @@ impl ExecuteResult {
         self
     }
 
+    pub(super) fn with_decision_source(mut self, source: SessionDecisionSource) -> Self {
+        self.decision_source = source;
+        self
+    }
+
     /// True if the policy approved the command. Note: this does NOT mean
-    /// the command actually ran — check the exec outcome for that.
+    /// the command actually ran - check the exec outcome for that.
     pub(super) fn policy_allowed(&self) -> bool {
         matches!(self.policy, PolicyOutcome::Allowed { .. })
     }
@@ -1350,6 +1429,37 @@ impl ExecuteResult {
         let allowed = self.policy_allowed();
         let verb_matches = self.verb_matches;
         let verb_guidance = self.verb_guidance;
+        let decision_source = self.decision_source.as_str().to_string();
+        let decision_trace = Some(DecisionTrace {
+            version: DecisionTrace::VERSION,
+            decision_source: decision_source.clone(),
+            verb_matches: verb_matches
+                .iter()
+                .map(|matched| DecisionVerbMatch {
+                    verb: matched.verb.clone(),
+                    cell: matched.cell.clone(),
+                    scope: format!("{:?}", matched.scope).to_ascii_lowercase(),
+                    action: format!("{:?}", matched.action).to_ascii_lowercase(),
+                    features: matched.features.clone(),
+                    selected: matched.selected,
+                    overridden: matched.overridden,
+                })
+                .collect(),
+            failed_dimensions: if allowed {
+                Vec::new()
+            } else {
+                vec![decision_source.clone()]
+            },
+            conflict: verb_guidance
+                .as_ref()
+                .filter(|guidance| guidance.to_ascii_lowercase().contains("conflict"))
+                .cloned(),
+            guidance: verb_guidance.clone(),
+            suggested_grant_delta: verb_guidance
+                .as_ref()
+                .filter(|guidance| guidance.contains("grant"))
+                .cloned(),
+        });
         let policy_reason = match self.policy {
             PolicyOutcome::Allowed { reason } | PolicyOutcome::Denied { reason } => reason,
         };
@@ -1371,6 +1481,8 @@ impl ExecuteResult {
                 coverage: None,
                 verb_matches,
                 verb_guidance,
+                decision_source,
+                decision_trace,
             },
             ExecOutcome::Failed {
                 reason: exec_msg, ..
@@ -1390,6 +1502,8 @@ impl ExecuteResult {
                 coverage: None,
                 verb_matches,
                 verb_guidance,
+                decision_source,
+                decision_trace,
             },
             ExecOutcome::DryRun { coverage } => ExecuteResponse {
                 allowed: true,
@@ -1404,6 +1518,8 @@ impl ExecuteResult {
                 coverage,
                 verb_matches,
                 verb_guidance,
+                decision_source,
+                decision_trace,
             },
             ExecOutcome::NotAttempted => ExecuteResponse {
                 allowed,
@@ -1416,6 +1532,8 @@ impl ExecuteResult {
                 coverage: None,
                 verb_matches,
                 verb_guidance,
+                decision_source,
+                decision_trace,
             },
             ExecOutcome::Held { handle, coverage } => ExecuteResponse {
                 // Approved but held: allowed=true (not a denial), no exit code.
@@ -1429,6 +1547,8 @@ impl ExecuteResult {
                 coverage: Some(coverage),
                 verb_matches,
                 verb_guidance,
+                decision_source,
+                decision_trace,
             },
             ExecOutcome::Provisional {
                 handle,
@@ -1447,6 +1567,8 @@ impl ExecuteResult {
                 coverage: Some(coverage),
                 verb_matches,
                 verb_guidance,
+                decision_source,
+                decision_trace,
             },
         }
     }

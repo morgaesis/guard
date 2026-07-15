@@ -1,6 +1,6 @@
 //! Parse a Kubernetes API request (method + path + query) into a typed
 //! [`ApiOp`], classify its consequence, and redact Secret values from a response
-//! body. Pure and deterministic — no I/O, no TLS — so the whole k8s-awareness of
+//! body. Pure and deterministic - no I/O, no TLS - so the whole k8s-awareness of
 //! the proxy is unit-tested here. The operation vocabulary itself
 //! ([`ApiOp`]/[`Verb`]) lives in the protocol-neutral [`super::op`].
 
@@ -41,11 +41,11 @@ pub fn parse_api_op(method: &str, path: &str, query: &str) -> Option<ApiOp> {
     // Resolve namespace, then the resource/name/subresource tail.
     let (namespace, tail): (Option<String>, &[&str]) = if rest[0] == "namespaces" {
         match rest.len() {
-            // `…/namespaces` — the namespaces resource collection (cluster-scoped).
+            // `…/namespaces` - the namespaces resource collection (cluster-scoped).
             1 => (None, rest),
-            // `…/namespaces/{name}` — a single namespace object (cluster-scoped).
+            // `…/namespaces/{name}` - a single namespace object (cluster-scoped).
             2 => (None, rest),
-            // `…/namespaces/{ns}/{resource}[/…]` — namespaced request.
+            // `…/namespaces/{ns}/{resource}[/…]` - namespaced request.
             _ => (Some(rest[1].to_string()), &rest[2..]),
         }
     } else {

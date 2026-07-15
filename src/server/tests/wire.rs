@@ -23,6 +23,10 @@ fn session_scoped_public_rpcs_carry_distinct_owner_bearers() {
         commands: vec![crate::server::BatchCommand {
             binary: "true".to_string(),
             args: Vec::new(),
+            env: std::collections::HashMap::new(),
+            secrets: std::collections::HashMap::new(),
+            secret_files: std::collections::HashMap::new(),
+            cwd: None,
         }],
     };
     assert!(!batch.requires_daemon_uid());
@@ -59,6 +63,18 @@ fn execute_result_denied_has_denied_policy_and_not_attempted_exec() {
     assert!(!r.policy_allowed());
     assert_eq!(r.policy_reason(), "nope");
     assert!(matches!(r.exec, ExecOutcome::NotAttempted));
+}
+
+#[test]
+fn execute_response_carries_stable_decision_source_and_trace() {
+    let response = ExecuteResult::denied("invalid")
+        .with_decision_source(crate::session::SessionDecisionSource::Validation)
+        .into_response();
+    assert_eq!(response.decision_source, "validation");
+    assert_eq!(
+        response.decision_trace.as_ref().map(|trace| trace.version),
+        Some(guard::gating::DecisionTrace::VERSION)
+    );
 }
 
 #[test]

@@ -3,7 +3,7 @@
 //!
 //! `guard run kubectl …` is gated at the command boundary, but tools that drive
 //! the Kubernetes API in-process (helm via client-go, terraform's k8s provider,
-//! k9s, any client library) never spawn a gated command — the command gate sees
+//! k9s, any client library) never spawn a gated command - the command gate sees
 //! one opaque invocation. This subsystem lets the daemon terminate the client's
 //! TLS connection, parse each API request into a typed [`op::ApiOp`], apply
 //! operator-authored [`policy`], redact Secret values from responses, and

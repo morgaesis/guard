@@ -71,7 +71,7 @@ pub(super) fn reconstruct_caller(
 }
 
 /// Reject a binary name that is a path, traversal, or contains shell-metachar
-/// noise — the same invariants `execute_command_inner` enforces for the primary
+/// noise - the same invariants `execute_command_inner` enforces for the primary
 /// binary, applied to a revert command before it is armed.
 /// Normalize a binary reference to the match key used by the allow-list: its
 /// file name with any directory stripped, a trailing `.exe`/`.EXE` removed, and
@@ -91,7 +91,7 @@ fn binary_match_key(binary: &str) -> String {
 
 /// Whether `binary` is permitted by the optional allow-list. `None` means no
 /// restriction. A bare command name (no path separator) matches an allow-list
-/// entry by match key — the common case, where the daemon's trusted PATH
+/// entry by match key - the common case, where the daemon's trusted PATH
 /// resolves the name. A path-qualified binary bypasses PATH resolution, so it is
 /// permitted ONLY by an exact allow-list entry; this stops a payload placed at
 /// an arbitrary path and named after an allowed tool (e.g. `/tmp/x/kubectl`)
@@ -408,6 +408,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
             session_revision: mutation.session_revision,
             secret_entitlements: mutation.secret_entitlements,
             reason: mutation.label,
+            decision_trace: Some(guard::gating::DecisionTrace::source("api_proxy")),
             created_unix: now,
             deadline_unix: now.saturating_add(self.window_secs),
             forward_done: true,
@@ -500,6 +501,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
             reason: reason.to_string(),
             risk: None,
             reversibility: None,
+            decision_trace: Some(guard::gating::DecisionTrace::source("api_proxy")),
             created_unix: now,
             ttl_secs: self.config.approval_ttl_secs,
             status: ApprovalStatus::Pending,
@@ -1152,6 +1154,7 @@ async fn arm_containment_with_authority<W: AsyncWrite + Unpin>(
         secret_entitlements,
         api_revert: None,
         reason: reason.clone(),
+        decision_trace: Some(guard::gating::DecisionTrace::source("evaluator")),
         created_unix: now,
         deadline_unix: now.saturating_add(window),
         forward_done: false,
@@ -1245,7 +1248,7 @@ async fn arm_containment_with_authority<W: AsyncWrite + Unpin>(
             result
         }
         _ => {
-            // The child never ran (spawn/setup failure) — nothing to revert.
+            // The child never ran (spawn/setup failure) - nothing to revert.
             // Drop the provisional and return the failure as-is.
             config.provisional.write().await.remove(&handle);
             delete_provisional_row(config, &handle).await;
@@ -1442,6 +1445,7 @@ async fn hold_for_approval_with_authority<W: AsyncWrite + Unpin>(
         reason: reason.clone(),
         risk,
         reversibility,
+        decision_trace: Some(guard::gating::DecisionTrace::source("evaluator")),
         created_unix: now,
         ttl_secs: config.approval_ttl_secs,
         status: ApprovalStatus::Pending,

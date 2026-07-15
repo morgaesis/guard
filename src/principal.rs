@@ -1,7 +1,7 @@
 //! Cross-platform caller/daemon identity key.
 //!
-//! Every consequence-gating authorization decision — who is the operator, who
-//! owns a provisional or approval row, which secret namespace a caller sees —
+//! Every consequence-gating authorization decision - who is the operator, who
+//! owns a provisional or approval row, which secret namespace a caller sees -
 //! is expressed in terms of a [`PrincipalKey`] rather than a Unix uid, so a
 //! Windows named-pipe caller identified by SID is a first-class principal with
 //! exact parity to a Unix uid caller. The only platform-specific code is how
@@ -13,7 +13,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 /// A caller's identity, as the string produced by `CallerIdentity::user_key()`:
 /// a decimal uid on Unix, a SID (`S-1-5-...`) on Windows, or a token for TCP
 /// callers. An unauthenticated caller has no key (`None`); two missing keys
-/// must never compare equal — see [`scope_eq`].
+/// must never compare equal - see [`scope_eq`].
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PrincipalKey(String);
 

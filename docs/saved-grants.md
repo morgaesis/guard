@@ -57,13 +57,17 @@ guard grant edit host-a-maintenance \
 
 guard grant regenerate host-a-maintenance \
   --prompt 'Inspect host-a and apply only the bounded service verb.'
+# Inspect the candidate and deterministic delta, then apply its exact proposal:
+guard grant regenerate host-a-maintenance --apply <proposal-id>
 
 guard grant issue host-a-maintenance --ttl 600 --label interactive-debug
 guard grant delete host-a-maintenance
 ```
 
-An edit increments the saved-grant revision. Regeneration replaces prompt-derived
-verbs through the same typed validation path. Issued sessions retain their
+An edit increments the saved-grant revision. Regeneration previews a validated
+candidate and deterministic delta without changing authority. Applying its
+integrity-bound proposal commits that exact candidate only when the saved-grant
+revision and evaluator regime remain unchanged. Issued sessions retain their
 immutable authority snapshot; they do not silently acquire a later saved-grant
 revision.
 
@@ -91,7 +95,7 @@ An agent can ask for a bounded amendment without gaining admin authority:
 
 ```bash
 guard grant request submit \
-  --prompt 'Need the host-a service restart verb for this incident.' \
+  --justification 'Need the host-a service restart verb for this incident.' \
   --verb host-a-restart \
   --ttl 600
 ```
@@ -129,10 +133,12 @@ guard session revoke-matching --saved-grant host-a-maintenance
 ```
 
 The SQLite state database stores saved grants, revisions, sessions, requests,
-transitions, and bounded interaction history. History includes decision sources,
-holds, evaluator calls, execution outcomes, and names of delivered secrets, but
-never secret values. A hold or provisional freezes the session authority it was
-created under, so later grant edits do not rewrite an already reviewed action.
+transitions, and bounded interaction history. Each interaction carries a
+versioned decision trace with its stable decision source, matched typed cells,
+failed dimensions or conflicts, and actionable guidance. Holds and provisionals
+persist the same trace with their immutable snapshots. History includes names of
+delivered secrets but never secret values. A later grant edit does not rewrite
+an already reviewed action.
 
 Optional rolling denial-count, hold-count, and denial-ratio thresholds suspend a
 session into deny-all while the triggering behavior remains in the configured

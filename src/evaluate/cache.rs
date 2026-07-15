@@ -15,7 +15,7 @@ pub const DEFAULT_CACHE_TTL_SECS: u64 = 3600;
 /// its lifetime, so the command line alone is a sufficient key. Changing
 /// the prompt requires recreating the Evaluator, which gets a fresh cache.
 ///
-/// Eviction is FIFO on insertion time — a small LRU would be nicer but the
+/// Eviction is FIFO on insertion time - a small LRU would be nicer but the
 /// cache is size-bounded and turnover is low, so the extra complexity is
 /// not worth it here.
 pub struct EvalCache {

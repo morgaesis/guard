@@ -84,7 +84,7 @@ pub(super) fn pass_store_initialized() -> bool {
 /// collapsed to `_`); it is wrapped verbatim as the principal. SID segments are
 /// not perfectly invertible to the original SID, so the recovered principal is
 /// a stable display/grouping label for the admin aggregate view; per-caller
-/// `list`/`get`/`set`/`delete` never round-trip through this — they address the
+/// `list`/`get`/`set`/`delete` never round-trip through this - they address the
 /// store by the live caller's `segment()`, which is exact.
 fn principal_from_segment(segment: &str) -> PrincipalKey {
     if let Some(uid_str) = segment.strip_prefix('u') {

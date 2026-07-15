@@ -20,7 +20,7 @@ Rules:
 - Pick the single most specific operation that satisfies the request.
 - Every parameter `pattern` MUST be a fully anchored regex (^...$) and as NARROW
   as possible. If the request names specific resources (a VM id, a network, a
-  profile), pin the pattern to exactly those values, e.g. ^(id-a|id-b)$ — never
+  profile), pin the pattern to exactly those values, e.g. ^(id-a|id-b)$ - never
   allow arbitrary values when specific ones were named.
 - Use {param} placeholders in args; each renders as exactly ONE argv element.
   Never put shell operators, pipes, redirects, spaces-as-separators, or a second

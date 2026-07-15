@@ -8,7 +8,7 @@
 //! a timely fashion"). This module provides that handshake and then runs the
 //! exact same [`crate::run_server`] path a foreground daemon runs, so the
 //! service and the interactive daemon share one configuration surface and one
-//! code path — there is no separate service config or policy.
+//! code path - there is no separate service config or policy.
 
 use std::ffi::OsString;
 use std::path::PathBuf;

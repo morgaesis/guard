@@ -1,11 +1,11 @@
 # Markdown lint config for guard prompt files.
-# These are LLM system prompts, not documentation — no headings required,
+# These are LLM system prompts, not documentation - no headings required,
 # no line length limits, and relaxed structural rules.
 
-# MD041: First line should be a heading — disabled (prompts start with instructions)
+# MD041: First line should be a heading - disabled (prompts start with instructions)
 MD041: false
 
-# MD013: Line length — disabled (prompts have long lists that shouldn't wrap)
+# MD013: Line length - disabled (prompts have long lists that shouldn't wrap)
 MD013: false
 
 # MD012: Multiple consecutive blank lines
@@ -15,5 +15,5 @@ MD012:
 # MD024: Multiple headings with the same content
 MD024: false
 
-# MD033: Inline HTML — disabled (not relevant for prompts)
+# MD033: Inline HTML - disabled (not relevant for prompts)
 MD033: false
