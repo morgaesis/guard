@@ -175,8 +175,8 @@ jobs:
         run: |
           mapfile -d '' archives < <(find artifacts -type f -name '*.tar.gz' -print0)
           test "${#archives[@]}" -gt 0
-          if release_state=$(gh release view "$RELEASE_TAG" --json isDraft 2>/dev/null); then
-            if ! jq -e '.isDraft' <<< "$release_state" >/dev/null; then
+          if is_draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' 2>/dev/null); then
+            if [ "$is_draft" != "true" ]; then
               echo "published release already exists for ${RELEASE_TAG}"
               exit 1
             fi

@@ -9,7 +9,9 @@ name: Dependabot review gate
 #
 # Major and unclassified version bumps fail closed for human review. The gate
 # does not execute pull request code, use external model credentials, post
-# comments, approve reviews, or merge changes.
+# comments, approve reviews, or merge changes. Major security updates follow
+# the same fail-closed policy because alert lookup requires a separate
+# privileged token.
 
 on:
   pull_request:
