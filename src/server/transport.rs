@@ -1546,7 +1546,7 @@ mod unix_listener_tests {
     }
 
     #[tokio::test]
-    async fn failed_socket_group_change_never_opens_socket_permissions() {
+    async fn failed_socket_group_change_removes_socket_before_group_publication() {
         let temp = tempfile::tempdir().unwrap();
         let socket = temp.path().join("guard.sock");
         let error = Server::prepare_unix_listener(
