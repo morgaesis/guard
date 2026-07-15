@@ -11,6 +11,7 @@
 
 use super::gate::HttpRevert;
 use super::op::ApiOp;
+use hyper::http::HeaderName;
 
 /// Identity of an object a tracked write created. The proxy records it (scoped
 /// to the creating connection) so a later delete of the same object is
@@ -61,6 +62,12 @@ pub trait ProtocolConfig: Send + Sync {
     /// Redact secret material from a response body, in place. Returns the
     /// number of objects redacted.
     fn redact_response(&self, value: &mut serde_json::Value) -> usize;
+
+    /// Explicit exception for a credential-shaped upstream response header.
+    /// The safe default strips every such header at the trust boundary.
+    fn allow_sensitive_response_header(&self, _name: &HeaderName) -> bool {
+        false
+    }
 
     /// Client-facing error body for proxy-generated denials and upstream
     /// failures. Kubernetes overrides this with a `Status`; other protocols use

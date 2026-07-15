@@ -1,4 +1,50 @@
 use super::*;
+use std::time::Duration;
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApiEndpointFile {
+    #[serde(default)]
+    endpoints: Vec<ApiEndpointSpec>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApiEndpointSpec {
+    name: String,
+    listen: String,
+    protocol: String,
+    #[serde(default)]
+    mode: ApiEndpointMode,
+    #[serde(default)]
+    upstream: Option<String>,
+    #[serde(default)]
+    token_env: Option<String>,
+    #[serde(default)]
+    token_file: Option<PathBuf>,
+    #[serde(default)]
+    kubeconfig: Option<PathBuf>,
+    #[serde(default)]
+    kube_context: Option<String>,
+    #[serde(default)]
+    policy: Option<PathBuf>,
+    #[serde(default)]
+    ca_out: Option<PathBuf>,
+    #[serde(default)]
+    brokered_kubeconfig_out: Option<PathBuf>,
+    #[serde(default)]
+    session_env: Option<String>,
+    #[serde(default)]
+    rarity_escalation: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ApiEndpointMode {
+    #[default]
+    Policy,
+    Readonly,
+}
 
 #[cfg(unix)]
 fn current_uid() -> u32 {
@@ -150,6 +196,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             allow_bin,
             child_env,
             api_proxy,
+            api_endpoints,
             api_protocol,
             api_upstream,
             api_token_env,
@@ -173,6 +220,11 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             session_max_holds,
             session_max_deny_ratio,
             session_deny_ratio_min_commands,
+            api_judge_max_concurrency,
+            api_judge_rate_per_minute,
+            api_judge_burst,
+            api_judge_error_threshold,
+            api_judge_circuit_cooldown,
             // Consumed in `main` (Windows SCM dispatch); irrelevant to the
             // server run itself, which is identical in service and foreground.
             service: _,
@@ -578,13 +630,15 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 false
             } else {
                 api_promotion
+                    .or_else(|| guard_env("API_VERB_COVERAGE").map(|v| parse_env_bool(&v)))
                     .or_else(|| guard_env("API_PROMOTION").map(|v| parse_env_bool(&v)))
                     .unwrap_or(true)
             };
             let api_promotion_store = if api_promotion_enabled {
                 let api_promotion_state_path = api_promotion_state
                     .or_else(|| {
-                        guard_env("API_PROMOTION_STATE")
+                        guard_env("API_VERB_COVERAGE_STATE")
+                            .or_else(|| guard_env("API_PROMOTION_STATE"))
                             .filter(|value| !value.is_empty())
                             .map(PathBuf::from)
                     })
@@ -597,13 +651,17 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 );
                 api_config.min_approvals = api_promotion_min_approvals
                     .or_else(|| {
-                        guard_env("API_PROMOTION_MIN_APPROVALS").and_then(|v| v.parse::<u32>().ok())
+                        guard_env("API_VERB_COVERAGE_MIN_APPROVALS")
+                            .or_else(|| guard_env("API_PROMOTION_MIN_APPROVALS"))
+                            .and_then(|v| v.parse::<u32>().ok())
                     })
                     .unwrap_or(api_config.min_approvals)
                     .max(2);
                 api_config.min_denials = api_promotion_min_denials
                     .or_else(|| {
-                        guard_env("API_PROMOTION_MIN_DENIALS").and_then(|v| v.parse::<u32>().ok())
+                        guard_env("API_VERB_COVERAGE_MIN_DENIALS")
+                            .or_else(|| guard_env("API_PROMOTION_MIN_DENIALS"))
+                            .and_then(|v| v.parse::<u32>().ok())
                     })
                     .unwrap_or(api_config.min_denials)
                     .max(1);
@@ -624,6 +682,59 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             } else {
                 None
             };
+            let parse_judge_u32 = |name: &str| {
+                guard_env(name)
+                    .map(|value| {
+                        value
+                            .parse::<u32>()
+                            .with_context(|| format!("parse GUARD_{name}"))
+                    })
+                    .transpose()
+            };
+            let parse_judge_usize = |name: &str| {
+                guard_env(name)
+                    .map(|value| {
+                        value
+                            .parse::<usize>()
+                            .with_context(|| format!("parse GUARD_{name}"))
+                    })
+                    .transpose()
+            };
+            let parse_judge_u64 = |name: &str| {
+                guard_env(name)
+                    .map(|value| {
+                        value
+                            .parse::<u64>()
+                            .with_context(|| format!("parse GUARD_{name}"))
+                    })
+                    .transpose()
+            };
+            let spend_defaults = server::ApiJudgeSpendConfig::default();
+            let api_judge_spend =
+                Arc::new(server::ApiJudgeSpend::new(server::ApiJudgeSpendConfig {
+                    max_concurrency: api_judge_max_concurrency
+                        .or(parse_judge_usize("API_JUDGE_MAX_CONCURRENCY")?)
+                        .unwrap_or(spend_defaults.max_concurrency)
+                        .max(1),
+                    rate_per_minute: api_judge_rate_per_minute
+                        .or(parse_judge_u32("API_JUDGE_RATE_PER_MINUTE")?)
+                        .unwrap_or(spend_defaults.rate_per_minute)
+                        .max(1),
+                    burst: api_judge_burst
+                        .or(parse_judge_u32("API_JUDGE_BURST")?)
+                        .unwrap_or(spend_defaults.burst)
+                        .max(1),
+                    error_threshold: api_judge_error_threshold
+                        .or(parse_judge_u32("API_JUDGE_ERROR_THRESHOLD")?)
+                        .unwrap_or(spend_defaults.error_threshold)
+                        .max(1),
+                    circuit_cooldown: Duration::from_secs(
+                        api_judge_circuit_cooldown
+                            .or(parse_judge_u64("API_JUDGE_CIRCUIT_COOLDOWN")?)
+                            .unwrap_or(spend_defaults.circuit_cooldown.as_secs())
+                            .max(1),
+                    ),
+                }));
 
             // Additive prompt: append to base prompt without replacing it.
             // Priority: --system-prompt-append flag > GUARD_PROMPT_APPEND env var
@@ -850,6 +961,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 min_commands_for_ratio: min_commands,
             };
             srv.set_behavior_limits(limits);
+            srv.set_api_coverage(api_promotion_store.clone());
 
             let explicit_verbs_path = verbs.or_else(|| {
                 guard_env("VERBS")
@@ -998,6 +1110,47 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             let env_api_ca_out = guard_env("API_CA_OUT").map(PathBuf::from);
             let env_api_policy = guard_env("API_POLICY").map(PathBuf::from);
             let env_api_rarity_escalation = guard_env("API_RARITY_ESCALATION");
+            let api_endpoints_path = api_endpoints.or_else(|| {
+                guard_env("API_ENDPOINTS")
+                    .filter(|value| !value.is_empty())
+                    .map(PathBuf::from)
+            });
+            let named_api_endpoints = match api_endpoints_path.as_ref() {
+                Some(path) => {
+                    let text = std::fs::read_to_string(path)
+                        .with_context(|| format!("read API endpoints file {}", path.display()))?;
+                    let file: ApiEndpointFile = serde_yaml_ng::from_str(&text)
+                        .with_context(|| format!("parse API endpoints file {}", path.display()))?;
+                    if file.endpoints.is_empty() {
+                        anyhow::bail!("API endpoints file contains no endpoints");
+                    }
+                    let mut names = std::collections::HashSet::new();
+                    let mut listen_addresses = std::collections::HashSet::new();
+                    for endpoint in &file.endpoints {
+                        if !names.insert(endpoint.name.clone()) {
+                            anyhow::bail!(
+                                "API endpoints file contains duplicate endpoint name '{}'",
+                                endpoint.name
+                            );
+                        }
+                        let listen: std::net::SocketAddr =
+                            endpoint.listen.parse().with_context(|| {
+                                format!(
+                                    "invalid listen address for API endpoint '{}'",
+                                    endpoint.name
+                                )
+                            })?;
+                        if !listen_addresses.insert(listen) {
+                            anyhow::bail!(
+                                "API endpoints file assigns listen address {} more than once",
+                                listen
+                            );
+                        }
+                    }
+                    file.endpoints
+                }
+                None => Vec::new(),
+            };
 
             let api_proxy_flag_set = api_proxy.is_some();
             let kube_proxy_flag_set = kube_proxy.is_some();
@@ -1006,11 +1159,32 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 || api_token_env.is_some()
                 || api_token_file.is_some()
                 || api_ca_out.is_some()
+                || kubeconfig.is_some()
+                || kube_context.is_some()
+                || api_policy.is_some()
+                || brokered_kubeconfig_out.is_some()
+                || api_rarity_escalation.is_some()
                 || env_api_protocol.is_some()
                 || env_api_upstream.is_some()
                 || env_api_token_env.is_some()
                 || env_api_token_file.is_some()
-                || env_api_ca_out.is_some();
+                || env_api_ca_out.is_some()
+                || env_api_policy.is_some()
+                || env_api_rarity_escalation.is_some();
+            if !named_api_endpoints.is_empty()
+                && (api_proxy_flag_set
+                    || kube_proxy_flag_set
+                    || env_api_proxy.is_some()
+                    || env_kube_proxy.is_some()
+                    || api_companion_configured)
+            {
+                anyhow::bail!(
+                    "--api-endpoints cannot be combined with the single-endpoint API proxy options"
+                );
+            }
+            if !named_api_endpoints.is_empty() && exec_as_caller {
+                anyhow::bail!("--api-endpoints is incompatible with --exec-as-caller");
+            }
 
             let generic_api_proxy_addr = if api_proxy_flag_set {
                 api_proxy
@@ -1049,9 +1223,9 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                     .with_context(|| format!("invalid API proxy address '{addr_str}'"))?;
                 if !listen.ip().is_loopback() {
                     anyhow::bail!(
-                        "--api-proxy must bind a loopback address (got {listen}): the proxy \
-                         authenticates nothing itself, so a non-loopback bind would offer the \
-                         daemon's upstream credential to anything that can reach the port"
+                        "--api-proxy must bind a loopback address (got {listen}): a Guard session \
+                         bearer is not bound to a network client identity, so a non-loopback bind \
+                         would expose the daemon's upstream authority to the network"
                     );
                 }
 
@@ -1181,6 +1355,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 {
                     let llm = api_judge_llm.clone();
                     let api_promotion_store = api_promotion_store.clone();
+                    let api_judge_spend_for_proxy = api_judge_spend.clone();
                     let builder =
                         Arc::new(
                             move |intent: Option<String>| match server::DaemonApiJudge::build(
@@ -1190,6 +1365,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                                 api_judge_cache_ttl,
                                 intent,
                                 api_promotion_store.clone(),
+                                api_judge_spend_for_proxy.clone(),
                             ) {
                                 Ok(judge) => Some(judge),
                                 Err(e) => {
@@ -1226,15 +1402,33 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                             "--brokered-kubeconfig-out is only valid for the Kubernetes API proxy"
                         );
                     }
-                    let yaml = proxy.brokered_kubeconfig();
-                    // The generator is credential-free by construction; assert it
-                    // before handing the file to an agent.
-                    guard::proxy::validate_brokered_kubeconfig(&yaml).map_err(|e| {
-                        anyhow::anyhow!("generated brokered kubeconfig is not credential-free: {e}")
+                    let session = guard_env("SESSION").filter(|value| !value.is_empty());
+                    let yaml = match session.as_deref() {
+                        Some(token) => {
+                            if session_aliases_upstream(&proxy, token) {
+                                anyhow::bail!(
+                                    "Guard session credential aliases the upstream API credential"
+                                );
+                            }
+                            proxy.brokered_kubeconfig_with_session(token)
+                        }
+                        None => proxy.brokered_kubeconfig(),
+                    };
+                    // Assert that the generated config contains no upstream
+                    // credential and, when requested, only the expected Guard
+                    // session bearer before handing it to an agent.
+                    match session.as_deref() {
+                        Some(token) => {
+                            guard::proxy::validate_brokered_kubeconfig_with_session(&yaml, token)
+                        }
+                        None => guard::proxy::validate_brokered_kubeconfig(&yaml),
+                    }
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "generated brokered kubeconfig contains an invalid credential: {e}"
+                        )
                     })?;
-                    std::fs::write(&out, yaml).with_context(|| {
-                        format!("write brokered kubeconfig to {}", out.display())
-                    })?;
+                    write_brokered_kubeconfig_output(&out, &yaml, session.is_some())?;
                     tracing::info!("Wrote brokered kubeconfig to {}", out.display());
                 }
                 tracing::info!(
@@ -1242,7 +1436,26 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                     proxy.protocol_name(),
                     proxy.listen()
                 );
-                srv.register_api_proxy(proxy).await;
+                srv.register_api_proxy("default", proxy).await;
+            }
+
+            for spec in named_api_endpoints {
+                let (name, proxy) = build_named_api_proxy(
+                    spec,
+                    &api_judge_llm,
+                    api_judge_cache_enabled,
+                    api_judge_cache_capacity,
+                    api_judge_cache_ttl,
+                    api_promotion_store.clone(),
+                    api_judge_spend.clone(),
+                )?;
+                tracing::info!(
+                    "API endpoint '{}' enabled for {} on {}",
+                    name,
+                    proxy.protocol_name(),
+                    proxy.listen()
+                );
+                srv.register_api_proxy(name, proxy).await;
             }
 
             // Plain stdout, not tracing: the default log filter is "warn", so
@@ -1338,5 +1551,375 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             }
         }
         ServerCommands::Status { socket, json } => handle_status(socket, json).await,
+    }
+}
+
+fn write_brokered_kubeconfig_output(
+    path: &std::path::Path,
+    yaml: &str,
+    contains_session: bool,
+) -> Result<()> {
+    #[cfg(unix)]
+    if contains_session {
+        use std::io::Write as _;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+        let existing_mode = match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                anyhow::bail!(
+                    "session-bearing brokered kubeconfig path is not a regular file: {}",
+                    path.display()
+                );
+            }
+            Ok(metadata) => Some(metadata.mode() & 0o777),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .with_context(|| format!("open brokered kubeconfig {}", path.display()))?;
+        let mode = existing_mode.unwrap_or(0o600) & !0o007;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        file.write_all(yaml.as_bytes())?;
+        file.flush()?;
+        return Ok(());
+    }
+
+    #[cfg(not(unix))]
+    let _ = contains_session;
+
+    std::fs::write(path, yaml)
+        .with_context(|| format!("write brokered kubeconfig to {}", path.display()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_named_api_proxy(
+    spec: ApiEndpointSpec,
+    llm: &crate::evaluate::LlmConfig,
+    cache_enabled: bool,
+    cache_capacity: usize,
+    cache_ttl: Duration,
+    coverage: Option<Arc<RwLock<guard::gating::api_promotion::ApiPromotionStore>>>,
+    spend: Arc<server::ApiJudgeSpend>,
+) -> Result<(String, Arc<guard::proxy::ApiProxy>)> {
+    if spec.name.is_empty()
+        || !spec
+            .name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+    {
+        anyhow::bail!("API endpoint name must contain only ASCII letters, digits, '-' or '_'");
+    }
+    let listen: std::net::SocketAddr = spec
+        .listen
+        .parse()
+        .with_context(|| format!("invalid listen address for API endpoint '{}'", spec.name))?;
+    if !listen.ip().is_loopback() {
+        anyhow::bail!(
+            "API endpoint '{}' must bind a loopback address (got {})",
+            spec.name,
+            listen
+        );
+    }
+    if listen.port() == 0 {
+        anyhow::bail!(
+            "API endpoint '{}' must use an explicit nonzero listener port",
+            spec.name
+        );
+    }
+    let protocol_name = spec.protocol.to_ascii_lowercase();
+    let is_kubernetes = matches!(protocol_name.as_str(), "kubernetes" | "k8s");
+    if !is_kubernetes && (spec.kubeconfig.is_some() || spec.kube_context.is_some()) {
+        anyhow::bail!(
+            "non-Kubernetes API endpoint '{}' cannot set kubeconfig or kube_context",
+            spec.name
+        );
+    }
+    if spec.session_env.is_some() && spec.brokered_kubeconfig_out.is_none() {
+        anyhow::bail!(
+            "API endpoint '{}' can set session_env only with brokered_kubeconfig_out",
+            spec.name
+        );
+    }
+    let protocol: Arc<dyn guard::proxy::ProtocolConfig> = match protocol_name.as_str() {
+        "kubernetes" | "k8s" => Arc::new(guard::proxy::KubernetesProtocol),
+        "github" => Arc::new(guard::proxy::GithubProtocol),
+        "vercel" => Arc::new(guard::proxy::VercelProtocol),
+        other => anyhow::bail!(
+            "unsupported protocol '{}' for API endpoint '{}'",
+            other,
+            spec.name
+        ),
+    };
+    let upstream = if is_kubernetes {
+        if spec.upstream.is_some() || spec.token_env.is_some() || spec.token_file.is_some() {
+            anyhow::bail!(
+                "Kubernetes API endpoint '{}' accepts kubeconfig credentials only",
+                spec.name
+            );
+        }
+        let path = spec.kubeconfig.as_ref().with_context(|| {
+            format!(
+                "Kubernetes API endpoint '{}' requires kubeconfig",
+                spec.name
+            )
+        })?;
+        guard::proxy::Upstream::from_kubeconfig_file(path, spec.kube_context.as_deref())
+            .with_context(|| format!("load kubeconfig for API endpoint '{}'", spec.name))?
+    } else {
+        let base = spec
+            .upstream
+            .as_deref()
+            .with_context(|| format!("API endpoint '{}' requires an upstream URL", spec.name))?;
+        let token = match (&spec.token_env, &spec.token_file) {
+            (Some(variable), None) => {
+                if !is_valid_env_name(variable) {
+                    anyhow::bail!("API endpoint '{}' has an invalid token_env", spec.name);
+                }
+                std::env::var(variable).with_context(|| {
+                    format!(
+                        "read credential environment for API endpoint '{}'",
+                        spec.name
+                    )
+                })?
+            }
+            (None, Some(path)) => std::fs::read_to_string(path)
+                .with_context(|| format!("read credential file for API endpoint '{}'", spec.name))?
+                .trim()
+                .to_string(),
+            (Some(_), Some(_)) => anyhow::bail!(
+                "API endpoint '{}' cannot set both token_env and token_file",
+                spec.name
+            ),
+            (None, None) => anyhow::bail!(
+                "API endpoint '{}' requires token_env or token_file",
+                spec.name
+            ),
+        };
+        if token.is_empty() {
+            anyhow::bail!("API endpoint '{}' resolved an empty credential", spec.name);
+        }
+        guard::proxy::Upstream::from_base_url(base, guard::proxy::UpstreamAuth::Bearer(token))
+            .with_context(|| format!("build upstream for API endpoint '{}'", spec.name))?
+    };
+    let tls = guard::proxy::ProxyTls::generate()
+        .with_context(|| format!("generate TLS for API endpoint '{}'", spec.name))?;
+    let ca_pem = tls.ca_pem().to_string();
+    let policy = match &spec.policy {
+        Some(path) => guard::proxy::ApiPolicy::load_file(path)
+            .with_context(|| format!("load policy for API endpoint '{}'", spec.name))?,
+        None => guard::proxy::ApiPolicy::deny_all(),
+    };
+    let policy_contains_evaluate = policy.contains_evaluate();
+    let policy_intent = policy.intent.clone();
+    let mut proxy = guard::proxy::ApiProxy::with_protocol(
+        protocol,
+        listen,
+        tls,
+        upstream,
+        policy,
+        spec.policy.clone(),
+    )
+    .with_endpoint_context(
+        spec.name.clone(),
+        format!("api-endpoint:{}:upstream", spec.name),
+    )
+    .with_listener_mode(match spec.mode {
+        ApiEndpointMode::Policy => guard::proxy::ApiListenerMode::Policy,
+        ApiEndpointMode::Readonly => guard::proxy::ApiListenerMode::Readonly,
+    });
+    if spec.rarity_escalation > 0 {
+        proxy = proxy.with_rarity_escalation(spec.rarity_escalation);
+    }
+    let proxy = Arc::new(proxy);
+    let mut judge_attached = false;
+    if llm.enabled && llm.api_key.as_ref().is_some_and(|key| !key.is_empty()) {
+        let llm = llm.clone();
+        let builder = Arc::new(move |intent: Option<String>| {
+            match server::DaemonApiJudge::build(
+                llm.clone(),
+                cache_enabled,
+                cache_capacity,
+                cache_ttl,
+                intent,
+                coverage.clone(),
+                spend.clone(),
+            ) {
+                Ok(judge) => Some(judge),
+                Err(error) => {
+                    tracing::error!("failed to build API evaluator: {error:#}");
+                    None
+                }
+            }
+        });
+        proxy.attach_judge_builder(builder.clone());
+        if let Some(judge) = builder(policy_intent) {
+            proxy.attach_judge(judge);
+            judge_attached = true;
+        }
+    }
+    if policy_contains_evaluate && !judge_attached {
+        tracing::warn!(
+            "API endpoint '{}' evaluates requests without an attached judge; requests fail closed",
+            spec.name
+        );
+    }
+    if let Some(path) = spec.ca_out {
+        std::fs::write(&path, ca_pem)
+            .with_context(|| format!("write CA for API endpoint '{}'", spec.name))?;
+    }
+    if let Some(path) = spec.brokered_kubeconfig_out {
+        if !is_kubernetes {
+            anyhow::bail!(
+                "API endpoint '{}' can emit a brokered kubeconfig only for Kubernetes",
+                spec.name
+            );
+        }
+        let session = match spec.session_env.as_deref() {
+            Some(variable) => {
+                if !is_valid_env_name(variable) {
+                    anyhow::bail!("API endpoint '{}' has an invalid session_env", spec.name);
+                }
+                Some(std::env::var(variable).with_context(|| {
+                    format!("read session environment for API endpoint '{}'", spec.name)
+                })?)
+            }
+            None => None,
+        };
+        let yaml = match session.as_deref() {
+            Some(token) => {
+                if session_aliases_upstream(&proxy, token) {
+                    anyhow::bail!(
+                        "API endpoint '{}' session credential aliases its upstream credential",
+                        spec.name
+                    );
+                }
+                proxy.brokered_kubeconfig_with_session(token)
+            }
+            None => proxy.brokered_kubeconfig(),
+        };
+        match session.as_deref() {
+            Some(token) => guard::proxy::validate_brokered_kubeconfig_with_session(&yaml, token),
+            None => guard::proxy::validate_brokered_kubeconfig(&yaml),
+        }
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "brokered kubeconfig for API endpoint '{}' is invalid: {error}",
+                spec.name
+            )
+        })?;
+        write_brokered_kubeconfig_output(&path, &yaml, session.is_some()).with_context(|| {
+            format!("write brokered kubeconfig for API endpoint '{}'", spec.name)
+        })?;
+    }
+    Ok((spec.name, proxy))
+}
+
+fn session_aliases_upstream(proxy: &guard::proxy::ApiProxy, token: &str) -> bool {
+    proxy.upstream().bearer() == Some(token)
+        || proxy
+            .upstream()
+            .basic_auth()
+            .is_some_and(|(username, password)| token == username || token == password)
+}
+
+#[cfg(test)]
+mod api_endpoint_tests {
+    use super::*;
+
+    fn endpoint(name: &str, kubeconfig: PathBuf) -> ApiEndpointSpec {
+        ApiEndpointSpec {
+            name: name.to_string(),
+            listen: "127.0.0.1:16443".to_string(),
+            protocol: "kubernetes".to_string(),
+            mode: ApiEndpointMode::Readonly,
+            upstream: None,
+            token_env: None,
+            token_file: None,
+            kubeconfig: Some(kubeconfig),
+            kube_context: None,
+            policy: None,
+            ca_out: None,
+            brokered_kubeconfig_out: None,
+            session_env: None,
+            rarity_escalation: 0,
+        }
+    }
+
+    #[test]
+    fn builds_multiple_named_listeners_for_the_same_protocol() {
+        let temp = tempfile::tempdir().unwrap();
+        let kubeconfig = temp.path().join("upstream.yaml");
+        std::fs::write(
+            &kubeconfig,
+            "apiVersion: v1\nkind: Config\ncurrent-context: ctx\nclusters:\n  - name: c\n    cluster:\n      server: https://127.0.0.1:6443\ncontexts:\n  - name: ctx\n    context: {cluster: c, user: u}\nusers:\n  - name: u\n    user: {token: test-only}\n",
+        )
+        .unwrap();
+        let llm = crate::evaluate::LlmConfig {
+            enabled: false,
+            api_key: None,
+            api_url: None,
+            model: None,
+            models: Vec::new(),
+            timeout_secs: 1,
+            retries: 0,
+        };
+        let first = build_named_api_proxy(
+            endpoint("first", kubeconfig.clone()),
+            &llm,
+            false,
+            1,
+            Duration::from_secs(1),
+            None,
+            Arc::new(server::ApiJudgeSpend::new(
+                server::ApiJudgeSpendConfig::default(),
+            )),
+        )
+        .unwrap();
+        let second = build_named_api_proxy(
+            endpoint("second", kubeconfig),
+            &llm,
+            false,
+            1,
+            Duration::from_secs(1),
+            None,
+            Arc::new(server::ApiJudgeSpend::new(
+                server::ApiJudgeSpendConfig::default(),
+            )),
+        )
+        .unwrap();
+        assert_eq!(first.0, "first");
+        assert_eq!(second.0, "second");
+        assert_eq!(first.1.protocol_name(), "kubernetes");
+        assert_eq!(second.1.protocol_name(), "kubernetes");
+        assert!(session_aliases_upstream(&first.1, "test-only"));
+        assert!(!session_aliases_upstream(&first.1, "guard-session"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_brokered_output_preserves_group_access_and_removes_other_access() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("brokered.kubeconfig");
+        std::fs::write(&output, "old").unwrap();
+        std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_brokered_kubeconfig_output(&output, "new", true).unwrap();
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), "new");
+        assert_eq!(
+            std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+
+        let link = temp.path().join("linked.kubeconfig");
+        symlink(&output, &link).unwrap();
+        assert!(write_brokered_kubeconfig_output(&link, "replacement", true).is_err());
+        assert_eq!(std::fs::read_to_string(output).unwrap(), "new");
     }
 }

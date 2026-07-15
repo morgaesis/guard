@@ -294,7 +294,7 @@ guard server start --gate consequence --socket /run/guard/guard.sock \
     --api-policy /etc/guard/api-policy.yaml \
     --brokered-kubeconfig-out /run/guard/brokered.kubeconfig
 
-# The agent uses the brokered config, which carries no credential:
+# The agent uses the brokered config, which carries no upstream credential:
 KUBECONFIG=/run/guard/brokered.kubeconfig helm upgrade --install app ./chart
 
 # GitHub: the daemon reads the token from its own environment; the agent
@@ -307,15 +307,73 @@ guard server start --gate consequence --socket /run/guard/guard.sock \
     --api-ca-out /run/guard/api-proxy-ca.pem
 ```
 
+One daemon can host reusable named listeners from `--api-endpoints PATH`:
+
+```yaml
+endpoints:
+  - name: production-cluster
+    listen: 127.0.0.1:8443
+    protocol: kubernetes
+    mode: readonly
+    kubeconfig: /etc/guard/production.kubeconfig
+    policy: /etc/guard/production-api.yaml
+    brokered_kubeconfig_out: /run/guard/production.kubeconfig
+    session_env: GUARD_PRODUCTION_SESSION
+  - name: github-automation
+    listen: 127.0.0.1:8444
+    protocol: github
+    upstream: https://api.github.com
+    token_env: GH_BROKER_TOKEN
+    policy: /etc/guard/github-policy.yaml
+    ca_out: /run/guard/github-ca.pem
+```
+
+Endpoint names bind reverts, audit records, coverage, and credential attribution
+to the listener that handled the request. `mode: readonly` rejects writes on the
+baseline listener. A write with a live prompt-bearing session is routed to the
+evaluator under that session intent, even when the endpoint policy otherwise
+allows it. `session_env` reads a live Guard session token from the daemon
+environment and places it in the brokered kubeconfig as its bearer. This bearer
+authenticates only to Guard: the proxy validates it, removes it, and injects the
+separate upstream credential. Generic clients can send the same standard
+`Authorization: Bearer` header. `X-Guard-Session` is a compatibility alias.
+Protect a session-bearing output for its intended agent. On Unix Guard refuses
+links, creates new output owner-only, and preserves an existing file's group
+access while removing all access for other users; pre-create a group-readable
+file when a service account writes for an agent group. On Windows the output
+inherits the configured directory and file ACL.
+Protocol hard-denies and explicit policy denies remain in force. The session
+fingerprint and prompt context scope evaluator caching and generated coverage,
+and the proxy revalidates the live, unsuspended session immediately before
+forwarding. Held requests, provisionals, and create/delete provenance retain the
+same fingerprint. Session history records the operation with a safe credential
+reference, never a credential value.
+
+Repeated evaluator decisions become exact API verb coverage cells keyed by
+endpoint, session fingerprint, protocol operation, namespace, and value-free
+body shape. Generated coverage has evaluator provenance, a regime stamp, and a
+bounded lifetime. `guard verb coverage list` inspects it and `guard verb coverage
+clear` removes generated cells and evidence. Value-bearing mutations remain
+evaluator-routed until verb coverage can constrain field values. Generated
+allows continue through the consequence floor. A session evaluates past a
+global evaluator-generated deny, while operator and hard denies remain floors.
+API evaluator spend is bounded by concurrency, token-bucket, and error
+circuit-breaker controls under the `--api-judge-*` options. Rate and circuit
+state are partitioned by endpoint and session, and attributed traffic has a
+reserved concurrency slot. Audit events include cumulative counters without
+request bodies or credential values.
+
 For Kubernetes the daemon reads the real bearer token or client certificate from
 its kubeconfig (`exec`/`auth-provider` plugins are rejected) and emits a brokered
-kubeconfig that points only at the proxy and is validated to carry no credential,
-so the proxy is the sole path to the cluster. For other protocols the bearer
+kubeconfig that points only at the proxy and is validated to carry no upstream
+credential. It may carry a Guard session bearer that the proxy consumes and
+never forwards, so the proxy is the sole path to the cluster. For other protocols the bearer
 token comes from an environment variable (`--api-token-env`) or a file
 (`--api-token-file`), never a command-line value, and `--api-ca-out` writes the
 proxy CA so generic HTTP clients can trust the TLS termination. `--api-proxy`
-refuses to start with `--exec-as-caller` and binds loopback addresses only, since
-the proxy authenticates nothing itself. Policy actions are `allow`, `deny`,
+refuses to start with `--exec-as-caller` and binds loopback addresses only. A
+Guard session bearer conveys scope but is not bound to a network client identity.
+Policy actions are `allow`, `deny`,
 `hold`, and `evaluate`; an allowed read of secret-bearing material is redacted
 by the protocol's own classification (Kubernetes Secret `data`/`stringData`,
 GitHub secret stores, Vercel env-var values), something upstream admission
@@ -349,22 +407,24 @@ fast-pathed, and otherwise it is held for the operator. See
 [`examples/github-policy.yaml`](examples/github-policy.yaml), and
 [`examples/vercel-policy.yaml`](examples/vercel-policy.yaml).
 
-API request-shape learning is evidence-only and exact-tuple based: repeated
-evaluator allows or denies for the same `(protocol, verb, group, version,
-resource, subresource, namespace, body-shape)` tuple, with the object name
-excluded and the body reduced to a value-free key skeleton, populate a bounded
-YAML store, so a learned rule matches only requests structurally identical to
-the ones the evaluator judged. Dry-run requests never feed it, an over-risk or
-irreversible allow permanently disqualifies its shape, and each learned verdict
-is invalidated when the evaluator model or the policy intent changes. Learned
-denies reject the same tuple before another evaluator call; learned allows reuse
-the stored risk and reversibility, skip only non-rare requests, and still route
-through `decide_gate`, so the consequence floor is unchanged. Promotion and
-fast-path hits are operator-audit-only, and a learned deny reads to the client
-exactly like a fresh evaluator denial. Command denials may include the caller's
-own repeated-denial count once the deny-shape
-threshold is reached, but clients never receive promotion state or a signal
-that an API shape skipped evaluation.
+Persisted reverts bind the endpoint, protocol, canonical target, and a
+secret-free digest of the selected upstream credential identity. A mismatch
+defers the still-live change for operator handling. Credential-bearing upstream
+response headers are stripped unless a protocol plug-in explicitly permits one.
+
+Generated API verb coverage is evidence-only and exact-cell based. Repeated
+evaluator decisions for the same endpoint, session fingerprint, protocol,
+typed operation, namespace, and value-free body shape populate a bounded YAML
+store. Object names are excluded. Dry-run requests never feed coverage,
+value-bearing mutations remain evaluator-routed, and an over-risk or
+irreversible allow disqualifies its cell. Evaluator-generated cells carry a
+regime stamp and expiry, so model, policy-intent, session-intent, and time
+changes route back to evaluation. A session routes a matching global generated
+deny back to evaluation; operator-authored denies remain floors. Generated
+allows reuse the stored risk and reversibility only for non-rare requests and
+still route through `decide_gate`, so the consequence floor is unchanged.
+Activation and fast-path hits are operator-audit-only. Clients receive the same
+decision shape whether coverage or a fresh evaluation produced it.
 
 ## Configuration
 
@@ -432,10 +492,16 @@ Unless marked "(client)", a variable is read by the daemon at startup; setting i
 | `GUARD_LEARN_ALLOW` | `true` | Auto-promote trusted verbs from repeated low-risk LLM approvals (requires `--gate consequence`). On by default; needs no operator step, unlike `GUARD_LEARN_RULES` -- restricted to reversible/recoverable-with-a-validated-revert shapes, never irreversible. |
 | `GUARD_LEARN_ALLOW_STATE` | `<state dir>/learned-allow.yaml` | Path to the auto-verb-promotion observation state YAML (bookkeeping only; promoted verbs land in `GUARD_VERBS`). |
 | `GUARD_LEARN_ALLOW_MIN_APPROVALS` | `5` | LLM approvals of the same shape required before attempting to promote a trusted verb. |
-| `GUARD_API_PROMOTION` | `true` | Auto-learn exact API request shapes from repeated evaluator allows and denies on proxied `evaluate` traffic. |
-| `GUARD_API_PROMOTION_STATE` | `<state dir>/learned-api.yaml` | Path to the API request-shape learning state YAML. |
-| `GUARD_API_PROMOTION_MIN_APPROVALS` | `5` | Evaluator approvals of the same API tuple required before a learned allow is active. |
-| `GUARD_API_PROMOTION_MIN_DENIALS` | `3` | Evaluator denials of the same API tuple required before a learned deny is active. |
+| `GUARD_API_ENDPOINTS` | (none) | YAML file containing reusable named API listeners. |
+| `GUARD_API_VERB_COVERAGE` | `true` | Generate exact API verb coverage from repeated evaluator decisions. The `GUARD_API_PROMOTION` name remains a compatibility alias. |
+| `GUARD_API_VERB_COVERAGE_STATE` | `<state dir>/learned-api.yaml` | Generated API verb coverage state YAML. |
+| `GUARD_API_VERB_COVERAGE_MIN_APPROVALS` | `5` | Evaluator approvals required before generated allow coverage is active. |
+| `GUARD_API_VERB_COVERAGE_MIN_DENIALS` | `3` | Evaluator denials required before generated deny coverage is active. |
+| `GUARD_API_JUDGE_MAX_CONCURRENCY` | `4` | Maximum simultaneous API evaluator calls. |
+| `GUARD_API_JUDGE_RATE_PER_MINUTE` | `60` | API evaluator token-bucket refill rate. |
+| `GUARD_API_JUDGE_BURST` | `10` | API evaluator token-bucket capacity. |
+| `GUARD_API_JUDGE_ERROR_THRESHOLD` | `3` | Consecutive evaluator errors that open the circuit. |
+| `GUARD_API_JUDGE_CIRCUIT_COOLDOWN` | `60` | Circuit-open duration in seconds. |
 | `GUARD_PROMPT_APPEND` | (none) | Path to additive prompt file (appended to base prompt) |
 | `GUARD_GPG_RECIPIENT` | (none) | GPG recipient for the `local` secret backend |
 | `GUARD_BACKEND` | (auto) | Secret backend: `pass`, `env`, `local`, `vault`, or `infisical`. Auto prefers `pass`; otherwise it falls back to non-persistent `env` and logs a warning. `vault` uses `VAULT_ADDR` with `VAULT_TOKEN` or `VAULT_ROLE_ID`+`VAULT_SECRET_ID` (KV v2, mount `VAULT_KV_MOUNT`, default `secret`); `infisical` uses `INFISICAL_CLIENT_ID`/`INFISICAL_CLIENT_SECRET`/`INFISICAL_PROJECT_ID` (Universal Auth, env `INFISICAL_ENVIRONMENT`). |
@@ -745,9 +811,14 @@ For forensics, `guard session show <token>` prints prompt context, generated
 notes, aggregate allow/deny and exec outcome counts, evaluator calls, cache hits,
 holds, distinct command shapes, novel-shape rate, source breakdown, a risk
 histogram, and a bounded recent interaction log. Each interaction includes an
-optional child exit code and the names, never values, of secrets that reached a
-successfully spawned child. The aggregates derive from persisted interactions,
-so they survive daemon restart within the configured retention window.
+optional child exit code and safe references, never values, for brokered
+credentials made available to the operation. Command interactions record stored
+secret names only after a child starts; allowed API interactions record the
+endpoint's upstream credential reference. Daemon-principal and TCP admin-token
+callers see the raw token. Non-admin local callers may show a session only by
+presenting its token and receive the same session details with tokens rendered
+as `(provided)`. The aggregates derive from persisted interactions, so they
+survive daemon restart within the configured retention window.
 
 The daemon can suspend a live session when rolling behavior crosses a configured
 denial count, hold count, or denial ratio. Configure the window and thresholds

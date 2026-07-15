@@ -122,6 +122,8 @@ impl Client {
             AdminRequest::ApprovalNote { .. } => "approval_note",
             AdminRequest::VerbList => "verb_list",
             AdminRequest::VerbCreate { .. } => "verb_create",
+            AdminRequest::VerbCoverageList => "verb_coverage_list",
+            AdminRequest::VerbCoverageClear => "verb_coverage_clear",
         };
         let envelope = IncomingMessage::Admin {
             admin: Box::new(request),

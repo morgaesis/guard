@@ -20,6 +20,7 @@ use crate::proxy::ApiRequestSummary;
 
 const MAX_EVIDENCE_PER_BUCKET: usize = 8;
 const MAX_BUCKETS: usize = 500;
+const DEFAULT_GENERATED_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
 #[derive(Debug, Clone)]
 pub struct ApiPromotionConfig {
@@ -27,6 +28,7 @@ pub struct ApiPromotionConfig {
     pub enabled: bool,
     pub min_approvals: u32,
     pub min_denials: u32,
+    pub generated_ttl_secs: u64,
 }
 
 impl ApiPromotionConfig {
@@ -36,6 +38,7 @@ impl ApiPromotionConfig {
             enabled: true,
             min_approvals: 5,
             min_denials: 3,
+            generated_ttl_secs: DEFAULT_GENERATED_TTL_SECS,
         }
     }
 }
@@ -49,11 +52,15 @@ pub struct ApiPromotionFile {
 }
 
 fn default_version() -> u32 {
-    1
+    2
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiShapeBucket {
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_fingerprint: Option<String>,
     pub protocol: String,
     pub verb: String,
     pub group: String,
@@ -90,14 +97,50 @@ pub struct ApiShapeBucket {
     /// stamp differs from the running config is not trusted.
     #[serde(default)]
     pub stamp: String,
+    #[serde(default)]
+    pub provenance: ApiCoverageProvenance,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix: Option<u64>,
     pub max_risk_seen: i32,
     pub first_seen_unix: u64,
     pub last_seen_unix: u64,
     pub last_reason: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiCoverageProvenance {
+    Operator,
+    #[default]
+    Evaluator,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiCoverageEntry {
+    pub key: String,
+    pub protocol: String,
+    pub endpoint: String,
+    pub session_fingerprint: Option<String>,
+    pub verb: String,
+    pub group: String,
+    pub version: String,
+    pub resource: String,
+    pub subresource: Option<String>,
+    pub namespace: Option<String>,
+    pub body_shape: String,
+    pub decision: String,
+    pub provenance: ApiCoverageProvenance,
+    pub regime: String,
+    pub approvals: u32,
+    pub denials: u32,
+    pub expires_at_unix: Option<u64>,
+    pub active: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiShape {
+    pub endpoint: String,
+    pub session_fingerprint: Option<String>,
     pub protocol: String,
     pub verb: String,
     pub group: String,
@@ -114,6 +157,8 @@ pub struct ApiShape {
 impl ApiShape {
     pub fn from_summary(summary: &ApiRequestSummary) -> Self {
         Self {
+            endpoint: summary.endpoint.clone(),
+            session_fingerprint: summary.session_fingerprint.clone(),
             protocol: summary.protocol.clone(),
             verb: summary.verb.clone(),
             group: summary.group.clone(),
@@ -132,6 +177,8 @@ impl ApiShape {
             s.replace('\\', "\\\\").replace('|', "\\|")
         }
         [
+            self.endpoint.as_str(),
+            self.session_fingerprint.as_deref().unwrap_or(""),
             self.protocol.as_str(),
             self.verb.as_str(),
             self.group.as_str(),
@@ -178,6 +225,7 @@ pub struct ApiLearnedDeny {
     pub shape: ApiShape,
     pub denials: u32,
     pub reason: String,
+    pub provenance: ApiCoverageProvenance,
 }
 
 #[derive(Debug, Clone)]
@@ -202,7 +250,7 @@ pub struct ApiPromotionStore {
 
 impl ApiPromotionStore {
     pub fn load(config: ApiPromotionConfig) -> Result<Self> {
-        let data = if config.path.exists() {
+        let mut data = if config.path.exists() {
             let content = std::fs::read_to_string(&config.path)
                 .with_context(|| format!("failed to read {}", config.path.display()))?;
             if content.trim().is_empty() {
@@ -229,6 +277,44 @@ impl ApiPromotionStore {
         } else {
             ApiPromotionFile::default()
         };
+        let now = now_unix();
+        let mut migrated: BTreeMap<String, ApiShapeBucket> = BTreeMap::new();
+        for (_, mut bucket) in std::mem::take(&mut data.buckets) {
+            if bucket.endpoint.is_empty() {
+                bucket.endpoint = "default".to_string();
+            }
+            if bucket.provenance == ApiCoverageProvenance::Evaluator
+                && bucket.expires_at_unix.is_none()
+            {
+                bucket.expires_at_unix = Some(
+                    bucket
+                        .last_seen_unix
+                        .max(now.saturating_sub(config.generated_ttl_secs))
+                        .saturating_add(config.generated_ttl_secs),
+                );
+            }
+            let shape = ApiShape {
+                endpoint: bucket.endpoint.clone(),
+                session_fingerprint: bucket.session_fingerprint.clone(),
+                protocol: bucket.protocol.clone(),
+                verb: bucket.verb.clone(),
+                group: bucket.group.clone(),
+                version: bucket.version.clone(),
+                resource: bucket.resource.clone(),
+                subresource: bucket.subresource.clone(),
+                namespace: bucket.namespace.clone(),
+                body_shape: bucket.body_shape.clone(),
+            };
+            let key = shape.key();
+            match migrated.get(&key) {
+                Some(existing) if existing.last_seen_unix >= bucket.last_seen_unix => {}
+                _ => {
+                    migrated.insert(key, bucket);
+                }
+            }
+        }
+        data.version = default_version();
+        data.buckets = migrated;
         Ok(Self { config, data })
     }
 
@@ -252,11 +338,69 @@ impl ApiPromotionStore {
         self.data.buckets.len()
     }
 
+    pub fn coverage(&self) -> Vec<ApiCoverageEntry> {
+        let now = now_unix();
+        self.data
+            .buckets
+            .iter()
+            .filter_map(|(key, bucket)| {
+                let decision = if bucket.learned_deny {
+                    "deny"
+                } else if bucket.promoted_allow {
+                    "allow"
+                } else {
+                    return None;
+                };
+                Some(ApiCoverageEntry {
+                    key: key.clone(),
+                    protocol: bucket.protocol.clone(),
+                    endpoint: bucket.endpoint.clone(),
+                    session_fingerprint: bucket.session_fingerprint.clone(),
+                    verb: bucket.verb.clone(),
+                    group: bucket.group.clone(),
+                    version: bucket.version.clone(),
+                    resource: bucket.resource.clone(),
+                    subresource: bucket.subresource.clone(),
+                    namespace: bucket.namespace.clone(),
+                    body_shape: bucket.body_shape.clone(),
+                    decision: decision.to_string(),
+                    provenance: bucket.provenance,
+                    regime: bucket.stamp.clone(),
+                    approvals: bucket.approvals,
+                    denials: bucket.denials,
+                    expires_at_unix: bucket.expires_at_unix,
+                    active: !Self::expired(bucket, now),
+                })
+            })
+            .collect()
+    }
+
+    pub fn clear_generated(&mut self) -> Result<usize> {
+        let before = self.data.buckets.len();
+        self.data
+            .buckets
+            .retain(|_, bucket| bucket.provenance == ApiCoverageProvenance::Operator);
+        let removed = before.saturating_sub(self.data.buckets.len());
+        if removed > 0 {
+            self.save()?;
+        }
+        Ok(removed)
+    }
+
+    fn expired(bucket: &ApiShapeBucket, now: u64) -> bool {
+        bucket.provenance == ApiCoverageProvenance::Evaluator
+            && bucket
+                .expires_at_unix
+                .is_some_and(|deadline| now >= deadline)
+    }
+
     /// Whether a bucket's learned state was produced under the given evaluator
     /// regime stamp. An empty stamp disables the check (no intent configured, or
     /// tests).
     fn stamp_current(bucket: &ApiShapeBucket, stamp: &str) -> bool {
-        stamp.is_empty() || bucket.stamp == stamp
+        bucket.provenance == ApiCoverageProvenance::Operator
+            || stamp.is_empty()
+            || bucket.stamp == stamp
     }
 
     pub fn learned_allow(
@@ -267,6 +411,9 @@ impl ApiPromotionStore {
         let shape = ApiShape::from_summary(summary);
         let bucket = self.data.buckets.get(&shape.key())?;
         if !bucket.promoted_allow || bucket.mixed_class || bucket.disqualified {
+            return None;
+        }
+        if Self::expired(bucket, now_unix()) {
             return None;
         }
         if !Self::stamp_current(bucket, stamp) {
@@ -286,10 +433,14 @@ impl ApiPromotionStore {
         if !bucket.learned_deny || !Self::stamp_current(bucket, stamp) {
             return None;
         }
+        if Self::expired(bucket, now_unix()) {
+            return None;
+        }
         Some(ApiLearnedDeny {
             shape,
             denials: bucket.denials,
             reason: bucket.last_reason.clone(),
+            provenance: bucket.provenance,
         })
     }
 
@@ -310,6 +461,14 @@ impl ApiPromotionStore {
         if summary.dry_run {
             return Ok(None);
         }
+        // A value-free body skeleton cannot constrain the values in a write.
+        // Until coverage carries field-aware value constraints, every
+        // value-bearing mutation stays on the evaluator path.
+        if !matches!(summary.verb.as_str(), "get" | "list" | "watch")
+            && summary.redacted_body_shape != "(no body)"
+        {
+            return Ok(None);
+        }
         let class = reversibility;
         let risk = risk.unwrap_or(10);
         // An ineligible allow (no class, irreversible, or over the per-class risk
@@ -323,10 +482,14 @@ impl ApiPromotionStore {
         };
 
         let min_approvals = self.config.min_approvals.max(2);
+        let expires_at = now_unix().saturating_add(self.config.generated_ttl_secs);
         let shape = ApiShape::from_summary(summary);
-        let bucket = self.bucket_mut(&shape, reason, stamp);
+        let Some(bucket) = self.bucket_mut(&shape, reason, stamp) else {
+            return Ok(None);
+        };
         bucket.last_reason = reason.to_string();
         bucket.last_seen_unix = now_unix();
+        bucket.expires_at_unix = Some(expires_at);
         push_evidence(bucket, summary);
         if !eligible {
             bucket.disqualified = true;
@@ -382,11 +545,20 @@ impl ApiPromotionStore {
             return Ok(None);
         }
         let min_denials = self.config.min_denials.max(1);
+        let expires_at = now_unix().saturating_add(self.config.generated_ttl_secs);
         let shape = ApiShape::from_summary(summary);
-        let bucket = self.bucket_mut(&shape, reason, stamp);
+        let Some(bucket) = self.bucket_mut(&shape, reason, stamp) else {
+            return Ok(None);
+        };
         bucket.denials = bucket.denials.saturating_add(1);
+        // One deny proves the value-free shape is not uniformly safe to
+        // auto-allow. Keep future allows on the evaluator path even before the
+        // deny reaches its own generation threshold.
+        bucket.disqualified = true;
+        bucket.promoted_allow = false;
         bucket.last_reason = reason.to_string();
         bucket.last_seen_unix = now_unix();
+        bucket.expires_at_unix = Some(expires_at);
         push_evidence(bucket, summary);
 
         let learned = !bucket.learned_deny && bucket.denials >= min_denials;
@@ -404,18 +576,23 @@ impl ApiPromotionStore {
         }
     }
 
-    fn bucket_mut(&mut self, shape: &ApiShape, reason: &str, stamp: &str) -> &mut ApiShapeBucket {
+    fn bucket_mut(
+        &mut self,
+        shape: &ApiShape,
+        reason: &str,
+        stamp: &str,
+    ) -> Option<&mut ApiShapeBucket> {
+        let generated_ttl_secs = self.config.generated_ttl_secs;
         let key = shape.key();
         if !self.data.buckets.contains_key(&key) && self.data.buckets.len() >= MAX_BUCKETS {
-            if let Some(oldest_key) = self
+            let oldest_key = self
                 .data
                 .buckets
                 .iter()
+                .filter(|(_, bucket)| bucket.provenance == ApiCoverageProvenance::Evaluator)
                 .min_by_key(|(_, bucket)| bucket.last_seen_unix)
-                .map(|(key, _)| key.clone())
-            {
-                self.data.buckets.remove(&oldest_key);
-            }
+                .map(|(key, _)| key.clone())?;
+            self.data.buckets.remove(&oldest_key);
         }
         let now = now_unix();
         let bucket = self
@@ -424,6 +601,8 @@ impl ApiPromotionStore {
             .entry(key)
             .or_insert_with(|| ApiShapeBucket {
                 protocol: shape.protocol.clone(),
+                endpoint: shape.endpoint.clone(),
+                session_fingerprint: shape.session_fingerprint.clone(),
                 verb: shape.verb.clone(),
                 group: shape.group.clone(),
                 version: shape.version.clone(),
@@ -440,15 +619,26 @@ impl ApiPromotionStore {
                 promoted_allow: false,
                 learned_deny: false,
                 stamp: stamp.to_string(),
+                provenance: ApiCoverageProvenance::Evaluator,
+                expires_at_unix: Some(now.saturating_add(generated_ttl_secs)),
                 max_risk_seen: 0,
                 first_seen_unix: now,
                 last_seen_unix: now,
                 last_reason: reason.to_string(),
             });
-        // A bucket learned under a different evaluator regime is stale: reset its
-        // accrued state so learning restarts under the new stamp rather than
-        // topping up a rule the current model and intent never produced.
-        if !stamp.is_empty() && bucket.stamp != stamp {
+        // Evaluator observations never rewrite operator-authored authority,
+        // including when the evaluator regime changes.
+        if bucket.provenance == ApiCoverageProvenance::Operator {
+            return None;
+        }
+        // A bucket learned under a different evaluator regime or past its TTL
+        // must re-earn its evidence rather than becoming active again after one
+        // fresh observation.
+        let expired = bucket.provenance == ApiCoverageProvenance::Evaluator
+            && bucket
+                .expires_at_unix
+                .is_some_and(|deadline| now >= deadline);
+        if expired || (!stamp.is_empty() && bucket.stamp != stamp) {
             bucket.approvals = 0;
             bucket.denials = 0;
             bucket.evidence.clear();
@@ -459,8 +649,10 @@ impl ApiPromotionStore {
             bucket.learned_deny = false;
             bucket.max_risk_seen = 0;
             bucket.stamp = stamp.to_string();
+            bucket.provenance = ApiCoverageProvenance::Evaluator;
+            bucket.expires_at_unix = Some(now.saturating_add(generated_ttl_secs));
         }
-        bucket
+        Some(bucket)
     }
 
     fn save(&self) -> Result<()> {
@@ -502,13 +694,14 @@ mod tests {
             enabled: true,
             min_approvals,
             min_denials,
+            generated_ttl_secs: DEFAULT_GENERATED_TTL_SECS,
         }
     }
 
     fn summary(name: &str) -> ApiRequestSummary {
         ApiRequestSummary {
             protocol: "kubernetes".to_string(),
-            verb: "patch".to_string(),
+            verb: "get".to_string(),
             path: format!("/apis/apps/v1/namespaces/dev/deployments/{name}"),
             redacted_query: String::new(),
             group: "apps".to_string(),
@@ -521,6 +714,10 @@ mod tests {
             redacted_body_shape: "{\"spec\":{\"replicas\":<number>}}".to_string(),
             revert_constructible: RevertConstructible::RestorePriorState,
             rarity: false,
+            endpoint: "default".to_string(),
+            session_fingerprint: None,
+            session_intent: None,
+            credential_ref: "upstream".to_string(),
         }
     }
 
@@ -556,6 +753,71 @@ mod tests {
         let learned = store.learned_allow(&s, "").unwrap();
         assert_eq!(learned.risk, 3);
         assert_eq!(learned.reversibility, Reversibility::Reversible);
+    }
+
+    #[test]
+    fn value_bearing_mutations_never_promote_without_field_constraints() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store =
+            ApiPromotionStore::load(config(temp.path().join("api.yaml"), 2, 3)).unwrap();
+        let mut write = summary("api");
+        write.verb = "patch".to_string();
+
+        for _ in 0..4 {
+            assert!(store
+                .record_allow(
+                    &write,
+                    Some(1),
+                    Some(Reversibility::Reversible),
+                    "ok",
+                    "regime-A",
+                )
+                .unwrap()
+                .is_none());
+        }
+        assert_eq!(store.bucket_count(), 0);
+        assert!(store.learned_allow(&write, "regime-A").is_none());
+    }
+
+    #[test]
+    fn evaluator_evidence_never_mutates_operator_coverage() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store =
+            ApiPromotionStore::load(config(temp.path().join("api.yaml"), 2, 2)).unwrap();
+        let request = summary("api");
+        let shape = ApiShape::from_summary(&request);
+        store
+            .record_deny(&request, "operator decision seed", "regime-A")
+            .unwrap();
+        let bucket = store.data.buckets.get_mut(&shape.key()).unwrap();
+        bucket.provenance = ApiCoverageProvenance::Operator;
+        bucket.last_reason = "operator deny".to_string();
+        bucket.learned_deny = true;
+        let before = serde_yaml_ng::to_string(bucket).unwrap();
+
+        store
+            .record_allow(
+                &request,
+                Some(1),
+                Some(Reversibility::Reversible),
+                "evaluator allow",
+                "regime-B",
+            )
+            .unwrap();
+        store
+            .record_deny(&request, "evaluator deny", "regime-B")
+            .unwrap();
+
+        let after =
+            serde_yaml_ng::to_string(store.data.buckets.get(&shape.key()).unwrap()).unwrap();
+        assert_eq!(after, before);
+        assert_eq!(
+            store
+                .learned_deny(&request, "unrelated-regime")
+                .unwrap()
+                .provenance,
+            ApiCoverageProvenance::Operator
+        );
     }
 
     #[test]
@@ -628,6 +890,8 @@ mod tests {
             store.data.buckets.insert(
                 key,
                 ApiShapeBucket {
+                    endpoint: String::new(),
+                    session_fingerprint: None,
                     protocol: format!("p{i}"),
                     verb: "get".to_string(),
                     group: String::new(),
@@ -645,6 +909,8 @@ mod tests {
                     promoted_allow: false,
                     learned_deny: false,
                     stamp: String::new(),
+                    provenance: ApiCoverageProvenance::Evaluator,
+                    expires_at_unix: None,
                     max_risk_seen: 1,
                     first_seen_unix: i as u64,
                     last_seen_unix: i as u64,
@@ -652,6 +918,12 @@ mod tests {
                 },
             );
         }
+        store
+            .data
+            .buckets
+            .get_mut("p0|get||v1|pods||ns0|{}")
+            .unwrap()
+            .provenance = ApiCoverageProvenance::Operator;
         assert_eq!(store.bucket_count(), MAX_BUCKETS);
 
         store
@@ -659,7 +931,8 @@ mod tests {
             .expect("record deny");
 
         assert_eq!(store.bucket_count(), MAX_BUCKETS);
-        assert!(!store.data.buckets.contains_key("p0|get||v1|pods||ns0|{}"));
+        assert!(store.data.buckets.contains_key("p0|get||v1|pods||ns0|{}"));
+        assert!(!store.data.buckets.contains_key("p1|get||v1|pods||ns1|{}"));
     }
 
     #[test]
@@ -819,5 +1092,164 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(store.learned_allow(&s, "regime-B").is_none());
+    }
+
+    #[test]
+    fn old_generated_coverage_migrates_to_bounded_expiry() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("api.yaml");
+        std::fs::write(
+            &path,
+            r#"version: 1
+buckets:
+  old:
+    protocol: kubernetes
+    verb: get
+    group: ''
+    version: v1
+    resource: pods
+    approvals: 5
+    denials: 0
+    promoted_allow: true
+    stamp: old-regime
+    max_risk_seen: 1
+    first_seen_unix: 1
+    last_seen_unix: 1
+    last_reason: ok
+"#,
+        )
+        .unwrap();
+        let store = ApiPromotionStore::load(config(path, 2, 2)).unwrap();
+        let entries = store.coverage();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].provenance, ApiCoverageProvenance::Evaluator);
+        assert!(entries[0].expires_at_unix.is_some());
+        assert!(!entries[0].active, "ancient migrated coverage is stale");
+    }
+
+    #[test]
+    fn old_bucket_keys_migrate_to_the_default_endpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("api.yaml");
+        let now = now_unix();
+        std::fs::write(
+            &path,
+            format!(
+                r#"version: 1
+buckets:
+  kubernetes|get|apps|v1|deployments||dev|body:
+    protocol: kubernetes
+    verb: get
+    group: apps
+    version: v1
+    resource: deployments
+    namespace: dev
+    body_shape: '{{"spec":{{"replicas":<number>}}}}'
+    approvals: 5
+    denials: 0
+    class_seen: reversible
+    promoted_allow: true
+    stamp: old-regime
+    max_risk_seen: 1
+    first_seen_unix: {now}
+    last_seen_unix: {now}
+    last_reason: ok
+"#
+            ),
+        )
+        .unwrap();
+        let store = ApiPromotionStore::load(config(path, 2, 2)).unwrap();
+        let s = summary("api");
+        assert!(store.learned_allow(&s, "old-regime").is_some());
+        let entries = store.coverage();
+        assert_eq!(entries[0].endpoint, "default");
+    }
+
+    #[test]
+    fn any_deny_disqualifies_an_existing_generated_allow() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store =
+            ApiPromotionStore::load(config(temp.path().join("api.yaml"), 2, 2)).unwrap();
+        let s = summary("api");
+        for _ in 0..2 {
+            store
+                .record_allow(&s, Some(1), Some(Reversibility::Reversible), "ok", "regime")
+                .unwrap();
+        }
+        assert!(store.learned_allow(&s, "regime").is_some());
+
+        store
+            .record_deny(&s, "unsafe value in this shape", "regime")
+            .unwrap();
+        assert!(store.learned_allow(&s, "regime").is_none());
+        store
+            .record_deny(&s, "unsafe value in this shape", "regime")
+            .unwrap();
+        assert!(store.learned_deny(&s, "regime").is_some());
+        assert_eq!(store.coverage()[0].decision, "deny");
+    }
+
+    #[test]
+    fn generated_coverage_is_scoped_by_endpoint_and_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store =
+            ApiPromotionStore::load(config(temp.path().join("api.yaml"), 2, 2)).unwrap();
+        let mut scoped = summary("api");
+        scoped.endpoint = "cluster-a".to_string();
+        scoped.session_fingerprint = Some("session-a".to_string());
+        for _ in 0..2 {
+            store
+                .record_allow(
+                    &scoped,
+                    Some(1),
+                    Some(Reversibility::Reversible),
+                    "ok",
+                    "regime",
+                )
+                .unwrap();
+        }
+        assert!(store.learned_allow(&scoped, "regime").is_some());
+        let mut other_session = scoped.clone();
+        other_session.session_fingerprint = Some("session-b".to_string());
+        assert!(store.learned_allow(&other_session, "regime").is_none());
+        let mut other_endpoint = scoped.clone();
+        other_endpoint.endpoint = "cluster-b".to_string();
+        assert!(store.learned_allow(&other_endpoint, "regime").is_none());
+        assert_eq!(store.clear_generated().unwrap(), 1);
+        assert!(store.coverage().is_empty());
+    }
+
+    #[test]
+    fn expired_coverage_restarts_evidence_collection() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store =
+            ApiPromotionStore::load(config(temp.path().join("api.yaml"), 2, 2)).unwrap();
+        let s = summary("api");
+        for _ in 0..2 {
+            store
+                .record_allow(&s, Some(1), Some(Reversibility::Reversible), "ok", "regime")
+                .unwrap();
+        }
+        assert!(store.learned_allow(&s, "regime").is_some());
+        let bucket = store
+            .data
+            .buckets
+            .get_mut(&ApiShape::from_summary(&s).key())
+            .unwrap();
+        bucket.expires_at_unix = Some(now_unix());
+
+        store
+            .record_allow(
+                &s,
+                Some(1),
+                Some(Reversibility::Reversible),
+                "fresh",
+                "regime",
+            )
+            .unwrap();
+        assert!(
+            store.learned_allow(&s, "regime").is_none(),
+            "one observation must not reactivate expired generated coverage"
+        );
     }
 }

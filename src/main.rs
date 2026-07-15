@@ -380,6 +380,29 @@ enum VerbCommands {
         #[arg(long, action = ArgAction::SetTrue)]
         json: bool,
     },
+    /// Inspect or clear evaluator-generated API verb coverage.
+    Coverage {
+        #[command(subcommand)]
+        command: VerbCoverageCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum VerbCoverageCommands {
+    /// List active and expired generated API coverage cells.
+    List {
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
+    /// Clear evaluator-generated API coverage and its evidence.
+    Clear {
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -880,6 +903,12 @@ enum ServerCommands {
         #[arg(long = "api-proxy", value_name = "ADDR")]
         api_proxy: Option<String>,
 
+        /// YAML file containing reusable named API endpoints. Each endpoint
+        /// owns its listener, protocol, upstream credential reference, policy,
+        /// and optional brokered client output. Env: GUARD_API_ENDPOINTS.
+        #[arg(long = "api-endpoints", value_name = "PATH")]
+        api_endpoints: Option<PathBuf>,
+
         /// Protocol parser for --api-proxy: kubernetes, github, or vercel. Env:
         /// GUARD_API_PROTOCOL.
         #[arg(long = "api-protocol", value_name = "NAME")]
@@ -944,13 +973,12 @@ enum ServerCommands {
         #[arg(long = "api-rarity-escalation", value_name = "N")]
         api_rarity_escalation: Option<u64>,
 
-        /// Auto-learn exact API request shapes from repeated evaluator verdicts
-        /// on proxied evaluate traffic. On by default. Learned denies
-        /// fast-reject the same tuple; learned allows reuse the stored
-        /// risk/reversibility and still pass through consequence gating. Env:
-        /// GUARD_API_PROMOTION.
+        /// Generate exact API verb coverage from repeated evaluator verdicts.
+        /// Generated allows retain the consequence floor. Env:
+        /// GUARD_API_VERB_COVERAGE.
         #[arg(
-            long = "api-promotion",
+            long = "api-verb-coverage",
+            alias = "api-promotion",
             action = ArgAction::Set,
             num_args = 0..=1,
             default_missing_value = "true",
@@ -959,23 +987,35 @@ enum ServerCommands {
         )]
         api_promotion: Option<bool>,
 
-        /// Disable API request shape learning.
-        #[arg(long = "no-api-promotion", action = ArgAction::SetTrue, overrides_with = "api_promotion")]
+        /// Disable generated API verb coverage.
+        #[arg(long = "no-api-verb-coverage", alias = "no-api-promotion", action = ArgAction::SetTrue, overrides_with = "api_promotion")]
         no_api_promotion: bool,
 
-        /// Path to the API request shape learning state YAML.
-        /// Env: GUARD_API_PROMOTION_STATE.
-        #[arg(long = "api-promotion-state", value_name = "PATH")]
+        /// Path to generated API verb coverage state YAML.
+        /// Env: GUARD_API_VERB_COVERAGE_STATE.
+        #[arg(
+            long = "api-verb-coverage-state",
+            alias = "api-promotion-state",
+            value_name = "PATH"
+        )]
         api_promotion_state: Option<PathBuf>,
 
-        /// Evaluator approvals of the same API shape required before a learned
-        /// allow fast path is active. Env: GUARD_API_PROMOTION_MIN_APPROVALS.
-        #[arg(long = "api-promotion-min-approvals", value_name = "N")]
+        /// Evaluator approvals required before generated allow coverage is active.
+        /// Env: GUARD_API_VERB_COVERAGE_MIN_APPROVALS.
+        #[arg(
+            long = "api-verb-coverage-min-approvals",
+            alias = "api-promotion-min-approvals",
+            value_name = "N"
+        )]
         api_promotion_min_approvals: Option<u32>,
 
-        /// Evaluator denials of the same API shape required before a learned
-        /// deny fast path is active. Env: GUARD_API_PROMOTION_MIN_DENIALS.
-        #[arg(long = "api-promotion-min-denials", value_name = "N")]
+        /// Evaluator denials required before generated deny coverage is active.
+        /// Env: GUARD_API_VERB_COVERAGE_MIN_DENIALS.
+        #[arg(
+            long = "api-verb-coverage-min-denials",
+            alias = "api-promotion-min-denials",
+            value_name = "N"
+        )]
         api_promotion_min_denials: Option<u32>,
 
         /// Fire an operator command for gate lifecycle events. The command is
@@ -1014,6 +1054,30 @@ enum ServerCommands {
         #[arg(long = "session-deny-ratio-min-commands", value_name = "N")]
         session_deny_ratio_min_commands: Option<u64>,
 
+        /// Maximum simultaneous evaluator calls across API proxy traffic.
+        /// Env: GUARD_API_JUDGE_MAX_CONCURRENCY.
+        #[arg(long, value_name = "N")]
+        api_judge_max_concurrency: Option<usize>,
+
+        /// Evaluator calls admitted per minute across API proxy traffic.
+        /// Env: GUARD_API_JUDGE_RATE_PER_MINUTE.
+        #[arg(long, value_name = "N")]
+        api_judge_rate_per_minute: Option<u32>,
+
+        /// Token-bucket burst capacity for API evaluator calls.
+        /// Env: GUARD_API_JUDGE_BURST.
+        #[arg(long, value_name = "N")]
+        api_judge_burst: Option<u32>,
+
+        /// Consecutive evaluator errors that open the API judge circuit.
+        /// Env: GUARD_API_JUDGE_ERROR_THRESHOLD.
+        #[arg(long, value_name = "N")]
+        api_judge_error_threshold: Option<u32>,
+
+        /// Seconds an API judge circuit remains open after repeated errors.
+        /// Env: GUARD_API_JUDGE_CIRCUIT_COOLDOWN.
+        #[arg(long, value_name = "SECONDS")]
+        api_judge_circuit_cooldown: Option<u64>,
         /// Internal marker: launched under the Windows Service Control Manager.
         /// The Windows installer sets this in the service binPath so startup
         /// answers the SCM start/stop handshake instead of running in the

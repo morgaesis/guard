@@ -9,6 +9,7 @@
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,8 +22,67 @@ use serde_json::{json, Value};
 
 use guard::gating::Reversibility;
 use guard::proxy::{
-    ApiJudge, ApiJudgeVerdict, ApiPolicy, ApiProxy, ApiRequestSummary, GateSink, ProxyTls, Upstream,
+    ApiJudge, ApiJudgeVerdict, ApiListenerMode, ApiPolicy, ApiProxy, ApiRequestSummary,
+    ApiSessionContext, ApiSessionEvent, ApiSessionSink, GateSink, ProxyTls, Upstream,
 };
+
+struct LiveSessionSink;
+
+#[async_trait::async_trait]
+impl ApiSessionSink for LiveSessionSink {
+    async fn resolve(&self, token: &str) -> Option<ApiSessionContext> {
+        (token == "live-session").then(|| ApiSessionContext {
+            fingerprint: "session-fingerprint".to_string(),
+            intent: Some("manage development pods".to_string()),
+            can_override_baseline: true,
+        })
+    }
+
+    async fn record(&self, _token: &str, _event: ApiSessionEvent) {}
+}
+
+#[derive(Clone, Default)]
+struct RecordingSessionSink {
+    events: Arc<std::sync::Mutex<Vec<ApiSessionEvent>>>,
+}
+
+#[async_trait::async_trait]
+impl ApiSessionSink for RecordingSessionSink {
+    async fn resolve(&self, token: &str) -> Option<ApiSessionContext> {
+        (token == "live-session").then(|| ApiSessionContext {
+            fingerprint: "session-fingerprint".to_string(),
+            intent: Some("manage development pods".to_string()),
+            can_override_baseline: true,
+        })
+    }
+
+    async fn record(&self, _token: &str, event: ApiSessionEvent) {
+        self.events.lock().unwrap().push(event);
+    }
+}
+
+struct ChangingSessionSink {
+    resolutions: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ApiSessionSink for ChangingSessionSink {
+    async fn resolve(&self, token: &str) -> Option<ApiSessionContext> {
+        let attempt = self.resolutions.fetch_add(1, Ordering::SeqCst);
+        (token == "live-then-edited").then(|| ApiSessionContext {
+            fingerprint: if attempt == 0 {
+                "original-session-authority"
+            } else {
+                "edited-session-authority"
+            }
+            .to_string(),
+            intent: Some("manage development pods".to_string()),
+            can_override_baseline: true,
+        })
+    }
+
+    async fn record(&self, _token: &str, _event: ApiSessionEvent) {}
+}
 
 /// Mock apiserver: returns a Secret (with data), a ConfigMap (with data), or a
 /// generic OK for everything else. Records nothing; the proxy is what we test.
@@ -48,6 +108,9 @@ async fn mock_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, I
     };
     Ok(Response::builder()
         .header("content-type", "application/json")
+        .header("set-cookie", "upstream-session=secret")
+        .header("authorization", "Bearer upstream-response-secret")
+        .header("www-authenticate", "Bearer realm=upstream")
         .body(Full::new(Bytes::from(body.to_string())))
         .unwrap())
 }
@@ -348,6 +411,7 @@ async fn proxy_arms_auto_revert_for_writes() {
 
     let sink = RecordingSink::default();
     proxy.attach_gate(Arc::new(sink.clone()));
+    proxy.attach_session_sink(Arc::new(LiveSessionSink));
 
     tokio::spawn(proxy.clone().serve());
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -361,6 +425,7 @@ async fn proxy_arms_auto_revert_for_writes() {
     // A create in a non-prod namespace is forwarded and a delete-revert is armed.
     let resp = client
         .post(format!("{base}/api/v1/namespaces/dev/pods"))
+        .bearer_auth("live-session")
         .body("{}")
         .send()
         .await
@@ -372,6 +437,7 @@ async fn proxy_arms_auto_revert_for_writes() {
         .patch(format!(
             "{base}/apis/apps/v1/namespaces/dev/deployments/api"
         ))
+        .bearer_auth("live-session")
         .header("content-type", "application/merge-patch+json")
         .body(r#"{"spec":{"replicas":5}}"#)
         .send()
@@ -384,6 +450,11 @@ async fn proxy_arms_auto_revert_for_writes() {
 
     let calls = sink.calls.lock().unwrap();
     assert_eq!(calls.len(), 2, "both writes armed a revert");
+    assert!(calls.iter().all(|call| {
+        call.session_fingerprint.as_deref() == Some("session-fingerprint")
+            && call.upstream_target == mock_base
+            && call.upstream_identity.len() == 64
+    }));
 
     // The create armed a DELETE for the server-assigned object name.
     assert_eq!(calls[0].revert.method, "DELETE");
@@ -519,6 +590,160 @@ async fn proxy_denies_subresource_and_strips_identity_headers() {
         !received.contains_key("x-remote-user"),
         "X-Remote-User must not reach the apiserver, got headers: {received:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guard_session_bearer_is_validated_and_never_forwarded() {
+    let mock_base = spawn_header_echo_upstream().await;
+    let kubeconfig = format!(
+        "apiVersion: v1\nkind: Config\ncurrent-context: ctx\nclusters:\n  - name: c\n    cluster: {{server: \"{mock_base}\"}}\ncontexts:\n  - name: ctx\n    context: {{cluster: c, user: u}}\nusers:\n  - name: u\n    user: {{token: upstream-only}}\n"
+    );
+    let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
+    let tls = ProxyTls::generate().expect("tls");
+    let ca_pem = tls.ca_pem().to_string();
+    let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).unwrap();
+    let port = free_port();
+    let listen = format!("127.0.0.1:{port}").parse().unwrap();
+    let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
+    proxy.attach_session_sink(Arc::new(LiveSessionSink));
+    tokio::spawn(proxy.clone().serve());
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    let base = format!("https://127.0.0.1:{port}");
+
+    let response = client
+        .get(format!("{base}/api/v1/namespaces/dev/pods"))
+        .bearer_auth("live-session")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(!response.headers().contains_key("set-cookie"));
+    assert!(!response.headers().contains_key("authorization"));
+    assert!(!response.headers().contains_key("www-authenticate"));
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(
+        body["receivedHeaders"]["authorization"].as_str(),
+        Some("Bearer upstream-only"),
+        "the Guard session bearer must be replaced by the upstream credential"
+    );
+
+    let invalid = client
+        .get(format!("{base}/api/v1/namespaces/dev/pods"))
+        .bearer_auth("expired-session")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        invalid.status(),
+        403,
+        "unknown or expired sessions fail closed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readonly_listener_requires_session_override_and_keeps_protocol_denies() {
+    let mock_base = spawn_mock_upstream().await;
+    let upstream =
+        Upstream::from_kubeconfig_str(&kubeconfig_for(&mock_base), None).expect("upstream");
+    let tls = ProxyTls::generate().expect("tls");
+    let ca_pem = tls.ca_pem().to_string();
+    let policy = ApiPolicy::from_yaml("default: allow\n").unwrap();
+    let port = free_port();
+    let listen = format!("127.0.0.1:{port}").parse().unwrap();
+    let proxy = Arc::new(
+        ApiProxy::new(listen, tls, upstream, policy, None)
+            .with_listener_mode(ApiListenerMode::Readonly),
+    );
+    let judge = RecordingJudge::new(vec![judge_allow(Some(1), Some(Reversibility::Reversible))]);
+    proxy.attach_judge(Arc::new(judge.clone()));
+    proxy.attach_session_sink(Arc::new(LiveSessionSink));
+    tokio::spawn(proxy.clone().serve());
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    let base = format!("https://127.0.0.1:{port}");
+
+    let unscoped = client
+        .post(format!("{base}/api/v1/namespaces/dev/pods"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unscoped.status(), 403);
+
+    let scoped = client
+        .post(format!("{base}/api/v1/namespaces/dev/pods"))
+        .bearer_auth("live-session")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(scoped.status(), 200);
+    {
+        let summaries = judge.summaries.lock().unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].session_intent.as_deref(),
+            Some("manage development pods")
+        );
+    }
+
+    let hard_deny = client
+        .post(format!("{base}/api/v1/namespaces/dev/pods/web/exec"))
+        .bearer_auth("live-session")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hard_deny.status(), 403);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_expansion_is_revalidated_immediately_before_forward() {
+    let mock_base = spawn_mock_upstream().await;
+    let upstream =
+        Upstream::from_kubeconfig_str(&kubeconfig_for(&mock_base), None).expect("upstream");
+    let tls = ProxyTls::generate().expect("tls");
+    let ca_pem = tls.ca_pem().to_string();
+    let policy = ApiPolicy::from_yaml("default: allow\n").unwrap();
+    let port = free_port();
+    let listen = format!("127.0.0.1:{port}").parse().unwrap();
+    let proxy = Arc::new(
+        ApiProxy::new(listen, tls, upstream, policy, None)
+            .with_listener_mode(ApiListenerMode::Readonly),
+    );
+    proxy.attach_judge(Arc::new(RecordingJudge::new(vec![judge_allow(
+        Some(1),
+        Some(Reversibility::Reversible),
+    )])));
+    proxy.attach_session_sink(Arc::new(ChangingSessionSink {
+        resolutions: AtomicUsize::new(0),
+    }));
+    tokio::spawn(proxy.clone().serve());
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    let response = client
+        .patch(format!(
+            "https://127.0.0.1:{port}/api/v1/namespaces/dev/pods/web"
+        ))
+        .bearer_auth("live-then-edited")
+        .header("content-type", "application/merge-patch+json")
+        .body(r#"{"metadata":{"labels":{"checked":"true"}}}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 403);
+    assert!(response.text().await.unwrap().contains("revoked"));
 }
 
 /// A `SelfSubjectAccessReview` (`kubectl auth can-i`) is forwarded with the same
@@ -727,6 +952,49 @@ async fn proxy_allows_contained_delete_of_created_resource() {
         403,
         "provenance is consumed; a repeat delete is held again"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn created_provenance_never_overrides_an_explicit_policy_deny() {
+    let mock_base = spawn_create_delete_mock().await;
+    let upstream =
+        Upstream::from_kubeconfig_str(&kubeconfig_for(&mock_base), None).expect("upstream");
+    let tls = ProxyTls::generate().expect("tls");
+    let ca_pem = tls.ca_pem().to_string();
+    let policy = ApiPolicy::from_yaml(
+        "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n  - verbs: [delete]\n    resources: [pods]\n    namespaces: [dev]\n    action: deny\n",
+    )
+    .unwrap();
+    let port = free_port();
+    let listen = format!("127.0.0.1:{port}").parse().unwrap();
+    let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
+    let sink = RecordingSink::default();
+    proxy.attach_gate(Arc::new(sink.clone()));
+    tokio::spawn(proxy.clone().serve());
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    let base = format!("https://127.0.0.1:{port}");
+    let created = client
+        .post(format!("{base}/api/v1/namespaces/dev/pods"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    created.bytes().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let denied = client
+        .delete(format!("{base}/api/v1/namespaces/dev/pods/check-pod"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), 403);
+    assert!(sink.resolved.lock().unwrap().is_empty());
 }
 
 /// Mock apiserver that returns a Secret read as a 200 with a non-JSON
@@ -1038,7 +1306,12 @@ impl guard::proxy::GateSink for ApprovingSink {
         None
     }
 
-    async fn hold_request(&self, _label: &str, _reason: &str) -> guard::proxy::HoldDecision {
+    async fn hold_request(
+        &self,
+        _label: &str,
+        _reason: &str,
+        _session_fingerprint: Option<&str>,
+    ) -> guard::proxy::HoldDecision {
         guard::proxy::HoldDecision::Approved {
             handle: "test-approved".to_string(),
         }
@@ -1102,6 +1375,8 @@ rules:
     let listen = format!("127.0.0.1:{port}").parse().unwrap();
     let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
     proxy.attach_gate(Arc::new(ApprovingSink));
+    let session_sink = RecordingSessionSink::default();
+    proxy.attach_session_sink(Arc::new(session_sink.clone()));
     tokio::spawn(proxy.clone().serve());
     tokio::time::sleep(Duration::from_millis(150)).await;
 
@@ -1112,10 +1387,15 @@ rules:
         .unwrap();
     let resp = client
         .delete(format!("{base}/api/v1/namespaces/dev/pods/web-0"))
+        .bearer_auth("live-session")
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "an approved hold is forwarded upstream");
+    let events = session_sink.events.lock().unwrap();
+    assert_eq!(events.len(), 1, "the held request is recorded once");
+    assert!(events[0].held, "an approved hold remains held in history");
+    assert!(events[0].allowed, "the operator-approved hold was allowed");
 }
 
 /// Gate sink that counts hold requests and approves each, so a test can assert
@@ -1131,7 +1411,12 @@ impl guard::proxy::GateSink for CountingSink {
         None
     }
 
-    async fn hold_request(&self, _label: &str, _reason: &str) -> guard::proxy::HoldDecision {
+    async fn hold_request(
+        &self,
+        _label: &str,
+        _reason: &str,
+        _session_fingerprint: Option<&str>,
+    ) -> guard::proxy::HoldDecision {
         *self.holds.lock().unwrap() += 1;
         guard::proxy::HoldDecision::Approved {
             handle: "test-approved".to_string(),

@@ -306,6 +306,7 @@ impl Drop for ProxyHoldOrphanGuard {
 /// `guard confirm` / `guard provisionals` / `guard revert` commands.
 pub(super) struct DaemonGateSink {
     pub(super) config: ServerConfig,
+    pub(super) endpoint: String,
     pub(super) protocol: String,
     pub(super) snapshot_dir: PathBuf,
     /// Whether `snapshot_dir` is exclusively the daemon's. When false, a
@@ -378,7 +379,10 @@ impl guard::proxy::GateSink for DaemonGateSink {
             None
         };
         let api_revert = ApiRevertPlan {
+            endpoint: self.endpoint.clone(),
             protocol: self.protocol.clone(),
+            upstream_target: mutation.upstream_target,
+            upstream_identity: mutation.upstream_identity,
             method: mutation.revert.method,
             path: mutation.revert.path,
             body_file,
@@ -399,7 +403,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
             confirm_check_binary: None,
             confirm_check_args: Vec::new(),
             control_path: Some(format!("daemon API proxy for protocol {}", self.protocol)),
-            session_fingerprint: None,
+            session_fingerprint: mutation.session_fingerprint.clone(),
             reason: mutation.label,
             created_unix: now,
             deadline_unix: now.saturating_add(self.window_secs),
@@ -419,7 +423,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
             event: "provisional_armed",
             at_unix: now,
             handle: Some(handle.clone()),
-            session_fingerprint: None,
+            session_fingerprint: mutation.session_fingerprint,
             reason: Some(provisional.reason.clone()),
             status: Some("armed".to_string()),
             behavior: None,
@@ -427,7 +431,12 @@ impl guard::proxy::GateSink for DaemonGateSink {
         Some(handle)
     }
 
-    async fn hold_request(&self, label: &str, reason: &str) -> guard::proxy::HoldDecision {
+    async fn hold_request(
+        &self,
+        label: &str,
+        reason: &str,
+        session_fingerprint: Option<&str>,
+    ) -> guard::proxy::HoldDecision {
         use guard::proxy::HoldDecision;
         let principal = Some(self.config.daemon_principal.clone());
         if let Some(why) = gate_capacity_reason(&self.config, principal.as_ref()).await {
@@ -445,7 +454,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
             cwd: None,
             env: std::collections::BTreeMap::new(),
             secret_keys: std::collections::BTreeMap::new(),
-            session_fingerprint: None,
+            session_fingerprint: session_fingerprint.map(str::to_string),
             secret_file_keys: std::collections::BTreeMap::new(),
             verb_name: None,
             verb_params: std::collections::BTreeMap::new(),
@@ -477,8 +486,9 @@ impl guard::proxy::GateSink for DaemonGateSink {
             .enqueue(approval.clone());
         persist_approval(&self.config, &approval).await;
         tracing::info!(target: "guard::audit",
-            "[AUDIT] HELD handle={} caller=(api-proxy) session=none api=\"{}\" ttl={}s",
+            "[AUDIT] HELD handle={} caller=(api-proxy) session={} api=\"{}\" ttl={}s",
             handle,
+            session_fingerprint.unwrap_or("none"),
             label,
             APPROVAL_TTL_SECS
         );
@@ -486,7 +496,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
             event: "hold_created",
             at_unix: now,
             handle: Some(handle.clone()),
-            session_fingerprint: None,
+            session_fingerprint: session_fingerprint.map(str::to_string),
             reason: Some(reason.to_string()),
             status: Some("pending".to_string()),
             behavior: None,
@@ -1763,21 +1773,52 @@ async fn run_api_revert(
     p: &Provisional,
     api: &ApiRevertPlan,
 ) -> Result<(), RevertError> {
-    let Some(proxy) = config
-        .protocol_registry
-        .read()
-        .await
-        .get(&api.protocol)
-        .cloned()
-    else {
+    let registry = config.protocol_registry.read().await;
+    let proxy = if api.endpoint.is_empty() {
+        let mut matches = registry
+            .values()
+            .filter(|proxy| proxy.protocol_name() == api.protocol);
+        let first = matches.next().cloned();
+        if first.is_some() && matches.next().is_some() {
+            return Err(RevertError::Retryable(format!(
+                "persisted API revert for protocol '{}' predates endpoint binding and matches multiple running endpoints; the change is still live and needs an operator decision",
+                api.protocol
+            )));
+        }
+        first
+    } else {
+        registry.get(&api.endpoint).cloned()
+    };
+    let Some(proxy) = proxy else {
         // The mutation is still live; the proxy that would carry the revert is
         // just not running now (a restart without the flag, a protocol change).
         // Surface it for an operator decision rather than burning the revert.
+        let target = if api.endpoint.is_empty() {
+            format!("no running api-proxy for protocol '{}'", api.protocol)
+        } else {
+            format!(
+                "no running API endpoint '{}' for protocol '{}'",
+                api.endpoint, api.protocol
+            )
+        };
         return Err(RevertError::Retryable(format!(
-            "no running api-proxy for protocol '{}'; the change is still live and needs an operator decision",
-            api.protocol
+            "{target}; the change is still live and needs an operator decision"
         )));
     };
+    if api.upstream_target.is_empty() || api.upstream_identity.is_empty() {
+        return Err(RevertError::Retryable(
+            "persisted API revert predates upstream identity binding; the change is still live and needs an operator decision"
+                .to_string(),
+        ));
+    }
+    if !proxy.matches_upstream_identity(&api.protocol, &api.upstream_target, &api.upstream_identity)
+    {
+        return Err(RevertError::Retryable(format!(
+            "API endpoint '{}' no longer matches the protocol, target, and credential identity that armed this revert; the change is still live and needs an operator decision",
+            api.endpoint
+        )));
+    }
+    drop(registry);
     let body = if let Some(path) = &api.body_file {
         Some(tokio::fs::read(path).await.map_err(|e| {
             RevertError::Failed(format!("read api revert body {}: {e}", path.display()))

@@ -474,6 +474,11 @@ pub enum AdminRequest {
         #[serde(default)]
         preview: bool,
     },
+    /// List evaluator-generated API verb coverage. Operator-only because
+    /// coverage reveals policy topology and evaluator regime identifiers.
+    VerbCoverageList,
+    /// Clear evaluator-generated API verb coverage and evidence.
+    VerbCoverageClear,
 }
 
 impl AdminRequest {
@@ -583,6 +588,12 @@ pub enum AdminResponse {
         verb: guard::gating::verb::Verb,
         /// True when the verb was written to the catalog; false for a preview.
         persisted: bool,
+    },
+    VerbCoverage {
+        items: Vec<guard::gating::api_promotion::ApiCoverageEntry>,
+    },
+    VerbCoverageCleared {
+        removed: usize,
     },
 }
 

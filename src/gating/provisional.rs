@@ -151,7 +151,13 @@ impl Provisional {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiRevertPlan {
+    #[serde(default)]
+    pub endpoint: String,
     pub protocol: String,
+    #[serde(default)]
+    pub upstream_target: String,
+    #[serde(default)]
+    pub upstream_identity: String,
     pub method: String,
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

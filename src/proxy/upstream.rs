@@ -4,8 +4,9 @@
 //! `auth-provider` credential plugins are rejected because the proxy cannot run
 //! them and a brokered client that could would reach the apiserver around the
 //! gate. Other protocols build from a base URL plus an optional bearer token.
-//! The daemon holds these credentials; the brokered config the agent receives
-//! carries none, so the proxy is the sole path to the upstream.
+//! The daemon holds these upstream credentials. A brokered config carries no
+//! upstream credential, though it may carry a Guard session bearer that the
+//! proxy consumes, so the proxy is the sole path to the upstream.
 
 use std::path::Path;
 
@@ -91,6 +92,7 @@ pub struct Upstream {
     client: reqwest::Client,
     bearer: Option<String>,
     basic: Option<(String, String)>,
+    identity_fingerprint: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,11 +129,21 @@ impl Upstream {
             UpstreamAuth::None => None,
             UpstreamAuth::Bearer(token) => Some(token),
         };
+        let canonical_base = base.trim_end_matches('/').to_string();
+        let identity_fingerprint = fingerprint_identity(
+            &canonical_base,
+            if let Some(token) = bearer.as_deref() {
+                ("bearer", token.as_bytes())
+            } else {
+                ("none", &[])
+            },
+        );
         Ok(Self {
-            base: base.trim_end_matches('/').to_string(),
+            base: canonical_base,
             client,
             bearer,
             basic: None,
+            identity_fingerprint,
         })
     }
 
@@ -250,6 +262,7 @@ impl Upstream {
         // Bind the single method to the client/request path. Attaching the client
         // certificate is a client-level decision, so only do it when the cert is
         // the elected method (a token takes precedence and stands alone).
+        let selected_client_cert = bearer.is_none() && client_identity.is_some();
         let (bearer, basic) = if bearer.is_some() {
             (bearer, None)
         } else if client_identity.is_some() {
@@ -264,11 +277,30 @@ impl Upstream {
         }
 
         let client = builder.build().context("build upstream TLS client")?;
+        let base = cluster.cluster.server.trim_end_matches('/').to_string();
+        let identity_fingerprint = if let Some(token) = bearer.as_deref() {
+            fingerprint_identity(&base, ("bearer", token.as_bytes()))
+        } else if selected_client_cert {
+            fingerprint_identity(
+                &base,
+                (
+                    "client-certificate",
+                    cert_pem.as_deref().unwrap_or_default(),
+                ),
+            )
+        } else if let Some((username, _password)) = basic.as_ref() {
+            // The username is the Basic-auth principal. Hashing the password
+            // would persist an offline verifier in revert metadata.
+            fingerprint_identity(&base, ("basic", username.as_bytes()))
+        } else {
+            fingerprint_identity(&base, ("none", &[]))
+        };
         Ok(Self {
-            base: cluster.cluster.server.trim_end_matches('/').to_string(),
+            base,
             client,
             bearer,
             basic,
+            identity_fingerprint,
         })
     }
 
@@ -293,6 +325,27 @@ impl Upstream {
     pub fn basic_auth(&self) -> Option<(&str, &str)> {
         self.basic.as_ref().map(|(u, p)| (u.as_str(), p.as_str()))
     }
+
+    /// Secret-free digest of the canonical target and selected upstream
+    /// authentication identity. Credential values never leave this object.
+    pub fn identity_fingerprint(&self) -> &str {
+        &self.identity_fingerprint
+    }
+}
+
+fn fingerprint_identity(base: &str, auth: (&str, &[u8])) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(base.as_bytes());
+    hasher.update([0]);
+    hasher.update(auth.0.as_bytes());
+    hasher.update([0]);
+    hasher.update(auth.1);
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Resolve a PEM field that may be inline base64 (`*-data`) or a file path.
@@ -338,6 +391,23 @@ users:
         let up = Upstream::from_kubeconfig_str(yaml, None).expect("parse");
         assert_eq!(up.base(), "https://api.example.test:6443");
         assert_eq!(up.bearer(), Some("brokered-secret-token"));
+        assert_eq!(up.identity_fingerprint().len(), 64);
+        assert!(!up.identity_fingerprint().contains("brokered-secret-token"));
+    }
+
+    #[test]
+    fn identity_fingerprint_changes_when_the_credential_rotates() {
+        let first = Upstream::from_base_url(
+            "https://api.example.test",
+            UpstreamAuth::Bearer("token-one".to_string()),
+        )
+        .unwrap();
+        let second = Upstream::from_base_url(
+            "https://api.example.test",
+            UpstreamAuth::Bearer("token-two".to_string()),
+        )
+        .unwrap();
+        assert_ne!(first.identity_fingerprint(), second.identity_fingerprint());
     }
 
     #[test]

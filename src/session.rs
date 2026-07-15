@@ -211,6 +211,7 @@ pub enum SessionDecisionSource {
     LearnedDeny,
     Validation,
     EvaluatorError,
+    ApiProxy,
 }
 
 impl SessionDecisionSource {
@@ -225,6 +226,7 @@ impl SessionDecisionSource {
             Self::LearnedDeny => "learned_deny",
             Self::Validation => "validation",
             Self::EvaluatorError => "evaluator_error",
+            Self::ApiProxy => "api_proxy",
         }
     }
 }
@@ -256,9 +258,8 @@ pub struct SessionInteraction {
     /// `None` also covers signals and paths where no child was started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
-    /// Secret-store key names whose values entered the environment of a
-    /// successfully spawned child. This records exposure, not proof that the
-    /// child read or consumed a value. Values are never persisted.
+    /// Safe references to brokered credentials made available to the operation.
+    /// Values are never persisted.
     #[serde(default, alias = "secret_refs", skip_serializing_if = "Vec::is_empty")]
     pub exposed_secret_refs: Vec<String>,
 }
@@ -675,6 +676,34 @@ impl SessionRegistry {
             return None;
         }
         grant.prompt_append.clone()
+    }
+
+    /// Return the authority fingerprint and evaluator intent for API requests
+    /// attributed to this live grant. The fingerprint changes when the prompt
+    /// or expiry changes, so delayed work cannot outlive the authority that was
+    /// evaluated even when an operator edits a grant under the same token.
+    pub fn api_authority_for(&self, token: &str) -> Option<(String, Option<String>)> {
+        let grant = self.grants.get(token)?;
+        if grant.is_expired(now_unix()) {
+            return None;
+        }
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(token.as_bytes());
+        hasher.update([0]);
+        if let Some(expiry) = grant.expires_at {
+            hasher.update(expiry.to_le_bytes());
+        }
+        hasher.update([0]);
+        if let Some(prompt) = grant.prompt_append.as_deref() {
+            hasher.update(prompt.as_bytes());
+        }
+        let fingerprint = hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        Some((fingerprint, grant.prompt_append.clone()))
     }
 
     pub fn verb_scope_for(&self, token: &str) -> Option<(Vec<String>, Vec<String>)> {
@@ -1144,6 +1173,32 @@ mod tests {
             Some("session is restoring a backup")
         );
         assert!(reg.prompt_append_for("missing").is_none());
+    }
+
+    #[test]
+    fn api_authority_fingerprint_changes_when_prompt_is_edited() {
+        let mut reg = SessionRegistry::new();
+        let grant = |prompt: &str| SessionGrant {
+            allow: vec![],
+            deny: vec![],
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            activated_verbs: Vec::new(),
+            override_markers: Vec::new(),
+            expires_at: None,
+            granted_at: 0,
+            prompt_append: Some(prompt.to_string()),
+            generated_notes: Vec::new(),
+            static_only: false,
+            auto_amend: false,
+        };
+        reg.grant("tok".to_string(), grant("inspect development pods"));
+        let (before, _) = reg.api_authority_for("tok").unwrap();
+        reg.grant("tok".to_string(), grant("apply development pods"));
+        let (after, intent) = reg.api_authority_for("tok").unwrap();
+
+        assert_ne!(before, after);
+        assert_eq!(intent.as_deref(), Some("apply development pods"));
     }
 
     #[test]

@@ -1007,6 +1007,27 @@ pub(super) async fn handle_admin_request(
                 },
             }
         }
+        AdminRequest::VerbCoverageList => {
+            let items = match &config.api_coverage {
+                Some(store) => store.read().await.coverage(),
+                None => Vec::new(),
+            };
+            AdminResponse::VerbCoverage { items }
+        }
+        AdminRequest::VerbCoverageClear => {
+            let Some(store) = &config.api_coverage else {
+                return AdminResponse::VerbCoverageCleared { removed: 0 };
+            };
+            match store.write().await.clear_generated() {
+                Ok(removed) => {
+                    tracing::info!(target: "guard::audit", "[AUDIT] API_VERB_COVERAGE_CLEARED removed={}", removed);
+                    AdminResponse::VerbCoverageCleared { removed }
+                }
+                Err(error) => AdminResponse::Error {
+                    message: format!("failed to clear generated API verb coverage: {error}"),
+                },
+            }
+        }
     }
 }
 

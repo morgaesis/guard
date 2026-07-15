@@ -38,8 +38,8 @@ use tokio::sync::RwLock;
 use tokio_rustls::TlsAcceptor;
 
 use super::gate::{
-    ApiJudge, ApiJudgeVerdict, ApiMutation, ApiRequestSummary, GateSink, HoldDecision,
-    RevertConstructible,
+    ApiJudge, ApiJudgeVerdict, ApiMutation, ApiRequestSummary, ApiSessionContext, ApiSessionEvent,
+    ApiSessionSink, GateSink, HoldDecision, RevertConstructible,
 };
 use super::k8s_protocol::KubernetesProtocol;
 use super::op::{ApiOp, Verb};
@@ -58,6 +58,19 @@ const POLICY_RELOAD_SECS: u64 = 5;
 
 type ProxyBody = BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
 type JudgeBuilder = dyn Fn(Option<String>) -> Option<Arc<dyn ApiJudge>> + Send + Sync;
+const GUARD_SESSION_HEADER: &str = "x-guard-session";
+
+#[derive(Debug, Clone)]
+struct GuardRejected;
+
+#[derive(Debug, Clone)]
+struct GuardHeld;
+
+#[derive(Debug, Clone)]
+struct SessionAuth {
+    token: String,
+    context: ApiSessionContext,
+}
 
 /// A configured API proxy: TLS identity, upstream connection, the attached
 /// protocol plug-in, and the hot-reloaded operator policy. Hosted by the daemon
@@ -96,6 +109,17 @@ pub struct ApiProxy {
     /// scrutiny on the first few occurrences of any shape it covers. Disabled
     /// (threshold 0) unless the operator opts in.
     rarity: RarityTracker,
+    endpoint: String,
+    credential_ref: String,
+    session_sink: OnceLock<Arc<dyn ApiSessionSink>>,
+    listener_mode: ApiListenerMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ApiListenerMode {
+    #[default]
+    Policy,
+    Readonly,
 }
 
 /// A request shape for rarity accounting: the typed operation minus its object
@@ -158,11 +182,11 @@ impl RarityTracker {
 /// provenance matching.
 ///
 /// The `conn` field scopes provenance to the connection that created the
-/// resource. The proxy authenticates no caller -- its brokered kubeconfig is
-/// credential-free (`with_no_client_auth`) -- so a single TLS/HTTP connection is
-/// the finest caller identity available. A delete arriving on a different
-/// connection than the create never matches, so the provenance shortcut is
-/// scoped to the connection that created a resource; a delete on any other
+/// resource. The TLS listener requests no client certificate. Caller scope is
+/// established by a Guard session bearer when one is supplied, and the bearer
+/// is consumed before the request reaches the upstream connection. A delete
+/// arriving on a different connection than the create never matches, so the
+/// provenance shortcut is scoped to the connection that created a resource; a delete on any other
 /// connection falls through to standard policy evaluation. Kubernetes
 /// clients (client-go, used by kubectl/helm) negotiate HTTP/2 and multiplex a
 /// process's whole session over one connection, so a legitimate same-process
@@ -170,6 +194,7 @@ impl RarityTracker {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CreatedKey {
     conn: u64,
+    session_fingerprint: Option<String>,
     group: String,
     resource: String,
     namespace: Option<String>,
@@ -258,7 +283,30 @@ impl ApiProxy {
             created: Mutex::new(CreatedRegistry::default()),
             next_conn: AtomicU64::new(1),
             rarity: RarityTracker::new(0),
+            endpoint: "default".to_string(),
+            credential_ref: "upstream".to_string(),
+            session_sink: OnceLock::new(),
+            listener_mode: ApiListenerMode::Policy,
         }
+    }
+
+    pub fn with_endpoint_context(
+        mut self,
+        endpoint: impl Into<String>,
+        credential_ref: impl Into<String>,
+    ) -> Self {
+        self.endpoint = endpoint.into();
+        self.credential_ref = credential_ref.into();
+        self
+    }
+
+    pub fn with_listener_mode(mut self, mode: ApiListenerMode) -> Self {
+        self.listener_mode = mode;
+        self
+    }
+
+    pub fn attach_session_sink(&self, sink: Arc<dyn ApiSessionSink>) {
+        let _ = self.session_sink.set(sink);
     }
 
     /// Enable rarity-based escalation: a policy-allowed request whose shape has
@@ -319,9 +367,17 @@ impl ApiProxy {
         &self.proxy_url
     }
 
-    /// The agent-facing brokered kubeconfig (points at the proxy, no credential).
+    /// The agent-facing brokered kubeconfig without a Guard session bearer.
     pub fn brokered_kubeconfig(&self) -> String {
         super::kubeconfig::brokered_kubeconfig(&self.proxy_url, &self.tls.ca_data_b64())
+    }
+
+    pub fn brokered_kubeconfig_with_session(&self, session_token: &str) -> String {
+        super::kubeconfig::brokered_kubeconfig_with_session(
+            &self.proxy_url,
+            &self.tls.ca_data_b64(),
+            session_token,
+        )
     }
 
     /// Accept loop: terminate TLS and serve each connection. Returns only on a
@@ -377,7 +433,8 @@ impl ApiProxy {
             let acceptor = acceptor.clone();
             let me = self.clone();
             // A per-connection id scopes delete provenance to the connection that
-            // created a resource (the proxy authenticates no caller).
+            // created a resource. The Guard session bearer is request context,
+            // not an upstream Kubernetes identity.
             let conn_id = self.next_conn.fetch_add(1, Ordering::Relaxed);
             tokio::spawn(async move {
                 let tls_stream = match acceptor.accept(tcp).await {
@@ -404,7 +461,63 @@ impl ApiProxy {
 
     /// Classify and dispatch one request. Always returns a response (never errors
     /// the connection); upstream and policy failures become HTTP status bodies.
-    async fn route(&self, req: Request<Incoming>, conn_id: u64) -> Response<ProxyBody> {
+    async fn route(&self, mut req: Request<Incoming>, conn_id: u64) -> Response<ProxyBody> {
+        let method = req.method().clone();
+        let path = req.uri().path().to_string();
+        let session_token = match take_guard_session(req.headers_mut()) {
+            Ok(token) => token,
+            Err(reason) => {
+                return self.status_resp(StatusCode::FORBIDDEN, reason, "Forbidden");
+            }
+        };
+        let session_context = if let Some(token) = session_token.as_deref() {
+            let Some(sink) = self.session_sink.get() else {
+                return self.status_resp(
+                    StatusCode::FORBIDDEN,
+                    "guard api-proxy: session attribution is unavailable",
+                    "Forbidden",
+                );
+            };
+            match sink.resolve(token).await {
+                Some(context) => Some(context),
+                None => {
+                    return self.status_resp(
+                        StatusCode::FORBIDDEN,
+                        "guard api-proxy: unknown or expired session",
+                        "Forbidden",
+                    )
+                }
+            }
+        } else {
+            None
+        };
+        if let (Some(token), Some(context)) = (session_token.clone(), session_context.clone()) {
+            req.extensions_mut().insert(SessionAuth { token, context });
+        }
+        let response = self.route_inner(req, conn_id, session_context).await;
+        if let (Some(token), Some(sink)) = (session_token.as_deref(), self.session_sink.get()) {
+            sink.record(
+                token,
+                ApiSessionEvent {
+                    endpoint: self.endpoint.clone(),
+                    operation: format!("{} {}", method, path),
+                    allowed: response.extensions().get::<GuardRejected>().is_none(),
+                    status: response.status().as_u16(),
+                    held: response.extensions().get::<GuardHeld>().is_some(),
+                    credential_ref: self.credential_ref.clone(),
+                },
+            )
+            .await;
+        }
+        response
+    }
+
+    async fn route_inner(
+        &self,
+        req: Request<Incoming>,
+        conn_id: u64,
+        session_context: Option<ApiSessionContext>,
+    ) -> Response<ProxyBody> {
         let method = req.method().clone();
         let path = req.uri().path().to_string();
         let query = req.uri().query().unwrap_or("").to_string();
@@ -441,7 +554,25 @@ impl ApiProxy {
             return self.status_resp(StatusCode::FORBIDDEN, &reason, "Forbidden");
         }
 
+        let readonly_session_override = self.listener_mode == ApiListenerMode::Readonly
+            && !op.is_read()
+            && session_context
+                .as_ref()
+                .is_some_and(|context| context.can_override_baseline);
+        if self.listener_mode == ApiListenerMode::Readonly
+            && !op.is_read()
+            && !readonly_session_override
+        {
+            return self.status_resp(
+                StatusCode::FORBIDDEN,
+                "guard api-proxy: listener readonly baseline denied a write without a session override",
+                "Forbidden",
+            );
+        }
+
         let label = format!("{} {}", op.verb.as_str(), path);
+
+        let decision = self.policy.read().await.decide(&op);
 
         // A delete of a resource guard itself created (and is still tracking for
         // auto-revert) in this process is contained cleanup — e.g. a Helm
@@ -450,8 +581,19 @@ impl ApiProxy {
         // untracked delete. Provenance is evidence-based: only a resource the
         // proxy forwarded a create for matches, so deletes of resources with no
         // creation record keep the standard policy handling.
-        if op.verb == Verb::Delete && op.subresource.is_none() {
-            if let Some(handle) = self.take_created_provenance(&op, conn_id) {
+        // Explicit policy denies remain absolute. Provenance can simplify a
+        // permitted cleanup, but it never overrides an operator deny.
+        if !matches!(decision.action, ApiAction::Deny)
+            && op.verb == Verb::Delete
+            && op.subresource.is_none()
+        {
+            if let Some(handle) = self.take_created_provenance(
+                &op,
+                conn_id,
+                session_context
+                    .as_ref()
+                    .map(|context| context.fingerprint.as_str()),
+            ) {
                 tracing::info!(
                     target: "guard::audit",
                     "ALLOW {} (contained: guard-created this session, resolving auto-revert {})",
@@ -465,7 +607,6 @@ impl ApiProxy {
             }
         }
 
-        let decision = self.policy.read().await.decide(&op);
         match decision.action {
             ApiAction::Deny => {
                 tracing::info!(target: "guard::apiproxy", "DENY {} ({})", label, decision.reason);
@@ -484,10 +625,19 @@ impl ApiProxy {
                     .await
             }
             ApiAction::Evaluate => {
-                self.route_evaluate(req, &path, &query, &op, false, conn_id)
+                self.route_evaluate(req, &path, &op, false, conn_id, session_context.as_ref())
                     .await
             }
             ApiAction::Allow => {
+                // A session can expand the listener's readonly baseline, but
+                // the expansion is prose intent rather than typed coverage.
+                // Judge it before accepting a policy-wide allow so the session
+                // prompt remains an actual boundary instead of a bypass flag.
+                if readonly_session_override {
+                    return self
+                        .route_evaluate(req, &path, &op, false, conn_id, session_context.as_ref())
+                        .await;
+                }
                 // Rarity escalation: a broad allow rule fails toward scrutiny on
                 // a shape it covers that the proxy has rarely (or never) seen.
                 // With a judge attached, the rare shape is evaluated with an
@@ -503,7 +653,14 @@ impl ApiProxy {
                                 label
                             );
                             return self
-                                .route_evaluate(req, &path, &query, &op, true, conn_id)
+                                .route_evaluate(
+                                    req,
+                                    &path,
+                                    &op,
+                                    true,
+                                    conn_id,
+                                    session_context.as_ref(),
+                                )
                                 .await;
                         } else {
                             let reason = format!(
@@ -533,18 +690,19 @@ impl ApiProxy {
         &self,
         req: Request<Incoming>,
         path: &str,
-        query: &str,
         op: &ApiOp,
         rarity: bool,
         conn_id: u64,
+        session_context: Option<&ApiSessionContext>,
     ) -> Response<ProxyBody> {
         let label = format!("{} {}", op.verb.as_str(), path);
+        let query = req.uri().query().unwrap_or("").to_string();
         let Some(judge) = self.judge.read().unwrap().clone() else {
             return self
                 .route_hold(
                     req,
                     path,
-                    query,
+                    &query,
                     op,
                     "api-policy evaluate requested but no evaluator is attached",
                     conn_id,
@@ -568,7 +726,7 @@ impl ApiProxy {
             protocol: self.protocol.name().to_string(),
             verb: op.verb.as_str().to_string(),
             path: path.to_string(),
-            redacted_query: crate::evaluate::redact_for_llm(query),
+            redacted_query: crate::evaluate::redact_for_llm(&query),
             group: op.group.clone(),
             version: op.version.clone(),
             resource: op.resource.clone(),
@@ -579,6 +737,15 @@ impl ApiProxy {
             redacted_body_shape: body_shape,
             revert_constructible: prepared,
             rarity,
+            endpoint: self.endpoint.clone(),
+            session_fingerprint: session_context.map(|context| context.fingerprint.clone()),
+            session_intent: session_context.and_then(|context| {
+                context
+                    .intent
+                    .as_deref()
+                    .map(crate::evaluate::redact_for_llm)
+            }),
+            credential_ref: self.credential_ref.clone(),
         };
 
         match judge.judge(&summary).await {
@@ -647,7 +814,7 @@ impl ApiProxy {
                             parts,
                             body,
                             path,
-                            query,
+                            &query,
                             redact,
                             Some(op.clone()),
                             conn_id,
@@ -679,7 +846,7 @@ impl ApiProxy {
                                     parts,
                                     body,
                                     path,
-                                    query,
+                                    &query,
                                     op,
                                     "evaluator allowed a contained write but no auto-revert can be armed right now",
                                     conn_id,
@@ -695,7 +862,7 @@ impl ApiProxy {
                                             parts,
                                             body,
                                             path,
-                                            query,
+                                            &query,
                                             op,
                                             "evaluator allowed a contained write but its revert could not be re-established at forward time",
                                             conn_id,
@@ -720,7 +887,7 @@ impl ApiProxy {
                             parts,
                             body,
                             path,
-                            query,
+                            &query,
                             redact,
                             Some(op.clone()),
                             conn_id,
@@ -733,7 +900,7 @@ impl ApiProxy {
                             parts,
                             body,
                             path,
-                            query,
+                            &query,
                             op,
                             &format!("api evaluator allowed but consequence gate held: {reason}"),
                             conn_id,
@@ -795,7 +962,11 @@ impl ApiProxy {
             );
         };
         tracing::info!(target: "guard::apiproxy", "HOLD {} ({})", label, reason);
-        match gate.hold_request(label, reason).await {
+        let session_fingerprint = req
+            .extensions()
+            .get::<SessionAuth>()
+            .map(|auth| auth.context.fingerprint.as_str());
+        let mut response = match gate.hold_request(label, reason, session_fingerprint).await {
             HoldDecision::Approved { handle } => {
                 // Redaction follows the protocol's classification, not the rule
                 // flag: a secret-material read that passes the gate (allowed or
@@ -823,7 +994,9 @@ impl ApiProxy {
                     "Forbidden",
                 )
             }
-        }
+        };
+        response.extensions_mut().insert(GuardHeld);
+        response
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -856,7 +1029,11 @@ impl ApiProxy {
             );
         };
         tracing::info!(target: "guard::apiproxy", "HOLD {} ({})", label, reason);
-        match gate.hold_request(label, reason).await {
+        let session_fingerprint = parts
+            .extensions
+            .get::<SessionAuth>()
+            .map(|auth| auth.context.fingerprint.as_str());
+        let mut response = match gate.hold_request(label, reason, session_fingerprint).await {
             HoldDecision::Approved { handle } => {
                 let redact = self.protocol.redactable_read(op);
                 tracing::info!(
@@ -889,7 +1066,9 @@ impl ApiProxy {
                     "Forbidden",
                 )
             }
-        }
+        };
+        response.extensions_mut().insert(GuardHeld);
+        response
     }
 
     async fn forward(
@@ -931,6 +1110,10 @@ impl ApiProxy {
         conn_id: u64,
         prepared_snapshot: Option<Option<Vec<u8>>>,
     ) -> Response<ProxyBody> {
+        let session_fingerprint = match self.revalidate_session(&parts).await {
+            Ok(fingerprint) => fingerprint,
+            Err(response) => return response,
+        };
         match self
             .forward_inner(
                 parts,
@@ -941,6 +1124,7 @@ impl ApiProxy {
                 op,
                 conn_id,
                 prepared_snapshot,
+                session_fingerprint,
             )
             .await
         {
@@ -970,6 +1154,7 @@ impl ApiProxy {
         op: Option<ApiOp>,
         conn_id: u64,
         prepared_snapshot: Option<Option<Vec<u8>>>,
+        session_fingerprint: Option<String>,
     ) -> Result<Response<ProxyBody>> {
         // A recoverable write we will wrap in an auto-revert envelope: fetch
         // the prior object first (when the protocol wants a restore-style
@@ -1032,6 +1217,8 @@ impl ApiProxy {
                 if is_hop_by_hop(name)
                     || name == header::CONTENT_LENGTH
                     || name == header::TRANSFER_ENCODING
+                    || (is_sensitive_response_header(name)
+                        && !self.protocol.allow_sensitive_response_header(name))
                 {
                     continue;
                 }
@@ -1089,7 +1276,8 @@ impl ApiProxy {
             let bytes = upstream_resp.bytes().await.context("read write response")?;
             if status.is_success() {
                 if let Some(o) = op.as_ref() {
-                    self.arm_write_revert(o, snapshot, &bytes, conn_id).await;
+                    self.arm_write_revert(o, snapshot, &bytes, conn_id, session_fingerprint)
+                        .await;
                 }
             }
             return Ok(builder
@@ -1104,6 +1292,34 @@ impl ApiProxy {
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
         let body = StreamBody::new(stream).boxed();
         Ok(builder.body(body).expect("build streamed response"))
+    }
+
+    async fn revalidate_session(
+        &self,
+        parts: &Parts,
+    ) -> Result<Option<String>, Response<ProxyBody>> {
+        let Some(auth) = parts.extensions.get::<SessionAuth>() else {
+            return Ok(None);
+        };
+        let Some(sink) = self.session_sink.get() else {
+            return Err(self.status_resp(
+                StatusCode::FORBIDDEN,
+                "guard api-proxy: session attribution is unavailable",
+                "Forbidden",
+            ));
+        };
+        let valid = sink
+            .resolve(&auth.token)
+            .await
+            .is_some_and(|current| current.fingerprint == auth.context.fingerprint);
+        if !valid {
+            return Err(self.status_resp(
+                StatusCode::FORBIDDEN,
+                "guard api-proxy: session expired, was revoked, or is suspended",
+                "Forbidden",
+            ));
+        }
+        Ok(Some(auth.context.fingerprint.clone()))
     }
 
     /// Fetch the current object at `path` before a mutation, so the protocol
@@ -1177,6 +1393,7 @@ impl ApiProxy {
         snapshot: Option<Vec<u8>>,
         response_body: &[u8],
         conn_id: u64,
+        session_fingerprint: Option<String>,
     ) {
         let Some(gate) = self.gate.get() else {
             return;
@@ -1194,6 +1411,7 @@ impl ApiProxy {
         };
         let created_key = plan.created.map(|c| CreatedKey {
             conn: conn_id,
+            session_fingerprint: session_fingerprint.clone(),
             group: c.group,
             resource: c.resource,
             namespace: c.namespace,
@@ -1204,6 +1422,9 @@ impl ApiProxy {
             .arm_revert(ApiMutation {
                 label: label.clone(),
                 revert: plan.revert,
+                session_fingerprint,
+                upstream_target: self.upstream.base().to_string(),
+                upstream_identity: self.upstream_identity_fingerprint(),
             })
             .await
         {
@@ -1226,10 +1447,16 @@ impl ApiProxy {
     /// this process, remove and return its auto-revert handle — evidence the
     /// delete is guard's own creation being cleaned up. Consumes the record so a
     /// resource is only ever contained-deleted once.
-    fn take_created_provenance(&self, op: &ApiOp, conn_id: u64) -> Option<String> {
+    fn take_created_provenance(
+        &self,
+        op: &ApiOp,
+        conn_id: u64,
+        session_fingerprint: Option<&str>,
+    ) -> Option<String> {
         let name = op.name.clone()?;
         let key = CreatedKey {
             conn: conn_id,
+            session_fingerprint: session_fingerprint.map(str::to_string),
             group: op.group.clone(),
             resource: op.resource.clone(),
             namespace: op.namespace.clone(),
@@ -1238,13 +1465,42 @@ impl ApiProxy {
         self.created.lock().unwrap().take(&key)
     }
 
+    pub fn upstream_identity_fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(self.endpoint.as_bytes());
+        hasher.update([0]);
+        hasher.update(self.protocol.name().as_bytes());
+        hasher.update([0]);
+        hasher.update(self.upstream.base().as_bytes());
+        hasher.update([0]);
+        hasher.update(self.credential_ref.as_bytes());
+        hasher.update([0]);
+        hasher.update(self.upstream.identity_fingerprint().as_bytes());
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    pub fn matches_upstream_identity(&self, protocol: &str, target: &str, identity: &str) -> bool {
+        !target.is_empty()
+            && !identity.is_empty()
+            && self.protocol.name() == protocol
+            && self.upstream.base() == target
+            && self.upstream_identity_fingerprint() == identity
+    }
+
     fn status_resp(&self, code: StatusCode, message: &str, reason: &str) -> Response<ProxyBody> {
         let body = self.protocol.error_body(code.as_u16(), message, reason);
-        Response::builder()
+        let mut response = Response::builder()
             .status(code)
             .header(header::CONTENT_TYPE, "application/json")
             .body(full_body(Bytes::from(body)))
-            .expect("build status response")
+            .expect("build status response");
+        response.extensions_mut().insert(GuardRejected);
+        response
     }
 
     fn rebuild_judge_for_intent(&self, intent: Option<String>) {
@@ -1254,6 +1510,50 @@ impl ApiProxy {
         let judge = builder(intent);
         *self.judge.write().unwrap() = judge;
         tracing::info!(target: "guard::apiproxy", "rebuilt api evaluator for policy intent change");
+    }
+}
+
+fn take_guard_session(headers: &mut HeaderMap) -> Result<Option<String>, &'static str> {
+    if headers.get_all(GUARD_SESSION_HEADER).iter().count() > 1
+        || headers.get_all(header::AUTHORIZATION).iter().count() > 1
+    {
+        return Err("guard api-proxy: multiple session credentials are not allowed");
+    }
+    let alias = match headers.remove(GUARD_SESSION_HEADER) {
+        Some(value) => {
+            let token = value
+                .to_str()
+                .map_err(|_| "guard api-proxy: invalid session token encoding")?;
+            if !super::kubeconfig::valid_guard_session_token(token) {
+                return Err("guard api-proxy: invalid session token");
+            }
+            Some(token.to_string())
+        }
+        None => None,
+    };
+    let bearer = match headers.remove(header::AUTHORIZATION) {
+        Some(value) => {
+            let value = value
+                .to_str()
+                .map_err(|_| "guard api-proxy: invalid Authorization encoding")?;
+            let (scheme, token) = value
+                .split_once(' ')
+                .ok_or("guard api-proxy: Authorization must be a Guard session bearer")?;
+            if !scheme.eq_ignore_ascii_case("bearer")
+                || !super::kubeconfig::valid_guard_session_token(token)
+            {
+                return Err("guard api-proxy: Authorization must be a Guard session bearer");
+            }
+            Some(token.to_string())
+        }
+        None => None,
+    };
+    match (alias, bearer) {
+        (Some(alias), Some(bearer)) if alias != bearer => {
+            Err("guard api-proxy: conflicting session credentials")
+        }
+        (Some(token), _) | (_, Some(token)) => Ok(Some(token)),
+        (None, None) => Ok(None),
     }
 }
 
@@ -1304,12 +1604,11 @@ fn is_hop_by_hop(name: &header::HeaderName) -> bool {
     )
 }
 
-/// Headers that carry or override the request's authenticated identity. The
-/// brokered client authenticates as nothing (its kubeconfig has no
-/// credential); the daemon's own upstream credential is what actually talks
-/// to the apiserver. These headers reassign the request's authenticated
-/// identity, and where the daemon's credential holds the Kubernetes
-/// `impersonate` RBAC permission (the identity-override grant, common for
+/// Headers that carry or override the upstream request identity. A brokered
+/// client may authenticate to Guard with a session bearer, while the daemon's
+/// separate upstream credential talks to the apiserver. These headers reassign
+/// the request's authenticated identity, and where the daemon's credential
+/// holds the Kubernetes `impersonate` RBAC permission (the identity-override grant, common for
 /// admin/CI service accounts) the apiserver would evaluate a forwarded header
 /// identity instead of the operator's. Since ApiPolicy matches only
 /// verb/resource/namespace and never identity, stripping these headers keeps
@@ -1322,6 +1621,21 @@ fn is_hop_by_hop(name: &header::HeaderName) -> bool {
 fn is_identity_header(name: &header::HeaderName) -> bool {
     let s = name.as_str();
     s.starts_with("impersonate-") || s.starts_with("x-remote-")
+}
+
+fn is_sensitive_response_header(name: &header::HeaderName) -> bool {
+    matches!(
+        name.as_str().to_ascii_lowercase().as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "proxy-authenticate"
+            | "www-authenticate"
+            | "authentication-info"
+            | "proxy-authentication-info"
+            | "cookie"
+            | "set-cookie"
+            | "set-cookie2"
+    )
 }
 
 fn is_json(headers: &HeaderMap) -> bool {
@@ -1487,10 +1801,18 @@ mod tests {
     fn created_key(conn: u64, name: &str) -> CreatedKey {
         CreatedKey {
             conn,
+            session_fingerprint: None,
             group: String::new(),
             resource: "configmaps".to_string(),
             namespace: Some("dev".to_string()),
             name: name.to_string(),
+        }
+    }
+
+    fn session_created_key(conn: u64, name: &str, fingerprint: &str) -> CreatedKey {
+        CreatedKey {
+            session_fingerprint: Some(fingerprint.to_string()),
+            ..created_key(conn, name)
         }
     }
 
@@ -1517,6 +1839,22 @@ mod tests {
             Some("handle-A".to_string())
         );
         assert_eq!(reg.len(), 0, "a matching take consumes the entry once");
+    }
+
+    #[test]
+    fn provenance_is_scoped_to_the_exact_session_on_a_shared_connection() {
+        let mut reg = CreatedRegistry::default();
+        reg.remember(
+            session_created_key(1, "foo", "session-a"),
+            "handle-a".to_string(),
+        );
+
+        assert_eq!(reg.take(&created_key(1, "foo")), None);
+        assert_eq!(reg.take(&session_created_key(1, "foo", "session-b")), None);
+        assert_eq!(
+            reg.take(&session_created_key(1, "foo", "session-a")),
+            Some("handle-a".to_string())
+        );
     }
 
     #[test]
@@ -1647,13 +1985,13 @@ mod tests {
 
         let op = delete_op("foo");
         // A delete on a different connection does not match.
-        assert_eq!(proxy.take_created_provenance(&op, 2), None);
+        assert_eq!(proxy.take_created_provenance(&op, 2, None), None);
         // The creating connection matches and consumes the record.
         assert_eq!(
-            proxy.take_created_provenance(&op, 1),
+            proxy.take_created_provenance(&op, 1, None),
             Some("h1".to_string())
         );
-        assert_eq!(proxy.take_created_provenance(&op, 1), None);
+        assert_eq!(proxy.take_created_provenance(&op, 1, None), None);
     }
 
     #[test]
@@ -1682,6 +2020,71 @@ mod tests {
     }
 
     #[test]
+    fn guard_session_bearer_is_parsed_and_removed() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer live-session".parse().unwrap(),
+        );
+        assert_eq!(
+            take_guard_session(&mut headers).unwrap().as_deref(),
+            Some("live-session")
+        );
+        assert!(!headers.contains_key(header::AUTHORIZATION));
+    }
+
+    #[test]
+    fn malformed_or_conflicting_session_credentials_fail_closed() {
+        let mut basic = HeaderMap::new();
+        basic.insert(header::AUTHORIZATION, "Basic abc".parse().unwrap());
+        assert!(take_guard_session(&mut basic).is_err());
+
+        let mut conflicting = HeaderMap::new();
+        conflicting.insert(GUARD_SESSION_HEADER, "one".parse().unwrap());
+        conflicting.insert(header::AUTHORIZATION, "Bearer two".parse().unwrap());
+        assert_eq!(
+            take_guard_session(&mut conflicting).unwrap_err(),
+            "guard api-proxy: conflicting session credentials"
+        );
+
+        let mut duplicate = HeaderMap::new();
+        duplicate.append(header::AUTHORIZATION, "Bearer one".parse().unwrap());
+        duplicate.append(header::AUTHORIZATION, "Bearer two".parse().unwrap());
+        assert_eq!(
+            take_guard_session(&mut duplicate).unwrap_err(),
+            "guard api-proxy: multiple session credentials are not allowed"
+        );
+    }
+
+    #[test]
+    fn credential_bearing_response_headers_are_sensitive() {
+        for name in [
+            "set-cookie",
+            "authorization",
+            "proxy-authenticate",
+            "www-authenticate",
+        ] {
+            assert!(is_sensitive_response_header(&name.parse().unwrap()));
+        }
+        assert!(!is_sensitive_response_header(
+            &"content-type".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn persisted_revert_identity_requires_protocol_target_and_credential_identity() {
+        let proxy = test_proxy();
+        let target = proxy.upstream().base().to_string();
+        let identity = proxy.upstream_identity_fingerprint();
+
+        assert!(proxy.matches_upstream_identity("kubernetes", &target, &identity));
+        assert!(!proxy.matches_upstream_identity("github", &target, &identity));
+        assert!(!proxy.matches_upstream_identity("kubernetes", "https://other.invalid", &identity));
+        assert!(!proxy.matches_upstream_identity("kubernetes", &target, "other-identity"));
+        assert!(!proxy.matches_upstream_identity("kubernetes", "", ""));
+    }
+
+    #[test]
     fn forget_created_by_handle_clears_public_provenance() {
         let proxy = test_proxy();
         proxy
@@ -1692,6 +2095,9 @@ mod tests {
 
         proxy.forget_created_by_handle("h1");
 
-        assert_eq!(proxy.take_created_provenance(&delete_op("foo"), 1), None);
+        assert_eq!(
+            proxy.take_created_provenance(&delete_op("foo"), 1, None),
+            None
+        );
     }
 }
