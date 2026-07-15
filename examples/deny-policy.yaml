@@ -24,7 +24,7 @@
 #
 # Use static policies only for DENY rules (fast-reject known-bad patterns).
 # An `allow` pattern in this file format is parsed for backward compatibility
-# and the --no-llm fallback mode, but it does NOT skip the LLM evaluator
+# and the --no-evaluator fallback mode, but it does NOT skip the LLM evaluator
 # while the LLM is enabled -- glob matching can't be trusted with that (same
 # limitations as above, worse on the allow side: an allowed shell operator
 # would bypass the LLM entirely). For a deterministic, LLM-skipping allow see

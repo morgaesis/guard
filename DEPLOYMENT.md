@@ -1,481 +1,211 @@
 # Deployment
 
-Long-running `guard` server deployment as a system service.
-
-## Scope
-
-Use this when `guard` should listen on a local UNIX socket and serve local clients (AI agents, shims) through a system service.
-
-On Windows, guard's native local transport is a named pipe with SID-based peer
-authentication, selected with `--socket <name>` (the same flag that selects a
-UNIX domain socket on Unix; the name maps to `\\.\pipe\<name>`). Point clients at
-it with `guard config set-server <name>`. The named-pipe SID is the caller's
-cross-platform principal, with exact parity to a Unix peer uid, so consequence
-gating, per-principal secret/`--env` injection, and daemon-principal admin all
-work over the pipe. The operator is whoever runs as the daemon's own principal
-(its SID on Windows, its uid on Unix). The pipe DACL gives the daemon SID,
-SYSTEM, and Administrators full control and gives Authenticated Users generic
-read/write access to connect, without pipe-instance creation. Connect permission
-is not command authorization: every request remains policy-gated and credentials
-stay daemon-held. On a multi-user host, every authenticated local user can submit
-policy-gated work, so isolate the permitted agent account or deploy a build whose
-pipe DACL names the intended agent SID.
-
-A TCP loopback transport is also available with `--tcp-port` (default
-`127.0.0.1:8123`) and a shared `GUARD_AUTH_TOKEN`. A TCP caller carries only
-a bearer token and no local principal, so over TCP consequence gating is refused,
-secret/`--env` injection is refused, and non-Ping admin RPCs such as `guard grant`
-require the separate `GUARD_ADMIN_TOKEN`. `--exec-as-caller` (setuid-style
-identity drop) is Unix-only; on Windows the daemon always executes approved
-commands as its own service account, and containment rests on that account
-isolation rather than an identity swap.
-
-Windows does not implement POSIX read grants. A brokered command that tries to
-read an operator-owned file receives the native `ACCESS_DENIED` result and Guard
-does not change that file's DACL. Put needed non-secret inputs inside the service
-boundary, or use `--secret-file ENV_VAR=secret-name` for a stored credential that
-the child accepts by pathname.
-
-The installer [`deployment/windows/install-guard.ps1`](deployment/windows/install-guard.ps1)
-provisions the bypass-resistant Windows service model: it registers guard as a
-Windows service running under the virtual service account `NT SERVICE\guard`,
-which owns the named pipe, the state database (`C:\ProgramData\guard\state.db`),
-the verb catalog, and any brokered credentials under an NTFS ACL that grants only
-the guard SID, SYSTEM, and Administrators and removes Users/Authenticated
-Users/Everyone. Because the interactive agent runs as a different, non-admin SID,
-it cannot satisfy the daemon's admin check to approve its own held commands and
-cannot read the brokered credentials or state. Run install/uninstall and the
-operator actions (`approve`, `deny`, `confirm`, `revert`) from an elevated
-PowerShell; `status`, `provisionals`, and `approvals` are read-only. Pass
-`-EnvFile` to supply an LLM API key; with no key the service runs `--no-llm`
-(static/verb policy only).
-
-Transient secret files and API-revert body snapshots use a stricter runtime ACL
-than the containing data directory: a protected, non-inheriting DACL with one
-allow ACE for the service SID. Guard verifies the owner, DACL protection, exact
-trustee set, file type, and absence of reparse points. Unsafe snapshot storage
-disables body-bearing reverts, and unsafe secret-file storage fails daemon
-startup.
-
-## Orchestrated workers with operator approval
-
-Consequence gating and session grants compose into a foreman/worker pattern for
-autonomous fleets. An orchestrator (the foreman) holds the operator role; the
-daemon runs as a separate principal (a dedicated uid on Unix, the service
-account on Windows); workers are agents that reach the system only through
-`guard run` and `guard verb`.
-
-1. The foreman issues a saved grant for each worker with
-   `guard grant issue <name>` and hands the worker the resulting
-   `GUARD_SESSION` token. The saved grant activates typed verbs, selects the
-   evaluation mode, and carries a bounded TTL, evaluator context, and
-   secret-name entitlements. The token is bearer access to that scoped session.
-
-2. The foreman loads a gated verb catalog with `--verbs`
-   ([`examples/verbs-kubectl.yaml`](examples/verbs-kubectl.yaml) is a reference).
-   Each verb pins a binary and an anchored, pattern-validated argv template, and
-   declares a consequence class. The catalog's `context` parameter is an explicit
-   allowlist of non-production clusters; a production context is not in the
-   alternation, so every verb rejects it and a worker cannot target production
-   through any verb.
-
-3. Workers call `guard verb run <name> --param k=v` or `guard run <cmd>` through
-   the daemon. With `--gate consequence`, reversible operations (read-only
-   inspection) run immediately, recoverable operations run behind an auto-revert
-   envelope, and irreversible operations are held for operator approval and not
-   executed.
-
-4. The foreman reviews held work with `guard approvals` / `guard provisionals`
-   and decides with `guard approve|deny|confirm|revert <handle>`. These control
-   RPCs are accepted only from the daemon's own principal, so a worker can never
-   approve its own held command. The irreversible steps stay with the operator.
-
-The trust boundary is the principal split: workers run as a different principal
-than the daemon, so the gate, the secret namespace, and the approval RPCs are all
-beyond their reach. This holds identically on Unix (uid separation) and Windows
-(service-account isolation with ACL'd state and credential directories).
-
-### Saved grants
-
-A saved grant is the reusable authorization object. The daemon loads a `grants:`
-catalog from `--grants <path>` or GUARD_GRANTS and also persists grants created
-with `guard grant save`. See
-[`examples/saved-grants.yaml`](examples/saved-grants.yaml). An explicitly named
-catalog that is missing, malformed, or contains duplicate names fails startup.
-
-Use `guard grant save`, `edit`, `regenerate`, `list`, `show`, and `delete` to
-manage definitions. `guard grant issue <name>` returns the `GUARD_SESSION`
-export for a new live session. Regeneration produces typed verb coverage with
-evidence and boundary probes while preserving sticky operator-authored cells.
-The issued session records the saved-grant revision, so a change invalidates
-affected evaluator-cache entries.
-
-Legacy `--profiles`, GUARD_PROFILES, `--profile`, and top-level `profiles:`
-files are migration aliases. Legacy command patterns convert only when they are
-an exact argv sequence or an exact sequence ending in a separate `*` token.
-Ambiguous shell globs fail loading. They do not remain an independent session
-policy system.
-
-Session coverage expands ordinary global read-only or evaluator coverage in
-its activated verb regions. A baseline cell with an explicit override marker
-requires the same marker in the issued grant. Sticky baseline cells remain
-absolute. Binary allow-lists, credential checks, consequence routing, audit,
-and session history remain independent hard controls.
-
-## Recommended deployment
-
-Choose the deployment model based on what authority the daemon should have.
-
-### Policy gate / secret broker
-
-Use this model when `guard` should mediate commands the daemon user can already
-run, inject configured secrets, redact output, or broker SSH commands to remote
-hosts.
-
-- Run guard as a dedicated unprivileged user (e.g., `guard`).
-- Enable systemd hardening directives (`NoNewPrivileges`, `ProtectSystem`, `PrivateTmp`).
-- The service cannot act like `sudo`: local commands execute as the daemon user,
-  and `NoNewPrivileges` prevents setuid helpers such as `sudo` from elevating.
-- This model is useful for read-only inspection, SSH proxying, and secret
-  injection where local privilege escalation is not required.
-- A brokered command (`ansible`, `helm`) that needs to read one specific
-  operator-owned config/vars/values file the daemon user does not own does not
-  require a broader trust model for that alone -- see "Scoped file read
-  grants" below, which is the preferred path for exactly this case under the
-  unprivileged model.
-
-### Scoped file read grants
-
-When a brokered command fails naming a file it could not read, guard
-automatically evaluates a time-boxed POSIX ACL read grant for that one path so
-the retried `ansible`/`helm` command can read an operator config/vars/values
-file the daemon user does not own. The grant targets guard's own service
-account, or the caller's uid under `--exec-as-caller`. The request goes through
-the same static credential deny-list, saved-grant verb coverage, and evaluator
-as any other brokered request, and the grant revokes at its bounded
-TTL. This is the preferred, default path for the "brokered command needs to
-read an operator file" gap under the unprivileged policy-gate model above;
-`--exec-as-caller` remains documented below for its own broader per-uid
-command-execution use cases.
-
-Two pieces of host setup are required for transparent read grants under the
-packaged, unprivileged `guard.service`:
-
-1. **Capabilities to bypass DAC ownership/traversal checks.** `setfacl`/`getfacl`
-   normally require the caller to own the target (or its parent, for adding an
-   entry) and to be able to traverse every ancestor directory. guard's service
-   account owns neither the operator's files nor, typically, the operator's
-   home directory. Two capabilities close this gap without making guard root
-   or setuid:
-   - `CAP_FOWNER` bypasses the "caller must own the file" check `setfacl`/`chmod`
-     enforce (`capabilities(7)` lists "set Access Control Lists (ACLs) on
-     arbitrary files" as one of the operations this capability grants).
-   - `CAP_DAC_READ_SEARCH` bypasses file read permission checks and directory
-     read/execute (search) permission checks generally (`capabilities(7)`), so
-     guard can both traverse an ancestor directory it cannot otherwise search
-     (e.g. an operator's `750` home directory, to add an `--x` ACL entry) and
-     read a file to inspect and plan its ACL.
-
-   The packaged [`deployment/systemd/guard.service`](deployment/systemd/guard.service)
-   already grants both, to the still-unprivileged `guard` user, via:
-
-   ```ini
-   AmbientCapabilities=CAP_FOWNER CAP_DAC_READ_SEARCH
-   ```
-
-   `AmbientCapabilities=` is the mechanism designed for exactly this: it grants
-   a fixed capability set to a non-root, non-setuid process that survives its
-   own `execve()` and the `User=` identity switch (`systemd.exec(5)`: ambient
-   capability sets "are useful if you want to execute a process as a
-   non-privileged user but still want to give it some capabilities"; systemd
-   automatically retains them across the `User=` switch via the `keep-caps`
-   securebit). It is unaffected by `NoNewPrivileges=true`, which only blocks a
-   process from gaining *more* privilege via an executed file's own
-   setuid/setgid bits or file capabilities (`capabilities(7)`,
-   `systemd.exec(5)`) -- it does not touch capabilities the unit itself grants
-   via `AmbientCapabilities=`.
-
-   These capabilities are for the daemon's own `setfacl`/`getfacl` calls only.
-   Because ambient capabilities are otherwise inherited across `execve()`, guard
-   clears the ambient *and* inheritable capability sets of every brokered
-   (caller-requested) child before it execs, so an approved brokered command
-   (`cat`, `ansible-playbook`, `kubectl`, …) never inherits `CAP_DAC_READ_SEARCH`
-   or `CAP_FOWNER` and cannot use them to bypass file DAC or the read-grant
-   deny-list; only the daemon's own ACL operations are privileged.
-
-   The unit deliberately sets **no** explicit `CapabilityBoundingSet=`. Narrowing
-   the bounding set to just these two capabilities would make it a hard ceiling
-   for every descendant, including one that later gains privilege via
-   `sudo`/setuid-root under the privileged-broker model (run with
-   `NoNewPrivileges=false`); that would silently strip whatever capabilities a
-   `sudo`-elevated child previously relied on. `AmbientCapabilities=` grants the
-   two capabilities to the daemon without lowering that ceiling for elevated
-   descendants.
-
-2. **A host-specific `ReadWritePaths=` carve-out.** `ProtectSystem=strict` +
-   `ProtectHome=read-only` on the packaged unit mount essentially everything
-   outside `ReadWritePaths=` read-only at the mount-namespace level. Adding an
-   ACL entry is a metadata *write*, so it stays blocked there even with both
-   capabilities above -- `systemd.exec(5)`: "Use `ReadWritePaths=` in order to
-   allow-list specific paths for write access if `ProtectSystem=strict` is
-   used." Because the paths an operator wants to grant reads under are
-   host-specific (wherever that operator's ops checkouts live), this carve-out
-   must **not** be hardcoded into the packaged unit. Add it as a drop-in
-   instead, e.g. `/etc/systemd/system/guard.service.d/60-read-grant-paths.conf`:
-
-   ```ini
-   [Service]
-   ReadWritePaths=/home/OPERATOR_USER/PATH/TO/OPS-CHECKOUT
-   ```
-
-   (`OPERATOR_USER`/`PATH/TO/OPS-CHECKOUT` are placeholders -- substitute the
-   real path(s) for the host.) Carve in the root of the tree files may be
-   granted under, up to and including the operator's home directory: a grant
-   may add a traverse-only ACL entry to ancestor directories between the
-   target file and that home boundary (see `guard::gating::read_grant`), and
-   those writes need the same carve-out as the leaf file's own grant. Reload
-   after adding the drop-in: `systemctl daemon-reload && systemctl restart
-   guard`; `systemctl cat guard.service` shows the merged unit.
-
-   This carve-out only lifts the systemd-level read-only *mount* restriction --
-   it grants no DAC/ACL access by itself, and by itself it exposes nothing.
-   Actual read access is still gated by the deny-list, the session/evaluator
-   decision, and the per-file ACL grant guard applies and revokes on approval;
-   a path being writable at the mount-namespace level only makes it possible
-   for an approved read grant to place an ACL entry there.
-
-### Privileged command broker
-
-Use this model only when `guard` is intentionally trusted to run privileged local
-commands after policy approval.
-
-- The agent process should run as a separate unprivileged user, restricted to connecting to the guard socket.
-- Use `--users` to restrict which UIDs can submit requests.
-- Provide the LLM API key via the environment file (`/etc/default/guard`), not CLI arguments.
-- Do not use `User=guard` or `NoNewPrivileges=true` if the daemon must execute
-  commands with root authority or invoke setuid helpers such as `sudo`.
-- Treat the daemon as a sudo-like trust boundary. If policy approves a command,
-  it executes with the daemon's privileges.
-- The agent should not have access to the guard process's `/proc/*/environ` or `/proc/*/cmdline` (ensured by running as a different user with standard procfs hidepid or systemd's `ProtectProc`).
-- For containers, use `env_clear` (enabled by default) so child processes never see the API key. Output redaction (also default) catches secrets in command output.
-
-By default the server validates caller UIDs but executes commands as its own
-service identity, so a root service is a privileged broker, not per-user
-impersonation. A Unix root daemon started with `--exec-as-caller` over a
-Unix-socket-only listener instead drops each child to the calling uid before
-exec, making it a per-user secret broker. `--exec-as-caller` is Unix-only. If
-the only reason to reach for this model is a brokered command needing to read
-one operator-owned config/vars/values file, use transparent read grants under
-the unprivileged policy-gate model instead (see above). That path solves the
-narrower case without the daemon needing root or per-uid command execution.
-`--exec-as-caller` remains the right tool for its own broader per-uid
-command-execution use cases.
-
-The two packaged systemd units embody these modes.
-[`deployment/systemd/guard.service`](deployment/systemd/guard.service) runs as a
-dedicated `guard` service account with `ProtectHome=read-only`; approved commands
-execute as that account.
-[`deployment/systemd/guard-exec-as-caller.service`](deployment/systemd/guard-exec-as-caller.service)
-runs as root and drops each approved command to the connecting caller's uid.
-
-Choose `guard-exec-as-caller.service` whenever the brokered commands read files
-the invoking user owns — ansible playbooks and inventories, Helm charts and
-values files, a caller's kubeconfig, or anything under the caller's home
-directory. `guard.service` cannot read those files: the dedicated `guard`
-account is a separate unprivileged uid with no access to another user's files,
-so the command runs as `guard` and the read fails. This is the ordinary reason
-to run exec-as-caller, not an edge case. When approved commands only touch paths
-the `guard` account itself owns (its state directory, a broker credential it
-holds), `guard.service` is sufficient.
-
-## OS-level sandboxing profiles
-
-Static hardening profile examples live under `deployment/hardening/`.
-`seccomp-deny-escape.json` is a default-allow seccomp profile for
-Docker/Podman `--security-opt seccomp=<file>` deployments. It denies
-container-escape and host-tampering syscalls such as `mount`, `pivot_root`,
-`ptrace`, kernel module load, keyring manipulation, and host clock changes
-while leaving normal daemon operation intact.
-
-`guard.apparmor.example` confines the daemon to its binary, state directory,
-system libraries, certificates, and child-command execution paths. Set the
-executable path and data directory to match the deployment before loading it.
-Use these files alongside the systemd hardening directives below; they are an
-OS-level layer, not a replacement for `NoNewPrivileges`, `User=guard`, or
-`--users`.
-
-## Auto-learned deny shapes
-
-Auto-learned deny shapes (`--learn-deny`, on by default) write a state file,
-`learned-deny.yaml`, alongside `learned-rules.yaml` and `state.db` in the
-daemon's state directory. It is a deny-only fast path the daemon populates
-itself from repeated LLM denials. It never grants a bypass, so it needs no
-operator review step. Check `guard status` for `learn_deny enabled=... shapes=N` to
-see whether it is active and how many shapes it has learned; disable with
-`--no-learn-deny` / `GUARD_LEARN_DENY=false` if you want to fully opt out
-(this stops new learning; it does not retroactively remove shapes already on
-disk, delete or edit `learned-deny.yaml` for that). A caller can force a
-fresh LLM look past a specific auto-learned deny with `guard run --reevaluate`.
-
-## Auto-verb-promotion
-
-Auto-verb-promotion (`--learn-allow`, on by default, requires `--gate
-consequence`) writes a bookkeeping state file, `learned-allow.yaml`, alongside
-the other state files above, and -- once a repeated shape qualifies --
-appends an actual verb to the catalog (`--verbs`; a default `verbs.yaml` is
-created in the state directory if `--verbs` was not given). Unlike learned-rule
-candidate detection, this needs no operator step at all: most real deployments
-are unattended, so a design that depends on an operator reading a notice and
-running `guard verb create` does not fire in practice. It is deliberately far
-more conservative than an operator-driven verb, on several axes explained in
-`gating::allow_promotion`'s module docs -- in short, every parameter's allowed
-values are pinned to the exact, regex-escaped values actually observed (never
-a model-authored pattern), an irreversible shape is never eligible, and a
-recoverable shape is promoted only with a validated revert. A promoted verb is
-stamped to the model + prompts that justified it, so a model or prompt change
-silently stops trusting verbs promoted under the old judgment rather than
-carrying that trust forward.
-
-Check `guard status` for `learn_allow enabled=... observations=N` (the
-observation count, not the number of verbs promoted). `guard verb list` is the
-actual, human-readable record of what has been auto-promoted -- entries carry
-`auto_promoted: true` and the evidence that justified them, and the reported
-`trusted` state already accounts for a stale promotion (see above), so a verb
-the daemon has silently stopped honoring shows as untrusted here too. `guard
-verb list` is also the revocation mechanism: edit or delete an entry in the
-verb catalog file like any other verb. Disable with `--no-learn-allow` /
-`GUARD_LEARN_ALLOW=false` if you want to fully opt out (this stops new
-promotions; it does not retroactively remove verbs already in the catalog).
-Distributing or synchronizing a verb catalog across a multi-host deployment is
-an operator concern; each daemon promotes independently into its own
-`--verbs` file.
-
-**Upgrading an existing deployment.** `--learn-allow` is on by default, same
-as `--learn-deny`, but unlike deny-shape learning it needs `--gate consequence`
-to do anything at all (with gating off there is no reversibility
-classification to key eligibility on, so the store stays inert). If you
-already run `--gate consequence` without `--verbs`, upgrading in place will,
-for the first time, create a live verb catalog under the default state
-directory and start populating it with `trusted: true` verbs from ordinary
-traffic - a real change in what "no `--verbs` flag" means for that
-deployment. If you'd rather opt in deliberately, either add `--no-learn-allow`
-or configure `--verbs` explicitly and review `guard verb list` periodically.
-
-**Pin state paths explicitly under a hardened systemd unit.** The default
-paths for `--verbs`, `--learn-allow-state`, `--deny-shapes`, and
-`--learned-rules` all resolve through the same XDG state-dir lookup as
-`--state-db`'s default (`dirs::state_dir()`, typically `$HOME/.local/state`)
--- but the packaged unit (`deployment/systemd/guard.service`) only pins
-`--state-db` explicitly, to `/var/lib/guard/state.db`. Left unpinned, the
-other files land under `/var/lib/guard/.local/state/guard/` -- covered by
-`ReadWritePaths=/var/lib/guard` and so not a startup failure, but a nested,
-non-obvious location an operator inspecting `/var/lib/guard/` won't find. If
-you enable `--gate consequence` on the packaged unit, also pass `--verbs
-/var/lib/guard/verbs.yaml` (after seeding it: `echo 'verbs: []' >
-/var/lib/guard/verbs.yaml`, since an explicitly-named `--verbs` path must
-already exist) to keep the catalog in the conventional location; the
-bookkeeping files (`--learn-allow-state`, `--deny-shapes`, `--learned-rules`)
-tolerate a missing path and can be pinned the same way without a seed step.
-
-**Auto-promotion rewrites your whole catalog file on every append.** Appending
-a verb (auto-promoted or via `guard verb create`) re-serializes the entire
-`--verbs` YAML document rather than appending a line, so a hand-authored
-catalog under version control will show its whole file reformatted/reordered
--- not just one new entry -- the first time a promotion lands, and any
-inline comments are not preserved across that rewrite.
-
-**Promotion failures are log-only.** A promotion attempt that the model
-declines, or that fails validation, or that fails to append (e.g. a verb-name
-collision with an existing catalog entry) is visible only via
-`tracing::warn!`/`tracing::debug!` log lines (`grep -i "verb-promotion\|verb
-auto_promoted" ` your journal), not in `guard status` or `guard verb list`.
-A definitive failure (validation or append) permanently stops retrying that
-shape; check the logs if a shape you expected to see promoted never appears
-in `guard verb list`.
-
-## Files
-
-Example systemd files:
-
-- [`deployment/systemd/guard.service`](deployment/systemd/guard.service)
-- [`deployment/systemd/guard-exec-as-caller.service`](deployment/systemd/guard-exec-as-caller.service)
-- [`deployment/systemd/guard.env.example`](deployment/systemd/guard.env.example)
-
-These examples are intentionally generic. Adjust user, group, socket path, allowed UIDs, mode, and hardening directives for the target host.
-
-## Suggested layout
-
-- Binary: `/usr/local/bin/guard`
-- Service unit: `/etc/systemd/system/guard.service`
-- Environment file: `/etc/default/guard`
-- UNIX socket: `/run/guard/guard.sock`
-
-## Example flow
-
-Install the binary:
-
-```bash
-install -m 0755 guard /usr/local/bin/guard
+A durable Guard deployment separates the agent, daemon, credentials, state, and
+operator authority. The daemon listens on a local Unix socket or Windows named
+pipe, and the agent has no direct route or credential for protected upstreams.
+
+## Operating model
+
+Guard is designed for deploy-and-forget authority. Routine work fits saved
+grants and typed verbs. Recoverable changes carry a viable forward, verify, and
+rollback chain. Holds are the exception for expired, conflicting, irreversible,
+or connectivity-unsafe operations and return a durable escalation handle.
+
+This supports autonomous incident response without requiring an operator to be
+available during every session. Notifications can wake or inform an operator,
+but notification delivery does not change a gate decision.
+
+The principal split is mandatory:
+
+- The daemon principal owns SSH keys, SSH agent sockets, kubeconfigs, API tokens,
+  state, verb catalogs, and saved grants.
+- The agent principal can connect to Guard and holds only short-lived session
+  bearers.
+- The operator principal is the daemon uid on Unix or daemon SID on Windows for
+  approval and authorization changes.
+
+An agent that can read daemon credentials or reach the same upstream directly
+can bypass Guard.
+
+## Unix service
+
+The packaged files are:
+
+```text
+deployment/systemd/guard.service
+deployment/systemd/guard.socket
+deployment/systemd/guard.env.example
+deployment/hardening/guard.apparmor.example
+deployment/hardening/seccomp-deny-escape.json
 ```
 
-Create the service user:
+The standard unprivileged model runs `guard` as a dedicated account and exposes
+`/run/guard/guard.sock` to the permitted agent group. Protect the state directory,
+environment file, catalogs, SSH material, and secret backend from that group.
 
 ```bash
-useradd --system --home-dir /var/lib/guard --create-home --shell /usr/sbin/nologin guard
-```
-
-Install the environment file:
-
-```bash
+install -m 0755 target/release/guard /usr/local/bin/guard
+install -m 0644 deployment/systemd/guard.service /etc/systemd/system/
+install -m 0644 deployment/systemd/guard.socket /etc/systemd/system/
 install -m 0600 deployment/systemd/guard.env.example /etc/default/guard
-# Edit /etc/default/guard and set GUARD_LLM_API_KEY
-```
-
-Install the unit:
-
-```bash
-install -m 0644 deployment/systemd/guard.service /etc/systemd/system/guard.service
-```
-
-By default, any local UNIX-socket caller can submit requests. To restrict
-access to specific client UIDs, add a comma-separated `--users` list to
-`ExecStart`, for example `--users 1000,1001`.
-
-Reload and start:
-
-```bash
 systemctl daemon-reload
-systemctl enable --now guard
+systemctl enable --now guard.socket guard.service
+guard status
 ```
 
-Verify:
+Edit `/etc/default/guard` before starting the service. Keep API keys and bearer
+tokens out of unit command lines. `systemctl cat guard.service` shows the exact
+merged hardening and environment configuration.
+
+Use `--users` to restrict submitting Unix uids when the socket group is broader
+than the intended agent account. `NoNewPrivileges=true` prevents approved
+children from gaining privilege through setuid helpers. A daemon that must act
+as root is a sudo-like trust boundary and needs narrow callers, binary floors,
+short grants, consequence gating, audit shipping, and separate agent identity.
+
+`--exec-as-caller` is a Unix-only alternative for a root socket daemon. Approved
+children drop to the authenticated caller uid and groups. It is incompatible
+with TCP, API proxying, and secret-file injection. The default broker model keeps
+the daemon identity because it owns the credentials the agent lacks.
+
+## Windows service
+
+[`deployment/windows/install-guard.ps1`](deployment/windows/install-guard.ps1)
+registers Guard under `NT SERVICE\guard`. The service SID owns the named pipe,
+state database, catalogs, and credential directory. Its NTFS ACL permits the
+service SID, SYSTEM, and Administrators while excluding the interactive agent.
+
+Run installation and operator decisions from an elevated shell. The interactive
+agent connects under its own SID, so it cannot satisfy the daemon-principal admin
+check or read daemon state. `--exec-as-caller` is unavailable; approved children
+run as the service account.
+
+Transient secret files and API rollback snapshots use protected non-inheriting
+ACLs for the service SID. Guard rejects reparse points and unsafe ownership or
+trustee sets. Unsafe storage disables the affected secret-file or body-bearing
+revert path.
+
+Named-pipe connect permission is not command authorization. On a multi-user
+host, isolate the agent account or restrict the pipe ACL to the intended SID.
+
+## TCP
+
+Loopback TCP carries execution and admin bearers but no kernel-authenticated
+principal. The daemon requires `GUARD_AUTH_TOKEN`; non-Ping admin RPCs require
+`GUARD_ADMIN_TOKEN`. Consequence gating and per-principal secret delivery are
+refused.
+
+TCP is appropriate only when local socket or named-pipe identity is unavailable.
+Keep it on loopback and protect the client configuration containing bearer
+tokens. A bearer shared among agents is one principal for authorization and
+audit purposes.
+
+## Brokered files and tools
+
+Guard runs approved commands in the caller's canonical working directory while
+retaining the daemon's clean environment, identity, SSH configuration, agent
+socket, and secret bindings. It does not stage or copy project files.
+
+On Unix, a brokered command that cannot read one named non-secret file can enter
+the transparent read-grant path. The packaged system service grants the daemon
+`CAP_FOWNER` and `CAP_DAC_READ_SEARCH` for its ACL operations, then clears
+ambient and inheritable capabilities before spawning brokered children. The
+child never inherits these capabilities.
+
+`ProtectSystem=strict` and `ProtectHome=read-only` also require a host-specific
+write carve-out for the tree whose ACL metadata Guard may change:
+
+```ini
+[Service]
+ReadWritePaths=/home/operator/path/to/operations
+```
+
+Place this in a service drop-in, reload systemd, and restart Guard. The carve-out
+only permits ACL metadata writes inside the service mount namespace. It grants
+no file access by itself. Guard separately rejects credential-shaped paths,
+pins the inode, prevents symlink and hardlink retargeting, applies a short TTL,
+and persists cleanup state. Windows does not modify caller file ACLs.
+
+Use `--secret-file ENV=NAME` when a child accepts credential material by path.
+The value remains in a daemon-owned child-lifetime file and is incompatible with
+`--exec-as-caller`.
+
+## Remote command credentials
+
+Store the only usable remote credentials under the daemon account. For SSH-based
+tools, configure the daemon's SSH config, known-hosts database, and agent socket.
+Do not forward the caller's `SSH_AUTH_SOCK` or trust caller SSH configuration.
+
+Use `GUARD_CHILD_ENV` for operator-selected daemon environment values such as a
+brokered `KUBECONFIG`. Use per-run or tool-config secret bindings for credential
+values. The agent names an entitlement, not the secret value.
+
+Shims are convenience wrappers around `guard run`; they are not security
+boundaries. Put them before real tools in the agent `PATH`, and enforce bypass
+prevention through credential ownership and network reachability.
+
+## API listeners
+
+API proxies bind loopback and are incompatible with `--exec-as-caller`. The
+daemon owns every upstream credential and emits only brokered client material.
+For Kubernetes, the brokered kubeconfig contains the local CA and optional Guard
+session bearer, never the upstream token or client key.
+
+Use `--api-endpoints` when one daemon serves multiple protocols or environments.
+Each endpoint has a unique name, listener, mode, policy, credential reference,
+and output path. Persisted rollback binds that identity and cannot cross to a
+different listener.
+
+Protect proxy ports from other local users. A Guard session bearer supplies
+scope, not network client identity. See [API proxy](docs/api-proxy.md).
+
+## Saved authority
+
+Load reusable grants with `--grants /etc/guard/saved-grants.yaml` and verbs with
+`--verbs /etc/guard/verbs.yaml`. Both catalogs are operator-owned. An explicitly
+configured missing, malformed, or duplicate catalog fails startup.
+
+Issue a session per worker or incident:
 
 ```bash
-systemctl status guard
-ls -l /run/guard/guard.sock
+eval "$(guard grant issue host-a-maintenance --label incident-42)"
 ```
 
-## Notes
+Prefer short TTLs for mutation authority. An issued session records its saved
+grant revision. Grant edits do not rewrite frozen holds or provisionals, and
+revision changes invalidate affected evaluator-cache entries.
 
-- The service runs in server mode over a UNIX socket.
-- On Windows, run `deployment/windows/install-guard.ps1` to register the
-  service-account model over a named pipe; this is required for consequence
-  gating and credential brokering, since both authorize on the named-pipe SID.
-  For a no-gating deployment, run `guard server start --tcp-port 8123`
-  from a service manager or scheduled task, set
-  `GUARD_LLM_API_KEY` / `OPENROUTER_API_KEY` and `GUARD_AUTH_TOKEN` in that
-  service environment (a TCP listener refuses to start without an exec token;
-  the environment variable keeps it out of process listings), and configure
-  clients on the same host with `guard config set-port 8123` and
-  `guard config set-token <exec-token>`.
-- The socket can be world-connectable at the filesystem layer because authorization is enforced by peer UID in the server.
-- Omit `--users` to allow any local UNIX-socket caller. Add `--users` only when the daemon should reject all callers outside a specific UID list.
-- The packaged unit stores persistent session state at `/var/lib/guard/state.db`, which remains writable under the default systemd sandbox profile.
-- For LLM-backed evaluation, provide credentials through the environment file rather than command-line arguments.
-- For policy-only deployments, use `--no-evaluator` and provide a `--policy` file.
-- For latency-sensitive repeated operations, enable consequence gating and
-  automatic verb promotion with `--learn-allow`.
-- Pre-LLM executable validation and credential-pattern deny are off by default. Enable with `--preflight` or `GUARD_PREFLIGHT=true`. These checks are coarse and over-match (they deny any command containing the `env` token); prefer them only on hosts where LLM cost or latency dominates over false positives.
-- For prompt and policy testing, run a separate `--dry-run` server on its own
-  socket so approved commands are evaluated but not executed.
-- Audit logs are emitted via `tracing` to stderr (captured by systemd journal). Set `RUST_LOG=info` in the environment file for standard logging.
+Configure optional rolling behavioral limits for denials, holds, and denial
+ratio. A suspended session becomes deny-all until the triggering behavior ages
+out or the session is revoked.
+
+## Holds, rollback, and notifications
+
+The daemon needs durable state and continuous supervision while provisionals are
+armed. It persists holds and rollback plans, but never fires an overdue rollback
+blindly during startup. Monitor `guard provisionals`, `guard approvals`, and the
+service audit stream after restart.
+
+`--notify-cmd` runs an operator-owned command with one bounded, secret-free JSON
+event on standard input. The hook has a timeout, concurrency ceiling, and cleared
+environment. Delivery credentials, retries, and destinations belong to the
+hook. Policy decisions do not depend on notification success.
+
+## Audit and hardening
+
+Ship the dedicated `guard::audit` target through journald, Windows service logs,
+or the deployment logging stack. SQLite is durable authorization state and
+queryable session history, not the primary audit sink.
+
+Apply defense in depth appropriate to daemon authority:
+
+- filesystem ACLs for state, catalogs, credentials, and logs;
+- socket, pipe, and loopback listener restrictions;
+- AppArmor or container seccomp examples from `deployment/hardening/`;
+- process visibility controls between agent and daemon accounts;
+- upstream RBAC, network segmentation, backups, and service supervision;
+- binary floors and typed verbs for privileged or opaque tools.
+
+After each deployment change, verify a permitted command, a denied command, an
+agent-side attempt to read daemon credentials, session expiry, and one
+provisional rollback path before granting unattended authority.
