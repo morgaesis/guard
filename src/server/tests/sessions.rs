@@ -1761,8 +1761,9 @@ async fn saved_grant_regeneration_previews_exact_apply_and_enforces_both_cas_key
         )
         .unwrap(),
     ));
-    let admin = CallerIdentity::TcpAdmin {
-        token: String::new(),
+    cfg.daemon_principal = PrincipalKey::from_uid(cfg.daemon_uid);
+    let daemon = CallerIdentity::Unix {
+        uid: cfg.daemon_uid,
     };
     let preview = || AdminRequest::SavedGrantRegenerate {
         name: "bounded".to_string(),
@@ -1799,7 +1800,7 @@ async fn saved_grant_regeneration_previews_exact_apply_and_enforces_both_cas_key
         auto_approve_requests: None,
     };
 
-    let response = handle_admin_request(&cfg, &admin, preview()).await;
+    let response = handle_admin_request(&cfg, &daemon, preview()).await;
     let AdminResponse::SavedGrantRegenerationProposal {
         proposal_id,
         candidate,
@@ -1820,7 +1821,7 @@ async fn saved_grant_regeneration_previews_exact_apply_and_enforces_both_cas_key
         .unwrap()
         .generated_verbs
         .is_empty());
-    let applied = handle_admin_request(&cfg, &admin, apply(proposal_id)).await;
+    let applied = handle_admin_request(&cfg, &daemon, apply(proposal_id)).await;
     let AdminResponse::SavedGrantRegenerated { grant, .. } = applied else {
         panic!("expected exact regeneration apply, got {applied:?}");
     };
@@ -1831,7 +1832,7 @@ async fn saved_grant_regeneration_previews_exact_apply_and_enforces_both_cas_key
         "apply must install the exact previewed candidate"
     );
 
-    let revision_preview = handle_admin_request(&cfg, &admin, preview()).await;
+    let revision_preview = handle_admin_request(&cfg, &daemon, preview()).await;
     let AdminResponse::SavedGrantRegenerationProposal {
         proposal_id: stale_revision,
         ..
@@ -1840,15 +1841,15 @@ async fn saved_grant_regeneration_previews_exact_apply_and_enforces_both_cas_key
         panic!()
     };
     assert!(matches!(
-        handle_admin_request(&cfg, &admin, edit_description()).await,
+        handle_admin_request(&cfg, &daemon, edit_description()).await,
         AdminResponse::SavedGrant { .. }
     ));
     assert!(matches!(
-        handle_admin_request(&cfg, &admin, apply(stale_revision)).await,
+        handle_admin_request(&cfg, &daemon, apply(stale_revision)).await,
         AdminResponse::Error { message } if message.contains("revision changed")
     ));
 
-    let regime_preview = handle_admin_request(&cfg, &admin, preview()).await;
+    let regime_preview = handle_admin_request(&cfg, &daemon, preview()).await;
     let AdminResponse::SavedGrantRegenerationProposal {
         proposal_id: stale_regime,
         ..
@@ -1858,7 +1859,7 @@ async fn saved_grant_regeneration_previews_exact_apply_and_enforces_both_cas_key
     };
     cfg.evaluator = Arc::new(evaluator("regime-b"));
     assert!(matches!(
-        handle_admin_request(&cfg, &admin, apply(stale_regime)).await,
+        handle_admin_request(&cfg, &daemon, apply(stale_regime)).await,
         AdminResponse::Error { message } if message.contains("evaluator regime changed")
     ));
 }

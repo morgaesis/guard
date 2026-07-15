@@ -93,14 +93,6 @@ eval "$(guard grant issue host-a-checks)"
 guard session status
 ```
 
-Edit a saved grant with `guard grant edit`. Preview regenerated typed coverage,
-inspect the candidate and delta, then apply that proposal:
-
-```bash
-guard grant regenerate host-a-checks
-guard grant regenerate host-a-checks --apply <proposal-id>
-```
-
 Agents request bounded expansion through `guard grant request submit`; a denial
 returns a durable handle and the exact operator action needed to resolve it.
 
