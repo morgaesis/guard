@@ -360,8 +360,8 @@ impl SessionStore {
 
     fn open_connection(path: &Path) -> Result<Connection> {
         prepare_state_path(path)?;
-        let conn =
-            Connection::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+        let conn = open_state_connection(path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
         conn.busy_timeout(Duration::from_secs(2))?;
         enforce_private_state_files(path)?;
         Ok(conn)
@@ -1222,6 +1222,21 @@ fn prepare_state_path(path: &Path) -> Result<()> {
     enforce_private_state_files(path)
 }
 
+#[cfg(unix)]
+fn open_state_connection(path: &Path) -> rusqlite::Result<Connection> {
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+        | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+        | rusqlite::OpenFlags::SQLITE_OPEN_URI
+        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    Connection::open_with_flags(path, flags)
+}
+
+#[cfg(not(unix))]
+fn open_state_connection(path: &Path) -> rusqlite::Result<Connection> {
+    Connection::open(path)
+}
+
 #[cfg(not(unix))]
 fn prepare_state_path(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
@@ -1234,6 +1249,7 @@ fn prepare_state_path(path: &Path) -> Result<()> {
 #[cfg(unix)]
 fn create_parent_without_symlinks(parent: &Path) -> Result<()> {
     let mut current = PathBuf::new();
+    let effective_uid = unsafe { libc::geteuid() };
     for component in parent.components() {
         current.push(component.as_os_str());
         match std::fs::symlink_metadata(&current) {
@@ -1247,6 +1263,7 @@ fn create_parent_without_symlinks(parent: &Path) -> Result<()> {
                         current.display()
                     );
                 }
+                validate_state_ancestor(&current, &metadata, effective_uid, current == parent)?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let mut builder = std::fs::DirBuilder::new();
@@ -1260,6 +1277,34 @@ fn create_parent_without_symlinks(parent: &Path) -> Result<()> {
                     .with_context(|| format!("failed to inspect {}", current.display()))
             }
         }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_state_ancestor(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    effective_uid: u32,
+    is_immediate_parent: bool,
+) -> Result<()> {
+    let owner = metadata.uid();
+    if owner != effective_uid && owner != 0 {
+        anyhow::bail!(
+            "state database ancestor {} is controlled by another principal",
+            path.display()
+        );
+    }
+    let mode = metadata.mode();
+    let protected_by_sticky_root = owner == 0 && mode & libc::S_ISVTX as u32 != 0;
+    if mode & 0o022 != 0
+        && !protected_by_sticky_root
+        && !(is_immediate_parent && owner == effective_uid)
+    {
+        anyhow::bail!(
+            "state database ancestor {} is writable by another principal",
+            path.display()
+        );
     }
     Ok(())
 }
@@ -1587,6 +1632,10 @@ mod tests {
         symlink(&target, &linked).unwrap();
         assert!(SessionStore::open(linked, 3600).await.is_err());
 
+        let direct_link = tmp.path().join("direct-link.db");
+        symlink(&target, &direct_link).unwrap();
+        assert!(open_state_connection(&direct_link).is_err());
+
         let directory = tmp.path().join("directory.db");
         std::fs::create_dir(&directory).unwrap();
         assert!(SessionStore::open(directory, 3600).await.is_err());
@@ -1609,6 +1658,17 @@ mod tests {
             let error = secure_state_parent(shared).unwrap_err();
             assert!(error.to_string().contains("writable by another principal"));
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn state_store_rejects_writable_ancestor() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let error = SessionStore::open(tmp.path().join("private/state.db"), 3600)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("writable by another principal"));
     }
 
     #[test]
