@@ -19,9 +19,9 @@ use super::wire::{
     VerbContext,
 };
 use super::{
-    ServerConfig, APPROVAL_TTL_SECS, DEFAULT_CONFIRM_WITHIN_SECS, GATING_RETENTION_SECS,
-    MAX_CONFIRM_WITHIN_SECS, MAX_PENDING_GLOBAL, MAX_PENDING_PER_CALLER, REVERT_EXEC_TIMEOUT_SECS,
-    SWEEPER_GRACE_SECS, SWEEPER_TICK_SECS,
+    ServerConfig, DEFAULT_CONFIRM_WITHIN_SECS, GATING_RETENTION_SECS, MAX_CONFIRM_WITHIN_SECS,
+    MAX_PENDING_GLOBAL, MAX_PENDING_PER_CALLER, REVERT_EXEC_TIMEOUT_SECS, SWEEPER_GRACE_SECS,
+    SWEEPER_TICK_SECS,
 };
 
 // ===========================================================================
@@ -428,7 +428,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
             risk: None,
             reversibility: None,
             created_unix: now,
-            ttl_secs: APPROVAL_TTL_SECS,
+            ttl_secs: self.config.approval_ttl_secs,
             status: ApprovalStatus::Pending,
             decided_unix: None,
             decided_reason: None,
@@ -448,7 +448,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
             "[AUDIT] HELD handle={} caller=(api-proxy) session=none api=\"{}\" ttl={}s",
             handle,
             label,
-            APPROVAL_TTL_SECS
+            self.config.approval_ttl_secs
         );
         // If the brokered client disconnects while parked, this future is
         // dropped mid-await; the guard then retires the orphaned hold.
@@ -461,7 +461,12 @@ impl guard::proxy::GateSink for DaemonGateSink {
         // slack past the TTL is a backstop against a missed wakeup, not a
         // second policy timer.
         let deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_secs(APPROVAL_TTL_SECS.saturating_add(60));
+            + std::time::Duration::from_secs(
+                self.config
+                    .approval_ttl_secs
+                    .min(31_536_000)
+                    .saturating_add(60),
+            );
         loop {
             // Register with the notifier before checking status (see
             // `wait_for_decision`): a decision landing between the check and
@@ -1000,7 +1005,7 @@ pub(super) async fn hold_for_approval<W: AsyncWrite + Unpin>(
         risk,
         reversibility,
         created_unix: now,
-        ttl_secs: APPROVAL_TTL_SECS,
+        ttl_secs: config.approval_ttl_secs,
         status: ApprovalStatus::Pending,
         decided_unix: None,
         decided_reason: None,
@@ -1020,7 +1025,7 @@ pub(super) async fn hold_for_approval<W: AsyncWrite + Unpin>(
         risk,
         reversibility.map(|r| r.as_str()),
         audit_command_line(&request.binary, &request.args),
-        APPROVAL_TTL_SECS
+        config.approval_ttl_secs
     );
 
     match request.wait_approval_secs {

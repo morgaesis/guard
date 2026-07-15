@@ -584,6 +584,40 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                 }
             }
         }
+        VerbCommands::Show { name, socket, json } => {
+            let (client, source) = gate_client(socket);
+            let response = client
+                .send_admin(server::AdminRequest::VerbShow { name })
+                .await
+                .map_err(|error| describe_connect_failure(error, &client, source))?;
+            match response {
+                server::AdminResponse::VerbCreated { verb, .. } => {
+                    if json {
+                        print_json(&verb)
+                    } else {
+                        println!("{}", serde_json::to_string_pretty(&verb)?);
+                        Ok(())
+                    }
+                }
+                server::AdminResponse::Error { message } => Err(anyhow::anyhow!(message)),
+                other => Err(anyhow::anyhow!("unexpected admin response: {other:?}")),
+            }
+        }
+        VerbCommands::Delete { name, socket } => {
+            let (client, source) = gate_client(socket);
+            match client
+                .send_admin(server::AdminRequest::VerbDelete { name })
+                .await
+                .map_err(|error| describe_connect_failure(error, &client, source))?
+            {
+                server::AdminResponse::Ok => {
+                    println!("ok");
+                    Ok(())
+                }
+                server::AdminResponse::Error { message } => Err(anyhow::anyhow!(message)),
+                other => Err(anyhow::anyhow!("unexpected admin response: {other:?}")),
+            }
+        }
         VerbCommands::Run {
             name,
             params,
@@ -719,6 +753,281 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
             }
         }
     }
+}
+
+pub(crate) async fn handle_grant(subcommand: GrantCommands) -> Result<()> {
+    use crate::grant_profile::{EvaluationMode, GrantCeiling, GrantRequestDelta, SavedGrant};
+    use std::str::FromStr;
+
+    let (socket, request, json) = match subcommand {
+        GrantCommands::Save {
+            name,
+            description,
+            verbs,
+            secret_names,
+            ttl,
+            prompt,
+            evaluation_mode,
+            auto_approve,
+            socket,
+            json,
+        }
+        | GrantCommands::Edit {
+            name,
+            description,
+            verbs,
+            secret_names,
+            ttl,
+            prompt,
+            evaluation_mode,
+            auto_approve,
+            socket,
+            json,
+        } => {
+            let evaluation_mode = EvaluationMode::from_str(&evaluation_mode)?;
+            let grant = SavedGrant {
+                name,
+                label: None,
+                description: description.unwrap_or_default(),
+                activated_verbs: verbs.clone(),
+                override_markers: Vec::new(),
+                secret_names: secret_names.clone(),
+                ttl_secs: ttl,
+                prompt_append: prompt,
+                evaluation_mode,
+                auto_approve_requests: auto_approve,
+                ceiling: GrantCeiling {
+                    verbs,
+                    secret_names,
+                    max_ttl_secs: ttl,
+                    allow_prompt_append: true,
+                    evaluation_modes: vec![evaluation_mode],
+                },
+                generated_verbs: Vec::new(),
+                revision: 0,
+                created_unix: 0,
+                updated_unix: 0,
+            };
+            (socket, server::AdminRequest::SavedGrantSave { grant }, json)
+        }
+        GrantCommands::Regenerate {
+            name,
+            prompt,
+            socket,
+            json,
+        } => (
+            socket,
+            server::AdminRequest::SavedGrantRegenerate { name, prompt },
+            json,
+        ),
+        GrantCommands::Issue {
+            name,
+            ttl,
+            label,
+            evaluation_mode,
+            socket,
+        } => {
+            let token = generate_session_token();
+            let mode = evaluation_mode
+                .as_deref()
+                .map(EvaluationMode::from_str)
+                .transpose()?;
+            let config = client_config::ClientConfig::load().ok().unwrap_or_default();
+            let (socket_path, tcp_port, source) =
+                resolve_client_endpoint_with_source(socket, &config);
+            let client = admin_client(socket_path, tcp_port, &config);
+            let response = client
+                .send_admin(server::AdminRequest::SessionGrant {
+                    token: token.clone(),
+                    allow: Vec::new(),
+                    deny: Vec::new(),
+                    activated_verbs: Vec::new(),
+                    override_markers: Vec::new(),
+                    ttl_secs: ttl,
+                    prompt_append: None,
+                    prose: None,
+                    saved_grant: Some(name),
+                    profile: None,
+                    evaluation_mode: mode,
+                    static_only: false,
+                    auto_amend: false,
+                })
+                .await
+                .map_err(|error| describe_connect_failure(error, &client, source))?;
+            return match response {
+                server::AdminResponse::Ok => {
+                    if let Some(label) = label {
+                        match client
+                            .send_admin(server::AdminRequest::SessionLabel {
+                                token: token.clone(),
+                                label,
+                            })
+                            .await?
+                        {
+                            server::AdminResponse::Ok => {}
+                            server::AdminResponse::Error { message } => {
+                                return Err(anyhow::anyhow!(message));
+                            }
+                            other => {
+                                return Err(anyhow::anyhow!(
+                                    "unexpected admin response: {other:?}"
+                                ));
+                            }
+                        }
+                    }
+                    println!("export GUARD_SESSION={token}");
+                    eprintln!("next: guard session show {token}");
+                    Ok(())
+                }
+                server::AdminResponse::Error { message } => Err(anyhow::anyhow!(message)),
+                other => Err(anyhow::anyhow!("unexpected admin response: {other:?}")),
+            };
+        }
+        GrantCommands::List { socket, json } => {
+            (socket, server::AdminRequest::SavedGrantList, json)
+        }
+        GrantCommands::Show { name, socket, json } => {
+            (socket, server::AdminRequest::SavedGrantShow { name }, json)
+        }
+        GrantCommands::Delete { name, socket } => (
+            socket,
+            server::AdminRequest::SavedGrantDelete { name },
+            false,
+        ),
+        GrantCommands::Request(command) => match command {
+            GrantRequestCommands::Submit {
+                session,
+                saved_grant,
+                prompt,
+                verbs,
+                secret_names,
+                ttl,
+                evaluation_mode,
+                socket,
+                json,
+            } => {
+                let session = session
+                    .or_else(|| std::env::var("GUARD_SESSION").ok())
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("grant request submit requires --session or GUARD_SESSION")
+                    })?;
+                let evaluation_mode = evaluation_mode
+                    .as_deref()
+                    .map(EvaluationMode::from_str)
+                    .transpose()?;
+                (
+                    socket,
+                    server::AdminRequest::GrantRequestSubmit {
+                        session_token: session,
+                        saved_grant,
+                        prompt,
+                        delta: GrantRequestDelta {
+                            activated_verbs: verbs,
+                            secret_names,
+                            ttl_secs: ttl,
+                            evaluation_mode,
+                            ..GrantRequestDelta::default()
+                        },
+                    },
+                    json,
+                )
+            }
+            GrantRequestCommands::List { socket, json } => {
+                let session_token = std::env::var("GUARD_SESSION")
+                    .ok()
+                    .filter(|value| !value.is_empty());
+                (
+                    socket,
+                    server::AdminRequest::GrantRequestList { session_token },
+                    json,
+                )
+            }
+            GrantRequestCommands::Show {
+                handle,
+                socket,
+                json,
+            } => (
+                socket,
+                server::AdminRequest::GrantRequestShow { handle },
+                json,
+            ),
+            GrantRequestCommands::Approve { handle, socket } => (
+                socket,
+                server::AdminRequest::GrantRequestApprove { handle },
+                false,
+            ),
+            GrantRequestCommands::Deny {
+                handle,
+                reason,
+                socket,
+            } => (
+                socket,
+                server::AdminRequest::GrantRequestDeny { handle, reason },
+                false,
+            ),
+            GrantRequestCommands::Withdraw { handle, socket } => (
+                socket,
+                server::AdminRequest::GrantRequestWithdraw { handle },
+                false,
+            ),
+        },
+    };
+
+    let config = client_config::ClientConfig::load().ok().unwrap_or_default();
+    let (socket_path, tcp_port, source) = resolve_client_endpoint_with_source(socket, &config);
+    let client = admin_client(socket_path, tcp_port, &config);
+    let response = client
+        .send_admin(request)
+        .await
+        .map_err(|error| describe_connect_failure(error, &client, source))?;
+    if json {
+        return print_json(&serde_json::json!({
+            "schema_version": JSON_SCHEMA_VERSION,
+            "type": "grant",
+            "response": response,
+        }));
+    }
+    match response {
+        server::AdminResponse::Ok => println!("ok"),
+        server::AdminResponse::SavedGrants { items } => {
+            if items.is_empty() {
+                println!("(no saved grants)");
+            }
+            for grant in items {
+                println!(
+                    "{} revision={} mode={} verbs={:?} secrets={:?}",
+                    grant.name,
+                    grant.revision,
+                    grant.evaluation_mode,
+                    grant.all_activated_verbs(),
+                    grant.secret_names
+                );
+            }
+        }
+        server::AdminResponse::SavedGrant { grant } => {
+            println!("{}", serde_json::to_string_pretty(&grant)?);
+            println!("next: guard grant issue {}", grant.name);
+        }
+        server::AdminResponse::GrantRequests { items } => {
+            for request in items {
+                println!(
+                    "{} status={} session={} next={}",
+                    request.handle,
+                    request.status.as_str(),
+                    request.session_token,
+                    request.next_action
+                );
+            }
+        }
+        server::AdminResponse::GrantRequest { request } => {
+            println!("{}", serde_json::to_string_pretty(&request)?);
+            println!("next: {}", request.next_action);
+        }
+        server::AdminResponse::Error { message } => return Err(anyhow::anyhow!(message)),
+        other => return Err(anyhow::anyhow!("unexpected admin response: {other:?}")),
+    }
+    Ok(())
 }
 
 /// Print a gated response (shared by `guard run` and `guard verb run`).
@@ -1335,67 +1644,6 @@ fn generate_session_token() -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn top_level_grant_to_session_command(
-    token_or_prose: Option<String>,
-    prose: Option<String>,
-    allow: Vec<String>,
-    deny: Vec<String>,
-    activated_verbs: Vec<String>,
-    override_markers: Vec<String>,
-    ttl: Option<u64>,
-    prompt: Option<String>,
-    prompt_file: Option<PathBuf>,
-    static_only: bool,
-    auto_amend: bool,
-    no_auto_amend: bool,
-    socket: Option<String>,
-) -> SessionCommands {
-    let single_positional_prose = prose.is_none()
-        && token_or_prose
-            .as_deref()
-            .is_some_and(|value| !looks_like_session_token(value));
-
-    // A lone positional shaped like a session token (32 lowercase hex chars)
-    // targets that session (Grant); anything else (absent, multi-word, or a
-    // plain word like `readonly`) is prose that starts a New session.
-    match token_or_prose {
-        Some(token) if !single_positional_prose => SessionCommands::Grant {
-            token,
-            prose,
-            allow,
-            deny,
-            activated_verbs,
-            override_markers,
-            ttl,
-            prompt,
-            prompt_file,
-            static_only,
-            auto_amend,
-            no_auto_amend,
-            socket,
-        },
-        other => {
-            let prose = prose.or(other);
-            SessionCommands::New {
-                prose,
-                profile: None,
-                allow,
-                deny,
-                activated_verbs,
-                override_markers,
-                ttl,
-                prompt,
-                prompt_file,
-                static_only,
-                auto_amend,
-                no_auto_amend,
-                socket,
-            }
-        }
-    }
-}
-
 fn resolve_session_auto_amend(
     prose: Option<&str>,
     auto_amend: bool,
@@ -1409,16 +1657,10 @@ fn resolve_session_auto_amend(
     }
 }
 
-/// Session tokens minted by `generate_session_token` are exactly 32 lowercase
-/// hex characters; anything else in the positional slot is grant prose.
-fn looks_like_session_token(value: &str) -> bool {
-    value.len() == 32
-        && value
-            .bytes()
-            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-}
-
 pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
+    use crate::grant_profile::EvaluationMode;
+    use std::str::FromStr;
+
     let config = client_config::ClientConfig::load().ok().unwrap_or_default();
 
     // `session new` is special: it mints a token before deciding what to
@@ -1426,13 +1668,14 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
     // we send a SessionGrant for the freshly-minted token.
     if let SessionCommands::New {
         prose,
-        profile,
+        saved_grant,
         allow,
         deny,
         activated_verbs,
         override_markers,
         ttl,
         prompt,
+        evaluation_mode,
         prompt_file,
         static_only,
         auto_amend,
@@ -1442,7 +1685,7 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
     {
         let token = generate_session_token();
         let has_grant = prose.is_some()
-            || profile.is_some()
+            || saved_grant.is_some()
             || !allow.is_empty()
             || !deny.is_empty()
             || !activated_verbs.is_empty()
@@ -1473,7 +1716,12 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                 ttl_secs: *ttl,
                 prompt_append,
                 prose: prose.clone(),
-                profile: profile.clone(),
+                saved_grant: saved_grant.clone(),
+                profile: None,
+                evaluation_mode: evaluation_mode
+                    .as_deref()
+                    .map(EvaluationMode::from_str)
+                    .transpose()?,
                 static_only: *static_only,
                 auto_amend,
             };
@@ -1522,6 +1770,8 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
             override_markers,
             ttl,
             prompt,
+            saved_grant,
+            evaluation_mode,
             prompt_file,
             static_only,
             auto_amend,
@@ -1546,7 +1796,12 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                     ttl_secs: ttl,
                     prompt_append,
                     prose,
+                    saved_grant,
                     profile: None,
+                    evaluation_mode: evaluation_mode
+                        .as_deref()
+                        .map(EvaluationMode::from_str)
+                        .transpose()?,
                     static_only,
                     auto_amend,
                 },
@@ -1568,6 +1823,26 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
         SessionCommands::Revoke { token, socket } => {
             (socket, server::AdminRequest::SessionRevoke { token })
         }
+        SessionCommands::Extend { token, ttl, socket } => (
+            socket,
+            server::AdminRequest::SessionExtend {
+                token,
+                ttl_secs: ttl,
+            },
+        ),
+        SessionCommands::Label {
+            token,
+            label,
+            socket,
+        } => (socket, server::AdminRequest::SessionLabel { token, label }),
+        SessionCommands::RevokeMatching {
+            label,
+            saved_grant,
+            socket,
+        } => (
+            socket,
+            server::AdminRequest::SessionRevokeFiltered { label, saved_grant },
+        ),
         SessionCommands::Show {
             token,
             limit,
@@ -1588,6 +1863,26 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                 server::AdminRequest::SessionShow {
                     token: target,
                     limit: Some(limit),
+                    caller_token: self_token,
+                },
+            )
+        }
+        SessionCommands::Status {
+            token,
+            socket,
+            json,
+        } => {
+            json_output = json;
+            let self_token = std::env::var("GUARD_SESSION")
+                .ok()
+                .filter(|value| !value.is_empty());
+            let target = token.or_else(|| self_token.clone()).ok_or_else(|| {
+                anyhow::anyhow!("guard session status needs a <token> argument or GUARD_SESSION")
+            })?;
+            (
+                socket,
+                server::AdminRequest::SessionStatus {
+                    token: target,
                     caller_token: self_token,
                 },
             )
@@ -1632,6 +1927,9 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
     {
         server::AdminResponse::Ok => {
             println!("ok");
+        }
+        server::AdminResponse::SessionBulkRevoked { count } => {
+            println!("revoked={count}");
         }
         server::AdminResponse::Error { message } => {
             eprintln!("error: {}", message);
@@ -1843,6 +2141,50 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                 }
             }
         }
+        server::AdminResponse::SessionStatus {
+            report,
+            approvals,
+            provisionals,
+            requests,
+        } => {
+            if json_output {
+                return print_json(&serde_json::json!({
+                    "schema_version": JSON_SCHEMA_VERSION,
+                    "type": "session_status",
+                    "report": report,
+                    "approvals": approvals,
+                    "provisionals": provisionals,
+                    "requests": requests,
+                }));
+            }
+            println!(
+                "active={} approvals={} provisionals={} grant_requests={}",
+                report.active.is_some(),
+                approvals.len(),
+                provisionals.len(),
+                requests.len()
+            );
+            for request in requests {
+                println!(
+                    "request={} status={} next={}",
+                    request.handle,
+                    request.status.as_str(),
+                    request.next_action
+                );
+            }
+            for approval in approvals {
+                println!(
+                    "approval={} status={} next=guard approvals {}",
+                    approval.handle, approval.status, approval.handle
+                );
+            }
+            for provisional in provisionals {
+                println!(
+                    "provisional={} status={} next=guard provisionals",
+                    provisional.handle, provisional.status
+                );
+            }
+        }
         server::AdminResponse::SessionAppeal {
             allowed,
             amended,
@@ -1873,7 +2215,12 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
         | server::AdminResponse::Approvals { .. }
         | server::AdminResponse::ApprovalShow { .. }
         | server::AdminResponse::Verbs { .. }
-        | server::AdminResponse::VerbCreated { .. } => {
+        | server::AdminResponse::VerbCreated { .. }
+        | server::AdminResponse::SavedGrants { .. }
+        | server::AdminResponse::SavedGrant { .. }
+        | server::AdminResponse::GrantRequests { .. }
+        | server::AdminResponse::GrantRequest { .. }
+        | server::AdminResponse::EvaluationBatch { .. } => {
             // session subcommands never request these response variants.
             eprintln!("unexpected response from session admin call");
             std::process::exit(1);

@@ -288,12 +288,15 @@ impl SavedGrantCatalog {
         Self::default()
     }
 
-    pub fn from_rows(rows: Vec<SavedGrant>) -> Result<Self> {
-        let mut catalog = Self::empty();
+    /// Overlay already-normalized durable rows onto file-backed definitions.
+    /// Durable edits win by name without incrementing their revision at load.
+    pub fn overlay_rows(&mut self, rows: Vec<SavedGrant>) -> Result<()> {
         for grant in rows {
-            catalog.insert(grant)?;
+            validate_name(&grant.name)?;
+            validate_saved_grant(&grant)?;
+            self.grants.insert(grant.name.clone(), grant);
         }
-        Ok(catalog)
+        Ok(())
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -363,11 +366,6 @@ impl SavedGrantCatalog {
         Self::from_yaml(&text)
     }
 }
-
-/// Internal compatibility alias for older server construction code. Public
-/// help and wire formats use saved-grant terminology.
-pub type ProfileCatalog = SavedGrantCatalog;
-pub type GrantProfile = SavedGrant;
 
 #[derive(Debug, Deserialize)]
 struct GrantFile {
@@ -639,6 +637,20 @@ mod tests {
     }
 
     #[test]
+    fn reference_saved_grant_catalog_is_valid() {
+        let catalog = SavedGrantCatalog::from_yaml(include_str!("../examples/saved-grants.yaml"))
+            .expect("reference catalog");
+        assert_eq!(
+            catalog.names(),
+            vec![
+                "ansible-host-a-apply".to_string(),
+                "cert-manager-rotation".to_string(),
+                "kube-readonly".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn migrates_unambiguous_profile_without_complement_denies() {
         let catalog = SavedGrantCatalog::from_yaml(
             "profiles:\n  - name: legacy\n    allow: [\"kubectl get *\"]\n    deny: [\"kubectl delete namespace *\"]\n",
@@ -698,5 +710,26 @@ mod tests {
             activated_verbs: vec!["deploy-b".to_string()],
             ..GrantRequestDelta::default()
         }));
+    }
+
+    #[test]
+    fn durable_rows_overlay_file_catalog_without_dropping_other_grants() {
+        let mut catalog = SavedGrantCatalog::from_yaml(
+            "grants:\n  - name: file-only\n    prompt_append: file\n  - name: shared\n    prompt_append: file revision\n",
+        )
+        .unwrap();
+        let durable = SavedGrantCatalog::from_yaml(
+            "grants:\n  - name: shared\n    prompt_append: durable revision\n",
+        )
+        .unwrap()
+        .get("shared")
+        .unwrap()
+        .clone();
+        catalog.overlay_rows(vec![durable]).unwrap();
+        assert!(catalog.get("file-only").is_some());
+        assert_eq!(
+            catalog.get("shared").unwrap().prompt_append.as_deref(),
+            Some("durable revision")
+        );
     }
 }

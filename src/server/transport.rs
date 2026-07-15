@@ -1,5 +1,5 @@
 use crate::evaluate::Evaluator;
-use crate::grant_profile::ProfileCatalog;
+use crate::grant_profile::SavedGrantCatalog;
 use crate::secrets::SecretManager;
 use crate::session::SessionRegistry;
 use crate::session_store::SessionStore;
@@ -110,15 +110,18 @@ impl Server {
         self.config.gate = gate;
     }
 
+    pub fn set_approval_ttl(&mut self, ttl_secs: u64) {
+        self.config.approval_ttl_secs = ttl_secs;
+    }
+
     /// Install the operator-defined verb catalog. Must be called before `run`.
     pub fn set_verbs(&mut self, catalog: VerbCatalog) {
         self.config.verbs = Arc::new(RwLock::new(catalog));
     }
 
-    /// Install the operator-defined session-grant profiles. Must be called
-    /// before `run`.
-    pub fn set_profiles(&mut self, catalog: ProfileCatalog) {
-        self.config.profiles = catalog;
+    /// Install reusable grants. Must be called before `run`.
+    pub fn set_saved_grants(&mut self, catalog: SavedGrantCatalog) {
+        self.config.saved_grants = Arc::new(RwLock::new(catalog));
     }
 
     /// Restrict which binaries may execute. `None` imposes no restriction (the
@@ -149,11 +152,31 @@ impl Server {
     /// become `exec_failed`. Both are surfaced via a high-severity audit line.
     async fn startup_gating(&self) {
         let Some(store) = &self.config.session_store else {
+            self.install_saved_grant_verbs().await;
             tracing::info!(
-                "Consequence gating enabled (no state-db: provisional/approval state is process-local and not recovered across restart)"
+                "No state database configured: saved grants, grant requests, sessions, and gate state are process-local"
             );
             return;
         };
+
+        match store.load_saved_grants().await {
+            Ok(rows) => {
+                if let Err(error) = self.config.saved_grants.write().await.overlay_rows(rows) {
+                    tracing::error!("failed to validate saved grants: {}", error);
+                }
+            }
+            Err(error) => tracing::error!("failed to load saved grants: {}", error),
+        }
+        self.install_saved_grant_verbs().await;
+        match store.load_grant_requests().await {
+            Ok(rows) => {
+                *self.config.grant_requests.write().await = rows
+                    .into_iter()
+                    .map(|request| (request.handle.clone(), request))
+                    .collect();
+            }
+            Err(error) => tracing::error!("failed to load grant requests: {}", error),
+        }
 
         match store.load_provisionals().await {
             Ok(rows) => {
@@ -286,6 +309,24 @@ impl Server {
         }
     }
 
+    async fn install_saved_grant_verbs(&self) {
+        let generated = self
+            .config
+            .saved_grants
+            .read()
+            .await
+            .list()
+            .into_iter()
+            .flat_map(|grant| grant.generated_verbs)
+            .collect::<Vec<_>>();
+        let mut verbs = self.config.verbs.write().await;
+        for verb in generated {
+            if let Err(error) = verbs.upsert_saved_grant_verb(verb) {
+                tracing::error!("failed to install generated saved-grant verb: {}", error);
+            }
+        }
+    }
+
     /// Load persisted read grants at startup. Any grant already past its TTL is
     /// revoked immediately (a read grant only removes access, so this is always
     /// safe to do unattended, unlike a provisional revert); a grant still within
@@ -337,11 +378,12 @@ impl Server {
     pub async fn run(&self) -> Result<()> {
         tracing::info!("Server::run() called");
 
-        // Consequence gating: load persisted state (with boot-safe recovery).
+        // Load durable authorization state. Consequence rows also receive
+        // boot-safe recovery when gating is enabled.
         if self.config.gate.is_on() {
             tracing::info!("Consequence gating: {}", self.config.gate);
-            self.startup_gating().await;
         }
+        self.startup_gating().await;
         // Reconcile persisted read grants (revoke expired, re-arm live).
         #[cfg(unix)]
         self.startup_read_grants().await;

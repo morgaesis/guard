@@ -160,6 +160,7 @@ pub struct CoverageMatch {
     pub cell: String,
     pub action: CoverageAction,
     pub override_marker: Option<String>,
+    pub sticky: bool,
     pub features: BTreeSet<String>,
     pub specificity: CoverageSpecificity,
 }
@@ -493,6 +494,7 @@ impl VerbCatalog {
                         CoverageAction::Evaluate
                     },
                     override_marker: None,
+                    sticky: false,
                     features: legacy_template_features(&verb.args),
                     specificity: CoverageSpecificity {
                         requirements: legacy_template_features(&verb.args),
@@ -509,6 +511,7 @@ impl VerbCatalog {
                         cell: cell.name.clone(),
                         action: cell.action,
                         override_marker: cell.override_marker.clone(),
+                        sticky: cell.sticky,
                         features,
                         specificity,
                     });

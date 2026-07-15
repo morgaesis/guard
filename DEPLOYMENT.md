@@ -65,13 +65,11 @@ daemon runs as a separate principal (a dedicated uid on Unix, the service
 account on Windows); workers are agents that reach the system only through
 `guard run` and `guard verb`.
 
-1. The foreman mints a scoped session grant for each worker:
-   `guard session new --allow '<glob>' --prompt '<intent>' --ttl <secs>`, or
-   `guard grant` with a prose description, and hands the worker the resulting
-   `GUARD_SESSION` token. The grant narrows what the worker may attempt without
-   relaxing the global mode. The token is bearer access to that scoped session.
-   Generated static-grant notes are stored separately from prompt context and
-   appear in `session list` / `session show`.
+1. The foreman issues a saved grant for each worker with
+   `guard grant issue <name>` and hands the worker the resulting
+   `GUARD_SESSION` token. The saved grant activates typed verbs, selects the
+   evaluation mode, and carries a bounded TTL, evaluator context, and
+   secret-name entitlements. The token is bearer access to that scoped session.
 
 2. The foreman loads a gated verb catalog with `--verbs`
    ([`examples/verbs-kubectl.yaml`](examples/verbs-kubectl.yaml) is a reference).
@@ -97,39 +95,32 @@ than the daemon, so the gate, the secret namespace, and the approval RPCs are al
 beyond their reach. This holds identically on Unix (uid separation) and Windows
 (service-account isolation with ACL'd state and credential directories).
 
-### Session-grant profiles
+### Saved grants
 
-A session-grant profile is an operator-authored, named bundle of the same fields
-the foreman would otherwise type into `guard session new`: a ttl, legacy
-allow/deny globs, and evaluator prompt context. It pre-authors a recurring,
-bounded box of access (for example, cert-manager certificate rotation) once, so
-a session does not have to be re-authored per worker or per operator round-trip.
-Profiles do not form a separate authority model; they mint ordinary sessions.
+A saved grant is the reusable authorization object. The daemon loads a `grants:`
+catalog from `--grants <path>` or GUARD_GRANTS and also persists grants created
+with `guard grant save`. See
+[`examples/saved-grants.yaml`](examples/saved-grants.yaml). An explicitly named
+catalog that is missing, malformed, or contains duplicate names fails startup.
 
-The daemon loads a profile catalog from `--profiles <path>` (or the
-`GUARD_PROFILES` environment variable) at `guard server start`. The catalog is a
-`profiles:` list of named entries in operator-controlled YAML
-([`examples/session-profiles.yaml`](examples/session-profiles.yaml) is a
-reference). It is read once at startup, not hot-reloaded, so a catalog change
-takes effect on the next daemon start. An explicitly named path that is missing
-or malformed fails startup loudly rather than starting with no profiles, the same
-as `--verbs`; parsing also rejects duplicate names and a profile that would grant
-nothing.
+Use `guard grant save`, `edit`, `regenerate`, `list`, `show`, and `delete` to
+manage definitions. `guard grant issue <name>` returns the `GUARD_SESSION`
+export for a new live session. Regeneration produces typed verb coverage with
+evidence and boundary probes while preserving sticky operator-authored cells.
+The issued session records the saved-grant revision, so a change invalidates
+affected evaluator-cache entries.
 
-The foreman mints a session from a profile in one round trip with
-`guard session new --profile <name>`, which returns the `GUARD_SESSION` token to
-hand to a worker. An unknown name is rejected by the daemon. A profile is a no
-new trust boundary: the session it mints takes the identical install and
-validation path as a hand-authored `guard session new`, so it can express nothing
-an operator could not type directly. A session allow-glob short-circuits past
-the evaluator only for requests without structured cwd, while staying inside
-the server binary allow-list, consequence routing, read-grant retry path,
-held-command snapshot binding, audit log, and session history. A deny-glob
-short-circuits to deny, and anything the globs do not cover still falls through
-to the per-command evaluator with the profile's prompt appended as context. New
-structured constraints are authored as typed verbs and reverse-matched
-capabilities; profiles are the compatibility wrapper that can select those
-capabilities as the grant model evolves.
+Legacy `--profiles`, GUARD_PROFILES, `--profile`, and top-level `profiles:`
+files are migration aliases. Legacy command patterns convert only when they are
+an exact argv sequence or an exact sequence ending in a separate `*` token.
+Ambiguous shell globs fail loading. They do not remain an independent session
+policy system.
+
+Session coverage expands ordinary global read-only or evaluator coverage in
+its activated verb regions. A baseline cell with an explicit override marker
+requires the same marker in the issued grant. Sticky baseline cells remain
+absolute. Binary allow-lists, credential checks, consequence routing, audit,
+and session history remain independent hard controls.
 
 ## Recommended deployment
 
@@ -160,8 +151,8 @@ automatically evaluates a time-boxed POSIX ACL read grant for that one path so
 the retried `ansible`/`helm` command can read an operator config/vars/values
 file the daemon user does not own. The grant targets guard's own service
 account, or the caller's uid under `--exec-as-caller`. The request goes through
-the same static credential deny-list, session allow/deny globs, and LLM
-evaluator as any other brokered request, and the grant revokes at its bounded
+the same static credential deny-list, saved-grant verb coverage, and evaluator
+as any other brokered request, and the grant revokes at its bounded
 TTL. This is the preferred, default path for the "brokered command needs to
 read an operator file" gap under the unprivileged policy-gate model above;
 `--exec-as-caller` remains documented below for its own broader per-uid

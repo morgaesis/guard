@@ -1,4 +1,4 @@
-//! guard - LLM-evaluated command gate for AI agents
+//! guard - evaluator-gated command execution for AI agents
 //!
 
 mod cli_client;
@@ -55,9 +55,9 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
 }
 
 use cli_client::{
-    handle_approval_note_cmd, handle_approvals, handle_config, handle_gate_action,
+    handle_approval_note_cmd, handle_approvals, handle_config, handle_gate_action, handle_grant,
     handle_provisionals, handle_session, handle_status, handle_verb, run_exec, run_mcp,
-    top_level_grant_to_session_command, GatingOptions, RunInjections, SshHostKeyCliMode,
+    GatingOptions, RunInjections, SshHostKeyCliMode,
 };
 use cli_secrets::handle_secrets;
 use cli_server::run_server;
@@ -66,7 +66,7 @@ use cli_shim::{handle_shim, ShimOptions};
 #[derive(Parser)]
 #[command(
     name = "guard",
-    about = "LLM-evaluated command gate for AI agents",
+    about = "Evaluator-gated command execution for AI agents",
     after_help = "Access model:\n  Non-admin local callers can run commands, manage their own secret namespace, read liveness status, list sessions with redaction, show a known session token, list/run verbs, inspect their own held approvals/provisionals, and manage local client setup.\n  Daemon-principal callers or TCP admin-token callers can grant/revoke/appeal sessions, approve/deny/confirm/revert gates, create verbs, read full daemon status, and inspect detailed secret ownership.\n\nUse `guard help-tree` for a categorized access summary."
 )]
 #[allow(clippy::large_enum_variant)]
@@ -175,52 +175,9 @@ enum MainArgs {
     /// Manage scoped session permissions
     #[clap(subcommand)]
     Session(SessionCommands),
-    /// Shorthand for `guard session new <prose>` or `guard session grant <token> ...`.
-    /// Daemon-principal or TCP admin-token only when it installs or updates a grant.
-    Grant {
-        /// Opaque session token to update, or quoted prose to create a fresh session.
-        token: Option<String>,
-        /// Prose describing the intended access. Known domains are compiled to
-        /// static session rules; misses fall through to the LLM unless
-        /// --static-only is set.
-        #[arg(value_name = "PROSE")]
-        prose: Option<String>,
-        /// Glob pattern to allow in this session (repeatable)
-        #[arg(long = "allow", value_name = "GLOB")]
-        allow: Vec<String>,
-        /// Glob pattern to deny in this session (repeatable, beats allow)
-        #[arg(long = "deny", value_name = "GLOB")]
-        deny: Vec<String>,
-        /// Activate a non-baseline catalog verb for this session (repeatable).
-        #[arg(long = "verb", value_name = "NAME")]
-        activated_verbs: Vec<String>,
-        /// Carry an exact marker that lets matching session permission replace
-        /// a baseline evaluate/deny cell (repeatable).
-        #[arg(long = "override-marker", value_name = "MARKER")]
-        override_markers: Vec<String>,
-        /// Time-to-live in seconds; omit for no expiry
-        #[arg(long, value_name = "SECONDS")]
-        ttl: Option<u64>,
-        /// Free-form context appended to the LLM system prompt for evaluator
-        /// calls made under this session token.
-        #[arg(long, value_name = "TEXT")]
-        prompt: Option<String>,
-        /// Read prompt from a file (alternative to --prompt).
-        #[arg(long, value_name = "PATH")]
-        prompt_file: Option<PathBuf>,
-        /// Deny session-rule misses instead of falling through to the LLM.
-        #[arg(long = "static-only", alias = "no-llm-fallback", action = ArgAction::SetTrue)]
-        static_only: bool,
-        /// Let fresh low-risk LLM fallback decisions add exact session rules.
-        #[arg(long = "auto-amend", action = ArgAction::SetTrue)]
-        auto_amend: bool,
-        /// Disable automatic exact-rule amendment for this grant.
-        #[arg(long = "no-auto-amend", action = ArgAction::SetTrue)]
-        no_auto_amend: bool,
-        /// Server socket path (defaults to configured)
-        #[arg(long, value_name = "PATH")]
-        socket: Option<String>,
-    },
+    /// Save, issue, amend, and request reusable grants.
+    #[clap(subcommand)]
+    Grant(GrantCommands),
     /// Ask the evaluator to amend or deny a session grant without executing the command.
     /// Daemon-principal or TCP admin-token only.
     //
@@ -228,6 +185,7 @@ enum MainArgs {
     // appealed command rather than printing this subcommand's help. Bare help
     // (before a binary is named) is recovered by `passthrough_command_help_requested`.
     #[clap(
+        hide = true,
         disable_help_flag = true,
         after_help = "Use `guard appeal --session <token> <binary> --help` to pass --help to the appealed command."
     )]
@@ -260,6 +218,11 @@ enum MainArgs {
         /// Include daemon-principal/admin-token commands.
         #[arg(long, action = ArgAction::SetTrue)]
         admin: bool,
+    },
+    /// Generate shell completion definitions.
+    Completions {
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
     },
     /// List provisional (containment-envelope) executions awaiting confirmation.
     Provisionals {
@@ -330,6 +293,20 @@ enum VerbCommands {
         #[arg(long, action = ArgAction::SetTrue)]
         json: bool,
     },
+    /// Show one verb, including typed coverage and generation evidence.
+    Show {
+        name: String,
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
+    /// Delete one operator-authored verb.
+    Delete {
+        name: String,
+        #[arg(long)]
+        socket: Option<String>,
+    },
     /// Run a verb with validated parameters: --param key=value (repeatable).
     Run {
         /// Verb name from the catalog.
@@ -370,35 +347,179 @@ enum VerbCommands {
 }
 
 #[derive(Subcommand)]
+enum GrantCommands {
+    /// Save a reusable grant. Existing names are updated with a new revision.
+    Save {
+        name: String,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long = "verb")]
+        verbs: Vec<String>,
+        #[arg(long = "secret")]
+        secret_names: Vec<String>,
+        #[arg(long)]
+        ttl: Option<u64>,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long, default_value = "evaluator")]
+        evaluation_mode: String,
+        #[arg(long, action = ArgAction::SetTrue)]
+        auto_approve: bool,
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
+    /// Update a reusable grant and increment its revision.
+    Edit {
+        name: String,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long = "verb")]
+        verbs: Vec<String>,
+        #[arg(long = "secret")]
+        secret_names: Vec<String>,
+        #[arg(long)]
+        ttl: Option<u64>,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long, default_value = "evaluator")]
+        evaluation_mode: String,
+        #[arg(long, action = ArgAction::SetTrue)]
+        auto_approve: bool,
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
+    /// Regenerate typed verbs from the saved prompt or replacement prose.
+    Regenerate {
+        name: String,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
+    /// Issue a reusable grant into a fresh session.
+    Issue {
+        name: String,
+        #[arg(long)]
+        ttl: Option<u64>,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        evaluation_mode: Option<String>,
+        #[arg(long)]
+        socket: Option<String>,
+    },
+    /// List reusable grants.
+    List {
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
+    /// Show one reusable grant.
+    Show {
+        name: String,
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
+    /// Delete one reusable grant and its generated verbs.
+    Delete {
+        name: String,
+        #[arg(long)]
+        socket: Option<String>,
+    },
+    /// Create and resolve durable grant amendment requests.
+    #[clap(subcommand)]
+    Request(GrantRequestCommands),
+}
+
+#[derive(Subcommand)]
+enum GrantRequestCommands {
+    /// Request a bounded amendment to the active session.
+    Submit {
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        saved_grant: Option<String>,
+        #[arg(long)]
+        prompt: String,
+        #[arg(long = "verb")]
+        verbs: Vec<String>,
+        #[arg(long = "secret")]
+        secret_names: Vec<String>,
+        #[arg(long)]
+        ttl: Option<u64>,
+        #[arg(long)]
+        evaluation_mode: Option<String>,
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
+    List {
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
+    Show {
+        handle: String,
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
+    Approve {
+        handle: String,
+        #[arg(long)]
+        socket: Option<String>,
+    },
+    Deny {
+        handle: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        socket: Option<String>,
+    },
+    Withdraw {
+        handle: String,
+        #[arg(long)]
+        socket: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum SessionCommands {
-    /// Mint a fresh session token (32 lowercase hex chars). With grant prose or any
-    /// grant flags, also installs the grant in one round trip and requires
-    /// the daemon principal or TCP admin token. Prints `export
+    /// Mint a fresh session token. Grant flags install scoped typed verbs and
+    /// require the daemon principal or TCP admin token. Prints `export
     /// GUARD_SESSION=<token>` on stdout so you can `eval $(guard session
     /// new ...)` to set it for the current shell.
     New {
-        /// Prose describing the intended access. Known domains are compiled to
-        /// static session rules; misses fall through to the LLM unless
-        /// --static-only is set.
-        #[arg(value_name = "PROSE")]
+        /// Compatibility prose appended to evaluator context.
+        #[arg(value_name = "PROSE", hide = true)]
         prose: Option<String>,
-        /// Mint this grant from an operator-defined profile (see --profiles on
-        /// `guard server start`): a named grant-field bundle.
-        /// Works standalone; an unknown name is rejected by the daemon.
-        #[arg(long, value_name = "NAME")]
-        profile: Option<String>,
+        /// Issue this session from a reusable saved grant.
+        #[arg(long, alias = "profile", value_name = "NAME")]
+        saved_grant: Option<String>,
         /// Glob pattern to allow in this session (repeatable)
-        #[arg(long = "allow", value_name = "GLOB")]
+        #[arg(long = "allow", value_name = "GLOB", hide = true)]
         allow: Vec<String>,
         /// Glob pattern to deny in this session (repeatable, beats allow)
-        #[arg(long = "deny", value_name = "GLOB")]
+        #[arg(long = "deny", value_name = "GLOB", hide = true)]
         deny: Vec<String>,
         /// Activate a non-baseline catalog verb for this session (repeatable).
         #[arg(long = "verb", value_name = "NAME")]
         activated_verbs: Vec<String>,
         /// Carry an exact marker that lets matching session permission replace
         /// a baseline evaluate/deny cell (repeatable).
-        #[arg(long = "override-marker", value_name = "MARKER")]
+        #[arg(long = "override-marker", value_name = "MARKER", hide = true)]
         override_markers: Vec<String>,
         /// Time-to-live in seconds; omit for no expiry (grants persist in the
         /// state DB and are reloaded on daemon restart)
@@ -407,17 +528,20 @@ enum SessionCommands {
         /// Free-form context appended to the LLM system prompt for this session.
         #[arg(long, value_name = "TEXT")]
         prompt: Option<String>,
+        /// Evaluator behavior for misses: evaluator, policy-only, or read-only.
+        #[arg(long, value_name = "MODE")]
+        evaluation_mode: Option<String>,
         /// Read session context from a file.
         #[arg(long, value_name = "PATH")]
         prompt_file: Option<PathBuf>,
         /// Deny session-rule misses instead of falling through to the LLM.
-        #[arg(long = "static-only", alias = "no-llm-fallback", action = ArgAction::SetTrue)]
+        #[arg(long = "static-only", alias = "no-llm-fallback", hide = true, action = ArgAction::SetTrue)]
         static_only: bool,
         /// Let fresh low-risk LLM fallback decisions add exact session rules.
-        #[arg(long = "auto-amend", action = ArgAction::SetTrue)]
+        #[arg(long = "auto-amend", hide = true, action = ArgAction::SetTrue)]
         auto_amend: bool,
         /// Disable automatic exact-rule amendment for this grant.
-        #[arg(long = "no-auto-amend", action = ArgAction::SetTrue)]
+        #[arg(long = "no-auto-amend", hide = true, action = ArgAction::SetTrue)]
         no_auto_amend: bool,
         /// Server socket path (defaults to configured)
         #[arg(long, value_name = "PATH")]
@@ -425,48 +549,52 @@ enum SessionCommands {
     },
     /// Install scoped permissions for a session token.
     /// Daemon-principal or TCP admin-token only.
+    #[command(hide = true)]
     Grant {
         /// Opaque session token; the agent passes this as GUARD_SESSION or --session
         token: String,
-        /// Prose describing the intended access. Known domains are compiled to
-        /// static session rules; misses fall through to the LLM unless
-        /// --static-only is set.
+        /// Compatibility prose appended to evaluator context.
         #[arg(value_name = "PROSE")]
         prose: Option<String>,
         /// Glob pattern to allow in this session (repeatable)
-        #[arg(long = "allow", value_name = "GLOB")]
+        #[arg(long = "allow", value_name = "GLOB", hide = true)]
         allow: Vec<String>,
         /// Glob pattern to deny in this session (repeatable, beats allow)
-        #[arg(long = "deny", value_name = "GLOB")]
+        #[arg(long = "deny", value_name = "GLOB", hide = true)]
         deny: Vec<String>,
         /// Activate a non-baseline catalog verb for this session (repeatable).
         #[arg(long = "verb", value_name = "NAME")]
         activated_verbs: Vec<String>,
         /// Carry an exact marker that lets matching session permission replace
         /// a baseline evaluate/deny cell (repeatable).
-        #[arg(long = "override-marker", value_name = "MARKER")]
+        #[arg(long = "override-marker", value_name = "MARKER", hide = true)]
         override_markers: Vec<String>,
         /// Time-to-live in seconds; omit for no expiry (grants persist in the
         /// state DB and are reloaded on daemon restart)
         #[arg(long, value_name = "SECONDS")]
         ttl: Option<u64>,
         /// Free-form context appended to the LLM system prompt for evaluator
-        /// calls made under this session token. Use to give the model context
-        /// the static glob patterns cannot express.
+        /// calls made under this session token.
         #[arg(long, value_name = "TEXT")]
         prompt: Option<String>,
+        /// Issue from a reusable saved grant.
+        #[arg(long, alias = "profile", value_name = "NAME")]
+        saved_grant: Option<String>,
+        /// Evaluator behavior for misses: evaluator, policy-only, or read-only.
+        #[arg(long, value_name = "MODE")]
+        evaluation_mode: Option<String>,
         /// Read prompt from a file (alternative to --prompt). Mutually
         /// exclusive with --prompt; --prompt-file wins if both are given.
         #[arg(long, value_name = "PATH")]
         prompt_file: Option<PathBuf>,
         /// Deny session-rule misses instead of falling through to the LLM.
-        #[arg(long = "static-only", alias = "no-llm-fallback", action = ArgAction::SetTrue)]
+        #[arg(long = "static-only", alias = "no-llm-fallback", hide = true, action = ArgAction::SetTrue)]
         static_only: bool,
         /// Let fresh low-risk LLM fallback decisions add exact session rules.
-        #[arg(long = "auto-amend", action = ArgAction::SetTrue)]
+        #[arg(long = "auto-amend", hide = true, action = ArgAction::SetTrue)]
         auto_amend: bool,
         /// Disable automatic exact-rule amendment for this grant.
-        #[arg(long = "no-auto-amend", action = ArgAction::SetTrue)]
+        #[arg(long = "no-auto-amend", hide = true, action = ArgAction::SetTrue)]
         no_auto_amend: bool,
         /// Server socket path (defaults to configured)
         #[arg(long, value_name = "PATH")]
@@ -479,6 +607,7 @@ enum SessionCommands {
     // `-h`/`--help` after the binary must reach the appealed command. Bare help is
     // recovered by `passthrough_command_help_requested`.
     #[clap(
+        hide = true,
         disable_help_flag = true,
         after_help = "Use `guard session appeal <token> <binary> --help` to pass --help to the appealed command."
     )]
@@ -502,6 +631,30 @@ enum SessionCommands {
         #[arg(long, value_name = "PATH")]
         socket: Option<String>,
     },
+    /// Extend an active session from now.
+    Extend {
+        token: String,
+        #[arg(long, value_name = "SECONDS")]
+        ttl: u64,
+        #[arg(long)]
+        socket: Option<String>,
+    },
+    /// Set or replace the label on an active session.
+    Label {
+        token: String,
+        label: String,
+        #[arg(long)]
+        socket: Option<String>,
+    },
+    /// Revoke every active session matching a label or saved grant.
+    RevokeMatching {
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        saved_grant: Option<String>,
+        #[arg(long)]
+        socket: Option<String>,
+    },
     /// Show one session in detail, including prompt, aggregate stats, and recent
     /// interactions. With no token, defaults to the caller's own `$GUARD_SESSION`.
     /// A non-daemon caller may only inspect the grant on its own token.
@@ -515,6 +668,14 @@ enum SessionCommands {
         #[arg(long, value_name = "PATH")]
         socket: Option<String>,
         /// Emit machine-readable session detail.
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
+    /// Show requester-scoped grant, escalation, hold, and provisional status.
+    Status {
+        token: Option<String>,
+        #[arg(long)]
+        socket: Option<String>,
         #[arg(long, action = ArgAction::SetTrue)]
         json: bool,
     },
@@ -666,7 +827,8 @@ enum ServerCommands {
 
         /// Enable or disable LLM evaluation.
         #[arg(
-            long,
+            long = "evaluator",
+            alias = "llm",
             action = ArgAction::Set,
             num_args = 0..=1,
             default_missing_value = "true",
@@ -676,7 +838,7 @@ enum ServerCommands {
         llm: Option<bool>,
 
         /// Disable LLM evaluation; static policy must allow commands.
-        #[arg(long = "no-llm", action = ArgAction::SetTrue, overrides_with = "llm")]
+        #[arg(long = "no-evaluator", alias = "no-llm", action = ArgAction::SetTrue, overrides_with = "llm")]
         no_llm: bool,
 
         /// Disable output redaction (default: redaction enabled)
@@ -705,28 +867,28 @@ enum ServerCommands {
         /// candidates in the policy reason text (with a ready-to-run `guard
         /// verb create --prompt` suggestion). Never grants a bypass itself --
         /// only an operator running that command can. Env: GUARD_LEARN_RULES.
-        #[arg(long = "learn-rules", action = ArgAction::SetTrue)]
+        #[arg(long = "learn-rules", hide = true, action = ArgAction::SetTrue)]
         learn_rules: bool,
 
         /// Path to the learned-rule candidate state YAML.
         /// Env: GUARD_LEARNED_RULES.
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", hide = true)]
         learned_rules: Option<PathBuf>,
 
         /// LLM approvals required before a command becomes a learned-rule
         /// candidate. Env: GUARD_LEARN_MIN_APPROVALS.
-        #[arg(long, value_name = "N")]
+        #[arg(long, value_name = "N", hide = true)]
         learn_min_approvals: Option<u32>,
 
         /// Maximum risk score eligible for learned-rule candidacy.
         /// Env: GUARD_LEARN_MAX_RISK.
-        #[arg(long, value_name = "0-10")]
+        #[arg(long, value_name = "0-10", hide = true)]
         learn_max_risk: Option<i32>,
 
         /// Service-shim behavior for learned-rule candidates: off, suggest, or
         /// create. A shim is a command alias, not a bypass -- the aliased
         /// command still runs through normal evaluation. Env: GUARD_LEARN_SHIMS.
-        #[arg(long, value_name = "MODE")]
+        #[arg(long, value_name = "MODE", hide = true)]
         learn_shims: Option<String>,
 
         /// Auto-learn deny shapes from repeated LLM denials and fast-reject
@@ -829,18 +991,21 @@ enum ServerCommands {
         #[arg(long, value_name = "MODE")]
         gate: Option<String>,
 
+        /// Held-command lifetime in seconds, or `unbounded`.
+        /// Env: GUARD_APPROVAL_TTL.
+        #[arg(long, value_name = "SECONDS|unbounded")]
+        approval_ttl: Option<String>,
+
         /// Path to the verb catalog YAML (the operator-defined, typed interface
         /// agents call via `guard verb`). Hot-reloaded on change.
         /// Env: GUARD_VERBS.
         #[arg(long, value_name = "PATH")]
         verbs: Option<PathBuf>,
 
-        /// Path to the session-grant profile catalog YAML: operator-authored,
-        /// named {ttl, allow, deny, prompt} bundles that `guard session new
-        /// --profile <name>` mints a grant from. Read once at startup.
-        /// Env: GUARD_PROFILES.
-        #[arg(long, value_name = "PATH")]
-        profiles: Option<PathBuf>,
+        /// Compatibility YAML to migrate into saved grants at startup.
+        /// Env: GUARD_GRANTS. `--profiles` and GUARD_PROFILES are aliases.
+        #[arg(long, alias = "profiles", value_name = "PATH")]
+        grants: Option<PathBuf>,
 
         /// Restrict which binaries the server may execute, regardless of the LLM
         /// decision. Repeat or comma-separate (e.g. `--allow-bin kubectl,git`).
@@ -1286,38 +1451,7 @@ async fn run_main() -> Result<()> {
         Ok(MainArgs::Config(subcommand)) => handle_config(subcommand).await,
         Ok(MainArgs::Mcp(subcommand)) => run_mcp(subcommand).await,
         Ok(MainArgs::Session(subcommand)) => handle_session(subcommand).await,
-        Ok(MainArgs::Grant {
-            token,
-            prose,
-            allow,
-            deny,
-            activated_verbs,
-            override_markers,
-            ttl,
-            prompt,
-            prompt_file,
-            static_only,
-            auto_amend,
-            no_auto_amend,
-            socket,
-        }) => {
-            handle_session(top_level_grant_to_session_command(
-                token,
-                prose,
-                allow,
-                deny,
-                activated_verbs,
-                override_markers,
-                ttl,
-                prompt,
-                prompt_file,
-                static_only,
-                auto_amend,
-                no_auto_amend,
-                socket,
-            ))
-            .await
-        }
+        Ok(MainArgs::Grant(subcommand)) => handle_grant(subcommand).await,
         Ok(MainArgs::Appeal {
             session,
             socket,
@@ -1341,6 +1475,11 @@ async fn run_main() -> Result<()> {
         Ok(MainArgs::Status { socket, json }) => handle_status(socket, json).await,
         Ok(MainArgs::HelpTree { admin }) => {
             print_help_tree(admin);
+            Ok(())
+        }
+        Ok(MainArgs::Completions { shell }) => {
+            let mut command = MainArgs::command();
+            clap_complete::generate(shell, &mut command, "guard", &mut std::io::stdout());
             Ok(())
         }
         Err(ref e)
@@ -1590,9 +1729,11 @@ fn print_help_tree(admin: bool) {
     println!("    server status");
     println!("    secrets|secret add|remove|list");
     println!("    verb list");
+    println!("    verb show <name>");
     println!("    verb run <name> --param key=value");
     println!("    session list [--history] [--since duration] [--full]");
     println!("    session show [token]  (defaults to $GUARD_SESSION)");
+    println!("    session status [token]");
     println!("    session new");
     println!("    provisionals");
     println!("    approvals [handle]");
@@ -1606,16 +1747,17 @@ fn print_help_tree(admin: bool) {
         println!();
         println!("{}", paint("  admin", AnsiColor::Yellow, color));
         println!("    server start");
-        println!("    session new [prose] [--allow glob] [--deny glob]");
-        println!("    session grant <token> [prose] [--allow glob] [--deny glob]");
+        println!("    grant save|edit|regenerate|issue|list|show|delete");
+        println!("    grant request submit|list|show|approve|deny|withdraw");
+        println!("    session new [prose] [--saved-grant name]");
+        println!("    session grant <token> [prose] [--saved-grant name]");
         println!("    session appeal <token> <binary> [args...]");
-        println!("    session revoke <token>");
-        println!("    grant [token] [prose]");
-        println!("    appeal --session <token> <binary> [args...]");
+        println!("    session revoke|extend|label|revoke-matching");
         println!("    secrets list --detailed");
         println!("    approve|deny <handle>");
         println!("    confirm|revert <handle>");
         println!("    verb create --prompt <text>");
+        println!("    verb delete <name>");
     } else {
         println!();
         println!(

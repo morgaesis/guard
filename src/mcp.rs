@@ -17,6 +17,8 @@ const JSONRPC_VERSION: &str = "2.0";
 const DEFAULT_TOOL_NAME: &str = "guard_run";
 const VERB_LIST_TOOL_NAME: &str = "guard_verbs";
 const APPROVAL_LIST_TOOL_NAME: &str = "guard_approvals";
+const EVALUATE_BATCH_TOOL_NAME: &str = "guard_evaluate_batch";
+const SESSION_STATUS_TOOL_NAME: &str = "guard_session_status";
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-03-26", "2024-11-05"];
 
 /// Cap the HTTP request body we will buffer. The MCP request payloads are
@@ -140,6 +142,18 @@ struct GuardToolArgs {
     /// only-existing (ssh's strict checking) when omitted.
     #[serde(default)]
     hostkey: Option<McpSshHostKeyMode>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct EvaluateBatchArgs {
+    #[serde(default)]
+    session: Option<String>,
+    commands: Vec<server::BatchCommand>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SessionStatusArgs {
+    session: String,
 }
 
 #[derive(Debug, Clone)]
@@ -753,6 +767,12 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                 } else if tool_call.name == APPROVAL_LIST_TOOL_NAME {
                     let result = self.call_approval_list().await;
                     jsonrpc_result_response(id, result)
+                } else if tool_call.name == EVALUATE_BATCH_TOOL_NAME {
+                    let result = self.call_evaluate_batch(tool_call.arguments).await;
+                    jsonrpc_result_response(id, result)
+                } else if tool_call.name == SESSION_STATUS_TOOL_NAME {
+                    let result = self.call_session_status(tool_call.arguments).await;
+                    jsonrpc_result_response(id, result)
                 } else {
                     jsonrpc_error_response(
                         id,
@@ -929,6 +949,53 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                         "idempotentHint": true,
                         "openWorldHint": false
                     }
+                },
+                {
+                    "name": EVALUATE_BATCH_TOOL_NAME,
+                    "title": "Evaluate a Command Batch",
+                    "description": "Evaluate 1 to 64 command shapes without executing them. Results share the active saved-grant revision cache context.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "session": { "type": "string" },
+                            "commands": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": 64,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "binary": { "type": "string" },
+                                        "args": { "type": "array", "items": { "type": "string" } }
+                                    },
+                                    "required": ["binary"]
+                                }
+                            }
+                        },
+                        "required": ["commands"]
+                    },
+                    "annotations": {
+                        "readOnlyHint": true,
+                        "destructiveHint": false,
+                        "idempotentHint": true,
+                        "openWorldHint": true
+                    }
+                },
+                {
+                    "name": SESSION_STATUS_TOOL_NAME,
+                    "title": "Show Session Status",
+                    "description": "Show the caller's live grant, escalations, holds, and provisionals for one session token.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": { "session": { "type": "string" } },
+                        "required": ["session"]
+                    },
+                    "annotations": {
+                        "readOnlyHint": true,
+                        "destructiveHint": false,
+                        "idempotentHint": true,
+                        "openWorldHint": false
+                    }
                 }
             ]
         })
@@ -975,6 +1042,77 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                 let structured = json!({ "approvals": items });
                 admin_tool_result(render_approvals_text(&items), structured)
             }
+            Ok(server::AdminResponse::Error { message }) => tool_error_result(message),
+            Ok(_) => tool_error_result("unexpected response from guard daemon".to_string()),
+            Err(error) => tool_error_result(format!("{error:#}")),
+        }
+    }
+
+    async fn call_evaluate_batch(&self, arguments: Value) -> Value {
+        let args: EvaluateBatchArgs = match serde_json::from_value(arguments) {
+            Ok(args) => args,
+            Err(error) => return tool_error_result(format!("invalid tool arguments: {error}")),
+        };
+        match self
+            .admin
+            .send_admin(server::AdminRequest::EvaluateBatch {
+                session_token: args.session,
+                commands: args.commands,
+            })
+            .await
+        {
+            Ok(server::AdminResponse::EvaluationBatch { items }) => {
+                let text = items
+                    .iter()
+                    .map(|item| {
+                        format!(
+                            "{} allowed={} risk={:?} reason={}",
+                            item.command, item.allowed, item.risk, item.reason
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                admin_tool_result(text, json!({ "items": items }))
+            }
+            Ok(server::AdminResponse::Error { message }) => tool_error_result(message),
+            Ok(_) => tool_error_result("unexpected response from guard daemon".to_string()),
+            Err(error) => tool_error_result(format!("{error:#}")),
+        }
+    }
+
+    async fn call_session_status(&self, arguments: Value) -> Value {
+        let args: SessionStatusArgs = match serde_json::from_value(arguments) {
+            Ok(args) => args,
+            Err(error) => return tool_error_result(format!("invalid tool arguments: {error}")),
+        };
+        match self
+            .admin
+            .send_admin(server::AdminRequest::SessionStatus {
+                token: args.session.clone(),
+                caller_token: Some(args.session),
+            })
+            .await
+        {
+            Ok(server::AdminResponse::SessionStatus {
+                report,
+                approvals,
+                provisionals,
+                requests,
+            }) => admin_tool_result(
+                format!(
+                    "active={} approvals={} provisionals={} grant_requests={}",
+                    report.active.is_some(),
+                    approvals.len(),
+                    provisionals.len(),
+                    requests.len()
+                ),
+                json!({
+                    "report": report,
+                    "approvals": approvals,
+                    "provisionals": provisionals,
+                    "requests": requests,
+                }),
+            ),
             Ok(server::AdminResponse::Error { message }) => tool_error_result(message),
             Ok(_) => tool_error_result("unexpected response from guard daemon".to_string()),
             Err(error) => tool_error_result(format!("{error:#}")),

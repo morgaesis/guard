@@ -391,8 +391,65 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
     command: String,
     source: SessionDecisionSource,
     risk: Option<i32>,
-    reason: String,
+    mut reason: String,
 ) -> ExecuteResult {
+    if let Some(token) = phase.session_token.as_deref() {
+        let existing = phase
+            .config
+            .grant_requests
+            .read()
+            .await
+            .values()
+            .find(|request| {
+                request.session_token == token
+                    && request.status == crate::grant_profile::GrantRequestStatus::Pending
+                    && request.justification == command
+            })
+            .cloned();
+        let request = match existing {
+            Some(request) => Some(request),
+            None => {
+                let saved_grant = phase.config.sessions.read().await.saved_grant_for(token);
+                let delta = crate::grant_profile::GrantRequestDelta {
+                    prompt_append: Some(format!(
+                        "Evaluate this denied operation within the operator-approved task scope: {command}"
+                    )),
+                    ..crate::grant_profile::GrantRequestDelta::default()
+                };
+                crate::grant_profile::GrantRequest::new(
+                    token.to_string(),
+                    saved_grant.map(|(name, _)| name),
+                    delta,
+                    command.clone(),
+                )
+                .ok()
+            }
+        };
+        if let Some(request) = request {
+            phase
+                .config
+                .grant_requests
+                .write()
+                .await
+                .insert(request.handle.clone(), request.clone());
+            if let Some(store) = &phase.config.session_store {
+                if let Err(error) = store.save_grant_request(request.clone()).await {
+                    tracing::warn!("failed to persist denial escalation: {}", error);
+                }
+            }
+            reason.push_str(&format!(
+                "; escalation={} next=`guard grant request show {}` operator=`guard grant request approve {}`",
+                request.handle, request.handle, request.handle
+            ));
+            tracing::warn!(
+                target: "guard::audit",
+                "[AUDIT] OPERATOR_NOTIFICATION kind=grant_request handle={} session={} command={}",
+                request.handle,
+                audit_session_fingerprint(Some(token)),
+                command
+            );
+        }
+    }
     log_audit_policy_for_request(phase.config, phase.caller, request, false, &reason);
     let _ = write_policy_decision(
         phase.stream_output,
@@ -623,6 +680,7 @@ async fn resolve_verb_context<W: AsyncWrite + Unpin>(
         let overridden = baseline_override_applies(
             scope,
             effective_action,
+            matched.sticky,
             matched.override_marker.as_deref(),
             &override_markers,
         );
@@ -639,10 +697,12 @@ async fn resolve_verb_context<W: AsyncWrite + Unpin>(
 fn baseline_override_applies(
     scope: VerbMatchScope,
     action: CoverageAction,
+    sticky: bool,
     required_marker: Option<&str>,
     granted_markers: &BTreeSet<String>,
 ) -> bool {
     scope == VerbMatchScope::Baseline
+        && !sticky
         && matches!(action, CoverageAction::Evaluate | CoverageAction::Deny)
         && required_marker.is_some_and(|marker| granted_markers.contains(marker))
 }
@@ -676,6 +736,7 @@ fn resolve_scoped_matches(
             if has_session {
                 matched.scope == VerbMatchScope::Session
                     || (matched.scope == VerbMatchScope::Baseline
+                        && (matched.matched.sticky || matched.matched.override_marker.is_some())
                         && matches!(
                             matched.effective_action,
                             CoverageAction::Evaluate | CoverageAction::Deny
@@ -1025,6 +1086,7 @@ mod verb_resolution_tests {
                 cell: cell.to_string(),
                 action,
                 override_marker: marker.map(str::to_string),
+                sticky: false,
                 features: features
                     .iter()
                     .map(|feature| (*feature).to_string())
@@ -1127,18 +1189,21 @@ mod verb_resolution_tests {
         assert!(baseline_override_applies(
             VerbMatchScope::Baseline,
             CoverageAction::Evaluate,
+            false,
             Some("operator:apply"),
             &granted,
         ));
         assert!(!baseline_override_applies(
             VerbMatchScope::Baseline,
             CoverageAction::Evaluate,
+            false,
             Some("operator:other"),
             &granted,
         ));
         assert!(!baseline_override_applies(
             VerbMatchScope::Session,
             CoverageAction::Deny,
+            false,
             Some("operator:apply"),
             &granted,
         ));
@@ -1715,7 +1780,21 @@ async fn try_static_fast_allow<W: AsyncWrite + Unpin>(
 async fn resolve_session_prompt(config: &ServerConfig, request: &ExecuteRequest) -> Option<String> {
     let session_prompt = if let Some(ref token) = request.session_token {
         let reg = config.sessions.read().await;
-        reg.prompt_append_for(token)
+        let revision = reg.effective_revision_key(token)?;
+        let mode = reg.evaluation_mode_for(token).unwrap_or_default();
+        let mut sections = vec![format!(
+            "[GUARD AUTHORIZATION CONTEXT]\neffective_grant_revision={revision}\nevaluation_mode={mode}"
+        )];
+        if mode == crate::grant_profile::EvaluationMode::ReadOnly {
+            sections.push(
+                "Allow read-only inspection. Deny mutations unless an activated session verb already preauthorized the exact typed operation."
+                    .to_string(),
+            );
+        }
+        if let Some(prompt) = reg.prompt_append_for(token) {
+            sections.push(prompt);
+        }
+        Some(sections.join("\n\n"))
     } else {
         None
     };
@@ -1796,12 +1875,9 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
 ) -> ExecuteResult {
     let config = phase.config;
     let session_token = phase.session_token.clone();
-    let session_prompt_active = session_prompt
-        .as_deref()
-        .map(|prompt| !prompt.trim().is_empty())
-        .unwrap_or(false);
+    let session_prompt_active = session_prompt.is_some();
     let evaluation_prompt = evaluation_context_prompt(&request, session_prompt);
-    let eval_result = if evaluation_prompt.is_some() && !session_prompt_active {
+    let eval_result = if evaluation_prompt.is_some() {
         config
             .evaluator
             .evaluate_with_cacheable_context(
@@ -2223,7 +2299,7 @@ async fn maybe_promote_deny_shape(
     };
     let hint = (outcome.denials >= outcome.required_denials).then(|| {
         format!(
-            "guard has denied {} similar {} commands; if this access is needed, ask your operator to broaden the session grant or add a profile",
+            "guard has denied {} similar {} commands; if this access is needed, use the escalation handle to request a saved-grant or verb amendment",
             outcome.denials, binary
         )
     });
@@ -2362,16 +2438,14 @@ async fn maybe_promote_allow_verb(
 async fn learning_notice(config: &ServerConfig, outcome: &LearningOutcome) -> Option<String> {
     let mut notice = if outcome.is_candidate {
         format!(
-            "Learned-rule candidate `{}` for `{}` reached {} approvals. This does NOT skip the \
-             LLM by itself; an operator can promote it with: guard verb create --prompt \
-             \"allow exactly: {}\" --binary {}.",
-            outcome.pattern, outcome.service, outcome.approvals, outcome.pattern, outcome.service
+            "Verb evidence for `{}` on `{}` reached {} approvals; automatic typed promotion evaluates coverage evidence and boundary probes without routine operator review.",
+            outcome.pattern, outcome.service, outcome.approvals
         )
     } else if let Some(reason) = &outcome.skipped_reason {
-        format!("Learned-rule skip: {reason}.")
+        format!("Verb evidence not promotable: {reason}.")
     } else {
         format!(
-            "Learned-rule candidate `{}` for `{}` ({}/{} approvals).",
+            "Verb evidence `{}` for `{}` ({}/{} approvals).",
             outcome.pattern, outcome.service, outcome.approvals, outcome.required_approvals
         )
     };
@@ -2895,6 +2969,24 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
     exposed_secret_refs.sort();
     exposed_secret_refs.dedup();
     let mut request_env = HashMap::new();
+
+    if let Some(token) = request.session_token.as_deref() {
+        let registry = config.sessions.read().await;
+        for secret_name in request
+            .secrets
+            .values()
+            .chain(request.secret_files.values())
+        {
+            if registry.secret_name_allowed(token, secret_name) == Some(false) {
+                return ExecuteResult::exec_failed(
+                    allow_reason,
+                    format!(
+                        "saved grant does not entitle secret '{secret_name}'; next: guard grant request submit --prompt 'allow secret {secret_name}' --secret {secret_name}"
+                    ),
+                );
+            }
+        }
+    }
 
     for key in request
         .env

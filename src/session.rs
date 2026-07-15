@@ -629,12 +629,21 @@ impl SessionRegistry {
             .map(|name| (name, grant.scope.saved_revision))
     }
 
-    pub fn secret_names_for(&self, token: &str) -> Vec<String> {
-        self.grants
-            .get(token)
-            .filter(|grant| !grant.is_expired(now_unix()))
-            .map(|grant| grant.scope.secret_names.clone())
-            .unwrap_or_default()
+    pub fn secret_name_allowed(&self, token: &str, name: &str) -> Option<bool> {
+        let grant = self.grants.get(token)?;
+        if grant.is_expired(now_unix()) {
+            return None;
+        }
+        if grant.scope.saved_grant.is_none() {
+            return Some(true);
+        }
+        Some(grant.scope.secret_names.iter().any(|selector| {
+            selector == name
+                || selector == "*"
+                || selector
+                    .strip_suffix('*')
+                    .is_some_and(|prefix| name.starts_with(prefix))
+        }))
     }
 
     pub fn effective_revision_key(&self, token: &str) -> Option<String> {
@@ -661,6 +670,19 @@ impl SessionRegistry {
         grant.expires_at = Some(expires_at);
         self.revision = self.revision.saturating_add(1);
         Some(expires_at)
+    }
+
+    pub fn set_label(&mut self, token: &str, label: String) -> Option<bool> {
+        let grant = self.grants.get_mut(token)?;
+        if grant.is_expired(now_unix()) {
+            return None;
+        }
+        let changed = grant.scope.label.as_deref() != Some(label.as_str());
+        grant.scope.label = Some(label);
+        if changed {
+            self.revision = self.revision.saturating_add(1);
+        }
+        Some(changed)
     }
 
     pub fn apply_delta(&mut self, token: &str, delta: &GrantRequestDelta) -> Option<bool> {

@@ -1,3 +1,4 @@
+use crate::grant_profile::{EvaluationMode, GrantRequest, GrantRequestDelta, SavedGrant};
 use crate::session::{HistoricalGrant, SessionExecStatus, SessionGrantSummary, SessionReport};
 use guard::gating::approval::Approval;
 use guard::gating::provisional::Provisional;
@@ -337,11 +338,13 @@ pub enum AdminRequest {
         prompt_append: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prose: Option<String>,
-        /// Name of an operator-defined profile to seed this grant from. Unknown
-        /// names are rejected; a known profile's grant fields are merged before
-        /// the grant is installed on the normal path.
+        /// Reusable grant to issue. `profile` remains a wire alias for older clients.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        saved_grant: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         profile: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evaluation_mode: Option<EvaluationMode>,
         #[serde(default)]
         static_only: bool,
         #[serde(default)]
@@ -355,6 +358,20 @@ pub enum AdminRequest {
     },
     SessionRevoke {
         token: String,
+    },
+    SessionExtend {
+        token: String,
+        ttl_secs: u64,
+    },
+    SessionLabel {
+        token: String,
+        label: String,
+    },
+    SessionRevokeFiltered {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        saved_grant: Option<String>,
     },
     SessionList {
         /// Include past (revoked/expired) grants alongside the active set.
@@ -378,6 +395,11 @@ pub enum AdminRequest {
         /// A non-admin caller may inspect a grant only when this equals `token`
         /// -- i.e. the caller is asking about the very token it holds. Absent
         /// for the daemon-principal case, which is authorized regardless.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_token: Option<String>,
+    },
+    SessionStatus {
+        token: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller_token: Option<String>,
     },
@@ -436,6 +458,12 @@ pub enum AdminRequest {
     },
     /// List the operator-defined verb catalog (the agent's menu).
     VerbList,
+    VerbShow {
+        name: String,
+    },
+    VerbDelete {
+        name: String,
+    },
     /// Synthesize a typed verb from operator prose via the LLM and (unless
     /// `preview`) append it to the catalog with the prose + evidence recorded.
     /// Operator-only (mutates the catalog).
@@ -445,6 +473,50 @@ pub enum AdminRequest {
         binary_hint: Option<String>,
         #[serde(default)]
         preview: bool,
+    },
+    SavedGrantList,
+    SavedGrantShow {
+        name: String,
+    },
+    SavedGrantSave {
+        grant: SavedGrant,
+    },
+    SavedGrantDelete {
+        name: String,
+    },
+    SavedGrantRegenerate {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
+    },
+    GrantRequestSubmit {
+        session_token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        saved_grant: Option<String>,
+        prompt: String,
+        delta: GrantRequestDelta,
+    },
+    GrantRequestList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_token: Option<String>,
+    },
+    GrantRequestShow {
+        handle: String,
+    },
+    GrantRequestApprove {
+        handle: String,
+    },
+    GrantRequestDeny {
+        handle: String,
+        reason: String,
+    },
+    GrantRequestWithdraw {
+        handle: String,
+    },
+    EvaluateBatch {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_token: Option<String>,
+        commands: Vec<BatchCommand>,
     },
 }
 
@@ -464,6 +536,7 @@ impl AdminRequest {
             Self::Ping
                 | Self::SessionList { .. }
                 | Self::SessionShow { .. }
+                | Self::SessionStatus { .. }
                 | Self::SecretSet { .. }
                 | Self::SecretDelete { .. }
                 | Self::SecretExists { .. }
@@ -475,6 +548,12 @@ impl AdminRequest {
                 // the handler, so it is not gated to the daemon UID here.
                 | Self::ApprovalNote { .. }
                 | Self::VerbList
+                | Self::VerbShow { .. }
+                | Self::GrantRequestList { .. }
+                | Self::GrantRequestShow { .. }
+                | Self::GrantRequestSubmit { .. }
+                | Self::GrantRequestWithdraw { .. }
+                | Self::EvaluateBatch { .. }
         )
     }
 }
@@ -496,6 +575,12 @@ pub enum AdminResponse {
     },
     SessionShow {
         report: SessionReport,
+    },
+    SessionStatus {
+        report: SessionReport,
+        approvals: Vec<ApprovalSummary>,
+        provisionals: Vec<ProvisionalSummary>,
+        requests: Vec<GrantRequest>,
     },
     SessionAppeal {
         allowed: bool,
@@ -556,6 +641,40 @@ pub enum AdminResponse {
         /// True when the verb was written to the catalog; false for a preview.
         persisted: bool,
     },
+    SavedGrants {
+        items: Vec<SavedGrant>,
+    },
+    SavedGrant {
+        grant: SavedGrant,
+    },
+    GrantRequests {
+        items: Vec<GrantRequest>,
+    },
+    GrantRequest {
+        request: GrantRequest,
+    },
+    SessionBulkRevoked {
+        count: usize,
+    },
+    EvaluationBatch {
+        items: Vec<BatchEvaluation>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchCommand {
+    pub binary: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchEvaluation {
+    pub command: String,
+    pub allowed: bool,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<i32>,
 }
 
 /// Agent-facing view of a catalog verb (its menu entry).
@@ -605,6 +724,11 @@ pub struct ProvisionalSummary {
     pub reason: String,
     pub created_unix: u64,
     pub deadline_unix: u64,
+    pub forward_done: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_names: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub principal: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -657,6 +781,14 @@ impl ProvisionalSummary {
             reason: p.reason.clone(),
             created_unix: p.created_unix,
             deadline_unix: p.deadline_unix,
+            forward_done: p.forward_done,
+            cwd: p.cwd.as_ref().map(|path| path.display().to_string()),
+            secret_names: p
+                .secret_keys
+                .values()
+                .chain(p.secret_file_keys.values())
+                .cloned()
+                .collect(),
             principal: p.principal.as_ref().map(|p| p.as_str().to_string()),
             revert_exit: p.revert_exit,
             revert_detail: p.revert_detail.clone(),

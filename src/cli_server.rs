@@ -123,8 +123,9 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             system_prompt,
             system_prompt_append,
             gate,
+            approval_ttl,
             verbs,
-            profiles,
+            grants,
             allow_bin,
             child_env,
             api_proxy,
@@ -161,6 +162,19 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             if gate_mode.is_on() {
                 tracing::info!("Consequence gating enabled (mode: {})", gate_mode);
             }
+            let approval_ttl = approval_ttl
+                .or_else(|| guard_env("APPROVAL_TTL").filter(|value| !value.is_empty()))
+                .map(|value| {
+                    if value.eq_ignore_ascii_case("unbounded") {
+                        Ok(u64::MAX)
+                    } else {
+                        value
+                            .parse::<u64>()
+                            .context("invalid approval TTL (expected seconds or 'unbounded')")
+                    }
+                })
+                .transpose()?
+                .unwrap_or(crate::server::APPROVAL_TTL_SECS);
 
             // --users is a Unix-uid allow-list enforced via SO_PEERCRED. The
             // Windows named-pipe transport authenticates peers by SID, so the
@@ -765,6 +779,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 state_db_path,
             )?;
             srv.set_gate(gate_mode);
+            srv.set_approval_ttl(approval_ttl);
 
             let explicit_verbs_path = verbs.or_else(|| {
                 guard_env("VERBS")
@@ -838,24 +853,24 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 srv.set_verbs(catalog);
             }
 
-            // Session-grant profiles: flag wins, else GUARD_PROFILES. An
-            // explicitly-named path must exist -- a typo should fail loudly, the
-            // same as --verbs, rather than silently starting with no profiles.
-            let profiles_path = profiles.or_else(|| {
-                guard_env("PROFILES")
+            // Saved grants: canonical flag/environment win, then migration alias.
+            // An explicitly named path must exist so a typo fails startup.
+            let grants_path = grants.or_else(|| {
+                guard_env("GRANTS")
+                    .or_else(|| guard_env("PROFILES"))
                     .filter(|v| !v.is_empty())
                     .map(PathBuf::from)
             });
-            if let Some(path) = profiles_path {
-                let catalog = grant_profile::ProfileCatalog::load(&path).with_context(|| {
-                    format!("failed to load session profile catalog {}", path.display())
+            if let Some(path) = grants_path {
+                let catalog = grant_profile::SavedGrantCatalog::load(&path).with_context(|| {
+                    format!("failed to load saved-grant catalog {}", path.display())
                 })?;
                 tracing::info!(
-                    "Loaded session profile catalog from {} ({} profile(s))",
+                    "Loaded saved-grant catalog from {} ({} grant(s))",
                     path.display(),
                     catalog.names().len()
                 );
-                srv.set_profiles(catalog);
+                srv.set_saved_grants(catalog);
             }
 
             // Binary allow-list: flag wins, else GUARD_ALLOW_BIN (comma-separated).

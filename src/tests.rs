@@ -44,8 +44,9 @@ fn parse_start(args: &[&str]) -> ServerCommands {
             system_prompt,
             system_prompt_append,
             gate,
+            approval_ttl,
             verbs,
-            profiles,
+            grants,
             allow_bin,
             child_env,
             api_proxy,
@@ -108,8 +109,9 @@ fn parse_start(args: &[&str]) -> ServerCommands {
             system_prompt,
             system_prompt_append,
             gate,
+            approval_ttl,
             verbs,
-            profiles,
+            grants,
             allow_bin,
             child_env,
             api_proxy,
@@ -426,114 +428,13 @@ fn test_server_start_admin_token_flag() {
 }
 
 #[test]
-fn top_level_grant_parses_prose_and_static_only() {
-    match MainArgs::try_parse_from([
-        "guard",
-        "grant",
-        "tok",
-        "--static-only",
-        "readonly grafana kube access",
-    ]) {
-        Ok(MainArgs::Grant {
-            token,
-            prose,
-            static_only,
-            ..
-        }) => {
-            assert_eq!(token.as_deref(), Some("tok"));
-            assert_eq!(prose.as_deref(), Some("readonly grafana kube access"));
-            assert!(static_only);
+fn saved_grant_issue_parses_canonical_command() {
+    match MainArgs::try_parse_from(["guard", "grant", "issue", "readonly-kube"]) {
+        Ok(MainArgs::Grant(GrantCommands::Issue { name, .. })) => {
+            assert_eq!(name, "readonly-kube");
         }
-        Ok(_) => panic!("expected top-level grant"),
-        Err(err) => panic!("expected grant parse, got {err}"),
-    }
-}
-
-#[test]
-fn top_level_grant_bare_prose_mints_session() {
-    let command = top_level_grant_to_session_command(
-        Some("readonly grafana kube access".to_string()),
-        None,
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Some(120),
-        None,
-        None,
-        true,
-        false,
-        false,
-        None,
-    );
-
-    match command {
-        SessionCommands::New {
-            prose,
-            ttl,
-            static_only,
-            ..
-        } => {
-            assert_eq!(prose.as_deref(), Some("readonly grafana kube access"));
-            assert_eq!(ttl, Some(120));
-            assert!(static_only);
-        }
-        _ => panic!("expected top-level prose grant to mint a session"),
-    }
-}
-
-#[test]
-fn top_level_grant_token_shaped_word_keeps_token_path() {
-    let command = top_level_grant_to_session_command(
-        Some("0123456789abcdef0123456789abcdef".to_string()),
-        None,
-        vec!["whoami".to_string()],
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        None,
-        None,
-        None,
-        false,
-        false,
-        false,
-        None,
-    );
-
-    match command {
-        SessionCommands::Grant { token, allow, .. } => {
-            assert_eq!(token, "0123456789abcdef0123456789abcdef");
-            assert_eq!(allow, vec!["whoami"]);
-        }
-        _ => panic!("expected token-shaped top-level grant to update a session"),
-    }
-}
-
-#[test]
-fn top_level_grant_plain_word_is_prose_not_token() {
-    // `guard grant readonly` must not target a session literally named
-    // "readonly"; a single word that is not 32 lowercase hex chars is prose.
-    let command = top_level_grant_to_session_command(
-        Some("readonly".to_string()),
-        None,
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        None,
-        None,
-        None,
-        false,
-        false,
-        false,
-        None,
-    );
-
-    match command {
-        SessionCommands::New { prose, .. } => {
-            assert_eq!(prose.as_deref(), Some("readonly"));
-        }
-        _ => panic!("expected non-token single word to mint a session with prose"),
+        Ok(_) => panic!("expected saved grant issue"),
+        Err(error) => panic!("expected grant parse, got {error}"),
     }
 }
 

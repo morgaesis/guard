@@ -10,7 +10,7 @@
 //! - Socket: 0666 so local clients can connect before UID validation
 
 use crate::evaluate::Evaluator;
-use crate::grant_profile::ProfileCatalog;
+use crate::grant_profile::{GrantRequest, SavedGrantCatalog};
 use crate::injection::is_valid_env_name;
 use crate::secrets::SecretManager;
 use crate::session::SessionRegistry;
@@ -66,7 +66,7 @@ const MAX_CONFIRM_WITHIN_SECS: u64 = 24 * 60 * 60;
 const REVERT_EXEC_TIMEOUT_SECS: u64 = 120;
 /// Default time a held command waits for operator approval before failing closed
 /// (denied-expired). Mirrors the decision-cache TTL default.
-const APPROVAL_TTL_SECS: u64 = 3600;
+pub(crate) const APPROVAL_TTL_SECS: u64 = 3600;
 /// Per-caller cap on outstanding holds + provisionals (local-DoS guard).
 const MAX_PENDING_PER_CALLER: usize = 32;
 /// Global cap on outstanding holds + provisionals.
@@ -93,8 +93,8 @@ pub(crate) use api_judge::DaemonApiJudge;
 pub(crate) use transport::winplat;
 pub use transport::Server;
 pub use wire::{
-    AdminRequest, AdminResponse, ApprovalSummary, ExecuteRequest, ExecuteResponse, GateStatus,
-    OutputStream, RevertSpec, SshHostKeyMode, VerbInvocation, VerbSummary,
+    AdminRequest, AdminResponse, ApprovalSummary, BatchCommand, ExecuteRequest, ExecuteResponse,
+    GateStatus, OutputStream, RevertSpec, SshHostKeyMode, VerbInvocation, VerbSummary,
 };
 pub(crate) use wire::{ExecuteStreamMessage, IncomingMessage};
 
@@ -154,13 +154,14 @@ struct ServerConfig {
     pub provisional: Arc<RwLock<ProvisionalRegistry>>,
     /// Operator-approval state (held irreversible commands).
     pub approvals: Arc<RwLock<ApprovalRegistry>>,
+    /// Held-command lifetime. `u64::MAX` represents an unbounded operator hold.
+    pub approval_ttl_secs: u64,
     /// Operator-authored verb catalog (the typed, least-expressive interface).
     pub verbs: Arc<RwLock<VerbCatalog>>,
-    /// Operator-authored session-grant profiles: named legacy patterns, typed
-    /// verb activations, override markers, ttl, and prompt context. Loaded at
-    /// startup from `--profiles` / `GUARD_PROFILES`; empty by default. A profile
-    /// takes the same install and validation path as a hand-authored grant.
-    pub profiles: ProfileCatalog,
+    /// Reusable grants and their generated typed verbs.
+    pub saved_grants: Arc<RwLock<SavedGrantCatalog>>,
+    /// Durable requests to amend a live or saved grant.
+    pub grant_requests: Arc<RwLock<std::collections::BTreeMap<String, GrantRequest>>>,
     /// Optional server-wide binary allow-list. `None` (the default) imposes no
     /// restriction. When `Some`, only binaries permitted by [`binary_allowed`]
     /// may execute, on every route (raw run, verb, and gated approval), as a
@@ -239,9 +240,10 @@ impl ServerConfig {
             gate: GateMode::Off,
             provisional: Arc::new(RwLock::new(ProvisionalRegistry::new())),
             approvals: Arc::new(RwLock::new(ApprovalRegistry::new())),
+            approval_ttl_secs: APPROVAL_TTL_SECS,
             verbs: Arc::new(RwLock::new(VerbCatalog::empty())),
-            // No profiles by default; the entrypoint sets this from --profiles.
-            profiles: ProfileCatalog::empty(),
+            saved_grants: Arc::new(RwLock::new(SavedGrantCatalog::empty())),
+            grant_requests: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
             // No binary restriction by default; the entrypoint sets this from
             // --allow-bin / GUARD_ALLOW_BIN, like the gate fields above.
             allowed_binaries: None,

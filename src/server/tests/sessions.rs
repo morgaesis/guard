@@ -1,4 +1,4 @@
-use crate::grant_profile::ProfileCatalog;
+use crate::grant_profile::SavedGrantCatalog;
 use crate::server::admin::handle_admin_request;
 use crate::server::execute::{
     allow_session_auto_amend_candidate, deny_session_auto_amend_candidate, execute_command,
@@ -8,8 +8,7 @@ use crate::server::transport::{claim_session_maintenance, session_maintenance_on
 use crate::server::wire::ExecOutcome;
 use crate::server::wire::{AdminRequest, AdminResponse, CallerIdentity, ExecuteRequest};
 use crate::session::{
-    SessionDecision, SessionDecisionSource, SessionExactRule, SessionExecStatus, SessionGrant,
-    SessionInteraction,
+    SessionDecisionSource, SessionExactRule, SessionExecStatus, SessionGrant, SessionInteraction,
 };
 use crate::session_store::SessionStore;
 use guard::gating::verb::VerbCatalog;
@@ -84,7 +83,9 @@ verbs:
             ttl_secs: None,
             prompt_append: None,
             prose: None,
+            saved_grant: None,
             profile: None,
+            evaluation_mode: None,
             static_only: false,
             auto_amend: false,
         },
@@ -104,7 +105,9 @@ verbs:
             ttl_secs: None,
             prompt_append: None,
             prose: None,
+            saved_grant: None,
             profile: None,
+            evaluation_mode: None,
             static_only: false,
             auto_amend: false,
         },
@@ -127,7 +130,9 @@ verbs:
             ttl_secs: None,
             prompt_append: None,
             prose: None,
+            saved_grant: None,
             profile: None,
+            evaluation_mode: None,
             static_only: false,
             auto_amend: false,
         },
@@ -455,7 +460,9 @@ async fn session_list_is_user_visible_but_prompt_is_hidden() {
             ttl_secs: None,
             prompt_append: Some("operator-only prompt".into()),
             prose: None,
+            saved_grant: None,
             profile: None,
+            evaluation_mode: None,
             static_only: false,
             auto_amend: false,
         },
@@ -514,7 +521,9 @@ async fn session_list_shows_current_session_details_without_raw_token_for_user()
             ttl_secs: None,
             prompt_append: Some("operator prompt".into()),
             prose: Some("kubernetes access for namespace nextcloud".into()),
+            saved_grant: None,
             profile: None,
+            evaluation_mode: None,
             static_only: false,
             auto_amend: false,
         },
@@ -546,7 +555,7 @@ async fn session_list_shows_current_session_details_without_raw_token_for_user()
                     visible.prompt_append.as_deref(),
                     Some("Session grant prose:\nkubernetes access for namespace nextcloud\n\nAdditional session context:\noperator prompt")
                 );
-            assert!(!visible.generated_notes.is_empty());
+            assert!(visible.generated_notes.is_empty());
             assert!(
                 grants.iter().all(|grant| grant.token != token),
                 "non-admin list output must not echo raw bearer tokens"
@@ -577,7 +586,9 @@ async fn session_show_reports_recent_stats() {
             ttl_secs: None,
             prompt_append: Some("operator context".into()),
             prose: None,
+            saved_grant: None,
             profile: None,
+            evaluation_mode: None,
             static_only: false,
             auto_amend: false,
         },
@@ -671,7 +682,9 @@ async fn session_show_self_token_sees_full_grant() {
             ttl_secs: Some(3600),
             prompt_append: Some("cert rotation context".into()),
             prose: None,
+            saved_grant: None,
             profile: None,
+            evaluation_mode: None,
             static_only: false,
             auto_amend: false,
         },
@@ -733,7 +746,9 @@ async fn session_show_other_token_denied_for_non_admin() {
                 ttl_secs: None,
                 prompt_append: Some("secret operator context".into()),
                 prose: None,
+                saved_grant: None,
                 profile: None,
+                evaluation_mode: None,
                 static_only: false,
                 auto_amend: false,
             },
@@ -773,10 +788,12 @@ async fn session_new_from_profile_mints_expected_grant() {
     let (mut cfg, _) = make_test_config();
     cfg.daemon_uid = 777;
     cfg.daemon_principal = PrincipalKey::from_uid(777);
-    cfg.profiles = ProfileCatalog::from_yaml(
-            "profiles:\n  - name: cert-manager-rotation\n    ttl_secs: 1800\n    allow:\n      - \"kubectl get certificate*\"\n    deny:\n      - \"kubectl delete namespace*\"\n    prompt_append: \"rotating cert-manager certificates\"\n",
+    cfg.saved_grants = std::sync::Arc::new(tokio::sync::RwLock::new(
+        SavedGrantCatalog::from_yaml(
+            "profiles:\n  - name: cert-manager-rotation\n    ttl_secs: 1800\n    allow:\n      - \"kubectl get certificate *\"\n    deny:\n      - \"kubectl delete namespace *\"\n    prompt_append: \"rotating cert-manager certificates\"\n",
         )
-        .expect("valid profile catalog");
+        .expect("valid saved grant catalog"),
+    ));
 
     let daemon = CallerIdentity::Unix { uid: 777 };
     let token = format!("session-profile-{}", std::process::id());
@@ -794,7 +811,9 @@ async fn session_new_from_profile_mints_expected_grant() {
             ttl_secs: None,
             prompt_append: None,
             prose: None,
-            profile: Some("cert-manager-rotation".into()),
+            saved_grant: Some("cert-manager-rotation".into()),
+            profile: None,
+            evaluation_mode: None,
             static_only: false,
             auto_amend: false,
         },
@@ -808,8 +827,9 @@ async fn session_new_from_profile_mints_expected_grant() {
         .into_iter()
         .find(|g| g.token == token)
         .expect("profile grant installed");
-    assert_eq!(summary.allow, vec!["kubectl get certificate*".to_string()]);
-    assert_eq!(summary.deny, vec!["kubectl delete namespace*".to_string()]);
+    assert!(summary.allow.is_empty());
+    assert!(summary.deny.is_empty());
+    assert_eq!(summary.activated_verbs.len(), 2);
     assert!(summary.expires_at.is_some(), "profile ttl applied");
     assert_eq!(
         summary.prompt_append.as_deref(),
@@ -845,7 +865,9 @@ async fn session_new_unknown_profile_fails_clearly() {
             ttl_secs: None,
             prompt_append: None,
             prose: None,
-            profile: Some("does-not-exist".into()),
+            saved_grant: Some("does-not-exist".into()),
+            profile: None,
+            evaluation_mode: None,
             static_only: false,
             auto_amend: false,
         },
@@ -854,8 +876,8 @@ async fn session_new_unknown_profile_fails_clearly() {
     match resp {
         AdminResponse::Error { message } => {
             assert!(
-                message.contains("unknown session profile") && message.contains("does-not-exist"),
-                "expected a clear unknown-profile error, got: {message}"
+                message.contains("unknown saved grant") && message.contains("does-not-exist"),
+                "expected a clear unknown-saved-grant error, got: {message}"
             );
         }
         other => panic!("expected error, got {:?}", other),
@@ -873,10 +895,12 @@ async fn profile_grant_still_deny_short_circuits_and_falls_through() {
     let (mut cfg, _) = make_test_config();
     cfg.daemon_uid = 777;
     cfg.daemon_principal = PrincipalKey::from_uid(777);
-    cfg.profiles = ProfileCatalog::from_yaml(
-            "profiles:\n  - name: scoped\n    allow:\n      - \"kubectl get*\"\n    deny:\n      - \"kubectl delete*\"\n",
+    cfg.saved_grants = std::sync::Arc::new(tokio::sync::RwLock::new(
+        SavedGrantCatalog::from_yaml(
+            "profiles:\n  - name: scoped\n    allow:\n      - \"kubectl get *\"\n    deny:\n      - \"kubectl delete *\"\n",
         )
-        .expect("valid profile catalog");
+        .expect("valid saved grant catalog"),
+    ));
 
     let daemon = CallerIdentity::Unix { uid: 777 };
     let token = format!("session-profcheck-{}", std::process::id());
@@ -892,7 +916,9 @@ async fn profile_grant_still_deny_short_circuits_and_falls_through() {
             ttl_secs: None,
             prompt_append: None,
             prose: None,
-            profile: Some("scoped".into()),
+            saved_grant: Some("scoped".into()),
+            profile: None,
+            evaluation_mode: None,
             static_only: false,
             auto_amend: false,
         },
@@ -901,22 +927,115 @@ async fn profile_grant_still_deny_short_circuits_and_falls_through() {
     assert!(matches!(resp, AdminResponse::Ok));
 
     let reg = cfg.sessions.read().await;
-    // A profile-derived grant behaves exactly like any other grant: its deny
-    // glob short-circuits to Deny...
-    assert!(matches!(
-        reg.check(&token, "kubectl", &["delete".into(), "pod".into()], None),
-        Some((SessionDecision::Deny, _))
+    let summary = reg
+        .list()
+        .into_iter()
+        .find(|grant| grant.token == token)
+        .expect("saved grant issued");
+    assert_eq!(summary.activated_verbs.len(), 2);
+    assert!(summary.allow.is_empty() && summary.deny.is_empty());
+}
+
+#[tokio::test]
+async fn grant_requests_use_the_issued_ceiling_and_redact_session_tokens() {
+    let (mut cfg, _) = make_test_config();
+    cfg.daemon_uid = 777;
+    cfg.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.saved_grants = Arc::new(RwLock::new(
+        SavedGrantCatalog::from_yaml(
+            "grants:\n  - name: bounded\n    prompt_append: bounded task\n    ttl_secs: 300\n    auto_approve_requests: true\n  - name: other\n    prompt_append: other task\n    ttl_secs: 3600\n    auto_approve_requests: true\n",
+        )
+        .expect("saved grants"),
     ));
-    // ...its allow glob short-circuits to Allow...
+    let daemon = CallerIdentity::Unix { uid: 777 };
+    let worker = CallerIdentity::Unix { uid: 778 };
+    let token = "bounded-session".to_string();
     assert!(matches!(
-        reg.check(&token, "kubectl", &["get".into(), "pods".into()], None),
-        Some((SessionDecision::Allow, _))
+        handle_admin_request(
+            &cfg,
+            &daemon,
+            AdminRequest::SessionGrant {
+                token: token.clone(),
+                allow: Vec::new(),
+                deny: Vec::new(),
+                activated_verbs: Vec::new(),
+                override_markers: Vec::new(),
+                ttl_secs: None,
+                prompt_append: None,
+                prose: None,
+                saved_grant: Some("bounded".to_string()),
+                profile: None,
+                evaluation_mode: None,
+                static_only: false,
+                auto_amend: false,
+            },
+        )
+        .await,
+        AdminResponse::Ok
     ));
-    // ...and a command matching neither falls through to normal evaluation.
-    assert!(
-        reg.check(&token, "helm", &["list".into()], None).is_none(),
-        "an unmatched command must fall through to the evaluator"
-    );
+
+    let mismatched = handle_admin_request(
+        &cfg,
+        &worker,
+        AdminRequest::GrantRequestSubmit {
+            session_token: token.clone(),
+            saved_grant: Some("other".to_string()),
+            prompt: "extend work".to_string(),
+            delta: crate::grant_profile::GrantRequestDelta {
+                ttl_secs: Some(120),
+                ..Default::default()
+            },
+        },
+    )
+    .await;
+    assert!(matches!(
+        mismatched,
+        AdminResponse::Error { message } if message.contains("does not match")
+    ));
+
+    let approved = handle_admin_request(
+        &cfg,
+        &worker,
+        AdminRequest::GrantRequestSubmit {
+            session_token: token.clone(),
+            saved_grant: None,
+            prompt: "extend work".to_string(),
+            delta: crate::grant_profile::GrantRequestDelta {
+                ttl_secs: Some(120),
+                ..Default::default()
+            },
+        },
+    )
+    .await;
+    assert!(matches!(
+        approved,
+        AdminResponse::GrantRequest { request }
+            if request.status == crate::grant_profile::GrantRequestStatus::Approved
+                && request.session_token.starts_with("sha256:")
+    ));
+
+    let unscoped = handle_admin_request(
+        &cfg,
+        &worker,
+        AdminRequest::GrantRequestList {
+            session_token: None,
+        },
+    )
+    .await;
+    assert!(matches!(unscoped, AdminResponse::Error { .. }));
+    let scoped = handle_admin_request(
+        &cfg,
+        &worker,
+        AdminRequest::GrantRequestList {
+            session_token: Some(token),
+        },
+    )
+    .await;
+    assert!(matches!(
+        scoped,
+        AdminResponse::GrantRequests { items }
+            if items.len() == 1 && items[0].session_token.starts_with("sha256:")
+    ));
 }
 
 #[tokio::test]

@@ -1,3 +1,4 @@
+use crate::grant_profile::{GrantRequest, SavedGrant};
 use crate::session::{
     HistoricalGrant, HistoricalStatus, IssuedGrantScope, SessionDecisionSource, SessionExactRule,
     SessionExecStatus, SessionGrant, SessionInteraction, SessionRegistry,
@@ -11,7 +12,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const VACUUM_MIN_PAGES: u64 = 512;
 const VACUUM_MIN_FREE_PAGES: u64 = 128;
 
@@ -405,6 +406,17 @@ impl SessionStore {
                 json TEXT NOT NULL,
                 status TEXT NOT NULL,
                 expires_unix INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS saved_grants (
+                name TEXT PRIMARY KEY,
+                json TEXT NOT NULL,
+                updated_unix INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS grant_requests (
+                handle TEXT PRIMARY KEY,
+                json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_unix INTEGER NOT NULL
             );",
         )?;
         ensure_column(
@@ -518,6 +530,19 @@ impl SessionStore {
     /// Repair columns that belong to the current schema version. This keeps
     /// startup safe after an interrupted or partially applied v3 migration.
     fn repair_current_schema(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS saved_grants (
+                name TEXT PRIMARY KEY,
+                json TEXT NOT NULL,
+                updated_unix INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS grant_requests (
+                handle TEXT PRIMARY KEY,
+                json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_unix INTEGER NOT NULL
+            );",
+        )?;
         ensure_column(
             conn,
             "session_grants",
@@ -562,6 +587,84 @@ impl SessionStore {
             "TEXT NOT NULL DEFAULT '[]'",
         )?;
         Ok(())
+    }
+
+    pub async fn save_saved_grant(&self, grant: SavedGrant) -> Result<()> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = Self::open_connection(&path)?;
+            Self::init_schema(&conn)?;
+            let json = serde_json::to_string(&grant).context("encode saved grant")?;
+            conn.execute(
+                "INSERT OR REPLACE INTO saved_grants (name, json, updated_unix) VALUES (?1, ?2, ?3)",
+                params![grant.name, json, encode_u64(grant.updated_unix)?],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("save saved grant task failed")?
+    }
+
+    pub async fn delete_saved_grant(&self, name: String) -> Result<()> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = Self::open_connection(&path)?;
+            Self::init_schema(&conn)?;
+            conn.execute("DELETE FROM saved_grants WHERE name = ?1", params![name])?;
+            Ok(())
+        })
+        .await
+        .context("delete saved grant task failed")?
+    }
+
+    pub async fn load_saved_grants(&self) -> Result<Vec<SavedGrant>> {
+        self.load_json_rows("SELECT json FROM saved_grants", "saved grant")
+            .await
+    }
+
+    pub async fn save_grant_request(&self, request: GrantRequest) -> Result<()> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = Self::open_connection(&path)?;
+            Self::init_schema(&conn)?;
+            let json = serde_json::to_string(&request).context("encode grant request")?;
+            conn.execute(
+                "INSERT OR REPLACE INTO grant_requests (handle, json, status, created_unix) VALUES (?1, ?2, ?3, ?4)",
+                params![request.handle, json, request.status.as_str(), encode_u64(request.created_unix)?],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("save grant request task failed")?
+    }
+
+    pub async fn load_grant_requests(&self) -> Result<Vec<GrantRequest>> {
+        self.load_json_rows("SELECT json FROM grant_requests", "grant request")
+            .await
+    }
+
+    async fn load_json_rows<T>(&self, query: &'static str, kind: &'static str) -> Result<Vec<T>>
+    where
+        T: serde::de::DeserializeOwned + Send + 'static,
+    {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = Self::open_connection(&path)?;
+            Self::init_schema(&conn)?;
+            let mut stmt = conn.prepare(query)?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            let mut values = Vec::new();
+            for row in rows {
+                let json = row?;
+                match serde_json::from_str::<T>(&json) {
+                    Ok(value) => values.push(value),
+                    Err(error) => tracing::warn!("skipping unreadable {} row: {}", kind, error),
+                }
+            }
+            Ok(values)
+        })
+        .await
+        .with_context(|| format!("load {kind} task failed"))?
     }
 
     // --- Consequence-gating runtime state (provisional executions and operator
@@ -927,6 +1030,45 @@ fn decode_exec_status(value: &str) -> rusqlite::Result<SessionExecStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn saved_grants_and_requests_round_trip() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::open(tmp.path().join("state.db"), 24 * 60 * 60)
+            .await
+            .expect("open store");
+        let grant = crate::grant_profile::SavedGrantCatalog::from_yaml(
+            "grants:\n  - name: deploy\n    activated_verbs: [deploy-host]\n    ttl_secs: 300\n",
+        )
+        .expect("catalog")
+        .get("deploy")
+        .expect("grant")
+        .clone();
+        store
+            .save_saved_grant(grant.clone())
+            .await
+            .expect("save grant");
+        let request = crate::grant_profile::GrantRequest::new(
+            "session-token".to_string(),
+            Some("deploy".to_string()),
+            crate::grant_profile::GrantRequestDelta {
+                ttl_secs: Some(120),
+                ..Default::default()
+            },
+            "extend the bounded deployment".to_string(),
+        )
+        .expect("request");
+        store
+            .save_grant_request(request.clone())
+            .await
+            .expect("save request");
+
+        let saved = store.load_saved_grants().await.unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].name, grant.name);
+        assert_eq!(saved[0].revision, grant.revision);
+        assert_eq!(store.load_grant_requests().await.unwrap(), vec![request]);
+    }
 
     /// A stale snapshot (cloned before a later mutation) must never clobber a
     /// newer snapshot that already landed: the registry is persisted as a
