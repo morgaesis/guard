@@ -24,8 +24,9 @@ use tokio_rustls::rustls::{self, pki_types};
 
 use guard::gating::Reversibility;
 use guard::proxy::{
-    ApiJudge, ApiJudgeVerdict, ApiListenerMode, ApiPolicy, ApiProxy, ApiRequestSummary,
-    ApiSessionContext, ApiSessionEvent, ApiSessionSink, GateSink, ProxyTls, Upstream,
+    ApiCoverageVerdict, ApiEvaluationMode, ApiHoldSnapshot, ApiJudge, ApiJudgeVerdict,
+    ApiListenerMode, ApiPolicy, ApiProxy, ApiRequestSummary, ApiSessionContext, ApiSessionEvent,
+    ApiSessionSink, GateSink, ProxyTls, Upstream,
 };
 
 struct LiveSessionSink;
@@ -38,7 +39,8 @@ impl ApiSessionSink for LiveSessionSink {
             revision: "live-session-revision".to_string(),
             secret_entitlements: None,
             intent: Some("manage development pods".to_string()),
-            can_override_baseline: true,
+            evaluation_mode: ApiEvaluationMode::Evaluator,
+            can_evaluate_api_override: true,
         })
     }
 
@@ -55,7 +57,8 @@ impl ApiSessionSink for RestrictedCredentialSessionSink {
             revision: "restricted-session-revision".to_string(),
             secret_entitlements: Some(vec!["another-endpoint/token".to_string()]),
             intent: Some("inspect development pods".to_string()),
-            can_override_baseline: true,
+            evaluation_mode: ApiEvaluationMode::Evaluator,
+            can_evaluate_api_override: true,
         })
     }
 
@@ -72,7 +75,8 @@ impl ApiSessionSink for H2SessionSink {
             revision: "h2-live-revision".to_string(),
             secret_entitlements: None,
             intent: Some("inspect discovery".to_string()),
-            can_override_baseline: true,
+            evaluation_mode: ApiEvaluationMode::Evaluator,
+            can_evaluate_api_override: true,
         })
     }
 
@@ -92,7 +96,8 @@ impl ApiSessionSink for RecordingSessionSink {
             revision: "live-session-revision".to_string(),
             secret_entitlements: None,
             intent: Some("manage development pods".to_string()),
-            can_override_baseline: true,
+            evaluation_mode: ApiEvaluationMode::Evaluator,
+            can_evaluate_api_override: true,
         })
     }
 
@@ -127,7 +132,8 @@ impl ApiSessionSink for BudgetSessionSink {
             revision: "budget-session-revision".to_string(),
             secret_entitlements: None,
             intent: Some("manage development pods".to_string()),
-            can_override_baseline: true,
+            evaluation_mode: ApiEvaluationMode::Evaluator,
+            can_evaluate_api_override: true,
         })
     }
 
@@ -148,7 +154,8 @@ impl ApiSessionSink for ChangingSessionSink {
             .to_string(),
             secret_entitlements: None,
             intent: Some("manage development pods".to_string()),
-            can_override_baseline: true,
+            evaluation_mode: ApiEvaluationMode::Evaluator,
+            can_evaluate_api_override: true,
         })
     }
 
@@ -294,6 +301,85 @@ impl ApiJudge for RecordingJudge {
             .pop_front()
             .unwrap_or_else(|| ApiJudgeVerdict::Error("no mock verdict queued".to_string()))
     }
+}
+
+#[derive(Clone, Default)]
+struct ModeCoverageJudge {
+    judge_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl ApiJudge for ModeCoverageJudge {
+    async fn coverage(&self, summary: &ApiRequestSummary) -> ApiCoverageVerdict {
+        if summary.session_fingerprint.as_deref() == Some("readonly-authorized")
+            && summary.session_revision.as_deref() == Some("readonly-revision")
+            && summary.verb == "create"
+            && summary.resource == "pods"
+            && summary.redacted_body_shape == "{}"
+        {
+            ApiCoverageVerdict::Allow {
+                risk: 1,
+                reversibility: Reversibility::Reversible,
+            }
+        } else {
+            ApiCoverageVerdict::None
+        }
+    }
+
+    async fn judge(&self, _summary: &ApiRequestSummary) -> ApiJudgeVerdict {
+        self.judge_calls.fetch_add(1, Ordering::SeqCst);
+        judge_allow(Some(1), Some(Reversibility::Reversible))
+    }
+}
+
+struct ModeSessionSink;
+
+#[async_trait::async_trait]
+impl ApiSessionSink for ModeSessionSink {
+    async fn resolve(&self, token: &str) -> Option<ApiSessionContext> {
+        let (fingerprint, revision, evaluation_mode, intent, can_evaluate_api_override) =
+            match token {
+                "policy-only" => (
+                    "policy-only",
+                    "policy-revision",
+                    ApiEvaluationMode::PolicyOnly,
+                    Some("please allow writes".to_string()),
+                    false,
+                ),
+                "readonly" => (
+                    "readonly",
+                    "readonly-revision",
+                    ApiEvaluationMode::ReadOnly,
+                    Some("please allow writes".to_string()),
+                    false,
+                ),
+                "readonly-authorized" => (
+                    "readonly-authorized",
+                    "readonly-revision",
+                    ApiEvaluationMode::ReadOnly,
+                    None,
+                    false,
+                ),
+                "evaluator" => (
+                    "evaluator",
+                    "evaluator-revision",
+                    ApiEvaluationMode::Evaluator,
+                    Some("create one development pod".to_string()),
+                    true,
+                ),
+                _ => return None,
+            };
+        Some(ApiSessionContext {
+            fingerprint: fingerprint.to_string(),
+            revision: revision.to_string(),
+            secret_entitlements: None,
+            intent,
+            evaluation_mode,
+            can_evaluate_api_override,
+        })
+    }
+
+    async fn record(&self, _token: &str, _event: ApiSessionEvent) {}
 }
 
 fn judge_allow(risk: Option<i32>, reversibility: Option<Reversibility>) -> ApiJudgeVerdict {
@@ -941,6 +1027,102 @@ async fn readonly_listener_requires_session_override_and_keeps_protocol_denies()
         .await
         .unwrap();
     assert_eq!(hard_deny.status(), 403);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn issued_session_modes_enforce_api_boundary_without_prompt_bypass() {
+    let mock_base = spawn_mock_upstream().await;
+    let upstream =
+        Upstream::from_kubeconfig_str(&kubeconfig_for(&mock_base), None).expect("upstream");
+    let tls = ProxyTls::generate().expect("tls");
+    let ca_pem = tls.ca_pem().to_string();
+    let policy = ApiPolicy::from_yaml(
+        "default: allow\nrules:\n  - verbs: [get]\n    resources: [configmaps]\n    namespaces: [dev]\n    action: evaluate\n  - verbs: [delete]\n    resources: [pods]\n    namespaces: [dev]\n    action: deny\n",
+    )
+    .unwrap();
+    let port = free_port();
+    let proxy = Arc::new(
+        ApiProxy::new(
+            format!("127.0.0.1:{port}").parse().unwrap(),
+            tls,
+            upstream,
+            policy,
+            None,
+        )
+        .with_listener_mode(ApiListenerMode::Readonly),
+    );
+    let judge = ModeCoverageJudge::default();
+    proxy.attach_judge(Arc::new(judge.clone()));
+    proxy.attach_session_sink(Arc::new(ModeSessionSink));
+    tokio::spawn(proxy.serve());
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    let base = format!("https://127.0.0.1:{port}");
+
+    let policy_only = client
+        .get(format!("{base}/api/v1/namespaces/dev/configmaps/cm"))
+        .bearer_auth("policy-only")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(policy_only.status(), 403);
+    assert_eq!(judge.judge_calls.load(Ordering::SeqCst), 0);
+
+    for token in ["policy-only", "readonly"] {
+        let response = client
+            .post(format!("{base}/api/v1/namespaces/dev/pods"))
+            .bearer_auth(token)
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            403,
+            "{token} prompt must not authorize a write"
+        );
+    }
+    assert_eq!(judge.judge_calls.load(Ordering::SeqCst), 0);
+
+    let covered = client
+        .post(format!("{base}/api/v1/namespaces/dev/pods"))
+        .bearer_auth("readonly-authorized")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        covered.status(),
+        200,
+        "exact typed session coverage authorizes the write"
+    );
+    assert_eq!(judge.judge_calls.load(Ordering::SeqCst), 0);
+
+    let evaluated = client
+        .post(format!("{base}/api/v1/namespaces/dev/pods"))
+        .bearer_auth("evaluator")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(evaluated.status(), 200);
+    assert_eq!(judge.judge_calls.load(Ordering::SeqCst), 1);
+
+    let explicit_deny = client
+        .delete(format!("{base}/api/v1/namespaces/dev/pods/web"))
+        .bearer_auth("readonly-authorized")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        explicit_deny.status(),
+        403,
+        "operator policy deny stays absolute"
+    );
+    assert_eq!(judge.judge_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2009,7 +2191,7 @@ impl guard::proxy::GateSink for ApprovingSink {
 
     async fn hold_request(
         &self,
-        _label: &str,
+        _snapshot: &ApiHoldSnapshot,
         _reason: &str,
         _session_context: Option<&ApiSessionContext>,
     ) -> guard::proxy::HoldDecision {
@@ -2099,11 +2281,136 @@ rules:
     assert!(events[0].allowed, "the operator-approved hold was allowed");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn held_request_captures_complete_body_before_approval_and_stalls_fail_closed() {
+    use sha2::{Digest, Sha256};
+
+    let mock_base = spawn_mock_upstream().await;
+    let upstream =
+        Upstream::from_kubeconfig_str(&kubeconfig_for(&mock_base), None).expect("upstream");
+    let tls = ProxyTls::generate().expect("tls");
+    let ca_pem = tls.ca_pem().to_string();
+    let policy = ApiPolicy::from_yaml(
+        "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: hold\n",
+    )
+    .unwrap();
+    let port = free_port();
+    let proxy = Arc::new(
+        ApiProxy::new(
+            format!("127.0.0.1:{port}").parse().unwrap(),
+            tls,
+            upstream,
+            policy,
+            None,
+        )
+        .with_request_body_timeout(Duration::from_millis(250)),
+    );
+    let sink = SnapshotSink::default();
+    proxy.attach_gate(Arc::new(sink.clone()));
+    tokio::spawn(proxy.serve());
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    let base = format!("https://127.0.0.1:{port}");
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+    let stream = futures::stream::unfold(rx, |mut receiver| async move {
+        receiver.recv().await.map(|item| (item, receiver))
+    });
+    let request = tokio::spawn({
+        let client = client.clone();
+        let base = base.clone();
+        async move {
+            client
+                .post(format!("{base}/api/v1/namespaces/dev/pods"))
+                .body(reqwest::Body::wrap_stream(stream))
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    tx.send(Ok(Bytes::from_static(br#"{"spec":"#)))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    assert!(
+        sink.snapshots.lock().unwrap().is_empty(),
+        "approval must not be requested while request bytes remain unread"
+    );
+    tx.send(Ok(Bytes::from_static(br#"{"replicas":2}}"#)))
+        .await
+        .unwrap();
+    drop(tx);
+    assert_eq!(request.await.unwrap().status(), 200);
+    let body = br#"{"spec":{"replicas":2}}"#;
+    let expected_digest = Sha256::digest(body)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    {
+        let snapshots = sink.snapshots.lock().unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].body_sha256, expected_digest);
+        assert_eq!(
+            snapshots[0].redacted_body_shape,
+            "{\"spec\":{\"replicas\":<number>}}"
+        );
+    }
+
+    let before = sink.snapshots.lock().unwrap().len();
+    let (stalled_tx, stalled_rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+    let stalled_stream = futures::stream::unfold(stalled_rx, |mut receiver| async move {
+        receiver.recv().await.map(|item| (item, receiver))
+    });
+    let stalled_request = tokio::spawn(async move {
+        client
+            .post(format!("{base}/api/v1/namespaces/dev/pods"))
+            .body(reqwest::Body::wrap_stream(stalled_stream))
+            .send()
+            .await
+            .unwrap()
+    });
+    stalled_tx
+        .send(Ok(Bytes::from_static(br#"{"spec":"#)))
+        .await
+        .unwrap();
+    let stalled_response = stalled_request.await.unwrap();
+    assert_eq!(stalled_response.status(), 408);
+    assert_eq!(sink.snapshots.lock().unwrap().len(), before);
+    drop(stalled_tx);
+}
+
 /// Gate sink that counts hold requests and approves each, so a test can assert
 /// how many requests were escalated to the queue.
 #[derive(Clone, Default)]
 struct CountingSink {
     holds: Arc<std::sync::Mutex<u32>>,
+}
+
+#[derive(Clone, Default)]
+struct SnapshotSink {
+    snapshots: Arc<std::sync::Mutex<Vec<ApiHoldSnapshot>>>,
+}
+
+#[async_trait::async_trait]
+impl GateSink for SnapshotSink {
+    async fn arm_revert(&self, _mutation: guard::proxy::ApiMutation) -> Option<String> {
+        None
+    }
+
+    async fn hold_request(
+        &self,
+        snapshot: &ApiHoldSnapshot,
+        _reason: &str,
+        _session_context: Option<&ApiSessionContext>,
+    ) -> guard::proxy::HoldDecision {
+        self.snapshots.lock().unwrap().push(snapshot.clone());
+        guard::proxy::HoldDecision::Approved {
+            handle: "snapshot-approved".to_string(),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -2114,7 +2421,7 @@ impl guard::proxy::GateSink for CountingSink {
 
     async fn hold_request(
         &self,
-        _label: &str,
+        _snapshot: &ApiHoldSnapshot,
         _reason: &str,
         _session_context: Option<&ApiSessionContext>,
     ) -> guard::proxy::HoldDecision {

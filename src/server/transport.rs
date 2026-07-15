@@ -62,11 +62,27 @@ impl guard::proxy::ApiSessionSink for DaemonApiSessionSink {
         }
         let (fingerprint, intent) = registry.api_authority_for(token)?;
         let (revision, secret_entitlements) = registry.authority_snapshot(token)?;
+        let evaluation_mode = registry.evaluation_mode_for(token).unwrap_or_default();
         Some(guard::proxy::ApiSessionContext {
             fingerprint,
             revision,
             secret_entitlements,
-            can_override_baseline: intent.is_some(),
+            can_evaluate_api_override: evaluation_mode
+                == crate::grant_profile::EvaluationMode::Evaluator
+                && intent
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty()),
+            evaluation_mode: match evaluation_mode {
+                crate::grant_profile::EvaluationMode::Evaluator => {
+                    guard::proxy::ApiEvaluationMode::Evaluator
+                }
+                crate::grant_profile::EvaluationMode::PolicyOnly => {
+                    guard::proxy::ApiEvaluationMode::PolicyOnly
+                }
+                crate::grant_profile::EvaluationMode::ReadOnly => {
+                    guard::proxy::ApiEvaluationMode::ReadOnly
+                }
+            },
             intent,
         })
     }

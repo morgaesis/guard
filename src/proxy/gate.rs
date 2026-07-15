@@ -9,6 +9,7 @@
 
 use crate::gating::Reversibility;
 use async_trait::async_trait;
+use std::collections::BTreeMap;
 
 /// How to undo a recoverable API mutation via an HTTP request through the upstream.
 /// This is protocol-generic; the protocol builds the full request plan including path.
@@ -94,7 +95,7 @@ pub trait GateSink: Send + Sync {
     /// denial. Default: fail closed, for sinks with no approval queue.
     async fn hold_request(
         &self,
-        _label: &str,
+        _snapshot: &ApiHoldSnapshot,
         _reason: &str,
         _session_context: Option<&ApiSessionContext>,
     ) -> HoldDecision {
@@ -102,6 +103,18 @@ pub trait GateSink: Send + Sync {
             reason: "no operator-approval queue is attached to this proxy".to_string(),
         }
     }
+}
+
+/// Immutable, credential-safe facts bound to an operator approval. The proxy
+/// retains the body bytes in memory and forwards those same bytes only after
+/// approval; the digest lets the durable approval row identify what was held.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiHoldSnapshot {
+    pub label: String,
+    pub body_sha256: String,
+    pub redacted_body_shape: String,
+    pub redacted_query: String,
+    pub authority_selectors: BTreeMap<String, String>,
 }
 
 /// Whether the proxy can construct an auto-revert for this exact request before
@@ -149,11 +162,13 @@ pub struct ApiRequestSummary {
     pub namespace: Option<String>,
     pub name: Option<String>,
     pub dry_run: bool,
+    pub authority_selectors: BTreeMap<String, String>,
     pub redacted_body_shape: String,
     pub revert_constructible: RevertConstructible,
     pub rarity: bool,
     pub endpoint: String,
     pub session_fingerprint: Option<String>,
+    pub session_revision: Option<String>,
     pub session_intent: Option<String>,
     pub credential_ref: String,
 }
@@ -177,10 +192,11 @@ impl ApiRequestSummary {
                 "namespace: {}\n",
                 "name: {}\n",
                 "dry_run: {}\n",
+                "authority_selectors: {}\n",
                 "body_shape: {}\n",
                 "revert_constructible: {}\n",
                 "rarity: {}",
-                "\nendpoint: {}\nsession: {}\nsession_intent: {}\ncredential_ref: {}"
+                "\nendpoint: {}\nsession: {}\nsession_revision: {}\nsession_intent: {}\ncredential_ref: {}"
             ),
             self.protocol,
             self.verb,
@@ -201,11 +217,21 @@ impl ApiRequestSummary {
             self.namespace.as_deref().unwrap_or("(cluster)"),
             self.name.as_deref().unwrap_or("(none)"),
             self.dry_run,
+            if self.authority_selectors.is_empty() {
+                "(none)".to_string()
+            } else {
+                self.authority_selectors
+                    .iter()
+                    .map(|(key, value)| format!("{key}={value}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            },
             self.redacted_body_shape,
             self.revert_constructible.as_str(),
             self.rarity,
             self.endpoint,
             self.session_fingerprint.as_deref().unwrap_or("(none)"),
+            self.session_revision.as_deref().unwrap_or("(none)"),
             self.session_intent.as_deref().unwrap_or("(none)"),
             self.credential_ref,
         )
@@ -222,7 +248,19 @@ pub struct ApiSessionContext {
     /// ad-hoc session, while `Some([])` entitles no upstream credential.
     pub secret_entitlements: Option<Vec<String>>,
     pub intent: Option<String>,
-    pub can_override_baseline: bool,
+    pub evaluation_mode: ApiEvaluationMode,
+    /// True only for an explicitly issued evaluator-mode session with task
+    /// intent. It permits a readonly listener baseline to route a write to the
+    /// evaluator, never to forward it directly.
+    pub can_evaluate_api_override: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ApiEvaluationMode {
+    #[default]
+    Evaluator,
+    PolicyOnly,
+    ReadOnly,
 }
 
 #[derive(Debug, Clone)]
@@ -256,7 +294,31 @@ pub enum ApiJudgeVerdict {
     Error(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApiCoverageVerdict {
+    None,
+    Allow {
+        risk: i32,
+        reversibility: Reversibility,
+    },
+    Deny {
+        reason: String,
+        operator: bool,
+    },
+}
+
 #[async_trait]
 pub trait ApiJudge: Send + Sync {
+    /// Whether this resolver can invoke an evaluator. A coverage-only resolver
+    /// returns false so evaluate and rarity paths keep failing toward hold.
+    fn evaluator_enabled(&self) -> bool {
+        true
+    }
+
+    /// Deterministic exact typed coverage lookup. This never invokes the model.
+    async fn coverage(&self, _summary: &ApiRequestSummary) -> ApiCoverageVerdict {
+        ApiCoverageVerdict::None
+    }
+
     async fn judge(&self, summary: &ApiRequestSummary) -> ApiJudgeVerdict;
 }

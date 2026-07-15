@@ -6,6 +6,7 @@
 //! no parsing; each protocol owns its own request parsing.
 
 use crate::gating::Reversibility;
+use std::collections::BTreeMap;
 
 /// The API verb, derived from the HTTP method and whether the request targets a
 /// named object, a collection, or a watch stream.
@@ -78,6 +79,11 @@ pub struct ApiOp {
     pub name: Option<String>,
     /// `?dryRun=` was set, so the upstream will not persist the change.
     pub dry_run: bool,
+    /// Protocol-defined query parameters that change the upstream authority
+    /// scope. Values are canonical, credential-safe identifiers. Presentation
+    /// parameters stay out of this map so pagination and output formatting do
+    /// not fragment typed coverage.
+    pub authority_selectors: BTreeMap<String, String>,
 }
 
 impl ApiOp {

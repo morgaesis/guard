@@ -7,6 +7,8 @@
 //! env-var deletes can be restored from a pre-delete snapshot.
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 use super::gate::HttpRevert;
 use super::op::{ApiOp, Verb};
@@ -32,9 +34,10 @@ impl ProtocolConfig for VercelProtocol {
     /// The version prefix and resource tokens match case-insensitively and the
     /// resource is lowercased in the op, so case variation cannot dodge a
     /// policy rule; project and object identifiers keep their case. Vercel's
-    /// query parameters (`teamId`, `follow`, …) never change what a request
-    /// is, so the query is ignored for classification.
-    fn parse_op(&self, method: &str, path: &str, _query: &str) -> Option<ApiOp> {
+    /// `teamId` selects the tenant whose authority is exercised and therefore
+    /// participates in typed coverage. Presentation-only parameters such as
+    /// `follow`, pagination, and output formatting do not.
+    fn parse_op(&self, method: &str, path: &str, query: &str) -> Option<ApiOp> {
         let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
         if segs.len() < 2 || !is_api_version(segs[0]) {
             return None; // /login, /.well-known, and anything un-versioned
@@ -96,6 +99,7 @@ impl ProtocolConfig for VercelProtocol {
             namespace,
             name,
             dry_run: false,
+            authority_selectors: vercel_authority_selectors(query),
         })
     }
 
@@ -187,6 +191,75 @@ impl ProtocolConfig for VercelProtocol {
     }
 }
 
+fn vercel_authority_selectors(query: &str) -> BTreeMap<String, String> {
+    let values = query
+        .split('&')
+        .filter_map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            key.eq_ignore_ascii_case("teamId")
+                .then(|| canonical_selector_value(value))
+        })
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return BTreeMap::new();
+    }
+    let mut selectors = BTreeMap::new();
+    selectors.insert("teamId".to_string(), values.join(","));
+    selectors
+}
+
+fn canonical_selector_value(raw: &str) -> String {
+    let decoded = percent_decode(raw).unwrap_or_else(|| raw.as_bytes().to_vec());
+    if !decoded.is_empty()
+        && decoded.len() <= 128
+        && decoded
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+    {
+        return String::from_utf8(decoded).expect("validated selector is ASCII");
+    }
+    let digest = Sha256::digest(&decoded);
+    format!(
+        "sha256:{}",
+        digest[..16]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
+}
+
+fn percent_decode(value: &str) -> Option<Vec<u8>> {
+    fn hex(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = value.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' if index + 2 < bytes.len() => {
+                output.push(hex(bytes[index + 1])? * 16 + hex(bytes[index + 2])?);
+                index += 3;
+            }
+            b'%' => return None,
+            b'+' => {
+                output.push(b' ');
+                index += 1;
+            }
+            byte => {
+                output.push(byte);
+                index += 1;
+            }
+        }
+    }
+    Some(output)
+}
+
 /// Join `rest[from..]` into one subresource string, `None` when empty.
 fn join_tail(rest: &[&str], from: usize) -> Option<String> {
     if rest.len() > from {
@@ -259,6 +332,30 @@ mod tests {
         assert_eq!(o.version, "v9");
         assert_eq!(o.resource, "env");
         assert_eq!(o.namespace.as_deref(), Some("prj_123"));
+    }
+
+    #[test]
+    fn tenant_selector_is_canonical_and_presentation_query_is_excluded() {
+        let first = VercelProtocol
+            .parse_op(
+                "GET",
+                "/v9/projects/prj_123",
+                "teamId=team_a&follow=true&page=2",
+            )
+            .unwrap();
+        let same = VercelProtocol
+            .parse_op("GET", "/v9/projects/prj_123", "teamid=team_a&follow=false")
+            .unwrap();
+        let other = VercelProtocol
+            .parse_op("GET", "/v9/projects/prj_123", "teamId=team_b")
+            .unwrap();
+        assert_eq!(first.authority_selectors, same.authority_selectors);
+        assert_ne!(first.authority_selectors, other.authority_selectors);
+        assert_eq!(
+            first.authority_selectors.get("teamId"),
+            Some(&"team_a".to_string())
+        );
+        assert_eq!(first.authority_selectors.len(), 1);
     }
 
     #[test]
