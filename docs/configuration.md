@@ -138,13 +138,23 @@ the daemon.
 | `GUARD_KUBE_PROXY_KUBECONFIG` | none | Daemon-owned upstream kubeconfig. |
 | `GUARD_KUBE_CONTEXT` | kubeconfig current context | Upstream Kubernetes context. |
 | `GUARD_API_POLICY` | none | Hot-reloaded API policy; absence is default deny. |
-| `GUARD_BROKERED_KUBECONFIG_OUT` | none | Credential-free agent kubeconfig. |
+| `GUARD_BROKERED_KUBECONFIG_OUT` | none | Operator/bootstrap kubeconfig output; agents use `guard api kubeconfig`. |
 | `GUARD_API_RARITY_ESCALATION` | `0` | Observation threshold for evaluator or hold escalation. |
 
 API evaluator concurrency, rate, burst, error circuit, and cooldown controls use
 the `GUARD_API_JUDGE_*` variables shown by `guard server start --help`.
 Admission is partitioned by endpoint and session, with reserved concurrency for
 attributed sessions. Rejected evaluator work fails closed.
+
+Command handling uses `GUARD_COMMAND_MAX_CONCURRENCY` and
+`GUARD_COMMAND_PRINCIPAL_CONCURRENCY`. Command evaluator admission uses
+`GUARD_COMMAND_EVALUATOR_MAX_CONCURRENCY`,
+`GUARD_COMMAND_EVALUATOR_PRINCIPAL_CONCURRENCY`,
+`GUARD_COMMAND_EVALUATOR_RATE_PER_MINUTE`, `GUARD_COMMAND_EVALUATOR_BURST`,
+`GUARD_COMMAND_EVALUATOR_ERROR_THRESHOLD`, and
+`GUARD_COMMAND_EVALUATOR_CIRCUIT_COOLDOWN`. Matching `guard server start`
+options override the environment. Overload, rate exhaustion, and an open error
+circuit fail closed and appear in `guard status` and the audit stream.
 
 See [API proxy](api-proxy.md) for listener and policy examples.
 

@@ -8,9 +8,7 @@ use crate::tool_config::ToolRegistry;
 use anyhow::bail;
 use anyhow::{Context, Result};
 use guard::gating::approval::{ApprovalRegistry, ApprovalStatus};
-use guard::gating::provisional::ProvisionalRegistry;
-#[cfg(windows)]
-use guard::gating::provisional::ProvisionalStatus;
+use guard::gating::provisional::{Provisional, ProvisionalRegistry, ProvisionalStatus};
 #[cfg(unix)]
 use guard::gating::read_grant::{GrantReadRegistry, ReadGrantStatus};
 use guard::gating::verb::VerbCatalog;
@@ -36,6 +34,7 @@ use super::gate_runtime::revert_dir_is_owner_only;
 use super::gate_runtime::{gating_sweeper, is_api_proxy_sentinel, now_unix, DaemonGateSink};
 #[cfg(unix)]
 use super::grants::{delete_read_grant_row, revoke_read_grant_acls};
+use super::runtime::NotifyEvent;
 use super::wire::{
     AdminRequest, AdminResponse, CallerIdentity, ExecOutcome, ExecuteResponse, ExecuteResult,
     ExecuteStreamMessage, IncomingMessage,
@@ -123,9 +122,153 @@ impl guard::proxy::ApiSessionSink for DaemonApiSessionSink {
     }
 }
 
+/// Validate the immutable authority that a persisted rollback depends on.
+/// This checks identities and secret names only. Secret values never enter the
+/// recovery reason, audit stream, or notification payload.
+async fn provisional_recovery_error(config: &ServerConfig, row: &Provisional) -> Option<String> {
+    if row.status != ProvisionalStatus::Armed || !row.forward_done {
+        return None;
+    }
+    if row.session_fingerprint.is_some() != row.session_revision.is_some() {
+        return Some("persisted session identity is incomplete".to_string());
+    }
+    let secret_names = row
+        .secret_keys
+        .values()
+        .chain(row.secret_file_keys.values())
+        .collect::<std::collections::BTreeSet<_>>();
+    if !secret_names.is_empty() {
+        let Some(principal) = row.principal.as_ref() else {
+            return Some("persisted secret references have no frozen principal".to_string());
+        };
+        if let Some(entitlements) = &row.secret_entitlements {
+            if secret_names
+                .iter()
+                .any(|name| !entitlements.iter().any(|allowed| allowed == *name))
+            {
+                return Some(
+                    "persisted secret references exceed frozen session entitlements".to_string(),
+                );
+            }
+        }
+        for name in secret_names {
+            match config.secrets.get(principal, name).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Some(format!(
+                        "persisted rollback secret reference '{}' is unavailable",
+                        name
+                    ))
+                }
+                Err(_) => {
+                    return Some(format!(
+                        "persisted rollback secret reference '{}' could not be revalidated",
+                        name
+                    ))
+                }
+            }
+        }
+    }
+    if let Some(api) = &row.api_revert {
+        if !row
+            .principal
+            .as_ref()
+            .is_some_and(|principal| config.daemon_principal.eq_ci(principal))
+        {
+            return Some(
+                "persisted API rollback principal is not the daemon principal".to_string(),
+            );
+        }
+        if api.endpoint.is_empty()
+            || api.upstream_target.is_empty()
+            || api.upstream_identity.is_empty()
+        {
+            return Some(
+                "persisted API rollback lacks exact endpoint or credential identity".to_string(),
+            );
+        }
+        let registry = config.protocol_registry.read().await;
+        let Some(proxy) = registry.get(&api.endpoint) else {
+            return Some(format!(
+                "persisted API rollback endpoint '{}' is unavailable",
+                api.endpoint
+            ));
+        };
+        if !proxy.matches_upstream_identity(
+            &api.protocol,
+            &api.upstream_target,
+            &api.upstream_identity,
+        ) {
+            return Some(format!(
+                "persisted API rollback endpoint '{}' no longer has the frozen protocol, target, and credential identity",
+                api.endpoint
+            ));
+        }
+    } else if row.revert_binary.is_empty() {
+        return Some("persisted command rollback has no revert binary".to_string());
+    }
+    None
+}
+
 #[cfg(test)]
 mod api_session_event_tests {
     use super::*;
+    use crate::evaluate::{EvalConfig, Evaluator};
+    use crate::secrets::{EnvBackend, SecretManager};
+    use crate::session::SessionRegistry;
+    use crate::tool_config::ToolRegistry;
+    use std::collections::BTreeMap;
+
+    fn recovery_config() -> ServerConfig {
+        ServerConfig::new(
+            None,
+            None,
+            Evaluator::new(EvalConfig::default().llm_enabled(false)).unwrap(),
+            SecretManager::with_backend(EnvBackend::default()),
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            ToolRegistry::isolated_for_tests(),
+            Vec::new(),
+            false,
+            SessionRegistry::new(),
+            None,
+            false,
+            None,
+        )
+    }
+
+    fn armed_command() -> Provisional {
+        Provisional {
+            handle: "recovery".to_string(),
+            principal: Some(guard::principal::PrincipalKey::from_uid(1_001)),
+            binary: "true".to_string(),
+            args: Vec::new(),
+            cwd: None,
+            secret_keys: BTreeMap::new(),
+            secret_file_keys: BTreeMap::new(),
+            revert_binary: "true".to_string(),
+            revert_args: Vec::new(),
+            confirm_check_binary: None,
+            confirm_check_args: Vec::new(),
+            control_path: Some("local".to_string()),
+            session_fingerprint: None,
+            session_revision: None,
+            secret_entitlements: None,
+            api_revert: None,
+            reason: "test".to_string(),
+            created_unix: 1,
+            deadline_unix: u64::MAX,
+            forward_done: true,
+            status: ProvisionalStatus::Armed,
+            revert_exit: None,
+            revert_detail: None,
+        }
+    }
 
     #[test]
     fn approved_api_hold_records_both_approval_and_completion() {
@@ -141,6 +284,69 @@ mod api_session_event_tests {
             api_session_exec_status(true, false),
             SessionExecStatus::Completed
         );
+    }
+
+    #[tokio::test]
+    async fn restart_authority_revalidation_rejects_missing_secret() {
+        let config = recovery_config();
+        let mut row = armed_command();
+        row.secret_keys
+            .insert("TOKEN".to_string(), "rollback/token".to_string());
+        row.secret_entitlements = Some(vec!["rollback/token".to_string()]);
+        let error = provisional_recovery_error(&config, &row)
+            .await
+            .expect("missing secret invalidates recovery authority");
+        assert!(error.contains("unavailable"));
+
+        config
+            .secrets
+            .set(
+                row.principal.as_ref().unwrap(),
+                "rollback/token",
+                "test-only",
+            )
+            .await
+            .unwrap();
+        assert!(provisional_recovery_error(&config, &row).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn restart_authority_revalidation_rejects_api_identity_change() {
+        let config = recovery_config();
+        let proxy = Arc::new(guard::proxy::ApiProxy::new(
+            "127.0.0.1:18443".parse().unwrap(),
+            guard::proxy::ProxyTls::generate().unwrap(),
+            guard::proxy::Upstream::from_base_url(
+                "https://127.0.0.1:16443",
+                guard::proxy::UpstreamAuth::Bearer("upstream-test-only".to_string()),
+            )
+            .unwrap(),
+            guard::proxy::ApiPolicy::deny_all(),
+            None,
+        ));
+        config
+            .protocol_registry
+            .write()
+            .await
+            .insert("cluster-a".to_string(), proxy.clone());
+        let mut row = armed_command();
+        row.principal = Some(config.daemon_principal.clone());
+        row.api_revert = Some(guard::gating::provisional::ApiRevertPlan {
+            endpoint: "cluster-a".to_string(),
+            protocol: "kubernetes".to_string(),
+            upstream_target: proxy.upstream().base().to_string(),
+            upstream_identity: "changed-credential-identity".to_string(),
+            method: "DELETE".to_string(),
+            path: "/api/v1/namespaces/dev/configmaps/test".to_string(),
+            body_file: None,
+        });
+        let error = provisional_recovery_error(&config, &row)
+            .await
+            .expect("changed endpoint identity invalidates recovery authority");
+        assert!(error.contains("frozen protocol, target, and credential identity"));
+
+        row.api_revert.as_mut().unwrap().upstream_identity = proxy.upstream_identity_fingerprint();
+        assert!(provisional_recovery_error(&config, &row).await.is_none());
     }
 }
 
@@ -221,6 +427,10 @@ impl Server {
 
     pub fn set_behavior_limits(&mut self, limits: crate::session::SessionBehaviorLimits) {
         self.config.behavior_limits = limits;
+    }
+
+    pub fn set_command_admission(&mut self, config: super::runtime::CommandAdmissionConfig) {
+        self.config.command_admission = super::runtime::CommandAdmission::new(config);
     }
 
     /// Install the operator-defined verb catalog. Must be called before `run`.
@@ -319,7 +529,6 @@ impl Server {
 
         match store.load_provisionals().await {
             Ok(rows) => {
-                #[cfg(windows)]
                 let mut rows = rows;
                 #[cfg(windows)]
                 if let Some(state_parent) = self
@@ -364,22 +573,47 @@ impl Server {
                         }
                     }
                 }
-                let (reg, moved) = ProvisionalRegistry::from_rows(rows);
-                if !moved.is_empty() {
+                let mut invalid = Vec::new();
+                for row in &mut rows {
+                    if let Some(reason) = provisional_recovery_error(&self.config, row).await {
+                        row.status = ProvisionalStatus::NeedsOperatorDecision;
+                        row.revert_detail = Some(reason.clone());
+                        invalid.push((row.handle.clone(), reason));
+                    }
+                }
+                let (mut reg, moved) = ProvisionalRegistry::from_rows(rows);
+                let mut escalated = invalid;
+                for handle in moved {
+                    let reason = "daemon stopped before the forward outcome or rollback completion was unambiguous"
+                        .to_string();
+                    reg.set_needs_operator_decision(&handle, reason.clone());
+                    escalated.push((handle, reason));
+                }
+                escalated.sort_by(|left, right| left.0.cmp(&right.0));
+                if !escalated.is_empty() {
                     tracing::warn!(target: "guard::audit",
-                        "[AUDIT] STARTUP_RECOVERY provisionals_needing_decision={} handles={:?} (no revert runs unattended at boot)",
-                        moved.len(),
-                        moved
+                        "[AUDIT] STARTUP_RECOVERY provisionals_needing_decision={} handles={:?}",
+                        escalated.len(),
+                        escalated.iter().map(|(handle, _)| handle).collect::<Vec<_>>()
                     );
-                    for h in &moved {
-                        if let Some(p) = reg.get(h) {
+                    for (handle, reason) in &escalated {
+                        if let Some(p) = reg.get(handle) {
                             if let Err(e) = store.save_provisional(p.clone()).await {
                                 tracing::warn!(
                                     "failed to persist recovered provisional {}: {}",
-                                    h,
+                                    handle,
                                     e
                                 );
                             }
+                            self.config.emit_event(NotifyEvent {
+                                event: "startup_recovery_escalated",
+                                at_unix: now_unix(),
+                                handle: Some(handle.clone()),
+                                session_fingerprint: p.session_fingerprint.clone(),
+                                reason: Some(reason.clone()),
+                                status: Some("needs_operator_decision".to_string()),
+                                behavior: None,
+                            });
                         }
                     }
                 }

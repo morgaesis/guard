@@ -125,6 +125,14 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
     stream_output: bool,
     stream_writer: &mut W,
 ) -> ExecuteResult {
+    let admission_scope = caller.to_string();
+    let _handler_permit = match config.command_admission.admit_handler(&admission_scope) {
+        Ok(permit) => permit,
+        Err(reason) => {
+            log_audit_policy_for_request(config, caller, &request, false, reason);
+            return ExecuteResult::denied(reason);
+        }
+    };
     let mut phase = ExecPhase {
         config,
         caller,
@@ -2058,6 +2066,21 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
             .await
         }
     };
+    let evaluator_scope = phase.caller.to_string();
+    let evaluator_permit = match config.command_admission.admit_evaluator(&evaluator_scope) {
+        Ok(permit) => permit,
+        Err(reason) => {
+            return deny_and_record(
+                phase,
+                &request,
+                command_line,
+                SessionDecisionSource::EvaluatorError,
+                None,
+                reason.to_string(),
+            )
+            .await
+        }
+    };
     let eval_result = if evaluation_prompt.is_some() {
         config
             .evaluator
@@ -2077,6 +2100,22 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
             )
             .await
     };
+    let provider_spend = matches!(
+        &eval_result,
+        crate::evaluate::EvalResult::Allow {
+            source: crate::evaluate::EvalSource::Llm,
+            ..
+        } | crate::evaluate::EvalResult::Deny {
+            source: crate::evaluate::EvalSource::Llm,
+            ..
+        } | crate::evaluate::EvalResult::Error(_)
+    );
+    config.command_admission.complete_evaluator(
+        &evaluator_scope,
+        matches!(&eval_result, crate::evaluate::EvalResult::Error(_)),
+        provider_spend,
+    );
+    drop(evaluator_permit);
 
     match eval_result {
         crate::evaluate::EvalResult::Deny {

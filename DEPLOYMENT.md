@@ -33,7 +33,6 @@ The packaged files are:
 
 ```text
 deployment/systemd/guard.service
-deployment/systemd/guard.socket
 deployment/systemd/guard.env.example
 deployment/hardening/guard.apparmor.example
 deployment/hardening/seccomp-deny-escape.json
@@ -49,18 +48,21 @@ successfully assigns the configured group. It never makes the socket
 world-accessible.
 
 ```bash
-groupadd --system guard-clients
-usermod --append --groups guard-clients agent-account
+getent group guard >/dev/null || groupadd --system guard
+getent group guard-clients >/dev/null || groupadd --system guard-clients
+id guard >/dev/null 2>&1 || useradd --system --gid guard --home-dir /var/lib/guard --shell /usr/sbin/nologin guard
+usermod --append --groups guard-clients guard-agent
 install -m 0755 target/release/guard /usr/local/bin/guard
 install -m 0644 deployment/systemd/guard.service /etc/systemd/system/
-install -m 0644 deployment/systemd/guard.socket /etc/systemd/system/
 install -m 0600 deployment/systemd/guard.env.example /etc/default/guard
+# Edit /etc/default/guard before the first start.
 systemctl daemon-reload
-systemctl enable --now guard.socket guard.service
+systemctl enable --now guard.service
 guard status
 ```
 
-Edit `/etc/default/guard` before starting the service. Keep API keys and bearer
+Replace `guard-agent` with each local agent account that may connect. Edit
+`/etc/default/guard` before starting the service. Keep API keys and bearer
 tokens out of unit command lines. `systemctl cat guard.service` shows the exact
 merged hardening and environment configuration.
 
@@ -120,6 +122,10 @@ the transparent read-grant path. The packaged system service grants the daemon
 `CAP_FOWNER` and `CAP_DAC_READ_SEARCH` for its ACL operations, then clears
 ambient and inheritable capabilities before spawning brokered children. The
 child never inherits these capabilities.
+
+The read-grant path requires the operating system ACL utilities, including
+`getfacl` and `setfacl`. Install the distribution's `acl` package before
+enabling this path.
 
 `ProtectSystem=strict` and `ProtectHome=read-only` also require a host-specific
 write carve-out for the tree whose ACL metadata Guard may change:
@@ -195,9 +201,12 @@ out or the session is revoked.
 ## Holds, rollback, and notifications
 
 The daemon needs durable state and continuous supervision while provisionals are
-armed. It persists holds and rollback plans, but never fires an overdue rollback
-blindly during startup. Monitor `guard provisionals`, `guard approvals`, and the
-service audit stream after restart.
+armed. It re-arms a completed forward command only after validating its frozen
+principal, session, secret selectors, endpoint, and credential identity. The
+sweeper observes a startup grace before processing due rows. An interrupted
+rollback, unknown forward outcome, or invalid frozen authority becomes
+`needs_operator_decision` and emits a recovery notification. Monitor `guard
+provisionals`, `guard approvals`, and the service audit stream after restart.
 
 `--notify-cmd` runs an operator-owned command with one bounded, secret-free JSON
 event on standard input. The hook has a timeout, concurrency ceiling, and cleared

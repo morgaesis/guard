@@ -226,6 +226,14 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             api_judge_burst,
             api_judge_error_threshold,
             api_judge_circuit_cooldown,
+            command_max_concurrency,
+            command_principal_concurrency,
+            command_evaluator_max_concurrency,
+            command_evaluator_principal_concurrency,
+            command_evaluator_rate_per_minute,
+            command_evaluator_burst,
+            command_evaluator_error_threshold,
+            command_evaluator_circuit_cooldown,
             // Consumed in `main` (Windows SCM dispatch); irrelevant to the
             // server run itself, which is identical in service and foreground.
             service: _,
@@ -912,6 +920,37 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             )?;
             srv.set_gate(gate_mode);
             srv.set_approval_ttl(approval_ttl);
+            let command_defaults = server::CommandAdmissionConfig::default();
+            srv.set_command_admission(server::CommandAdmissionConfig {
+                handler_concurrency: command_max_concurrency
+                    .or(parse_judge_usize("COMMAND_MAX_CONCURRENCY")?)
+                    .unwrap_or(command_defaults.handler_concurrency),
+                principal_handler_concurrency: command_principal_concurrency
+                    .or(parse_judge_usize("COMMAND_PRINCIPAL_CONCURRENCY")?)
+                    .unwrap_or(command_defaults.principal_handler_concurrency),
+                evaluator_concurrency: command_evaluator_max_concurrency
+                    .or(parse_judge_usize("COMMAND_EVALUATOR_MAX_CONCURRENCY")?)
+                    .unwrap_or(command_defaults.evaluator_concurrency),
+                principal_evaluator_concurrency: command_evaluator_principal_concurrency
+                    .or(parse_judge_usize(
+                        "COMMAND_EVALUATOR_PRINCIPAL_CONCURRENCY",
+                    )?)
+                    .unwrap_or(command_defaults.principal_evaluator_concurrency),
+                evaluator_rate_per_minute: command_evaluator_rate_per_minute
+                    .or(parse_judge_u32("COMMAND_EVALUATOR_RATE_PER_MINUTE")?)
+                    .unwrap_or(command_defaults.evaluator_rate_per_minute),
+                evaluator_burst: command_evaluator_burst
+                    .or(parse_judge_u32("COMMAND_EVALUATOR_BURST")?)
+                    .unwrap_or(command_defaults.evaluator_burst),
+                evaluator_error_threshold: command_evaluator_error_threshold
+                    .or(parse_judge_u32("COMMAND_EVALUATOR_ERROR_THRESHOLD")?)
+                    .unwrap_or(command_defaults.evaluator_error_threshold),
+                evaluator_circuit_cooldown: Duration::from_secs(
+                    command_evaluator_circuit_cooldown
+                        .or(parse_judge_u64("COMMAND_EVALUATOR_CIRCUIT_COOLDOWN")?)
+                        .unwrap_or(command_defaults.evaluator_circuit_cooldown.as_secs()),
+                ),
+            });
             let notify_cmd = notify_cmd
                 .or_else(|| guard_env("NOTIFY_CMD").filter(|value| !value.trim().is_empty()));
             if let Some(command) = notify_cmd {

@@ -150,9 +150,9 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
 }
 
 use cli_client::{
-    handle_approval_note_cmd, handle_approvals, handle_config, handle_gate_action, handle_grant,
-    handle_provisionals, handle_session, handle_status, handle_verb, run_exec, run_mcp,
-    GatingOptions, RunInjections, SshHostKeyCliMode,
+    handle_api, handle_approval_note_cmd, handle_approvals, handle_config, handle_gate_action,
+    handle_grant, handle_provisionals, handle_session, handle_status, handle_verb, run_exec,
+    run_mcp, GatingOptions, RunInjections, SshHostKeyCliMode,
 };
 use cli_secrets::handle_secrets;
 use cli_server::run_server;
@@ -276,6 +276,9 @@ enum MainArgs {
     /// Manage client configuration
     #[clap(subcommand)]
     Config(ConfigCommands),
+    /// Obtain client material for brokered API endpoints.
+    #[clap(subcommand)]
+    Api(ApiCommands),
     /// Expose guard as an MCP server over stdio
     #[clap(subcommand)]
     Mcp(McpCommands),
@@ -1354,6 +1357,38 @@ enum ServerCommands {
         /// Env: GUARD_API_JUDGE_CIRCUIT_COOLDOWN.
         #[arg(long, value_name = "SECONDS")]
         api_judge_circuit_cooldown: Option<u64>,
+
+        /// Maximum simultaneous command handlers. Env: GUARD_COMMAND_MAX_CONCURRENCY.
+        #[arg(long, value_name = "N")]
+        command_max_concurrency: Option<usize>,
+        /// Maximum simultaneous commands for one authenticated principal. Env:
+        /// GUARD_COMMAND_PRINCIPAL_CONCURRENCY.
+        #[arg(long, value_name = "N")]
+        command_principal_concurrency: Option<usize>,
+        /// Maximum simultaneous command evaluator calls. Env:
+        /// GUARD_COMMAND_EVALUATOR_MAX_CONCURRENCY.
+        #[arg(long, value_name = "N")]
+        command_evaluator_max_concurrency: Option<usize>,
+        /// Maximum simultaneous evaluator calls for one principal. Env:
+        /// GUARD_COMMAND_EVALUATOR_PRINCIPAL_CONCURRENCY.
+        #[arg(long, value_name = "N")]
+        command_evaluator_principal_concurrency: Option<usize>,
+        /// Evaluator admissions per minute for each command principal. Env:
+        /// GUARD_COMMAND_EVALUATOR_RATE_PER_MINUTE.
+        #[arg(long, value_name = "N")]
+        command_evaluator_rate_per_minute: Option<u32>,
+        /// Per-principal command evaluator burst capacity. Env:
+        /// GUARD_COMMAND_EVALUATOR_BURST.
+        #[arg(long, value_name = "N")]
+        command_evaluator_burst: Option<u32>,
+        /// Consecutive command evaluator errors that open the circuit. Env:
+        /// GUARD_COMMAND_EVALUATOR_ERROR_THRESHOLD.
+        #[arg(long, value_name = "N")]
+        command_evaluator_error_threshold: Option<u32>,
+        /// Command evaluator circuit cooldown in seconds. Env:
+        /// GUARD_COMMAND_EVALUATOR_CIRCUIT_COOLDOWN.
+        #[arg(long, value_name = "SECONDS")]
+        command_evaluator_circuit_cooldown: Option<u64>,
         /// Internal marker: launched under the Windows Service Control Manager.
         /// The Windows installer sets this in the service binPath so startup
         /// answers the SCM start/stop handshake instead of running in the
@@ -1440,6 +1475,22 @@ enum ConfigCommands {
     },
     /// Clear configuration
     Clear,
+}
+
+#[derive(Subcommand)]
+enum ApiCommands {
+    /// Issue a kubeconfig carrying the live GUARD_SESSION bearer.
+    Kubeconfig {
+        /// Named Kubernetes endpoint configured on the daemon.
+        #[arg(long, default_value = "default")]
+        endpoint: String,
+        /// Write a private 0600 file instead of YAML on standard output.
+        #[arg(long, value_name = "PATH")]
+        output: Option<PathBuf>,
+        /// Server socket path (defaults to configured).
+        #[arg(long, value_name = "PATH")]
+        socket: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1677,6 +1728,7 @@ async fn run_main() -> Result<()> {
             .await
         }
         Ok(MainArgs::Config(subcommand)) => handle_config(subcommand).await,
+        Ok(MainArgs::Api(subcommand)) => handle_api(subcommand).await,
         Ok(MainArgs::Mcp(subcommand)) => run_mcp(subcommand).await,
         Ok(MainArgs::Session(subcommand)) => handle_session(subcommand).await,
         Ok(MainArgs::Grant(subcommand)) => handle_grant(subcommand).await,

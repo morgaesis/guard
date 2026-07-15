@@ -22,6 +22,8 @@ cargo build --quiet --release
 ```bash
 GUARD_VERSION=v0.4.0
 curl -fsSLO "https://github.com/morgaesis/guard/releases/download/${GUARD_VERSION}/guard-${GUARD_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+curl -fsSLO "https://github.com/morgaesis/guard/releases/download/${GUARD_VERSION}/SHA256SUMS"
+sha256sum --check --ignore-missing SHA256SUMS
 tar -xzf "guard-${GUARD_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 install -m 0755 guard ~/.local/bin/guard
 ```

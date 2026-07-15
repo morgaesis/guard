@@ -100,11 +100,12 @@ Command containment assesses the forward command, rollback, confirmation check,
 deadline, and control path together. A viable chain runs autonomously. A chain
 that may sever the authority needed to verify or revert holds.
 
-Holds and provisionals persist in SQLite. Startup restores state without firing
-an overdue rollback in an unverified environment. A due command rollback uses
-the frozen working directory, principal, and credential bindings. A due HTTP
-rollback uses an exact live endpoint, protocol, canonical target, session, and
-upstream credential identity match.
+Holds and provisionals persist in SQLite. Startup re-arms a completed forward
+command after validating its frozen authority, then observes a grace before due
+rollback processing. Interrupted or authority-invalid rows require an operator
+decision. A due command rollback uses the frozen working directory, principal,
+and credential bindings. A due HTTP rollback uses an exact live endpoint,
+protocol, canonical target, session, and upstream credential identity match.
 
 ## API flow
 
@@ -175,6 +176,10 @@ Mode-specific prompts live in `config/`. The evaluator receives redacted command
 or typed API context and returns a structured allow or deny verdict plus risk and
 reversibility. Retry and fallback behavior is bounded; errors are not cached and
 fail closed.
+
+Global and per-principal command admission bounds handler and evaluator
+concurrency. Per-principal token buckets and error circuits bound evaluator
+spend and failure amplification without charging deterministic verb paths.
 
 The evaluator reads attacker-controlled request text and is not a deterministic
 security mechanism. Prompts include specific anti-injection guidance, while

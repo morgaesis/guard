@@ -24,6 +24,31 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
+      - name: Test release integrity logic
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "guard") | .version')
+          verify_tag() { test "$1" = "v${version}"; }
+          verify_tag "v${version}"
+          if verify_tag "v0.0.0"; then
+            echo "mismatched release tag was accepted"
+            exit 1
+          fi
+          mkdir -p /tmp/guard-release-test/a /tmp/guard-release-test/b
+          printf one > /tmp/guard-release-test/a/one.tar.gz
+          printf two > /tmp/guard-release-test/b/two.tar.gz
+          find /tmp/guard-release-test -type f -name '*.tar.gz' -print | LC_ALL=C sort | while IFS= read -r archive; do
+            checksum=$(sha256sum "$archive" | cut -d ' ' -f 1)
+            printf '%s  %s\n' "$checksum" "$(basename "$archive")"
+          done > /tmp/guard-release-test/SHA256SUMS
+          test -s /tmp/guard-release-test/SHA256SUMS
+          mkdir /tmp/guard-release-test/verify
+          cp /tmp/guard-release-test/a/*.tar.gz /tmp/guard-release-test/b/*.tar.gz /tmp/guard-release-test/verify/
+          cp /tmp/guard-release-test/SHA256SUMS /tmp/guard-release-test/verify/
+          (cd /tmp/guard-release-test/verify && sha256sum --check SHA256SUMS)
+          rm -rf /tmp/guard-release-test
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
         with:

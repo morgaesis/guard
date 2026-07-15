@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use super::make_test_config;
+use super::{capture_async, make_test_config};
 
 fn granted_session(allow: Vec<String>, allow_exact: Vec<SessionExactRule>) -> SessionGrant {
     SessionGrant {
@@ -36,6 +36,94 @@ fn granted_session(allow: Vec<String>, allow_exact: Vec<SessionExactRule>) -> Se
         auto_amend: false,
         granted_at: 0,
     }
+}
+
+#[tokio::test]
+async fn kubeconfig_issuance_is_local_live_session_scoped_and_secret_free() {
+    let (cfg, audit) = make_test_config();
+    let token = "finite-kube-session-token";
+    let mut grant = granted_session(Vec::new(), Vec::new());
+    grant.expires_at = Some(guard::env::now_unix() + 60);
+    cfg.sessions.write().await.grant(token.to_string(), grant);
+
+    let proxy = guard::proxy::ApiProxy::new(
+        "127.0.0.1:18443".parse().unwrap(),
+        guard::proxy::ProxyTls::generate().expect("proxy TLS"),
+        guard::proxy::Upstream::from_base_url(
+            "https://127.0.0.1:16443",
+            guard::proxy::UpstreamAuth::Bearer("upstream-test-only".to_string()),
+        )
+        .expect("upstream"),
+        guard::proxy::ApiPolicy::deny_all(),
+        None,
+    );
+    cfg.protocol_registry
+        .write()
+        .await
+        .insert("cluster-a".to_string(), Arc::new(proxy));
+
+    let request = || AdminRequest::KubeconfigIssue {
+        endpoint: "cluster-a".to_string(),
+        session_token: token.to_string(),
+    };
+    let (response, logs) = capture_async(
+        &audit,
+        handle_admin_request(&cfg, &CallerIdentity::Unix { uid: 1_001 }, request()),
+    )
+    .await;
+    let AdminResponse::KubeconfigIssued { yaml, expires_at } = response else {
+        panic!("expected kubeconfig issuance");
+    };
+    assert!(expires_at > guard::env::now_unix());
+    guard::proxy::validate_brokered_kubeconfig_with_session(&yaml, token)
+        .expect("only the Guard bearer is present");
+    assert!(!yaml.contains("upstream-test-only"));
+    assert!(
+        !logs.contains(token),
+        "raw session token entered audit output"
+    );
+
+    assert!(matches!(
+        handle_admin_request(&cfg, &CallerIdentity::Unix { uid: 1_002 }, request()).await,
+        AdminResponse::KubeconfigIssued { .. }
+    ));
+    assert!(matches!(
+        handle_admin_request(
+            &cfg,
+            &CallerIdentity::Tcp {
+                token: "tcp-auth".to_string()
+            },
+            request()
+        )
+        .await,
+        AdminResponse::Error { .. }
+    ));
+
+    cfg.sessions.write().await.revoke(token);
+    assert!(matches!(
+        handle_admin_request(&cfg, &CallerIdentity::Unix { uid: 1_001 }, request()).await,
+        AdminResponse::Error { .. }
+    ));
+
+    let expired = "expired-kube-session";
+    let mut expired_grant = granted_session(Vec::new(), Vec::new());
+    expired_grant.expires_at = Some(guard::env::now_unix());
+    cfg.sessions
+        .write()
+        .await
+        .grant(expired.to_string(), expired_grant);
+    assert!(matches!(
+        handle_admin_request(
+            &cfg,
+            &CallerIdentity::Unix { uid: 1_001 },
+            AdminRequest::KubeconfigIssue {
+                endpoint: "cluster-a".to_string(),
+                session_token: expired.to_string(),
+            }
+        )
+        .await,
+        AdminResponse::Error { .. }
+    ));
 }
 
 #[tokio::test]

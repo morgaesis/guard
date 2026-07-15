@@ -997,6 +997,35 @@ fn safe_allow_disabled_in_paranoid_mode() {
     assert!(deterministic_safe_allow_reason(&cfg, "id", &[]).is_none());
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn deterministic_safe_allow_uses_no_evaluator_admission() {
+    let (cfg, _) = make_test_config();
+    let result = execute_command(
+        basic_request("uptime", Vec::new()),
+        &cfg,
+        &CallerIdentity::Unix { uid: 1_001 },
+    )
+    .await;
+    assert!(result.policy_allowed(), "got: {:?}", result.exec);
+    let counters = cfg.command_admission.snapshot();
+    assert_eq!(counters.handler_admitted, 1);
+    assert_eq!(counters.evaluator_attempted, 0);
+    let status = handle_admin_request(
+        &cfg,
+        &CallerIdentity::Unix {
+            uid: cfg.daemon_uid,
+        },
+        AdminRequest::Status,
+    )
+    .await;
+    let AdminResponse::Status { status } = status else {
+        panic!("expected status response");
+    };
+    assert_eq!(status.command_admission.handler_admitted, 1);
+    assert_eq!(status.command_admission.evaluator_attempted, 0);
+}
+
 /// Policy denial: only the POLICY event fires, never EXEC_FAILED.
 /// Legacy grep patterns `[AUDIT] DENIED` still match.
 #[tokio::test]
