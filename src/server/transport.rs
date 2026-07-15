@@ -769,6 +769,9 @@ impl Server {
             tokio::fs::create_dir_all(parent)
                 .await
                 .context("failed to create socket directory")?;
+            // Keep the path unreachable to other principals across the
+            // bind-to-chmod interval. Group traversal is published only after
+            // the socket group and mode are both installed below.
             Self::chmod_path(parent, 0o700)
                 .await
                 .context("failed to restrict socket directory before binding")?;
