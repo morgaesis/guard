@@ -9,18 +9,18 @@ run behind an automatic rollback, and which wait for a human.
 
 Set the `reversibility` field to one of:
 
-- `reversible` — read-only, idempotent, or trivially undone. The command
+- `reversible` - read-only, idempotent, or trivially undone. The command
   inspects state or makes a change that leaves nothing to clean up. Examples:
   `ls`, `cat`, `ps`, `df`, `systemctl status`, `journalctl -u app`, `git status`,
   `kubectl get pods`, `curl` of a read-only status endpoint.
 
-- `recoverable` — a mutation with a clear inverse and bounded blast radius that a
+- `recoverable` - a mutation with a clear inverse and bounded blast radius that a
   rollback command could restore. The change is real but undoable. Examples:
   `systemctl restart app`, `systemctl reload app`, `kubectl scale --replicas=3`,
   `kubectl rollout restart`, editing an ordinary application config file, a
   firewall or routing change that a paired command can revert, `apt-get install`.
 
-- `irreversible` — destruction, data loss, or a change with no clean inverse, and
+- `irreversible` - destruction, data loss, or a change with no clean inverse, and
   anything you are not sure how to undo. Examples: recursive deletion of data or
   system trees, `mkfs`, `shred`, `wipefs`, disk writes to block devices, `DROP`/
   `TRUNCATE`/`DELETE`, `kubectl delete` of namespaces/PVCs, deleting volumes or

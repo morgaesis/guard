@@ -5,10 +5,10 @@
 //! the commands it approves, and the daemon routes an approved command to one of
 //! three gates by consequence:
 //!
-//! - `GateOutcome::ExecuteNow` — run immediately (today's behavior).
-//! - `GateOutcome::Contain` — execute inside a containment envelope that
+//! - `GateOutcome::ExecuteNow` - run immediately (today's behavior).
+//! - `GateOutcome::Contain` - execute inside a containment envelope that
 //!   auto-reverts unless an operator confirms (see [`provisional`]).
-//! - `GateOutcome::Hold` — do not execute; enqueue for operator approval bound
+//! - `GateOutcome::Hold` - do not execute; enqueue for operator approval bound
 //!   to the exact artifact (see [`approval`]).
 //!
 //! The routing is fail-safe: reversibility can only *raise* the gate, never
@@ -31,6 +31,55 @@ pub mod verb;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
+
+/// Versioned explanation of one admission decision. This is deliberately
+/// transport-neutral so the same immutable record can be attached to command
+/// responses, session history, holds, and containment snapshots.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionTrace {
+    pub version: u32,
+    pub decision_source: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verb_matches: Vec<DecisionVerbMatch>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_dimensions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guidance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested_grant_delta: Option<String>,
+}
+
+impl DecisionTrace {
+    pub const VERSION: u32 = 1;
+
+    pub fn source(source: impl Into<String>) -> Self {
+        Self {
+            version: Self::VERSION,
+            decision_source: source.into(),
+            verb_matches: Vec::new(),
+            failed_dimensions: Vec::new(),
+            conflict: None,
+            guidance: None,
+            suggested_grant_delta: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionVerbMatch {
+    pub verb: String,
+    pub cell: String,
+    pub scope: String,
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
+    #[serde(default)]
+    pub selected: bool,
+    #[serde(default)]
+    pub overridden: bool,
+}
 
 /// Errors from the provisional / approval state machines. Surfaced to the
 /// operator or agent as a denial/error reason, so messages are caller-facing.

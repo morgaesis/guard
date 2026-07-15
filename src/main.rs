@@ -65,6 +65,12 @@ fn preprocess_legacy_grant_args(mut args: Vec<String>) -> Vec<String> {
     if args.get(1).map(String::as_str) != Some("grant") {
         return args;
     }
+    // Bare `guard grant` and its help flags belong to the canonical saved-grant
+    // tree. They must never be reinterpreted as the legacy session-minting
+    // shorthand.
+    if args.len() == 2 || matches!(args.get(2).map(String::as_str), Some("-h" | "--help")) {
+        return args;
+    }
     const CANONICAL: &[&str] = &[
         "save",
         "edit",
@@ -180,6 +186,9 @@ enum MainArgs {
         /// Emit one machine-readable result object instead of streaming child output.
         #[arg(long, action = ArgAction::SetTrue)]
         json: bool,
+        /// Explain the selected verb coverage and decision source on stderr.
+        #[arg(long, action = ArgAction::SetTrue)]
+        explain: bool,
         /// Inject an environment variable (KEY=VALUE, repeatable)
         #[arg(long = "env", value_name = "KEY=VALUE", value_parser = parse_env_assignment)]
         env_vars: Vec<(String, String)>,
@@ -436,6 +445,9 @@ enum VerbCommands {
         /// Emit one machine-readable result object instead of streaming child output.
         #[arg(long, action = ArgAction::SetTrue)]
         json: bool,
+        /// Explain the selected verb coverage and decision source on stderr.
+        #[arg(long, action = ArgAction::SetTrue)]
+        explain: bool,
     },
     /// Create a verb from plain-language prose (LLM-synthesized, validated, and
     /// stored with the prose + evidence). Operator-only.
@@ -493,6 +505,18 @@ enum GrantCommands {
         override_markers: Vec<String>,
         #[arg(long = "secret")]
         secret_names: Vec<String>,
+        /// Maximum verbs an automatic amendment may request.
+        #[arg(long = "ceiling-verb")]
+        ceiling_verbs: Vec<String>,
+        /// Maximum secret selectors an automatic amendment may request.
+        #[arg(long = "ceiling-secret")]
+        ceiling_secrets: Vec<String>,
+        #[arg(long = "ceiling-ttl")]
+        ceiling_ttl: Option<u64>,
+        #[arg(long = "ceiling-mode")]
+        ceiling_modes: Vec<String>,
+        #[arg(long = "allow-prompt-append", action = ArgAction::SetTrue)]
+        allow_prompt_append: bool,
         #[arg(long)]
         ttl: Option<u64>,
         #[arg(long)]
@@ -526,6 +550,24 @@ enum GrantCommands {
         /// Remove every secret-name entitlement.
         #[arg(long, conflicts_with = "secret_names")]
         clear_secrets: bool,
+        #[arg(long = "ceiling-verb")]
+        ceiling_verbs: Vec<String>,
+        #[arg(long, conflicts_with = "ceiling_verbs")]
+        clear_ceiling_verbs: bool,
+        #[arg(long = "ceiling-secret")]
+        ceiling_secrets: Vec<String>,
+        #[arg(long, conflicts_with = "ceiling_secrets")]
+        clear_ceiling_secrets: bool,
+        #[arg(long = "ceiling-ttl")]
+        ceiling_ttl: Option<u64>,
+        #[arg(long, conflicts_with = "ceiling_ttl")]
+        clear_ceiling_ttl: bool,
+        #[arg(long = "ceiling-mode")]
+        ceiling_modes: Vec<String>,
+        #[arg(long, conflicts_with = "ceiling_modes")]
+        clear_ceiling_modes: bool,
+        #[arg(long = "allow-prompt-append", action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+        allow_prompt_append: Option<bool>,
         #[arg(long)]
         ttl: Option<u64>,
         /// Remove the default TTL.
@@ -547,6 +589,9 @@ enum GrantCommands {
         name: String,
         #[arg(long)]
         prompt: Option<String>,
+        /// Apply an exact proposal returned by a previous preview.
+        #[arg(long, value_name = "PROPOSAL_ID", conflicts_with = "prompt")]
+        apply: Option<String>,
         #[arg(long)]
         socket: Option<String>,
         #[arg(long, action = ArgAction::SetTrue)]
@@ -599,11 +644,15 @@ enum GrantRequestCommands {
         #[arg(long)]
         saved_grant: Option<String>,
         #[arg(long)]
-        prompt: String,
+        justification: String,
+        #[arg(long = "prompt-append")]
+        prompt_append: Option<String>,
         #[arg(long = "verb")]
         verbs: Vec<String>,
         #[arg(long = "secret")]
         secret_names: Vec<String>,
+        #[arg(long = "override-marker")]
+        override_markers: Vec<String>,
         #[arg(long)]
         ttl: Option<u64>,
         #[arg(long)]
@@ -1639,6 +1688,7 @@ async fn run_main() -> Result<()> {
     match result {
         Ok(MainArgs::Run {
             json,
+            explain,
             env_vars,
             secret_vars,
             secret_file_vars,
@@ -1678,6 +1728,7 @@ async fn run_main() -> Result<()> {
                 gating,
                 hostkey.into(),
                 json,
+                explain,
             )
             .await
         }

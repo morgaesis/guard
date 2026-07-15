@@ -449,7 +449,7 @@ users:
     user:
       token: brokered-secret-token
 "#;
-        // Empty CA data decodes to an empty bundle (no certs added) — fine for the
+        // Empty CA data decodes to an empty bundle (no certs added) - fine for the
         // parse-level test; we only assert base/bearer resolution here.
         let up = Upstream::from_kubeconfig_str(yaml, None).expect("parse");
         assert_eq!(up.base(), "https://api.example.test:6443");

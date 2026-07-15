@@ -1,4 +1,4 @@
-//! Operator-authored policy over Kubernetes API operations — the proxy's "slow
+//! Operator-authored policy over Kubernetes API operations - the proxy's "slow
 //! clock", analogous to the verb catalog. Only the operator edits it; agents
 //! cannot. Rules match an [`ApiOp`] by verb/resource/namespace/subresource and
 //! yield an action (allow, deny, hold, evaluate) plus, for allowed reads, whether to

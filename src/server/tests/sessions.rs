@@ -1,3 +1,4 @@
+use crate::evaluate::{EvalConfig, Evaluator};
 use crate::grant_profile::{EvaluationMode, SavedGrantCatalog};
 use crate::server::admin::handle_admin_request;
 use crate::server::execute::{
@@ -703,6 +704,7 @@ async fn session_show_reports_recent_stats() {
                 exec_status: SessionExecStatus::Completed,
                 exit_code: Some(0),
                 exposed_secret_refs: vec!["service/token".into()],
+                decision_trace: None,
             },
         );
         reg.record_interaction(
@@ -717,6 +719,7 @@ async fn session_show_reports_recent_stats() {
                 exec_status: SessionExecStatus::NotAttempted,
                 exit_code: None,
                 exposed_secret_refs: Vec::new(),
+                decision_trace: None,
             },
         );
     }
@@ -1187,6 +1190,7 @@ async fn grant_request_submit_enforces_suspension_quota_and_aggregate_size() {
             exit_code: None,
             at_unix: guard::env::now_unix(),
             exposed_secret_refs: Vec::new(),
+            decision_trace: None,
         },
     );
     let submit =
@@ -1547,6 +1551,15 @@ async fn saved_grant_edit_uses_explicit_clear_and_tristate_operations() {
             clear_override_markers: true,
             secret_names: Vec::new(),
             clear_secrets: true,
+            ceiling_verbs: Vec::new(),
+            clear_ceiling_verbs: false,
+            ceiling_secrets: Vec::new(),
+            clear_ceiling_secrets: false,
+            ceiling_ttl_secs: None,
+            clear_ceiling_ttl: false,
+            ceiling_modes: Vec::new(),
+            clear_ceiling_modes: false,
+            allow_prompt_append: None,
             ttl_secs: None,
             clear_ttl: true,
             prompt_append: None,
@@ -1580,6 +1593,15 @@ async fn saved_grant_edit_uses_explicit_clear_and_tristate_operations() {
             clear_override_markers: false,
             secret_names: Vec::new(),
             clear_secrets: false,
+            ceiling_verbs: Vec::new(),
+            clear_ceiling_verbs: false,
+            ceiling_secrets: Vec::new(),
+            clear_ceiling_secrets: false,
+            ceiling_ttl_secs: None,
+            clear_ceiling_ttl: false,
+            ceiling_modes: Vec::new(),
+            clear_ceiling_modes: false,
+            allow_prompt_append: None,
             ttl_secs: None,
             clear_ttl: false,
             prompt_append: Some(String::new()),
@@ -1808,6 +1830,10 @@ async fn evaluate_batch_requires_owned_live_unsuspended_session_or_admin() {
     let commands = vec![crate::server::BatchCommand {
         binary: "true".to_string(),
         args: Vec::new(),
+        env: std::collections::HashMap::new(),
+        secrets: std::collections::HashMap::new(),
+        secret_files: std::collections::HashMap::new(),
+        cwd: None,
     }];
     let evaluate = |session_token, caller_token| AdminRequest::EvaluateBatch {
         session_token,
@@ -1827,6 +1853,14 @@ async fn evaluate_batch_requires_owned_live_unsuspended_session_or_admin() {
         .await,
         AdminResponse::Error { message } if message.contains("only batch-evaluate for itself")
     ));
+    let before = (
+        cfg.approvals.read().await.list().len(),
+        cfg.provisional.read().await.list().len(),
+        cfg.read_grants.read().await.list().len(),
+        cfg.grant_requests.read().await.len(),
+        cfg.verbs.read().await.list().len(),
+        cfg.sessions.read().await.interactions_snapshot().len(),
+    );
     assert!(matches!(
         handle_admin_request(
             &cfg,
@@ -1839,6 +1873,18 @@ async fn evaluate_batch_requires_owned_live_unsuspended_session_or_admin() {
         .await,
         AdminResponse::EvaluationBatch { .. }
     ));
+    let after = (
+        cfg.approvals.read().await.list().len(),
+        cfg.provisional.read().await.list().len(),
+        cfg.read_grants.read().await.list().len(),
+        cfg.grant_requests.read().await.len(),
+        cfg.verbs.read().await.list().len(),
+        cfg.sessions.read().await.interactions_snapshot().len(),
+    );
+    assert_eq!(
+        after, before,
+        "batch preview must have no durable side effects"
+    );
     assert!(matches!(
         handle_admin_request(&cfg, &daemon, evaluate(None, None)).await,
         AdminResponse::EvaluationBatch { .. }
@@ -1856,6 +1902,7 @@ async fn evaluate_batch_requires_owned_live_unsuspended_session_or_admin() {
             exit_code: None,
             at_unix: guard::env::now_unix(),
             exposed_secret_refs: Vec::new(),
+            decision_trace: None,
         },
     );
     assert!(matches!(
@@ -1867,6 +1914,79 @@ async fn evaluate_batch_requires_owned_live_unsuspended_session_or_admin() {
         .await,
         AdminResponse::Error { message } if message.contains("suspended")
     ));
+}
+
+#[tokio::test]
+async fn evaluate_batch_seeds_the_identical_real_run_cache_key() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(super::exec_policy::run_denying_llm(listener));
+
+    let evaluator = Evaluator::new(
+        EvalConfig::default()
+            .llm_api_key("test-key".to_string())
+            .llm_api_url(url)
+            .llm_retries(0),
+    )
+    .unwrap();
+    let (mut cfg, _) = make_test_config();
+    cfg.evaluator = Arc::new(evaluator);
+    let token = "batch-cache-owner".to_string();
+    let mut grant = granted_session(Vec::new(), Vec::new());
+    grant.static_only = false;
+    cfg.sessions.write().await.grant(token.clone(), grant);
+    let cwd = tempfile::tempdir().unwrap();
+    let cwd = cwd.path().canonicalize().unwrap();
+    let command = crate::server::BatchCommand {
+        binary: "echo".to_string(),
+        args: vec!["delete-prod".to_string()],
+        env: HashMap::new(),
+        secrets: HashMap::new(),
+        secret_files: HashMap::new(),
+        cwd: Some(cwd.clone()),
+    };
+    let worker = CallerIdentity::Unix { uid: 1000 };
+
+    let response = handle_admin_request(
+        &cfg,
+        &worker,
+        AdminRequest::EvaluateBatch {
+            session_token: Some(token.clone()),
+            caller_token: Some(token.clone()),
+            commands: vec![command.clone()],
+        },
+    )
+    .await;
+    let AdminResponse::EvaluationBatch { items } = response else {
+        panic!("expected batch evaluation")
+    };
+    assert_eq!(items[0].decision_source, "llm");
+
+    let result = execute_command(
+        ExecuteRequest {
+            binary: command.binary,
+            args: command.args,
+            auth_token: None,
+            env: command.env,
+            secrets: command.secrets,
+            secret_files: command.secret_files,
+            stream: false,
+            session_token: Some(token),
+            revert: None,
+            confirm_within_secs: None,
+            reevaluate: false,
+            ssh_hostkey: None,
+            cwd: command.cwd,
+            require_approval: None,
+            wait_approval_secs: None,
+            verb: None,
+        },
+        &cfg,
+        &worker,
+    )
+    .await
+    .into_response();
+    assert_eq!(result.decision_source, "cache");
 }
 
 #[tokio::test]
@@ -1948,6 +2068,15 @@ async fn grant_request_approval_rejects_expiry_and_stale_saved_revision() {
                 clear_override_markers: false,
                 secret_names: Vec::new(),
                 clear_secrets: false,
+                ceiling_verbs: Vec::new(),
+                clear_ceiling_verbs: false,
+                ceiling_secrets: Vec::new(),
+                clear_ceiling_secrets: false,
+                ceiling_ttl_secs: None,
+                clear_ceiling_ttl: false,
+                ceiling_modes: Vec::new(),
+                clear_ceiling_modes: false,
+                allow_prompt_append: None,
                 ttl_secs: None,
                 clear_ttl: false,
                 prompt_append: None,

@@ -103,6 +103,7 @@ pub(crate) async fn run_exec(
     gating: GatingOptions,
     hostkey: server::SshHostKeyMode,
     json: bool,
+    explain: bool,
 ) -> Result<()> {
     let config = client_config::ClientConfig::load().ok().unwrap_or_default();
 
@@ -265,6 +266,10 @@ pub(crate) async fn run_exec(
             if let Some(stderr) = &resp.stderr {
                 eprint!("{}", stderr);
             }
+        }
+        if explain {
+            print_verb_guidance(&resp);
+            eprintln!("  decision source: {}", resp.decision_source);
         }
         if let Some(code) = resp.exit_code {
             std::process::exit(code);
@@ -722,6 +727,7 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
             wait_approval,
             socket,
             json,
+            explain,
         } => {
             let config = client_config::ClientConfig::load().ok().unwrap_or_default();
             let (socket_path, tcp_port, endpoint_source) =
@@ -792,7 +798,7 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                 }))?;
                 exit_for_execute_response(&resp);
             }
-            render_gated_response(&resp, streamed, &name)
+            render_gated_response(&resp, streamed, &name, explain)
         }
         VerbCommands::Create {
             prompt,
@@ -937,6 +943,11 @@ pub(crate) async fn handle_grant(subcommand: GrantCommands) -> Result<()> {
             verbs,
             override_markers,
             secret_names,
+            ceiling_verbs,
+            ceiling_secrets,
+            ceiling_ttl,
+            ceiling_modes,
+            allow_prompt_append,
             ttl,
             prompt,
             evaluation_mode,
@@ -945,6 +956,10 @@ pub(crate) async fn handle_grant(subcommand: GrantCommands) -> Result<()> {
             json,
         } => {
             let evaluation_mode = EvaluationMode::from_str(&evaluation_mode)?;
+            let ceiling_modes = ceiling_modes
+                .iter()
+                .map(|mode| EvaluationMode::from_str(mode))
+                .collect::<Result<Vec<_>, _>>()?;
             let grant = SavedGrant {
                 name,
                 label: None,
@@ -957,11 +972,23 @@ pub(crate) async fn handle_grant(subcommand: GrantCommands) -> Result<()> {
                 evaluation_mode,
                 auto_approve_requests: auto_approve,
                 ceiling: GrantCeiling {
-                    verbs,
-                    secret_names,
-                    max_ttl_secs: ttl,
-                    allow_prompt_append: false,
-                    evaluation_modes: vec![evaluation_mode],
+                    verbs: if ceiling_verbs.is_empty() {
+                        verbs
+                    } else {
+                        ceiling_verbs
+                    },
+                    secret_names: if ceiling_secrets.is_empty() {
+                        secret_names
+                    } else {
+                        ceiling_secrets
+                    },
+                    max_ttl_secs: ceiling_ttl.or(ttl),
+                    allow_prompt_append,
+                    evaluation_modes: if ceiling_modes.is_empty() {
+                        vec![evaluation_mode]
+                    } else {
+                        ceiling_modes
+                    },
                 },
                 generated_verbs: Vec::new(),
                 revision: 0,
@@ -979,6 +1006,15 @@ pub(crate) async fn handle_grant(subcommand: GrantCommands) -> Result<()> {
             clear_override_markers,
             secret_names,
             clear_secrets,
+            ceiling_verbs,
+            clear_ceiling_verbs,
+            ceiling_secrets,
+            clear_ceiling_secrets,
+            ceiling_ttl,
+            clear_ceiling_ttl,
+            ceiling_modes,
+            clear_ceiling_modes,
+            allow_prompt_append,
             ttl,
             clear_ttl,
             prompt,
@@ -991,6 +1027,10 @@ pub(crate) async fn handle_grant(subcommand: GrantCommands) -> Result<()> {
                 .as_deref()
                 .map(EvaluationMode::from_str)
                 .transpose()?;
+            let ceiling_modes = ceiling_modes
+                .iter()
+                .map(|mode| EvaluationMode::from_str(mode))
+                .collect::<Result<Vec<_>, _>>()?;
             (
                 socket,
                 server::AdminRequest::SavedGrantEdit {
@@ -1002,6 +1042,15 @@ pub(crate) async fn handle_grant(subcommand: GrantCommands) -> Result<()> {
                     clear_override_markers,
                     secret_names,
                     clear_secrets,
+                    ceiling_verbs,
+                    clear_ceiling_verbs,
+                    ceiling_secrets,
+                    clear_ceiling_secrets,
+                    ceiling_ttl_secs: ceiling_ttl,
+                    clear_ceiling_ttl,
+                    ceiling_modes,
+                    clear_ceiling_modes,
+                    allow_prompt_append,
                     ttl_secs: ttl,
                     clear_ttl,
                     prompt_append: prompt,
@@ -1014,11 +1063,16 @@ pub(crate) async fn handle_grant(subcommand: GrantCommands) -> Result<()> {
         GrantCommands::Regenerate {
             name,
             prompt,
+            apply,
             socket,
             json,
         } => (
             socket,
-            server::AdminRequest::SavedGrantRegenerate { name, prompt },
+            server::AdminRequest::SavedGrantRegenerate {
+                name,
+                prompt,
+                proposal_id: apply,
+            },
             json,
         ),
         GrantCommands::Issue {
@@ -1115,9 +1169,11 @@ pub(crate) async fn handle_grant(subcommand: GrantCommands) -> Result<()> {
             GrantRequestCommands::Submit {
                 session,
                 saved_grant,
-                prompt,
+                justification,
+                prompt_append,
                 verbs,
                 secret_names,
+                override_markers,
                 ttl,
                 evaluation_mode,
                 socket,
@@ -1142,13 +1198,14 @@ pub(crate) async fn handle_grant(subcommand: GrantCommands) -> Result<()> {
                         session_token: session,
                         caller_token,
                         saved_grant,
-                        prompt,
+                        prompt: justification,
                         delta: GrantRequestDelta {
                             activated_verbs: verbs,
+                            override_markers,
                             secret_names,
                             ttl_secs: ttl,
+                            prompt_append,
                             evaluation_mode,
-                            ..GrantRequestDelta::default()
                         },
                     },
                     json,
@@ -1258,6 +1315,21 @@ pub(crate) async fn handle_grant(subcommand: GrantCommands) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&grant)?);
             println!("added={added:?} removed={removed:?} changed={changed:?}");
         }
+        server::AdminResponse::SavedGrantRegenerationProposal {
+            name,
+            source_revision,
+            regime,
+            proposal_id,
+            candidate,
+            added,
+            removed,
+            changed,
+        } => {
+            println!("{}", serde_json::to_string_pretty(&candidate)?);
+            println!("added={added:?} removed={removed:?} changed={changed:?}");
+            println!("source_revision={source_revision} regime={regime}");
+            println!("apply: guard grant regenerate {name} --apply {proposal_id}");
+        }
         server::AdminResponse::GrantRequests { items } => {
             for request in items {
                 println!(
@@ -1284,6 +1356,7 @@ fn render_gated_response(
     resp: &server::ExecuteResponse,
     streamed: bool,
     label: &str,
+    explain: bool,
 ) -> Result<()> {
     match resp.status {
         Some(server::GateStatus::Held) => {
@@ -1345,6 +1418,10 @@ fn render_gated_response(
                     if let Some(err) = &resp.stderr {
                         eprint!("{}", err);
                     }
+                }
+                if explain {
+                    print_verb_guidance(resp);
+                    eprintln!("  decision source: {}", resp.decision_source);
                 }
                 if let Some(code) = resp.exit_code {
                     std::process::exit(code);
@@ -1921,6 +1998,44 @@ fn resolve_session_auto_amend(
     }
 }
 
+/// Complete authority-bearing input for `session new`. Keeping the emptiness
+/// predicate on the typed input prevents a newly added flag from minting an
+/// unconfigured bearer because a hand-maintained boolean forgot it.
+#[derive(Clone, Copy)]
+pub(crate) struct SessionAuthorityInput<'a> {
+    pub(crate) prose: &'a Option<String>,
+    pub(crate) saved_grant: &'a Option<String>,
+    pub(crate) allow: &'a [String],
+    pub(crate) deny: &'a [String],
+    pub(crate) activated_verbs: &'a [String],
+    pub(crate) override_markers: &'a [String],
+    pub(crate) ttl: &'a Option<u64>,
+    pub(crate) prompt: &'a Option<String>,
+    pub(crate) evaluation_mode: &'a Option<String>,
+    pub(crate) prompt_file: &'a Option<PathBuf>,
+    pub(crate) static_only: bool,
+    pub(crate) auto_amend: bool,
+    pub(crate) no_auto_amend: bool,
+}
+
+impl SessionAuthorityInput<'_> {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.prose.is_none()
+            && self.saved_grant.is_none()
+            && self.allow.is_empty()
+            && self.deny.is_empty()
+            && self.activated_verbs.is_empty()
+            && self.override_markers.is_empty()
+            && self.ttl.is_none()
+            && self.prompt.is_none()
+            && self.evaluation_mode.is_none()
+            && self.prompt_file.is_none()
+            && !self.static_only
+            && !self.auto_amend
+            && !self.no_auto_amend
+    }
+}
+
 pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
     use crate::grant_profile::EvaluationMode;
     use std::str::FromStr;
@@ -1948,16 +2063,22 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
     } = &subcommand
     {
         let token = generate_session_token();
-        let has_grant = prose.is_some()
-            || saved_grant.is_some()
-            || !allow.is_empty()
-            || !deny.is_empty()
-            || !activated_verbs.is_empty()
-            || !override_markers.is_empty()
-            || ttl.is_some()
-            || prompt.is_some()
-            || prompt_file.is_some()
-            || *static_only;
+        let has_grant = !SessionAuthorityInput {
+            prose,
+            saved_grant,
+            allow,
+            deny,
+            activated_verbs,
+            override_markers,
+            ttl,
+            prompt,
+            evaluation_mode,
+            prompt_file,
+            static_only: *static_only,
+            auto_amend: *auto_amend,
+            no_auto_amend: *no_auto_amend,
+        }
+        .is_empty();
 
         if has_grant {
             let prompt_append = read_grant_prompt(prompt.clone(), prompt_file.as_ref())?;
@@ -2226,21 +2347,17 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                 for g in &grants {
                     let label = paint("[active]", AnsiColor::Green, color);
                     println!(
-                        "{}  token={} allow={:?} deny={:?} allow_exact={:?} deny_exact={:?} verbs={:?} overrides={:?} static_only={} auto_amend={} granted_at={} expires_at={} prompt={} notes={:?}",
+                        "{} token={} verbs={:?} overrides={:?} mode={} grant={:?} revision={:?} granted_at={} expires_at={} prompt={}",
                         label,
                         g.token,
-                        g.allow,
-                        g.deny,
-                        g.allow_exact,
-                        g.deny_exact,
                         g.activated_verbs,
                         g.override_markers,
-                        g.static_only,
-                        g.auto_amend,
+                        g.scope.evaluation_mode,
+                        g.scope.saved_grant,
+                        g.scope.saved_revision,
                         format_timestamp(g.granted_at),
                         format_optional_timestamp(g.expires_at),
                         format_prompt(g.prompt_append.as_deref(), print_full_prompt),
-                        g.generated_notes,
                     );
                 }
                 for h in &history {
@@ -2253,22 +2370,18 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                         }
                     };
                     println!(
-                        "{} token={} allow={:?} deny={:?} allow_exact={:?} deny_exact={:?} verbs={:?} overrides={:?} static_only={} auto_amend={} granted_at={} ended_at={} expires_at={} prompt={} notes={:?}",
+                        "{} token={} verbs={:?} overrides={:?} mode={} grant={:?} revision={:?} granted_at={} ended_at={} expires_at={} prompt={}",
                         label,
                         h.token,
-                        h.allow,
-                        h.deny,
-                        h.allow_exact,
-                        h.deny_exact,
                         h.activated_verbs,
                         h.override_markers,
-                        h.static_only,
-                        h.auto_amend,
+                        h.scope.evaluation_mode,
+                        h.scope.saved_grant,
+                        h.scope.saved_revision,
                         format_timestamp(h.granted_at),
                         format_timestamp(h.ended_at),
                         format_optional_timestamp(h.expires_at),
                         format_prompt(h.prompt_append.as_deref(), print_full_prompt),
-                        h.generated_notes,
                     );
                 }
             }
@@ -2283,16 +2396,13 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
             }
             if let Some(active) = report.active {
                 println!(
-                    "token={} status=active static_only={} auto_amend={} granted_at={} expires_at={} allow={:?} deny={:?} allow_exact={:?} deny_exact={:?} verbs={:?} overrides={:?}",
+                    "token={} status=active mode={} grant={:?} revision={:?} granted_at={} expires_at={} verbs={:?} overrides={:?}",
                     active.token,
-                    active.static_only,
-                    active.auto_amend,
+                    active.scope.evaluation_mode,
+                    active.scope.saved_grant,
+                    active.scope.saved_revision,
                     format_timestamp(active.granted_at),
                     format_optional_timestamp(active.expires_at),
-                    active.allow,
-                    active.deny,
-                    active.allow_exact,
-                    active.deny_exact,
                     active.activated_verbs,
                     active.override_markers,
                 );
@@ -2311,21 +2421,17 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                     server::HistoricalStatus::Expired => "expired",
                 };
                 println!(
-                    "history status={} static_only={} auto_amend={} granted_at={} ended_at={} expires_at={} allow={:?} deny={:?} allow_exact={:?} deny_exact={:?} verbs={:?} overrides={:?} prompt={} notes={:?}",
+                    "history status={} mode={} grant={:?} revision={:?} granted_at={} ended_at={} expires_at={} verbs={:?} overrides={:?} prompt={}",
                     label,
-                    entry.static_only,
-                    entry.auto_amend,
+                    entry.scope.evaluation_mode,
+                    entry.scope.saved_grant,
+                    entry.scope.saved_revision,
                     format_timestamp(entry.granted_at),
                     format_timestamp(entry.ended_at),
                     format_optional_timestamp(entry.expires_at),
-                    entry.allow,
-                    entry.deny,
-                    entry.allow_exact,
-                    entry.deny_exact,
                     entry.activated_verbs,
                     entry.override_markers,
                     format_prompt(entry.prompt_append.as_deref(), true),
-                    entry.generated_notes,
                 );
             }
 
@@ -2501,6 +2607,7 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
         | server::AdminResponse::SavedGrants { .. }
         | server::AdminResponse::SavedGrant { .. }
         | server::AdminResponse::SavedGrantRegenerated { .. }
+        | server::AdminResponse::SavedGrantRegenerationProposal { .. }
         | server::AdminResponse::GrantRequests { .. }
         | server::AdminResponse::GrantRequest { .. }
         | server::AdminResponse::EvaluationBatch { .. } => {
@@ -2771,6 +2878,8 @@ mod tests {
             coverage: None,
             verb_matches: Vec::new(),
             verb_guidance: None,
+            decision_source: "static_policy".to_string(),
+            decision_trace: Some(guard::gating::DecisionTrace::source("static_policy")),
         };
         let envelope = execute_response_envelope(
             "run_result",

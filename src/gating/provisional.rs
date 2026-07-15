@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
-use super::GateError;
+use super::{DecisionTrace, GateError};
 use crate::principal::{scope_eq, PrincipalKey};
 
 /// Lifecycle of a provisional execution.
@@ -130,6 +130,9 @@ pub struct Provisional {
     pub api_revert: Option<ApiRevertPlan>,
     /// Short, caller-facing rationale for the original approval.
     pub reason: String,
+    /// Admission explanation captured before the forward command runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_trace: Option<DecisionTrace>,
     pub created_unix: u64,
     /// Auto-revert fires at or after this wall-clock unix-seconds value.
     pub deadline_unix: u64,
@@ -210,6 +213,16 @@ impl ProvisionalRegistry {
 
     pub fn get(&self, handle: &str) -> Option<&Provisional> {
         self.items.get(handle)
+    }
+
+    pub fn set_decision_trace(
+        &mut self,
+        handle: &str,
+        trace: DecisionTrace,
+    ) -> Option<Provisional> {
+        let provisional = self.items.get_mut(handle)?;
+        provisional.decision_trace = Some(trace);
+        Some(provisional.clone())
     }
 
     /// Drop a provisional outright (e.g. its forward command failed, so there is
@@ -408,6 +421,7 @@ mod tests {
             secret_entitlements: None,
             api_revert: None,
             reason: "restart".into(),
+            decision_trace: None,
             created_unix: 100,
             deadline_unix: deadline,
             forward_done: true,

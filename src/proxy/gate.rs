@@ -64,7 +64,7 @@ pub enum HoldDecision {
 pub trait GateSink: Send + Sync {
     /// Arm an auto-revert envelope around a mutation the proxy already applied.
     /// Returns the provisional handle, or `None` if the daemon declined (e.g.
-    /// the outstanding-provisional cap is hit). The proxy proceeds regardless —
+    /// the outstanding-provisional cap is hit). The proxy proceeds regardless -
     /// the mutation is already live; `None` only means it will not auto-revert.
     async fn arm_revert(&self, mutation: ApiMutation) -> Option<String>;
 
@@ -81,7 +81,7 @@ pub trait GateSink: Send + Sync {
     }
 
     /// Resolve an auto-revert armed under `handle` because the object it would
-    /// undo is already gone by the workload's own action — a resource guard
+    /// undo is already gone by the workload's own action - a resource guard
     /// created earlier in the session that the workload has now deleted (e.g. a
     /// Helm post-install hook removing its own check resource). Cancels the
     /// pending revert so the sweeper does not later try to delete an object that

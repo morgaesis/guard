@@ -22,7 +22,7 @@
          the daemon state (state.db). The data directory ACL grants FULL only to
          the guard SID, SYSTEM, and Administrators, and explicitly removes Users,
          Authenticated Users, and Everyone. A non-admin agent opening state.db or
-         the kubeconfig gets ACCESS_DENIED from the kernel — it cannot read a
+         the kubeconfig gets ACCESS_DENIED from the kernel - it cannot read a
          brokered secret and cannot write a forged "approved" row to flip a held
          command into an executed one.
 
@@ -170,7 +170,7 @@ function Get-GuardSid {
     # purely from the service name and works BEFORE the service exists, so we can
     # display it any time. NOTE: although the SID value is deterministic, icacls
     # cannot RESOLVE it (neither the `*S-1-5-80-...` SID form nor the
-    # `NT SERVICE\guard` name form) until the service has actually been created —
+    # `NT SERVICE\guard` name form) until the service has actually been created -
     # both fail with "No mapping between account names and security IDs" (error
     # 1332) on a non-existent service. The install therefore creates the service
     # FIRST, then applies the guard-SID grant. Output looks like:
@@ -191,7 +191,7 @@ function Set-DataDirAcl {
         grant FULL only to the guard SID, SYSTEM, and Administrators, and remove
         every broad principal (Users, Authenticated Users, Everyone). With
         inheritance broken and no broad ACE, a non-admin agent gets ACCESS_DENIED
-        opening anything under this directory — it cannot read brokered secrets or
+        opening anything under this directory - it cannot read brokered secrets or
         the daemon state, and cannot write a forged approval row.
     #>
     param(

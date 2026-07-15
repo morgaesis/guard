@@ -12,7 +12,7 @@
 #
 # Cluster safety: the `context` param is validated against an explicit ALLOWLIST
 # of non-production clusters. A production context (e.g. prod) is not in
-# the alternation, so the pattern REJECTS it — an agent cannot target prod through
+# the alternation, so the pattern REJECTS it - an agent cannot target prod through
 # any verb, regardless of what the model decides. For a single-cluster deployment,
 # drop the param and hardcode `--context <cluster>` directly in `args` (strongest).
 #

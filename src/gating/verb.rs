@@ -739,7 +739,7 @@ impl VerbCatalog {
 /// Compose the new catalog text by adding one verb to the top-level `verbs:`
 /// sequence. Parses the existing catalog into the YAML model (tolerating a
 /// leading UTF-8 BOM), pushes the verb, and re-serializes the whole document.
-/// Re-serializing — rather than text-appending at EOF — handles a missing,
+/// Re-serializing - rather than text-appending at EOF - handles a missing,
 /// null, empty (`[]`), or flow-style `verbs:` key and preserves any other
 /// top-level keys, instead of assuming `verbs:` is the last block in the file.
 /// The caller validates the result before writing. (Comments in the catalog are
@@ -1285,8 +1285,8 @@ fn validate_verb(verb: &Verb) -> Result<()> {
                 spec.pattern
             );
         }
-        // Compile the anchored form so an invalid regex — or one whose
-        // alternation would escape the anchors — is rejected at load time.
+        // Compile the anchored form so an invalid regex - or one whose
+        // alternation would escape the anchors - is rejected at load time.
         compile_anchored(&spec.pattern).with_context(|| {
             format!(
                 "verb '{}' param '{}' has an invalid regex",

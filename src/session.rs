@@ -27,11 +27,13 @@ pub const DEFAULT_HISTORY_RETENTION_SECS: u64 = 24 * 60 * 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionGrant {
+    #[serde(default, skip_serializing)]
     pub allow: Vec<String>,
+    #[serde(default, skip_serializing)]
     pub deny: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing)]
     pub allow_exact: Vec<SessionExactRule>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing)]
     pub deny_exact: Vec<SessionExactRule>,
     /// Catalog verbs activated only while this session grant is live.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -181,9 +183,11 @@ pub struct HistoricalGrant {
     pub prompt_append: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub generated_notes: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
     pub static_only: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
     pub auto_amend: bool,
 }
 
@@ -202,11 +206,13 @@ pub enum SessionAmendment {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionGrantSummary {
     pub token: String,
+    #[serde(default, skip_serializing)]
     pub allow: Vec<String>,
+    #[serde(default, skip_serializing)]
     pub deny: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing)]
     pub allow_exact: Vec<SessionExactRule>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing)]
     pub deny_exact: Vec<SessionExactRule>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub activated_verbs: Vec<String>,
@@ -221,9 +227,11 @@ pub struct SessionGrantSummary {
     pub prompt_append: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub generated_notes: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
     pub static_only: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
     pub auto_amend: bool,
 }
 
@@ -246,7 +254,7 @@ pub enum SessionDecisionSource {
 }
 
 impl SessionDecisionSource {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::SessionAllow => "session_allow",
             Self::SessionDeny => "session_deny",
@@ -295,6 +303,9 @@ pub struct SessionInteraction {
     /// Values are never persisted.
     #[serde(default, alias = "secret_refs", skip_serializing_if = "Vec::is_empty")]
     pub exposed_secret_refs: Vec<String>,
+    /// Versioned admission explanation for this interaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_trace: Option<guard::gating::DecisionTrace>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -997,7 +1008,7 @@ impl SessionRegistry {
 
     /// Check whether the session's grants short-circuit the decision.
     ///
-    /// Returns `Some(Deny)` if a deny pattern matches — deny always wins.
+    /// Returns `Some(Deny)` if a deny pattern matches - deny always wins.
     /// Returns `Some(Allow)` if an allow pattern matches.
     /// Returns `None` if the session has no matching rule (fall through
     /// to normal evaluation), including when the token is unknown,
@@ -1580,6 +1591,7 @@ mod tests {
                 exec_status: SessionExecStatus::Completed,
                 exit_code: Some(0),
                 exposed_secret_refs: Vec::new(),
+                decision_trace: None,
             },
         );
         reg.record_interaction(
@@ -1594,6 +1606,7 @@ mod tests {
                 exec_status: SessionExecStatus::NotAttempted,
                 exit_code: None,
                 exposed_secret_refs: Vec::new(),
+                decision_trace: None,
             },
         );
         reg.record_interaction(
@@ -1608,6 +1621,7 @@ mod tests {
                 exec_status: SessionExecStatus::Failed,
                 exit_code: None,
                 exposed_secret_refs: Vec::new(),
+                decision_trace: None,
             },
         );
 
@@ -1673,6 +1687,7 @@ mod tests {
                     exec_status: status,
                     exit_code: None,
                     exposed_secret_refs: Vec::new(),
+                    decision_trace: None,
                 },
             );
         }
@@ -1731,5 +1746,43 @@ mod tests {
                 .label,
             None
         );
+    }
+
+    #[test]
+    fn canonical_session_json_hides_legacy_rules_but_keeps_typed_overrides() {
+        let summary = SessionGrantSummary {
+            token: "tok".to_string(),
+            allow: vec!["legacy*".to_string()],
+            deny: vec!["legacy-deny*".to_string()],
+            allow_exact: vec![SessionExactRule::new("echo", vec!["ok".to_string()])],
+            deny_exact: Vec::new(),
+            activated_verbs: vec!["inspect".to_string()],
+            override_markers: vec!["operator:apply".to_string()],
+            scope: IssuedGrantScope {
+                saved_grant: Some("incident".to_string()),
+                saved_revision: 7,
+                ..IssuedGrantScope::default()
+            },
+            expires_at: None,
+            granted_at: 1,
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            static_only: true,
+            auto_amend: true,
+        };
+        let json = serde_json::to_value(summary).unwrap();
+        for hidden in [
+            "allow",
+            "deny",
+            "allow_exact",
+            "deny_exact",
+            "static_only",
+            "auto_amend",
+        ] {
+            assert!(json.get(hidden).is_none(), "{hidden} leaked: {json}");
+        }
+        assert_eq!(json["override_markers"][0], "operator:apply");
+        assert_eq!(json["scope"]["saved_grant"], "incident");
+        assert_eq!(json["scope"]["saved_revision"], 7);
     }
 }

@@ -2,7 +2,7 @@
 //! [`ApiOp`] (verb, group/version, resource, subresource, namespace, name) and
 //! its consequence classification. Every [`super::protocol::ProtocolConfig`]
 //! parses its own wire shape into this vocabulary, so the policy and server
-//! layers match one operation type regardless of protocol. Pure data — no I/O,
+//! layers match one operation type regardless of protocol. Pure data - no I/O,
 //! no parsing; each protocol owns its own request parsing.
 
 use crate::gating::Reversibility;

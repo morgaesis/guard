@@ -31,6 +31,113 @@ pub(super) const MAX_GRANT_REQUESTS: usize = 1024;
 pub(super) const MAX_PENDING_GRANT_REQUESTS_PER_SESSION: usize = 32;
 pub(super) const MAX_GRANT_REQUEST_PAYLOAD_BYTES: usize = 64 * 1024;
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RegenerationProposal {
+    name: String,
+    source_revision: u64,
+    regime: String,
+    prompt: String,
+    candidate: Verb,
+}
+
+#[cfg(test)]
+mod regeneration_proposal_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn candidate() -> Verb {
+        Verb {
+            name: "generated:test".to_string(),
+            description: "test".to_string(),
+            binary: "echo".to_string(),
+            args: vec!["ok".to_string()],
+            baseline: false,
+            coverage: Vec::new(),
+            credential_plan: None,
+            params: BTreeMap::new(),
+            consequence: guard::gating::Reversibility::Reversible,
+            revert: None,
+            trusted: false,
+            prompt_context: None,
+            source_prose: Some("test".to_string()),
+            evidence: None,
+            auto_promoted: false,
+            promotion_stamp: Some("regime-a".to_string()),
+        }
+    }
+
+    fn proposal() -> RegenerationProposal {
+        RegenerationProposal {
+            name: "saved".to_string(),
+            source_revision: 7,
+            regime: "regime-a".to_string(),
+            prompt: "bounded".to_string(),
+            candidate: candidate(),
+        }
+    }
+
+    #[test]
+    fn proposal_round_trip_preserves_exact_candidate_and_bindings() {
+        let proposal = proposal();
+        let id = encode_regeneration_proposal(&proposal).unwrap();
+        let decoded = decode_regeneration_proposal(&id).unwrap();
+        assert_eq!(decoded.name, "saved");
+        assert_eq!(decoded.source_revision, 7);
+        assert_eq!(decoded.regime, "regime-a");
+        assert_eq!(
+            serde_json::to_value(decoded.candidate).unwrap(),
+            serde_json::to_value(proposal.candidate).unwrap()
+        );
+    }
+
+    #[test]
+    fn proposal_tampering_fails_integrity_check() {
+        let mut id = encode_regeneration_proposal(&proposal()).unwrap();
+        let last = id.pop().unwrap();
+        id.push(if last == '0' { '1' } else { '0' });
+        assert!(decode_regeneration_proposal(&id).is_err());
+    }
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
+    if !value.len().is_multiple_of(2) {
+        return Err("invalid regeneration proposal".to_string());
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|index| {
+            u8::from_str_radix(&value[index..index + 2], 16)
+                .map_err(|_| "invalid regeneration proposal".to_string())
+        })
+        .collect()
+}
+
+fn encode_regeneration_proposal(proposal: &RegenerationProposal) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json::to_vec(proposal).map_err(|error| error.to_string())?;
+    let digest = encode_hex(&Sha256::digest(&bytes));
+    Ok(format!("rg1-{digest}-{}", encode_hex(&bytes)))
+}
+
+fn decode_regeneration_proposal(value: &str) -> Result<RegenerationProposal, String> {
+    use sha2::{Digest, Sha256};
+    let rest = value
+        .strip_prefix("rg1-")
+        .ok_or_else(|| "invalid regeneration proposal version".to_string())?;
+    let (expected, payload) = rest
+        .split_once('-')
+        .ok_or_else(|| "invalid regeneration proposal".to_string())?;
+    let bytes = decode_hex(payload)?;
+    if encode_hex(&Sha256::digest(&bytes)) != expected {
+        return Err("regeneration proposal integrity check failed".to_string());
+    }
+    serde_json::from_slice(&bytes).map_err(|_| "invalid regeneration proposal".to_string())
+}
+
 pub(super) fn grant_request_payload_bytes(request: &GrantRequest) -> usize {
     request.justification.len()
         + request
@@ -318,6 +425,9 @@ async fn handle_session_appeal(
                         exec_status: SessionExecStatus::NotAttempted,
                         exit_code: None,
                         exposed_secret_refs: Vec::new(),
+                        decision_trace: Some(guard::gating::DecisionTrace::source(
+                            format!("{source:?}").to_ascii_lowercase(),
+                        )),
                     },
                 )
                 .await;
@@ -369,6 +479,9 @@ async fn handle_session_appeal(
                     exec_status: SessionExecStatus::NotAttempted,
                     exit_code: None,
                     exposed_secret_refs: Vec::new(),
+                    decision_trace: Some(guard::gating::DecisionTrace::source(
+                        format!("{source:?}").to_ascii_lowercase(),
+                    )),
                 },
             )
             .await;
@@ -432,6 +545,9 @@ async fn handle_session_appeal(
                     exec_status: SessionExecStatus::NotAttempted,
                     exit_code: None,
                     exposed_secret_refs: Vec::new(),
+                    decision_trace: Some(guard::gating::DecisionTrace::source(
+                        format!("{source:?}").to_ascii_lowercase(),
+                    )),
                 },
             )
             .await;
@@ -1409,6 +1525,15 @@ pub(super) async fn handle_admin_request(
             clear_override_markers,
             secret_names,
             clear_secrets,
+            ceiling_verbs,
+            clear_ceiling_verbs,
+            ceiling_secrets,
+            clear_ceiling_secrets,
+            ceiling_ttl_secs,
+            clear_ceiling_ttl,
+            ceiling_modes,
+            clear_ceiling_modes,
+            allow_prompt_append,
             ttl_secs,
             clear_ttl,
             prompt_append,
@@ -1444,6 +1569,29 @@ pub(super) async fn handle_admin_request(
                 } else if !secret_names.is_empty() {
                     grant.secret_names = secret_names.clone();
                     grant.ceiling.secret_names = secret_names;
+                }
+                if clear_ceiling_verbs {
+                    grant.ceiling.verbs.clear();
+                } else if !ceiling_verbs.is_empty() {
+                    grant.ceiling.verbs = ceiling_verbs;
+                }
+                if clear_ceiling_secrets {
+                    grant.ceiling.secret_names.clear();
+                } else if !ceiling_secrets.is_empty() {
+                    grant.ceiling.secret_names = ceiling_secrets;
+                }
+                if clear_ceiling_ttl {
+                    grant.ceiling.max_ttl_secs = None;
+                } else if let Some(ttl) = ceiling_ttl_secs {
+                    grant.ceiling.max_ttl_secs = Some(ttl);
+                }
+                if clear_ceiling_modes {
+                    grant.ceiling.evaluation_modes.clear();
+                } else if !ceiling_modes.is_empty() {
+                    grant.ceiling.evaluation_modes = ceiling_modes;
+                }
+                if let Some(allow) = allow_prompt_append {
+                    grant.ceiling.allow_prompt_append = allow;
                 }
                 if clear_ttl {
                     grant.ttl_secs = None;
@@ -1506,27 +1654,53 @@ pub(super) async fn handle_admin_request(
             *config.verbs.write().await = staged_verbs;
             AdminResponse::Ok
         }
-        AdminRequest::SavedGrantRegenerate { name, prompt } => {
+        AdminRequest::SavedGrantRegenerate {
+            name,
+            prompt,
+            proposal_id,
+        } => {
             let Some(existing) = config.saved_grants.read().await.get(&name).cloned() else {
                 return AdminResponse::Error {
                     message: format!("unknown saved grant: '{name}'"),
                 };
             };
-            let prompt = prompt
-                .or(existing.prompt_append.clone())
-                .filter(|value| !value.trim().is_empty());
-            let Some(prompt) = prompt else {
-                return AdminResponse::Error {
-                    message: "regeneration requires --prompt or a saved prompt".to_string(),
+            let regime = config.evaluator.verb_promotion_stamp().to_string();
+            let (prompt, synthesized, is_apply) = if let Some(proposal_id) = proposal_id {
+                let proposal = match decode_regeneration_proposal(&proposal_id) {
+                    Ok(proposal) => proposal,
+                    Err(message) => return AdminResponse::Error { message },
                 };
-            };
-            let synthesized = match config.evaluator.synthesize_verb(&prompt, None).await {
-                Ok(verb) => verb,
-                Err(error) => {
+                if proposal.name != name || proposal.source_revision != existing.revision {
                     return AdminResponse::Error {
-                        message: format!("saved grant regeneration failed: {error}"),
-                    }
+                        message: "regeneration proposal is stale: saved grant revision changed"
+                            .to_string(),
+                    };
                 }
+                if proposal.regime != regime {
+                    return AdminResponse::Error {
+                        message: "regeneration proposal is stale: evaluator regime changed"
+                            .to_string(),
+                    };
+                }
+                (proposal.prompt, proposal.candidate, true)
+            } else {
+                let prompt = prompt
+                    .or(existing.prompt_append.clone())
+                    .filter(|value| !value.trim().is_empty());
+                let Some(prompt) = prompt else {
+                    return AdminResponse::Error {
+                        message: "regeneration requires --prompt or a saved prompt".to_string(),
+                    };
+                };
+                let synthesized = match config.evaluator.synthesize_verb(&prompt, None).await {
+                    Ok(verb) => verb,
+                    Err(error) => {
+                        return AdminResponse::Error {
+                            message: format!("saved grant regeneration failed: {error}"),
+                        }
+                    }
+                };
+                (prompt, synthesized, false)
             };
             if !sticky_coverage_is_compatible(&existing.generated_verbs, &synthesized) {
                 return AdminResponse::Error {
@@ -1541,27 +1715,44 @@ pub(super) async fn handle_admin_request(
                 .filter(|cell| cell.sticky)
                 .cloned()
                 .collect();
-            let verb = stamp_generated_verb(
-                synthesized,
-                &name,
-                &prompt,
-                config.evaluator.verb_promotion_stamp(),
-                sticky,
-            );
-            let mut updated = existing;
-            updated.prompt_append = Some(prompt);
+            let verb = stamp_generated_verb(synthesized, &name, &prompt, &regime, sticky);
+            let mut updated = existing.clone();
+            updated.prompt_append = Some(prompt.clone());
             updated.generated_verbs = vec![verb.clone()];
             let staged = stage_saved_grant_regeneration(
                 &*config.saved_grants.read().await,
                 &*config.verbs.read().await,
                 &name,
                 updated,
-                verb,
+                verb.clone(),
             );
             let (staged_grants, staged_verbs, updated, added, removed, changed) = match staged {
                 Ok(staged) => staged,
                 Err(message) => return AdminResponse::Error { message },
             };
+            if !is_apply {
+                let proposal = RegenerationProposal {
+                    name: name.clone(),
+                    source_revision: existing.revision,
+                    regime: regime.clone(),
+                    prompt,
+                    candidate: verb.clone(),
+                };
+                let proposal_id = match encode_regeneration_proposal(&proposal) {
+                    Ok(id) => id,
+                    Err(message) => return AdminResponse::Error { message },
+                };
+                return AdminResponse::SavedGrantRegenerationProposal {
+                    name,
+                    source_revision: existing.revision,
+                    regime,
+                    proposal_id,
+                    candidate: verb,
+                    added,
+                    removed,
+                    changed,
+                };
+            }
             if let Some(store) = &config.session_store {
                 if let Err(error) = store.save_saved_grant(updated.clone()).await {
                     return AdminResponse::Error {
@@ -1865,50 +2056,85 @@ pub(super) async fn handle_admin_request(
                         .to_string(),
                 };
             }
-            let context = match session_token.as_deref() {
-                Some(token) => {
-                    let registry = config.sessions.read().await;
-                    if !registry.has(token) {
-                        return AdminResponse::Error {
-                            message: format!("unknown active session: '{token}'"),
-                        };
-                    }
-                    if let Some(reason) = registry.suspension_reason(token, &config.behavior_limits)
-                    {
-                        return AdminResponse::Error {
-                            message: format!("session is suspended: {reason}"),
-                        };
-                    }
-                    let revision = registry
-                        .effective_revision_key(token)
-                        .expect("active session has an effective revision");
-                    let mode = registry.evaluation_mode_for(token).unwrap_or_default();
-                    Some(format!(
-                        "[GUARD AUTHORIZATION CONTEXT]\neffective_grant_revision={revision}\nevaluation_mode={mode}\n{}",
-                        registry.prompt_append_for(token).unwrap_or_default()
-                    ))
+            if let Some(token) = session_token.as_deref() {
+                let registry = config.sessions.read().await;
+                if !registry.has(token) {
+                    return AdminResponse::Error {
+                        message: format!("unknown active session: '{token}'"),
+                    };
                 }
-                None => None,
-            };
+                if let Some(reason) = registry.suspension_reason(token, &config.behavior_limits) {
+                    return AdminResponse::Error {
+                        message: format!("session is suspended: {reason}"),
+                    };
+                }
+            }
+            // The preview uses the production admission pipeline with execution
+            // disabled and isolated mutable registries. It therefore shares
+            // validation, cwd, session revision, policy, typed coverage,
+            // environment/secret authorization, and evaluator cache context
+            // with a subsequent real run without creating holds or history.
+            let mut preview = config.clone();
+            preview.dry_run = true;
+            preview.admission_preview = true;
+            preview.session_store = None;
+            preview.sessions = std::sync::Arc::new(tokio::sync::RwLock::new(
+                config.sessions.read().await.clone(),
+            ));
+            preview.verbs =
+                std::sync::Arc::new(tokio::sync::RwLock::new(config.verbs.read().await.clone()));
+            preview.saved_grants = std::sync::Arc::new(tokio::sync::RwLock::new(
+                config.saved_grants.read().await.clone(),
+            ));
+            preview.grant_requests =
+                std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::BTreeMap::new()));
+            preview.grant_request_transition_gate =
+                std::sync::Arc::new(tokio::sync::Mutex::new(()));
+            preview.provisional = std::sync::Arc::new(tokio::sync::RwLock::new(
+                guard::gating::provisional::ProvisionalRegistry::new(),
+            ));
+            preview.approvals = std::sync::Arc::new(tokio::sync::RwLock::new(
+                guard::gating::approval::ApprovalRegistry::new(),
+            ));
+            preview.read_grants = std::sync::Arc::new(tokio::sync::RwLock::new(
+                guard::gating::read_grant::GrantReadRegistry::new(),
+            ));
+            preview.notify_hook = None;
             let mut items = Vec::with_capacity(commands.len());
             for command in commands {
                 let rendered = command_line(&command.binary, &command.args);
-                let (allowed, reason, risk) = match config
-                    .evaluator
-                    .evaluate_with_cacheable_context(&rendered, context.as_deref(), false)
-                    .await
-                {
-                    crate::evaluate::EvalResult::Allow { reason, risk, .. } => (true, reason, risk),
-                    crate::evaluate::EvalResult::Deny { reason, risk, .. } => (false, reason, risk),
-                    crate::evaluate::EvalResult::Error(error) => {
-                        (false, format!("evaluation error: {error}"), None)
-                    }
-                };
+                let response = super::execute::execute_command(
+                    super::wire::ExecuteRequest {
+                        binary: command.binary,
+                        args: command.args,
+                        auth_token: None,
+                        env: command.env,
+                        secrets: command.secrets,
+                        secret_files: command.secret_files,
+                        stream: false,
+                        session_token: session_token.clone(),
+                        revert: None,
+                        confirm_within_secs: None,
+                        require_approval: None,
+                        wait_approval_secs: None,
+                        verb: None,
+                        reevaluate: false,
+                        ssh_hostkey: None,
+                        cwd: command.cwd,
+                    },
+                    &preview,
+                    caller,
+                )
+                .await
+                .into_response();
                 items.push(super::wire::BatchEvaluation {
                     command: rendered,
-                    allowed,
-                    reason,
-                    risk,
+                    allowed: response.allowed,
+                    reason: response.reason,
+                    risk: None,
+                    decision_source: response.decision_source,
+                    verb_matches: response.verb_matches,
+                    guidance: response.verb_guidance,
                 });
             }
             AdminResponse::EvaluationBatch { items }

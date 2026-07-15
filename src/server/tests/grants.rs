@@ -185,7 +185,7 @@ fn permission_denied_path_understands_common_error_shapes() {
 }
 
 /// A permission failure naming a path the grant pipeline rejects (here:
-/// unresolvable) must surface the command's own failure unchanged — no
+/// unresolvable) must surface the command's own failure unchanged - no
 /// retry loop, no grant row.
 #[cfg(unix)]
 #[tokio::test]

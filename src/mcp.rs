@@ -176,6 +176,9 @@ struct GuardToolResponse {
     handle: Option<String>,
     /// Honest statement of what the gate checked and did not check.
     coverage: Option<guard::gating::Coverage>,
+    verb_matches: Vec<server::VerbMatchInfo>,
+    guidance: Option<String>,
+    decision_source: String,
 }
 
 impl From<server::ExecuteResponse> for GuardToolResponse {
@@ -198,6 +201,9 @@ impl From<server::ExecuteResponse> for GuardToolResponse {
                 .to_string()
             }),
             handle: response.handle,
+            verb_matches: response.verb_matches,
+            guidance: response.verb_guidance,
+            decision_source: response.decision_source,
         }
     }
 }
@@ -1169,7 +1175,7 @@ fn render_verbs_text(items: &[server::VerbSummary]) -> String {
     let mut lines = Vec::with_capacity(items.len());
     for v in items {
         let mut line = format!(
-            "{} [{}]{}{} — {}",
+            "{} [{}]{}{} - {}",
             v.name,
             v.consequence,
             if v.trusted { " trusted" } else { "" },
@@ -1277,6 +1283,9 @@ fn tool_result(result: GuardToolResponse) -> Value {
         "status": result.status,
         "handle": result.handle,
         "coverage": result.coverage
+        ,"verb_matches": result.verb_matches
+        ,"guidance": result.guidance
+        ,"decision_source": result.decision_source
     });
 
     json!({
@@ -1353,6 +1362,13 @@ fn render_tool_text(result: &Value) -> String {
     let stderr = result.get("stderr").and_then(Value::as_str).unwrap_or("");
     let status = result.get("status").and_then(Value::as_str);
     let handle = result.get("handle").and_then(Value::as_str).unwrap_or("");
+    let guidance = result
+        .get("guidance")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!("\nGuidance: {value}"))
+        .unwrap_or_default();
+    let decision = decision_text(result);
 
     // Consequence-gate outcomes are not denials: surface the handle, the next
     // step, and the honest coverage so the model knows what was NOT verified.
@@ -1360,8 +1376,8 @@ fn render_tool_text(result: &Value) -> String {
         Some("held") => {
             return format!(
                 "HELD for operator approval (handle {handle}): {reason}\nThe operator must run `guard approve {handle}` for this to execute. Do not retry; wait or proceed with other work.{}",
-                coverage_text(result)
-            );
+                coverage_text(result),
+            ) + &decision + &guidance;
         }
         Some("provisional") => {
             let mut out = String::new();
@@ -1382,7 +1398,7 @@ fn render_tool_text(result: &Value) -> String {
     }
 
     if !allowed {
-        return format!("DENIED: {reason}");
+        return format!("DENIED: {reason}{decision}{guidance}");
     }
 
     // Approved path: the policy reason is operational noise for the
@@ -1406,11 +1422,40 @@ fn render_tool_text(result: &Value) -> String {
         sections.push(format!("stderr:\n{stderr}"));
     }
     if sections.is_empty() {
-        // Approved, exit 0, no stdout, no stderr — produce something
+        // Approved, exit 0, no stdout, no stderr - produce something
         // non-empty so the MCP transport doesn't return a blank value.
         return "(no output)".to_string();
     }
     sections.join("\n")
+}
+
+fn decision_text(result: &Value) -> String {
+    let source = result
+        .get("decision_source")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let matches = result
+        .get("verb_matches")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    Some(format!(
+                        "{}/{}",
+                        item.get("verb")?.as_str()?,
+                        item.get("cell")?.as_str()?
+                    ))
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    if matches.is_empty() {
+        format!("\nDecision source: {source}")
+    } else {
+        format!("\nDecision source: {source}; matched cells: {matches}")
+    }
 }
 
 #[cfg(test)]
@@ -1480,6 +1525,9 @@ mod tests {
                 status: None,
                 handle: None,
                 coverage: None,
+                verb_matches: Vec::new(),
+                guidance: None,
+                decision_source: "static_policy".to_string(),
             }),
         });
         let mut server = McpServer::new(executor, empty_admin(), DEFAULT_TOOL_NAME.to_string());
@@ -1585,6 +1633,9 @@ mod tests {
                 status: None,
                 handle: None,
                 coverage: None,
+                verb_matches: Vec::new(),
+                guidance: None,
+                decision_source: "static_policy".to_string(),
             }),
         });
         let mut server = McpServer::new(executor, empty_admin(), DEFAULT_TOOL_NAME.to_string());
@@ -1696,6 +1747,9 @@ mod tests {
                 status: None,
                 handle: None,
                 coverage: None,
+                verb_matches: Vec::new(),
+                guidance: None,
+                decision_source: "static_policy".to_string(),
             }),
         });
         let mut server = McpServer::new(executor, empty_admin(), DEFAULT_TOOL_NAME.to_string());
@@ -1806,11 +1860,17 @@ mod tests {
             status: None,
             handle: None,
             coverage: None,
+            verb_matches: Vec::new(),
+            guidance: None,
+            decision_source: "static_policy".to_string(),
         });
 
         assert_eq!(value["isError"], false);
         assert_eq!(value["structuredContent"]["allowed"], false);
-        assert_eq!(value["content"][0]["text"], "DENIED: policy denied");
+        assert_eq!(
+            value["content"][0]["text"],
+            "DENIED: policy denied\nDecision source: static_policy"
+        );
     }
 
     #[tokio::test]
@@ -1825,6 +1885,9 @@ mod tests {
                 status: None,
                 handle: None,
                 coverage: None,
+                verb_matches: Vec::new(),
+                guidance: None,
+                decision_source: "static_policy".to_string(),
             }),
         });
         let mut server = McpServer::new(executor, empty_admin(), DEFAULT_TOOL_NAME.to_string());
@@ -1854,6 +1917,9 @@ mod tests {
                 status: None,
                 handle: None,
                 coverage: None,
+                verb_matches: Vec::new(),
+                guidance: None,
+                decision_source: "static_policy".to_string(),
             }),
         });
         let mut server = McpServer::new(executor, empty_admin(), DEFAULT_TOOL_NAME.to_string());
@@ -1892,6 +1958,9 @@ mod tests {
                 status: None,
                 handle: None,
                 coverage: None,
+                verb_matches: Vec::new(),
+                guidance: None,
+                decision_source: "static_policy".to_string(),
             }),
         });
         let admin = Arc::new(FakeAdmin {
@@ -1947,6 +2016,9 @@ mod tests {
                 status: None,
                 handle: None,
                 coverage: None,
+                verb_matches: Vec::new(),
+                guidance: None,
+                decision_source: "static_policy".to_string(),
             }),
         });
         let admin = Arc::new(FakeAdmin {
@@ -2018,6 +2090,9 @@ mod tests {
                 status: None,
                 handle: None,
                 coverage: None,
+                verb_matches: Vec::new(),
+                guidance: None,
+                decision_source: "static_policy".to_string(),
             }),
         });
         let mut server = McpServer::new(executor, empty_admin(), DEFAULT_TOOL_NAME.to_string());

@@ -77,7 +77,9 @@ credential-shaped patterns.
 
 Human `guard run` streams the child process. `guard run --json` returns one
 machine-readable result containing child stdout, stderr, exit status, decision
-source, matched verb cells, and escalation guidance. Read commands such as
+source, matched verb cells, and escalation guidance. `--explain` renders those
+details on stderr for a successful human run; default success remains quiet.
+Denied and held results render guidance without requiring the flag. Read commands such as
 `guard status --json`, `guard session status --json`, and `guard verb list
 --json` support automation without parsing prose.
 
@@ -96,8 +98,9 @@ guard mcp serve
 ```
 
 The MCP server executes commands and provides requester-scoped verb, approval,
-and session operations through the normal daemon protocol. It does not create a
-parallel policy path.
+and session operations through the normal daemon protocol. Structured and human
+tool results carry the stable decision source, matched cells, and guidance. It
+does not create a parallel policy path.
 
 HTTP MCP is available for a local single-tenant runtime and requires a bearer:
 

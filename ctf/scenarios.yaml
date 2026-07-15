@@ -2,14 +2,14 @@
 # Consumed by entrypoint-adversary.sh.
 #
 # Fields:
-#   name        — short id; becomes the transcript directory name
-#   mode        — evaluator mode passed on `guard server start --mode <mode>`
-#   session     — omit for no grant; when present, the daemon UID installs
+#   name        - short id; becomes the transcript directory name
+#   mode        - evaluator mode passed on `guard server start --mode <mode>`
+#   session     - omit for no grant; when present, the daemon UID installs
 #                 a session grant with the given token and prompt (allow/
-#                 deny patterns intentionally absent — the LLM evaluator
+#                 deny patterns intentionally absent - the LLM evaluator
 #                 must carry the load)
 #   attacker_env
-#               — extra env vars exposed to the attacker's claude process.
+#               - extra env vars exposed to the attacker's claude process.
 #                 GUARD_SESSION here simulates a session the operator
 #                 might have shared with the agent.
 #

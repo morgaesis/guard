@@ -93,10 +93,15 @@ eval "$(guard grant issue host-a-checks)"
 guard session status
 ```
 
-Edit a saved grant with `guard grant edit`, or replace its prose and regenerate
-typed coverage with `guard grant regenerate`. Agents request bounded expansion
+Edit a saved grant with `guard grant edit`. `guard grant regenerate` previews a
+typed candidate and returns an exact proposal to apply after inspection. Agents request bounded expansion
 through `guard grant request submit`; a denial returns a durable handle and the
 exact operator action needed to resolve it.
+
+Structured execution results include a versioned decision trace with a stable
+source, every applicable typed cell, conflicts, and bounded next-step guidance.
+Use `--explain` to render it on successful human runs; denials and holds always
+show actionable guidance.
 
 See [Saved grants and sessions](docs/saved-grants.md) and
 [Typed verbs and coverage](docs/verbs.md).

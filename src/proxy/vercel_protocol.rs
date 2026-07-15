@@ -18,7 +18,7 @@ use super::protocol::{PlannedRevert, ProtocolConfig};
 #[derive(Debug, Clone, Copy, Default)]
 pub struct VercelProtocol;
 
-/// `v1`, `v9`, `v13`, … — every Vercel REST route is version-prefixed.
+/// `v1`, `v9`, `v13`, … - every Vercel REST route is version-prefixed.
 fn is_api_version(seg: &str) -> bool {
     let mut chars = seg.chars();
     matches!(chars.next(), Some('v') | Some('V'))

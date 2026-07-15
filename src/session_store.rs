@@ -16,7 +16,7 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const VACUUM_MIN_PAGES: u64 = 512;
 const VACUUM_MIN_FREE_PAGES: u64 = 128;
 
@@ -170,7 +170,7 @@ impl SessionStore {
         let mut interactions = Vec::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT token, at_unix, command, allowed, source, reason, risk, exec_status, exit_code, secret_refs_json
+                "SELECT token, at_unix, command, allowed, source, reason, risk, exec_status, exit_code, secret_refs_json, decision_trace_json
                  FROM session_interactions
                  ORDER BY at_unix ASC, id ASC",
             )?;
@@ -189,6 +189,17 @@ impl SessionStore {
                         exec_status: decode_exec_status(&exec_status)?,
                         exit_code: row.get(8)?,
                         exposed_secret_refs: decode_vec(&row.get::<_, String>(9)?)?,
+                        decision_trace: row
+                            .get::<_, Option<String>>(10)?
+                            .map(|json| serde_json::from_str(&json))
+                            .transpose()
+                            .map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    10,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(error),
+                                )
+                            })?,
                     },
                 ))
             })?;
@@ -284,8 +295,8 @@ impl SessionStore {
         for (token, interaction) in snapshot.interactions_snapshot() {
             tx.execute(
                 "INSERT INTO session_interactions
-                 (token, at_unix, command, allowed, source, reason, risk, exec_status, exit_code, secret_refs_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 (token, at_unix, command, allowed, source, reason, risk, exec_status, exit_code, secret_refs_json, decision_trace_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     token,
                     encode_u64(interaction.at_unix)?,
@@ -296,7 +307,12 @@ impl SessionStore {
                     interaction.risk,
                     encode_exec_status(interaction.exec_status),
                     interaction.exit_code,
-                    encode_vec(&interaction.exposed_secret_refs)?
+                    encode_vec(&interaction.exposed_secret_refs)?,
+                    interaction
+                        .decision_trace
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?
                 ],
             )?;
         }
@@ -431,7 +447,8 @@ impl SessionStore {
                 risk INTEGER,
                 exec_status TEXT NOT NULL,
                 exit_code INTEGER,
-                secret_refs_json TEXT NOT NULL DEFAULT '[]'
+                secret_refs_json TEXT NOT NULL DEFAULT '[]',
+                decision_trace_json TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_session_interactions_token ON session_interactions(token);
             CREATE INDEX IF NOT EXISTS idx_session_interactions_at ON session_interactions(at_unix);
@@ -572,6 +589,7 @@ impl SessionStore {
             "secret_refs_json",
             "TEXT NOT NULL DEFAULT '[]'",
         )?;
+        ensure_column(&tx, "session_interactions", "decision_trace_json", "TEXT")?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(())
@@ -640,6 +658,7 @@ impl SessionStore {
             "secret_refs_json",
             "TEXT NOT NULL DEFAULT '[]'",
         )?;
+        ensure_column(conn, "session_interactions", "decision_trace_json", "TEXT")?;
         Ok(())
     }
 
@@ -2035,6 +2054,7 @@ mod tests {
                     exec_status: SessionExecStatus::Completed,
                     exit_code: Some(0),
                     exposed_secret_refs: Vec::new(),
+                    decision_trace: None,
                 },
             )],
             1,
@@ -2173,6 +2193,7 @@ mod tests {
                     exec_status: SessionExecStatus::CompletedAfterApproval,
                     exit_code: Some(0),
                     exposed_secret_refs: vec!["service/token".into()],
+                    decision_trace: Some(guard::gating::DecisionTrace::source("cache")),
                 },
             )],
             24 * 60 * 60,
@@ -2190,6 +2211,13 @@ mod tests {
         assert_eq!(report.stats.completed, 1);
         assert_eq!(report.stats.holds, 1);
         assert_eq!(report.stats.risk_histogram[1], 1);
+        assert_eq!(
+            report.recent[0]
+                .decision_trace
+                .as_ref()
+                .map(|trace| trace.decision_source.as_str()),
+            Some("cache")
+        );
         assert_eq!(report.stats.evaluator_calls, 1);
         assert_eq!(report.stats.novel_shapes, 1);
         assert_eq!(report.stats.novel_shape_rate_percent, 100);
