@@ -855,7 +855,7 @@ async fn nonstreaming_wait_approval_returns_promptly_on_decision() {
 async fn hold_then_ttl_expiry_denies_fail_closed() {
     let (cfg, _operator, agent) = gating_config(7006, 1000);
     let agent_principal = agent.principal();
-    let session_token = "held-session-token-never-persisted";
+    let session_token = new_handle();
 
     let request = ExecuteRequest {
         binary: "rm".to_string(),
@@ -864,7 +864,7 @@ async fn hold_then_ttl_expiry_denies_fail_closed() {
         env: HashMap::new(),
         secrets: HashMap::new(),
         stream: false,
-        session_token: Some(session_token.to_string()),
+        session_token: Some(session_token.clone()),
         revert: None,
         confirm_within_secs: None,
         reevaluate: false,
@@ -903,14 +903,14 @@ async fn hold_then_ttl_expiry_denies_fail_closed() {
     assert_eq!(expired, vec![handle.clone()]);
 
     let row = cfg.approvals.read().await.get(&handle).cloned().unwrap();
-    let expected_session_ref = audit_session_ref(Some(session_token));
+    let expected_session_ref = audit_session_ref(Some(&session_token));
     assert_eq!(
         row.snapshot.session_ref.as_deref(),
         Some(expected_session_ref.as_str())
     );
     assert!(!serde_json::to_string(&row.snapshot)
         .unwrap()
-        .contains(session_token));
+        .contains(&session_token));
     assert_eq!(
         row.status,
         ApprovalStatus::Expired,
