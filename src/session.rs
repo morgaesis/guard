@@ -605,12 +605,11 @@ impl SessionRegistry {
         }
     }
 
-    /// Remove expired entries (move them to history) and trim history
-    /// older than the retention window. Called opportunistically.
+    /// Remove expired entries (move them to history) and trim history older
+    /// than the retention window. Increments the revision exactly once when
+    /// persisted state changes and leaves it unchanged on a no-op.
     pub fn purge_expired(&mut self) -> bool {
-        let grants_before = self.grants.len();
-        let history_before = self.history.len();
-        let interactions_before = self.interactions.len();
+        let mut changed = false;
         let now = now_unix();
         let retention_cutoff = now.saturating_sub(self.history_retention_secs);
 
@@ -622,18 +621,19 @@ impl SessionRegistry {
             .collect();
         for token in expired_tokens {
             if let Some(grant) = self.grants.remove(&token) {
+                changed = true;
                 self.history
                     .push(historical(&token, grant, now, HistoricalStatus::Expired));
             }
         }
 
+        let history_before = self.history.len();
         self.history.retain(|h| h.ended_at >= retention_cutoff);
+        changed |= self.history.len() != history_before;
+        let interactions_before = self.interactions.len();
         self.interactions
             .retain(|entry| entry.interaction.at_unix >= retention_cutoff);
-
-        let changed = self.grants.len() != grants_before
-            || self.history.len() != history_before
-            || self.interactions.len() != interactions_before;
+        changed |= self.interactions.len() != interactions_before;
         if changed {
             self.revision += 1;
         }
