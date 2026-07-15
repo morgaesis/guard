@@ -21,6 +21,7 @@ fn ssh_request(mode: Option<SshHostKeyMode>, argv: &[&str]) -> ExecuteRequest {
         auth_token: None,
         env: HashMap::new(),
         secrets: HashMap::new(),
+        secret_files: HashMap::new(),
         stream: false,
         session_token: None,
         revert: None,

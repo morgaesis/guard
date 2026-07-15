@@ -89,11 +89,15 @@ pub struct Provisional {
     /// command-shaped revert. Absent on older rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
-    /// env-var -> secret-key mapping needed by the revert. Secret values are
-    /// never persisted; the daemon resolves these references under `principal`
-    /// immediately before the revert executes. Absent on older rows.
+    /// env-var -> secret-key mapping injected into the revert environment.
+    /// Secret values are never persisted; the daemon resolves these references
+    /// under `principal` immediately before the revert executes. Absent on older
+    /// rows.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub secret_keys: BTreeMap<String, String>,
+    /// env-var -> secret-key mappings materialized as files for the revert.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secret_file_keys: BTreeMap<String, String>,
     /// The structured revert command (no shell). Operator-authored (verb) or an
     /// agent-supplied `--revert` that was itself evaluated to APPROVE at arm time.
     pub revert_binary: String,
@@ -348,6 +352,7 @@ mod tests {
             args: vec!["restart".into(), "app".into()],
             cwd: None,
             secret_keys: BTreeMap::new(),
+            secret_file_keys: BTreeMap::new(),
             revert_binary: "systemctl".into(),
             revert_args: vec!["stop".into(), "app".into()],
             api_revert: None,

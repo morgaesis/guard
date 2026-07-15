@@ -13,9 +13,13 @@ it with `guard config set-server <name>`. The named-pipe SID is the caller's
 cross-platform principal, with exact parity to a Unix peer uid, so consequence
 gating, per-principal secret/`--env` injection, and daemon-principal admin all
 work over the pipe. The operator is whoever runs as the daemon's own principal
-(its SID on Windows, its uid on Unix). Connect access is governed by the pipe
-ACL - Administrators/SYSTEM/Authenticated Users by default; tighten it to a
-specific agent SID on a multi-user host.
+(its SID on Windows, its uid on Unix). The pipe DACL gives the daemon SID,
+SYSTEM, and Administrators full control and gives Authenticated Users generic
+read/write access to connect, without pipe-instance creation. Connect permission
+is not command authorization: every request remains policy-gated and credentials
+stay daemon-held. On a multi-user host, every authenticated local user can submit
+policy-gated work, so isolate the permitted agent account or deploy a build whose
+pipe DACL names the intended agent SID.
 
 A TCP loopback transport is also available with `--tcp-port` (default
 `127.0.0.1:8123`) and a shared `GUARD_AUTH_TOKEN`. A TCP caller carries only
@@ -25,6 +29,12 @@ require the separate `GUARD_ADMIN_TOKEN`. `--exec-as-caller` (setuid-style
 identity drop) is Unix-only; on Windows the daemon always executes approved
 commands as its own service account, and containment rests on that account
 isolation rather than an identity swap.
+
+Windows does not implement POSIX read grants. A brokered command that tries to
+read an operator-owned file receives the native `ACCESS_DENIED` result and Guard
+does not change that file's DACL. Put needed non-secret inputs inside the service
+boundary, or use `--secret-file ENV_VAR=secret-name` for a stored credential that
+the child accepts by pathname.
 
 The installer [`deployment/windows/install-guard.ps1`](deployment/windows/install-guard.ps1)
 provisions the bypass-resistant Windows service model: it registers guard as a
@@ -39,6 +49,13 @@ operator actions (`approve`, `deny`, `confirm`, `revert`) from an elevated
 PowerShell; `status`, `provisionals`, and `approvals` are read-only. Pass
 `-EnvFile` to supply an LLM API key; with no key the service runs `--no-llm`
 (static/verb policy only).
+
+Transient secret files and API-revert body snapshots use a stricter runtime ACL
+than the containing data directory: a protected, non-inheriting DACL with one
+allow ACE for the service SID. Guard verifies the owner, DACL protection, exact
+trustee set, file type, and absence of reparse points. Unsafe snapshot storage
+disables body-bearing reverts, and unsafe secret-file storage fails daemon
+startup.
 
 ## Orchestrated workers with operator approval
 

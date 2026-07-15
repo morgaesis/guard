@@ -754,12 +754,27 @@ failure unchanged, and every grant and retry is audited.
 
 `guard run` can request stored secrets for one approved command without requiring a shim or persistent tool config. The daemon resolves the secret values immediately before exec, injects them into the child environment, and includes those values in exact-match output redaction.
 
-`guard secrets add/list/remove` and `--secret`/`--env` injection are local-caller operations on both platforms. They require an authenticated local peer - a Unix-socket uid or a Windows named-pipe SID - and the secret namespace is keyed from that principal. A bearer-token TCP caller is refused, because a token is not a trustworthy local identity. Any local caller can manage its own secret namespace. When the daemon principal runs `guard secrets list`, it gets an aggregate names-only view across every principal's namespace; duplicate key names can appear more than once and are intentionally not annotated with ownership in the default list output.
+File-oriented consumers use `--secret-file ENV_VAR=secret-name`. Guard creates an
+unpredictable per-execution directory and a daemon-only file for each requested
+secret, then sets `ENV_VAR` to that pathname. Unix directories use mode `0700`
+and files use `0600`. Windows directories and files use a protected,
+non-inheriting DACL whose only allow ACE is the daemon or service SID. The files
+exist only while the child is running and are removed after normal exit, child
+failure, spawn failure, or a streaming-client disconnect. Startup removes files
+left by an interrupted daemon without following links. Secret values do not
+enter the request protocol, logs, approval rows, or provisional rows.
 
-Per-run `--env` and `--secret` values cannot replace Guard-owned execution
-context. If a requested env var collides with tool configuration or daemon
-`--child-env`, the command fails before exec instead of silently overriding a
-brokered endpoint or credential.
+The `--secret-file` mode is refused with `--exec-as-caller`. A caller-identity
+child cannot read a daemon-only file, and changing the file ACL to make that
+work would disclose the secret to the caller. Use ordinary `--secret` injection
+or daemon-identity execution for that deployment.
+
+`guard secrets add/list/remove` and `--secret`/`--secret-file`/`--env` injection are local-caller operations on both platforms. They require an authenticated local peer - a Unix-socket uid or a Windows named-pipe SID - and the secret namespace is keyed from that principal. A bearer-token TCP caller is refused, because a token is not a trustworthy local identity. Any local caller can manage its own secret namespace. When the daemon principal runs `guard secrets list`, it gets an aggregate names-only view across every principal's namespace; duplicate key names can appear more than once and are intentionally not annotated with ownership in the default list output.
+
+Per-run `--env`, `--secret`, and `--secret-file` bindings cannot replace
+Guard-owned execution context. If a requested env var collides with another
+binding, tool configuration, or daemon `--child-env`, the command fails before
+exec instead of silently overriding a brokered endpoint or credential.
 
 For daemon-side migration and cleanup, use `guard secrets list --detailed` as the daemon principal. That view annotates the owning principal for namespaced entries and `origin=legacy` for pre-namespace flat secrets that still need operator migration.
 
@@ -793,6 +808,20 @@ Map a different environment variable name to a stored secret key with `ENV_VAR=s
 ```bash
 guard run --secret OPNSENSE_API_KEY=atlas/opnsense-apikey ssh opnsense-host uptime
 ```
+
+Pass a pathname to tools that require a credential file without exposing the
+value to the caller:
+
+```bash
+guard run \
+  --secret-file ANSIBLE_VAULT_PASSWORD_FILE=ansible/vault-password \
+  ansible-playbook site.yml --check
+```
+
+Held commands persist only the env-var-to-secret-name mapping and a salted value
+binding. Approval re-resolves the secret and fails closed if it changed after
+the hold. Provisional reverts persist the same mapping and resolve the current
+value immediately before the revert, matching ordinary secret injection.
 
 Plain per-run environment values are also supported for non-secret settings:
 

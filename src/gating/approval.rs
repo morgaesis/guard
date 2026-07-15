@@ -44,10 +44,10 @@ pub struct SecretBinding {
 
 /// The immutable execution inputs an approval is bound to. Stored at enqueue and
 /// replayed verbatim at approve time. Secret *values* are never stored — only the
-/// env-var -> secret-key mapping, resolved at exec under the original caller's
-/// namespace, plus an optional salted-hash [`SecretBinding`] used to detect a
-/// value swap between hold and approval. `BTreeMap` gives a stable order for a
-/// stable fingerprint.
+/// env-var -> secret-key mappings for environment and file injection, resolved
+/// at exec under the original caller's namespace, plus an optional salted-hash
+/// [`SecretBinding`] used to detect a value swap between hold and approval.
+/// `BTreeMap` gives a stable order for a stable fingerprint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub struct ApprovalSnapshot {
     pub binary: String,
@@ -69,6 +69,9 @@ pub struct ApprovalSnapshot {
         skip_serializing_if = "Option::is_none"
     )]
     pub session_fingerprint: Option<String>,
+    /// env-var -> secret-key mapping materialized as child-lifetime files.
+    #[serde(default)]
+    pub secret_file_keys: BTreeMap<String, String>,
     /// If this hold originated from a verb, the verb name and the validated
     /// params, plus the catalog version it was rendered against. A catalog
     /// change voids the approval.
@@ -434,6 +437,7 @@ mod tests {
             env: BTreeMap::new(),
             secret_keys: BTreeMap::new(),
             session_fingerprint: None,
+            secret_file_keys: BTreeMap::new(),
             verb_name: None,
             verb_params: BTreeMap::new(),
             catalog_version: None,

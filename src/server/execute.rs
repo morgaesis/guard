@@ -974,6 +974,7 @@ mod verb_resolution_tests {
             auth_token: None,
             env: HashMap::new(),
             secrets: HashMap::new(),
+            secret_files: HashMap::new(),
             stream: false,
             session_token: None,
             revert: None,
@@ -1652,8 +1653,8 @@ async fn enforce_binary_policy<W: AsyncWrite + Unpin>(
 /// Deterministic pre-LLM fast allow for a fixed set of trivially safe
 /// read-only commands. Like a trusted verb, it is a deterministic allow
 /// that precedes the evaluator; it never applies when the caller injected
-/// env/secrets (which could change the command's meaning) and is disabled
-/// in paranoid mode. `accept-all` host-key mode is excluded explicitly:
+/// env or secret bindings (which could change the command's meaning) and is
+/// disabled in paranoid mode. `accept-all` host-key mode is excluded explicitly:
 /// its injected `StrictHostKeyChecking=no` already fails the ssh option
 /// allow-list, but keeping the guard here documents that giving up host
 /// authentication never rides the fast path even if the diagnostic is fixed.
@@ -1666,6 +1667,7 @@ async fn try_static_fast_allow<W: AsyncWrite + Unpin>(
     let config = phase.config;
     if request.env.is_empty()
         && request.secrets.is_empty()
+        && request.secret_files.is_empty()
         && !matches!(request.ssh_hostkey, Some(SshHostKeyMode::AcceptAll))
     {
         if let Some(reason) =
@@ -2889,11 +2891,17 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
     let trusted_tool_env = tool_env.env;
     let mut exposed_secret_refs = tool_env.secret_refs;
     exposed_secret_refs.extend(request.secrets.values().cloned());
+    exposed_secret_refs.extend(request.secret_files.values().cloned());
     exposed_secret_refs.sort();
     exposed_secret_refs.dedup();
     let mut request_env = HashMap::new();
 
-    for key in request.env.keys().chain(request.secrets.keys()) {
+    for key in request
+        .env
+        .keys()
+        .chain(request.secrets.keys())
+        .chain(request.secret_files.keys())
+    {
         if !is_valid_env_name(key) {
             return ExecuteResult::exec_failed(
                 allow_reason,
@@ -2906,6 +2914,32 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
                 format!("dangerous injected environment variable name: '{}'", key),
             );
         }
+    }
+
+    let mut injection_names = std::collections::HashSet::new();
+    for key in request
+        .env
+        .keys()
+        .chain(request.secrets.keys())
+        .chain(request.secret_files.keys())
+    {
+        if !injection_names.insert(key) {
+            return ExecuteResult::exec_failed(
+                allow_reason,
+                format!(
+                    "injected environment variable '{}' has multiple bindings",
+                    key
+                ),
+            );
+        }
+    }
+
+    if config.exec_as_caller && !request.secret_files.is_empty() {
+        return ExecuteResult::exec_failed(
+            allow_reason,
+            "--secret-file is unavailable when the daemon uses --exec-as-caller because the caller identity must not receive access to daemon-owned secret files"
+                .to_string(),
+        );
     }
 
     // Per-run --env injection is honored for any authenticated local caller
@@ -2961,12 +2995,51 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
         }
     }
 
+    // Resolve file-backed secrets immediately before execution, but do not put
+    // their values in the child environment. Materialization happens only
+    // after all request and collision validation has succeeded.
+    let mut secret_file_values = Vec::new();
+    if !request.secret_files.is_empty() {
+        let principal = match caller.principal() {
+            Some(principal) if caller.is_local_peer() => principal,
+            _ => {
+                return ExecuteResult::exec_failed(
+                    allow_reason,
+                    "secret-file injection requires an authenticated local caller".to_string(),
+                );
+            }
+        };
+        let mut mappings: Vec<_> = request.secret_files.iter().collect();
+        mappings.sort_by(|a, b| a.0.cmp(b.0));
+        for (env_var, secret_key) in mappings {
+            let value = match config.secrets.get(&principal, secret_key).await {
+                Ok(Some(value)) => value,
+                Ok(None) => {
+                    return ExecuteResult::exec_failed(
+                        allow_reason,
+                        format!(
+                            "secret not found: '{}' (required by --secret-file {})",
+                            secret_key, env_var
+                        ),
+                    );
+                }
+                Err(e) => {
+                    return ExecuteResult::exec_failed(
+                        allow_reason,
+                        format!("failed to read secret '{}': {}", secret_key, e),
+                    );
+                }
+            };
+            secret_file_values.push((env_var.clone(), value));
+        }
+    }
+
     let daemon_child_env: HashMap<String, String> = config
         .extra_child_env
         .iter()
         .filter_map(|var| std::env::var(var).ok().map(|value| (var.clone(), value)))
         .collect();
-    for key in request_env.keys() {
+    for key in request_env.keys().chain(request.secret_files.keys()) {
         if trusted_tool_env.contains_key(key) {
             return ExecuteResult::exec_failed(
                 allow_reason,
@@ -2989,6 +3062,12 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
     let mut redaction_env = daemon_child_env.clone();
     redaction_env.extend(request_env.clone());
     redaction_env.extend(trusted_tool_env.clone());
+    for (index, (_, value)) in secret_file_values.iter().enumerate() {
+        redaction_env.insert(
+            format!("GUARD_SECRET_FILE_REDACTION_{index}"),
+            value.clone(),
+        );
+    }
 
     tracing::info!(
         "Executing: {} {:?} ({}) cwd={}",
@@ -3015,6 +3094,31 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
         }
         cmd.current_dir(cwd);
     }
+
+    let secret_file_lease = if secret_file_values.is_empty() {
+        None
+    } else {
+        let Some(root) = config.secret_file_root.as_ref() else {
+            return ExecuteResult::exec_failed(
+                allow_reason,
+                "secret-file storage is not initialized".to_string(),
+            );
+        };
+        match super::secure_fs::SecretFileLease::create(root, &secret_file_values) {
+            Ok((lease, bindings)) => {
+                for (env_var, path) in bindings {
+                    request_env.insert(env_var, path.to_string_lossy().into_owned());
+                }
+                Some(lease)
+            }
+            Err(e) => {
+                return ExecuteResult::exec_failed(
+                    allow_reason,
+                    format!("failed to materialize secret files: {}", e),
+                );
+            }
+        }
+    };
 
     // SECURITY: Clear ALL inherited env vars. The child process gets only what we
     // explicitly allow. This prevents leaking the guard's own secrets (API keys,
@@ -3094,7 +3198,7 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
     }
 
     if stream_output {
-        return execute_spawn_streaming(
+        let result = execute_spawn_streaming(
             cmd,
             allow_reason,
             config,
@@ -3107,6 +3211,8 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
             stream_writer,
         )
         .await;
+        drop(secret_file_lease);
+        return result;
     }
 
     cmd.stdout(Stdio::piped());
@@ -3148,6 +3254,7 @@ pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
         Some(redact_command_text(config, &redaction_env, s))
     };
 
+    drop(secret_file_lease);
     ExecuteResult::completed(allow_reason, output.status.code(), stdout, stderr)
         .with_exposed_secret_refs(exposed_secret_refs)
 }

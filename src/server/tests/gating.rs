@@ -71,6 +71,7 @@ fn contain_request(binary: &str, args: &[&str], revert: RevertSpec) -> ExecuteRe
         auth_token: None,
         env: HashMap::new(),
         secrets: HashMap::new(),
+        secret_files: HashMap::new(),
         stream: false,
         session_token: None,
         revert: Some(revert),
@@ -137,16 +138,28 @@ impl AsyncWrite for FlakyWriter {
 async fn containment_stays_armed_when_client_stream_drops_after_launch() {
     let (cfg, _operator, agent) = gating_config(7001, 1000);
     let agent_principal = agent.principal();
+    cfg.secrets
+        .set(
+            agent_principal.as_ref().unwrap(),
+            "stream-file-secret",
+            "stream-value",
+        )
+        .await
+        .unwrap();
 
     // Forward `echo` produces a line, so the daemon attempts to stream it;
     // our writer fails on that first write -> exec_failed_after_start.
-    let request = contain_request(
+    let mut request = contain_request(
         "echo",
         &["contained-change"],
         RevertSpec {
             binary: "true".to_string(),
             args: Vec::new(),
         },
+    );
+    request.secret_files.insert(
+        "STREAM_SECRET_FILE".to_string(),
+        "stream-file-secret".to_string(),
     );
     let mut writer = FlakyWriter::failing_after(0);
 
@@ -183,6 +196,17 @@ async fn containment_stays_armed_when_client_stream_drops_after_launch() {
         "forward_done must be set so the deadline is honored"
     );
     assert_eq!(reg.outstanding(), 1, "the armed row still occupies a slot");
+    assert_eq!(
+        p.secret_file_keys.get("STREAM_SECRET_FILE"),
+        Some(&"stream-file-secret".to_string())
+    );
+    assert_eq!(
+        std::fs::read_dir(cfg.secret_file_root.as_ref().unwrap())
+            .unwrap()
+            .count(),
+        0,
+        "stream disconnect must remove child-lifetime secret files"
+    );
 }
 
 /// Counterpart to the leak test: a contained forward command that FAILS TO
@@ -377,10 +401,11 @@ async fn contain_then_deadline_triggers_sweeper_autorevert() {
     );
 }
 
-/// A persisted provisional keeps only the secret reference. After a simulated
-/// daemon restart, the operator-initiated revert resolves that reference from
-/// the new daemon's live secret manager. A temporarily missing secret defers
-/// the revert for an operator retry instead of burning the rollback.
+/// A persisted provisional keeps only a secret-file reference. After a
+/// simulated daemon restart, the operator-initiated revert resolves and
+/// materializes that reference from the new daemon's live secret manager. A
+/// temporarily missing secret defers the revert for an operator retry instead
+/// of burning the rollback.
 #[cfg(unix)]
 #[tokio::test]
 async fn provisional_revert_reresolves_secret_after_restart() {
@@ -409,15 +434,15 @@ async fn provisional_revert_reresolves_secret_after_restart() {
             binary: "sh".to_string(),
             args: vec![
                 "-c".to_string(),
-                "printf '%s' \"$REVERT_TOKEN\" > \"$1\"".to_string(),
+                "cat \"$REVERT_TOKEN_FILE\" > \"$1\"".to_string(),
                 "sh".to_string(),
                 output.display().to_string(),
             ],
         },
     );
     request
-        .secrets
-        .insert("REVERT_TOKEN".to_string(), secret_key.clone());
+        .secret_files
+        .insert("REVERT_TOKEN_FILE".to_string(), secret_key.clone());
 
     let mut sink = tokio::io::sink();
     let result = arm_containment(
@@ -442,7 +467,7 @@ async fn provisional_revert_reresolves_secret_after_restart() {
         .expect("load persisted provisional");
     assert_eq!(persisted.len(), 1);
     assert_eq!(
-        persisted[0].secret_keys.get("REVERT_TOKEN"),
+        persisted[0].secret_file_keys.get("REVERT_TOKEN_FILE"),
         Some(&secret_key)
     );
     let persisted_json = serde_json::to_string(&persisted[0]).expect("serialize persisted row");
@@ -591,6 +616,7 @@ async fn api_revert_without_running_proxy_defers_to_operator() {
         args: vec!["delete labels/bug in o/r".to_string()],
         cwd: None,
         secret_keys: BTreeMap::new(),
+        secret_file_keys: BTreeMap::new(),
         revert_binary: "(api-proxy)".to_string(),
         revert_args: vec![
             "github".to_string(),
@@ -685,6 +711,7 @@ async fn api_revert_executes_through_registered_proxy_upstream() {
         args: vec!["delete labels/bug in o/r".to_string()],
         cwd: None,
         secret_keys: BTreeMap::new(),
+        secret_file_keys: BTreeMap::new(),
         revert_binary: "(api-proxy)".to_string(),
         revert_args: vec![
             "github".to_string(),
@@ -793,6 +820,7 @@ async fn hold_then_operator_approve_executes_snapshot_nonoperator_refused() {
         auth_token: None,
         env: HashMap::new(),
         secrets: HashMap::new(),
+        secret_files: HashMap::new(),
         stream: false,
         session_token: None,
         revert: None,
@@ -1005,6 +1033,7 @@ async fn nonstreaming_wait_approval_returns_promptly_on_decision() {
         auth_token: None,
         env: HashMap::new(),
         secrets: HashMap::new(),
+        secret_files: HashMap::new(),
         stream: false,
         session_token: None,
         revert: None,
@@ -1068,6 +1097,7 @@ async fn hold_then_ttl_expiry_denies_fail_closed() {
         auth_token: None,
         env: HashMap::new(),
         secrets: HashMap::new(),
+        secret_files: HashMap::new(),
         stream: false,
         session_token: Some(session_token.clone()),
         revert: None,
@@ -1141,9 +1171,8 @@ fn hash_secret_value_is_salted_and_value_sensitive() {
     assert_eq!(a.len(), 64);
 }
 
-/// A held command captures a salted hash of its mapped secret VALUES. If the
-/// same-principal caller swaps a value between hold and approval, approval
-/// fails closed before the command runs.
+/// File-backed secret references use the same held-value binding as env
+/// secrets. Persisted snapshots contain names and hashes, never values.
 #[tokio::test]
 async fn approve_rejected_when_bound_secret_value_changed() {
     let (cfg, _operator, agent) = gating_config(7201, 4201);
@@ -1151,14 +1180,15 @@ async fn approve_rejected_when_bound_secret_value_changed() {
     let p = agent_principal.clone().expect("agent principal");
     cfg.secrets.set(&p, "BIND_TEST_KEY", "v1").await.unwrap();
 
-    let mut secrets = HashMap::new();
-    secrets.insert("INJECTED".to_string(), "BIND_TEST_KEY".to_string());
+    let mut secret_files = HashMap::new();
+    secret_files.insert("INJECTED_FILE".to_string(), "BIND_TEST_KEY".to_string());
     let request = ExecuteRequest {
         binary: "true".to_string(),
         args: Vec::new(),
         auth_token: None,
         env: HashMap::new(),
-        secrets,
+        secrets: HashMap::new(),
+        secret_files,
         stream: false,
         session_token: None,
         revert: None,
@@ -1201,6 +1231,12 @@ async fn approve_rejected_when_bound_secret_value_changed() {
         snapshot.secret_binding.is_some(),
         "a secret-value binding must be captured at hold time"
     );
+    assert_eq!(
+        snapshot.secret_file_keys.get("INJECTED_FILE"),
+        Some(&"BIND_TEST_KEY".to_string())
+    );
+    let persisted = serde_json::to_string(&snapshot).unwrap();
+    assert!(!persisted.contains("v1"));
 
     // The same principal swaps the value the operator was reviewing.
     cfg.secrets
@@ -1233,14 +1269,15 @@ async fn approve_passes_binding_when_secret_value_unchanged() {
     let p = agent_principal.clone().expect("agent principal");
     cfg.secrets.set(&p, "BIND_OK_KEY", "stable").await.unwrap();
 
-    let mut secrets = HashMap::new();
-    secrets.insert("INJECTED".to_string(), "BIND_OK_KEY".to_string());
+    let mut secret_files = HashMap::new();
+    secret_files.insert("INJECTED_FILE".to_string(), "BIND_OK_KEY".to_string());
     let request = ExecuteRequest {
         binary: "true".to_string(),
         args: Vec::new(),
         auth_token: None,
         env: HashMap::new(),
-        secrets,
+        secrets: HashMap::new(),
+        secret_files,
         stream: false,
         session_token: None,
         revert: None,
@@ -1291,6 +1328,13 @@ async fn approve_passes_binding_when_secret_value_unchanged() {
             reason
         );
     }
+    assert_eq!(
+        std::fs::read_dir(cfg.secret_file_root.as_ref().unwrap())
+            .unwrap()
+            .count(),
+        0,
+        "held approval execution must clean its secret-file lease"
+    );
 
     let _ = cfg.secrets.delete(&p, "BIND_OK_KEY").await;
 }
@@ -1315,6 +1359,7 @@ async fn approve_rejected_when_unresolved_secret_appears_after_hold() {
         auth_token: None,
         env: HashMap::new(),
         secrets,
+        secret_files: HashMap::new(),
         stream: false,
         session_token: None,
         revert: None,
@@ -1393,6 +1438,7 @@ async fn approval_note_operator_and_owner_post_others_refused() {
         auth_token: None,
         env: HashMap::new(),
         secrets: HashMap::new(),
+        secret_files: HashMap::new(),
         stream: false,
         session_token: None,
         revert: None,
@@ -1493,6 +1539,7 @@ async fn approve_voided_when_verb_catalog_version_changed() {
         env: BTreeMap::new(),
         secret_keys: BTreeMap::new(),
         session_fingerprint: None,
+        secret_file_keys: BTreeMap::new(),
         verb_name: Some("restart-service".to_string()),
         verb_params: BTreeMap::new(),
         // Live catalog (VerbCatalog::empty()) has version 0; a stale stamp.
@@ -1559,6 +1606,7 @@ async fn approved_snapshot_rechecks_binary_floor_before_exec() {
         env: BTreeMap::new(),
         secret_keys: BTreeMap::new(),
         session_fingerprint: None,
+        secret_file_keys: BTreeMap::new(),
         verb_name: None,
         verb_params: BTreeMap::new(),
         catalog_version: None,
@@ -1591,6 +1639,7 @@ async fn approved_snapshot_rejects_dangerous_request_env_before_exec() {
         )]),
         secret_keys: BTreeMap::new(),
         session_fingerprint: None,
+        secret_file_keys: BTreeMap::new(),
         verb_name: None,
         verb_params: BTreeMap::new(),
         catalog_version: None,
@@ -1625,6 +1674,7 @@ async fn approved_snapshot_executes_in_snapshotted_cwd() {
         env: BTreeMap::new(),
         secret_keys: BTreeMap::new(),
         session_fingerprint: None,
+        secret_file_keys: BTreeMap::new(),
         verb_name: None,
         verb_params: BTreeMap::new(),
         catalog_version: None,
@@ -1660,6 +1710,7 @@ async fn approved_snapshot_rejects_missing_snapshotted_cwd_before_exec() {
         env: BTreeMap::new(),
         secret_keys: BTreeMap::new(),
         session_fingerprint: None,
+        secret_file_keys: BTreeMap::new(),
         verb_name: None,
         verb_params: BTreeMap::new(),
         catalog_version: None,
@@ -1703,6 +1754,7 @@ async fn approved_snapshot_rejects_retargeted_snapshotted_cwd_before_exec() {
         env: BTreeMap::new(),
         secret_keys: BTreeMap::new(),
         session_fingerprint: None,
+        secret_file_keys: BTreeMap::new(),
         verb_name: None,
         verb_params: BTreeMap::new(),
         catalog_version: None,
@@ -1743,6 +1795,7 @@ async fn provisional_revert_executes_in_snapshotted_cwd() {
         args: Vec::new(),
         cwd: Some(temp.path().to_path_buf()),
         secret_keys: BTreeMap::new(),
+        secret_file_keys: BTreeMap::new(),
         revert_binary: "sh".to_string(),
         revert_args: vec![
             "-c".to_string(),
