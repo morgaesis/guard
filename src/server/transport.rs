@@ -779,8 +779,14 @@ impl Server {
         Self::chmod_path(socket_path, 0o600).await?;
 
         if let Some(group) = socket_group {
-            Self::chown_to_group(socket_path, group).await?;
-            Self::chmod_path(socket_path, 0o660).await?;
+            if let Err(error) = Self::chown_to_group(socket_path, group).await {
+                let _ = Self::chmod_path(socket_path, 0o600).await;
+                return Err(error);
+            }
+            if let Err(error) = Self::chmod_path(socket_path, 0o660).await {
+                let _ = Self::chmod_path(socket_path, 0o600).await;
+                return Err(error);
+            }
             if let Some(parent) = socket_path.parent() {
                 Self::chmod_path(parent, 0o755).await?;
             }
