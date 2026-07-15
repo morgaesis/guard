@@ -436,7 +436,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
 
     async fn hold_request(
         &self,
-        label: &str,
+        api_snapshot: &guard::proxy::ApiHoldSnapshot,
         reason: &str,
         session_context: Option<&guard::proxy::ApiSessionContext>,
     ) -> guard::proxy::HoldDecision {
@@ -451,9 +451,35 @@ impl guard::proxy::GateSink for DaemonGateSink {
         // the operation label. Approval releases the parked request; nothing is
         // ever spawned from this row (see the sentinel branch in
         // `handle_approve`).
+        let selector_facts = api_snapshot
+            .authority_selectors
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join(",");
         let snapshot = ApprovalSnapshot {
             binary: API_PROXY_SENTINEL_BINARY.to_string(),
-            args: vec![label.to_string()],
+            args: vec![
+                api_snapshot.label.clone(),
+                format!("body_sha256={}", api_snapshot.body_sha256),
+                format!("body_shape={}", api_snapshot.redacted_body_shape),
+                format!(
+                    "query={}",
+                    if api_snapshot.redacted_query.is_empty() {
+                        "(none)"
+                    } else {
+                        &api_snapshot.redacted_query
+                    }
+                ),
+                format!(
+                    "authority_selectors={}",
+                    if selector_facts.is_empty() {
+                        "(none)"
+                    } else {
+                        &selector_facts
+                    }
+                ),
+            ],
             cwd: None,
             env: std::collections::BTreeMap::new(),
             secret_keys: std::collections::BTreeMap::new(),
@@ -492,12 +518,13 @@ impl guard::proxy::GateSink for DaemonGateSink {
             .enqueue(approval.clone());
         persist_approval(&self.config, &approval).await;
         tracing::info!(target: "guard::audit",
-            "[AUDIT] HELD handle={} caller=(api-proxy) session={} api=\"{}\" ttl={}s",
+            "[AUDIT] HELD handle={} caller=(api-proxy) session={} api=\"{}\" body_sha256={} ttl={}s",
             handle,
             session_context
                 .map(|context| context.fingerprint.as_str())
                 .unwrap_or("none"),
-            label,
+            api_snapshot.label,
+            api_snapshot.body_sha256,
             self.config.approval_ttl_secs
         );
         self.config.emit_event(NotifyEvent {

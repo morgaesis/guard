@@ -52,7 +52,7 @@ pub struct ApiPromotionFile {
 }
 
 fn default_version() -> u32 {
-    2
+    3
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +61,8 @@ pub struct ApiShapeBucket {
     pub endpoint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_revision: Option<String>,
     pub protocol: String,
     pub verb: String,
     pub group: String,
@@ -71,6 +73,8 @@ pub struct ApiShapeBucket {
     pub subresource: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub authority_selectors: BTreeMap<String, String>,
     #[serde(default)]
     pub body_shape: String,
     pub approvals: u32,
@@ -121,12 +125,14 @@ pub struct ApiCoverageEntry {
     pub protocol: String,
     pub endpoint: String,
     pub session_fingerprint: Option<String>,
+    pub session_revision: Option<String>,
     pub verb: String,
     pub group: String,
     pub version: String,
     pub resource: String,
     pub subresource: Option<String>,
     pub namespace: Option<String>,
+    pub authority_selectors: BTreeMap<String, String>,
     pub body_shape: String,
     pub decision: String,
     pub provenance: ApiCoverageProvenance,
@@ -141,6 +147,7 @@ pub struct ApiCoverageEntry {
 pub struct ApiShape {
     pub endpoint: String,
     pub session_fingerprint: Option<String>,
+    pub session_revision: Option<String>,
     pub protocol: String,
     pub verb: String,
     pub group: String,
@@ -148,6 +155,7 @@ pub struct ApiShape {
     pub resource: String,
     pub subresource: Option<String>,
     pub namespace: Option<String>,
+    pub authority_selectors: BTreeMap<String, String>,
     /// The value-free body key skeleton. Included so promotion is scoped to the
     /// exact request structure the evaluator approved; a request that adds or
     /// renames a field lands in a different bucket and is judged fresh.
@@ -159,6 +167,7 @@ impl ApiShape {
         Self {
             endpoint: summary.endpoint.clone(),
             session_fingerprint: summary.session_fingerprint.clone(),
+            session_revision: summary.session_revision.clone(),
             protocol: summary.protocol.clone(),
             verb: summary.verb.clone(),
             group: summary.group.clone(),
@@ -166,6 +175,7 @@ impl ApiShape {
             resource: summary.resource.clone(),
             subresource: summary.subresource.clone(),
             namespace: summary.namespace.clone(),
+            authority_selectors: summary.authority_selectors.clone(),
             body_shape: summary.redacted_body_shape.clone(),
         }
     }
@@ -176,9 +186,16 @@ impl ApiShape {
         fn esc(s: &str) -> String {
             s.replace('\\', "\\\\").replace('|', "\\|")
         }
+        let authority_selectors = self
+            .authority_selectors
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join(",");
         [
             self.endpoint.as_str(),
             self.session_fingerprint.as_deref().unwrap_or(""),
+            self.session_revision.as_deref().unwrap_or(""),
             self.protocol.as_str(),
             self.verb.as_str(),
             self.group.as_str(),
@@ -186,6 +203,7 @@ impl ApiShape {
             self.resource.as_str(),
             self.subresource.as_deref().unwrap_or(""),
             self.namespace.as_deref().unwrap_or(""),
+            authority_selectors.as_str(),
             self.body_shape.as_str(),
         ]
         .iter()
@@ -196,7 +214,7 @@ impl ApiShape {
 
     pub fn audit_label(&self) -> String {
         format!(
-            "protocol={} verb={} group={} version={} resource={} subresource={} namespace={}",
+            "protocol={} verb={} group={} version={} resource={} subresource={} namespace={} selectors={}",
             self.protocol,
             self.verb,
             if self.group.is_empty() {
@@ -207,7 +225,16 @@ impl ApiShape {
             self.version,
             self.resource,
             self.subresource.as_deref().unwrap_or("(none)"),
-            self.namespace.as_deref().unwrap_or("(cluster)")
+            self.namespace.as_deref().unwrap_or("(cluster)"),
+            if self.authority_selectors.is_empty() {
+                "(none)".to_string()
+            } else {
+                self.authority_selectors
+                    .iter()
+                    .map(|(key, value)| format!("{key}={value}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }
         )
     }
 }
@@ -296,6 +323,7 @@ impl ApiPromotionStore {
             let shape = ApiShape {
                 endpoint: bucket.endpoint.clone(),
                 session_fingerprint: bucket.session_fingerprint.clone(),
+                session_revision: bucket.session_revision.clone(),
                 protocol: bucket.protocol.clone(),
                 verb: bucket.verb.clone(),
                 group: bucket.group.clone(),
@@ -303,6 +331,7 @@ impl ApiPromotionStore {
                 resource: bucket.resource.clone(),
                 subresource: bucket.subresource.clone(),
                 namespace: bucket.namespace.clone(),
+                authority_selectors: bucket.authority_selectors.clone(),
                 body_shape: bucket.body_shape.clone(),
             };
             let key = shape.key();
@@ -356,12 +385,14 @@ impl ApiPromotionStore {
                     protocol: bucket.protocol.clone(),
                     endpoint: bucket.endpoint.clone(),
                     session_fingerprint: bucket.session_fingerprint.clone(),
+                    session_revision: bucket.session_revision.clone(),
                     verb: bucket.verb.clone(),
                     group: bucket.group.clone(),
                     version: bucket.version.clone(),
                     resource: bucket.resource.clone(),
                     subresource: bucket.subresource.clone(),
                     namespace: bucket.namespace.clone(),
+                    authority_selectors: bucket.authority_selectors.clone(),
                     body_shape: bucket.body_shape.clone(),
                     decision: decision.to_string(),
                     provenance: bucket.provenance,
@@ -603,12 +634,14 @@ impl ApiPromotionStore {
                 protocol: shape.protocol.clone(),
                 endpoint: shape.endpoint.clone(),
                 session_fingerprint: shape.session_fingerprint.clone(),
+                session_revision: shape.session_revision.clone(),
                 verb: shape.verb.clone(),
                 group: shape.group.clone(),
                 version: shape.version.clone(),
                 resource: shape.resource.clone(),
                 subresource: shape.subresource.clone(),
                 namespace: shape.namespace.clone(),
+                authority_selectors: shape.authority_selectors.clone(),
                 body_shape: shape.body_shape.clone(),
                 approvals: 0,
                 denials: 0,
@@ -711,11 +744,13 @@ mod tests {
             namespace: Some("dev".to_string()),
             name: Some(name.to_string()),
             dry_run: false,
+            authority_selectors: BTreeMap::new(),
             redacted_body_shape: "{\"spec\":{\"replicas\":<number>}}".to_string(),
             revert_constructible: RevertConstructible::RestorePriorState,
             rarity: false,
             endpoint: "default".to_string(),
             session_fingerprint: None,
+            session_revision: None,
             session_intent: None,
             credential_ref: "upstream".to_string(),
         }
@@ -839,6 +874,53 @@ mod tests {
     }
 
     #[test]
+    fn full_session_revision_partitions_coverage_and_unchanged_revision_hits() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store =
+            ApiPromotionStore::load(config(temp.path().join("api.yaml"), 2, 2)).unwrap();
+        let mut first = summary("api");
+        first.session_fingerprint = Some("session".to_string());
+        first.session_revision = Some("revision-one".to_string());
+        for _ in 0..2 {
+            store
+                .record_allow(
+                    &first,
+                    Some(1),
+                    Some(Reversibility::Reversible),
+                    "ok",
+                    "regime-one",
+                )
+                .unwrap();
+        }
+        assert!(store.learned_allow(&first, "regime-one").is_some());
+        assert!(store.learned_allow(&first.clone(), "regime-one").is_some());
+
+        let mut edited = first.clone();
+        edited.session_revision = Some("revision-two".to_string());
+        assert!(store.learned_allow(&edited, "regime-one").is_none());
+        assert_ne!(
+            ApiShape::from_summary(&first).key(),
+            ApiShape::from_summary(&edited).key()
+        );
+    }
+
+    #[test]
+    fn authority_selectors_partition_typed_coverage() {
+        let mut first = summary("api");
+        first
+            .authority_selectors
+            .insert("teamId".to_string(), "team-a".to_string());
+        let mut second = first.clone();
+        second
+            .authority_selectors
+            .insert("teamId".to_string(), "team-b".to_string());
+        assert_ne!(
+            ApiShape::from_summary(&first).key(),
+            ApiShape::from_summary(&second).key()
+        );
+    }
+
+    #[test]
     fn risk_ceiling_blocks_allow_promotion_evidence() {
         let temp = tempfile::tempdir().unwrap();
         let mut store =
@@ -892,6 +974,7 @@ mod tests {
                 ApiShapeBucket {
                     endpoint: String::new(),
                     session_fingerprint: None,
+                    session_revision: None,
                     protocol: format!("p{i}"),
                     verb: "get".to_string(),
                     group: String::new(),
@@ -899,6 +982,7 @@ mod tests {
                     resource: "pods".to_string(),
                     subresource: None,
                     namespace: Some(format!("ns{i}")),
+                    authority_selectors: BTreeMap::new(),
                     body_shape: "{}".to_string(),
                     approvals: 1,
                     denials: 0,

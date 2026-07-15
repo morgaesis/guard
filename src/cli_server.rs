@@ -1348,6 +1348,13 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 }
                 let proxy = Arc::new(proxy);
                 let mut api_judge_attached = false;
+                if let Some(coverage) = api_promotion_store.clone() {
+                    proxy.attach_judge(server::DaemonApiJudge::build_coverage_only(
+                        &api_judge_llm,
+                        policy_intent.as_deref(),
+                        coverage,
+                    ));
+                }
                 if api_judge_llm.enabled
                     && api_judge_llm
                         .api_key
@@ -1739,6 +1746,13 @@ fn build_named_api_proxy(
     }
     let proxy = Arc::new(proxy);
     let mut judge_attached = false;
+    if let Some(store) = coverage.clone() {
+        proxy.attach_judge(server::DaemonApiJudge::build_coverage_only(
+            llm,
+            policy_intent.as_deref(),
+            store,
+        ));
+    }
     if llm.enabled && llm.api_key.as_ref().is_some_and(|key| !key.is_empty()) {
         let llm = llm.clone();
         let builder = Arc::new(move |intent: Option<String>| {
