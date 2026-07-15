@@ -391,6 +391,12 @@ verbs:
         response.verb_matches[0].action,
         guard::gating::verb::CoverageAction::Evaluate
     );
+    let trace = response.decision_trace.as_ref().expect("decision trace");
+    assert_eq!(trace.version, guard::gating::DecisionTrace::VERSION);
+    assert_eq!(trace.decision_source, response.decision_source);
+    assert_eq!(trace.verb_matches.len(), 1);
+    assert_eq!(trace.verb_matches[0].action, "evaluate");
+    assert!(!trace.failed_dimensions.is_empty());
     let admission = cfg.command_admission.snapshot();
     assert_eq!(admission.handler_admitted, 1);
     assert_eq!(admission.evaluator_admitted, 1);
@@ -429,6 +435,12 @@ verbs:
         .into_response();
     assert!(response.allowed, "{response:?}");
     assert_eq!(response.exit_code, Some(0));
+    let trace = response.decision_trace.as_ref().expect("decision trace");
+    assert_eq!(trace.version, guard::gating::DecisionTrace::VERSION);
+    assert_eq!(trace.decision_source, response.decision_source);
+    assert_eq!(trace.verb_matches.len(), 1);
+    assert_eq!(trace.verb_matches[0].action, "preauthorized");
+    assert!(trace.failed_dimensions.is_empty());
     let admission = cfg.command_admission.snapshot();
     assert_eq!(admission.handler_admitted, 1);
     assert_eq!(admission.evaluator_attempted, 0);

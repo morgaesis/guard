@@ -262,6 +262,7 @@ mod api_session_event_tests {
             secret_entitlements: None,
             api_revert: None,
             reason: "test".to_string(),
+            decision_trace: None,
             created_unix: 1,
             deadline_unix: u64::MAX,
             forward_done: true,

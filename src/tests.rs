@@ -795,6 +795,79 @@ fn canonical_grant_commands_bypass_legacy_preprocessing() {
 }
 
 #[test]
+fn saved_grant_authority_commands_parse_as_one_canonical_tree() {
+    assert!(matches!(
+        MainArgs::try_parse_from([
+            "guard",
+            "grant",
+            "save",
+            "bounded",
+            "--verb",
+            "inspect",
+            "--override-marker",
+            "operator:apply",
+            "--secret",
+            "service/readonly/*",
+            "--ceiling-verb",
+            "restart-one",
+            "--ceiling-secret",
+            "service/readonly/*",
+            "--ceiling-ttl",
+            "300",
+            "--ceiling-mode",
+            "policy-only",
+            "--allow-prompt-append",
+            "--prompt",
+            "bounded work",
+        ]),
+        Ok(MainArgs::Grant(GrantCommands::Save { .. }))
+    ));
+    assert!(matches!(
+        MainArgs::try_parse_from([
+            "guard",
+            "grant",
+            "edit",
+            "bounded",
+            "--clear-override-markers",
+            "--clear-ceiling-verbs",
+            "--allow-prompt-append=false",
+            "--auto-approve=false",
+        ]),
+        Ok(MainArgs::Grant(GrantCommands::Edit { .. }))
+    ));
+    assert!(matches!(
+        MainArgs::try_parse_from([
+            "guard",
+            "grant",
+            "regenerate",
+            "bounded",
+            "--apply",
+            "rg1-proposal",
+        ]),
+        Ok(MainArgs::Grant(GrantCommands::Regenerate { .. }))
+    ));
+    assert!(matches!(
+        MainArgs::try_parse_from([
+            "guard",
+            "grant",
+            "request",
+            "submit",
+            "--session",
+            "session-token",
+            "--justification",
+            "pager alert",
+            "--prompt-append",
+            "evaluate one service",
+            "--override-marker",
+            "operator:apply",
+        ]),
+        Ok(MainArgs::Grant(GrantCommands::Request(
+            GrantRequestCommands::Submit { .. }
+        )))
+    ));
+}
+
+#[test]
 fn guard_mode_env_resolution() {
     use guard::policy::PolicyMode;
 

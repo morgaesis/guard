@@ -790,6 +790,43 @@ mod tests {
     }
 
     #[test]
+    fn ceiling_round_trip_and_request_fields_preserve_authority_boundaries() {
+        let catalog = SavedGrantCatalog::from_yaml(
+            "grants:\n  - name: bounded\n    activated_verbs: [inspect]\n    override_markers: [operator:apply]\n    secret_names: [service/readonly/*]\n    ttl_secs: 120\n    prompt_append: baseline context\n    evaluation_mode: evaluator\n    auto_approve_requests: true\n    ceiling:\n      verbs: [inspect, restart-one]\n      secret_names: [service/readonly/*]\n      max_ttl_secs: 300\n      allow_prompt_append: true\n      evaluation_modes: [evaluator, policy_only]\n",
+        )
+        .unwrap();
+        let saved = catalog.get("bounded").unwrap();
+        let encoded = serde_json::to_string(saved).unwrap();
+        let decoded: SavedGrant = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.ceiling, saved.ceiling);
+        assert_eq!(decoded.override_markers, vec!["operator:apply"]);
+
+        let delta = GrantRequestDelta {
+            activated_verbs: vec!["restart-one".to_string()],
+            prompt_append: Some("evaluate only the named service".to_string()),
+            ..Default::default()
+        };
+        assert!(saved.contains_delta(&delta));
+        let request = GrantRequest::new(
+            "session-token".to_string(),
+            Some("bounded".to_string()),
+            delta.clone(),
+            "pager alert requires one bounded restart".to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            request.justification,
+            "pager alert requires one bounded restart"
+        );
+        assert_eq!(request.delta.prompt_append, delta.prompt_append);
+        assert!(!request.justification.contains("evaluate only"));
+        assert!(!saved.contains_delta(&GrantRequestDelta {
+            override_markers: vec!["operator:apply".to_string()],
+            ..Default::default()
+        }));
+    }
+
+    #[test]
     fn durable_rows_overlay_file_catalog_without_dropping_other_grants() {
         let mut catalog = SavedGrantCatalog::from_yaml(
             "grants:\n  - name: file-only\n    prompt_append: file\n  - name: shared\n    prompt_append: file revision\n",

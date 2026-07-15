@@ -1715,7 +1715,14 @@ pub(super) async fn handle_admin_request(
                 .filter(|cell| cell.sticky)
                 .cloned()
                 .collect();
-            let verb = stamp_generated_verb(synthesized, &name, &prompt, &regime, sticky);
+            // Applying a proposal installs the exact candidate the operator
+            // previewed. Re-stamping it would change its name, provenance, and
+            // generated timestamp after approval.
+            let verb = if is_apply {
+                synthesized
+            } else {
+                stamp_generated_verb(synthesized, &name, &prompt, &regime, sticky)
+            };
             let mut updated = existing.clone();
             updated.prompt_append = Some(prompt.clone());
             updated.generated_verbs = vec![verb.clone()];

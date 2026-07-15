@@ -1646,6 +1646,90 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn v4_to_v5_migration_is_private_and_adds_decision_traces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("migration-state");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let path = parent.join("state.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA user_version = 4;").unwrap();
+        drop(conn);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        let _store = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let conn = Connection::open(&path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        let trace_columns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('session_interactions') WHERE name = 'decision_trace_json'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(trace_columns, 1);
+        assert_eq!(mode(&parent), 0o700);
+        assert_eq!(mode(&path), 0o600);
+    }
+
+    #[tokio::test]
+    async fn provisional_decision_trace_survives_restart_recovery() {
+        use guard::gating::provisional::{ProvisionalRegistry, ProvisionalStatus};
+        use std::collections::BTreeMap;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(tmp.path().join("state.db"), 3600)
+            .await
+            .unwrap();
+        let trace = guard::gating::DecisionTrace::source("static_policy");
+        store
+            .save_provisional(Provisional {
+                handle: "restart-trace".to_string(),
+                principal: Some(guard::principal::PrincipalKey::from_uid(1001)),
+                binary: "true".to_string(),
+                args: Vec::new(),
+                cwd: None,
+                secret_keys: BTreeMap::new(),
+                secret_file_keys: BTreeMap::new(),
+                revert_binary: "true".to_string(),
+                revert_args: Vec::new(),
+                confirm_check_binary: None,
+                confirm_check_args: Vec::new(),
+                control_path: Some("local".to_string()),
+                session_fingerprint: Some("sha256:test".to_string()),
+                session_revision: Some("revision".to_string()),
+                secret_entitlements: Some(Vec::new()),
+                api_revert: None,
+                reason: "bounded change".to_string(),
+                decision_trace: Some(trace.clone()),
+                created_unix: 1,
+                deadline_unix: u64::MAX,
+                forward_done: true,
+                status: ProvisionalStatus::Armed,
+                revert_exit: None,
+                revert_detail: None,
+            })
+            .await
+            .unwrap();
+
+        let rows = SessionStore::open(tmp.path().join("state.db"), 3600)
+            .await
+            .unwrap()
+            .load_provisionals()
+            .await
+            .unwrap();
+        let (registry, moved) = ProvisionalRegistry::from_rows(rows);
+        assert!(moved.is_empty());
+        let restored = registry.get("restart-trace").unwrap();
+        assert_eq!(restored.status, ProvisionalStatus::Armed);
+        assert_eq!(restored.decision_trace.as_ref(), Some(&trace));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn state_store_rejects_symlinks_and_non_regular_database_paths() {
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp.path().join("target.db");
