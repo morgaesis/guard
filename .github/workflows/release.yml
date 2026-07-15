@@ -102,13 +102,23 @@ jobs:
         if: "!matrix.use_cross"
         env:
           BUILD_TARGET: ${{ matrix.target }}
-        run: cargo build --release --target "$BUILD_TARGET"
+        run: |
+          case "$BUILD_TARGET" in
+            x86_64-unknown-linux-gnu|x86_64-pc-windows-msvc) ;;
+            *) echo "unexpected native build target: $BUILD_TARGET"; exit 1 ;;
+          esac
+          cargo build --release --target "$BUILD_TARGET"
 
       - name: Build binary (Cross)
         if: matrix.use_cross
         env:
           BUILD_TARGET: ${{ matrix.target }}
-        run: cross build --release --target "$BUILD_TARGET"
+        run: |
+          test "$BUILD_TARGET" = "aarch64-unknown-linux-gnu" || {
+            echo "unexpected cross build target: $BUILD_TARGET"
+            exit 1
+          }
+          cross build --release --target "$BUILD_TARGET"
 
       - name: Strip binary
         if: endsWith(matrix.target, '-linux-gnu')
