@@ -1,21 +1,21 @@
 # Example configurations
 
-Reference configs for guard. None of these are loaded automatically. Guard's
-default behaviour is LLM-only evaluation with a single model
-(`openai/gpt-5.4-mini` via OpenRouter, function-calling, two retries). That
-default is production-ready for most deployments. Everything in this directory
-is an opt-in override for a specific deployment constraint.
+Reference configurations for Guard. None are loaded automatically. The default
+is evaluator-only command gating with `openai/gpt-5.4-mini` through OpenRouter,
+function calling, and two retries. The files in this directory opt into a
+specific deterministic policy, verb catalog, saved grant, API policy, or model
+fallback configuration.
 
 Load a policy with `guard server start --policy examples/<file>.yaml`, or place
 it at `~/.config/guard/policy.yaml` for automatic discovery. Load an env file
 with your service manager or `set -a; source examples/<file>.env; set +a`.
 
-There are two, NOT interchangeable, ways to skip an LLM round-trip. A static
+There are two distinct ways to skip an LLM round-trip. A static
 **deny** pattern fast-rejects before the LLM is called. A **verb** is the only
-way to get a fast-path **allow**: glob patterns over a flat command string
+way to get a fast-path **allow**. Command patterns over a flat string
 cannot parse shell quoting or operators (`ls; rm -rf /` matches `ls*`), so an
 `allow` pattern in a policy file is parsed for backward compatibility and the
-`--no-llm` fallback mode, but it does not skip the LLM evaluator while the LLM
+`--no-evaluator` fallback mode, but it does not skip the LLM evaluator while the LLM
 is enabled. A verb's parameters are structurally validated instead (anchored
 regex per parameter, single-argv rendering, no shell), which is what makes
 `trusted: true` safe to wire up as a real bypass.
@@ -31,7 +31,7 @@ regex per parameter, single-argv rendering, no shell), which is what makes
 - **[verbs-readonly.yaml](verbs-readonly.yaml)** -- Read-only verb catalog for
   inspection commands. Lets deterministic read-only operations (`whoami`,
   `hostname`, `ls`, `kubectl get`, ...) skip the LLM entirely, via
-  structurally-validated typed verbs rather than glob patterns. Appropriate
+  structurally validated typed verbs rather than command patterns. Appropriate
   for latency-critical observability workflows where the set of safe commands
   is small and enumerable. Not the default; load with `--verbs`.
 
@@ -70,7 +70,7 @@ regex per parameter, single-argv rendering, no shell), which is what makes
 - **[fallback-models.env](fallback-models.env)** -- Multi-model fallback chain.
   Adds retry-then-failover across multiple LLM providers via
   `GUARD_LLM_MODELS`. Only needed when your uptime requirements exceed a
-  single provider's SLA, or when you need to defend against provider-specific
+  single provider, or when you need to defend against provider-specific
   outages. Default is a single model with retries.
 
 ## When to stay on defaults
@@ -78,6 +78,6 @@ regex per parameter, single-argv rendering, no shell), which is what makes
 If you are deploying guard for a single agent, a developer workstation, or any
 workflow where a 0.5-2s LLM evaluation per command is acceptable, stay on the
 defaults. Static deny policies and verb catalogs add maintenance overhead, and
-glob-based deny patterns have well-known evasion paths (see `deny-policy.yaml`
+flat-string deny patterns have well-known evasion paths (see `deny-policy.yaml`
 header for details). Fallback chains add provider management complexity.
 Adopt either only when a concrete constraint forces the tradeoff.
