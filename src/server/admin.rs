@@ -889,6 +889,72 @@ pub(super) async fn handle_admin_request(
                 requests,
             }
         }
+        AdminRequest::KubeconfigIssue {
+            endpoint,
+            session_token,
+        } => {
+            let Some(principal) = caller.principal().filter(|_| caller.is_local_peer()) else {
+                return AdminResponse::Error {
+                    message: "brokered kubeconfig issuance requires an authenticated local caller"
+                        .to_string(),
+                };
+            };
+            let expires_at = {
+                let sessions = config.sessions.read().await;
+                if let Some(reason) =
+                    sessions.suspension_reason(&session_token, &config.behavior_limits)
+                {
+                    return AdminResponse::Error { message: reason };
+                }
+                match sessions.expires_at_for(&session_token) {
+                    Some(Some(expires_at)) if expires_at > now_unix() => expires_at,
+                    Some(None) => return AdminResponse::Error {
+                        message:
+                            "brokered kubeconfig issuance requires a session with a finite expiry"
+                                .to_string(),
+                    },
+                    _ => {
+                        return AdminResponse::Error {
+                            message: "unknown, expired, or revoked session".to_string(),
+                        }
+                    }
+                }
+            };
+            let proxy = config
+                .protocol_registry
+                .read()
+                .await
+                .get(&endpoint)
+                .cloned();
+            let Some(proxy) = proxy else {
+                return AdminResponse::Error {
+                    message: format!("unknown API endpoint: '{endpoint}'"),
+                };
+            };
+            if proxy.protocol_name() != "kubernetes" {
+                return AdminResponse::Error {
+                    message: format!("API endpoint '{endpoint}' is not Kubernetes"),
+                };
+            }
+            let yaml = proxy.brokered_kubeconfig_with_session(&session_token);
+            if let Err(error) =
+                guard::proxy::validate_brokered_kubeconfig_with_session(&yaml, &session_token)
+            {
+                tracing::error!("failed to validate brokered kubeconfig: {error}");
+                return AdminResponse::Error {
+                    message: "brokered kubeconfig generation failed closed".to_string(),
+                };
+            }
+            tracing::info!(target: "guard::audit",
+                "[AUDIT] KUBECONFIG_ISSUED caller={} principal={} endpoint={} session_fingerprint={} expires_at={}",
+                caller,
+                principal,
+                endpoint,
+                audit_session_fingerprint(Some(&session_token)),
+                expires_at
+            );
+            AdminResponse::KubeconfigIssued { yaml, expires_at }
+        }
         AdminRequest::SecretSet { key, value } => {
             if !is_valid_secret_key(&key) {
                 return AdminResponse::Error {
@@ -1110,6 +1176,7 @@ pub(super) async fn handle_admin_request(
                     pending_approvals: config.approvals.read().await.outstanding(),
                     verb_catalog_hash,
                     verb_catalog_changed_unix,
+                    command_admission: config.command_admission.snapshot(),
                 },
             }
         }

@@ -36,8 +36,9 @@ pub enum ProvisionalStatus {
     /// The revert was attempted but failed; the mutation may still be in place.
     /// Kept queryable so an operator notices.
     RevertFailed,
-    /// The daemon restarted while this was armed/reverting. To avoid running a
-    /// revert unattended at boot, it waits for an explicit operator decision.
+    /// Recovery could not prove that the persisted rollback authority remains
+    /// exact, or the daemon stopped while a rollback was in flight. It waits
+    /// for an explicit operator decision.
     NeedsOperatorDecision,
 }
 
@@ -182,18 +183,17 @@ impl ProvisionalRegistry {
         Self::default()
     }
 
-    /// Rebuild from persisted rows (daemon startup), applying recovery: any row
-    /// that was `Armed`/`Reverting` (or armed-but-not-forward-done) is moved to
-    /// `NeedsOperatorDecision` so no revert fires unattended at boot. Returns the
-    /// handles that were moved, for an operator-facing audit summary.
+    /// Rebuild persisted rows at daemon startup. A completed forward command
+    /// remains armed across restart, including when its deadline is already
+    /// due. The daemon applies a startup grace before the sweeper can claim it.
+    /// An interrupted rollback or a row persisted before the forward outcome
+    /// became known is ambiguous and therefore needs an operator decision.
     pub fn from_rows(rows: Vec<Provisional>) -> (Self, Vec<String>) {
         let mut items = HashMap::new();
         let mut moved = Vec::new();
         for mut row in rows {
-            let needs_recovery = matches!(
-                row.status,
-                ProvisionalStatus::Armed | ProvisionalStatus::Reverting
-            );
+            let needs_recovery = row.status == ProvisionalStatus::Reverting
+                || (row.status == ProvisionalStatus::Armed && !row.forward_done);
             if needs_recovery {
                 row.status = ProvisionalStatus::NeedsOperatorDecision;
                 moved.push(row.handle.clone());
@@ -463,18 +463,28 @@ mod tests {
     }
 
     #[test]
-    fn startup_recovery_never_auto_fires() {
-        let p = armed("h1", Some(PrincipalKey::from_uid(1001)), 150); // deadline already passed at "now"
+    fn startup_recovery_rearms_completed_forward() {
+        let p = armed("h1", Some(PrincipalKey::from_uid(1001)), 150);
         let (mut reg, moved) = ProvisionalRegistry::from_rows(vec![p]);
-        assert_eq!(moved, vec!["h1".to_string()]);
-        assert_eq!(
-            reg.get("h1").unwrap().status,
-            ProvisionalStatus::NeedsOperatorDecision
-        );
-        // The sweeper must NOT pick up a needs-decision row even past deadline.
-        assert!(reg.take_due(9999).is_empty());
-        // It can still be confirmed or reverted by the operator.
-        assert!(reg.confirm("h1").is_ok());
+        assert!(moved.is_empty());
+        assert_eq!(reg.get("h1").unwrap().status, ProvisionalStatus::Armed);
+        assert_eq!(reg.take_due(9999)[0].handle, "h1");
+    }
+
+    #[test]
+    fn startup_recovery_escalates_ambiguous_rows() {
+        let mut before_forward = armed("not-forwarded", Some(PrincipalKey::from_uid(1001)), 150);
+        before_forward.forward_done = false;
+        let mut interrupted = armed("interrupted", Some(PrincipalKey::from_uid(1001)), 150);
+        interrupted.status = ProvisionalStatus::Reverting;
+        let (reg, moved) = ProvisionalRegistry::from_rows(vec![before_forward, interrupted]);
+        assert_eq!(moved, vec!["interrupted", "not-forwarded"]);
+        for handle in moved {
+            assert_eq!(
+                reg.get(&handle).unwrap().status,
+                ProvisionalStatus::NeedsOperatorDecision
+            );
+        }
     }
 
     #[test]

@@ -20,6 +20,27 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+      - name: Verify signed annotated tag and Cargo version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "guard") | .version')
+          test "$RELEASE_TAG" = "v${version}" || {
+            echo "release tag does not match Cargo package version v${version}"
+            exit 1
+          }
+          tag_ref=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}")
+          test "$(jq -r '.object.type' <<< "$tag_ref")" = tag || {
+            echo "release ref is not an annotated tag"
+            exit 1
+          }
+          tag_sha=$(jq -r '.object.sha' <<< "$tag_ref")
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_sha}" --jq '.verification.verified')" = true || {
+            echo "release tag signature is not verified"
+            exit 1
+          }
       - name: Rust Cache
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
       - name: Run tests
@@ -69,7 +90,7 @@ jobs:
 
       - name: Install Cross
         if: matrix.use_cross
-        run: cargo install cross --git https://github.com/cross-rs/cross.git
+        run: cargo install cross --version 0.2.5 --locked
 
       - name: Build binary (Native)
         if: "!matrix.use_cross"
@@ -104,10 +125,20 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
       - name: Download all artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
           path: artifacts
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          find artifacts -type f -name '*.tar.gz' -print | LC_ALL=C sort | while IFS= read -r archive; do
+            checksum=$(sha256sum "$archive" | cut -d ' ' -f 1)
+            printf '%s  %s\n' "$checksum" "$(basename "$archive")"
+          done > SHA256SUMS
+          test -s SHA256SUMS
 
       - name: Create Release
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b  # v3.0.1
@@ -115,3 +146,4 @@ jobs:
           generate_release_notes: true
           files: |
             artifacts/**/*.tar.gz
+            SHA256SUMS

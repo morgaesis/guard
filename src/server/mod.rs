@@ -90,6 +90,7 @@ mod wire;
 // (`Server`, `resolve_daemon_principal`) and the wire types shared with the
 // CLI, the MCP server, and `daemon_client`. Everything else stays internal.
 pub(crate) use api_judge::{ApiJudgeSpend, ApiJudgeSpendConfig, DaemonApiJudge};
+pub(crate) use runtime::CommandAdmissionConfig;
 #[cfg(windows)]
 pub(crate) use transport::winplat;
 pub use transport::Server;
@@ -204,6 +205,8 @@ struct ServerConfig {
     /// Optional session-scoped circuit breakers derived from persisted
     /// interactions. Every threshold is disabled by default.
     pub behavior_limits: SessionBehaviorLimits,
+    /// Shared command-handler and evaluator admission control.
+    pub command_admission: runtime::CommandAdmission,
 }
 
 impl ServerConfig {
@@ -274,6 +277,9 @@ impl ServerConfig {
             notify_hook: None,
             process_tracker: runtime::ProcessTracker::default(),
             behavior_limits: SessionBehaviorLimits::default(),
+            command_admission: runtime::CommandAdmission::new(
+                runtime::CommandAdmissionConfig::default(),
+            ),
         }
     }
 

@@ -338,6 +338,85 @@ fn gate_client(socket_override: Option<String>) -> (daemon_client::Client, Endpo
     (client, source)
 }
 
+pub(crate) async fn handle_api(command: ApiCommands) -> Result<()> {
+    match command {
+        ApiCommands::Kubeconfig {
+            endpoint,
+            output,
+            socket,
+        } => {
+            let session_token = std::env::var("GUARD_SESSION")
+                .ok()
+                .filter(|token| guard::proxy::valid_guard_session_token(token))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "guard api kubeconfig requires a valid GUARD_SESSION environment variable"
+                    )
+                })?;
+            let (client, source) = gate_client(socket);
+            let response = client
+                .send_admin(server::AdminRequest::KubeconfigIssue {
+                    endpoint,
+                    session_token,
+                })
+                .await
+                .map_err(|error| describe_connect_failure(error, &client, source))?;
+            match response {
+                server::AdminResponse::KubeconfigIssued { yaml, .. } => {
+                    if let Some(path) = output {
+                        write_client_private_file(&path, yaml.as_bytes())?;
+                    } else {
+                        print!("{yaml}");
+                    }
+                    Ok(())
+                }
+                server::AdminResponse::Error { message } => Err(anyhow::anyhow!(message)),
+                _ => Err(anyhow::anyhow!("unexpected kubeconfig issuance response")),
+            }
+        }
+    }
+}
+
+fn write_client_private_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("output path has no file name: {}", path.display()))?;
+    let temporary = parent.join(format!(
+        ".{}.guard-{:016x}.tmp",
+        file_name.to_string_lossy(),
+        rand::random::<u64>()
+    ));
+    let result = (|| -> Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = options
+            .open(&temporary)
+            .with_context(|| format!("create private kubeconfig {}", temporary.display()))?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        #[cfg(not(unix))]
+        if path.exists() {
+            anyhow::bail!("refusing to replace existing kubeconfig {}", path.display());
+        }
+        std::fs::rename(&temporary, path)
+            .with_context(|| format!("install kubeconfig {}", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
 pub(crate) async fn handle_provisionals(socket: Option<String>, json: bool) -> Result<()> {
     let (client, source) = gate_client(socket);
     match client
@@ -1706,6 +1785,17 @@ pub(crate) async fn handle_status(socket: Option<String>, json: bool) -> Result<
                 "  queues         approvals={} provisionals={}",
                 status.pending_approvals, status.pending_provisionals
             );
+            println!(
+                "  command_load   handlers={}/{} rejected={} evaluators={}/{} rate_limited={} circuit_rejected={} errors={}",
+                status.command_admission.handler_admitted,
+                status.command_admission.handler_attempted,
+                status.command_admission.handler_rejected,
+                status.command_admission.evaluator_admitted,
+                status.command_admission.evaluator_attempted,
+                status.command_admission.evaluator_rate_limited,
+                status.command_admission.evaluator_circuit_rejections,
+                status.command_admission.evaluator_errors,
+            );
             println!("  sessions       {}", status.session_count);
             println!("  daemon_uid     {}", status.daemon_uid);
             println!("  exec_identity  {}", status.exec_identity);
@@ -2399,6 +2489,7 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
         | server::AdminResponse::SecretExists { .. }
         | server::AdminResponse::SecretList { .. }
         | server::AdminResponse::SecretListDetailed { .. }
+        | server::AdminResponse::KubeconfigIssued { .. }
         | server::AdminResponse::GateAction { .. }
         | server::AdminResponse::Provisionals { .. }
         | server::AdminResponse::Approvals { .. }
@@ -2706,5 +2797,26 @@ mod tests {
         let mut short = Some("short".to_string());
         truncate_prompt(&mut short);
         assert_eq!(short.as_deref(), Some("short"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn kubeconfig_output_is_private_and_replaced_without_following_symlinks() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("guard.kubeconfig");
+        write_client_private_file(&output, b"first").unwrap();
+        let first = std::fs::metadata(&output).unwrap();
+        assert_eq!(first.permissions().mode() & 0o777, 0o600);
+        assert_eq!(first.uid(), unsafe { libc::geteuid() });
+
+        let victim = temp.path().join("victim");
+        std::fs::write(&victim, "unchanged").unwrap();
+        std::fs::remove_file(&output).unwrap();
+        std::os::unix::fs::symlink(&victim, &output).unwrap();
+        write_client_private_file(&output, b"replacement").unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "unchanged");
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), "replacement");
     }
 }

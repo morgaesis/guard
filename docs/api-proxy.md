@@ -16,16 +16,24 @@ guard server start \
   --gate consequence \
   --kube-proxy 127.0.0.1:8443 \
   --kubeconfig /etc/guard/kubeconfig \
-  --api-policy /etc/guard/api-policy.yaml \
-  --brokered-kubeconfig-out /run/guard/brokered.kubeconfig
+  --api-policy /etc/guard/api-policy.yaml
 
-KUBECONFIG=/run/guard/brokered.kubeconfig kubectl get pods -n dev
+guard api kubeconfig --output "$HOME/.kube/guard-config"
+KUBECONFIG="$HOME/.kube/guard-config" kubectl get pods -n dev
 ```
 
 The input kubeconfig belongs to the daemon and may contain a bearer token or
 client certificate. Exec and auth-provider plugins are rejected. The brokered
 kubeconfig points only to Guard, trusts its local CA, and contains no upstream
 credential.
+
+`guard api kubeconfig` authenticates the local caller and embeds its live,
+finite-expiry `GUARD_SESSION` bearer. The caller process writes a mode 0600,
+caller-owned output file. Expired, revoked, or suspended sessions stop working
+at the proxy and cannot issue another config. Reissue the config after session
+or daemon TLS rotation. `--brokered-kubeconfig-out` remains an explicit
+operator/bootstrap compatibility path and does not replace caller-scoped
+issuance.
 
 ## Session attribution
 

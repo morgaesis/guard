@@ -5,6 +5,307 @@ use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use super::wire::CommandAdmissionStatus;
+
+const MAX_COMMAND_ADMISSION_SCOPES: usize = 4096;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CommandAdmissionConfig {
+    pub handler_concurrency: usize,
+    pub principal_handler_concurrency: usize,
+    pub evaluator_concurrency: usize,
+    pub principal_evaluator_concurrency: usize,
+    pub evaluator_rate_per_minute: u32,
+    pub evaluator_burst: u32,
+    pub evaluator_error_threshold: u32,
+    pub evaluator_circuit_cooldown: Duration,
+}
+
+impl Default for CommandAdmissionConfig {
+    fn default() -> Self {
+        Self {
+            handler_concurrency: 32,
+            principal_handler_concurrency: 8,
+            evaluator_concurrency: 4,
+            principal_evaluator_concurrency: 2,
+            evaluator_rate_per_minute: 60,
+            evaluator_burst: 10,
+            evaluator_error_threshold: 3,
+            evaluator_circuit_cooldown: Duration::from_secs(60),
+        }
+    }
+}
+
+struct CommandScopeState {
+    handler: Arc<tokio::sync::Semaphore>,
+    evaluator: Arc<tokio::sync::Semaphore>,
+    tokens: f64,
+    refilled_at: Instant,
+    touched_at: Instant,
+    consecutive_errors: u32,
+    circuit_open_until: Option<Instant>,
+}
+
+#[derive(Default)]
+struct CommandAdmissionCounters {
+    handler_attempted: AtomicU64,
+    handler_admitted: AtomicU64,
+    handler_rejected: AtomicU64,
+    evaluator_attempted: AtomicU64,
+    evaluator_admitted: AtomicU64,
+    evaluator_rate_limited: AtomicU64,
+    evaluator_concurrency_limited: AtomicU64,
+    evaluator_errors: AtomicU64,
+    evaluator_circuit_rejections: AtomicU64,
+}
+
+#[derive(Clone)]
+pub(super) struct CommandAdmission {
+    config: CommandAdmissionConfig,
+    handler: Arc<tokio::sync::Semaphore>,
+    evaluator: Arc<tokio::sync::Semaphore>,
+    scopes: Arc<Mutex<HashMap<String, CommandScopeState>>>,
+    counters: Arc<CommandAdmissionCounters>,
+}
+
+pub(super) struct CommandHandlerPermit {
+    _global: tokio::sync::OwnedSemaphorePermit,
+    _principal: tokio::sync::OwnedSemaphorePermit,
+}
+
+pub(super) struct CommandEvaluatorPermit {
+    _global: tokio::sync::OwnedSemaphorePermit,
+    _principal: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl CommandAdmission {
+    pub(super) fn new(mut config: CommandAdmissionConfig) -> Self {
+        config.handler_concurrency = config.handler_concurrency.max(1);
+        config.principal_handler_concurrency = config.principal_handler_concurrency.max(1);
+        config.evaluator_concurrency = config.evaluator_concurrency.max(1);
+        config.principal_evaluator_concurrency = config.principal_evaluator_concurrency.max(1);
+        config.evaluator_rate_per_minute = config.evaluator_rate_per_minute.max(1);
+        config.evaluator_burst = config.evaluator_burst.max(1);
+        config.evaluator_error_threshold = config.evaluator_error_threshold.max(1);
+        config.evaluator_circuit_cooldown = config
+            .evaluator_circuit_cooldown
+            .max(Duration::from_millis(1));
+        Self {
+            handler: Arc::new(tokio::sync::Semaphore::new(config.handler_concurrency)),
+            evaluator: Arc::new(tokio::sync::Semaphore::new(config.evaluator_concurrency)),
+            scopes: Arc::new(Mutex::new(HashMap::new())),
+            counters: Arc::new(CommandAdmissionCounters::default()),
+            config,
+        }
+    }
+
+    fn scope_state(
+        &self,
+        scope: &str,
+        now: Instant,
+    ) -> Result<(Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>), &'static str> {
+        let mut states = self.scopes.lock().expect("command admission lock");
+        if !states.contains_key(scope) && states.len() >= MAX_COMMAND_ADMISSION_SCOPES {
+            let evict = states
+                .iter()
+                .filter(|(_, state)| {
+                    Arc::strong_count(&state.handler) == 1
+                        && Arc::strong_count(&state.evaluator) == 1
+                })
+                .min_by_key(|(_, state)| state.touched_at)
+                .map(|(key, _)| key.clone());
+            if let Some(key) = evict {
+                states.remove(&key);
+            } else {
+                return Err("command admission principal capacity reached");
+            }
+        }
+        let state = states
+            .entry(scope.to_string())
+            .or_insert_with(|| CommandScopeState {
+                handler: Arc::new(tokio::sync::Semaphore::new(
+                    self.config.principal_handler_concurrency,
+                )),
+                evaluator: Arc::new(tokio::sync::Semaphore::new(
+                    self.config.principal_evaluator_concurrency,
+                )),
+                tokens: f64::from(self.config.evaluator_burst),
+                refilled_at: now,
+                touched_at: now,
+                consecutive_errors: 0,
+                circuit_open_until: None,
+            });
+        state.touched_at = now;
+        Ok((state.handler.clone(), state.evaluator.clone()))
+    }
+
+    pub(super) fn admit_handler(&self, scope: &str) -> Result<CommandHandlerPermit, &'static str> {
+        self.counters
+            .handler_attempted
+            .fetch_add(1, Ordering::Relaxed);
+        let now = Instant::now();
+        let (principal, _) = self.scope_state(scope, now).inspect_err(|_| {
+            self.reject_handler("scope_capacity");
+        })?;
+        let principal = principal.try_acquire_owned().map_err(|_| {
+            self.reject_handler("principal_concurrency");
+            "command per-principal concurrency limit reached"
+        })?;
+        let global = self.handler.clone().try_acquire_owned().map_err(|_| {
+            self.reject_handler("global_concurrency");
+            "command handler concurrency limit reached"
+        })?;
+        self.counters
+            .handler_admitted
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(CommandHandlerPermit {
+            _global: global,
+            _principal: principal,
+        })
+    }
+
+    fn reject_handler(&self, event: &str) {
+        self.counters
+            .handler_rejected
+            .fetch_add(1, Ordering::Relaxed);
+        self.audit(event);
+    }
+
+    pub(super) fn admit_evaluator(
+        &self,
+        scope: &str,
+    ) -> Result<CommandEvaluatorPermit, &'static str> {
+        self.counters
+            .evaluator_attempted
+            .fetch_add(1, Ordering::Relaxed);
+        let now = Instant::now();
+        let (_, principal) = self.scope_state(scope, now).inspect_err(|_| {
+            self.counters
+                .evaluator_concurrency_limited
+                .fetch_add(1, Ordering::Relaxed);
+            self.audit("evaluator_scope_capacity");
+        })?;
+        let principal = principal.try_acquire_owned().map_err(|_| {
+            self.counters
+                .evaluator_concurrency_limited
+                .fetch_add(1, Ordering::Relaxed);
+            self.audit("evaluator_principal_concurrency");
+            "command evaluator per-principal concurrency limit reached"
+        })?;
+        let global = self.evaluator.clone().try_acquire_owned().map_err(|_| {
+            self.counters
+                .evaluator_concurrency_limited
+                .fetch_add(1, Ordering::Relaxed);
+            self.audit("evaluator_global_concurrency");
+            "command evaluator concurrency limit reached"
+        })?;
+        {
+            let mut states = self.scopes.lock().expect("command admission lock");
+            let state = states
+                .get_mut(scope)
+                .expect("admission scope remains registered");
+            state.touched_at = now;
+            if state.circuit_open_until.is_some_and(|until| now < until) {
+                self.counters
+                    .evaluator_circuit_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                drop(states);
+                self.audit("evaluator_circuit_open");
+                return Err("command evaluator circuit is open");
+            }
+            state.circuit_open_until = None;
+            let refill = now.duration_since(state.refilled_at).as_secs_f64()
+                * f64::from(self.config.evaluator_rate_per_minute)
+                / 60.0;
+            state.tokens = (state.tokens + refill).min(f64::from(self.config.evaluator_burst));
+            state.refilled_at = now;
+            if state.tokens < 1.0 {
+                self.counters
+                    .evaluator_rate_limited
+                    .fetch_add(1, Ordering::Relaxed);
+                drop(states);
+                self.audit("evaluator_rate_limited");
+                return Err("command evaluator rate limit reached");
+            }
+            state.tokens -= 1.0;
+        }
+        self.counters
+            .evaluator_admitted
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(CommandEvaluatorPermit {
+            _global: global,
+            _principal: principal,
+        })
+    }
+
+    pub(super) fn complete_evaluator(&self, scope: &str, error: bool, provider_spend: bool) {
+        let now = Instant::now();
+        let mut states = self.scopes.lock().expect("command admission lock");
+        if let Some(state) = states.get_mut(scope) {
+            state.touched_at = now;
+            if !provider_spend {
+                state.tokens = (state.tokens + 1.0).min(f64::from(self.config.evaluator_burst));
+            } else if error {
+                self.counters
+                    .evaluator_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                state.consecutive_errors = state.consecutive_errors.saturating_add(1);
+                if state.consecutive_errors >= self.config.evaluator_error_threshold {
+                    state.circuit_open_until = Some(now + self.config.evaluator_circuit_cooldown);
+                }
+            } else {
+                state.consecutive_errors = 0;
+            }
+        }
+        drop(states);
+        self.audit(if !provider_spend {
+            "evaluator_no_spend"
+        } else if error {
+            "evaluator_error"
+        } else {
+            "evaluator_completed"
+        });
+    }
+
+    pub(super) fn snapshot(&self) -> CommandAdmissionStatus {
+        CommandAdmissionStatus {
+            handler_attempted: self.counters.handler_attempted.load(Ordering::Relaxed),
+            handler_admitted: self.counters.handler_admitted.load(Ordering::Relaxed),
+            handler_rejected: self.counters.handler_rejected.load(Ordering::Relaxed),
+            evaluator_attempted: self.counters.evaluator_attempted.load(Ordering::Relaxed),
+            evaluator_admitted: self.counters.evaluator_admitted.load(Ordering::Relaxed),
+            evaluator_rate_limited: self.counters.evaluator_rate_limited.load(Ordering::Relaxed),
+            evaluator_concurrency_limited: self
+                .counters
+                .evaluator_concurrency_limited
+                .load(Ordering::Relaxed),
+            evaluator_errors: self.counters.evaluator_errors.load(Ordering::Relaxed),
+            evaluator_circuit_rejections: self
+                .counters
+                .evaluator_circuit_rejections
+                .load(Ordering::Relaxed),
+        }
+    }
+
+    fn audit(&self, event: &str) {
+        let counters = self.snapshot();
+        tracing::info!(target: "guard::audit",
+            "[AUDIT] COMMAND_ADMISSION event={} handler_attempted={} handler_admitted={} handler_rejected={} evaluator_attempted={} evaluator_admitted={} evaluator_rate_limited={} evaluator_concurrency_limited={} evaluator_errors={} evaluator_circuit_rejections={}",
+            event,
+            counters.handler_attempted,
+            counters.handler_admitted,
+            counters.handler_rejected,
+            counters.evaluator_attempted,
+            counters.evaluator_admitted,
+            counters.evaluator_rate_limited,
+            counters.evaluator_concurrency_limited,
+            counters.evaluator_errors,
+            counters.evaluator_circuit_rejections
+        );
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct NotifyEvent {
@@ -39,6 +340,7 @@ impl NotifyHook {
     }
 
     pub(super) fn emit(&self, event: NotifyEvent) {
+        let event = bounded_notify_event(event);
         let command = self.command.clone();
         let timeout = self.timeout;
         let permit = match self.concurrency.clone().try_acquire_owned() {
@@ -97,6 +399,24 @@ impl NotifyHook {
             }
         });
     }
+}
+
+fn bounded_notify_text(value: Option<String>, max_chars: usize) -> Option<String> {
+    value.map(|text| {
+        if text.chars().count() <= max_chars {
+            text
+        } else {
+            text.chars().take(max_chars).collect()
+        }
+    })
+}
+
+fn bounded_notify_event(mut event: NotifyEvent) -> NotifyEvent {
+    event.handle = bounded_notify_text(event.handle, 128);
+    event.session_fingerprint = bounded_notify_text(event.session_fingerprint, 96);
+    event.reason = bounded_notify_text(event.reason, 1024);
+    event.status = bounded_notify_text(event.status, 64);
+    event
 }
 
 #[derive(Clone, Default)]
@@ -228,6 +548,33 @@ mod tests {
         assert_eq!(value["session_fingerprint"], "session:abcd");
         assert!(value.get("behavior").is_none());
         assert_eq!(value.as_object().expect("object").len(), 6);
+
+        let recovery = NotifyEvent {
+            event: "startup_recovery_escalated",
+            at_unix: 43,
+            handle: Some("recovery-1".into()),
+            session_fingerprint: Some("sha256:abcd".into()),
+            reason: Some("persisted rollback authority is unavailable".into()),
+            status: Some("needs_operator_decision".into()),
+            behavior: None,
+        };
+        let encoded = serde_json::to_string(&recovery).unwrap();
+        assert!(encoded.contains("startup_recovery_escalated"));
+        assert!(
+            encoded.len() < 512,
+            "recovery notification must stay bounded"
+        );
+        let bounded = bounded_notify_event(NotifyEvent {
+            event: "startup_recovery_escalated",
+            at_unix: 44,
+            handle: Some("h".repeat(1_000)),
+            session_fingerprint: None,
+            reason: Some("r".repeat(100_000)),
+            status: Some("needs_operator_decision".into()),
+            behavior: None,
+        });
+        assert_eq!(bounded.handle.unwrap().len(), 128);
+        assert_eq!(bounded.reason.unwrap().len(), 1024);
     }
 
     #[tokio::test]
@@ -311,5 +658,63 @@ mod tests {
             Some(&second.generation)
         );
         second.complete();
+    }
+
+    #[test]
+    fn command_handler_admission_is_fair_per_principal() {
+        let admission = CommandAdmission::new(CommandAdmissionConfig {
+            handler_concurrency: 2,
+            principal_handler_concurrency: 1,
+            ..CommandAdmissionConfig::default()
+        });
+        let _alice = admission.admit_handler("alice").expect("alice admitted");
+        assert!(admission.admit_handler("alice").is_err());
+        let _bob = admission.admit_handler("bob").expect("bob reserve remains");
+        let status = admission.snapshot();
+        assert_eq!(status.handler_admitted, 2);
+        assert_eq!(status.handler_rejected, 1);
+    }
+
+    #[test]
+    fn command_evaluator_rate_limit_and_circuit_recover() {
+        let admission = CommandAdmission::new(CommandAdmissionConfig {
+            evaluator_concurrency: 1,
+            principal_evaluator_concurrency: 1,
+            evaluator_rate_per_minute: 1,
+            evaluator_burst: 2,
+            evaluator_error_threshold: 1,
+            evaluator_circuit_cooldown: Duration::from_millis(10),
+            ..CommandAdmissionConfig::default()
+        });
+        let first = admission.admit_evaluator("alice").expect("first call");
+        drop(first);
+        admission.complete_evaluator("alice", true, true);
+        assert!(admission.admit_evaluator("alice").is_err());
+        std::thread::sleep(Duration::from_millis(20));
+        let second = admission
+            .admit_evaluator("alice")
+            .expect("circuit recovered");
+        drop(second);
+        admission.complete_evaluator("alice", false, true);
+        assert!(admission.admit_evaluator("alice").is_err());
+        let status = admission.snapshot();
+        assert_eq!(status.evaluator_admitted, 2);
+        assert_eq!(status.evaluator_circuit_rejections, 1);
+        assert_eq!(status.evaluator_rate_limited, 1);
+        assert_eq!(status.evaluator_errors, 1);
+    }
+
+    #[test]
+    fn command_evaluator_refunds_non_provider_decisions() {
+        let admission = CommandAdmission::new(CommandAdmissionConfig {
+            evaluator_rate_per_minute: 1,
+            evaluator_burst: 1,
+            ..CommandAdmissionConfig::default()
+        });
+        let permit = admission.admit_evaluator("alice").unwrap();
+        drop(permit);
+        admission.complete_evaluator("alice", false, false);
+        assert!(admission.admit_evaluator("alice").is_ok());
+        assert_eq!(admission.snapshot().evaluator_rate_limited, 0);
     }
 }

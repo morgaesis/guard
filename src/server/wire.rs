@@ -346,6 +346,10 @@ pub(super) fn verb_effective_trust(verb: &guard::gating::verb::Verb, current_sta
     )
 }
 
+fn default_api_endpoint() -> String {
+    "default".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 #[allow(clippy::enum_variant_names)]
@@ -430,6 +434,13 @@ pub enum AdminRequest {
         token: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller_token: Option<String>,
+    },
+    /// Issue an agent kubeconfig for one live, expiring Guard session. The
+    /// upstream credential remains daemon-only.
+    KubeconfigIssue {
+        #[serde(default = "default_api_endpoint")]
+        endpoint: String,
+        session_token: String,
     },
     SecretSet {
         key: String,
@@ -607,6 +618,7 @@ impl AdminRequest {
                 | Self::SessionList { .. }
                 | Self::SessionShow { .. }
                 | Self::SessionStatus { .. }
+                | Self::KubeconfigIssue { .. }
                 | Self::SecretSet { .. }
                 | Self::SecretDelete { .. }
                 | Self::SecretExists { .. }
@@ -651,6 +663,10 @@ pub enum AdminResponse {
         approvals: Vec<ApprovalSummary>,
         provisionals: Vec<ProvisionalSummary>,
         requests: Vec<GrantRequest>,
+    },
+    KubeconfigIssued {
+        yaml: String,
+        expires_at: u64,
     },
     SessionAppeal {
         allowed: bool,
@@ -991,6 +1007,22 @@ pub struct ServerStatus {
     /// Filesystem change time for a file-backed verb catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verb_catalog_changed_unix: Option<u64>,
+    /// Bounded command-handler and evaluator admission counters.
+    #[serde(default)]
+    pub command_admission: CommandAdmissionStatus,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CommandAdmissionStatus {
+    pub handler_attempted: u64,
+    pub handler_admitted: u64,
+    pub handler_rejected: u64,
+    pub evaluator_attempted: u64,
+    pub evaluator_admitted: u64,
+    pub evaluator_rate_limited: u64,
+    pub evaluator_concurrency_limited: u64,
+    pub evaluator_errors: u64,
+    pub evaluator_circuit_rejections: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

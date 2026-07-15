@@ -109,6 +109,7 @@ impl Client {
             AdminRequest::SessionList { .. } => "session_list",
             AdminRequest::SessionShow { .. } => "session_show",
             AdminRequest::SessionStatus { .. } => "session_status",
+            AdminRequest::KubeconfigIssue { .. } => "kubeconfig_issue",
             AdminRequest::SecretSet { .. } => "secret_set",
             AdminRequest::SecretDelete { .. } => "secret_delete",
             AdminRequest::SecretExists { .. } => "secret_exists",

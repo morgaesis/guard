@@ -655,13 +655,13 @@ async fn provisional_revert_reresolves_secret_after_restart() {
         .await
         .expect("remove secret before restart");
 
-    // Simulate a restart with a fresh config and secret-manager cache. Startup
-    // recovery requires an explicit operator revert, which is what
-    // begin_revert models here.
+    // Simulate registry restoration with a fresh secret-manager cache. A
+    // completed forward remains armed; this test then models an immediate
+    // operator revert while its named secret is unavailable.
     let (mut restarted, _operator, _agent) = gating_config(7_016, agent_uid);
     restarted.session_store = Some(store.clone());
     let (registry, moved) = guard::gating::provisional::ProvisionalRegistry::from_rows(persisted);
-    assert_eq!(moved, vec![handle.clone()]);
+    assert!(moved.is_empty());
     *restarted.provisional.write().await = registry;
 
     let missing_claim = restarted

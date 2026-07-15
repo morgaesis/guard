@@ -30,9 +30,7 @@ in [README.md](README.md), [ARCHITECTURE.md](ARCHITECTURE.md), and [`docs/`](doc
 
 ## Operations
 
-- Report verb-catalog content hash and change time, queue depths, generated-store
-  counts, and client/server version mismatch in `guard status`.
 - Add cross-daemon catalog and saved-grant drift comparison without exposing
   authority or credential values.
-- Expand fault-injection coverage for restart recovery, unavailable rollback
-  endpoints, notification failure, and evaluator rate circuits.
+- Add durable notification delivery with bounded retry and dead-letter
+  inspection for operators that require delivery guarantees.
