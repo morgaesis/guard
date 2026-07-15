@@ -474,7 +474,7 @@ impl ApiProxy {
     fn begin_authority_update(&self) {
         loop {
             let revision = self.authority_revision.load(Ordering::Acquire);
-            if revision % 2 == 1 {
+            if !revision.is_multiple_of(2) {
                 std::thread::yield_now();
                 continue;
             }
@@ -495,19 +495,19 @@ impl ApiProxy {
 
     fn finish_authority_update(&self) {
         let previous = self.authority_revision.fetch_add(1, Ordering::Release);
-        debug_assert_eq!(previous % 2, 1);
+        debug_assert!(!previous.is_multiple_of(2));
     }
 
     async fn capture_route_authority(&self) -> (ApiPolicy, RouteAuthority) {
         loop {
             let before = self.authority_revision.load(Ordering::Acquire);
-            if before % 2 == 1 {
+            if !before.is_multiple_of(2) {
                 tokio::task::yield_now().await;
                 continue;
             }
             let policy = self.policy.read().await.clone();
             let after = self.authority_revision.load(Ordering::Acquire);
-            if before == after && after % 2 == 0 {
+            if before == after && after.is_multiple_of(2) {
                 let policy_fingerprint = policy.authority_fingerprint();
                 return (
                     policy,
@@ -947,8 +947,8 @@ impl ApiProxy {
             Err(error) => return self.request_body_error_response(error),
         };
         let route_authority = match self.route_authority_from_parts(&parts) {
-            Ok(authority) => authority,
-            Err(response) => return response,
+            Some(authority) => authority,
+            None => return self.missing_route_authority_response(),
         };
         let body_shape = redacted_body_shape(&body);
         let prepared = match self.prepare_revert(op, path, &route_authority).await {
@@ -1474,8 +1474,8 @@ impl ApiProxy {
         created_cleanup: Option<CreatedMatch>,
     ) -> Response<ProxyBody> {
         let route_authority = match self.route_authority_from_parts(&parts) {
-            Ok(authority) => authority,
-            Err(response) => return response,
+            Some(authority) => authority,
+            None => return self.missing_route_authority_response(),
         };
         // Snapshot reads can block on the upstream. Acquire any snapshot before
         // the common final authority checks so a session edit, expiry, or policy
@@ -1830,21 +1830,16 @@ impl ApiProxy {
         }
     }
 
-    fn route_authority_from_parts(
-        &self,
-        parts: &Parts,
-    ) -> Result<RouteAuthority, Response<ProxyBody>> {
-        parts
-            .extensions
-            .get::<RouteAuthority>()
-            .cloned()
-            .ok_or_else(|| {
-                self.status_resp(
-                    StatusCode::FORBIDDEN,
-                    "guard api-proxy: request authority binding is missing",
-                    "Forbidden",
-                )
-            })
+    fn route_authority_from_parts(&self, parts: &Parts) -> Option<RouteAuthority> {
+        parts.extensions.get::<RouteAuthority>().cloned()
+    }
+
+    fn missing_route_authority_response(&self) -> Response<ProxyBody> {
+        self.status_resp(
+            StatusCode::FORBIDDEN,
+            "guard api-proxy: request authority binding is missing",
+            "Forbidden",
+        )
     }
 
     /// Re-read the complete policy and evaluator-intent generation immediately
