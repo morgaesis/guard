@@ -137,6 +137,7 @@ fn stamp_generated_verb(
         inventory: None,
         namespace: None,
         fanout: None,
+        environment: Vec::new(),
         override_marker: None,
         sticky: false,
         provenance: Some(provenance),

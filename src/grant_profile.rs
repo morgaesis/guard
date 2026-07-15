@@ -514,6 +514,7 @@ fn migrate_legacy_pattern(
         inventory: None,
         namespace: None,
         fanout: None,
+        environment: Vec::new(),
         override_marker: None,
         sticky: true,
         provenance: Some(CoverageProvenance {

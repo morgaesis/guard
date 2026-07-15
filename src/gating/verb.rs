@@ -61,6 +61,43 @@ pub enum CoverageAction {
     Deny,
 }
 
+/// Origin of one caller-controlled child-environment binding. Daemon tool
+/// configuration is intentionally absent: it is trusted server state, not a
+/// request input that a coverage cell needs to authorize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EnvironmentBindingSource {
+    Plain,
+    Secret,
+    SecretFile,
+}
+
+fn default_environment_source() -> EnvironmentBindingSource {
+    EnvironmentBindingSource::Plain
+}
+
+/// Explicit typed authority for one caller-controlled environment binding.
+/// `values` matches the plain value or daemon secret-store name exactly. An
+/// anchored `pattern` supports bounded path-like inputs. Omitting both permits
+/// any value for this exact source and environment variable name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvironmentConstraint {
+    pub name: String,
+    #[serde(
+        default = "default_environment_source",
+        skip_serializing_if = "is_plain_source"
+    )]
+    pub source: EnvironmentBindingSource,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+}
+
+fn is_plain_source(source: &EnvironmentBindingSource) -> bool {
+    *source == EnvironmentBindingSource::Plain
+}
+
 /// Select one or more argv values either by option spelling or by exact argv
 /// position. Option spellings accept both `--name value` and `--name=value`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,6 +160,11 @@ pub struct VerbCoverageCell {
     pub namespace: Option<ValueConstraint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fanout: Option<FanoutConstraint>,
+    /// Caller-controlled environment bindings this cell may preauthorize.
+    /// Empty is migration-safe and means no `--env`, `--secret`, or
+    /// `--secret-file` injection can skip evaluator review.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub environment: Vec<EnvironmentConstraint>,
     /// Exact marker an operator-issued session grant must carry to override an
     /// `evaluate` or `deny` cell. Generated verbs cannot mint these markers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -169,6 +211,9 @@ pub struct CoverageMatch {
     pub sticky: bool,
     pub features: BTreeSet<String>,
     pub specificity: CoverageSpecificity,
+    /// Every caller-controlled environment binding fits explicit typed cell
+    /// authority. False downgrades preauthorization to evaluator review.
+    pub environment_authorized: bool,
 }
 
 /// Comparable semantic restrictions for one matched cell. Observed values are
@@ -475,6 +520,26 @@ impl VerbCatalog {
     /// collection step so an alphabetically earlier verb can never shadow a
     /// semantically stronger match.
     pub fn match_command_all(&self, binary: &str, args: &[String]) -> Vec<CoverageMatch> {
+        self.match_command_all_with_environment(
+            binary,
+            args,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+    }
+
+    /// Collect coverage while binding every caller-controlled environment
+    /// input to explicit typed authority. Tool-configured daemon environment is
+    /// intentionally not accepted here because callers cannot choose it.
+    pub fn match_command_all_with_environment(
+        &self,
+        binary: &str,
+        args: &[String],
+        plain: &BTreeMap<String, String>,
+        secrets: &BTreeMap<String, String>,
+        secret_files: &BTreeMap<String, String>,
+    ) -> Vec<CoverageMatch> {
         let mut matches = Vec::new();
         for verb in self.verbs.values() {
             if !binary_names_match(binary, &verb.binary) {
@@ -513,6 +578,9 @@ impl VerbCatalog {
                         requirements: legacy_template_features(&verb.args),
                         ..CoverageSpecificity::default()
                     },
+                    environment_authorized: plain.is_empty()
+                        && secrets.is_empty()
+                        && secret_files.is_empty(),
                 });
                 continue;
             }
@@ -527,6 +595,12 @@ impl VerbCatalog {
                         sticky: cell.sticky,
                         features,
                         specificity,
+                        environment_authorized: environment_is_authorized(
+                            cell,
+                            plain,
+                            secrets,
+                            secret_files,
+                        ),
                     });
                 }
             }
@@ -923,6 +997,39 @@ fn coverage_cell_matches(
     Some((features, specificity))
 }
 
+fn environment_is_authorized(
+    cell: &VerbCoverageCell,
+    plain: &BTreeMap<String, String>,
+    secrets: &BTreeMap<String, String>,
+    secret_files: &BTreeMap<String, String>,
+) -> bool {
+    [
+        (EnvironmentBindingSource::Plain, plain),
+        (EnvironmentBindingSource::Secret, secrets),
+        (EnvironmentBindingSource::SecretFile, secret_files),
+    ]
+    .into_iter()
+    .all(|(source, bindings)| {
+        bindings.iter().all(|(name, value)| {
+            cell.environment.iter().any(|constraint| {
+                constraint.source == source
+                    && constraint.name == *name
+                    && environment_value_matches(constraint, value)
+            })
+        })
+    })
+}
+
+fn environment_value_matches(constraint: &EnvironmentConstraint, value: &str) -> bool {
+    if !constraint.values.is_empty() && !constraint.values.iter().any(|allowed| allowed == value) {
+        return false;
+    }
+    constraint
+        .pattern
+        .as_deref()
+        .is_none_or(|pattern| compile_anchored(pattern).is_ok_and(|regex| regex.is_match(value)))
+}
+
 fn matched_values(constraint: &ValueConstraint, args: &[String]) -> Option<Vec<String>> {
     let mut found = Vec::new();
     if let Some(position) = constraint.position {
@@ -1093,6 +1200,13 @@ pub fn validate_auto_promoted_verb_safety(verb: &Verb, evidence: &[Vec<String>])
              approval regardless of `trusted`, so promoting it only discards the per-instance \
              LLM reasoning a human reviewer would otherwise see"
         );
+    }
+    if verb
+        .coverage
+        .iter()
+        .any(|cell| !cell.environment.is_empty())
+    {
+        bail!("an auto-promoted verb may not authorize caller environment bindings");
     }
     if !is_kebab_name(&verb.name) {
         bail!(
@@ -1325,6 +1439,56 @@ fn validate_verb(verb: &Verb) -> Result<()> {
                 cell.name
             );
         }
+        let mut environment_bindings = BTreeSet::new();
+        for constraint in &cell.environment {
+            if !valid_environment_name(&constraint.name) {
+                bail!(
+                    "verb '{}' coverage cell '{}': invalid environment variable name '{}'",
+                    verb.name,
+                    cell.name,
+                    constraint.name
+                );
+            }
+            if !environment_bindings.insert((constraint.source, constraint.name.as_str())) {
+                bail!(
+                    "verb '{}' coverage cell '{}': duplicate {:?} environment binding '{}'",
+                    verb.name,
+                    cell.name,
+                    constraint.source,
+                    constraint.name
+                );
+            }
+            if constraint.values.iter().any(String::is_empty) {
+                bail!(
+                    "verb '{}' coverage cell '{}': environment allowed values may not be empty",
+                    verb.name,
+                    cell.name
+                );
+            }
+            if constraint.values.iter().collect::<BTreeSet<_>>().len() != constraint.values.len() {
+                bail!(
+                    "verb '{}' coverage cell '{}': environment allowed values may not contain duplicates",
+                    verb.name,
+                    cell.name
+                );
+            }
+            if let Some(pattern) = constraint.pattern.as_deref() {
+                if !(pattern.starts_with('^') && pattern.ends_with('$')) {
+                    bail!(
+                        "verb '{}' coverage cell '{}': environment pattern for '{}' must be fully anchored (^...$)",
+                        verb.name,
+                        cell.name,
+                        constraint.name
+                    );
+                }
+                compile_anchored(pattern).with_context(|| {
+                    format!(
+                        "verb '{}' coverage cell '{}' has an invalid environment pattern for '{}'",
+                        verb.name, cell.name, constraint.name
+                    )
+                })?;
+            }
+        }
     }
     Ok(())
 }
@@ -1348,6 +1512,14 @@ fn valid_override_marker(marker: &str) -> bool {
         && chars.all(|character| {
             character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | ':' | '/' | '-')
         })
+}
+
+fn valid_environment_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
 }
 
 fn validate_value_constraint(verb: &str, cell: &str, constraint: &ValueConstraint) -> Result<()> {
@@ -1989,6 +2161,7 @@ verbs:
             inventory: None,
             namespace: None,
             fanout: None,
+            environment: Vec::new(),
             override_marker: Some("operator:k-check".to_string()),
             sticky: true,
             provenance: None,
@@ -2371,6 +2544,95 @@ verbs:
 
         let apply = args_vec(&["site.yml"]);
         assert!(cat.match_command_all("ansible-playbook", &apply).is_empty());
+    }
+
+    #[test]
+    fn caller_environment_requires_explicit_typed_cell_authority() {
+        let cat = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: ansible-check
+    binary: ansible-playbook
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: check
+        action: preauthorized
+        required_args: ["--check"]
+        environment:
+          - name: ANSIBLE_CONFIG
+            values: ["/srv/automation/ansible.cfg"]
+          - name: VAULT_PASSWORD
+            source: secret
+            values: ["ansible/vault-password"]
+"#,
+        )
+        .unwrap();
+        let command = args_vec(&["--check", "site.yml"]);
+        let mut plain = BTreeMap::new();
+        plain.insert(
+            "ANSIBLE_CONFIG".to_string(),
+            "/srv/automation/ansible.cfg".to_string(),
+        );
+        let mut secrets = BTreeMap::new();
+        secrets.insert(
+            "VAULT_PASSWORD".to_string(),
+            "ansible/vault-password".to_string(),
+        );
+        let matches = cat.match_command_all_with_environment(
+            "ansible-playbook",
+            &command,
+            &plain,
+            &secrets,
+            &BTreeMap::new(),
+        );
+        assert!(matches[0].environment_authorized);
+
+        plain.insert(
+            "ANSIBLE_CONFIG".to_string(),
+            "/tmp/caller-controlled.cfg".to_string(),
+        );
+        let matches = cat.match_command_all_with_environment(
+            "ansible-playbook",
+            &command,
+            &plain,
+            &secrets,
+            &BTreeMap::new(),
+        );
+        assert!(!matches[0].environment_authorized);
+
+        let mut unexpected = BTreeMap::new();
+        unexpected.insert("EXTRA".to_string(), "value".to_string());
+        let matches = cat.match_command_all_with_environment(
+            "ansible-playbook",
+            &command,
+            &unexpected,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+        assert!(!matches[0].environment_authorized);
+    }
+
+    #[test]
+    fn environment_patterns_must_be_anchored() {
+        let error = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: unsafe-env
+    binary: ansible-playbook
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: check
+        action: preauthorized
+        required_args: ["--check"]
+        environment:
+          - name: ANSIBLE_CONFIG
+            pattern: "/srv/.*"
+"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("must be fully anchored"));
     }
 
     #[test]
