@@ -619,9 +619,10 @@ impl SessionRegistry {
             .filter(|(_, g)| g.is_expired(now))
             .map(|(t, _)| t.clone())
             .collect();
+        let had_expired_grants = !expired_tokens.is_empty();
+        changed |= had_expired_grants;
         for token in expired_tokens {
             if let Some(grant) = self.grants.remove(&token) {
-                changed = true;
                 self.history
                     .push(historical(&token, grant, now, HistoricalStatus::Expired));
             }
