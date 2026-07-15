@@ -135,7 +135,10 @@ guard server start --gate consequence --exec-as-caller \
 guard run ls -la /etc/nginx/
 
 # Recoverable: executes inside an auto-revert envelope.
-guard run --revert "systemctl stop app" --confirm-within 900 \
+guard run --revert "systemctl stop app" \
+  --confirm-check "systemctl is-active app" \
+  --revert-control-path "local systemd control socket" \
+  --confirm-within 900 \
   systemctl restart app
 # PROVISIONAL containment envelope: ... handle: 3f9c...
 # result: executed, auto-reverts unless confirmed
@@ -152,22 +155,34 @@ guard approve a1b2...           # operator: execute the exact held command
 guard deny a1b2...              # operator: reject it
 ```
 
-A free-form `--revert` is assessed by the evaluator at arm time, with the forward
-command as context, for both policy compliance and whether it is a sensible
-inverse of the forward action. The daemon may run it unattended, so it is gated
-as the consequential action it is. Only an explicit approval arms the envelope;
-any other verdict escalates the command to operator review (it is held, not armed
-with an unverified rollback and not silently denied), so an agent cannot smuggle
-an arbitrary or off-target command into the rollback slot. An operator-authored
-verb revert is the slow clock and is not re-evaluated. A recoverable command with
-no usable revert is held, not run unconfined. Held commands fail closed: an
-unattended queue denies on a TTL rather than stalling. Held and provisional state
-survives a daemon restart, and a revert never runs unattended at boot. A
+A free-form `--revert` is assessed at arm time as part of one containment
+envelope. The evaluator sees the forward command, rollback, optional
+`--confirm-check`, deadline, and the explicit or inferred control path needed to
+verify and roll back. It approves only a plausible complete chain. A forward
+action that may sever its SSH, API, socket, credential, daemon, or local control
+path is held for review with the same durable handle as other uncertain actions.
+An operator-authored verb rollback remains preauthorized, but adding a check or
+an explicit control path causes the complete envelope to receive a live
+assessment.
+
+At the deadline, an envelope without a confirmation check rolls back. With a
+check, exit zero confirms the change and every other outcome, including timeout
+or spawn failure, runs the rollback. Both commands retain the forward action's
+canonical working directory, original principal, and daemon-side secret and
+secret-file bindings. A recoverable command with no usable rollback is held, not
+run unconfined. Held commands fail closed on their TTL. Held and provisional
+state survives a daemon restart, and a rollback never runs unattended at boot. A
 past-deadline provisional becomes `needs_operator_decision` for explicit
 handling. `DENIED` means the command did not execute. Evaluator errors, invalid
 revert commands, missing approval snapshots, and unsafe replay checks fail closed
 and return an explicit denial or hold reason. Inspect state with `guard
 provisionals` and `guard approvals`.
+
+An optional operator notification hook receives lifecycle JSON on standard input
+for `hold_created`, `provisional_armed`, `provisional_due`, and `decision_made`.
+Configure it with `--notify-cmd` or `GUARD_NOTIFY_CMD`; Guard supplies no webhook
+or delivery credentials. Hook processes have a bounded timeout, a concurrency
+ceiling, a cleared environment, and no effect on the gate decision.
 
 ### Verbs: the typed interface
 
@@ -726,7 +741,41 @@ An appeal runs the evaluator with the session context and then either amends an 
 
 Session grants are persisted in the daemon state database and survive daemon restarts by default. The default path is the XDG state dir (`$XDG_STATE_HOME/guard/state.db` or `~/.local/state/guard/state.db`); override it with `--state-db` or `GUARD_STATE_DB`. `guard session revoke <token>` is restricted to the daemon principal. `guard session list` is visible over a local listener to exec-allowed callers: non-admin callers see redacted tokens, hidden rule bodies, hidden verb activations, hidden override markers, hidden generated notes, and hidden prompt text for other sessions. If `GUARD_SESSION` matches an active or historical grant, that row is shown as `token=(current)` with its own permissions, prompt context, and generated notes visible, but the raw token is still not printed.
 
-For forensics, `guard session show <token>` prints prompt context, generated notes, aggregate allow/deny and exec outcome counts, source breakdown (`llm`, `cache`, `static_policy`, `session_allow`, `session_deny`, `session_static_only`, `validation`), a risk histogram for LLM-evaluated calls, and a bounded recent interaction log. Each interaction includes an optional child exit code and the names, never values, of secrets that reached a successfully spawned child. Daemon-principal and TCP admin-token callers see the raw token. Non-admin local callers may show a session only by presenting its token and receive the same session details with tokens rendered as `(provided)`. Those summaries are loaded from the state database, so they remain available after a service restart within the configured retention window.
+For forensics, `guard session show <token>` prints prompt context, generated
+notes, aggregate allow/deny and exec outcome counts, evaluator calls, cache hits,
+holds, distinct command shapes, novel-shape rate, source breakdown, a risk
+histogram, and a bounded recent interaction log. Each interaction includes an
+optional child exit code and the names, never values, of secrets that reached a
+successfully spawned child. The aggregates derive from persisted interactions,
+so they survive daemon restart within the configured retention window.
+
+The daemon can suspend a live session when rolling behavior crosses a configured
+denial count, hold count, or denial ratio. Configure the window and thresholds
+with `--session-behavior-window`, `--session-max-denials`,
+`--session-max-holds`, `--session-max-deny-ratio`, and
+`--session-deny-ratio-min-commands`, or the corresponding `GUARD_*` variables.
+Thresholds are disabled unless set. A suspended session denies every subsequent
+request until its triggering events age out of the rolling window or the grant
+is revoked. The notification hook receives the same behavior snapshot without
+the bearer session token.
+
+## Brokered child lifetime
+
+On Unix, each brokered child leads a dedicated process group. A streaming client
+disconnect or daemon shutdown kills that group, including ordinary background
+children. A descendant that deliberately creates a new session can outlive the
+request; `systemd-run` is the preferred sanctioned detach mechanism because it
+gives the work an explicit service lifetime. `setsid` has the same lifetime
+effect without service supervision. `nohup` only becomes detached after the
+parent exits and all inherited output pipes reach EOF; a descendant that keeps a
+Guard stream attached remains owned and is killed on disconnect.
+
+The non-streaming request path waits for the child to finish because it has no
+live output write with which to observe a client disconnect. Cancellation of the
+server task and service shutdown still terminate the tracked child. On Windows,
+Guard terminates the tracked direct child when the request or service lifetime
+ends; long-running independent work belongs in a Windows service or scheduled
+task with its own authorization.
 
 ## Scoped file read grants
 

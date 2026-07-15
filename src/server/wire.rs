@@ -228,6 +228,34 @@ pub struct RevertSpec {
     pub binary: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Independent verification command run at the containment deadline. Exit
+    /// zero keeps the forward change; every other outcome runs the rollback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm_check: Option<CommandSpec>,
+    /// Operator description of the authority and transport the daemon needs to
+    /// execute the check and rollback. The evaluator treats this as data, not
+    /// instructions, and holds when the forward command can plausibly sever it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_path: Option<String>,
+}
+
+impl RevertSpec {
+    pub fn new(binary: impl Into<String>, args: Vec<String>) -> Self {
+        Self {
+            binary: binary.into(),
+            args,
+            confirm_check: None,
+            control_path: None,
+        }
+    }
+}
+
+/// A structured command used inside an already-evaluated containment envelope.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommandSpec {
+    pub binary: String,
+    #[serde(default)]
+    pub args: Vec<String>,
 }
 
 /// A request to run a catalog verb by name with validated parameters.
@@ -602,6 +630,12 @@ pub struct ProvisionalSummary {
     pub status: String,
     pub command: String,
     pub revert_command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm_check: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_fingerprint: Option<String>,
     pub reason: String,
     pub created_unix: u64,
     pub deadline_unix: u64,
@@ -654,6 +688,15 @@ impl ProvisionalSummary {
             status: p.status.as_str().to_string(),
             command,
             revert_command: p.revert_command_line(),
+            confirm_check: p.confirm_check_binary.as_ref().map(|binary| {
+                if p.confirm_check_args.is_empty() {
+                    binary.clone()
+                } else {
+                    format!("{} {}", binary, p.confirm_check_args.join(" "))
+                }
+            }),
+            control_path: p.control_path.clone(),
+            session_fingerprint: p.session_fingerprint.clone(),
             reason: p.reason.clone(),
             created_unix: p.created_unix,
             deadline_unix: p.deadline_unix,
