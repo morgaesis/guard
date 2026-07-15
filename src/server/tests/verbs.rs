@@ -391,6 +391,9 @@ verbs:
         response.verb_matches[0].action,
         guard::gating::verb::CoverageAction::Evaluate
     );
+    let admission = cfg.command_admission.snapshot();
+    assert_eq!(admission.handler_admitted, 1);
+    assert_eq!(admission.evaluator_admitted, 1);
 }
 
 #[tokio::test]
@@ -426,6 +429,9 @@ verbs:
         .into_response();
     assert!(response.allowed, "{response:?}");
     assert_eq!(response.exit_code, Some(0));
+    let admission = cfg.command_admission.snapshot();
+    assert_eq!(admission.handler_admitted, 1);
+    assert_eq!(admission.evaluator_attempted, 0);
 }
 
 /// An auto-promoted verb (`gating::allow_promotion`) is trusted only as
