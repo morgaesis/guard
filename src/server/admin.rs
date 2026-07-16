@@ -8,7 +8,7 @@ use guard::gating::verb::{
     CoverageAction, CoverageProbe, CoverageProvenance, Verb, VerbCoverageCell,
 };
 use guard::principal::{scope_eq, PrincipalKey};
-use guard::redact::{audit_escape, command_line, redact_output};
+use guard::redact::{audit_escape, command_line, redact_output, redact_output_text};
 
 use super::execute::{
     audit_session_fingerprint, persist_current_sessions, persist_session_snapshot,
@@ -927,6 +927,7 @@ pub(super) async fn handle_admin_request(
                     let can_view =
                         caller_can_view_session(server, caller, &grant.token, visible_token);
                     redact_session_summary_for_list(&mut grant, is_admin, can_view);
+                    grant.redact_credentials();
                     grant
                 })
                 .collect();
@@ -937,6 +938,7 @@ pub(super) async fn handle_admin_request(
                         let can_view =
                             caller_can_view_session(server, caller, &grant.token, visible_token);
                         redact_historical_grant_for_list(&mut grant, is_admin, can_view);
+                        grant.redact_credentials();
                         grant
                     })
                     .collect()
@@ -984,6 +986,10 @@ pub(super) async fn handle_admin_request(
                     if !is_admin {
                         mask_session_report_token(&mut report);
                     }
+                    // Command-derived text (recorded argv, learned rules,
+                    // prompts) can carry credentials; no inspection surface
+                    // may emit it un-redacted, in text or JSON, for any caller.
+                    report.redact_credentials();
                     AdminResponse::SessionShow { report }
                 }
                 None => AdminResponse::Error {
@@ -1015,6 +1021,7 @@ pub(super) async fn handle_admin_request(
             if !is_admin {
                 mask_session_report_token(&mut report);
             }
+            report.redact_credentials();
             let fingerprint = audit_session_fingerprint(Some(&token));
             let approvals = server
                 .state
@@ -2600,6 +2607,15 @@ pub(super) async fn prune_grant_requests(server: &ServerContext) {
 
 fn redact_grant_request(mut request: GrantRequest) -> GrantRequest {
     request.session_token = audit_session_fingerprint(Some(&request.session_token));
+    // Requester-supplied free text may quote command lines that carry inline
+    // credentials; redact before the request leaves the daemon.
+    request.justification = redact_output_text(&request.justification);
+    if let Some(prompt) = request.delta.prompt_append.take() {
+        request.delta.prompt_append = Some(redact_output_text(&prompt));
+    }
+    if let Some(reason) = request.decided_reason.take() {
+        request.decided_reason = Some(redact_output_text(&reason));
+    }
     request
 }
 

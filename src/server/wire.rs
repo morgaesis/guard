@@ -6,6 +6,7 @@ use guard::gating::approval::Approval;
 use guard::gating::provisional::Provisional;
 use guard::gating::{Coverage, DecisionTrace, DecisionVerbMatch};
 use guard::principal::PrincipalKey;
+use guard::redact::redact_output_text;
 use serde::{Deserialize, Serialize};
 
 use super::execute::audit_session_fingerprint;
@@ -717,6 +718,9 @@ pub struct ApprovalSummary {
 
 impl ProvisionalSummary {
     pub(super) fn from_row(p: &Provisional) -> Self {
+        // Summaries are operator-facing display records (session status,
+        // provisional listings), never the executed command, so credential
+        // material embedded in argv is redacted at this boundary.
         let command = if p.args.is_empty() {
             p.binary.clone()
         } else {
@@ -725,18 +729,18 @@ impl ProvisionalSummary {
         Self {
             handle: p.handle.clone(),
             status: p.status.as_str().to_string(),
-            command,
-            revert_command: p.revert_command_line(),
+            command: redact_output_text(&command),
+            revert_command: redact_output_text(&p.revert_command_line()),
             confirm_check: p.confirm_check_binary.as_ref().map(|binary| {
-                if p.confirm_check_args.is_empty() {
+                redact_output_text(&if p.confirm_check_args.is_empty() {
                     binary.clone()
                 } else {
                     format!("{} {}", binary, p.confirm_check_args.join(" "))
-                }
+                })
             }),
             control_path: p.control_path.clone(),
             session_fingerprint: p.session_fingerprint.clone(),
-            reason: p.reason.clone(),
+            reason: redact_output_text(&p.reason),
             created_unix: p.created_unix,
             deadline_unix: p.deadline_unix,
             forward_done: p.forward_done,
@@ -749,7 +753,7 @@ impl ProvisionalSummary {
                 .collect(),
             principal: p.principal.as_ref().map(|p| p.as_str().to_string()),
             revert_exit: p.revert_exit,
-            revert_detail: p.revert_detail.clone(),
+            revert_detail: p.revert_detail.as_deref().map(redact_output_text),
             decision_trace: p.decision_trace.clone(),
         }
     }
@@ -757,11 +761,13 @@ impl ProvisionalSummary {
 
 impl ApprovalSummary {
     pub(super) fn from_row(a: &Approval) -> Self {
+        // See `ProvisionalSummary::from_row`: display boundary, argv may
+        // carry inline credentials.
         Self {
             handle: a.handle.clone(),
             status: a.status.as_str().to_string(),
-            command: a.snapshot.command_line(),
-            reason: a.reason.clone(),
+            command: redact_output_text(&a.snapshot.command_line()),
+            reason: redact_output_text(&a.reason),
             risk: a.risk,
             reversibility: a.reversibility.map(|r| r.as_str().to_string()),
             fingerprint: a.snapshot.fingerprint(),
@@ -773,10 +779,18 @@ impl ApprovalSummary {
                 .as_ref()
                 .map(|p| p.as_str().to_string()),
             exit_code: a.result_exit,
-            stdout: a.result_stdout.clone(),
-            stderr: a.result_stderr.clone(),
-            decided_reason: a.decided_reason.clone(),
-            notes: a.notes.clone(),
+            stdout: a.result_stdout.as_deref().map(redact_output_text),
+            stderr: a.result_stderr.as_deref().map(redact_output_text),
+            decided_reason: a.decided_reason.as_deref().map(redact_output_text),
+            notes: a
+                .notes
+                .iter()
+                .map(|note| guard::gating::approval::ApprovalNote {
+                    at_unix: note.at_unix,
+                    author: note.author.clone(),
+                    text: redact_output_text(&note.text),
+                })
+                .collect(),
             decision_trace: a.decision_trace.clone(),
         }
     }
