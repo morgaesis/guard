@@ -2072,7 +2072,7 @@ async fn evaluate_batch_requires_owned_live_unsuspended_session_or_admin() {
             .await
             .grant(token.to_string(), granted_session(Vec::new(), Vec::new()));
     }
-    let commands = vec![crate::server::BatchCommand {
+    let commands = vec![guard::wire::BatchCommand {
         binary: "true".to_string(),
         args: Vec::new(),
         env: std::collections::HashMap::new(),
@@ -2182,7 +2182,7 @@ async fn evaluate_batch_seeds_the_identical_real_run_cache_key() {
     cfg.sessions.write().await.grant(token.clone(), grant);
     let cwd = tempfile::tempdir().unwrap();
     let cwd = cwd.path().canonicalize().unwrap();
-    let command = crate::server::BatchCommand {
+    let command = guard::wire::BatchCommand {
         binary: "echo".to_string(),
         args: vec!["delete-prod".to_string()],
         env: HashMap::from([("DEPLOY_SCOPE".to_string(), "alpha".to_string())]),

@@ -3,7 +3,7 @@ use crate::injection::{collect_unique_pairs, derive_env_name};
 use crate::server;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -83,108 +83,13 @@ impl Default for McpConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
-struct GuardVerbArgs {
-    name: String,
-    #[serde(default)]
-    params: std::collections::BTreeMap<String, String>,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-enum McpSshHostKeyMode {
-    OnlyExisting,
-    AcceptNew,
-    AcceptAll,
-}
-
-impl From<McpSshHostKeyMode> for server::SshHostKeyMode {
-    fn from(value: McpSshHostKeyMode) -> Self {
-        match value {
-            McpSshHostKeyMode::OnlyExisting => Self::OnlyExisting,
-            McpSshHostKeyMode::AcceptNew => Self::AcceptNew,
-            McpSshHostKeyMode::AcceptAll => Self::AcceptAll,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-struct GuardToolArgs {
-    #[serde(default)]
-    binary: String,
-    #[serde(default)]
-    args: Vec<String>,
-    #[serde(default)]
-    env: HashMap<String, String>,
-    #[serde(default)]
-    secrets: Vec<String>,
-    #[serde(default, rename = "secretEnv")]
-    secret_env: HashMap<String, String>,
-    #[serde(default, rename = "secretFiles")]
-    secret_files: HashMap<String, String>,
-    // --- Consequence gating (optional) ---
-    /// Rollback command for a recoverable action, as a single string.
-    #[serde(default)]
-    revert: Option<String>,
-    #[serde(default, rename = "confirmCheck")]
-    confirm_check: Option<String>,
-    #[serde(default, rename = "revertControlPath")]
-    revert_control_path: Option<String>,
-    #[serde(default, rename = "confirmWithin")]
-    confirm_within: Option<u64>,
-    #[serde(default, rename = "requireApproval")]
-    require_approval: bool,
-    #[serde(default, rename = "waitApproval")]
-    wait_approval: Option<WaitApproval>,
-    /// Invoke a catalog verb instead of a raw binary.
-    #[serde(default)]
-    verb: Option<GuardVerbArgs>,
-    /// Skip the daemon's auto-learned deny-shape fast path and force a fresh
-    /// LLM look at this one command. Never skips an operator-authored policy
-    /// deny rule. Use this if an auto-learned shape over-blocked something
-    /// that should be allowed.
-    #[serde(default)]
-    reevaluate: bool,
-    /// SSH host-key policy for a guarded `ssh` command. Defaults to
-    /// only-existing (ssh's strict checking) when omitted.
-    #[serde(default)]
-    hostkey: Option<McpSshHostKeyMode>,
-}
-
-/// `waitApproval` accepts a boolean or an integer so the MCP argument mirrors
-/// the CLI's `--wait-approval [SECONDS|unbounded]`: `true` is the bare flag
-/// (unbounded wait), an integer bounds the wait in seconds, and `false` is the
-/// same as omitting the argument.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(untagged)]
-enum WaitApproval {
-    Flag(bool),
-    Seconds(u64),
-}
-
-impl WaitApproval {
-    /// Convert to the wire representation the daemon expects: seconds to
-    /// wait, with `u64::MAX` meaning unbounded (identical to the CLI flag).
-    fn into_secs(self) -> Option<u64> {
-        match self {
-            WaitApproval::Flag(true) => Some(u64::MAX),
-            WaitApproval::Flag(false) => None,
-            WaitApproval::Seconds(secs) => Some(secs),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct EvaluateBatchArgs {
-    #[serde(default)]
-    session: Option<String>,
-    commands: Vec<server::BatchCommand>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct SessionStatusArgs {
-    session: String,
-}
+// The untrusted MCP request shapes (JSON-RPC envelope and typed tool
+// arguments) live in the library crate (`guard::wire::mcp`) so their parsing
+// surface can be fuzzed.
+use guard::wire::mcp::{
+    parse_jsonrpc_envelope, EvaluateBatchArgs, GuardToolArgs, JsonRpcEnvelopeError,
+    SessionStatusArgs, ToolCallParams, WaitApproval,
+};
 
 #[derive(Debug, Clone)]
 struct GuardToolResponse {
@@ -767,31 +672,33 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
     }
 
     async fn handle_message(&mut self, message: Value) -> Option<Value> {
-        let Some(object) = message.as_object() else {
-            return Some(jsonrpc_error_response(
-                Value::Null,
-                -32600,
-                "invalid request: JSON-RPC message must be an object".to_string(),
-                None,
-            ));
+        let envelope = match parse_jsonrpc_envelope(&message) {
+            Ok(envelope) => envelope,
+            Err(JsonRpcEnvelopeError::NotAnObject) => {
+                return Some(jsonrpc_error_response(
+                    Value::Null,
+                    -32600,
+                    "invalid request: JSON-RPC message must be an object".to_string(),
+                    None,
+                ));
+            }
+            Err(JsonRpcEnvelopeError::MissingMethod { id }) => {
+                return Some(jsonrpc_error_response(
+                    id.unwrap_or(Value::Null),
+                    -32600,
+                    "invalid request: missing method".to_string(),
+                    None,
+                ));
+            }
         };
 
-        let id = object.get("id").cloned();
-        let Some(method) = object.get("method").and_then(Value::as_str) else {
-            return Some(jsonrpc_error_response(
-                id.unwrap_or(Value::Null),
-                -32600,
-                "invalid request: missing method".to_string(),
-                None,
-            ));
-        };
-        let params = object.get("params").cloned().unwrap_or(Value::Null);
-
-        if let Some(id) = id {
-            return self.handle_request(id, method, params).await;
+        if let Some(id) = envelope.id {
+            return self
+                .handle_request(id, &envelope.method, envelope.params)
+                .await;
         }
 
-        self.handle_notification(method, params);
+        self.handle_notification(&envelope.method, envelope.params);
         None
     }
 
@@ -1247,13 +1154,6 @@ fn admin_tool_result(text: String, structured: Value) -> Value {
     })
 }
 
-#[derive(Debug, Deserialize)]
-struct ToolCallParams {
-    name: String,
-    #[serde(default)]
-    arguments: Value,
-}
-
 fn parse_tool_call(params: Value) -> Result<ToolCallParams> {
     serde_json::from_value(params).context("invalid tools/call params")
 }
@@ -1487,6 +1387,7 @@ fn decision_text(result: &Value) -> String {
 mod tests {
     use super::*;
     use anyhow::anyhow;
+    use guard::wire::mcp::McpSshHostKeyMode;
 
     #[derive(Clone)]
     struct FakeExecutor {

@@ -1,0 +1,4 @@
+-oStrictHostKeyChecking=accept-new
+-vv
+host-c
+df -h

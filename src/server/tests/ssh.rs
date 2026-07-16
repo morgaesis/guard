@@ -1,7 +1,7 @@
+use crate::server::deterministic_safe_allow_reason;
 use crate::server::wire::{ExecuteRequest, SshHostKeyMode};
-use crate::server::{
-    deterministic_safe_allow_reason, is_fixed_readonly_diagnostic, ssh_o_directive_readonly_safe,
-    ssh_options_all_readonly_safe,
+use guard::gating::ssh_readonly::{
+    is_fixed_readonly_diagnostic, ssh_o_directive_readonly_safe, ssh_options_all_readonly_safe,
 };
 use std::collections::HashMap;
 

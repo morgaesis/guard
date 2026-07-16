@@ -55,3 +55,6 @@ uzers = "0.12.2"
 [target."cfg(windows)".dependencies]
 windows-service = "0.8.1"
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Pipes", "Win32_System_Threading", "Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+proptest = "1.11.0"

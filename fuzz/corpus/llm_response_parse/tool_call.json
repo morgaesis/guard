@@ -1,0 +1,1 @@
+1{"choices":[{"message":{"tool_calls":[{"function":{"name":"decide","arguments":"{\"decision\":\"APPROVE\",\"reason\":\"read-only\",\"risk\":1}"}}]},"finish_reason":"tool_calls"}]}

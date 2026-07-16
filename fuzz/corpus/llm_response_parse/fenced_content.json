@@ -1,0 +1,1 @@
+0{"choices":[{"message":{"content":"Decision:\n```json\n{\"decision\":\"APPROVE\",\"reason\":\"safe diagnostic\",\"risk\":2}\n```"},"finish_reason":"stop"}]}

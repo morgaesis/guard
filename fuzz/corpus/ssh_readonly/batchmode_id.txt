@@ -1,0 +1,4 @@
+-o
+BatchMode=yes
+host-a
+id

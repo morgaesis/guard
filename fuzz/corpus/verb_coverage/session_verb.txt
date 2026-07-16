@@ -1,0 +1,22 @@
+verbs:
+  - name: host-a-apply
+    description: Session-scoped apply
+    binary: ansible
+    baseline: false
+    consequence: recoverable
+    revert:
+      binary: ansible-runner
+      args: ["rollback.yml", "--limit", "host-a"]
+    trusted: true
+    coverage:
+      - name: host-a-apply
+        action: preauthorized
+        forbidden_args: ["--check"]
+        target:
+          position: 0
+          values: ["host-a"]
+===
+ansible
+host-a
+-m
+ping

