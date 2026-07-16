@@ -183,6 +183,9 @@ impl GuardAdmin for ClientExecutor {
 #[async_trait]
 impl GuardExecutor for ClientExecutor {
     async fn execute(&self, args: GuardToolArgs) -> Result<GuardToolResponse> {
+        if args.verb.is_none() && args.binary.trim().is_empty() {
+            bail!("either `binary` or `verb` is required");
+        }
         let env = collect_unique_pairs(args.env, "environment variable injection", "value")
             .map_err(anyhow::Error::msg)?;
         let secrets = guard_tool_secret_map(&args.secrets, args.secret_env)?;
@@ -796,18 +799,18 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                 {
                     "name": self.tool_name,
                     "title": "Run Command Through Guard",
-                    "description": "Execute a command through the guard daemon. The command is evaluated against security policy before execution. Plain environment overrides and named secret references are optional; secret values are resolved by the daemon and never exposed to the client.",
+                    "description": "Execute a command through the guard daemon. Provide binary (with optional args) for a raw command, or verb for a catalog verb invocation; one of the two is required. The command is evaluated against security policy before execution. Plain environment overrides and named secret references are optional; secret values are resolved by the daemon and never exposed to the client.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "binary": {
                                 "type": "string",
-                                "description": "Binary to execute (e.g. ssh, kubectl, helm, aws)."
+                                "description": "Binary to execute (e.g. ssh, kubectl, helm, aws). Required unless `verb` is provided."
                             },
                             "args": {
                                 "type": "array",
                                 "items": { "type": "string" },
-                                "description": "Arguments to pass to the binary."
+                                "description": "Arguments to pass to the binary. Only meaningful with `binary`; omit for a verb invocation."
                             },
                             "hostkey": {
                                 "type": "string",
@@ -836,7 +839,7 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                             },
                             "verb": {
                                 "type": "object",
-                                "description": "Optional: invoke an operator-defined verb instead of a raw binary. Provide name and params; the daemon renders the typed template.",
+                                "description": "Invoke an operator-defined verb instead of a raw binary (omit binary/args). Provide name and params; the daemon renders the typed template.",
                                 "properties": {
                                     "name": { "type": "string" },
                                     "params": { "type": "object", "additionalProperties": { "type": "string" } }
@@ -864,15 +867,14 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                                 "description": "Optional: force this command onto the operator-approval (hold) path."
                             },
                             "waitApproval": {
-                                "type": "integer",
-                                "description": "Optional: block up to N seconds for an operator decision on a held command and return the real result inline."
+                                "type": ["integer", "boolean"],
+                                "description": "Optional: block for an operator decision on a held command and return the real result inline. An integer waits up to that many seconds; true waits without bound (the CLI's bare --wait-approval); false is the same as omitting it."
                             },
                             "reevaluate": {
                                 "type": "boolean",
                                 "description": "Optional: skip the daemon's generated deny-shape fast path and force a fresh evaluator look at this command. Never skips operator-authored deny coverage. Use this if generated coverage blocked something that should be allowed."
                             }
-                        },
-                        "required": ["binary", "args"]
+                        }
                     },
                     "outputSchema": {
                         "type": "object",
@@ -1575,9 +1577,15 @@ mod tests {
             .expect("tools/list should respond");
 
         assert_eq!(response["result"]["tools"][0]["name"], DEFAULT_TOOL_NAME);
+        assert!(
+            response["result"]["tools"][0]["inputSchema"]
+                .get("required")
+                .is_none(),
+            "binary/args must not be schema-required: a verb-only invocation is valid"
+        );
         assert_eq!(
-            response["result"]["tools"][0]["inputSchema"]["required"],
-            json!(["binary", "args"])
+            response["result"]["tools"][0]["inputSchema"]["properties"]["waitApproval"]["type"],
+            json!(["integer", "boolean"])
         );
         assert_eq!(
             response["result"]["tools"][0]["inputSchema"]["properties"]["hostkey"]["enum"],
@@ -1615,6 +1623,67 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(without.hostkey, None);
+    }
+
+    #[test]
+    fn guard_tool_args_accepts_verb_without_binary() {
+        let parsed: GuardToolArgs = serde_json::from_value(json!({
+            "verb": { "name": "drain-node", "params": { "node": "worker-1" } }
+        }))
+        .unwrap();
+        assert_eq!(parsed.binary, "");
+        assert!(parsed.args.is_empty());
+        let verb = parsed.verb.expect("verb parsed");
+        assert_eq!(verb.name, "drain-node");
+        assert_eq!(
+            verb.params.get("node").map(String::as_str),
+            Some("worker-1")
+        );
+    }
+
+    #[test]
+    fn wait_approval_accepts_boolean_and_integer_forms() {
+        let seconds: GuardToolArgs =
+            serde_json::from_value(json!({ "binary": "true", "waitApproval": 30 })).unwrap();
+        assert_eq!(
+            seconds.wait_approval.and_then(WaitApproval::into_secs),
+            Some(30)
+        );
+
+        let unbounded: GuardToolArgs =
+            serde_json::from_value(json!({ "binary": "true", "waitApproval": true })).unwrap();
+        assert_eq!(
+            unbounded.wait_approval.and_then(WaitApproval::into_secs),
+            Some(u64::MAX)
+        );
+
+        let disabled: GuardToolArgs =
+            serde_json::from_value(json!({ "binary": "true", "waitApproval": false })).unwrap();
+        assert_eq!(
+            disabled.wait_approval.and_then(WaitApproval::into_secs),
+            None
+        );
+
+        let omitted: GuardToolArgs = serde_json::from_value(json!({ "binary": "true" })).unwrap();
+        assert_eq!(
+            omitted.wait_approval.and_then(WaitApproval::into_secs),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn executor_rejects_calls_without_binary_or_verb() {
+        let executor = ClientExecutor {
+            socket_path: Some(PathBuf::from("/nonexistent/guard.sock")),
+            tcp_port: None,
+            auth_token: None,
+        };
+        let args: GuardToolArgs = serde_json::from_value(json!({})).unwrap();
+        let error = executor.execute(args).await.unwrap_err();
+        assert!(
+            error.to_string().contains("`binary` or `verb`"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]
