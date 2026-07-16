@@ -2,6 +2,7 @@
 name = "guard"
 version = "0.5.0"
 edition = "2021"
+rust-version = "1.95"
 description = "LLM-evaluated command gate for AI agents"
 authors = ["Mörgæsis <morgaesis+git@morgaes.is>"]
 license = "MIT"
@@ -14,9 +15,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "guard"
 path = "src/main.rs"
-
-[[test]]
-name = "protocol_examples"
 
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }
@@ -47,6 +45,7 @@ base64 = "0.22.1"
 serde_yaml_ng = "0.10.0"
 clap_complete = "4.6.7"
 hmac = "0.13.0"
+subtle = "2.6.1"
 
 [target."cfg(unix)".dependencies]
 libc = "0.2.186"

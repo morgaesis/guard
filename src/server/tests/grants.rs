@@ -1,5 +1,7 @@
 #[cfg(unix)]
-use crate::server::execute::{exec_with_read_grant_retry, permission_denied_path};
+use crate::server::execute::{
+    exec_with_read_grant_retry_with_secret_authority, permission_denied_path,
+};
 #[cfg(unix)]
 use crate::server::gate_runtime::now_unix;
 #[cfg(unix)]
@@ -216,7 +218,7 @@ async fn read_grant_retry_returns_original_failure_when_grant_denied() {
         verb: None,
     };
     let mut sink = tokio::io::sink();
-    let result = exec_with_read_grant_retry(
+    let result = exec_with_read_grant_retry_with_secret_authority(
         request,
         &cfg,
         &caller,
@@ -224,6 +226,7 @@ async fn read_grant_retry_returns_original_failure_when_grant_denied() {
         0,
         false,
         &mut sink,
+        None,
     )
     .await;
     match &result.exec {
@@ -316,7 +319,7 @@ async fn read_grant_retry_grants_and_reruns_after_permission_denied() {
         uid: unsafe { libc::geteuid() },
     };
     let mut sink = tokio::io::sink();
-    let result = exec_with_read_grant_retry(
+    let result = exec_with_read_grant_retry_with_secret_authority(
         request,
         &cfg,
         &caller,
@@ -324,6 +327,7 @@ async fn read_grant_retry_grants_and_reruns_after_permission_denied() {
         0,
         false,
         &mut sink,
+        None,
     )
     .await;
     match &result.exec {

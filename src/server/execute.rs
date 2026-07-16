@@ -1,8 +1,4 @@
 use crate::injection::is_valid_env_name;
-use crate::redact::{
-    audit_escape, redact_exact_secrets, redact_output, redact_output_text,
-    redact_output_with_state, RedactionState,
-};
 use crate::session::{
     SessionAmendment, SessionDecision, SessionDecisionSource, SessionExecStatus,
     SessionInteraction, SessionRegistry,
@@ -15,6 +11,10 @@ use anyhow::{bail, Result};
 use guard::gating::verb::{CoverageAction, CoverageMatch, CoverageSpecificity, ValueDomain};
 use guard::gating::{Coverage, DecisionTrace, DecisionVerbMatch, Reversibility};
 use guard::learned_rules::{AutoShimMode, LearningOutcome};
+use guard::redact::{
+    audit_escape, command_line, redact_exact_secrets, redact_output, redact_output_text,
+    redact_output_with_state, RedactionState,
+};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 #[cfg(unix)]
@@ -2358,29 +2358,29 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
     };
     let provider_spend = matches!(
         &eval_result,
-        crate::evaluate::EvalResult::Allow {
-            source: crate::evaluate::EvalSource::Llm,
+        guard::evaluate::EvalResult::Allow {
+            source: guard::evaluate::EvalSource::Llm,
             ..
-        } | crate::evaluate::EvalResult::Deny {
-            source: crate::evaluate::EvalSource::Llm,
+        } | guard::evaluate::EvalResult::Deny {
+            source: guard::evaluate::EvalSource::Llm,
             ..
-        } | crate::evaluate::EvalResult::Error(_)
+        } | guard::evaluate::EvalResult::Error(_)
     );
     config.command_admission.complete_evaluator(
         &evaluator_scope,
-        matches!(&eval_result, crate::evaluate::EvalResult::Error(_)),
+        matches!(&eval_result, guard::evaluate::EvalResult::Error(_)),
         provider_spend,
     );
     drop(evaluator_permit);
 
     match eval_result {
-        crate::evaluate::EvalResult::Deny {
+        guard::evaluate::EvalResult::Deny {
             reason,
             source,
             risk,
         } => {
             let mut reason = reason;
-            if matches!(source, crate::evaluate::EvalSource::Llm) && !config.admission_preview {
+            if matches!(source, guard::evaluate::EvalSource::Llm) && !config.admission_preview {
                 if let Some(notice) = maybe_auto_amend_session_after_llm(
                     config,
                     session_token.as_deref(),
@@ -2416,7 +2416,7 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
             )
             .await
         }
-        crate::evaluate::EvalResult::Error(e) => {
+        guard::evaluate::EvalResult::Error(e) => {
             tracing::error!("evaluation error: {}", e);
             let reason = format!("evaluation error: {}", e);
             deny_and_record(
@@ -2429,14 +2429,14 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
             )
             .await
         }
-        crate::evaluate::EvalResult::Allow {
+        guard::evaluate::EvalResult::Allow {
             reason,
             source,
             risk,
             reversibility,
         } => {
             let mut reason = reason;
-            if matches!(source, crate::evaluate::EvalSource::Llm)
+            if matches!(source, guard::evaluate::EvalSource::Llm)
                 && !config.admission_preview
                 && !session_prompt_active
                 && session_token.is_none()
@@ -2473,7 +2473,7 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
                 )
                 .await;
             }
-            if matches!(source, crate::evaluate::EvalSource::Llm) && !config.admission_preview {
+            if matches!(source, guard::evaluate::EvalSource::Llm) && !config.admission_preview {
                 if let Some(notice) = maybe_auto_amend_session_after_llm(
                     config,
                     session_token.as_deref(),
@@ -2514,7 +2514,7 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
                 verb_ctx.as_ref().map(|v| v.class).or(reversibility)
             };
             let bypass = !constraints.typed_evaluation_required
-                && matches!(source, crate::evaluate::EvalSource::StaticPolicy)
+                && matches!(source, guard::evaluate::EvalSource::StaticPolicy)
                 && verb_ctx.is_none();
             let inputs = GateInputs {
                 reason,
@@ -2539,21 +2539,13 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
 }
 
 pub(super) fn session_source_from_eval(
-    source: crate::evaluate::EvalSource,
+    source: guard::evaluate::EvalSource,
 ) -> SessionDecisionSource {
     match source {
-        crate::evaluate::EvalSource::Llm => SessionDecisionSource::Llm,
-        crate::evaluate::EvalSource::Cache => SessionDecisionSource::Cache,
-        crate::evaluate::EvalSource::StaticPolicy => SessionDecisionSource::StaticPolicy,
-        crate::evaluate::EvalSource::LearnedDeny => SessionDecisionSource::LearnedDeny,
-    }
-}
-
-pub(super) fn command_line(binary: &str, args: &[String]) -> String {
-    if args.is_empty() {
-        binary.to_string()
-    } else {
-        format!("{} {}", binary, args.join(" "))
+        guard::evaluate::EvalSource::Llm => SessionDecisionSource::Llm,
+        guard::evaluate::EvalSource::Cache => SessionDecisionSource::Cache,
+        guard::evaluate::EvalSource::StaticPolicy => SessionDecisionSource::StaticPolicy,
+        guard::evaluate::EvalSource::LearnedDeny => SessionDecisionSource::LearnedDeny,
     }
 }
 
@@ -2586,7 +2578,7 @@ fn caller_environment_subject(request: &ExecuteRequest) -> Option<String> {
             .map(|(environment, store_name)| {
                 serde_json::json!({
                     "environment": environment,
-                    "store_name": crate::evaluate::redact_for_llm(store_name),
+                    "store_name": guard::evaluate::redact_for_llm(store_name),
                 })
             })
             .collect::<Vec<_>>()
@@ -2602,7 +2594,7 @@ fn caller_environment_subject(request: &ExecuteRequest) -> Option<String> {
             (
                 name.clone(),
                 serde_json::json!({
-                    "redacted": crate::evaluate::redact_for_llm(value),
+                    "redacted": guard::evaluate::redact_for_llm(value),
                     "sha256": digest,
                 }),
             )
@@ -3375,29 +3367,6 @@ pub(super) fn permission_denied_path(output: &str) -> Option<String> {
 /// deny-list, session rules, evaluator, pinned TTL ACL, full audit) and retry
 /// the command. A denied or failed grant returns the original failure
 /// untouched; each round must unblock a new path or the loop stops.
-#[allow(dead_code)]
-pub(super) async fn exec_with_read_grant_retry<W: AsyncWrite + Unpin>(
-    request: ExecuteRequest,
-    config: &ServerConfig,
-    caller: &CallerIdentity,
-    allow_reason: String,
-    depth: u32,
-    stream_output: bool,
-    stream_writer: &mut W,
-) -> ExecuteResult {
-    exec_with_read_grant_retry_with_secret_authority(
-        request,
-        config,
-        caller,
-        allow_reason,
-        depth,
-        stream_output,
-        stream_writer,
-        None,
-    )
-    .await
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn exec_with_read_grant_retry_with_secret_authority<W: AsyncWrite + Unpin>(
     request: ExecuteRequest,
@@ -3493,29 +3462,6 @@ pub(super) async fn exec_with_read_grant_retry_with_secret_authority<W: AsyncWri
         }
         result
     }
-}
-
-#[allow(dead_code)]
-pub(super) async fn exec_after_approval<W: AsyncWrite + Unpin>(
-    request: ExecuteRequest,
-    config: &ServerConfig,
-    caller: &CallerIdentity,
-    allow_reason: String,
-    depth: u32,
-    stream_output: bool,
-    stream_writer: &mut W,
-) -> ExecuteResult {
-    exec_after_approval_with_secret_authority(
-        request,
-        config,
-        caller,
-        allow_reason,
-        depth,
-        stream_output,
-        stream_writer,
-        None,
-    )
-    .await
 }
 
 #[allow(clippy::too_many_arguments)]

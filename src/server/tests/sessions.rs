@@ -1,4 +1,3 @@
-use crate::evaluate::{EvalConfig, Evaluator};
 use crate::grant_profile::{EvaluationMode, SavedGrantCatalog};
 use crate::server::admin::handle_admin_request;
 use crate::server::execute::{
@@ -12,6 +11,7 @@ use crate::session::{
     SessionDecisionSource, SessionExactRule, SessionExecStatus, SessionGrant, SessionInteraction,
 };
 use crate::session_store::SessionStore;
+use guard::evaluate::{EvalConfig, Evaluator};
 use guard::gating::verb::VerbCatalog;
 use guard::gating::GateMode;
 use guard::principal::PrincipalKey;
@@ -565,11 +565,11 @@ fn session_auto_amend_deny_candidates_are_high_risk_exact_rules() {
 #[test]
 fn session_source_reports_cache_separately_from_static_policy() {
     assert_eq!(
-        session_source_from_eval(crate::evaluate::EvalSource::Cache),
+        session_source_from_eval(guard::evaluate::EvalSource::Cache),
         SessionDecisionSource::Cache
     );
     assert_eq!(
-        session_source_from_eval(crate::evaluate::EvalSource::StaticPolicy),
+        session_source_from_eval(guard::evaluate::EvalSource::StaticPolicy),
         SessionDecisionSource::StaticPolicy
     );
 }

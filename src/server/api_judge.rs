@@ -1,6 +1,6 @@
-use crate::evaluate::{redact_for_llm, EvalConfig, EvalResult, EvalSource, Evaluator, LlmConfig};
 use anyhow::Result;
 use async_trait::async_trait;
+use guard::evaluate::{redact_for_llm, EvalConfig, EvalResult, EvalSource, Evaluator, LlmConfig};
 use guard::gating::api_promotion::{ApiCoverageProvenance, ApiPromotionOutcome, ApiPromotionStore};
 use guard::gating::GateMode;
 use guard::proxy::{ApiCoverageVerdict, ApiJudge, ApiJudgeVerdict, ApiRequestSummary};

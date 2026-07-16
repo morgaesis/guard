@@ -614,6 +614,7 @@ dependencies = [
  "serde_yaml_ng",
  "sha2",
  "shell-words",
+ "subtle",
  "tempfile",
  "tokio",
  "tokio-rustls",

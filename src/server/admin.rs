@@ -1,5 +1,4 @@
 use crate::grant_profile::{EvaluationMode, GrantRequest, GrantRequestStatus};
-use crate::redact::{audit_escape, redact_output};
 use crate::secrets::legacy_sentinel;
 use crate::session::{
     HistoricalGrant, IssuedGrantScope, SessionAmendment, SessionDecision, SessionDecisionSource,
@@ -9,11 +8,12 @@ use guard::gating::verb::{
     CoverageAction, CoverageProbe, CoverageProvenance, Verb, VerbCoverageCell,
 };
 use guard::principal::{scope_eq, PrincipalKey};
+use guard::redact::{audit_escape, command_line, redact_output};
 
 use super::execute::{
     allow_session_auto_amend_candidate, amend_session_exact_rule, audit_session_fingerprint,
-    command_line, deny_session_auto_amend_candidate, persist_current_sessions,
-    persist_session_snapshot, record_live_session_interaction, session_source_from_eval,
+    deny_session_auto_amend_candidate, persist_current_sessions, persist_session_snapshot,
+    record_live_session_interaction, session_source_from_eval,
     validate_session_exact_rule_candidate,
 };
 use super::gate_runtime::{
@@ -428,13 +428,13 @@ async fn handle_session_appeal(
         .await;
 
     match eval_result {
-        crate::evaluate::EvalResult::Allow {
+        guard::evaluate::EvalResult::Allow {
             reason,
             source,
             risk,
             reversibility: _,
         } => {
-            if !matches!(source, crate::evaluate::EvalSource::Llm) {
+            if !matches!(source, guard::evaluate::EvalSource::Llm) {
                 return AdminResponse::SessionAppeal {
                     allowed: false,
                     amended: false,
@@ -536,13 +536,13 @@ async fn handle_session_appeal(
                 risk,
             }
         }
-        crate::evaluate::EvalResult::Deny {
+        guard::evaluate::EvalResult::Deny {
             reason,
             source,
             risk,
         } => {
             let mut amended = false;
-            if matches!(source, crate::evaluate::EvalSource::Llm)
+            if matches!(source, guard::evaluate::EvalSource::Llm)
                 && deny_session_auto_amend_candidate(&binary, &args, risk).is_ok()
             {
                 match amend_session_exact_rule(
@@ -602,7 +602,7 @@ async fn handle_session_appeal(
                 risk,
             }
         }
-        crate::evaluate::EvalResult::Error(err) => AdminResponse::SessionAppeal {
+        guard::evaluate::EvalResult::Error(err) => AdminResponse::SessionAppeal {
             allowed: false,
             amended: false,
             pattern: Some(command_line),

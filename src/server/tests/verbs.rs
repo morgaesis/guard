@@ -1,10 +1,10 @@
-use crate::evaluate::{EvalConfig, Evaluator};
 use crate::server::admin::handle_admin_request;
 use crate::server::execute::execute_command;
 use crate::server::wire::{
     AdminRequest, AdminResponse, CallerIdentity, ExecuteRequest, GateStatus, VerbInvocation,
 };
 use crate::session::SessionGrant;
+use guard::evaluate::{EvalConfig, Evaluator};
 use guard::gating::verb::VerbCatalog;
 use guard::gating::GateMode;
 use std::collections::HashMap;

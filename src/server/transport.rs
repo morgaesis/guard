@@ -1,4 +1,3 @@
-use crate::evaluate::Evaluator;
 use crate::grant_profile::SavedGrantCatalog;
 use crate::secrets::SecretManager;
 use crate::session::SessionRegistry;
@@ -7,6 +6,7 @@ use crate::tool_config::ToolRegistry;
 #[cfg(unix)]
 use anyhow::bail;
 use anyhow::{Context, Result};
+use guard::evaluate::Evaluator;
 use guard::gating::approval::{ApprovalRegistry, ApprovalStatus};
 use guard::gating::provisional::{Provisional, ProvisionalRegistry, ProvisionalStatus};
 #[cfg(unix)]
@@ -216,10 +216,10 @@ async fn provisional_recovery_error(config: &ServerConfig, row: &Provisional) ->
 #[cfg(test)]
 mod api_session_event_tests {
     use super::*;
-    use crate::evaluate::{EvalConfig, Evaluator};
     use crate::secrets::{EnvBackend, SecretManager};
     use crate::session::SessionRegistry;
     use crate::tool_config::ToolRegistry;
+    use guard::evaluate::{EvalConfig, Evaluator};
     use std::collections::BTreeMap;
 
     fn recovery_config() -> ServerConfig {
@@ -731,7 +731,7 @@ impl Server {
                         tracing::warn!(target: "guard::audit",
                             "[AUDIT] READ_GRANT_REVOKED handle={} path=\"{}\" source=startup-expired",
                             grant.handle,
-                            crate::redact::audit_escape(&grant.target_path)
+                            guard::redact::audit_escape(&grant.target_path)
                         );
                         delete_read_grant_row(&self.config, &grant.target_path).await;
                     }
@@ -739,8 +739,8 @@ impl Server {
                         tracing::warn!(target: "guard::audit",
                             "[AUDIT] READ_GRANT_REVOKE_FAILED handle={} path=\"{}\" source=startup-expired detail=\"{}\"",
                             grant.handle,
-                            crate::redact::audit_escape(&grant.target_path),
-                            crate::redact::audit_escape(&e.to_string())
+                            guard::redact::audit_escape(&grant.target_path),
+                            guard::redact::audit_escape(&e.to_string())
                         );
                         surviving.insert(grant);
                     }

@@ -1,4 +1,7 @@
-use super::*;
+use super::{env_pairs_to_map, print_json, JSON_SCHEMA_VERSION};
+use crate::{shim, tool_config};
+use anyhow::Result;
+use std::path::PathBuf;
 
 pub(crate) struct ShimOptions {
     pub(crate) tools: Option<Vec<String>>,
