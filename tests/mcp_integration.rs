@@ -11,6 +11,7 @@
 //! Using --no-llm with a deterministic deny/allow list keeps the test
 //! reproducible, hermetic, and free from network dependencies.
 
+use std::os::unix::fs::PermissionsExt;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -47,11 +48,18 @@ impl Drop for DaemonGuard {
     }
 }
 
-async fn wait_for_socket(path: &std::path::Path) {
+async fn wait_for_socket(path: &std::path::Path, child: &mut Child) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
         if path.exists() {
             return;
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!(
+                "daemon exited with {status} before creating socket {} (its stderr is passed \
+                 through above)",
+                path.display()
+            );
         }
         sleep(Duration::from_millis(50)).await;
     }
@@ -59,12 +67,21 @@ async fn wait_for_socket(path: &std::path::Path) {
 }
 
 async fn start_daemon(tmp: &TempDir) -> (DaemonGuard, std::path::PathBuf) {
+    // The daemon refuses to open its state database when any ancestor
+    // directory is group- or other-writable (see validate_state_ancestor in
+    // src/session_store.rs). tempfile::tempdir() inherits the process umask,
+    // so on hosts with a group-writable umask (e.g. 007 -> mode 0770) the
+    // daemon exits at startup and the socket never appears. Pin the tempdir,
+    // which doubles as HOME, to 0700 so the test is umask-independent.
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("restrict tempdir permissions");
+
     let socket_path = tmp.path().join("guard.sock");
     let policy_path = tmp.path().join("policy.yaml");
     std::fs::write(&policy_path, POLICY_YAML).expect("write policy yaml");
     let test_secret_env = format!("GUARD_SECRET_U{}_mcp-test-secret", current_uid());
 
-    let child = Command::new(GUARD_BIN)
+    let mut child = Command::new(GUARD_BIN)
         .args(["server", "start", "--no-llm", "--policy"])
         .arg(&policy_path)
         .arg("--socket")
@@ -75,12 +92,15 @@ async fn start_daemon(tmp: &TempDir) -> (DaemonGuard, std::path::PathBuf) {
         .env(&test_secret_env, "test-value")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        // Pass the daemon's stderr through: when startup fails, the daemon's
+        // own error is the diagnosis, and discarding it turns any failure
+        // into an opaque socket-wait timeout.
+        .stderr(Stdio::inherit())
         .kill_on_drop(true)
         .spawn()
         .expect("spawn guard daemon");
 
-    wait_for_socket(&socket_path).await;
+    wait_for_socket(&socket_path, &mut child).await;
     (DaemonGuard { child }, socket_path)
 }
 
