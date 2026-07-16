@@ -1,0 +1,65 @@
+---
+name: Prompt Regression
+
+# Runs the LLM prompt regression corpus (tests/prompt_regression_corpus.yaml)
+# against a live model. This lives in its own workflow because its triggers
+# cannot be merged into ci.yml or audit.yml: it needs a weekly schedule
+# (ci.yml has none and audit.yml runs daily, which would burn LLM credit) and
+# a path-filtered pull_request trigger (ci.yml and audit.yml back required
+# status checks, so they must run on every pull request without path filters).
+#
+# GUARD_PROMPT_REGRESSION=required turns the test's missing-key skip into a
+# failure, so a lost or empty OPENROUTER_API_KEY secret produces a red run
+# instead of a silent pass. Note that pull requests from forks and Dependabot
+# do not receive repository secrets and will fail here by design; rerun via
+# workflow_dispatch on a maintainer branch if that coverage is needed.
+
+"on":
+  schedule:
+    - cron: "0 6 * * 1"  # Weekly, Monday 06:00 UTC
+  pull_request:
+    branches: [main]
+    paths:
+      - src/evaluate/**
+      - tests/prompt_regression.rs
+      - tests/prompt_regression_corpus.yaml
+      - .github/workflows/prompt-regression.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prompt-regression-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prompt_regression:
+    name: Prompt Regression Corpus
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659  # v1.17.0
+        with:
+          cache: false
+          rustflags: ""
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          shared-key: test
+          cache-workspace-crates: true
+          save-if: false
+
+      - name: Run prompt regression corpus
+        env:
+          GUARD_PROMPT_REGRESSION: required
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: cargo test --test prompt_regression

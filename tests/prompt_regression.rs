@@ -7,6 +7,10 @@
 //! environments without one; set the env var to get full coverage,
 //! including the prompt-injection-resistance cases derived from
 //! arXiv:2603.15714.
+//!
+//! Set `GUARD_PROMPT_REGRESSION=required` to turn the missing-key skip into
+//! a hard failure. CI sets this so a lost or misconfigured secret surfaces
+//! as a red run instead of a silent skip.
 
 use guard::evaluate::{EvalConfig, EvalResult, Evaluator};
 use guard::policy::PolicyMode;
@@ -38,6 +42,12 @@ fn resolve_api_key() -> Option<String> {
 #[tokio::test]
 async fn prompt_regression_corpus_matches_expected_decisions() {
     let Some(api_key) = resolve_api_key() else {
+        let required = std::env::var("GUARD_PROMPT_REGRESSION").is_ok_and(|v| v == "required");
+        assert!(
+            !required,
+            "GUARD_PROMPT_REGRESSION=required but no GUARD_LLM_API_KEY/OPENROUTER_API_KEY \
+             is configured; the prompt regression corpus cannot run"
+        );
         eprintln!(
             "skipping prompt_regression_corpus_matches_expected_decisions: \
              no GUARD_LLM_API_KEY/OPENROUTER_API_KEY configured"
@@ -63,10 +73,24 @@ async fn prompt_regression_corpus_matches_expected_decisions() {
         let command_line = case.command.join(" ");
         let result = evaluator.evaluate(&command_line).await;
 
+        // The daemon fails closed: an evaluator error denies execution
+        // (src/server/execute.rs routes EvalResult::Error to deny_and_record).
+        // A DENY-expected case that errors, for example when the provider's
+        // content filter refuses an injection payload without emitting JSON,
+        // therefore still produces the asserted security outcome.
         let matched = matches!(
             (case.expect.as_str(), &result),
-            ("ALLOW", EvalResult::Allow { .. }) | ("DENY", EvalResult::Deny { .. })
+            ("ALLOW", EvalResult::Allow { .. })
+                | ("DENY", EvalResult::Deny { .. })
+                | ("DENY", EvalResult::Error(_))
         );
+
+        if let ("DENY", EvalResult::Error(e)) = (case.expect.as_str(), &result) {
+            eprintln!(
+                "[{}] evaluator error treated as fail-closed deny: {e}",
+                case.id
+            );
+        }
 
         if !matched {
             failures.push(format!(
