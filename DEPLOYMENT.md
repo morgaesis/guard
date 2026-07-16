@@ -33,6 +33,7 @@ The packaged files are:
 
 ```text
 deployment/systemd/guard.service
+deployment/systemd/guard-exec-as-caller.service
 deployment/systemd/guard.env.example
 deployment/hardening/guard.apparmor.example
 deployment/hardening/seccomp-deny-escape.json
@@ -98,6 +99,32 @@ revert path.
 
 Named-pipe connect permission is not command authorization. On a multi-user
 host, isolate the agent account or restrict the pipe ACL to the intended SID.
+
+## Upgrades
+
+Upgrade a deployed daemon by replacing the binary and restarting the service.
+On Unix:
+
+```bash
+install -m 0755 target/release/guard /usr/local/bin/guard
+systemctl restart guard.service
+guard status
+```
+
+On Windows, stop the `guard` service, replace the installed binary, and start
+the service. Re-running `install-guard.ps1` is only needed when the account or
+ACL layout changes, not for a binary swap.
+
+The state database is schema-versioned. A daemon that opens an older database
+migrates it in place at startup. A daemon refuses a database written by a newer
+binary and fails startup, so a downgrade requires restoring the state database
+that matches the older binary, or removing it, which discards sessions, saved
+authority state, holds, and history.
+
+Complete or resolve armed provisionals before restarting where practical. The
+sweeper re-validates frozen authority after startup; monitor
+`guard provisionals` and `guard approvals` as described under
+[Holds, rollback, and notifications](#holds-rollback-and-notifications).
 
 ## TCP
 

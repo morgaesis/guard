@@ -140,14 +140,41 @@ podman run -it --rm \
 
 ## Running CTF adversarial tests
 
-See [ctf/DESIGN.md](ctf/DESIGN.md) for the full CTF test harness setup. Quick summary:
+See [ctf/DESIGN.md](ctf/DESIGN.md) for the full CTF test harness setup. Three
+tracked entry points cover the harness:
 
 ```bash
 export GUARD_LLM_API_KEY=sk-or-...
-./ctf/run.sh                    # start containers
-python3 ctf/.run-all-modes.py   # run all tests across all modes
-./ctf/teardown.sh               # clean up
+
+# Two-container harness (guard daemon + shimmed tools vs. target host).
+./ctf/run.sh                                   # build and start containers
+podman exec -it guard-local run-claude-attack  # drive the agent CTF
+./ctf/teardown.sh                              # clean up containers and state
+
+# Single hardened container running an adversarial Claude campaign against
+# the daemon; results land in ctf/runs/<timestamp>/.
+./ctf/run-adversary.sh
+
+# Consequence-gating harness (Docker or Podman).
+./ctf/gating/run.sh          # adversarial gating attack
+./ctf/gating/run.sh test     # full cargo test suite in a Linux container
 ```
+
+`run.sh` and `run-adversary.sh` need `GUARD_LLM_API_KEY` or
+`OPENROUTER_API_KEY` for the daemon's evaluator, plus a `claude` CLI and its
+OAuth credentials for the attacking agent.
+
+## Test integrity
+
+- A test gated on a secret (for example the evaluator API key) may skip when
+  the secret is absent locally. When its matching `GUARD_*_REQUIRED`
+  environment variable is set, the test must fail instead of skipping. A CI
+  leg that provides the secret sets the variable so a missing or broken secret
+  cannot silently erase coverage.
+- Parse-only assertions are not behavioral coverage. Every YAML test corpus
+  under `tests/` must be evaluated against the policy engine or evaluator;
+  a test that only deserializes and counts entries does not count as coverage
+  for the behaviors the corpus describes.
 
 ## Dependency auditing
 

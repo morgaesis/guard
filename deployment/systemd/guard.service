@@ -53,7 +53,7 @@ NoNewPrivileges=true
 # only. Because ambient capabilities are otherwise inherited across execve(),
 # guard clears the ambient AND inheritable sets of every brokered (caller-
 # requested) child before it execs (see drop_brokered_child_capabilities in
-# src/server.rs), so a brokered `cat`/`ansible-playbook`/etc. never inherits
+# src/server/execute.rs), so a brokered `cat`/`ansible-playbook`/etc. never inherits
 # CAP_DAC_READ_SEARCH or CAP_FOWNER and cannot bypass file DAC.
 #
 # No explicit CapabilityBoundingSet= is set: narrowing the bounding set to just

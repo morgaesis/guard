@@ -1,8 +1,10 @@
 # Configuration
 
 Guard reads daemon settings from CLI flags, `GUARD_*` environment variables,
-and `.env` files. It walks from the daemon working directory toward `/` and uses
-the nearest value for each key. Unless stated otherwise, the daemon reads a
+and a `.env` file. At startup it searches from the daemon working directory
+toward `/` and loads the nearest `.env` file whole; there is no per-key merging
+across files, and variables already set in the process environment take
+precedence over file values. Unless stated otherwise, the daemon reads a
 setting at startup and a client cannot override it.
 
 Use [`.env.example`](../.env.example) as the copyable reference. Service
@@ -17,7 +19,7 @@ not in command-line arguments.
 | `GUARD_LLM_API_URL` | OpenRouter chat completions | OpenAI-compatible evaluator endpoint. |
 | `GUARD_LLM_MODEL` | `openai/gpt-5.4-mini` | Primary model. |
 | `GUARD_LLM_MODELS` | unset | Comma-separated fallback chain that supersedes the single model. |
-| `GUARD_LLM_RETRIES` | `2` | Transient retries per model, from 1 to 2. |
+| `GUARD_LLM_RETRIES` | `2` | Transient retries per model, from 0 to 2; larger values are capped at 2. |
 | `GUARD_LLM_TIMEOUT` | `30` | Per-call timeout in seconds. |
 | `GUARD_MODE` | `readonly` | `readonly`, `safe`, or `paranoid`. |
 | `GUARD_DRY_RUN` | `false` | Evaluate approved work without spawning it. |
@@ -25,6 +27,9 @@ not in command-line arguments.
 | `GUARD_PREFLIGHT` | `false` | Deterministic executable and credential-disclosure checks. |
 | `GUARD_ALLOW_BIN` | unset | Comma-separated hard binary floor. |
 | `GUARD_GATE` | `off` | `off` or `consequence`; requires a local authenticated listener. |
+| `GUARD_APPROVAL_TTL` | `3600` | Held-command lifetime in seconds, or `unbounded`. |
+| `GUARD_NOTIFY_CMD` | unset | Operator command receiving one JSON gate-lifecycle event on stdin. |
+| `GUARD_NOTIFY_TIMEOUT_SECS` | `10` | Notify command timeout in seconds, from 1 to 60. |
 | `GUARD_VERBS` | state directory when promotion needs it | Typed verb catalog. |
 | `GUARD_GRANTS` | unset | Reusable saved-grant catalog. |
 
@@ -58,6 +63,12 @@ A local Unix socket or Windows named pipe supplies a kernel-authenticated
 principal. TCP supplies only bearer identity, so consequence gating and
 per-principal secret injection are unavailable there. A TCP listener requires
 an execution token; admin RPCs require the separate admin token.
+
+`--socket-group <group>` (flag only, no environment variable) assigns the Unix
+socket to a group. The daemon creates the socket as `0600` and widens it to
+`0660` only after the group assignment succeeds; a failed assignment removes
+the socket and aborts startup. `--users` restricts submitting uids inside the
+group.
 
 ## State, cache, and behavioral limits
 
@@ -157,6 +168,12 @@ options override the environment. Overload, rate exhaustion, and an open error
 circuit fail closed and appear in `guard status` and the audit stream.
 
 See [API proxy](api-proxy.md) for listener and policy examples.
+
+## Logging
+
+`GUARD_LOG_LEVEL` sets the daemon log filter (default `warn`); a set `RUST_LOG`
+takes precedence. Audit events use the dedicated `guard::audit` target and are
+not gated by this filter.
 
 ## SSH host keys
 
