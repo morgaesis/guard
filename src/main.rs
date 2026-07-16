@@ -21,6 +21,8 @@ mod tool_config;
 #[cfg(windows)]
 mod winsvc;
 
+#[cfg(windows)]
+use anyhow::Context;
 use anyhow::Result;
 use clap::{ArgAction, CommandFactory, Parser, Subcommand};
 use injection::{collect_unique_pairs, derive_env_name, is_valid_env_name};
