@@ -23,6 +23,7 @@
 pub mod allow_promotion;
 pub mod api_promotion;
 pub mod approval;
+pub mod coverage;
 pub mod deny_shape;
 pub mod provisional;
 pub mod read_grant;

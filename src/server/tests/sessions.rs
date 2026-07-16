@@ -1,8 +1,8 @@
 use crate::grant_profile::{EvaluationMode, SavedGrantCatalog};
 use crate::server::admin::handle_admin_request;
-use crate::server::execute::{
-    allow_session_auto_amend_candidate, deny_session_auto_amend_candidate, execute_command,
-    session_source_from_eval,
+use crate::server::execute::{execute_command, session_source_from_eval};
+use crate::server::learning::{
+    allow_session_auto_amend_candidate, deny_session_auto_amend_candidate,
 };
 use crate::server::transport::{claim_session_maintenance, session_maintenance_once};
 use crate::server::wire::ExecOutcome;

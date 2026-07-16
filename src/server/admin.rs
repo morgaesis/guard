@@ -11,14 +11,16 @@ use guard::principal::{scope_eq, PrincipalKey};
 use guard::redact::{audit_escape, command_line, redact_output};
 
 use super::execute::{
-    allow_session_auto_amend_candidate, amend_session_exact_rule, audit_session_fingerprint,
-    deny_session_auto_amend_candidate, persist_current_sessions, persist_session_snapshot,
+    audit_session_fingerprint, persist_current_sessions, persist_session_snapshot,
     record_live_session_interaction, session_source_from_eval,
-    validate_session_exact_rule_candidate,
 };
 use super::gate_runtime::{
     execute_snapshot, finish_revert, forget_proxy_provenance, is_api_proxy_sentinel, now_unix,
     persist_approval, persist_provisional, remove_revert_body,
+};
+use super::learning::{
+    allow_session_auto_amend_candidate, amend_session_exact_rule,
+    deny_session_auto_amend_candidate, validate_session_exact_rule_candidate,
 };
 use super::runtime::NotifyEvent;
 use super::wire::{

@@ -41,10 +41,6 @@ use tokio::sync::{Mutex, RwLock};
 const MAX_GUARD_DEPTH: u32 = 5;
 const MAX_REQUEST_BYTES: usize = 1_048_576; // 1MB
 const MAX_OUTPUT_BYTES: usize = 10_485_760; // 10MB
-const SESSION_AUTO_AMEND_MAX_ALLOW_RISK: i32 = 2;
-const SESSION_AUTO_AMEND_MIN_DENY_RISK: i32 = 5;
-const SESSION_EXACT_RULE_MAX_ARGS: usize = 128;
-const SESSION_EXACT_RULE_MAX_ARG_LEN: usize = 1024;
 
 // --- Consequence-gating tuning (operator-overridable where noted) ---
 /// How often the sweeper checks for due auto-reverts and expired holds.
@@ -82,6 +78,7 @@ mod api_judge;
 mod execute;
 mod gate_runtime;
 mod grants;
+mod learning;
 mod runtime;
 mod secure_fs;
 #[cfg(test)]
