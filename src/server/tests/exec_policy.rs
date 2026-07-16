@@ -152,7 +152,10 @@ async fn cwd_is_included_in_audit_and_evaluation_context() {
     assert!(logs.contains("[AUDIT] ALLOWED"), "logs={logs}");
     assert!(logs.contains("caller=uid=1000"), "logs={logs}");
     assert!(
-        logs.contains(&format!("cwd=\"{}\"", cwd.display())),
+        logs.contains(&format!(
+            "cwd=\"{}\"",
+            guard::redact::audit_escape(&cwd.display().to_string())
+        )),
         "logs={logs}"
     );
     assert!(logs.contains("cmd=\"pwd\""), "logs={logs}");
@@ -1046,6 +1049,78 @@ async fn audit_policy_denied_emits_only_policy_event() {
     assert!(
         !output.contains("EXEC_FAILED"),
         "policy denial must not produce EXEC_FAILED: {output}"
+    );
+}
+
+/// A denied request whose argument embeds "\n[AUDIT] ALLOWED ..." must not
+/// forge a physical audit line: render-side escaping keeps one logical audit
+/// record on exactly one physical line, so grep-based audit tooling never
+/// sees a fabricated record.
+#[tokio::test]
+async fn audit_line_injection_via_argv_is_escaped() {
+    let (cfg, buf) = make_test_config();
+    let caller = CallerIdentity::Unix { uid: 1000 };
+    let forged = "payload\n[AUDIT] ALLOWED forged caller=uid=0 cmd=\"rm -rf /\" reason=\"forged\"";
+    let result = ExecuteResult::denied("denied\r\n[AUDIT] ALLOWED forged-via-reason");
+
+    let (_, output) = capture_async(&buf, async {
+        emit_audit_events(&cfg, &caller, "echo", &[forged.to_string()], &result);
+    })
+    .await;
+
+    assert_eq!(
+        output
+            .lines()
+            .filter(|line| line.contains("[AUDIT]"))
+            .count(),
+        1,
+        "one logical audit record must stay one physical line: {output}"
+    );
+    assert!(
+        output
+            .lines()
+            .all(|line| !line.trim_start().starts_with("[AUDIT] ALLOWED")),
+        "no physical line may start with the forged prefix: {output}"
+    );
+    assert!(
+        output.contains("payload\\n[AUDIT] ALLOWED forged"),
+        "argv injection must appear escaped on the original line: {output}"
+    );
+    assert!(
+        output.contains("denied\\r\\n[AUDIT] ALLOWED forged-via-reason"),
+        "reason injection must appear escaped on the original line: {output}"
+    );
+    assert!(
+        output.contains("[AUDIT] DENIED"),
+        "the real record survives: {output}"
+    );
+}
+
+/// NUL can never be a legitimate argv byte; the wire boundary rejects it
+/// outright instead of relying on escaping. Newlines and tabs stay accepted
+/// (commit messages via -m are legitimate multi-line arguments).
+#[tokio::test]
+async fn nul_byte_in_argument_is_rejected_at_validation() {
+    let (cfg, _) = make_test_config();
+    let caller = CallerIdentity::Unix { uid: 1000 };
+    let req = basic_request("echo", vec!["safe".to_string(), "with\0nul".to_string()]);
+
+    let result = execute_command(req, &cfg, &caller).await;
+
+    assert!(
+        !result.policy_allowed(),
+        "NUL in argv must be denied: {:?}",
+        result.exec
+    );
+    assert!(
+        result.policy_reason().contains("contains NUL byte"),
+        "got: {}",
+        result.policy_reason()
+    );
+    assert!(
+        result.policy_reason().contains("index 1"),
+        "the offending argument index is named: {}",
+        result.policy_reason()
     );
 }
 

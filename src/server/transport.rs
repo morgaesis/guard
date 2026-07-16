@@ -731,7 +731,7 @@ impl Server {
                         tracing::warn!(target: "guard::audit",
                             "[AUDIT] READ_GRANT_REVOKED handle={} path=\"{}\" source=startup-expired",
                             grant.handle,
-                            grant.target_path
+                            crate::redact::audit_escape(&grant.target_path)
                         );
                         delete_read_grant_row(&self.config, &grant.target_path).await;
                     }
@@ -739,8 +739,8 @@ impl Server {
                         tracing::warn!(target: "guard::audit",
                             "[AUDIT] READ_GRANT_REVOKE_FAILED handle={} path=\"{}\" source=startup-expired detail=\"{}\"",
                             grant.handle,
-                            grant.target_path,
-                            e
+                            crate::redact::audit_escape(&grant.target_path),
+                            crate::redact::audit_escape(&e.to_string())
                         );
                         surviving.insert(grant);
                     }

@@ -101,6 +101,7 @@ pub use wire::{
 };
 pub(crate) use wire::{ExecuteStreamMessage, IncomingMessage};
 
+use crate::redact::audit_escape;
 use execute::{audit_command_line, audit_session_fingerprint};
 use wire::CallerIdentity;
 
@@ -390,7 +391,7 @@ impl ServerConfig {
             caller,
             audit_session_fingerprint(session_token),
             audit_command_line(binary, args),
-            reason
+            audit_escape(reason)
         );
     }
 
@@ -412,7 +413,7 @@ impl ServerConfig {
             caller,
             audit_session_fingerprint(session_token),
             audit_command_line(binary, args),
-            reason
+            audit_escape(reason)
         );
     }
 }

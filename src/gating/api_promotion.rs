@@ -213,7 +213,7 @@ impl ApiShape {
     }
 
     pub fn audit_label(&self) -> String {
-        format!(
+        let label = format!(
             "protocol={} verb={} group={} version={} resource={} subresource={} namespace={} selectors={}",
             self.protocol,
             self.verb,
@@ -235,7 +235,10 @@ impl ApiShape {
                     .collect::<Vec<_>>()
                     .join(",")
             }
-        )
+        );
+        // Shape components derive from the caller's request URL and body;
+        // escape control characters so the label cannot split an audit line.
+        crate::redact::audit_escape(&label).into_owned()
     }
 }
 
@@ -293,9 +296,9 @@ impl ApiPromotionStore {
                         let _ = std::fs::rename(&config.path, &quarantine);
                         tracing::error!(target: "guard::audit",
                             "[AUDIT] API_PROMOTION_CORRUPT path=\"{}\" quarantined=\"{}\" error={} (starting from an empty store)",
-                            config.path.display(),
-                            quarantine.display(),
-                            e
+                            crate::redact::audit_escape(&config.path.display().to_string()),
+                            crate::redact::audit_escape(&quarantine.display().to_string()),
+                            crate::redact::audit_escape(&e.to_string())
                         );
                         ApiPromotionFile::default()
                     }

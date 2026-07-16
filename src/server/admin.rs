@@ -1,5 +1,5 @@
 use crate::grant_profile::{EvaluationMode, GrantRequest, GrantRequestStatus};
-use crate::redact::redact_output;
+use crate::redact::{audit_escape, redact_output};
 use crate::secrets::legacy_sentinel;
 use crate::session::{
     HistoricalGrant, IssuedGrantScope, SessionAmendment, SessionDecision, SessionDecisionSource,
@@ -526,7 +526,7 @@ async fn handle_session_appeal(
                 caller,
                 audit_session_fingerprint(Some(&token)),
                 amended,
-                redact_output(&command_line)
+                audit_escape(&redact_output(&command_line))
             );
             AdminResponse::SessionAppeal {
                 allowed: true,
@@ -592,7 +592,7 @@ async fn handle_session_appeal(
                 caller,
                 audit_session_fingerprint(Some(&token)),
                 amended,
-                redact_output(&command_line)
+                audit_escape(&redact_output(&command_line))
             );
             AdminResponse::SessionAppeal {
                 allowed: false,
@@ -619,7 +619,7 @@ pub(super) async fn handle_admin_request(
 ) -> AdminResponse {
     if request.requires_daemon_uid() {
         if let Err(e) = config.validate_admin(caller) {
-            tracing::warn!(target: "guard::audit", "[AUDIT] ADMIN_REJECTED caller={} reason=\"{}\"", caller, e);
+            tracing::warn!(target: "guard::audit", "[AUDIT] ADMIN_REJECTED caller={} reason=\"{}\"", caller, audit_escape(&e.to_string()));
             return AdminResponse::Error {
                 message: e.to_string(),
             };
@@ -1101,7 +1101,7 @@ pub(super) async fn handle_admin_request(
                 "[AUDIT] KUBECONFIG_ISSUED caller={} principal={} endpoint={} session_fingerprint={} expires_at={}",
                 caller,
                 principal,
-                endpoint,
+                audit_escape(&endpoint),
                 audit_session_fingerprint(Some(&session_token)),
                 expires_at
             );
@@ -1485,7 +1485,7 @@ pub(super) async fn handle_admin_request(
                     if !preview {
                         tracing::info!(target: "guard::audit",
                             "[AUDIT] VERB_CREATED name={} consequence={} trusted={}",
-                            verb.name,
+                            audit_escape(&verb.name),
                             verb.consequence.as_str(),
                             verb.trusted
                         );
@@ -2777,7 +2777,7 @@ async fn handle_approve(
                     .session_fingerprint
                     .as_deref()
                     .unwrap_or("none"),
-                detail
+                audit_escape(&detail)
             );
             config.emit_event(NotifyEvent {
                 event: "decision_made",
@@ -2839,7 +2839,7 @@ async fn handle_approve(
                     .session_fingerprint
                     .as_deref()
                     .unwrap_or("none"),
-                detail
+                audit_escape(&detail)
             );
             (
                 format!("approved {} but execution failed: {}", handle, detail),
@@ -2930,7 +2930,7 @@ pub(super) async fn handle_approval_note(
                     tracing::info!(target: "guard::audit",
                         "[AUDIT] APPROVAL_NOTE handle={} author={} caller={}",
                         handle,
-                        author,
+                        audit_escape(author),
                         caller
                     );
                     AdminResponse::ApprovalShow {

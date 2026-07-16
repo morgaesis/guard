@@ -988,8 +988,8 @@ impl ApiProxy {
                 tracing::info!(
                     target: "guard::audit",
                     "[AUDIT] EVALUATE decision=deny risk=none reversibility=none reason={} label={}",
-                    reason,
-                    label
+                    crate::redact::audit_escape(&reason),
+                    crate::redact::audit_escape(&label)
                 );
                 self.status_resp(
                     StatusCode::FORBIDDEN,
@@ -1009,8 +1009,8 @@ impl ApiProxy {
                 tracing::info!(
                     target: "guard::audit",
                     "[AUDIT] EVALUATE decision=error risk=none reversibility=none reason={} label={}",
-                    error,
-                    label
+                    crate::redact::audit_escape(&error),
+                    crate::redact::audit_escape(&label)
                 );
                 self.status_resp(
                     StatusCode::FORBIDDEN,
@@ -1031,8 +1031,8 @@ impl ApiProxy {
                     "[AUDIT] EVALUATE decision=allow risk={:?} reversibility={:?} reason={} label={}",
                     risk,
                     reversibility,
-                    reason,
-                    label
+                    crate::redact::audit_escape(&reason),
+                    crate::redact::audit_escape(&label)
                 );
                 let outcome = decide_gate(reversibility, risk, prepared.is_constructible(), false);
                 match outcome {
