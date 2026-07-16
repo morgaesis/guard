@@ -205,9 +205,13 @@ async fn mcp_end_to_end_initialize_list_call() {
         .iter()
         .find(|t| t["name"] == "guard_run")
         .expect("guard_run tool present");
+    assert!(
+        guard_run["inputSchema"].get("required").is_none(),
+        "binary/args must not be schema-required: a verb-only invocation is valid"
+    );
     assert_eq!(
-        guard_run["inputSchema"]["required"],
-        json!(["binary", "args"])
+        guard_run["inputSchema"]["properties"]["waitApproval"]["type"],
+        json!(["integer", "boolean"])
     );
 
     // 3. tools/call with an allowed command

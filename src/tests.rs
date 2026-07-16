@@ -1502,6 +1502,63 @@ fn cli_command_path_avoids_unknown_positional_values() {
 }
 
 #[test]
+fn cli_command_path_normalizes_aliases() {
+    assert_eq!(
+        cli_command_path(&["secret".to_string(), "add".to_string(), "KEY".to_string()]),
+        "secrets add"
+    );
+    assert_eq!(
+        cli_command_path(&["exec".to_string(), "git".to_string(), "status".to_string()]),
+        "run"
+    );
+}
+
+/// Anti-drift guard: every leaf command in the clap tree must resolve to its
+/// full path through `cli_command_path`, so the audit command path can never
+/// silently lag a newly added subcommand.
+#[test]
+fn cli_command_path_covers_every_clap_leaf_command() {
+    fn walk(command: &clap::Command, path: &mut Vec<String>, failures: &mut Vec<String>) {
+        let mut subcommands = command
+            .get_subcommands()
+            .filter(|sub| sub.get_name() != "help")
+            .peekable();
+        if subcommands.peek().is_none() {
+            let expected = path.join(" ");
+            let resolved = cli_command_path(path);
+            if resolved != expected {
+                failures.push(format!("`{expected}` resolved to `{resolved}`"));
+            }
+            return;
+        }
+        for sub in subcommands {
+            path.push(sub.get_name().to_string());
+            walk(sub, path, failures);
+            path.pop();
+        }
+    }
+
+    let root = MainArgs::command();
+    assert!(
+        root.get_subcommands().next().is_some(),
+        "clap tree walk found no commands"
+    );
+    let mut failures = Vec::new();
+    for sub in root
+        .get_subcommands()
+        .filter(|sub| sub.get_name() != "help")
+    {
+        let mut path = vec![sub.get_name().to_string()];
+        walk(sub, &mut path, &mut failures);
+    }
+    assert!(
+        failures.is_empty(),
+        "cli_command_path lags the clap command tree:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
 fn env_pairs_to_map_rejects_conflicting_duplicate_values() {
     let err = env_pairs_to_map(vec![
         ("FOO".to_string(), "one".to_string()),

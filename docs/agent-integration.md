@@ -83,10 +83,29 @@ Denied and held results render guidance without requiring the flag. Read command
 `guard status --json`, `guard session status --json`, and `guard verb list
 --json` support automation without parsing prose.
 
-Guard-origin denial, hold, and operational failures use distinct outcomes from
-an executed child's exit status. A successful human command does not print verb
-matching noise. Denied and held commands print the matching coverage and the
-next bounded action on stderr.
+A successful human command does not print verb matching noise. Denied and held
+commands print the matching coverage and the next bounded action on stderr.
+
+### Exit codes
+
+`guard run` reserves three exit codes for guard-origin outcomes and otherwise
+propagates the executed child's exit status untranslated:
+
+| Code  | Meaning                                                          |
+| ----- | ---------------------------------------------------------------- |
+| 125   | Guard operational error (daemon unreachable, protocol failure)   |
+| 126   | Denied by policy                                                 |
+| 127   | Held for operator approval                                       |
+| 2     | Invalid guard CLI usage (argument parsing)                       |
+| other | The child's own exit status, propagated untranslated             |
+
+The reserved range collides with codes a child can produce on its own: `sh -c`
+exits 127 when the named command is missing, and `git bisect skip` uses 125. An
+exit code of 125-127 therefore suggests, but cannot prove, a guard-origin
+outcome. An agent that needs certainty runs with `--json` and reads the
+`allowed` and `status` fields; the exit code is a convenience for shell
+pipelines, not the authoritative decision channel. `guard run` prints this
+contract in its own help output (`guard help run`).
 
 ## MCP
 
@@ -101,6 +120,24 @@ The MCP server executes commands and provides requester-scoped verb, approval,
 and session operations through the normal daemon protocol. Structured and human
 tool results carry the stable decision source, matched cells, and guidance. It
 does not create a parallel policy path.
+
+The server exposes five tools:
+
+| Tool | Purpose | Key arguments | CLI equivalent |
+| ---- | ------- | ------------- | -------------- |
+| `guard_run` | Execute one command through the daemon | `binary` (string) plus `args` (string array), or `verb` (`{name, params}`) for a catalog verb; one of the two is required. Optional: `env`, `secretEnv`, `secretFiles` (string maps), `secrets` (string array), `hostkey` (enum), containment gating (`revert`, `confirmCheck`, `revertControlPath` strings; `confirmWithin` integer; `requireApproval` boolean; `waitApproval` integer seconds or boolean), `reevaluate` (boolean) | `guard run`, `guard verb run` |
+| `guard_verbs` | Read the operator-defined verb catalog | none | `guard verb list` |
+| `guard_approvals` | List the caller's held approvals and provisional executions | none | `guard approvals`, `guard provisionals` |
+| `guard_evaluate_batch` | Dry-evaluate up to 64 command shapes without executing anything | `commands` (array of `{binary, args}`, 1-64 items, required); `session` (string, optional target session) | MCP-only; no CLI equivalent |
+| `guard_session_status` | Show one session's grant, escalations, holds, and provisionals | `session` (string, required) | `guard session status` |
+
+`guard_run` is the default name for the execution tool; `guard mcp serve
+--tool-name` renames it. `guard_run`'s `waitApproval` mirrors the CLI's
+`--wait-approval`: an integer bounds the wait in seconds, `true` waits without
+bound, and `false` or omission returns the held handle immediately.
+`guard_evaluate_batch` evaluates every shape against the active saved-grant
+revision cache context and returns per-command verdicts without running,
+holding, or reverting anything.
 
 HTTP MCP is available for a local single-tenant runtime and requires a bearer:
 
