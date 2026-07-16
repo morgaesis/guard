@@ -1,7 +1,7 @@
 use crate::injection::is_valid_env_name;
 use crate::redact::{
-    redact_exact_secrets, redact_output, redact_output_text, redact_output_with_state,
-    RedactionState,
+    audit_escape, redact_exact_secrets, redact_output, redact_output_text,
+    redact_output_with_state, RedactionState,
 };
 use crate::session::{
     SessionAmendment, SessionDecision, SessionDecisionSource, SessionExecStatus,
@@ -68,9 +68,9 @@ pub(super) fn log_audit_policy_for_request(
             action,
             caller,
             audit_session_fingerprint(request.session_token.as_deref()),
-            cwd.display(),
+            audit_escape(&cwd.display().to_string()),
             audit_command_line(&request.binary, &request.args),
-            reason
+            audit_escape(reason)
         );
     } else {
         config.log_audit_policy(
@@ -1712,6 +1712,23 @@ async fn validate_exec_request<W: AsyncWrite + Unpin>(
         .await);
     }
 
+    // NUL can never be a legitimate argv byte (execve delimits arguments with
+    // NUL), so reject it at the boundary. Other control characters stay
+    // accepted: multi-line arguments (commit messages via -m, heredoc-style
+    // payloads) are legitimate, and the audit renderer escapes them.
+    if let Some(position) = request.args.iter().position(|arg| arg.contains('\0')) {
+        let reason = format!("invalid argument at index {}: contains NUL byte", position);
+        return Err(deny_and_record(
+            phase,
+            request,
+            request.binary.clone(),
+            SessionDecisionSource::Validation,
+            None,
+            reason,
+        )
+        .await);
+    }
+
     // Reconstruct full command line early so session short-circuit and
     // evaluator share the same command text.
     let command_line = command_line(&request.binary, &request.args);
@@ -2455,9 +2472,10 @@ fn caller_environment_subject(request: &ExecuteRequest) -> Option<String> {
 /// masked. Argv routinely carries inline credentials (`--password=...`,
 /// `Authorization: Bearer <token>`, connection URLs); the audit trail needs
 /// the command shape, not the values, and the daemon log must not become a
-/// secret store.
+/// secret store. Control characters are escaped (`audit_escape`) so argv
+/// cannot inject forged physical audit lines.
 pub(super) fn audit_command_line(binary: &str, args: &[String]) -> String {
-    redact_output(&command_line(binary, args))
+    audit_escape(&redact_output(&command_line(binary, args))).into_owned()
 }
 
 pub(super) fn validate_session_exact_rule_candidate(
@@ -2669,8 +2687,8 @@ async fn maybe_promote_deny_shape(
             Ok(true) => {
                 tracing::info!(target: "guard::audit",
                     "[AUDIT] DENY_SHAPE_LEARNED service={} binary={} denials={}",
-                    outcome.service,
-                    outcome.binary,
+                    audit_escape(&outcome.service),
+                    audit_escape(&outcome.binary),
                     outcome.denials
                 );
             }
@@ -2771,8 +2789,8 @@ async fn maybe_promote_allow_verb(
             Ok(()) => {
                 tracing::info!(target: "guard::audit",
                     "[AUDIT] VERB_AUTO_PROMOTED name={} binary={} consequence={} approvals={}",
-                    verb.name,
-                    verb.binary,
+                    audit_escape(&verb.name),
+                    audit_escape(&verb.binary),
                     verb.consequence.as_str(),
                     outcome.approvals
                 );
@@ -3305,7 +3323,7 @@ pub(super) async fn exec_with_read_grant_retry_with_secret_authority<W: AsyncWri
                 "[AUDIT] READ_GRANT_AUTO caller={} session_fingerprint={} path=\"{}\" ttl={}s (retrying after permission denied)",
                 caller,
                 audit_session_fingerprint(request.session_token.as_deref()),
-                path,
+                audit_escape(&path),
                 AUTO_READ_GRANT_TTL_SECS
             );
             result = exec_after_approval_with_secret_authority(

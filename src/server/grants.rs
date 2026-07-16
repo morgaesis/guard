@@ -348,7 +348,7 @@ pub(super) async fn handle_grant_read(
         "[AUDIT] READ_GRANT_ISSUED caller={} handle={} path=\"{}\" grantee_uid={} ttl={} traverse_grants={} session_fingerprint={}",
         caller,
         grant.handle,
-        grant.target_path,
+        crate::redact::audit_escape(&grant.target_path),
         grantee_uid,
         ttl,
         traverse_count,
@@ -740,7 +740,7 @@ pub(super) async fn finish_read_grant_revert(
                 tracing::info!(target: "guard::audit",
                     "[AUDIT] READ_GRANT_REVOKED handle={} path=\"{}\" source={}",
                     grant.handle,
-                    grant.target_path,
+                    crate::redact::audit_escape(&grant.target_path),
                     source
                 );
             }
@@ -756,9 +756,9 @@ pub(super) async fn finish_read_grant_revert(
                 tracing::warn!(target: "guard::audit",
                     "[AUDIT] READ_GRANT_REVOKE_FAILED handle={} path=\"{}\" source={} detail=\"{}\"",
                     grant.handle,
-                    grant.target_path,
+                    crate::redact::audit_escape(&grant.target_path),
                     source,
-                    e
+                    crate::redact::audit_escape(&e.to_string())
                 );
             }
         }

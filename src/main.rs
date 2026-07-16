@@ -2005,7 +2005,7 @@ fn log_cli_usage_error(args: &[String], error: &clap::Error) {
     let command_path = cli_command_path(args);
     tracing::warn!(target: "guard::audit",
         "[AUDIT] CLI_USAGE_ERROR command={} kind={:?} argc={}",
-        command_path,
+        redact::audit_escape(&command_path),
         error.kind(),
         args.len()
     );

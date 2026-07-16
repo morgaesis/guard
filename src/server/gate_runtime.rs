@@ -525,7 +525,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
             session_context
                 .map(|context| context.fingerprint.as_str())
                 .unwrap_or("none"),
-            api_snapshot.label,
+            crate::redact::audit_escape(&api_snapshot.label),
             api_snapshot.body_sha256,
             self.config.approval_ttl_secs
         );
@@ -2282,7 +2282,7 @@ async fn defer_revert(
         p.handle,
         caller,
         kind,
-        detail
+        crate::redact::audit_escape(&detail)
     );
     config.emit_event(NotifyEvent {
         event: "decision_made",

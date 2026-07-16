@@ -1,5 +1,40 @@
 use regex::Regex;
+use std::borrow::Cow;
 use std::sync::OnceLock;
+
+/// Escape a value for interpolation into a plain-text `[AUDIT]` line so one
+/// logical audit record is always exactly one physical line. Without this, a
+/// caller-controlled value containing a newline (argv, deny reason, path)
+/// forges audit records: `\n[AUDIT] ALLOWED ...` in an argument becomes a
+/// physical line that grep-based audit tooling cannot tell from a real one.
+///
+/// Semantics (Rust debug-style, injective): backslash doubles to `\\` so the
+/// escaping stays unambiguous, `\n`/`\r`/`\t` use their mnemonic forms, and
+/// every other control character (remaining C0, DEL, and C1) renders as
+/// `\u{XX}`. All other characters, including non-ASCII text, pass through
+/// unchanged. Returns the input unmodified (borrowed) when nothing needs
+/// escaping. A structured audit sink can reuse this as its string-field
+/// sanitizer.
+pub fn audit_escape(value: &str) -> Cow<'_, str> {
+    if !value.contains(|c: char| c == '\\' || c.is_control()) {
+        return Cow::Borrowed(value);
+    }
+    let mut escaped = String::with_capacity(value.len() + 8);
+    for c in value.chars() {
+        match c {
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            c if c.is_control() => {
+                use std::fmt::Write;
+                let _ = write!(escaped, "\\u{{{:x}}}", c as u32);
+            }
+            c => escaped.push(c),
+        }
+    }
+    Cow::Owned(escaped)
+}
 
 /// Value-shaped patterns that need no key-name context: recognizable token
 /// formats and blobs. These run BEFORE the name-based pattern so that a
@@ -459,6 +494,43 @@ pub fn redact_exact_secrets(text: &str, secrets: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_escape_passes_plain_text_through_borrowed() {
+        assert!(matches!(
+            audit_escape("git commit -m message"),
+            Cow::Borrowed(_)
+        ));
+        assert_eq!(audit_escape("état café 日本語"), "état café 日本語");
+    }
+
+    #[test]
+    fn audit_escape_keeps_one_record_on_one_line() {
+        let escaped = audit_escape("x\n[AUDIT] ALLOWED forged");
+        assert_eq!(escaped, "x\\n[AUDIT] ALLOWED forged");
+        assert!(!escaped.contains('\n'));
+        assert!(!escaped.contains('\r'));
+    }
+
+    #[test]
+    fn audit_escape_covers_all_control_characters() {
+        assert_eq!(audit_escape("a\tb\rc"), "a\\tb\\rc");
+        assert_eq!(audit_escape("bell\u{7}del\u{7f}"), "bell\\u{7}del\\u{7f}");
+        assert_eq!(audit_escape("c1\u{85}end"), "c1\\u{85}end");
+        // Backslash doubles so escaped output is unambiguous: a literal
+        // two-character "\n" in the input stays distinguishable from an
+        // escaped newline.
+        assert_eq!(audit_escape("literal\\n"), "literal\\\\n");
+        for c in ('\u{0}'..='\u{9f}').filter(|c| c.is_control()) {
+            let escaped = audit_escape(&c.to_string()).into_owned();
+            assert!(
+                escaped.chars().all(|c| !c.is_control()),
+                "control {:?} survived as {:?}",
+                c,
+                escaped
+            );
+        }
+    }
 
     #[test]
     fn test_redact_token_env_var() {
