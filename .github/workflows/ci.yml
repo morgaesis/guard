@@ -41,16 +41,25 @@ jobs:
             echo "mismatched release tag was accepted"
             exit 1
           fi
-          mkdir -p /tmp/guard-release-test/a /tmp/guard-release-test/b
+          mkdir -p /tmp/guard-release-test/a /tmp/guard-release-test/b /tmp/guard-release-test/c
           printf one > /tmp/guard-release-test/a/one.tar.gz
           printf two > /tmp/guard-release-test/b/two.tar.gz
-          find /tmp/guard-release-test -type f -name '*.tar.gz' -print | LC_ALL=C sort | while IFS= read -r archive; do
-            checksum=$(sha256sum "$archive" | cut -d ' ' -f 1)
-            printf '%s  %s\n' "$checksum" "$(basename "$archive")"
+          printf sbom > /tmp/guard-release-test/c/three.cdx.json
+          printf skip > /tmp/guard-release-test/c/notes.txt
+          find /tmp/guard-release-test -type f \( -name '*.tar.gz' -o -name '*.cdx.json' \) -print \
+            | LC_ALL=C sort | while IFS= read -r asset; do
+            checksum=$(sha256sum "$asset" | cut -d ' ' -f 1)
+            printf '%s  %s\n' "$checksum" "$(basename "$asset")"
           done > /tmp/guard-release-test/SHA256SUMS
           test -s /tmp/guard-release-test/SHA256SUMS
+          test "$(wc -l < /tmp/guard-release-test/SHA256SUMS)" -eq 3
+          if grep -q 'notes.txt' /tmp/guard-release-test/SHA256SUMS; then
+            echo "checksum manifest included an unexpected file type"
+            exit 1
+          fi
           mkdir /tmp/guard-release-test/verify
           cp /tmp/guard-release-test/a/*.tar.gz /tmp/guard-release-test/b/*.tar.gz /tmp/guard-release-test/verify/
+          cp /tmp/guard-release-test/c/*.cdx.json /tmp/guard-release-test/verify/
           cp /tmp/guard-release-test/SHA256SUMS /tmp/guard-release-test/verify/
           (cd /tmp/guard-release-test/verify && sha256sum --check SHA256SUMS)
           rm -rf /tmp/guard-release-test
