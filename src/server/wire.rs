@@ -432,6 +432,14 @@ pub enum AdminRequest {
         caller_token: Option<String>,
         commands: Vec<BatchCommand>,
     },
+    /// Walk the hash-chained audit log and report whether it is intact.
+    /// Daemon-principal only: the audit file is daemon-owned state.
+    AuditVerify,
+    /// Read the last `limit` records of the audit log. Daemon-principal only.
+    AuditTail {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+    },
 }
 
 impl AdminRequest {
@@ -599,6 +607,14 @@ pub enum AdminResponse {
     },
     EvaluationBatch {
         items: Vec<BatchEvaluation>,
+    },
+    AuditVerification {
+        path: String,
+        verification: guard::audit::ChainVerification,
+    },
+    AuditRecords {
+        path: String,
+        items: Vec<serde_json::Value>,
     },
 }
 

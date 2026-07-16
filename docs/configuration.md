@@ -75,6 +75,7 @@ group.
 | Variable | Default | Meaning |
 |---|---|---|
 | `GUARD_STATE_DB` | XDG state directory | SQLite sessions, saved grants, requests, holds, provisionals, and history. |
+| `GUARD_AUDIT_LOG` | `audit.jsonl` in the state directory | Append-only hash-chained JSONL audit log. |
 | `GUARD_HISTORY_RETENTION_SECS` | `86400` | Retention for ended sessions and interactions. |
 | `GUARD_CACHE` | `true` | Evaluator decision cache. |
 | `GUARD_CACHE_CAPACITY` | `1024` | Maximum cached decisions. |
@@ -174,6 +175,34 @@ See [API proxy](api-proxy.md) for listener and policy examples.
 `GUARD_LOG_LEVEL` sets the daemon log filter (default `warn`); a set `RUST_LOG`
 takes precedence. Audit events use the dedicated `guard::audit` target and are
 not gated by this filter.
+
+## Audit log
+
+Every audit event is a typed record with two projections from one emission
+path: a grep-able `[AUDIT] <KIND> key=value ...` line on stderr (control
+characters escaped so one logical record is always one physical line), and an
+authoritative JSONL record appended to the audit log file (`--audit-log` /
+`GUARD_AUDIT_LOG`, default `audit.jsonl` next to the state database, owner-only
+permissions). Field content in the JSONL file is JSON-encoded, so no argument
+or reason can forge a physical record.
+
+Each record carries `seq` and `prev_hash` (SHA-256 of the previous serialized
+record; a fixed genesis constant for the first), so any truncation, edit, or
+reorder breaks the chain. `guard audit verify` walks the chain and reports
+intact or the first broken sequence; `guard audit tail [-n N]` reads the most
+recent records. Both are daemon-principal-only and support `--json`.
+
+If an allow decision, an operator approval, or a confirm cannot be durably
+appended (disk full, permission failure), the action is denied: guard fails
+closed rather than acting unaudited. A daemon that cannot open the audit log
+at startup refuses to start.
+
+Guard performs no rotation. On startup the daemon continues the existing
+file's chain from its tail; an intact history stays verifiable across
+restarts. External rotation, truncation, or edits break the chain by design,
+and `guard audit verify` reports the break instead of hiding it. To start a
+fresh chain, archive the file and remove it; the daemon then begins a new
+chain at the genesis constant.
 
 ## SSH host keys
 

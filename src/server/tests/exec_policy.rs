@@ -142,7 +142,7 @@ async fn cwd_is_included_in_audit_and_evaluation_context() {
     assert!(prompt.contains("SESSION CONTEXT"));
 
     let (_, logs) = capture_async(&buf, async {
-        log_audit_policy_for_request(
+        let _ = log_audit_policy_for_request(
             &cfg,
             &CallerIdentity::Unix { uid: 1000 },
             &req,
@@ -229,7 +229,7 @@ async fn secret_binding_names_are_evaluator_inputs_but_never_audit_fields() {
     assert!(prompt.contains("private/automation/vault-name"));
 
     let (_, logs) = capture_async(&buf, async {
-        log_audit_policy_for_request(
+        let _ = log_audit_policy_for_request(
             &cfg,
             &CallerIdentity::Unix { uid: 1000 },
             &request,
@@ -1087,7 +1087,8 @@ async fn audit_policy_denied_emits_only_policy_event() {
 /// sees a fabricated record.
 #[tokio::test]
 async fn audit_line_injection_via_argv_is_escaped() {
-    let (cfg, buf) = make_test_config();
+    let (mut cfg, buf) = make_test_config();
+    let (dir, _log) = super::attach_test_audit_log(&mut cfg);
     let caller = CallerIdentity::Unix { uid: 1000 };
     let forged = "payload\n[AUDIT] ALLOWED forged caller=uid=0 cmd=\"rm -rf /\" reason=\"forged\"";
     let result = ExecuteResult::denied("denied\r\n[AUDIT] ALLOWED forged-via-reason");
@@ -1096,6 +1097,33 @@ async fn audit_line_injection_via_argv_is_escaped() {
         emit_audit_events(&cfg, &caller, "echo", &[forged.to_string()], &result);
     })
     .await;
+
+    // The durable JSONL record carries the raw injected string as a JSON
+    // field: physical-line forgery is impossible in the structured sink.
+    let jsonl = std::fs::read_to_string(dir.path().join("audit.jsonl")).expect("read audit log");
+    assert_eq!(
+        jsonl.lines().count(),
+        1,
+        "one logical record is one physical JSONL line: {jsonl}"
+    );
+    let record: guard::audit::AuditRecord =
+        serde_json::from_str(jsonl.lines().next().unwrap()).expect("parse audit record");
+    assert!(matches!(record.event.kind, guard::audit::AuditKind::Denied));
+    assert_eq!(
+        record.event.cmd.as_deref(),
+        Some(format!("echo {forged}").as_str()),
+        "the raw argv (newline included) is a JSON field, not a physical line"
+    );
+    assert_eq!(
+        record.event.reason.as_deref(),
+        Some("denied\r\n[AUDIT] ALLOWED forged-via-reason")
+    );
+    assert!(
+        !jsonl
+            .lines()
+            .any(|line| line.trim_start().starts_with("[AUDIT]")),
+        "no JSONL line can start with a forged audit prefix: {jsonl}"
+    );
 
     assert_eq!(
         output
@@ -1123,6 +1151,89 @@ async fn audit_line_injection_via_argv_is_escaped() {
         output.contains("[AUDIT] DENIED"),
         "the real record survives: {output}"
     );
+}
+
+/// `guard audit verify` / `guard audit tail` admin RPCs: the daemon principal
+/// can walk the chain and read records; any other caller is rejected before
+/// the handler runs (daemon-principal-only read path).
+#[tokio::test]
+async fn audit_verify_and_tail_admin_rpcs() {
+    let (mut cfg, _buf) = make_test_config();
+    let (dir, _log) = super::attach_test_audit_log(&mut cfg);
+    cfg.config.audit_log_path = Some(dir.path().join("audit.jsonl"));
+    let caller = CallerIdentity::Unix { uid: 1000 };
+
+    let result = execute_command(basic_request("id", vec![]), &cfg, &caller).await;
+    assert!(result.policy_allowed());
+
+    let admin = CallerIdentity::Unix {
+        uid: cfg.config.daemon_uid,
+    };
+    match handle_admin_request(&cfg, &admin, AdminRequest::AuditVerify).await {
+        AdminResponse::AuditVerification { verification, .. } => {
+            assert!(verification.intact, "{verification:?}");
+            assert_eq!(verification.records, 1);
+        }
+        other => panic!("expected AuditVerification, got {other:?}"),
+    }
+    match handle_admin_request(&cfg, &admin, AdminRequest::AuditTail { limit: None }).await {
+        AdminResponse::AuditRecords { items, .. } => {
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0]["kind"], "ALLOWED");
+        }
+        other => panic!("expected AuditRecords, got {other:?}"),
+    }
+
+    // A non-daemon caller cannot read the audit log.
+    let outsider = CallerIdentity::Unix {
+        uid: cfg.config.daemon_uid.wrapping_add(1),
+    };
+    match handle_admin_request(&cfg, &outsider, AdminRequest::AuditVerify).await {
+        AdminResponse::Error { message } => {
+            assert!(message.contains("not the daemon principal"), "{message}")
+        }
+        other => panic!("expected rejection, got {other:?}"),
+    }
+}
+
+/// When the durable audit sink cannot be written, an allow decision fails
+/// closed: the command is denied rather than executed unaudited.
+#[tokio::test]
+async fn audit_sink_write_failure_fails_closed_on_allow() {
+    let (mut cfg, _buf) = make_test_config();
+    let (dir, log) = super::attach_test_audit_log(&mut cfg);
+    let caller = CallerIdentity::Unix { uid: 1000 };
+
+    // Sanity: with a healthy sink, the deterministic safe allow executes.
+    let ok = execute_command(basic_request("id", vec![]), &cfg, &caller).await;
+    assert!(ok.policy_allowed(), "id is a deterministic safe allow");
+
+    log.fail_appends_for_tests(true);
+    let result = execute_command(basic_request("id", vec![]), &cfg, &caller).await;
+    assert!(
+        !result.policy_allowed(),
+        "an unauditable allow must be denied: {:?}",
+        result.exec
+    );
+    assert!(
+        result.policy_reason().contains("audit log unavailable"),
+        "denial names the audit failure: {}",
+        result.policy_reason()
+    );
+    assert!(
+        matches!(result.exec, ExecOutcome::NotAttempted),
+        "the command must not execute: {:?}",
+        result.exec
+    );
+
+    // Recovery: once the sink writes again, allows resume and the chain on
+    // disk is intact (failed appends never wrote partial records).
+    log.fail_appends_for_tests(false);
+    let again = execute_command(basic_request("id", vec![]), &cfg, &caller).await;
+    assert!(again.policy_allowed());
+    let verification =
+        guard::audit::verify_chain(&dir.path().join("audit.jsonl")).expect("verify chain");
+    assert!(verification.intact, "{verification:?}");
 }
 
 /// NUL can never be a legitimate argv byte; the wire boundary rejects it

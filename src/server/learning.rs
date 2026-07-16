@@ -21,7 +21,7 @@ use crate::shim::ShimGenerator;
 use anyhow::Result;
 use guard::gating::Reversibility;
 use guard::learned_rules::{AutoShimMode, LearningOutcome};
-use guard::redact::{audit_escape, command_line};
+use guard::redact::command_line;
 use std::path::PathBuf;
 
 use super::execute::persist_session_snapshot;
@@ -237,14 +237,16 @@ pub(super) async fn maybe_promote_deny_shape(
         return hint;
     }
     let evaluator = server.state.evaluator.clone();
+    let audit_sink = server.state.audit.clone();
     tokio::spawn(async move {
         match evaluator.try_promote_deny_shape(&outcome).await {
             Ok(true) => {
-                tracing::info!(target: "guard::audit",
-                    "[AUDIT] DENY_SHAPE_LEARNED service={} binary={} denials={}",
-                    audit_escape(&outcome.service),
-                    audit_escape(&outcome.binary),
-                    outcome.denials
+                let _ = guard::audit::emit(
+                    audit_sink.as_deref(),
+                    &guard::audit::AuditEvent::new(guard::audit::AuditKind::DenyShapeLearned)
+                        .field("service", &outcome.service)
+                        .field("binary", &outcome.binary)
+                        .field("denials", outcome.denials),
                 );
             }
             Ok(false) => {
@@ -307,6 +309,7 @@ pub(super) async fn maybe_promote_allow_verb(
     }
     let evaluator = server.state.evaluator.clone();
     let verbs = server.state.verbs.clone();
+    let audit_sink = server.state.audit.clone();
     tokio::spawn(async move {
         // `Ok(None)` here means "not confident yet" or a transient LLM
         // failure -- both should keep retrying as more evidence accumulates,
@@ -342,12 +345,13 @@ pub(super) async fn maybe_promote_allow_verb(
         let mut cat = verbs.write().await;
         match cat.append_verb(&verb) {
             Ok(()) => {
-                tracing::info!(target: "guard::audit",
-                    "[AUDIT] VERB_AUTO_PROMOTED name={} binary={} consequence={} approvals={}",
-                    audit_escape(&verb.name),
-                    audit_escape(&verb.binary),
-                    verb.consequence.as_str(),
-                    outcome.approvals
+                let _ = guard::audit::emit(
+                    audit_sink.as_deref(),
+                    &guard::audit::AuditEvent::new(guard::audit::AuditKind::VerbAutoPromoted)
+                        .field("name", &verb.name)
+                        .field("binary", &verb.binary)
+                        .field("consequence", verb.consequence.as_str())
+                        .field("approvals", outcome.approvals),
                 );
             }
             Err(err) => {

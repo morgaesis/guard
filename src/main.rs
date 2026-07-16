@@ -151,9 +151,9 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
 }
 
 use cli_client::{
-    handle_api, handle_approval_note_cmd, handle_approvals, handle_config, handle_gate_action,
-    handle_grant, handle_provisionals, handle_session, handle_status, handle_verb, run_exec,
-    run_mcp, GatingOptions, RunInjections, SshHostKeyCliMode,
+    handle_api, handle_approval_note_cmd, handle_approvals, handle_audit_tail, handle_audit_verify,
+    handle_config, handle_gate_action, handle_grant, handle_provisionals, handle_session,
+    handle_status, handle_verb, run_exec, run_mcp, GatingOptions, RunInjections, SshHostKeyCliMode,
 };
 use cli_secrets::handle_secrets;
 use cli_server::run_server;
@@ -404,6 +404,33 @@ enum MainArgs {
     /// Run or list operator-defined verbs (the typed, least-expressive interface).
     #[clap(subcommand)]
     Verb(VerbCommands),
+    /// Inspect the daemon's hash-chained audit log. Daemon-principal only.
+    #[clap(subcommand)]
+    Audit(AuditCommands),
+}
+
+#[derive(Subcommand)]
+enum AuditCommands {
+    /// Walk the audit chain from genesis and report intact or the first
+    /// broken sequence (any truncation, edit, or reorder breaks the chain).
+    Verify {
+        #[arg(long)]
+        socket: Option<String>,
+        /// Emit the machine-readable verification result.
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
+    /// Print the most recent audit records.
+    Tail {
+        /// Number of records to print (default 20).
+        #[arg(short = 'n', long = "lines", value_name = "N")]
+        n: Option<usize>,
+        #[arg(long)]
+        socket: Option<String>,
+        /// Emit machine-readable audit records.
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1168,6 +1195,11 @@ enum ServerCommands {
         #[arg(long, value_name = "PATH")]
         state_db: Option<PathBuf>,
 
+        /// Append-only hash-chained JSONL audit log path. Defaults to
+        /// audit.jsonl in the state directory. Env: GUARD_AUDIT_LOG.
+        #[arg(long = "audit-log", value_name = "PATH")]
+        audit_log: Option<PathBuf>,
+
         /// Retain ended session grants and command interactions for this many
         /// seconds. Env: GUARD_HISTORY_RETENTION_SECS. Default: 86400.
         #[arg(long = "history-retention", value_name = "SECONDS")]
@@ -1766,6 +1798,10 @@ async fn run_main() -> Result<()> {
             socket,
         }) => handle_approval_note_cmd(socket, handle, text).await,
         Ok(MainArgs::Verb(subcommand)) => handle_verb(subcommand).await,
+        Ok(MainArgs::Audit(subcommand)) => match subcommand {
+            AuditCommands::Verify { socket, json } => handle_audit_verify(socket, json).await,
+            AuditCommands::Tail { n, socket, json } => handle_audit_tail(socket, n, json).await,
+        },
         Ok(MainArgs::Secrets(subcommand)) => handle_secrets(subcommand).await,
         Ok(MainArgs::Shim {
             json,
@@ -2014,11 +2050,13 @@ fn format_optional_timestamp(ts: Option<u64>) -> String {
 
 fn log_cli_usage_error(args: &[String], error: &clap::Error) {
     let command_path = cli_command_path(args);
-    tracing::warn!(target: "guard::audit",
-        "[AUDIT] CLI_USAGE_ERROR command={} kind={:?} argc={}",
-        guard::redact::audit_escape(&command_path),
-        error.kind(),
-        args.len()
+    // Client-side event: no durable sink is installed in the CLI process, so
+    // this reaches the stderr projection only.
+    let _ = guard::audit::emit_global(
+        &guard::audit::AuditEvent::new(guard::audit::AuditKind::CliUsageError)
+            .field("command", command_path)
+            .field("kind", format!("{:?}", error.kind()))
+            .field("argc", args.len()),
     );
 }
 
@@ -2098,6 +2136,7 @@ fn print_help_tree(admin: bool) {
         println!("    confirm|revert <handle>");
         println!("    verb create --prompt <text>");
         println!("    verb delete <name>");
+        println!("    audit verify|tail [-n N]");
     } else {
         println!();
         println!(

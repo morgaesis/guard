@@ -291,18 +291,24 @@ impl CommandAdmission {
 
     fn audit(&self, event: &str) {
         let counters = self.snapshot();
-        tracing::info!(target: "guard::audit",
-            "[AUDIT] COMMAND_ADMISSION event={} handler_attempted={} handler_admitted={} handler_rejected={} evaluator_attempted={} evaluator_admitted={} evaluator_rate_limited={} evaluator_concurrency_limited={} evaluator_errors={} evaluator_circuit_rejections={}",
-            event,
-            counters.handler_attempted,
-            counters.handler_admitted,
-            counters.handler_rejected,
-            counters.evaluator_attempted,
-            counters.evaluator_admitted,
-            counters.evaluator_rate_limited,
-            counters.evaluator_concurrency_limited,
-            counters.evaluator_errors,
-            counters.evaluator_circuit_rejections
+        let _ = guard::audit::emit_global(
+            &guard::audit::AuditEvent::new(guard::audit::AuditKind::CommandAdmission)
+                .field("event", event)
+                .field("handler_attempted", counters.handler_attempted)
+                .field("handler_admitted", counters.handler_admitted)
+                .field("handler_rejected", counters.handler_rejected)
+                .field("evaluator_attempted", counters.evaluator_attempted)
+                .field("evaluator_admitted", counters.evaluator_admitted)
+                .field("evaluator_rate_limited", counters.evaluator_rate_limited)
+                .field(
+                    "evaluator_concurrency_limited",
+                    counters.evaluator_concurrency_limited,
+                )
+                .field("evaluator_errors", counters.evaluator_errors)
+                .field(
+                    "evaluator_circuit_rejections",
+                    counters.evaluator_circuit_rejections,
+                ),
         );
     }
 }
