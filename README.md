@@ -165,6 +165,7 @@ tool-native access control, backups, and network segmentation. See
 | Document | Contents |
 |---|---|
 | [INSTALL.md](INSTALL.md) | Binary installation and initial endpoint setup |
+| [Release verification](docs/release-verification.md) | Checksums, SBOMs, and signed build provenance |
 | [DEPLOYMENT.md](DEPLOYMENT.md) | Service accounts, hardening, and unattended operation |
 | [Configuration](docs/configuration.md) | Environment, endpoints, evaluator, and state |
 | [Saved grants and sessions](docs/saved-grants.md) | Reusable authority, live sessions, and requests |
