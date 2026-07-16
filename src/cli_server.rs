@@ -1,5 +1,22 @@
-use super::*;
+use super::{
+    color_enabled_for_stderr, env_pairs_to_map, paint, parse_env_bool, resolve_bool_flag,
+    secret_pairs_to_map, AnsiColor, ServerCommands,
+};
+use crate::cli_client::handle_status;
+use crate::injection::{collect_unique_pairs, is_valid_env_name};
+use crate::{
+    client_config, daemon_client, defaults, grant_profile, secrets, server, session, session_store,
+    tool_config,
+};
+use anyhow::{Context, Result};
+use guard::env::guard_env;
+use guard::learned_rules::{AutoShimMode, LearnedRuleStore, LearningConfig};
+use guard::policy::PolicyMode;
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::RwLock;
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -414,7 +431,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             let resolved_timeout = llm_timeout
                 .or_else(|| guard_env("LLM_TIMEOUT").and_then(|v| v.parse::<u64>().ok()))
                 .unwrap_or(30);
-            let mut eval_config = evaluate::EvalConfig::default()
+            let mut eval_config = guard::evaluate::EvalConfig::default()
                 .llm_enabled(llm_enabled)
                 .gate_mode(gate_mode)
                 .llm_timeout_secs(resolved_timeout);
@@ -433,7 +450,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             // Model resolution precedence (single primary model):
             //   1. --llm-model CLI flag
             //   2. GUARD_LLM_MODEL env var (singular - primary model)
-            //   3. evaluate::EvalConfig default (DEFAULT_MODEL in evaluate.rs)
+            //   3. guard::evaluate::EvalConfig default (DEFAULT_MODEL in evaluate.rs)
             //
             // The fallback chain (GUARD_LLM_MODELS / --llm-models) is
             // resolved separately below and, when set, takes precedence over
@@ -501,10 +518,10 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             let cache_enabled = !no_cache && cache_env_enabled;
             let cache_capacity = cache_capacity
                 .or_else(|| guard_env("CACHE_CAPACITY").and_then(|v| v.parse::<usize>().ok()))
-                .unwrap_or(evaluate::DEFAULT_CACHE_CAPACITY);
+                .unwrap_or(guard::evaluate::DEFAULT_CACHE_CAPACITY);
             let cache_ttl_secs = cache_ttl
                 .or_else(|| guard_env("CACHE_TTL").and_then(|v| v.parse::<u64>().ok()))
-                .unwrap_or(evaluate::DEFAULT_CACHE_TTL_SECS);
+                .unwrap_or(guard::evaluate::DEFAULT_CACHE_TTL_SECS);
             eval_config = eval_config
                 .cache_enabled(cache_enabled)
                 .cache_capacity(cache_capacity)
@@ -844,8 +861,8 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             let api_judge_cache_ttl = std::time::Duration::from_secs(cache_ttl_secs);
 
             tracing::info!("Creating evaluator...");
-            let evaluator =
-                evaluate::Evaluator::new(eval_config).context("Failed to create evaluator")?;
+            let evaluator = guard::evaluate::Evaluator::new(eval_config)
+                .context("Failed to create evaluator")?;
             tracing::info!("Evaluator created successfully");
 
             // Redaction is server-side only, controlled by CLI flag.
@@ -1664,7 +1681,7 @@ fn is_supported_api_loopback(ip: std::net::IpAddr) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn build_named_api_proxy(
     spec: ApiEndpointSpec,
-    llm: &crate::evaluate::LlmConfig,
+    llm: &guard::evaluate::LlmConfig,
     cache_enabled: bool,
     cache_capacity: usize,
     cache_ttl: Duration,
@@ -1931,7 +1948,7 @@ mod api_endpoint_tests {
             "apiVersion: v1\nkind: Config\ncurrent-context: ctx\nclusters:\n  - name: c\n    cluster:\n      server: https://127.0.0.1:6443\ncontexts:\n  - name: ctx\n    context: {cluster: c, user: u}\nusers:\n  - name: u\n    user: {token: test-only}\n",
         )
         .unwrap();
-        let llm = crate::evaluate::LlmConfig {
+        let llm = guard::evaluate::LlmConfig {
             enabled: false,
             api_key: None,
             api_url: None,

@@ -14,6 +14,7 @@
 use crate::grant_profile::{EvaluationMode, GrantRequestDelta};
 use guard::env::now_unix;
 use guard::policy::{Decision, PolicyRule};
+use guard::redact::command_line;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::collections::{BTreeMap, HashMap};
@@ -183,11 +184,13 @@ pub struct HistoricalGrant {
     pub prompt_append: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub generated_notes: Vec<String>,
+    /// Recorded grant posture, round-tripped through the `session_history`
+    /// state-DB columns (see `session_store`). Never serialized on the wire.
     #[serde(default, skip_serializing)]
-    #[allow(dead_code)]
     pub static_only: bool,
+    /// Recorded grant posture, round-tripped through the `session_history`
+    /// state-DB columns (see `session_store`). Never serialized on the wire.
     #[serde(default, skip_serializing)]
-    #[allow(dead_code)]
     pub auto_amend: bool,
 }
 
@@ -227,12 +230,6 @@ pub struct SessionGrantSummary {
     pub prompt_append: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub generated_notes: Vec<String>,
-    #[serde(default, skip_serializing)]
-    #[allow(dead_code)]
-    pub static_only: bool,
-    #[serde(default, skip_serializing)]
-    #[allow(dead_code)]
-    pub auto_amend: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -520,8 +517,6 @@ impl SessionRegistry {
                 granted_at: g.granted_at,
                 prompt_append: g.prompt_append.clone(),
                 generated_notes: g.generated_notes.clone(),
-                static_only: g.static_only,
-                auto_amend: g.auto_amend,
             })
             .collect()
     }
@@ -578,8 +573,6 @@ impl SessionRegistry {
                     granted_at: grant.granted_at,
                     prompt_append: grant.prompt_append.clone(),
                     generated_notes: grant.generated_notes.clone(),
-                    static_only: grant.static_only,
-                    auto_amend: grant.auto_amend,
                 })
             }
         });
@@ -1150,14 +1143,6 @@ fn historical(
         generated_notes: grant.generated_notes,
         static_only: grant.static_only,
         auto_amend: grant.auto_amend,
-    }
-}
-
-fn command_line(cmd: &str, args: &[String]) -> String {
-    if args.is_empty() {
-        cmd.to_string()
-    } else {
-        format!("{} {}", cmd, args.join(" "))
     }
 }
 
@@ -1767,18 +1752,9 @@ mod tests {
             granted_at: 1,
             prompt_append: None,
             generated_notes: Vec::new(),
-            static_only: true,
-            auto_amend: true,
         };
         let json = serde_json::to_value(summary).unwrap();
-        for hidden in [
-            "allow",
-            "deny",
-            "allow_exact",
-            "deny_exact",
-            "static_only",
-            "auto_amend",
-        ] {
+        for hidden in ["allow", "deny", "allow_exact", "deny_exact"] {
             assert!(json.get(hidden).is_none(), "{hidden} leaked: {json}");
         }
         assert_eq!(json["override_markers"][0], "operator:apply");

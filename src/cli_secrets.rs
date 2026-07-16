@@ -1,6 +1,8 @@
-use super::*;
-
+use super::{print_json, SecretCommands, JSON_SCHEMA_VERSION};
 use crate::cli_client::{admin_client, resolve_client_endpoint};
+use crate::{client_config, server};
+use anyhow::{Context, Result};
+use std::io::{IsTerminal, Read};
 
 pub(crate) async fn handle_secrets(subcommand: SecretCommands) -> Result<()> {
     let config = client_config::ClientConfig::load().ok().unwrap_or_default();

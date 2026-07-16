@@ -493,22 +493,8 @@ impl HttpRequest {
         else {
             return false;
         };
-        constant_time_eq(presented.as_bytes(), expected.as_bytes())
+        crate::server::constant_time_eq(presented.as_bytes(), expected.as_bytes())
     }
-}
-
-/// Length-checked, branch-stable byte comparison. Returns false immediately on
-/// a length mismatch (the lengths are not secret), then ORs every byte diff so
-/// the loop runs to completion regardless of where the first mismatch is.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 /// Read one HTTP/1.1 request: the request line, headers, and exactly
@@ -2065,6 +2051,7 @@ mod tests {
 
     #[test]
     fn constant_time_eq_matches_only_on_equal_bytes() {
+        use crate::server::constant_time_eq;
         assert!(constant_time_eq(b"token", b"token"));
         assert!(!constant_time_eq(b"token", b"tokem"));
         assert!(!constant_time_eq(b"token", b"token-longer"));

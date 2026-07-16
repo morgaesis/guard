@@ -1,4 +1,15 @@
-use super::*;
+use super::{
+    color_enabled_for_stderr, color_enabled_for_stdout, format_optional_timestamp,
+    format_timestamp, paint, print_json, AnsiColor, ApiCommands, ConfigCommands, GrantCommands,
+    GrantRequestCommands, McpCommands, SessionCommands, VerbCommands, VerbCoverageCommands,
+    EXIT_GUARD_DENIED, EXIT_GUARD_HELD, JSON_SCHEMA_VERSION,
+};
+use crate::{client_config, daemon_client, defaults, mcp, server, session};
+use anyhow::{Context, Result};
+use guard::env::guard_env;
+use std::collections::HashMap;
+use std::io::Write;
+use std::path::PathBuf;
 
 /// Consequence-gating options parsed from `guard run` flags.
 pub(crate) struct GatingOptions {

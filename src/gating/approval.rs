@@ -115,11 +115,7 @@ pub struct ApprovalSnapshot {
 
 impl ApprovalSnapshot {
     pub fn command_line(&self) -> String {
-        if self.args.is_empty() {
-            self.binary.clone()
-        } else {
-            format!("{} {}", self.binary, self.args.join(" "))
-        }
+        crate::redact::command_line(&self.binary, &self.args)
     }
 
     /// Short, stable fingerprint shown to the operator so two visually-similar

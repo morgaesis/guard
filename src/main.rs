@@ -21,19 +21,14 @@ mod tool_config;
 #[cfg(windows)]
 mod winsvc;
 
-use guard::evaluate;
-use guard::learned_rules::{AutoShimMode, LearnedRuleStore, LearningConfig};
-use guard::redact;
-
-use anyhow::{Context, Result};
+#[cfg(windows)]
+use anyhow::Context;
+use anyhow::Result;
 use clap::{ArgAction, CommandFactory, Parser, Subcommand};
-use guard::policy::PolicyMode;
 use injection::{collect_unique_pairs, derive_env_name, is_valid_env_name};
 use std::collections::HashMap;
-use std::io::{IsTerminal, Read, Write};
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::RwLock;
 use tracing_subscriber::filter::{filter_fn, FilterExt};
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::FormatTime;
@@ -2021,7 +2016,7 @@ fn log_cli_usage_error(args: &[String], error: &clap::Error) {
     let command_path = cli_command_path(args);
     tracing::warn!(target: "guard::audit",
         "[AUDIT] CLI_USAGE_ERROR command={} kind={:?} argc={}",
-        redact::audit_escape(&command_path),
+        guard::redact::audit_escape(&command_path),
         error.kind(),
         args.len()
     );

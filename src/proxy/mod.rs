@@ -46,7 +46,7 @@ pub use kubeconfig::{
     brokered_kubeconfig, brokered_kubeconfig_with_session, valid_guard_session_token,
     validate_brokered_kubeconfig, validate_brokered_kubeconfig_with_session, BrokerError,
 };
-pub use op::{ApiOp, Verb};
+pub use op::ApiOp;
 pub use policy::{ApiAction, ApiPolicy, ApiRule};
 pub use protocol::{CreatedIdentity, NonResourceRead, PlannedRevert, ProtocolConfig};
 pub use server::{ApiListenerMode, ApiProxy};

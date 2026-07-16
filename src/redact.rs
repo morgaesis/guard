@@ -2,6 +2,19 @@ use regex::Regex;
 use std::borrow::Cow;
 use std::sync::OnceLock;
 
+/// Render a command as one display line: the binary followed by its arguments,
+/// space-separated. This is the single renderer for operator-facing and audit
+/// surfaces (approval snapshots, session rules, audit records). It performs no
+/// escaping or redaction; those are applied separately at the audit boundary
+/// (see [`audit_escape`] and [`redact_output`]).
+pub fn command_line(binary: &str, args: &[String]) -> String {
+    if args.is_empty() {
+        binary.to_string()
+    } else {
+        format!("{} {}", binary, args.join(" "))
+    }
+}
+
 /// Escape a value for interpolation into a plain-text `[AUDIT]` line so one
 /// logical audit record is always exactly one physical line. Without this, a
 /// caller-controlled value containing a newline (argv, deny reason, path)

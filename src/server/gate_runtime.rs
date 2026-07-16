@@ -525,7 +525,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
             session_context
                 .map(|context| context.fingerprint.as_str())
                 .unwrap_or("none"),
-            crate::redact::audit_escape(&api_snapshot.label),
+            guard::redact::audit_escape(&api_snapshot.label),
             api_snapshot.body_sha256,
             self.config.approval_ttl_secs
         );
@@ -745,11 +745,11 @@ async fn assess_revert(
         .evaluate_with_context(&revert_line, Some(&context))
         .await
     {
-        crate::evaluate::EvalResult::Allow { .. } => RevertAssessment::Sensible,
-        crate::evaluate::EvalResult::Deny { reason, .. } => {
+        guard::evaluate::EvalResult::Allow { .. } => RevertAssessment::Sensible,
+        guard::evaluate::EvalResult::Deny { reason, .. } => {
             RevertAssessment::NeedsReview(format!("rollback not affirmed by policy: {reason}"))
         }
-        crate::evaluate::EvalResult::Error(e) => {
+        guard::evaluate::EvalResult::Error(e) => {
             RevertAssessment::NeedsReview(format!("rollback could not be evaluated: {e}"))
         }
     }
@@ -974,42 +974,7 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
 /// Arm a containment envelope: persist the provisional, run the forward command,
 /// then mark it armed with an auto-revert deadline.
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-pub(super) async fn arm_containment<W: AsyncWrite + Unpin>(
-    request: ExecuteRequest,
-    config: &ServerConfig,
-    caller: &CallerIdentity,
-    caller_principal: Option<PrincipalKey>,
-    reason: String,
-    depth: u32,
-    stream_output: bool,
-    stream_writer: &mut W,
-) -> ExecuteResult {
-    let authority = match request.session_token.as_deref() {
-        Some(token) => config
-            .sessions
-            .read()
-            .await
-            .authority_snapshot(token)
-            .map(SessionAuthoritySnapshot::from),
-        None => None,
-    };
-    arm_containment_with_authority(
-        request,
-        config,
-        caller,
-        caller_principal,
-        reason,
-        depth,
-        stream_output,
-        stream_writer,
-        authority,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn arm_containment_with_authority<W: AsyncWrite + Unpin>(
+pub(super) async fn arm_containment_with_authority<W: AsyncWrite + Unpin>(
     request: ExecuteRequest,
     config: &ServerConfig,
     caller: &CallerIdentity,
@@ -1259,46 +1224,7 @@ async fn arm_containment_with_authority<W: AsyncWrite + Unpin>(
 
 /// Hold an irreversible/uncertain/high-risk command for operator approval.
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-pub(super) async fn hold_for_approval<W: AsyncWrite + Unpin>(
-    request: ExecuteRequest,
-    config: &ServerConfig,
-    caller: &CallerIdentity,
-    caller_principal: Option<PrincipalKey>,
-    reason: String,
-    risk: Option<i32>,
-    reversibility: Option<Reversibility>,
-    verb: Option<VerbContext>,
-    stream_output: bool,
-    stream_writer: &mut W,
-) -> ExecuteResult {
-    let authority = match request.session_token.as_deref() {
-        Some(token) => config
-            .sessions
-            .read()
-            .await
-            .authority_snapshot(token)
-            .map(SessionAuthoritySnapshot::from),
-        None => None,
-    };
-    hold_for_approval_with_authority(
-        request,
-        config,
-        caller,
-        caller_principal,
-        reason,
-        risk,
-        reversibility,
-        verb,
-        stream_output,
-        stream_writer,
-        authority,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn hold_for_approval_with_authority<W: AsyncWrite + Unpin>(
+pub(super) async fn hold_for_approval_with_authority<W: AsyncWrite + Unpin>(
     request: ExecuteRequest,
     config: &ServerConfig,
     caller: &CallerIdentity,
@@ -2282,7 +2208,7 @@ async fn defer_revert(
         p.handle,
         caller,
         kind,
-        crate::redact::audit_escape(&detail)
+        guard::redact::audit_escape(&detail)
     );
     config.emit_event(NotifyEvent {
         event: "decision_made",

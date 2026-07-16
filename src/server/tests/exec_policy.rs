@@ -2,7 +2,7 @@ use crate::server::admin::handle_admin_request;
 #[cfg(windows)]
 use crate::server::binary_path_candidates;
 #[cfg(unix)]
-use crate::server::execute::exec_after_approval;
+use crate::server::execute::exec_after_approval_with_secret_authority;
 use crate::server::execute::{
     audit_command_line, audit_session_fingerprint, evaluation_context_prompt, execute_command,
     log_audit_policy_for_request,
@@ -269,7 +269,7 @@ async fn secret_exposure_is_audited_only_after_successful_spawn() {
         "test/secret-exposure-success".into(),
     );
     let mut sink = tokio::io::sink();
-    let result = exec_after_approval(
+    let result = exec_after_approval_with_secret_authority(
         request,
         &cfg,
         &caller,
@@ -277,6 +277,7 @@ async fn secret_exposure_is_audited_only_after_successful_spawn() {
         0,
         false,
         &mut sink,
+        None,
     )
     .await;
     assert_eq!(result.exit_code(), Some(0));
@@ -314,7 +315,7 @@ async fn secret_exposure_is_audited_only_after_successful_spawn() {
         "test/secret-exposure-failed-spawn".into(),
     );
     let mut sink = tokio::io::sink();
-    let result = exec_after_approval(
+    let result = exec_after_approval_with_secret_authority(
         request,
         &cfg,
         &caller,
@@ -322,6 +323,7 @@ async fn secret_exposure_is_audited_only_after_successful_spawn() {
         0,
         false,
         &mut sink,
+        None,
     )
     .await;
     assert!(result.exposed_secret_refs().is_empty());
@@ -374,7 +376,7 @@ async fn saved_grant_entitlement_covers_tool_config_secret_refs() {
     let mut request = basic_request("true", Vec::new());
     request.session_token = Some("tool-secret-session".to_string());
     let mut sink = tokio::io::sink();
-    let result = exec_after_approval(
+    let result = exec_after_approval_with_secret_authority(
         request,
         &cfg,
         &caller,
@@ -382,6 +384,7 @@ async fn saved_grant_entitlement_covers_tool_config_secret_refs() {
         0,
         false,
         &mut sink,
+        None,
     )
     .await;
     match result.exec {
@@ -524,7 +527,7 @@ async fn streaming_secret_exposure_is_recorded_even_on_nonzero_exit() {
     let mut sink = tokio::io::sink();
     let (result, logs) = capture_async(
         &buf,
-        exec_after_approval(
+        exec_after_approval_with_secret_authority(
             request,
             &cfg,
             &caller,
@@ -532,6 +535,7 @@ async fn streaming_secret_exposure_is_recorded_even_on_nonzero_exit() {
             0,
             true,
             &mut sink,
+            None,
         ),
     )
     .await;
@@ -2107,7 +2111,7 @@ async fn secret_file_exists_only_for_child_lifetime_and_failure_exit_cleans_it()
         "child-file-secret".to_string(),
     );
     let mut sink = tokio::io::sink();
-    let result = exec_after_approval(
+    let result = exec_after_approval_with_secret_authority(
         request,
         &cfg,
         &CallerIdentity::Unix { uid: 1000 },
@@ -2115,6 +2119,7 @@ async fn secret_file_exists_only_for_child_lifetime_and_failure_exit_cleans_it()
         0,
         false,
         &mut sink,
+        None,
     )
     .await;
     let path = match result.exec {

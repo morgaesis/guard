@@ -3,12 +3,12 @@ use crate::server::execute::audit_session_fingerprint;
 #[cfg(unix)]
 use crate::server::gate_runtime::run_provisional_check;
 use crate::server::gate_runtime::{
-    approval_to_result, execute_snapshot, hash_secret_value, hold_for_approval, new_handle,
-    now_unix, route_gated_allow, GateInputs,
+    approval_to_result, execute_snapshot, hash_secret_value, hold_for_approval_with_authority,
+    new_handle, now_unix, route_gated_allow, GateInputs, SessionAuthoritySnapshot,
 };
 #[cfg(unix)]
 use crate::server::gate_runtime::{
-    arm_containment, finish_due_provisional, finish_revert, DaemonGateSink,
+    arm_containment_with_authority, finish_due_provisional, finish_revert, DaemonGateSink,
 };
 use crate::server::wire::{
     AdminRequest, AdminResponse, CallerIdentity, ExecOutcome, ExecuteRequest, ExecuteResult,
@@ -33,10 +33,20 @@ use tokio::io::AsyncWrite;
 
 use super::make_test_config;
 
+/// Capture the live session authority the way the daemon does before routing
+/// (`route_gated_allow` receives it in `GateInputs::authority`).
+async fn live_authority(cfg: &ServerConfig, token: &str) -> Option<SessionAuthoritySnapshot> {
+    cfg.sessions
+        .read()
+        .await
+        .authority_snapshot(token)
+        .map(SessionAuthoritySnapshot::from)
+}
+
 // ---- Consequence-gating orchestration tests -----------------------------
 //
-// These drive the daemon orchestration in this file (arm_containment,
-// hold_for_approval, handle_admin_request -> confirm/approve/deny/revert,
+// These drive the daemon orchestration in this file (arm_containment_with_authority,
+// hold_for_approval_with_authority, handle_admin_request -> confirm/approve/deny/revert,
 // and the sweeper's expire/auto-revert steps) directly in-process, so the
 // invariants the Docker CTF (ctf/gating) checks end-to-end are also caught
 // by `cargo test`. Tests that must spawn a real forward/revert child use
@@ -69,7 +79,7 @@ fn gating_config(
     (cfg, operator, agent)
 }
 
-/// A request with a structured revert, used to drive `arm_containment`.
+/// A request with a structured revert, used to drive `arm_containment_with_authority`.
 fn contain_request(binary: &str, args: &[&str], revert: RevertSpec) -> ExecuteRequest {
     ExecuteRequest {
         binary: binary.to_string(),
@@ -193,7 +203,7 @@ async fn containment_stays_armed_when_client_stream_drops_after_launch() {
     );
     let mut writer = FlakyWriter::failing_after(0);
 
-    let result = arm_containment(
+    let result = arm_containment_with_authority(
         request,
         &cfg,
         &agent,
@@ -202,6 +212,7 @@ async fn containment_stays_armed_when_client_stream_drops_after_launch() {
         0,
         true, // stream_output: exercise the streaming failure path
         &mut writer,
+        None,
     )
     .await;
     tokio::time::sleep(std::time::Duration::from_millis(450)).await;
@@ -260,7 +271,7 @@ async fn containment_dropped_when_forward_fails_to_spawn() {
     );
     let mut sink = tokio::io::sink();
 
-    let result = arm_containment(
+    let result = arm_containment_with_authority(
         request,
         &cfg,
         &agent,
@@ -269,6 +280,7 @@ async fn containment_dropped_when_forward_fails_to_spawn() {
         0,
         false,
         &mut sink,
+        None,
     )
     .await;
 
@@ -298,7 +310,7 @@ async fn contain_then_operator_confirm_keeps_change_nonoperator_refused() {
 
     let request = contain_request("true", &[], RevertSpec::new("true", Vec::new()));
     let mut sink = tokio::io::sink();
-    let result = arm_containment(
+    let result = arm_containment_with_authority(
         request,
         &cfg,
         &agent,
@@ -307,6 +319,7 @@ async fn contain_then_operator_confirm_keeps_change_nonoperator_refused() {
         0,
         false,
         &mut sink,
+        None,
     )
     .await;
     let handle = match &result.exec {
@@ -379,7 +392,7 @@ async fn contain_then_deadline_triggers_sweeper_autorevert() {
     let mut request = contain_request("true", &[], RevertSpec::new("true", Vec::new()));
     request.confirm_within_secs = Some(1);
     let mut sink = tokio::io::sink();
-    let result = arm_containment(
+    let result = arm_containment_with_authority(
         request,
         &cfg,
         &agent,
@@ -388,6 +401,7 @@ async fn contain_then_deadline_triggers_sweeper_autorevert() {
         0,
         false,
         &mut sink,
+        None,
     )
     .await;
     let handle = match &result.exec {
@@ -453,7 +467,7 @@ async fn due_confirm_check_reuses_secret_bindings_and_keeps_the_change() {
         .secret_files
         .insert("CHECK_TOKEN_FILE".into(), "check-token".into());
     let mut sink = tokio::io::sink();
-    let result = arm_containment(
+    let result = arm_containment_with_authority(
         request,
         &cfg,
         &agent,
@@ -462,6 +476,7 @@ async fn due_confirm_check_reuses_secret_bindings_and_keeps_the_change() {
         0,
         false,
         &mut sink,
+        live_authority(&cfg, "check-session").await,
     )
     .await;
     let handle = match result.exec {
@@ -505,7 +520,7 @@ async fn due_failed_confirm_check_runs_the_rollback() {
     });
     let request = contain_request("true", &[], revert);
     let mut sink = tokio::io::sink();
-    let result = arm_containment(
+    let result = arm_containment_with_authority(
         request,
         &cfg,
         &agent,
@@ -514,6 +529,7 @@ async fn due_failed_confirm_check_runs_the_rollback() {
         0,
         false,
         &mut sink,
+        None,
     )
     .await;
     let handle = match result.exec {
@@ -553,7 +569,7 @@ async fn containment_check_cannot_bypass_the_server_binary_floor() {
         revert,
     );
     let mut sink = tokio::io::sink();
-    let result = arm_containment(
+    let result = arm_containment_with_authority(
         request,
         &cfg,
         &agent,
@@ -562,6 +578,7 @@ async fn containment_check_cannot_bypass_the_server_binary_floor() {
         0,
         false,
         &mut sink,
+        None,
     )
     .await;
 
@@ -621,7 +638,7 @@ async fn provisional_revert_reresolves_secret_after_restart() {
         .insert("REVERT_TOKEN_FILE".to_string(), secret_key.clone());
 
     let mut sink = tokio::io::sink();
-    let result = arm_containment(
+    let result = arm_containment_with_authority(
         request,
         &cfg,
         &agent,
@@ -630,6 +647,7 @@ async fn provisional_revert_reresolves_secret_after_restart() {
         0,
         false,
         &mut sink,
+        None,
     )
     .await;
     let handle = match result.exec {
@@ -740,7 +758,7 @@ async fn containment_refuses_plain_env_before_forward_exec() {
         .insert("MODE".to_string(), "cleanup".to_string());
 
     let mut sink = tokio::io::sink();
-    let result = arm_containment(
+    let result = arm_containment_with_authority(
         request,
         &cfg,
         &agent,
@@ -749,6 +767,7 @@ async fn containment_refuses_plain_env_before_forward_exec() {
         0,
         false,
         &mut sink,
+        None,
     )
     .await;
 
@@ -1212,7 +1231,7 @@ async fn hold_then_operator_approve_executes_snapshot_nonoperator_refused() {
         verb: None,
     };
     let mut sink = tokio::io::sink();
-    let held = hold_for_approval(
+    let held = hold_for_approval_with_authority(
         request,
         &cfg,
         &agent,
@@ -1223,6 +1242,7 @@ async fn hold_then_operator_approve_executes_snapshot_nonoperator_refused() {
         None,
         false,
         &mut sink,
+        None,
     )
     .await;
     let handle = match &held.exec {
@@ -1312,7 +1332,7 @@ async fn approval_rejects_tool_secret_rotated_after_hold() {
         verb: None,
     };
     let mut sink = tokio::io::sink();
-    let held = hold_for_approval(
+    let held = hold_for_approval_with_authority(
         request,
         &cfg,
         &agent,
@@ -1323,6 +1343,7 @@ async fn approval_rejects_tool_secret_rotated_after_hold() {
         None,
         false,
         &mut sink,
+        None,
     )
     .await;
     let ExecOutcome::Held { handle, .. } = held.exec else {
@@ -1604,7 +1625,7 @@ async fn nonstreaming_wait_approval_returns_promptly_on_decision() {
     let cfg2 = cfg.clone();
     let waiter = tokio::spawn(async move {
         let mut sink = tokio::io::sink();
-        hold_for_approval(
+        hold_for_approval_with_authority(
             request,
             &cfg2,
             &agent,
@@ -1615,6 +1636,7 @@ async fn nonstreaming_wait_approval_returns_promptly_on_decision() {
             None,
             false,
             &mut sink,
+            None,
         )
         .await
     });
@@ -1670,7 +1692,7 @@ async fn hold_then_ttl_expiry_denies_fail_closed() {
         verb: None,
     };
     let mut sink = tokio::io::sink();
-    let held = hold_for_approval(
+    let held = hold_for_approval_with_authority(
         request,
         &cfg,
         &agent,
@@ -1681,6 +1703,7 @@ async fn hold_then_ttl_expiry_denies_fail_closed() {
         None,
         false,
         &mut sink,
+        live_authority(&cfg, &session_token).await,
     )
     .await;
     let handle = match &held.exec {
@@ -1761,7 +1784,7 @@ async fn approve_rejected_when_bound_secret_value_changed() {
         verb: None,
     };
     let mut sink = tokio::io::sink();
-    let held = hold_for_approval(
+    let held = hold_for_approval_with_authority(
         request,
         &cfg,
         &agent,
@@ -1772,6 +1795,7 @@ async fn approve_rejected_when_bound_secret_value_changed() {
         None,
         false,
         &mut sink,
+        None,
     )
     .await;
     let handle = match &held.exec {
@@ -1850,7 +1874,7 @@ async fn approve_passes_binding_when_secret_value_unchanged() {
         verb: None,
     };
     let mut sink = tokio::io::sink();
-    let held = hold_for_approval(
+    let held = hold_for_approval_with_authority(
         request,
         &cfg,
         &agent,
@@ -1861,6 +1885,7 @@ async fn approve_passes_binding_when_secret_value_unchanged() {
         None,
         false,
         &mut sink,
+        None,
     )
     .await;
     let handle = match &held.exec {
@@ -1932,7 +1957,7 @@ async fn approve_rejected_when_unresolved_secret_appears_after_hold() {
         verb: None,
     };
     let mut sink = tokio::io::sink();
-    let held = hold_for_approval(
+    let held = hold_for_approval_with_authority(
         request,
         &cfg,
         &agent,
@@ -1943,6 +1968,7 @@ async fn approve_rejected_when_unresolved_secret_appears_after_hold() {
         None,
         false,
         &mut sink,
+        None,
     )
     .await;
     let handle = match &held.exec {
@@ -2011,7 +2037,7 @@ async fn approval_note_operator_and_owner_post_others_refused() {
         verb: None,
     };
     let mut sink = tokio::io::sink();
-    let held = hold_for_approval(
+    let held = hold_for_approval_with_authority(
         request,
         &cfg,
         &agent,
@@ -2022,6 +2048,7 @@ async fn approval_note_operator_and_owner_post_others_refused() {
         None,
         false,
         &mut sink,
+        None,
     )
     .await;
     let handle = match &held.exec {

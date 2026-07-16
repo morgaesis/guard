@@ -9,12 +9,12 @@
 //! - Socket dir: 0755 when managed by socket_group
 //! - Socket: 0600 by default, or 0660 after a successful socket-group change
 
-use crate::evaluate::Evaluator;
 use crate::grant_profile::{GrantRequest, SavedGrantCatalog};
 use crate::injection::is_valid_env_name;
 use crate::secrets::SecretManager;
 use crate::session::{SessionBehaviorLimits, SessionRegistry};
 use crate::session_store::SessionStore;
+use guard::evaluate::Evaluator;
 use guard::gating::approval::ApprovalRegistry;
 use guard::gating::provisional::ProvisionalRegistry;
 use guard::gating::read_grant::GrantReadRegistry;
@@ -104,9 +104,18 @@ pub use wire::{
 };
 pub(crate) use wire::{ExecuteStreamMessage, IncomingMessage};
 
-use crate::redact::audit_escape;
 use execute::{audit_command_line, audit_session_fingerprint};
+use guard::redact::audit_escape;
 use wire::CallerIdentity;
+
+/// Constant-time byte comparison for bearer credentials (auth tokens, admin
+/// tokens, MCP bearers). Backed by `subtle` so the comparison does not leak a
+/// prefix match through timing; a length mismatch returns false (lengths are
+/// not secret).
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
+    a.ct_eq(b).into()
+}
 
 #[derive(Clone)]
 struct ServerConfig {
@@ -341,15 +350,7 @@ impl ServerConfig {
 
     fn validate_token(&self, token: Option<&str>) -> Result<()> {
         if let Some(ref expected) = self.auth_token {
-            let provided = token.unwrap_or("").as_bytes();
-            let expected = expected.as_bytes();
-            // Constant-time comparison to prevent timing side-channel
-            let len_match = provided.len() == expected.len();
-            let byte_match = provided
-                .iter()
-                .zip(expected.iter())
-                .fold(0u8, |acc, (a, b)| acc | (a ^ b));
-            if !len_match || byte_match != 0 {
+            if !constant_time_eq(token.unwrap_or("").as_bytes(), expected.as_bytes()) {
                 anyhow::bail!("invalid auth token");
             }
         }
@@ -360,14 +361,7 @@ impl ServerConfig {
         let Some(ref expected) = self.admin_token else {
             anyhow::bail!("admin token is not configured");
         };
-        let provided = token.unwrap_or("").as_bytes();
-        let expected = expected.as_bytes();
-        let len_match = provided.len() == expected.len();
-        let byte_match = provided
-            .iter()
-            .zip(expected.iter())
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b));
-        if !len_match || byte_match != 0 {
+        if !constant_time_eq(token.unwrap_or("").as_bytes(), expected.as_bytes()) {
             anyhow::bail!("invalid admin token");
         }
         Ok(())

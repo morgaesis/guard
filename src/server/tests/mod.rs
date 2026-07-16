@@ -6,10 +6,10 @@ mod ssh;
 mod verbs;
 mod wire;
 
-use crate::evaluate::{EvalConfig, Evaluator};
 use crate::secrets::{EnvBackend, SecretManager};
 use crate::session::SessionRegistry;
 use crate::tool_config::ToolRegistry;
+use guard::evaluate::{EvalConfig, Evaluator};
 use guard::policy::PolicyMode;
 use std::future::Future;
 use std::io::Write;
