@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use guard::gating::approval::Approval;
 use guard::gating::provisional::Provisional;
 use guard::gating::read_grant::ReadGrant;
+use guard::redact::redact_output_text;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -16,7 +17,10 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
-const SCHEMA_VERSION: i64 = 5;
+/// Version 6 sanitizes persisted command-derived text (recorded argv, deny
+/// reasons, prompts, learned exact rules) with credential redaction; see
+/// `sanitize_persisted_credentials`.
+const SCHEMA_VERSION: i64 = 6;
 const VACUUM_MIN_PAGES: u64 = 512;
 const VACUUM_MIN_FREE_PAGES: u64 = 128;
 
@@ -590,6 +594,11 @@ impl SessionStore {
             "TEXT NOT NULL DEFAULT '[]'",
         )?;
         ensure_column(&tx, "session_interactions", "decision_trace_json", "TEXT")?;
+        // Databases written before schema v6 may hold credential material that
+        // transited a command line (recorded argv, learned rules, prompts).
+        // Sanitize once as part of the migration; the version bump below makes
+        // this pass run exactly once per database.
+        sanitize_persisted_credentials(&tx)?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(())
@@ -1197,6 +1206,140 @@ impl SessionStore {
     }
 }
 
+/// One-time migration pass (schema v6): run credential redaction over
+/// persisted command-derived text so a secret that entered the state database
+/// under an older schema does not outlive the upgrade. Rows are sanitized in
+/// place -- diagnostic utility is kept, credential-shaped values become the
+/// `[REDACTED]` marker. New writes are sanitized before they reach the store
+/// (see `SessionRegistry::record_interaction` and the session amendment
+/// paths), so this only has to cover historical rows.
+fn sanitize_persisted_credentials(conn: &Connection) -> Result<()> {
+    {
+        let mut stmt = conn.prepare(
+            "SELECT rowid, command, reason, decision_trace_json FROM session_interactions",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (rowid, command, reason, trace_json) in rows {
+            let sanitized_command = redact_output_text(&command);
+            let sanitized_reason = redact_output_text(&reason);
+            let sanitized_trace = trace_json.as_deref().map(sanitize_decision_trace_json);
+            if sanitized_command != command
+                || sanitized_reason != reason
+                || sanitized_trace != trace_json
+            {
+                conn.execute(
+                    "UPDATE session_interactions
+                     SET command = ?1, reason = ?2, decision_trace_json = ?3
+                     WHERE rowid = ?4",
+                    params![sanitized_command, sanitized_reason, sanitized_trace, rowid],
+                )?;
+            }
+        }
+    }
+    for table in ["session_grants", "session_history"] {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT rowid, prompt_append, generated_notes_json, allow_json, deny_json, allow_exact_json, deny_exact_json FROM {table}"
+        ))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (rowid, prompt, notes, allow, deny, allow_exact, deny_exact) in rows {
+            let sanitized_prompt = prompt.as_deref().map(redact_output_text);
+            let sanitized_notes = sanitize_string_vec_json(&notes);
+            let sanitized_allow = sanitize_string_vec_json(&allow);
+            let sanitized_deny = sanitize_string_vec_json(&deny);
+            let sanitized_allow_exact = sanitize_exact_rules_json(&allow_exact);
+            let sanitized_deny_exact = sanitize_exact_rules_json(&deny_exact);
+            if sanitized_prompt != prompt
+                || sanitized_notes != notes
+                || sanitized_allow != allow
+                || sanitized_deny != deny
+                || sanitized_allow_exact != allow_exact
+                || sanitized_deny_exact != deny_exact
+            {
+                conn.execute(
+                    &format!(
+                        "UPDATE {table}
+                         SET prompt_append = ?1, generated_notes_json = ?2, allow_json = ?3,
+                             deny_json = ?4, allow_exact_json = ?5, deny_exact_json = ?6
+                         WHERE rowid = ?7"
+                    ),
+                    params![
+                        sanitized_prompt,
+                        sanitized_notes,
+                        sanitized_allow,
+                        sanitized_deny,
+                        sanitized_allow_exact,
+                        sanitized_deny_exact,
+                        rowid
+                    ],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Sanitize the string members of one persisted `DecisionTrace`. Unreadable
+/// JSON is left untouched: the load path already tolerates and reports it.
+fn sanitize_decision_trace_json(json: &str) -> String {
+    let Ok(mut trace) = serde_json::from_str::<guard::gating::DecisionTrace>(json) else {
+        return json.to_string();
+    };
+    for field in [
+        &mut trace.conflict,
+        &mut trace.guidance,
+        &mut trace.suggested_grant_delta,
+    ] {
+        if let Some(value) = field.as_mut() {
+            *value = redact_output_text(value);
+        }
+    }
+    serde_json::to_string(&trace).unwrap_or_else(|_| json.to_string())
+}
+
+fn sanitize_string_vec_json(json: &str) -> String {
+    let Ok(mut values) = serde_json::from_str::<Vec<String>>(json) else {
+        return json.to_string();
+    };
+    for value in &mut values {
+        *value = redact_output_text(value);
+    }
+    serde_json::to_string(&values).unwrap_or_else(|_| json.to_string())
+}
+
+fn sanitize_exact_rules_json(json: &str) -> String {
+    let Ok(mut rules) = serde_json::from_str::<Vec<SessionExactRule>>(json) else {
+        return json.to_string();
+    };
+    for rule in &mut rules {
+        rule.binary = redact_output_text(&rule.binary);
+        for arg in &mut rule.args {
+            *arg = redact_output_text(arg);
+        }
+    }
+    serde_json::to_string(&rules).unwrap_or_else(|_| json.to_string())
+}
+
 fn should_vacuum(page_count: u64, free_pages: u64) -> bool {
     page_count >= VACUUM_MIN_PAGES
         && free_pages >= VACUUM_MIN_FREE_PAGES
@@ -1646,7 +1789,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn v4_to_v5_migration_is_private_and_adds_decision_traces() {
+    async fn legacy_v4_migration_is_private_and_adds_decision_traces() {
         let tmp = tempfile::tempdir().unwrap();
         let parent = tmp.path().join("migration-state");
         std::fs::create_dir(&parent).unwrap();
@@ -1993,6 +2136,106 @@ mod tests {
             loaded.has("second"),
             "the stale snapshot must not roll back the newer grant"
         );
+    }
+
+    // Synthetic test-fixture credential shapes (never real secrets).
+    const FIXTURE_BEARER_JWT: &str = "eyJhbGciOiJSUzI1NiIsImtpZCI6IlN5bnRoZXRpYyJ9.eyJpc3MiOiJrdWJlcm5ldGVzL3NlcnZpY2VhY2NvdW50In0.SyntheticSignature123";
+    const FIXTURE_PASSWORD_FLAG: &str = "--password=SyntheticHunter2Value";
+
+    #[tokio::test]
+    async fn v5_migration_sanitizes_persisted_credentials_and_bumps_version() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("state.db");
+        {
+            // Seed a database exactly one schema version back, holding
+            // credential material the way a pre-v6 daemon persisted it.
+            let store = SessionStore::open(path.clone(), 24 * 60 * 60)
+                .await
+                .expect("open store");
+            drop(store);
+            let conn = Connection::open(&path).expect("reopen seeded db");
+            conn.execute(
+                "INSERT INTO session_grants
+                 (token, allow_json, deny_json, allow_exact_json, deny_exact_json, scope_json, prompt_append, generated_notes_json, granted_at)
+                 VALUES ('tok', '[]', '[]', ?1, '[]', '{}', ?2, ?3, 1)",
+                params![
+                    serde_json::to_string(&vec![SessionExactRule::new(
+                        "kubectl",
+                        vec![format!("--token={FIXTURE_BEARER_JWT}"), "get".to_string()],
+                    )])
+                    .unwrap(),
+                    format!("session context {FIXTURE_PASSWORD_FLAG}"),
+                    serde_json::to_string(&vec![format!("note {FIXTURE_PASSWORD_FLAG}")]).unwrap(),
+                ],
+            )
+            .expect("seed grant");
+            conn.execute(
+                "INSERT INTO session_interactions
+                 (token, at_unix, command, allowed, source, reason, risk, exec_status)
+                 VALUES ('tok', ?1, ?2, 1, 'llm', ?3, 1, 'completed')",
+                params![
+                    encode_u64(guard::env::now_unix()).unwrap(),
+                    format!("kubectl --token={FIXTURE_BEARER_JWT} get pods"),
+                    format!("allowed with {FIXTURE_PASSWORD_FLAG}"),
+                ],
+            )
+            .expect("seed interaction");
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
+                .expect("set previous schema version");
+            drop(conn);
+        }
+
+        let store = SessionStore::open(path.clone(), 24 * 60 * 60)
+            .await
+            .expect("migrate store");
+        drop(store);
+
+        let conn = Connection::open(&path).expect("reopen migrated db");
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let (command, reason): (String, String) = conn
+            .query_row(
+                "SELECT command, reason FROM session_interactions WHERE token = 'tok'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            !command.contains("SyntheticSignature123"),
+            "bearer token survived migration: {command}"
+        );
+        assert!(command.contains("[REDACTED]"), "marker missing: {command}");
+        assert!(command.contains("kubectl"), "utility lost: {command}");
+        assert!(!reason.contains("SyntheticHunter2Value"), "got: {reason}");
+        assert!(reason.contains("[REDACTED]"), "got: {reason}");
+        let (prompt, notes, allow_exact): (String, String, String) = conn
+            .query_row(
+                "SELECT prompt_append, generated_notes_json, allow_exact_json FROM session_grants WHERE token = 'tok'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert!(!prompt.contains("SyntheticHunter2Value"), "got: {prompt}");
+        assert!(prompt.contains("[REDACTED]"), "got: {prompt}");
+        assert!(!notes.contains("SyntheticHunter2Value"), "got: {notes}");
+        assert!(
+            !allow_exact.contains("SyntheticSignature123"),
+            "exact rule survived migration: {allow_exact}"
+        );
+        let rules: Vec<SessionExactRule> = serde_json::from_str(&allow_exact).unwrap();
+        assert_eq!(rules[0].binary, "kubectl");
+        assert!(rules[0].args[0].contains("[REDACTED]"));
+        drop(conn);
+
+        // The migrated database still loads as a normal registry.
+        let store = SessionStore::open(path, 24 * 60 * 60)
+            .await
+            .expect("reopen migrated store");
+        let registry = store.load_registry().await.expect("load registry");
+        let prompt = registry.prompt_append_for("tok").expect("prompt");
+        assert!(!prompt.contains("SyntheticHunter2Value"));
     }
 
     #[tokio::test]

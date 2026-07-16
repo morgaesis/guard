@@ -71,6 +71,18 @@ fn redaction_patterns() -> &'static Vec<(Regex, &'static str)> {
             (Regex::new(r"sk-[A-Za-z0-9_-]{20,}").unwrap(), "[REDACTED]"),
             // AWS access key id
             (Regex::new(r"\bAKIA[0-9A-Z]{16}\b").unwrap(), "[REDACTED]"),
+            // URL userinfo passwords: `scheme://user:password@host`. The
+            // password segment of a connection string (postgres://, redis://,
+            // amqp://, https:// with basic auth) is a credential wherever it
+            // appears; the username and host stay visible so the operator can
+            // still tell which endpoint was addressed.
+            (
+                Regex::new(
+                    r#"(?i)\b([a-z][a-z0-9+.-]{1,30}://[^/\s:@'"]{1,128}):([^@\s/'"]{1,256})@"#,
+                )
+                .unwrap(),
+                "${1}:[REDACTED]@",
+            ),
             // JWT tokens (eyJ header). The first-segment minimum of 8 admits
             // the shortest real headers (`{"alg":"none"}` encodes to 16
             // chars after `eyJ`) while the three-segment dot structure keeps
@@ -1031,6 +1043,40 @@ mod tests {
         let once = redact_output_text(input);
         let twice = redact_output_text(&once);
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn test_redact_url_userinfo_password() {
+        let input = "psql postgres://admin:hunter2secret@db.example.com:5432/app";
+        let output = redact_output_text(input);
+        assert!(!output.contains("hunter2secret"), "got: {output}");
+        assert_eq!(
+            output,
+            "psql postgres://admin:[REDACTED]@db.example.com:5432/app"
+        );
+    }
+
+    #[test]
+    fn test_redact_url_userinfo_password_is_idempotent() {
+        let input = "redis://cache:s3cr3tvalue@cache.internal:6379";
+        let once = redact_output_text(input);
+        let twice = redact_output_text(&once);
+        assert!(!once.contains("s3cr3tvalue"), "got: {once}");
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn test_no_redact_url_without_userinfo() {
+        let input = "curl https://api.example.com:8443/v1/health";
+        let output = redact_output_text(input);
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn test_no_redact_scp_style_remote() {
+        let input = "git clone git@github.com:owner/repo.git";
+        let output = redact_output_text(input);
+        assert_eq!(output, input);
     }
 
     #[test]

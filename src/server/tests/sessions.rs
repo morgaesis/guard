@@ -568,6 +568,169 @@ fn session_auto_amend_deny_candidates_are_high_risk_exact_rules() {
     );
 }
 
+// Synthetic test-fixture credential shapes (never real secrets): a
+// kubernetes-style service-account bearer JWT and a --password= flag.
+const FIXTURE_BEARER_JWT: &str = "eyJhbGciOiJSUzI1NiIsImtpZCI6IlN5bnRoZXRpYyJ9.eyJpc3MiOiJrdWJlcm5ldGVzL3NlcnZpY2VhY2NvdW50In0.SyntheticSignature123";
+const FIXTURE_PASSWORD_FLAG: &str = "--password=SyntheticHunter2Value";
+
+#[test]
+fn session_auto_amend_refuses_credential_shaped_argv() {
+    // A session exact rule persists argv verbatim; credential-shaped material
+    // (bearer tokens, --password= flags, URL userinfo) must refuse amendment
+    // on both the allow and the deny side.
+    assert!(allow_session_auto_amend_candidate(
+        "kubectl",
+        &[format!("--token={FIXTURE_BEARER_JWT}"), "get".into()],
+        Some(1)
+    )
+    .is_err());
+    assert!(allow_session_auto_amend_candidate(
+        "mysql",
+        &["-u".into(), "root".into(), FIXTURE_PASSWORD_FLAG.into()],
+        Some(1)
+    )
+    .is_err());
+    assert!(deny_session_auto_amend_candidate(
+        "psql",
+        &["postgres://app:SyntheticDbPass1@db.internal/prod".into()],
+        Some(9)
+    )
+    .is_err());
+    // A credential-free command of the same shape still qualifies.
+    assert!(
+        allow_session_auto_amend_candidate("kubectl", &["get".into(), "pods".into()], Some(1))
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn session_inspection_surfaces_redact_credentials_in_text_and_json() {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    let daemon = CallerIdentity::Unix { uid: 777 };
+    let token = "inspection-redaction-token".to_string();
+
+    // Install rows the way a pre-sanitization daemon would have persisted
+    // them: raw credential material in the grant prompt, a learned exact
+    // rule, and recorded argv. from_parts loads state verbatim, so this
+    // exercises the display boundary rather than storage-time sanitization.
+    let mut grants = HashMap::new();
+    grants.insert(
+        token.clone(),
+        crate::session::SessionGrant {
+            allow: Vec::new(),
+            deny: Vec::new(),
+            allow_exact: vec![SessionExactRule::new(
+                "kubectl",
+                vec![format!("--token={FIXTURE_BEARER_JWT}"), "get".into()],
+            )],
+            deny_exact: Vec::new(),
+            activated_verbs: Vec::new(),
+            override_markers: Vec::new(),
+            scope: Default::default(),
+            expires_at: None,
+            granted_at: 1,
+            prompt_append: Some(format!("session context {FIXTURE_PASSWORD_FLAG}")),
+            generated_notes: Vec::new(),
+            static_only: false,
+            auto_amend: false,
+        },
+    );
+    let registry = crate::session::SessionRegistry::from_parts(
+        grants,
+        Vec::new(),
+        vec![(
+            token.clone(),
+            SessionInteraction {
+                at_unix: guard::env::now_unix(),
+                command: format!("kubectl --token={FIXTURE_BEARER_JWT} get pods"),
+                allowed: true,
+                source: SessionDecisionSource::Llm,
+                reason: format!("allowed despite {FIXTURE_PASSWORD_FLAG}"),
+                risk: Some(1),
+                exec_status: SessionExecStatus::Completed,
+                exit_code: Some(0),
+                exposed_secret_refs: Vec::new(),
+                decision_trace: None,
+            },
+        )],
+        crate::session::DEFAULT_HISTORY_RETENTION_SECS,
+    );
+    *cfg.state.sessions.write().await = registry;
+
+    let show = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::SessionShow {
+            token: token.clone(),
+            limit: Some(20),
+            caller_token: None,
+        },
+    )
+    .await;
+    let show_json = serde_json::to_string(&show).unwrap();
+    assert!(
+        !show_json.contains("SyntheticSignature123"),
+        "session show leaked the bearer token: {show_json}"
+    );
+    assert!(
+        !show_json.contains("SyntheticHunter2Value"),
+        "session show leaked the password: {show_json}"
+    );
+    assert!(
+        show_json.contains("[REDACTED]"),
+        "session show must keep the redaction marker: {show_json}"
+    );
+    let AdminResponse::SessionShow { report } = show else {
+        panic!("expected session show");
+    };
+    let active = report.active.expect("active grant");
+    assert!(
+        active.allow_exact[0].args[0].contains("[REDACTED]"),
+        "exact rule argv must be redacted even outside JSON serialization"
+    );
+    assert!(
+        report.recent[0].command.contains("kubectl get")
+            || report.recent[0].command.contains("kubectl")
+    );
+
+    let status = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::SessionStatus {
+            token: token.clone(),
+            caller_token: None,
+        },
+    )
+    .await;
+    let status_json = serde_json::to_string(&status).unwrap();
+    assert!(
+        !status_json.contains("SyntheticSignature123"),
+        "{status_json}"
+    );
+    assert!(
+        !status_json.contains("SyntheticHunter2Value"),
+        "{status_json}"
+    );
+    assert!(status_json.contains("[REDACTED]"), "{status_json}");
+
+    let list = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::SessionList {
+            include_history: true,
+            since_unix: None,
+            visible_token: None,
+        },
+    )
+    .await;
+    let list_json = serde_json::to_string(&list).unwrap();
+    assert!(!list_json.contains("SyntheticSignature123"), "{list_json}");
+    assert!(!list_json.contains("SyntheticHunter2Value"), "{list_json}");
+    assert!(list_json.contains("[REDACTED]"), "{list_json}");
+}
+
 #[test]
 fn session_source_reports_cache_separately_from_static_policy() {
     assert_eq!(

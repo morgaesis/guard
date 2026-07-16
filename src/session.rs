@@ -14,7 +14,7 @@
 use crate::grant_profile::{EvaluationMode, GrantRequestDelta};
 use guard::env::now_unix;
 use guard::policy::{Decision, PolicyRule};
-use guard::redact::command_line;
+use guard::redact::{command_line, redact_output_text};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::collections::{BTreeMap, HashMap};
@@ -101,6 +101,101 @@ pub struct IssuedGrantScope {
 impl SessionGrant {
     pub fn is_expired(&self, now: u64) -> bool {
         matches!(self.expires_at, Some(exp) if now >= exp)
+    }
+}
+
+/// Sanitize one string that is about to be persisted or displayed, stripping
+/// credential-shaped material (bearer/JWT tokens, `--password=` flags, URL
+/// userinfo, high-entropy blobs). A secret that transited a command line must
+/// not outlive it in the state database or in an operator terminal; the
+/// `[REDACTED]` marker preserves the fact that something was there.
+fn sanitize_credentials(value: &mut String) {
+    let sanitized = redact_output_text(value);
+    if sanitized != *value {
+        *value = sanitized;
+    }
+}
+
+fn sanitize_credentials_opt(value: &mut Option<String>) {
+    if let Some(value) = value.as_mut() {
+        sanitize_credentials(value);
+    }
+}
+
+fn sanitize_credentials_vec(values: &mut [String]) {
+    for value in values {
+        sanitize_credentials(value);
+    }
+}
+
+fn sanitize_credentials_rules(rules: &mut [SessionExactRule]) {
+    for rule in rules {
+        sanitize_credentials(&mut rule.binary);
+        sanitize_credentials_vec(&mut rule.args);
+    }
+}
+
+fn sanitize_credentials_trace(trace: &mut Option<guard::gating::DecisionTrace>) {
+    if let Some(trace) = trace.as_mut() {
+        sanitize_credentials_opt(&mut trace.conflict);
+        sanitize_credentials_opt(&mut trace.guidance);
+        sanitize_credentials_opt(&mut trace.suggested_grant_delta);
+    }
+}
+
+impl SessionInteraction {
+    /// Redact credential-shaped material from every command-derived field.
+    /// Applied when the interaction is recorded (so secrets never reach the
+    /// state database) and again on every inspection surface (so historical
+    /// rows written before sanitization existed cannot leak either).
+    pub fn redact_credentials(&mut self) {
+        sanitize_credentials(&mut self.command);
+        sanitize_credentials(&mut self.reason);
+        sanitize_credentials_trace(&mut self.decision_trace);
+    }
+}
+
+impl SessionGrantSummary {
+    /// Redact credential-shaped material from every field that can carry
+    /// command-derived text before the summary leaves the daemon.
+    pub fn redact_credentials(&mut self) {
+        sanitize_credentials_vec(&mut self.allow);
+        sanitize_credentials_vec(&mut self.deny);
+        sanitize_credentials_rules(&mut self.allow_exact);
+        sanitize_credentials_rules(&mut self.deny_exact);
+        sanitize_credentials_opt(&mut self.prompt_append);
+        sanitize_credentials_vec(&mut self.generated_notes);
+    }
+}
+
+impl HistoricalGrant {
+    /// See [`SessionGrantSummary::redact_credentials`].
+    pub fn redact_credentials(&mut self) {
+        sanitize_credentials_vec(&mut self.allow);
+        sanitize_credentials_vec(&mut self.deny);
+        sanitize_credentials_rules(&mut self.allow_exact);
+        sanitize_credentials_rules(&mut self.deny_exact);
+        sanitize_credentials_opt(&mut self.prompt_append);
+        sanitize_credentials_vec(&mut self.generated_notes);
+    }
+}
+
+impl SessionReport {
+    /// Redact credential-shaped material from every command-derived field of
+    /// the report (active grant, historical grants, recent interactions).
+    /// Inspection surfaces (`session show`/`list`/`status`, text and JSON)
+    /// must never emit un-redacted command-derived text.
+    pub fn redact_credentials(&mut self) {
+        if let Some(active) = &mut self.active {
+            active.redact_credentials();
+        }
+        for grant in &mut self.history {
+            grant.redact_credentials();
+        }
+        for interaction in &mut self.recent {
+            interaction.redact_credentials();
+        }
+        sanitize_credentials_opt(&mut self.stats.suspension_reason);
     }
 }
 
@@ -464,6 +559,12 @@ impl SessionRegistry {
         if grant.granted_at == 0 {
             grant.granted_at = now_unix();
         }
+        // Free-form grant text is persisted to the state database and echoed
+        // by inspection commands; credential-shaped material must not enter
+        // it. Rule patterns are left as authored: sanitizing them would
+        // silently change what the grant matches.
+        sanitize_credentials_opt(&mut grant.prompt_append);
+        sanitize_credentials_vec(&mut grant.generated_notes);
         // If we are overwriting an active grant, archive the previous
         // version so the audit trail still shows what was in effect.
         if let Some(prev) = self.grants.remove(&token) {
@@ -539,6 +640,10 @@ impl SessionRegistry {
         if interaction.at_unix == 0 {
             interaction.at_unix = now_unix();
         }
+        // Interactions are persisted to the state database; argv routinely
+        // carries inline credentials (`--password=...`, bearer tokens,
+        // connection strings) that must not outlive the command line.
+        interaction.redact_credentials();
         self.interactions.push(StoredSessionInteraction {
             token: token.to_string(),
             interaction,
@@ -883,7 +988,9 @@ impl SessionRegistry {
             grant.expires_at = Some(now_unix().saturating_add(ttl_secs));
         }
         if let Some(prompt) = &delta.prompt_append {
-            grant.prompt_append = Some(prompt.clone());
+            // Delta prompts can be requested by the agent side and may quote
+            // command lines; sanitize like every other persisted prompt.
+            grant.prompt_append = Some(redact_output_text(prompt));
         }
         if let Some(mode) = delta.evaluation_mode {
             grant.scope.evaluation_mode = mode;
@@ -1711,6 +1818,147 @@ mod tests {
             .suspension_reason("tok", &ratio_limits)
             .unwrap()
             .contains("25% denials"));
+    }
+
+    // Synthetic test-fixture credential shapes (never real secrets): a
+    // kubernetes-style service-account bearer JWT and a --password= flag.
+    const FIXTURE_BEARER_JWT: &str = "eyJhbGciOiJSUzI1NiIsImtpZCI6IlN5bnRoZXRpYyJ9.eyJpc3MiOiJrdWJlcm5ldGVzL3NlcnZpY2VhY2NvdW50In0.SyntheticSignature123";
+    const FIXTURE_PASSWORD_FLAG: &str = "--password=SyntheticHunter2Value";
+
+    #[test]
+    fn record_interaction_sanitizes_credentials_before_storage() {
+        let mut reg = reg_with("tok", &[], &[]);
+        reg.record_interaction(
+            "tok",
+            SessionInteraction {
+                at_unix: 10,
+                command: format!("kubectl --token={FIXTURE_BEARER_JWT} get pods"),
+                allowed: false,
+                source: SessionDecisionSource::Llm,
+                reason: format!("denied: command carried {FIXTURE_PASSWORD_FLAG}"),
+                risk: Some(7),
+                exec_status: SessionExecStatus::NotAttempted,
+                exit_code: None,
+                exposed_secret_refs: Vec::new(),
+                decision_trace: None,
+            },
+        );
+
+        let stored = reg.interactions_snapshot();
+        let (_, interaction) = &stored[0];
+        assert!(
+            !interaction.command.contains("SyntheticSignature123"),
+            "bearer token persisted: {}",
+            interaction.command
+        );
+        assert!(
+            interaction.command.contains("[REDACTED]"),
+            "redaction marker missing: {}",
+            interaction.command
+        );
+        assert!(interaction.command.contains("kubectl"), "utility lost");
+        assert!(
+            !interaction.reason.contains("SyntheticHunter2Value"),
+            "password persisted: {}",
+            interaction.reason
+        );
+        assert!(interaction.reason.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn grant_sanitizes_prompt_append_and_notes_before_storage() {
+        let mut reg = SessionRegistry::new();
+        reg.grant(
+            "tok".to_string(),
+            SessionGrant {
+                allow: vec![],
+                deny: vec![],
+                allow_exact: Vec::new(),
+                deny_exact: Vec::new(),
+                activated_verbs: Vec::new(),
+                override_markers: Vec::new(),
+                scope: Default::default(),
+                expires_at: None,
+                granted_at: 0,
+                prompt_append: Some(format!(
+                    "restoring backups; connect with {FIXTURE_PASSWORD_FLAG}"
+                )),
+                generated_notes: vec![format!("migrated from token={FIXTURE_BEARER_JWT}")],
+                static_only: false,
+                auto_amend: false,
+            },
+        );
+        let prompt = reg.prompt_append_for("tok").unwrap();
+        assert!(!prompt.contains("SyntheticHunter2Value"), "got: {prompt}");
+        assert!(prompt.contains("[REDACTED]"), "got: {prompt}");
+        assert!(prompt.contains("restoring backups"), "utility lost");
+        let report = reg.show("tok", 1).unwrap();
+        let notes = report.active.unwrap().generated_notes;
+        assert!(
+            !notes[0].contains("SyntheticSignature123"),
+            "got: {notes:?}"
+        );
+        assert!(notes[0].contains("[REDACTED]"), "got: {notes:?}");
+    }
+
+    #[test]
+    fn report_redaction_covers_legacy_unsanitized_rows() {
+        // Simulate rows persisted before storage-time sanitization existed:
+        // from_parts loads them verbatim, the inspection boundary must still
+        // redact every command-derived field.
+        let mut grants = HashMap::new();
+        grants.insert(
+            "tok".to_string(),
+            SessionGrant {
+                allow: vec![format!("psql postgres://app:SyntheticDbPass1@db/x*")],
+                deny: vec![],
+                allow_exact: vec![SessionExactRule::new(
+                    "kubectl",
+                    vec![format!("--token={FIXTURE_BEARER_JWT}"), "get".to_string()],
+                )],
+                deny_exact: Vec::new(),
+                activated_verbs: Vec::new(),
+                override_markers: Vec::new(),
+                scope: Default::default(),
+                expires_at: None,
+                granted_at: 1,
+                prompt_append: Some(format!("context {FIXTURE_PASSWORD_FLAG}")),
+                generated_notes: Vec::new(),
+                static_only: false,
+                auto_amend: false,
+            },
+        );
+        let registry = SessionRegistry::from_parts(
+            grants,
+            Vec::new(),
+            vec![(
+                "tok".to_string(),
+                SessionInteraction {
+                    at_unix: now_unix(),
+                    command: format!("curl -H 'Authorization: Bearer {FIXTURE_BEARER_JWT}'"),
+                    allowed: true,
+                    source: SessionDecisionSource::Llm,
+                    reason: "ok".into(),
+                    risk: Some(1),
+                    exec_status: SessionExecStatus::Completed,
+                    exit_code: Some(0),
+                    exposed_secret_refs: Vec::new(),
+                    decision_trace: None,
+                },
+            )],
+            DEFAULT_HISTORY_RETENTION_SECS,
+        );
+
+        let mut report = registry.show("tok", 10).unwrap();
+        report.redact_credentials();
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(!json.contains("SyntheticSignature123"), "got: {json}");
+        assert!(!json.contains("SyntheticHunter2Value"), "got: {json}");
+        assert!(!json.contains("SyntheticDbPass1"), "got: {json}");
+        assert!(json.contains("[REDACTED]"), "got: {json}");
+        let active = report.active.unwrap();
+        assert_eq!(active.allow_exact[0].binary, "kubectl");
+        assert!(active.allow_exact[0].args[0].contains("[REDACTED]"));
     }
 
     #[test]

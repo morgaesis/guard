@@ -21,7 +21,7 @@ use crate::shim::ShimGenerator;
 use anyhow::Result;
 use guard::gating::Reversibility;
 use guard::learned_rules::{AutoShimMode, LearningOutcome};
-use guard::redact::{audit_escape, command_line};
+use guard::redact::{audit_escape, command_line, redact_output_text};
 use std::path::PathBuf;
 
 use super::execute::persist_session_snapshot;
@@ -60,6 +60,17 @@ pub(super) fn validate_session_exact_rule_candidate(
         if arg.contains('\0') || arg.contains('\n') || arg.contains('\r') {
             return Err("appeal command contains control characters".to_string());
         }
+    }
+    // A session exact rule persists this argv verbatim in the state database
+    // and echoes it from every session inspection command. If credential
+    // redaction would change the command line, the rule would either store a
+    // secret or never match; refuse the amendment instead.
+    let command = command_line(binary, args);
+    if redact_output_text(&command) != command {
+        return Err(
+            "appeal command contains credential-shaped material and cannot be stored as a session rule"
+                .to_string(),
+        );
     }
     Ok(())
 }
