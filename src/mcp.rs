@@ -3,14 +3,20 @@ use crate::injection::{collect_unique_pairs, derive_env_name};
 use crate::server;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use http_body_util::{BodyExt, Full, Limited};
+use hyper::body::{Bytes, Incoming};
+use hyper::service::service_fn;
+use hyper::{header, HeaderMap, Method, Request, Response, StatusCode};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper_util::server::conn::auto;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
 const JSONRPC_VERSION: &str = "2.0";
@@ -340,6 +346,18 @@ async fn serve_stdio<E: GuardExecutor, A: GuardAdmin>(mut server: McpServer<E, A
     Ok(())
 }
 
+/// Cap on the buffered read/write buffer hyper keeps per HTTP/1 connection,
+/// which also bounds the request head (request line + headers). Combined with
+/// the body cap, this bounds the total bytes an unauthenticated peer can make
+/// the server buffer for one request.
+const MAX_HTTP_HEADER_SECTION: usize = 64 * 1024;
+
+/// Bound the time spent reading one request (headers via hyper's header read
+/// timeout, body via an explicit timeout around the capped body read) so a
+/// stalled (slowloris-style) connection cannot hold a task open indefinitely
+/// before the bearer check.
+const HTTP_REQUEST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Minimal MCP Streamable-HTTP transport: a single POST endpoint that pipes the
 /// JSON-RPC body through the same request handler the stdio path uses. Every
 /// request must carry `Authorization: Bearer <token>`; there is no server-side
@@ -365,6 +383,18 @@ async fn serve_http<E: GuardExecutor + 'static, A: GuardAdmin + 'static>(
     }
     tracing::info!(address = %bound, "MCP HTTP transport listening");
 
+    serve_http_on(listener, server, token).await
+}
+
+/// Accept loop over an already-bound listener: each connection is served by
+/// hyper (keep-alive, chunked transfer encoding, and HTTP/2 over prior
+/// knowledge come from the shared `auto` connection builder the api-proxy also
+/// uses).
+async fn serve_http_on<E: GuardExecutor + 'static, A: GuardAdmin + 'static>(
+    listener: TcpListener,
+    server: McpServer<E, A>,
+    token: String,
+) -> Result<()> {
     let server = Arc::new(Mutex::new(server));
     let token = Arc::new(token);
 
@@ -379,66 +409,89 @@ async fn serve_http<E: GuardExecutor + 'static, A: GuardAdmin + 'static>(
         let server = server.clone();
         let token = token.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_http_connection(stream, server, &token).await {
+            let service = service_fn(move |request| {
+                let server = server.clone();
+                let token = token.clone();
+                async move {
+                    Ok::<_, std::convert::Infallible>(
+                        handle_http_request(request, &server, &token).await,
+                    )
+                }
+            });
+            let mut builder = auto::Builder::new(TokioExecutor::new());
+            builder
+                .http1()
+                .timer(TokioTimer::new())
+                .header_read_timeout(HTTP_REQUEST_READ_TIMEOUT)
+                .max_buf_size(MAX_HTTP_HEADER_SECTION);
+            if let Err(error) = builder
+                .serve_connection(TokioIo::new(stream), service)
+                .await
+            {
                 tracing::debug!(error = %error, "MCP HTTP connection ended with error");
             }
         });
     }
 }
 
-/// Serve a single HTTP/1.1 request on `stream` (we always close after one,
-/// `Connection: close`). Auth is enforced before the body is dispatched.
-async fn handle_http_connection<E: GuardExecutor, A: GuardAdmin>(
-    mut stream: TcpStream,
-    server: Arc<Mutex<McpServer<E, A>>>,
+/// Serve one HTTP request. Auth is enforced before the body is read; the body
+/// read is bounded in both size (`MAX_HTTP_BODY`, which covers chunked bodies
+/// with no Content-Length) and time.
+async fn handle_http_request<E: GuardExecutor, A: GuardAdmin>(
+    request: Request<Incoming>,
+    server: &Mutex<McpServer<E, A>>,
     token: &str,
-) -> Result<()> {
-    // Bound the time spent reading one request so a stalled (slowloris-style)
-    // connection cannot hold a task open indefinitely before the bearer check.
-    let request = match tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        read_http_request(&mut stream),
+) -> Response<Full<Bytes>> {
+    // Reject a declared oversized body up front, before any other check, so
+    // the bound applies even to unauthenticated peers.
+    let declared_length = request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    if declared_length.is_some_and(|length| length > MAX_HTTP_BODY as u64) {
+        return http_error_response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
+    }
+
+    if request.method() != Method::POST {
+        return http_error_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method not allowed; POST a JSON-RPC request",
+        );
+    }
+
+    if !path_is_mcp_endpoint(request.uri().path()) {
+        return http_error_response(StatusCode::NOT_FOUND, "not found");
+    }
+
+    if !bearer_matches(request.headers(), token) {
+        return http_error_response(StatusCode::UNAUTHORIZED, "missing or invalid bearer token");
+    }
+
+    let body = match tokio::time::timeout(
+        HTTP_REQUEST_READ_TIMEOUT,
+        Limited::new(request.into_body(), MAX_HTTP_BODY).collect(),
     )
     .await
     {
-        Ok(Ok(request)) => request,
-        Ok(Err(HttpError::Status(code, message))) => {
-            return write_http_response(&mut stream, code, &error_body(&message)).await;
+        Ok(Ok(collected)) => collected.to_bytes(),
+        Ok(Err(error)) if error.is::<http_body_util::LengthLimitError>() => {
+            return http_error_response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
         }
-        Ok(Err(HttpError::Io(error))) => return Err(error.into()),
+        Ok(Err(_)) => {
+            return http_error_response(StatusCode::BAD_REQUEST, "failed to read request body");
+        }
         Err(_) => {
-            return write_http_response(&mut stream, 408, &error_body("request timeout")).await;
+            return http_error_response(StatusCode::REQUEST_TIMEOUT, "request timeout");
         }
     };
 
-    if request.method != "POST" {
-        return write_http_response(
-            &mut stream,
-            405,
-            &error_body("method not allowed; POST a JSON-RPC request"),
-        )
-        .await;
-    }
-
-    if !request.path_is_mcp_endpoint() {
-        return write_http_response(&mut stream, 404, &error_body("not found")).await;
-    }
-
-    if !request.bearer_matches(token) {
-        return write_http_response(
-            &mut stream,
-            401,
-            &error_body("missing or invalid bearer token"),
-        )
-        .await;
-    }
-
-    let message: Value = match serde_json::from_slice(&request.body) {
+    let message: Value = match serde_json::from_slice(&body) {
         Ok(message) => message,
         Err(error) => {
             let payload =
                 jsonrpc_error_response(Value::Null, -32700, format!("parse error: {error}"), None);
-            return write_http_response(&mut stream, 400, &payload).await;
+            return json_response(StatusCode::BAD_REQUEST, &payload);
         }
     };
 
@@ -450,187 +503,57 @@ async fn handle_http_connection<E: GuardExecutor, A: GuardAdmin>(
     // A JSON-RPC notification (no id) produces no response value. The MCP
     // Streamable-HTTP shape answers such a POST with 202 Accepted and no body.
     match response {
-        Some(response) => write_http_response(&mut stream, 200, &response).await,
-        None => write_http_empty(&mut stream, 202).await,
+        Some(response) => json_response(StatusCode::OK, &response),
+        None => empty_response(StatusCode::ACCEPTED),
     }
 }
 
-enum HttpError {
-    /// A protocol-level rejection we answer with this status and message.
-    Status(u16, String),
-    Io(std::io::Error),
+fn path_is_mcp_endpoint(path: &str) -> bool {
+    path == "/" || path == "/mcp"
 }
 
-impl From<std::io::Error> for HttpError {
-    fn from(error: std::io::Error) -> Self {
-        HttpError::Io(error)
-    }
-}
-
-struct HttpRequest {
-    method: String,
-    path: String,
-    authorization: Option<String>,
-    body: Vec<u8>,
-}
-
-impl HttpRequest {
-    fn path_is_mcp_endpoint(&self) -> bool {
-        let path = self.path.split('?').next().unwrap_or(&self.path);
-        path == "/" || path == "/mcp"
-    }
-
-    /// Constant-time-ish bearer comparison: reject on length mismatch, then
-    /// compare every byte without early exit so the check does not leak the
-    /// token length or a prefix match through timing.
-    fn bearer_matches(&self, expected: &str) -> bool {
-        let Some(value) = self.authorization.as_deref() else {
-            return false;
-        };
-        let Some(presented) = value
-            .strip_prefix("Bearer ")
-            .or_else(|| value.strip_prefix("bearer "))
-        else {
-            return false;
-        };
-        crate::server::constant_time_eq(presented.as_bytes(), expected.as_bytes())
-    }
-}
-
-/// Read one HTTP/1.1 request: the request line, headers, and exactly
-/// `Content-Length` body bytes. Headers are parsed case-insensitively. We bound
-/// both the header section and the body so an unauthenticated peer cannot force
-/// unbounded buffering.
-/// Cap on the request header section (request line + headers). Combined with the
-/// body cap, this bounds the total bytes an unauthenticated peer can make the
-/// server buffer for one request, even via a single header line with no newline.
-const MAX_HTTP_HEADER_SECTION: usize = 64 * 1024;
-
-async fn read_http_request(stream: &mut TcpStream) -> std::result::Result<HttpRequest, HttpError> {
-    // Bound the total bytes read for one request (header section + body): reads
-    // past the limit return EOF and degrade to a 400, so a single connection
-    // cannot force unbounded buffering before the bearer check.
-    let mut reader = BufReader::new(stream).take((MAX_HTTP_HEADER_SECTION + MAX_HTTP_BODY) as u64);
-    let mut request_line = String::new();
-    let read = reader.read_line(&mut request_line).await?;
-    if read == 0 {
-        return Err(HttpError::Status(400, "empty request".to_string()));
-    }
-
-    let mut parts = request_line.split_whitespace();
-    let method = parts
-        .next()
-        .ok_or_else(|| HttpError::Status(400, "malformed request line".to_string()))?
-        .to_string();
-    let path = parts
-        .next()
-        .ok_or_else(|| HttpError::Status(400, "malformed request line".to_string()))?
-        .to_string();
-
-    let mut content_length: Option<usize> = None;
-    let mut authorization: Option<String> = None;
-    loop {
-        let mut header = String::new();
-        let read = reader.read_line(&mut header).await?;
-        if read == 0 {
-            return Err(HttpError::Status(
-                400,
-                "unexpected end of headers".to_string(),
-            ));
-        }
-        let trimmed = header.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
-            break;
-        }
-        let Some((name, value)) = trimmed.split_once(':') else {
-            return Err(HttpError::Status(400, "malformed header".to_string()));
-        };
-        let name = name.trim().to_ascii_lowercase();
-        let value = value.trim();
-        match name.as_str() {
-            "content-length" => {
-                let parsed: usize = value
-                    .parse()
-                    .map_err(|_| HttpError::Status(400, "invalid Content-Length".to_string()))?;
-                if parsed > MAX_HTTP_BODY {
-                    return Err(HttpError::Status(413, "request body too large".to_string()));
-                }
-                content_length = Some(parsed);
-            }
-            "authorization" => authorization = Some(value.to_string()),
-            _ => {}
-        }
-    }
-
-    let body = match content_length {
-        Some(0) | None => Vec::new(),
-        Some(len) => {
-            let mut buf = vec![0u8; len];
-            reader.read_exact(&mut buf).await?;
-            buf
-        }
+/// Bearer comparison via the shared constant-time helper: reject on length
+/// mismatch, then compare every byte without early exit so the check does not
+/// leak a prefix match through timing.
+fn bearer_matches(headers: &HeaderMap, expected: &str) -> bool {
+    let Some(value) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
     };
-
-    Ok(HttpRequest {
-        method,
-        path,
-        authorization,
-        body,
-    })
+    let Some(presented) = value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))
+    else {
+        return false;
+    };
+    crate::server::constant_time_eq(presented.as_bytes(), expected.as_bytes())
 }
 
 fn error_body(message: &str) -> Value {
     json!({ "error": message })
 }
 
-/// Write an HTTP/1.1 response with a JSON body, correct Content-Length, and
-/// `Connection: close`.
-async fn write_http_response(stream: &mut TcpStream, status: u16, body: &Value) -> Result<()> {
-    let payload = serde_json::to_vec(body)?;
-    let head = format!(
-        "HTTP/1.1 {status} {reason}\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {len}\r\n\
-         Connection: close\r\n\
-         \r\n",
-        status = status,
-        reason = http_reason(status),
-        len = payload.len(),
-    );
-    stream.write_all(head.as_bytes()).await?;
-    stream.write_all(&payload).await?;
-    stream.flush().await?;
-    Ok(())
+fn json_response(status: StatusCode, body: &Value) -> Response<Full<Bytes>> {
+    let payload = serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec());
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(payload)))
+        .expect("static response parts are valid")
 }
 
-/// Write an HTTP/1.1 response with no body (used for 202 Accepted on a
-/// JSON-RPC notification).
-async fn write_http_empty(stream: &mut TcpStream, status: u16) -> Result<()> {
-    let head = format!(
-        "HTTP/1.1 {status} {reason}\r\n\
-         Content-Length: 0\r\n\
-         Connection: close\r\n\
-         \r\n",
-        status = status,
-        reason = http_reason(status),
-    );
-    stream.write_all(head.as_bytes()).await?;
-    stream.flush().await?;
-    Ok(())
+fn http_error_response(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
+    json_response(status, &error_body(message))
 }
 
-fn http_reason(status: u16) -> &'static str {
-    match status {
-        200 => "OK",
-        202 => "Accepted",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        408 => "Request Timeout",
-        413 => "Payload Too Large",
-        _ => "Error",
-    }
+/// A response with no body (used for 202 Accepted on a JSON-RPC notification).
+fn empty_response(status: StatusCode) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(status)
+        .body(Full::new(Bytes::new()))
+        .expect("static response parts are valid")
 }
 
 struct McpServer<E: GuardExecutor, A: GuardAdmin> {
@@ -1374,6 +1297,8 @@ mod tests {
     use super::*;
     use anyhow::anyhow;
     use guard::wire::mcp::McpSshHostKeyMode;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpStream;
 
     #[derive(Clone)]
     struct FakeExecutor {
@@ -2082,6 +2007,53 @@ mod tests {
         server
     }
 
+    /// Bind an ephemeral port and serve the real hyper-backed HTTP transport
+    /// (`serve_http_on`) on it, so tests exercise the production accept loop,
+    /// connection builder, and request handler.
+    async fn spawn_http_server(token: &str) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let token = token.to_string();
+        let handle = tokio::spawn(async move {
+            let _ = serve_http_on(listener, http_test_server(), token).await;
+        });
+        (addr, handle)
+    }
+
+    /// Read exactly one HTTP response (status line, headers, Content-Length
+    /// body) off a connection without consuming bytes of a following response,
+    /// so keep-alive tests can issue sequential requests on one stream.
+    async fn read_one_response(stream: &mut TcpStream) -> (u16, String) {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            let read = stream.read(&mut byte).await.expect("read header byte");
+            assert!(read > 0, "connection closed before end of headers");
+            head.push(byte[0]);
+        }
+        let head_text = String::from_utf8_lossy(&head).into_owned();
+        let status: u16 = head_text
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse().ok())
+            .expect("status code");
+        let content_length: usize = head_text
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                if name.trim().eq_ignore_ascii_case("content-length") {
+                    value.trim().parse().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        let mut body = vec![0u8; content_length];
+        stream.read_exact(&mut body).await.expect("read body");
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
     /// Drive one raw HTTP request against an ephemeral-port HTTP MCP server and
     /// return the parsed status line + body string.
     async fn http_roundtrip(
@@ -2123,27 +2095,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn http_transport_enforces_bearer_and_serves_tools_list() {
         let token = "test-bearer-token".to_string();
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("local addr");
-
-        let token_for_task = token.clone();
-        let handle = tokio::spawn(async move {
-            // Inline a one-connection-at-a-time accept loop mirroring serve_http,
-            // so the test exercises the real connection handler and auth path.
-            let server = Arc::new(Mutex::new(http_test_server()));
-            let token = Arc::new(token_for_task);
-            loop {
-                let (stream, _) = match listener.accept().await {
-                    Ok(accepted) => accepted,
-                    Err(_) => break,
-                };
-                let server = server.clone();
-                let token = token.clone();
-                tokio::spawn(async move {
-                    let _ = handle_http_connection(stream, server, &token).await;
-                });
-            }
-        });
+        let (addr, handle) = spawn_http_server(&token).await;
 
         let list_body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
 
@@ -2194,6 +2146,140 @@ mod tests {
             .and_then(|code| code.parse().ok())
             .expect("status");
         assert_eq!(status, 405, "GET must be rejected");
+
+        handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_transport_serves_sequential_requests_on_one_connection() {
+        let token = "keepalive-token";
+        let (addr, handle) = spawn_http_server(token).await;
+
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        for id in 1..=2 {
+            let body = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"ping"}}"#);
+            let request = format!(
+                "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(request.as_bytes())
+                .await
+                .expect("write request");
+            let (status, response_body) = read_one_response(&mut stream).await;
+            assert_eq!(status, 200, "request {id} on the shared connection");
+            let parsed: Value = serde_json::from_str(&response_body).expect("body is JSON");
+            assert_eq!(parsed["id"], id);
+            assert!(parsed["result"].is_object());
+        }
+
+        handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_transport_accepts_chunked_request_bodies() {
+        let token = "chunked-token";
+        let (addr, handle) = spawn_http_server(token).await;
+
+        let body = r#"{"jsonrpc":"2.0","id":11,"method":"ping"}"#;
+        let (first, second) = body.split_at(10);
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{first}\r\n{:x}\r\n{second}\r\n0\r\n\r\n",
+            first.len(),
+            second.len()
+        );
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write request");
+        let (status, response_body) = read_one_response(&mut stream).await;
+        assert_eq!(status, 200, "chunked request must be accepted");
+        let parsed: Value = serde_json::from_str(&response_body).expect("body is JSON");
+        assert_eq!(parsed["id"], 11);
+
+        handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_transport_rejects_oversized_bodies() {
+        let token = "oversize-token";
+        let (addr, handle) = spawn_http_server(token).await;
+
+        // Declared oversized body: the 413 comes back from the Content-Length
+        // check alone, before any body bytes are sent.
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            MAX_HTTP_BODY + 1
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write request");
+        let (status, _) = read_one_response(&mut stream).await;
+        assert_eq!(status, 413, "declared oversized body must be rejected");
+        drop(stream);
+
+        // Chunked oversized body (no Content-Length header to check up front):
+        // the streaming cap on the body read must reject it. The body is one
+        // byte over the cap and fully framed, so the server drains the input
+        // and can deliver the 413 over a clean close.
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream
+            .write_all(
+                format!(
+                    "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write head");
+        let chunk = vec![b'x'; 64 * 1024];
+        let mut remaining = MAX_HTTP_BODY + 1;
+        while remaining > 0 {
+            let take = remaining.min(chunk.len());
+            stream
+                .write_all(format!("{take:x}\r\n").as_bytes())
+                .await
+                .expect("write chunk size");
+            stream
+                .write_all(&chunk[..take])
+                .await
+                .expect("write chunk data");
+            stream.write_all(b"\r\n").await.expect("write chunk end");
+            remaining -= take;
+        }
+        stream
+            .write_all(b"0\r\n\r\n")
+            .await
+            .expect("write terminal chunk");
+        let (status, _) = read_one_response(&mut stream).await;
+        assert_eq!(status, 413, "chunked oversized body must be rejected");
+
+        handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_transport_rejects_malformed_requests() {
+        let token = "malformed-token";
+        let (addr, handle) = spawn_http_server(token).await;
+
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream
+            .write_all(b"this is not http\r\n\r\n")
+            .await
+            .expect("write garbage");
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await.expect("read response");
+        let text = String::from_utf8_lossy(&raw);
+        let status: u16 = text
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse().ok())
+            .expect("status code");
+        assert_eq!(status, 400, "malformed HTTP must be rejected");
 
         handle.abort();
     }
