@@ -12,7 +12,7 @@
     structurally unable to:
 
       1. Approve / deny / confirm / revert its own gated commands. The daemon's
-         `validate_admin` (src/server.rs) only accepts an admin RPC when the
+         `validate_admin` (src/server/mod.rs) only accepts an admin RPC when the
          connecting peer's SID equals the daemon's own SID. The agent connects
          to the pipe as its own SID, which is NOT the guard SID, so every
          `guard approve|deny|confirm|revert` it issues is refused. Only a caller

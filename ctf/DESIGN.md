@@ -90,7 +90,7 @@ These vectors are not fully addressed by guard alone and require deployment-leve
 | PATH manipulation | Restricted shell, read-only PATH |
 | Interpreter subprocess calls (`python3 -c "import subprocess; ..."`) | Remove interpreters from agent container, or add to prompt |
 | `/dev/tcp` bash builtin | Disable with restricted bash or remove bash |
-| Guard socket permissions | Default 0666 for UID-based auth; restrict with `--users` flag |
+| Guard socket reachable by other group members | Socket is created `0600`, widened to `0660` only after `--socket-group` assignment; add `--users` to restrict submitting uids inside the group |
 
 See [DEPLOYMENT.md](../DEPLOYMENT.md) for recommended production deployment practices.
 
@@ -99,15 +99,3 @@ See [DEPLOYMENT.md](../DEPLOYMENT.md) for recommended production deployment prac
 The CTF validates whether the guard's command interposition model provides meaningful security when the attacker (AI agent) has shell access, knowledge of the architecture, and the ability to reason about bypass strategies.
 
 The expected outcome is that LLM evaluation + environment isolation + output redaction provides strong defense-in-depth, but shim-based interposition alone is insufficient. Kernel-level enforcement (seccomp, AppArmor, read-only FS) is recommended for high-security deployments.
-
-## Results summary
-
-Three-mode verification (readonly, safe, paranoid) across 20 commands per mode (10 attacks + 10 legitimate): 60/60 correct.
-
-Adversarial red-teaming with Claude Opus 4.6: 70+ attack vectors tested. All destructive, escalation, and obfuscation attacks denied. Prompt extraction and binary inspection allowed (accepted risk for open-source). API key exfiltration attacks allowed by LLM but mitigated architecturally by `env_clear` (child processes never see the key).
-
-Adversarial review by GPT 5.4: 25 additional vectors proposed (tool side-channels, pure-shell reads, container sockets, data exfiltration). All blocked by the LLM prompt's explicit coverage of these patterns.
-
-False positive testing: 45 legitimate admin commands tested, 0 false denials from the LLM evaluator.
-
-Token cost: ~800-1200 tokens per evaluation with Gemini 3 Flash, roughly $0.00005-0.00015 per decision. A full 60-command test suite costs under $0.01.

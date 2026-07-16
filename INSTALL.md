@@ -89,4 +89,6 @@ Prefer the local socket or named pipe for a single-host deployment.
 
 Use [`.env.example`](.env.example) and [Configuration](docs/configuration.md)
 for daemon settings. Use [DEPLOYMENT.md](DEPLOYMENT.md) before granting the
-daemon remote credentials or privileged local authority.
+daemon remote credentials or privileged local authority; its Upgrades section
+covers replacing the binary of a deployed service and the state-database
+schema behavior across versions.
