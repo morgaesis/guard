@@ -17,7 +17,9 @@ use guard::gating::GateMode;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::NamedPipeServer;
 use tokio::net::TcpListener;
@@ -1385,6 +1387,67 @@ async fn handle_client_pipe(stream: NamedPipeServer, config: &ServerConfig) -> R
     serve_connection(stream, caller, config).await
 }
 
+/// One request line read under the transport size cap.
+enum BoundedLine {
+    /// A complete line within the cap (also the final unterminated line at EOF).
+    Line(String),
+    /// Clean end of stream.
+    Eof,
+    /// The peer sent more than `MAX_REQUEST_BYTES` before a newline arrived.
+    /// The remainder of the oversized line is still in flight, so the caller
+    /// must close the connection rather than keep reading.
+    TooLong,
+}
+
+/// Read one newline-delimited request without ever buffering more than
+/// `MAX_REQUEST_BYTES + 1` bytes. `Lines::next_line` grows its buffer until it
+/// sees `\n`, so a peer that never sends one could exhaust memory before any
+/// size check runs; this enforces the cap while the line is still streaming
+/// in. Matches `next_line` semantics for in-cap input: strips `\n`/`\r\n`,
+/// yields a final unterminated line at EOF, and errors on invalid UTF-8.
+async fn read_bounded_line<R>(reader: &mut R) -> std::io::Result<BoundedLine>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut buf = Vec::new();
+    let read = (&mut *reader)
+        .take(MAX_REQUEST_BYTES as u64 + 1)
+        .read_until(b'\n', &mut buf)
+        .await?;
+    if read == 0 {
+        return Ok(BoundedLine::Eof);
+    }
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+        if buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
+    } else if buf.len() > MAX_REQUEST_BYTES {
+        return Ok(BoundedLine::TooLong);
+    }
+    String::from_utf8(buf)
+        .map(BoundedLine::Line)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// Denial response for a request rejected before policy evaluation.
+fn validation_error_response(reason: String) -> ExecuteResponse {
+    ExecuteResponse {
+        allowed: false,
+        reason,
+        exit_code: None,
+        stdout: None,
+        stderr: None,
+        status: None,
+        handle: None,
+        coverage: None,
+        verb_matches: Vec::new(),
+        verb_guidance: None,
+        decision_source: "validation".to_string(),
+        decision_trace: Some(guard::gating::DecisionTrace::source("validation")),
+    }
+}
+
 /// Drive the request/response protocol for one connected client, independent of
 /// the underlying transport (UNIX socket or Windows named pipe).
 async fn serve_connection<S>(stream: S, caller: CallerIdentity, config: &ServerConfig) -> Result<()>
@@ -1392,32 +1455,34 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let (reader, mut writer) = tokio::io::split(stream);
-    let mut lines = BufReader::new(reader).lines();
+    let mut reader = BufReader::new(reader);
 
     tracing::info!("serve_connection: waiting for request...");
-    while let Ok(Some(line)) = lines.next_line().await {
-        if line.len() > MAX_REQUEST_BYTES {
-            tracing::warn!("request too large ({} bytes), dropping", line.len());
-            continue;
-        }
+    loop {
+        let line = match read_bounded_line(&mut reader).await {
+            Ok(BoundedLine::Line(line)) => line,
+            Ok(BoundedLine::Eof) | Err(_) => break,
+            Ok(BoundedLine::TooLong) => {
+                tracing::warn!(
+                    "request exceeds {} bytes, closing connection",
+                    MAX_REQUEST_BYTES
+                );
+                let resp = validation_error_response(format!(
+                    "request exceeds {} bytes",
+                    MAX_REQUEST_BYTES
+                ));
+                writer
+                    .write_all(serde_json::to_string(&resp)?.as_bytes())
+                    .await?;
+                writer.write_all(b"\n").await?;
+                break;
+            }
+        };
         tracing::debug!("serve_connection: received request (raw)");
         let incoming: IncomingMessage = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
-                let resp = ExecuteResponse {
-                    allowed: false,
-                    reason: format!("invalid request: {}", e),
-                    exit_code: None,
-                    stdout: None,
-                    stderr: None,
-                    status: None,
-                    handle: None,
-                    coverage: None,
-                    verb_matches: Vec::new(),
-                    verb_guidance: None,
-                    decision_source: "validation".to_string(),
-                    decision_trace: Some(guard::gating::DecisionTrace::source("validation")),
-                };
+                let resp = validation_error_response(format!("invalid request: {}", e));
                 writer
                     .write_all(serde_json::to_string(&resp)?.as_bytes())
                     .await?;
@@ -1447,20 +1512,7 @@ where
                 false,
                 "invalid auth token",
             );
-            let resp = ExecuteResponse {
-                allowed: false,
-                reason: "invalid auth token".to_string(),
-                exit_code: None,
-                stdout: None,
-                stderr: None,
-                status: None,
-                handle: None,
-                coverage: None,
-                verb_matches: Vec::new(),
-                verb_guidance: None,
-                decision_source: "validation".to_string(),
-                decision_trace: Some(guard::gating::DecisionTrace::source("validation")),
-            };
+            let resp = validation_error_response("invalid auth token".to_string());
             writer
                 .write_all(serde_json::to_string(&resp)?.as_bytes())
                 .await?;
@@ -1591,30 +1643,32 @@ pub(super) async fn session_maintenance_once(config: &ServerConfig) -> Result<bo
 
 async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    let mut reader = BufReader::new(reader);
 
-    while let Ok(Some(line)) = lines.next_line().await {
-        if line.len() > MAX_REQUEST_BYTES {
-            tracing::warn!("request too large ({} bytes), dropping", line.len());
-            continue;
-        }
+    loop {
+        let line = match read_bounded_line(&mut reader).await {
+            Ok(BoundedLine::Line(line)) => line,
+            Ok(BoundedLine::Eof) | Err(_) => break,
+            Ok(BoundedLine::TooLong) => {
+                tracing::warn!(
+                    "request exceeds {} bytes, closing connection",
+                    MAX_REQUEST_BYTES
+                );
+                let resp = validation_error_response(format!(
+                    "request exceeds {} bytes",
+                    MAX_REQUEST_BYTES
+                ));
+                writer
+                    .write_all(serde_json::to_string(&resp)?.as_bytes())
+                    .await?;
+                writer.write_all(b"\n").await?;
+                break;
+            }
+        };
         let incoming: IncomingMessage = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
-                let resp = ExecuteResponse {
-                    allowed: false,
-                    reason: format!("invalid request: {}", e),
-                    exit_code: None,
-                    stdout: None,
-                    stderr: None,
-                    status: None,
-                    handle: None,
-                    coverage: None,
-                    verb_matches: Vec::new(),
-                    verb_guidance: None,
-                    decision_source: "validation".to_string(),
-                    decision_trace: Some(guard::gating::DecisionTrace::source("validation")),
-                };
+                let resp = validation_error_response(format!("invalid request: {}", e));
                 writer
                     .write_all(serde_json::to_string(&resp)?.as_bytes())
                     .await?;
@@ -1663,20 +1717,7 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
                 false,
                 "invalid auth token",
             );
-            let resp = ExecuteResponse {
-                allowed: false,
-                reason: "invalid auth token".to_string(),
-                exit_code: None,
-                stdout: None,
-                stderr: None,
-                status: None,
-                handle: None,
-                coverage: None,
-                verb_matches: Vec::new(),
-                verb_guidance: None,
-                decision_source: "validation".to_string(),
-                decision_trace: Some(guard::gating::DecisionTrace::source("validation")),
-            };
+            let resp = validation_error_response("invalid auth token".to_string());
             writer
                 .write_all(serde_json::to_string(&resp)?.as_bytes())
                 .await?;
@@ -1751,6 +1792,183 @@ pub(super) async fn write_policy_decision<W: AsyncWrite + Unpin>(
         .await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod line_limit_tests {
+    use super::*;
+    use std::time::Duration;
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+    async fn next_bounded(reader: &mut (impl AsyncBufRead + Unpin)) -> BoundedLine {
+        read_bounded_line(reader).await.expect("read line")
+    }
+
+    #[tokio::test]
+    async fn bounded_reader_matches_next_line_semantics() {
+        let mut reader = &b"hello\r\nworld\npartial"[..];
+        assert!(matches!(
+            next_bounded(&mut reader).await,
+            BoundedLine::Line(line) if line == "hello"
+        ));
+        assert!(matches!(
+            next_bounded(&mut reader).await,
+            BoundedLine::Line(line) if line == "world"
+        ));
+        assert!(matches!(
+            next_bounded(&mut reader).await,
+            BoundedLine::Line(line) if line == "partial"
+        ));
+        assert!(matches!(next_bounded(&mut reader).await, BoundedLine::Eof));
+    }
+
+    #[tokio::test]
+    async fn bounded_reader_accepts_line_at_exact_cap() {
+        let mut data = vec![b'a'; MAX_REQUEST_BYTES];
+        data.push(b'\n');
+        data.extend_from_slice(b"next\n");
+        let mut reader = &data[..];
+        assert!(matches!(
+            next_bounded(&mut reader).await,
+            BoundedLine::Line(line) if line.len() == MAX_REQUEST_BYTES
+        ));
+        assert!(matches!(
+            next_bounded(&mut reader).await,
+            BoundedLine::Line(line) if line == "next"
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_reader_rejects_line_over_cap() {
+        let data = vec![b'a'; MAX_REQUEST_BYTES + 1];
+        let mut reader = &data[..];
+        assert!(matches!(
+            next_bounded(&mut reader).await,
+            BoundedLine::TooLong
+        ));
+    }
+
+    /// A peer that streams more than the cap without a newline gets a denial
+    /// response and a closed connection instead of an unbounded server buffer.
+    #[tokio::test]
+    async fn serve_connection_closes_on_oversized_request() {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let config = crate::server::tests::config_for_proposal_test();
+        let task = tokio::spawn(async move {
+            serve_connection(server, CallerIdentity::Unknown, &config).await
+        });
+
+        let (read_half, mut write_half) = tokio::io::split(client);
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            write_half
+                .write_all(&vec![b'x'; MAX_REQUEST_BYTES + 1])
+                .await
+                .expect("stream oversized request");
+            let mut lines = BufReader::new(read_half).lines();
+            let response = lines
+                .next_line()
+                .await
+                .expect("read denial")
+                .expect("denial line before close");
+            let response: ExecuteResponse =
+                serde_json::from_str(&response).expect("parse denial response");
+            assert!(!response.allowed);
+            assert!(response.reason.contains("exceeds"), "{}", response.reason);
+            assert_eq!(response.decision_source, "validation");
+            // The server closes the connection after the denial.
+            assert_eq!(lines.next_line().await.expect("read EOF"), None);
+        })
+        .await
+        .expect("connection must terminate instead of buffering indefinitely");
+        task.await.expect("server task").expect("serve_connection");
+    }
+
+    /// A line exactly at the cap still reaches request parsing, and the
+    /// connection stays open for further requests.
+    #[tokio::test]
+    async fn serve_connection_accepts_line_at_exact_cap() {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let config = crate::server::tests::config_for_proposal_test();
+        let task = tokio::spawn(async move {
+            serve_connection(server, CallerIdentity::Unknown, &config).await
+        });
+
+        let (read_half, mut write_half) = tokio::io::split(client);
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            let mut request = vec![b'x'; MAX_REQUEST_BYTES];
+            request.push(b'\n');
+            write_half.write_all(&request).await.expect("send request");
+            let mut lines = BufReader::new(read_half).lines();
+            let response = lines
+                .next_line()
+                .await
+                .expect("read response")
+                .expect("response line");
+            let response: ExecuteResponse =
+                serde_json::from_str(&response).expect("parse response");
+            assert!(!response.allowed);
+            // Not JSON, so it must fail at parsing, not at the size gate.
+            assert!(
+                response.reason.contains("invalid request"),
+                "{}",
+                response.reason
+            );
+            // The connection survives an at-cap line.
+            write_half
+                .write_all(b"also-not-json\n")
+                .await
+                .expect("send follow-up");
+            let response = lines
+                .next_line()
+                .await
+                .expect("read follow-up response")
+                .expect("follow-up response line");
+            let response: ExecuteResponse =
+                serde_json::from_str(&response).expect("parse follow-up response");
+            assert!(response.reason.contains("invalid request"));
+            write_half.shutdown().await.expect("shutdown write half");
+            assert_eq!(lines.next_line().await.expect("read EOF"), None);
+        })
+        .await
+        .expect("responses must arrive");
+        task.await.expect("server task").expect("serve_connection");
+    }
+
+    /// The oversized-line cap holds on TCP before any token validation runs.
+    #[tokio::test]
+    async fn tcp_oversized_preauth_request_closes_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let config = crate::server::tests::config_for_proposal_test();
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            handle_client_tcp(stream, &config).await
+        });
+
+        let client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let (read_half, mut write_half) = client.into_split();
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            write_half
+                .write_all(&vec![b'x'; MAX_REQUEST_BYTES + 1])
+                .await
+                .expect("stream oversized request");
+            let mut lines = BufReader::new(read_half).lines();
+            let response = lines
+                .next_line()
+                .await
+                .expect("read denial")
+                .expect("denial line before close");
+            let response: ExecuteResponse =
+                serde_json::from_str(&response).expect("parse denial response");
+            assert!(!response.allowed);
+            assert!(response.reason.contains("exceeds"), "{}", response.reason);
+            assert_eq!(lines.next_line().await.expect("read EOF"), None);
+        })
+        .await
+        .expect("connection must terminate instead of buffering indefinitely");
+        task.await.expect("server task").expect("handle_client_tcp");
+    }
 }
 
 #[cfg(all(test, unix))]
