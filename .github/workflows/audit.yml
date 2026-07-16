@@ -84,7 +84,7 @@ jobs:
         run: cargo install cargo-outdated --version 0.19.0 --locked
 
       - name: Report outdated dependencies
-        run: cargo outdated
+        run: cargo outdated --exit-code 1
 
   cargo_machete:
     name: Unused Dependencies
@@ -108,6 +108,48 @@ jobs:
 
       - name: Check unused
         run: cargo machete
+
+  # Fails when the live required-status-check set on main drifts from the
+  # declared list in scripts/sync-branch-protection.sh. The default
+  # GITHUB_TOKEN cannot read the branch protection endpoint; provision a
+  # fine-grained personal access token with repository permission
+  # "Administration: read-only" and store it as the REQUIRED_CHECKS_TOKEN
+  # secret to make this check authoritative. Without it the job attempts the
+  # public branch endpoint and, if that is also unreadable, emits a warning
+  # annotation instead of silently passing.
+  branch_protection_drift:
+    name: Branch Protection Drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Compare live required checks with declared list
+        env:
+          GH_TOKEN: ${{ secrets.REQUIRED_CHECKS_TOKEN || github.token }}
+          TOKEN_PROVIDED: ${{ secrets.REQUIRED_CHECKS_TOKEN != '' }}
+          REPO: ${{ github.repository }}
+        run: |
+          set +e
+          scripts/sync-branch-protection.sh --check
+          status=$?
+          set -e
+          case "$status" in
+            0) exit 0 ;;
+            1)
+              echo "::error::Required status checks on main drifted from the declared list; run scripts/sync-branch-protection.sh --apply."
+              exit 1
+              ;;
+            *)
+              if [ "$TOKEN_PROVIDED" = "true" ]; then
+                echo "::error::REQUIRED_CHECKS_TOKEN is set but branch protection is unreadable; check the token's Administration: read permission."
+                exit 1
+              fi
+              echo "::warning::Branch protection is unreadable with the default token; drift check skipped. Provision the REQUIRED_CHECKS_TOKEN secret (fine-grained PAT, Administration: read-only) to enforce it."
+              exit 0
+              ;;
+          esac
 
   dependency_review:
     name: Dependency Review

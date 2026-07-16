@@ -118,6 +118,13 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             binary: guard
+          # Dry-runs the cross-compiled release target so aarch64 breakage
+          # surfaces on pull requests instead of at tag time. Mirrors the
+          # cross usage in release.yml.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            binary: guard
+            use_cross: true
           - target: aarch64-apple-darwin
             os: macos-latest
             binary: guard
@@ -167,12 +174,23 @@ jobs:
           cache-workspace-crates: true
           save-if: ${{ github.event_name != 'pull_request' }}
 
+      - name: Install Cross
+        if: matrix.use_cross && steps.binary-cache.outputs.cache-hit != 'true'
+        run: cargo install cross --version 0.2.5 --locked
+
       - name: Build
-        if: steps.binary-cache.outputs.cache-hit != 'true'
+        if: ${{ !matrix.use_cross && steps.binary-cache.outputs.cache-hit != 'true' }}
         shell: bash
         env:
           BUILD_TARGET: ${{ matrix.target }}
         run: cargo build --release --target "$BUILD_TARGET"
+
+      - name: Build (Cross)
+        if: matrix.use_cross && steps.binary-cache.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+        run: cross build --release --target "$BUILD_TARGET"
 
       - name: Save exact binary
         if: >-
@@ -188,4 +206,13 @@ jobs:
         shell: bash
         env:
           BINARY: target/${{ matrix.target }}/release/${{ matrix.binary }}
-        run: '"$BINARY" --version'
+          USE_CROSS: ${{ matrix.use_cross }}
+        run: |
+          if [ "$USE_CROSS" = "true" ]; then
+            # The cross-compiled binary cannot execute on the host runner;
+            # confirm it exists and targets the expected architecture.
+            file "$BINARY"
+            file "$BINARY" | grep -q aarch64
+          else
+            "$BINARY" --version
+          fi

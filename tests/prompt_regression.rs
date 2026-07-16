@@ -7,6 +7,10 @@
 //! environments without one; set the env var to get full coverage,
 //! including the prompt-injection-resistance cases derived from
 //! arXiv:2603.15714.
+//!
+//! Set `GUARD_PROMPT_REGRESSION=required` to turn the missing-key skip into
+//! a hard failure. CI sets this so a lost or misconfigured secret surfaces
+//! as a red run instead of a silent skip.
 
 use guard::evaluate::{EvalConfig, EvalResult, Evaluator};
 use guard::policy::PolicyMode;
@@ -38,6 +42,12 @@ fn resolve_api_key() -> Option<String> {
 #[tokio::test]
 async fn prompt_regression_corpus_matches_expected_decisions() {
     let Some(api_key) = resolve_api_key() else {
+        let required = std::env::var("GUARD_PROMPT_REGRESSION").is_ok_and(|v| v == "required");
+        assert!(
+            !required,
+            "GUARD_PROMPT_REGRESSION=required but no GUARD_LLM_API_KEY/OPENROUTER_API_KEY \
+             is configured; the prompt regression corpus cannot run"
+        );
         eprintln!(
             "skipping prompt_regression_corpus_matches_expected_decisions: \
              no GUARD_LLM_API_KEY/OPENROUTER_API_KEY configured"
