@@ -485,116 +485,81 @@ fn match_glob(pattern: &str, text: &str) -> bool {
     match_glob_recursive(&pattern_chars, &text_chars)
 }
 
-/// Recursive glob matching with backtracking.
+/// Iterative glob matching with backtracking.
+///
+/// All failure paths funnel into a single backtrack site so termination is
+/// guaranteed: each backtrack makes the most recent `*` consume one more text
+/// character, and once the text is exhausted no further backtracking is
+/// possible.
 fn match_glob_recursive(pattern: &[char], text: &[char]) -> bool {
     let mut p_idx = 0usize;
     let mut t_idx = 0usize;
     let mut star_pos: Option<usize> = None;
-    let mut t_at_star: Option<usize> = None;
+    let mut t_at_star = 0usize;
 
     loop {
-        if p_idx < pattern.len() {
-            match pattern[p_idx] {
-                '*' => {
-                    // Save position before *, and current text position
-                    star_pos = Some(p_idx);
-                    t_at_star = Some(t_idx);
-                    p_idx += 1;
-                }
-                '?' => {
-                    if t_idx < text.len() {
-                        p_idx += 1;
-                        t_idx += 1;
-                    } else if let (Some(sp), Some(_)) = (star_pos, t_at_star) {
-                        // Backtrack to previous *
-                        p_idx = sp + 1;
-                        t_idx = t_at_star.unwrap() + 1;
-                        t_at_star = Some(t_idx);
-                    } else {
-                        return false;
-                    }
-                }
-                '[' => {
-                    // Find closing ]
-                    if let Some(end) = pattern[p_idx..].iter().position(|&c| c == ']') {
-                        let class_end = p_idx + end;
-                        let class = &pattern[p_idx + 1..class_end];
+        if p_idx < pattern.len() && pattern[p_idx] == '*' {
+            // Record the *, initially matching zero characters
+            star_pos = Some(p_idx);
+            t_at_star = t_idx;
+            p_idx += 1;
+            continue;
+        }
 
-                        let negated = class.first() == Some(&'!');
-                        let class_content = if negated { &class[1..] } else { class };
-
-                        if t_idx < text.len() {
-                            let ch = text[t_idx];
-                            let matches = class_content.contains(&ch)
-                                || (class_content.len() == 3
-                                    && class_content[1] == '-'
-                                    && ch >= class_content[0]
-                                    && ch <= class_content[2]);
-
-                            if matches != negated {
-                                p_idx = class_end + 1;
-                                t_idx += 1;
-                            } else if let (Some(sp), Some(_)) = (star_pos, t_at_star) {
-                                p_idx = sp + 1;
-                                t_idx = t_at_star.unwrap() + 1;
-                                t_at_star = Some(t_idx);
-                            } else {
-                                return false;
-                            }
-                        } else if let (Some(sp), Some(_)) = (star_pos, t_at_star) {
-                            p_idx = sp + 1;
-                            t_idx = t_at_star.unwrap() + 1;
-                            t_at_star = Some(t_idx);
-                        } else {
-                            return false;
-                        }
-                    } else {
-                        // No closing ], treat [ as literal
-                        if t_idx < text.len() && pattern[p_idx] == text[t_idx] {
-                            p_idx += 1;
-                            t_idx += 1;
-                        } else if let (Some(sp), Some(_)) = (star_pos, t_at_star) {
-                            p_idx = sp + 1;
-                            t_idx = t_at_star.unwrap() + 1;
-                            t_at_star = Some(t_idx);
-                        } else {
-                            return false;
-                        }
-                    }
-                }
-                c => {
-                    if t_idx < text.len() && c == text[t_idx] {
-                        p_idx += 1;
-                        t_idx += 1;
-                    } else if let (Some(sp), Some(_)) = (star_pos, t_at_star) {
-                        // Backtrack: try matching * with more characters
-                        p_idx = sp + 1;
-                        t_idx = t_at_star.unwrap() + 1;
-                        t_at_star = Some(t_idx);
-                        // If we've consumed all text after backtracking and still have pattern,
-                        // fail immediately to avoid infinite loop
-                        if t_idx >= text.len() && p_idx < pattern.len() {
-                            return false;
-                        }
-                    } else {
-                        return false;
-                    }
-                }
+        if p_idx < pattern.len() && t_idx < text.len() {
+            let (matched, p_next) = match_single(pattern, p_idx, text[t_idx]);
+            if matched {
+                p_idx = p_next;
+                t_idx += 1;
+                continue;
             }
-        } else if t_idx < text.len() {
-            // Pattern exhausted but text remains - only valid if we can match remaining with *
-            if let (Some(sp), Some(_)) = (star_pos, t_at_star) {
-                // Try matching * with more characters
-                p_idx = sp + 1;
-                t_idx = t_at_star.unwrap() + 1;
-                t_at_star = Some(t_idx);
-            } else {
-                return false;
-            }
-        } else {
+        } else if p_idx >= pattern.len() && t_idx >= text.len() {
             // Both exhausted - match success
             return true;
         }
+
+        // Mismatch, or exactly one of pattern/text exhausted: backtrack to the
+        // most recent *, extending it by one character. If there is no * or
+        // the * has already consumed all remaining text, the match fails.
+        match star_pos {
+            Some(sp) if t_at_star < text.len() => {
+                t_at_star += 1;
+                t_idx = t_at_star;
+                p_idx = sp + 1;
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// Match a single non-`*` pattern element (`?`, a `[...]` class, or a literal
+/// character) against one text character. Returns whether it matched and the
+/// pattern index just past the element.
+fn match_single(pattern: &[char], p_idx: usize, ch: char) -> (bool, usize) {
+    match pattern[p_idx] {
+        '?' => (true, p_idx + 1),
+        '[' => {
+            // Find closing ]
+            if let Some(end) = pattern[p_idx..].iter().position(|&c| c == ']') {
+                let class_end = p_idx + end;
+                let class = &pattern[p_idx + 1..class_end];
+
+                let negated = class.first() == Some(&'!');
+                let class_content = if negated { &class[1..] } else { class };
+
+                let matches = class_content.contains(&ch)
+                    || (class_content.len() == 3
+                        && class_content[1] == '-'
+                        && ch >= class_content[0]
+                        && ch <= class_content[2]);
+
+                (matches != negated, class_end + 1)
+            } else {
+                // No closing ], treat [ as literal
+                (ch == '[', p_idx + 1)
+            }
+        }
+        c => (c == ch, p_idx + 1),
     }
 }
 
@@ -736,6 +701,27 @@ mod tests {
         assert!(match_glob("docker*", "docker"));
         assert!(match_glob("docker*", "docker ps"));
         assert!(match_glob("docker*", "docker-compose up -d"));
+    }
+
+    #[test]
+    fn test_glob_backtrack_terminates_on_exhausted_text() {
+        // A `?` or `[...]` immediately after `*` used to backtrack forever
+        // once the text was exhausted. These must terminate (returning false);
+        // a regression hangs and is caught by the test timeout.
+        assert!(!match_glob("*.py[co]", "foo.py"));
+        assert!(!match_glob("*.log?", "a.log"));
+        assert!(!match_glob("rm*?", "rm"));
+        assert!(!match_glob("*[a]", "x"));
+        assert!(!match_glob("*?", ""));
+        assert!(!match_glob("*[!a]", "a"));
+
+        // The same pattern shapes still match when the text is long enough.
+        assert!(match_glob("*.py[co]", "foo.pyc"));
+        assert!(match_glob("*.py[co]", "foo.pyo"));
+        assert!(match_glob("*.log?", "a.log1"));
+        assert!(match_glob("rm*?", "rm x"));
+        assert!(match_glob("*[a]", "xa"));
+        assert!(match_glob("*?", "x"));
     }
 
     // === Command parsing tests ===
