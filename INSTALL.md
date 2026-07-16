@@ -36,6 +36,10 @@ Published targets are:
 
 Build from source on macOS. The release workflow does not publish macOS assets.
 
+Releases also ship per-target CycloneDX SBOMs and signed build provenance
+attestations. See [Release verification](docs/release-verification.md) for
+checking them.
+
 ## Local endpoint
 
 Set the evaluator key where the daemon starts:
