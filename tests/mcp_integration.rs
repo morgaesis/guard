@@ -16,7 +16,8 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use tempfile::TempDir;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::time::{sleep, timeout};
 
@@ -286,4 +287,199 @@ async fn mcp_end_to_end_initialize_list_call() {
         )
         .await;
     assert_eq!(unknown["error"]["code"], -32601);
+}
+
+const HTTP_TOKEN: &str = "integration-test-bearer";
+
+/// Spawn `guard mcp serve --http` against a (not necessarily live) daemon
+/// socket path and wait until the HTTP listener accepts connections. The
+/// initialize/tools/list handshake never touches the daemon, so this covers
+/// the HTTP transport itself hermetically.
+async fn start_http_mcp(tmp: &TempDir) -> (McpHttpGuard, std::net::SocketAddr) {
+    let socket_path = tmp.path().join("guard.sock");
+    // Reserve an ephemeral port, then hand it to the child. The tiny window
+    // between drop and child bind is acceptable for a test environment.
+    let addr = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
+        probe.local_addr().expect("probe addr")
+    };
+
+    let child = Command::new(GUARD_BIN)
+        .args(["mcp", "serve", "--socket"])
+        .arg(&socket_path)
+        .args(["--http", &addr.to_string(), "--http-token", HTTP_TOKEN])
+        .env("HOME", tmp.path())
+        .env("XDG_CONFIG_HOME", tmp.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn guard mcp serve --http");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(stream) = TcpStream::connect(addr).await {
+            drop(stream);
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "MCP HTTP listener on {addr} did not accept within 10s"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    (McpHttpGuard { child }, addr)
+}
+
+struct McpHttpGuard {
+    child: Child,
+}
+
+impl Drop for McpHttpGuard {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+    }
+}
+
+/// Read exactly one HTTP response (status line, headers, Content-Length body)
+/// off a connection without consuming bytes of a following response, so
+/// keep-alive assertions can reuse the stream.
+async fn read_one_http_response(stream: &mut TcpStream) -> (u16, String) {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        let read = timeout(Duration::from_secs(10), stream.read(&mut byte))
+            .await
+            .expect("response header timed out")
+            .expect("read header byte");
+        assert!(read > 0, "connection closed before end of headers");
+        head.push(byte[0]);
+    }
+    let head_text = String::from_utf8_lossy(&head).into_owned();
+    let status: u16 = head_text
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .expect("status code");
+    let content_length: usize = head_text
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                value.trim().parse().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    let mut body = vec![0u8; content_length];
+    timeout(Duration::from_secs(10), stream.read_exact(&mut body))
+        .await
+        .expect("response body timed out")
+        .expect("read body");
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+fn http_post(body: &str) -> String {
+    format!(
+        "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {HTTP_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_http_transport_keepalive_pair_on_one_connection() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_mcp, addr) = start_http_mcp(&tmp).await;
+
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+
+    // First request on the connection: initialize.
+    let init_body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": { "name": "integration-test", "version": "1.0.0" }
+        }
+    })
+    .to_string();
+    stream
+        .write_all(http_post(&init_body).as_bytes())
+        .await
+        .expect("write initialize");
+    let (status, body) = read_one_http_response(&mut stream).await;
+    assert_eq!(status, 200);
+    let init: Value = serde_json::from_str(&body).expect("initialize response is JSON");
+    assert_eq!(init["id"], 1);
+    assert_eq!(init["result"]["protocolVersion"], "2025-03-26");
+
+    // Second request on the SAME connection: tools/list must be served without
+    // a reconnect (keep-alive).
+    let list_body = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
+    stream
+        .write_all(http_post(list_body).as_bytes())
+        .await
+        .expect("write tools/list");
+    let (status, body) = read_one_http_response(&mut stream).await;
+    assert_eq!(status, 200);
+    let list: Value = serde_json::from_str(&body).expect("tools/list response is JSON");
+    assert_eq!(list["id"], 2);
+    let names: Vec<&str> = list["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    assert!(names.contains(&"guard_run"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_http_transport_rejects_oversized_body() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_mcp, addr) = start_http_mcp(&tmp).await;
+
+    // Declare a body over the transport's 1 MiB cap; the rejection must arrive
+    // without the body ever being sent.
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {HTTP_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        2 * 1024 * 1024
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write request head");
+    let (status, _) = read_one_http_response(&mut stream).await;
+    assert_eq!(status, 413, "oversized body must be rejected");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_http_transport_rejects_malformed_http() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_mcp, addr) = start_http_mcp(&tmp).await;
+
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    stream
+        .write_all(b"this is not http\r\n\r\n")
+        .await
+        .expect("write garbage");
+    let mut raw = Vec::new();
+    timeout(Duration::from_secs(10), stream.read_to_end(&mut raw))
+        .await
+        .expect("response timed out")
+        .expect("read response");
+    let text = String::from_utf8_lossy(&raw);
+    let status: u16 = text
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .expect("status code");
+    assert_eq!(status, 400, "malformed HTTP must be rejected");
 }
