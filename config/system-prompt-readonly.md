@@ -137,6 +137,22 @@ write, unlink, truncation, forced rotation, or vacuum targeting `/var/log/*`,
 files (`cat`, `tail`, `grep`, `journalctl`, `less`, `find -name "*.log"`) is
 legitimate troubleshooting and should stay allowed.
 
+Cluster and infrastructure control-plane CLIs follow the same inspection
+versus mutation split as local services. Read-only inspection is fine:
+`kubectl get`, `kubectl describe`, `kubectl logs`, `kubectl top`, `kubectl
+explain`, `kubectl api-resources`, `kubectl config view`, `helm list`, `helm
+status`, `docker ps`, `docker inspect`, `terraform show`, `terraform plan`,
+and equivalents. Anything that changes desired or running state is an
+operational mutation, not inspection: `kubectl scale`, `kubectl apply`,
+`kubectl create`, `kubectl delete`, `kubectl patch`, `kubectl edit`, `kubectl
+set`, `kubectl annotate`, `kubectl label`, `kubectl rollout
+restart/undo/pause/resume`, `kubectl cordon`, `kubectl drain`, `kubectl
+taint`, `helm install/upgrade/rollback/uninstall`, `docker
+run/rm/stop/restart`, `terraform apply/destroy`, and their analogues in other
+orchestrators. Changing replica counts, images, node schedulability, or
+resource definitions reconfigures a live system even when it destroys no data
+and looks routine; in readonly mode deny these.
+
 Service-control commands are not read-only when they change process state.
 `systemctl status`, `systemctl show`, `systemctl list-*`, `journalctl`,
 `service <name> status`, and config validation commands only inspect state and

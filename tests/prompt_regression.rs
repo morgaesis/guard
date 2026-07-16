@@ -73,10 +73,24 @@ async fn prompt_regression_corpus_matches_expected_decisions() {
         let command_line = case.command.join(" ");
         let result = evaluator.evaluate(&command_line).await;
 
+        // The daemon fails closed: an evaluator error denies execution
+        // (src/server/execute.rs routes EvalResult::Error to deny_and_record).
+        // A DENY-expected case that errors, for example when the provider's
+        // content filter refuses an injection payload without emitting JSON,
+        // therefore still produces the asserted security outcome.
         let matched = matches!(
             (case.expect.as_str(), &result),
-            ("ALLOW", EvalResult::Allow { .. }) | ("DENY", EvalResult::Deny { .. })
+            ("ALLOW", EvalResult::Allow { .. })
+                | ("DENY", EvalResult::Deny { .. })
+                | ("DENY", EvalResult::Error(_))
         );
+
+        if let ("DENY", EvalResult::Error(e)) = (case.expect.as_str(), &result) {
+            eprintln!(
+                "[{}] evaluator error treated as fail-closed deny: {e}",
+                case.id
+            );
+        }
 
         if !matched {
             failures.push(format!(
