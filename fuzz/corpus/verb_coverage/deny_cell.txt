@@ -1,0 +1,15 @@
+verbs:
+  - name: kubectl-guard
+    description: Deny secret reads
+    binary: kubectl
+    consequence: reversible
+    coverage:
+      - name: no-secrets
+        action: deny
+        sticky: true
+        required_args: ["get", "secrets"]
+===
+kubectl
+get
+secrets
+-A

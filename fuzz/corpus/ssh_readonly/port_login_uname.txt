@@ -1,0 +1,7 @@
+-p
+2222
+-l
+root
+-4
+host-b
+uname -a

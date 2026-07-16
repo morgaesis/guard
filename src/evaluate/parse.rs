@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 /// other valid OpenAI-compatible shape. Some routers/models ignore the
 /// request mode and return a tool call for a JSON request, or plain content
 /// for a tool-call request.
-pub(super) fn parse_decision_response(
+pub fn parse_decision_response(
     parsed: &serde_json::Value,
     prefer_function_calling: bool,
 ) -> Result<LlmResponse> {
@@ -41,7 +41,7 @@ pub(super) fn parse_decision_response(
 /// Structural description of a response that failed to parse: key names,
 /// counts, and kinds only - never message content, so a provider echo of the
 /// (already redacted) command cannot ride an error string into logs.
-pub(super) fn response_shape_summary(parsed: &serde_json::Value) -> String {
+pub fn response_shape_summary(parsed: &serde_json::Value) -> String {
     let top_keys = parsed
         .as_object()
         .map(|obj| obj.keys().cloned().collect::<Vec<_>>().join(","))
@@ -80,7 +80,7 @@ pub(super) fn response_shape_summary(parsed: &serde_json::Value) -> String {
 
 /// Compact summary of a provider-embedded `error` object (an HTTP-200 body
 /// carrying an error, common behind routers). Message text is truncated.
-pub(super) fn provider_error_summary(parsed: &serde_json::Value) -> String {
+pub fn provider_error_summary(parsed: &serde_json::Value) -> String {
     let message = parsed
         .pointer("/error/message")
         .and_then(|v| v.as_str())

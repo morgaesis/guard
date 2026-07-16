@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"guard_evaluate_batch","arguments":{"session":"tok-1234","commands":[{"binary":"ls","args":["/tmp"]},{"binary":"rm","args":["-rf","/"],"cwd":"/home"}]}}}

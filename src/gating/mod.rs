@@ -26,6 +26,7 @@ pub mod approval;
 pub mod deny_shape;
 pub mod provisional;
 pub mod read_grant;
+pub mod ssh_readonly;
 pub mod verb;
 
 use serde::{Deserialize, Serialize};

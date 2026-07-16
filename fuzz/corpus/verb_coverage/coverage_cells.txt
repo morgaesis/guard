@@ -1,0 +1,28 @@
+verbs:
+  - name: ansible-baseline
+    description: Bounded checks
+    binary: ansible
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: bounded-check
+        action: preauthorized
+        required_args: ["--check"]
+        inventory:
+          options: ["-i", "--inventory"]
+          values: ["inventory/production"]
+        fanout:
+          options: ["--limit"]
+          max: 2
+      - name: bounded-apply
+        action: evaluate
+        forbidden_args: ["--check"]
+        override_marker: operator:ansible-apply
+===
+ansible
+all
+--check
+-i
+inventory/production
+--limit
+host-a

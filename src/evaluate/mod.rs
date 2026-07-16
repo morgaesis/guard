@@ -10,6 +10,15 @@ mod result;
 mod synthesis;
 mod verb_confirm;
 
+/// Fuzzing-only surface for the provider-response parser. Hidden from docs;
+/// not a stable API. The `parse` module itself stays private.
+#[doc(hidden)]
+pub mod fuzzing {
+    pub use super::parse::{
+        parse_decision_response, provider_error_summary, response_shape_summary,
+    };
+}
+
 pub use cache::{EvalCache, DEFAULT_CACHE_CAPACITY, DEFAULT_CACHE_TTL_SECS};
 pub use config::{EvalConfig, LlmConfig};
 pub use redact::redact_for_llm;

@@ -6,3 +6,4 @@ pub mod policy;
 pub mod principal;
 pub mod proxy;
 pub mod redact;
+pub mod wire;

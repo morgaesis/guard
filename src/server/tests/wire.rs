@@ -20,7 +20,7 @@ fn session_scoped_public_rpcs_carry_distinct_owner_bearers() {
     let batch = crate::server::wire::AdminRequest::EvaluateBatch {
         session_token: Some("target".to_string()),
         caller_token: Some("owner".to_string()),
-        commands: vec![crate::server::BatchCommand {
+        commands: vec![guard::wire::BatchCommand {
             binary: "true".to_string(),
             args: Vec::new(),
             env: std::collections::HashMap::new(),

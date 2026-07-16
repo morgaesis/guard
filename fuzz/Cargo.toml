@@ -20,3 +20,38 @@ path = "fuzz_targets/security_boundaries.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "wire_protocol"
+path = "fuzz_targets/wire_protocol.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mcp_jsonrpc"
+path = "fuzz_targets/mcp_jsonrpc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "llm_response_parse"
+path = "fuzz_targets/llm_response_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ssh_readonly"
+path = "fuzz_targets/ssh_readonly.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "verb_coverage"
+path = "fuzz_targets/verb_coverage.rs"
+test = false
+doc = false
+bench = false

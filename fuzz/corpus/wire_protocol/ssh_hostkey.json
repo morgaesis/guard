@@ -1,0 +1,1 @@
+{"binary":"ssh","args":["-o","BatchMode=yes","host-a","id"],"ssh_hostkey":"accept-new","stream":true}

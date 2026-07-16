@@ -1,0 +1,14 @@
+verbs:
+  - name: service-status
+    description: Show a unit status
+    binary: systemctl
+    args: ["status", "{unit}", "--no-pager"]
+    params:
+      unit: { pattern: "^[a-zA-Z0-9@._-]+$", required: true }
+    consequence: reversible
+    trusted: true
+===
+systemctl
+status
+nginx
+--no-pager

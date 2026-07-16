@@ -1654,6 +1654,180 @@ mod verb_resolution_tests {
     }
 }
 
+/// Property coverage for scope composition in `resolve_scoped_matches`: a
+/// session-scope grant must never shadow a baseline evaluate/deny requirement
+/// that is protected (sticky, or carrying an override marker the session was
+/// not granted). Grounded in the real pipeline: `overridden` is computed with
+/// `baseline_override_applies`, and a baseline deny cell is always sticky
+/// because catalog validation (`gating::verb`) rejects non-sticky baseline
+/// denies.
+#[cfg(test)]
+mod verb_resolution_properties {
+    use super::*;
+    use guard::gating::verb::{CoverageMatch, CoverageSpecificity, RenderedVerb};
+    use guard::gating::Reversibility;
+    use proptest::prelude::*;
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+    const FEATURE_POOL: [&str; 4] = ["required:apply", "target:host-a", "flag:--check", "ns:prod"];
+    const MARKER_POOL: [&str; 2] = ["operator:apply", "operator:destroy"];
+
+    fn request() -> ExecuteRequest {
+        ExecuteRequest {
+            binary: "kubectl".to_string(),
+            args: vec!["get".to_string(), "pods".to_string()],
+            auth_token: None,
+            env: HashMap::new(),
+            secrets: HashMap::new(),
+            secret_files: HashMap::new(),
+            stream: false,
+            session_token: None,
+            revert: None,
+            confirm_within_secs: None,
+            require_approval: None,
+            wait_approval_secs: None,
+            verb: None,
+            reevaluate: false,
+            ssh_hostkey: None,
+            cwd: None,
+        }
+    }
+
+    /// (is_session, action_index, sticky, marker_index, feature_mask)
+    fn raw_match() -> impl Strategy<Value = (bool, u8, bool, Option<u8>, u8)> {
+        (
+            any::<bool>(),
+            0u8..3,
+            any::<bool>(),
+            proptest::option::of(0u8..MARKER_POOL.len() as u8),
+            any::<u8>(),
+        )
+    }
+
+    fn build_match(
+        index: usize,
+        (is_session, action_index, sticky, marker_index, feature_mask): (
+            bool,
+            u8,
+            bool,
+            Option<u8>,
+            u8,
+        ),
+        granted_markers: &BTreeSet<String>,
+    ) -> ScopedCoverageMatch {
+        let scope = if is_session {
+            VerbMatchScope::Session
+        } else {
+            VerbMatchScope::Baseline
+        };
+        let action = match action_index {
+            0 => CoverageAction::Preauthorized,
+            1 => CoverageAction::Evaluate,
+            _ => CoverageAction::Deny,
+        };
+        // Catalog validation guarantees baseline deny coverage is sticky.
+        let sticky =
+            sticky || (scope == VerbMatchScope::Baseline && matches!(action, CoverageAction::Deny));
+        let override_marker = marker_index.map(|i| MARKER_POOL[i as usize].to_string());
+        let features: BTreeSet<String> = FEATURE_POOL
+            .iter()
+            .enumerate()
+            .filter(|(bit, _)| feature_mask & (1 << bit) != 0)
+            .map(|(_, feature)| feature.to_string())
+            .collect();
+        // Mirror `resolve_verb_context`: overridden is derived, not free.
+        let overridden = baseline_override_applies(
+            scope,
+            action,
+            sticky,
+            override_marker.as_deref(),
+            granted_markers,
+        );
+        ScopedCoverageMatch {
+            matched: CoverageMatch {
+                rendered: RenderedVerb {
+                    name: format!("verb-{index}"),
+                    binary: "kubectl".to_string(),
+                    args: vec!["get".to_string(), "pods".to_string()],
+                    consequence: Reversibility::Recoverable,
+                    revert: None,
+                    trusted: true,
+                    prompt_context: None,
+                    baseline: scope == VerbMatchScope::Baseline,
+                    credential_plan: None,
+                    params: BTreeMap::new(),
+                    auto_promoted: false,
+                    promotion_stamp: None,
+                },
+                cell: format!("cell-{index}"),
+                action,
+                override_marker,
+                sticky,
+                features: features.clone(),
+                specificity: CoverageSpecificity {
+                    requirements: features,
+                    ..CoverageSpecificity::default()
+                },
+                environment_authorized: true,
+            },
+            scope,
+            effective_action: action,
+            overridden,
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+        #[test]
+        fn session_scope_never_shadows_protected_baseline_requirements(
+            raw in proptest::collection::vec(raw_match(), 1..6),
+            granted_mask in 0u8..4,
+        ) {
+            let granted_markers: BTreeSet<String> = MARKER_POOL
+                .iter()
+                .enumerate()
+                .filter(|(bit, _)| granted_mask & (1 << bit) != 0)
+                .map(|(_, marker)| marker.to_string())
+                .collect();
+            let scoped: Vec<ScopedCoverageMatch> = raw
+                .iter()
+                .enumerate()
+                .map(|(index, spec)| build_match(index, *spec, &granted_markers))
+                .collect();
+
+            let has_session = scoped
+                .iter()
+                .any(|m| m.scope == VerbMatchScope::Session);
+            let protected_baseline_requirement = scoped.iter().any(|m| {
+                m.scope == VerbMatchScope::Baseline
+                    && !m.overridden
+                    && matches!(
+                        m.effective_action,
+                        CoverageAction::Evaluate | CoverageAction::Deny
+                    )
+                    && (m.matched.sticky || m.matched.override_marker.is_some())
+            });
+
+            let mut request_a = request();
+            let resolution = resolve_scoped_matches(scoped.clone(), 17, &mut request_a);
+
+            // Same input resolves identically (no argv- or order-dependent state).
+            let mut request_b = request();
+            let replay = resolve_scoped_matches(scoped, 17, &mut request_b);
+            prop_assert_eq!(replay.decision, resolution.decision);
+
+            if has_session && protected_baseline_requirement {
+                // The protected baseline requirement must keep authority: the
+                // composed decision can be Deny, Conflict, or Evaluate, but a
+                // session grant can never turn it into a preauthorized skip of
+                // the evaluator, and it can never vanish entirely.
+                prop_assert_ne!(resolution.decision, VerbDecision::Preauthorized);
+                prop_assert_ne!(resolution.decision, VerbDecision::None);
+            }
+        }
+    }
+}
+
 /// Static request validation before any policy decision: recursion depth,
 /// binary-name shape, and injection validation. Returns the recursion depth
 /// and the reconstructed command line, which the session short-circuit and
@@ -1681,26 +1855,8 @@ async fn validate_exec_request<W: AsyncWrite + Unpin>(
     }
 
     // Validate binary name: reject paths, traversal, and shell metacharacters.
-    // Windows path forms (backslash, drive-letter `:`, UNC) are rejected too so a
-    // caller cannot pass an absolute/relative path disguised as the "binary".
-    if request.binary.contains('/')
-        || request.binary.contains('\\')
-        || request.binary.contains(':')
-        || request.binary.contains("..")
-        || request.binary.contains('\0')
-        || request.binary.is_empty()
-    {
-        let looks_like_shell_string = request.binary.contains(char::is_whitespace)
-            || request.binary.contains('"')
-            || request.binary.contains('\'');
-        let reason = if looks_like_shell_string {
-            format!(
-                "invalid binary name: '{}'. guard run expects `<binary> [args...]`, not a shell string. Pass the command as separate arguments; e.g. `guard run ssh host 'remote cmd'` instead of `guard run 'ssh host \"remote cmd\"'`.",
-                request.binary
-            )
-        } else {
-            format!("invalid binary name: '{}'", request.binary)
-        };
+    // The check itself lives in `guard::wire` (the fuzzed parsing surface).
+    if let Err(reason) = guard::wire::validate_binary_name(&request.binary) {
         return Err(deny_and_record(
             phase,
             request,
@@ -1712,12 +1868,9 @@ async fn validate_exec_request<W: AsyncWrite + Unpin>(
         .await);
     }
 
-    // NUL can never be a legitimate argv byte (execve delimits arguments with
-    // NUL), so reject it at the boundary. Other control characters stay
-    // accepted: multi-line arguments (commit messages via -m, heredoc-style
-    // payloads) are legitimate, and the audit renderer escapes them.
-    if let Some(position) = request.args.iter().position(|arg| arg.contains('\0')) {
-        let reason = format!("invalid argument at index {}: contains NUL byte", position);
+    // Reject NUL bytes in argv at the boundary; the check itself lives in
+    // `guard::wire` (the fuzzed parsing surface) next to the binary-name rule.
+    if let Err(reason) = guard::wire::validate_args(&request.args) {
         return Err(deny_and_record(
             phase,
             request,
