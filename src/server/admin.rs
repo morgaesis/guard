@@ -27,7 +27,7 @@ use super::wire::{
     verb_effective_trust, AdminRequest, AdminResponse, ApprovalSummary, CallerIdentity,
     ExecOutcome, ProvisionalSummary, SecretDetail, ServerStatus, VerbSummary,
 };
-use super::{is_valid_secret_key, ServerConfig};
+use super::{is_valid_secret_key, ServerContext};
 
 pub(super) const MAX_GRANT_REQUESTS: usize = 1024;
 pub(super) const MAX_PENDING_GRANT_REQUESTS_PER_SESSION: usize = 32;
@@ -110,19 +110,23 @@ mod regeneration_proposal_tests {
     }
 
     #[test]
-    fn server_config_clones_share_proposal_authentication_authority() {
-        let config = crate::server::tests::config_for_proposal_test();
-        let preview = config.clone();
+    fn server_context_clones_share_proposal_authentication_authority() {
+        let server = crate::server::tests::config_for_proposal_test();
+        let preview = server.clone();
         assert!(std::sync::Arc::ptr_eq(
-            &config.regeneration_proposal_key,
-            &preview.regeneration_proposal_key
+            &server.config.regeneration_proposal_key,
+            &preview.config.regeneration_proposal_key
         ));
-        let id =
-            encode_regeneration_proposal(&proposal(), config.regeneration_proposal_key.as_ref())
-                .unwrap();
-        assert!(
-            decode_regeneration_proposal(&id, preview.regeneration_proposal_key.as_ref()).is_ok()
-        );
+        let id = encode_regeneration_proposal(
+            &proposal(),
+            server.config.regeneration_proposal_key.as_ref(),
+        )
+        .unwrap();
+        assert!(decode_regeneration_proposal(
+            &id,
+            preview.config.regeneration_proposal_key.as_ref()
+        )
+        .is_ok());
     }
 }
 
@@ -291,18 +295,18 @@ fn stamp_generated_verb(
     verb
 }
 
-fn caller_is_session_admin(config: &ServerConfig, caller: &CallerIdentity) -> bool {
-    matches!(caller.principal(), Some(ref p) if config.daemon_principal.eq_ci(p))
+fn caller_is_session_admin(server: &ServerContext, caller: &CallerIdentity) -> bool {
+    matches!(caller.principal(), Some(ref p) if server.config.daemon_principal.eq_ci(p))
         || matches!(caller, CallerIdentity::TcpAdmin { .. })
 }
 
 fn caller_can_view_session(
-    config: &ServerConfig,
+    server: &ServerContext,
     caller: &CallerIdentity,
     token: &str,
     visible_token: Option<&str>,
 ) -> bool {
-    caller_is_session_admin(config, caller) || visible_token == Some(token)
+    caller_is_session_admin(server, caller) || visible_token == Some(token)
 }
 
 fn redact_session_summary_for_list(grant: &mut SessionGrantSummary, admin: bool, can_view: bool) {
@@ -362,7 +366,7 @@ fn mask_session_report_token(report: &mut SessionReport) {
 }
 
 async fn handle_session_appeal(
-    config: &ServerConfig,
+    server: &ServerContext,
     caller: &CallerIdentity,
     token: String,
     binary: String,
@@ -385,7 +389,7 @@ async fn handle_session_appeal(
     }
 
     let (exists, decision, session_prompt) = {
-        let reg = config.sessions.read().await;
+        let reg = server.state.sessions.read().await;
         (
             reg.has(&token),
             // Appeals are command-shape requests and do not carry authenticated
@@ -424,7 +428,8 @@ async fn handle_session_appeal(
     // An appeal is itself a request for a fresh look: it always bypasses the
     // auto-learned deny-shape fast path (never the operator PolicyEngine
     // deny rules, which `evaluate_with_reevaluate` never skips either way).
-    let eval_result = config
+    let eval_result = server
+        .state
         .evaluator
         .evaluate_with_reevaluate(&command_line, session_prompt.as_deref(), true)
         .await;
@@ -449,7 +454,7 @@ async fn handle_session_appeal(
             }
             if let Err(skip) = allow_session_auto_amend_candidate(&binary, &args, risk) {
                 record_live_session_interaction(
-                    config,
+                    server,
                     Some(&token),
                     SessionInteraction {
                         at_unix: 0,
@@ -481,7 +486,7 @@ async fn handle_session_appeal(
             }
 
             let amended = match amend_session_exact_rule(
-                config,
+                server,
                 &token,
                 SessionAmendment::Allow,
                 binary.clone(),
@@ -505,7 +510,7 @@ async fn handle_session_appeal(
                 )
             };
             record_live_session_interaction(
-                config,
+                server,
                 Some(&token),
                 SessionInteraction {
                     at_unix: 0,
@@ -548,7 +553,7 @@ async fn handle_session_appeal(
                 && deny_session_auto_amend_candidate(&binary, &args, risk).is_ok()
             {
                 match amend_session_exact_rule(
-                    config,
+                    server,
                     &token,
                     SessionAmendment::Deny,
                     binary.clone(),
@@ -571,7 +576,7 @@ async fn handle_session_appeal(
                 format!("appeal denied. LLM reason: {reason}")
             };
             record_live_session_interaction(
-                config,
+                server,
                 Some(&token),
                 SessionInteraction {
                     at_unix: 0,
@@ -615,12 +620,12 @@ async fn handle_session_appeal(
 }
 
 pub(super) async fn handle_admin_request(
-    config: &ServerConfig,
+    server: &ServerContext,
     caller: &CallerIdentity,
     request: AdminRequest,
 ) -> AdminResponse {
     if request.requires_daemon_uid() {
-        if let Err(e) = config.validate_admin(caller) {
+        if let Err(e) = server.validate_admin(caller) {
             tracing::warn!(target: "guard::audit", "[AUDIT] ADMIN_REJECTED caller={} reason=\"{}\"", caller, audit_escape(&e.to_string()));
             return AdminResponse::Error {
                 message: e.to_string(),
@@ -663,7 +668,7 @@ pub(super) async fn handle_admin_request(
             };
             let mut saved_prompt: Option<String> = None;
             if let Some(name) = saved_grant.as_deref() {
-                let selected = config.saved_grants.read().await.get(name).cloned();
+                let selected = server.state.saved_grants.read().await.get(name).cloned();
                 match selected {
                     Some(p) => {
                         let generated = p.generated_verb_names();
@@ -678,7 +683,7 @@ pub(super) async fn handle_admin_request(
                             secret_names: p.secret_names.clone(),
                             evaluation_mode: p.evaluation_mode,
                         };
-                        let mut catalog = config.verbs.write().await;
+                        let mut catalog = server.state.verbs.write().await;
                         for verb in &p.generated_verbs {
                             if let Err(error) = catalog.upsert_saved_grant_verb(verb.clone()) {
                                 return AdminResponse::Error {
@@ -699,7 +704,7 @@ pub(super) async fn handle_admin_request(
                 }
             }
             if !activated_verbs.is_empty() || !override_markers.is_empty() {
-                let mut catalog = config.verbs.write().await;
+                let mut catalog = server.state.verbs.write().await;
                 if let Err(error) = catalog.reload_if_stale() {
                     tracing::warn!("verb catalog reload failed, using previous: {}", error);
                 }
@@ -778,14 +783,16 @@ pub(super) async fn handle_admin_request(
                 granted_at: 0, // SessionRegistry::grant fills the current time
             };
             let (before, after) = {
-                let mut reg = config.sessions.write().await;
+                let mut reg = server.state.sessions.write().await;
                 reg.purge_expired();
                 let before = reg.clone();
                 reg.grant(token.clone(), grant);
                 (before, reg.clone())
             };
-            if let Err(err) = persist_session_snapshot(config.session_store.clone(), after).await {
-                *config.sessions.write().await = before;
+            if let Err(err) =
+                persist_session_snapshot(server.state.session_store.clone(), after).await
+            {
+                *server.state.sessions.write().await = before;
                 return AdminResponse::Error {
                     message: format!("failed to persist session grant: {}", err),
                 };
@@ -805,16 +812,18 @@ pub(super) async fn handle_admin_request(
             token,
             binary,
             args,
-        } => handle_session_appeal(config, caller, token, binary, args).await,
+        } => handle_session_appeal(server, caller, token, binary, args).await,
         AdminRequest::SessionRevoke { token } => {
             let (removed, before, after) = {
-                let mut reg = config.sessions.write().await;
+                let mut reg = server.state.sessions.write().await;
                 let before = reg.clone();
                 let removed = reg.revoke(&token);
                 (removed, before, reg.clone())
             };
-            if let Err(err) = persist_session_snapshot(config.session_store.clone(), after).await {
-                *config.sessions.write().await = before;
+            if let Err(err) =
+                persist_session_snapshot(server.state.session_store.clone(), after).await
+            {
+                *server.state.sessions.write().await = before;
                 return AdminResponse::Error {
                     message: format!("failed to persist session revoke: {}", err),
                 };
@@ -829,7 +838,7 @@ pub(super) async fn handle_admin_request(
         }
         AdminRequest::SessionExtend { token, ttl_secs } => {
             let (before, changed, after) = {
-                let mut registry = config.sessions.write().await;
+                let mut registry = server.state.sessions.write().await;
                 let before = registry.clone();
                 let changed = registry.extend(&token, ttl_secs).is_some();
                 (before, changed, registry.clone())
@@ -839,9 +848,10 @@ pub(super) async fn handle_admin_request(
                     message: format!("unknown active session: '{token}'"),
                 };
             }
-            if let Err(error) = persist_session_snapshot(config.session_store.clone(), after).await
+            if let Err(error) =
+                persist_session_snapshot(server.state.session_store.clone(), after).await
             {
-                *config.sessions.write().await = before;
+                *server.state.sessions.write().await = before;
                 return AdminResponse::Error {
                     message: format!("failed to persist session extension: {error}"),
                 };
@@ -851,7 +861,7 @@ pub(super) async fn handle_admin_request(
         AdminRequest::SessionLabel { token, label } => {
             let label = (!label.trim().is_empty()).then(|| label.trim().to_string());
             let (before, changed, after) = {
-                let mut registry = config.sessions.write().await;
+                let mut registry = server.state.sessions.write().await;
                 let before = registry.clone();
                 let changed = registry.set_label(&token, label).is_some();
                 (before, changed, registry.clone())
@@ -861,9 +871,10 @@ pub(super) async fn handle_admin_request(
                     message: format!("unknown active session: '{token}'"),
                 };
             }
-            if let Err(error) = persist_session_snapshot(config.session_store.clone(), after).await
+            if let Err(error) =
+                persist_session_snapshot(server.state.session_store.clone(), after).await
             {
-                *config.sessions.write().await = before;
+                *server.state.sessions.write().await = before;
                 return AdminResponse::Error {
                     message: format!("failed to persist session label: {error}"),
                 };
@@ -877,14 +888,15 @@ pub(super) async fn handle_admin_request(
                 };
             }
             let (before, count, after) = {
-                let mut registry = config.sessions.write().await;
+                let mut registry = server.state.sessions.write().await;
                 let before = registry.clone();
                 let count = registry.revoke_filtered(label.as_deref(), saved_grant.as_deref());
                 (before, count, registry.clone())
             };
-            if let Err(error) = persist_session_snapshot(config.session_store.clone(), after).await
+            if let Err(error) =
+                persist_session_snapshot(server.state.session_store.clone(), after).await
             {
-                *config.sessions.write().await = before;
+                *server.state.sessions.write().await = before;
                 return AdminResponse::Error {
                     message: format!("failed to persist bulk revoke: {error}"),
                 };
@@ -899,21 +911,21 @@ pub(super) async fn handle_admin_request(
             // Opportunistic purge so list shows fresh state and history
             // bookkeeping stays bounded.
             {
-                let mut reg = config.sessions.write().await;
+                let mut reg = server.state.sessions.write().await;
                 reg.purge_expired();
             }
-            if let Err(err) = persist_current_sessions(config).await {
+            if let Err(err) = persist_current_sessions(server).await {
                 tracing::warn!("failed to persist purged session state: {}", err);
             }
-            let reg = config.sessions.read().await;
-            let is_admin = caller_is_session_admin(config, caller);
+            let reg = server.state.sessions.read().await;
+            let is_admin = caller_is_session_admin(server, caller);
             let visible_token = visible_token.as_deref();
             let grants = reg
                 .list()
                 .into_iter()
                 .map(|mut grant| {
                     let can_view =
-                        caller_can_view_session(config, caller, &grant.token, visible_token);
+                        caller_can_view_session(server, caller, &grant.token, visible_token);
                     redact_session_summary_for_list(&mut grant, is_admin, can_view);
                     grant
                 })
@@ -923,7 +935,7 @@ pub(super) async fn handle_admin_request(
                     .into_iter()
                     .map(|mut grant| {
                         let can_view =
-                            caller_can_view_session(config, caller, &grant.token, visible_token);
+                            caller_can_view_session(server, caller, &grant.token, visible_token);
                         redact_historical_grant_for_list(&mut grant, is_admin, can_view);
                         grant
                     })
@@ -939,13 +951,13 @@ pub(super) async fn handle_admin_request(
             caller_token,
         } => {
             {
-                let mut reg = config.sessions.write().await;
+                let mut reg = server.state.sessions.write().await;
                 reg.purge_expired();
             }
-            if let Err(err) = persist_current_sessions(config).await {
+            if let Err(err) = persist_current_sessions(server).await {
                 tracing::warn!("failed to persist purged session state: {}", err);
             }
-            let is_admin = caller_is_session_admin(config, caller);
+            let is_admin = caller_is_session_admin(server, caller);
             // A non-admin caller may inspect only the grant on its own token: the
             // token it presents as its identity ($GUARD_SESSION) must equal the
             // token it is asking about. That token is the same bearer credential
@@ -963,8 +975,9 @@ pub(super) async fn handle_admin_request(
                         .to_string(),
                 };
             }
-            let reg = config.sessions.read().await;
-            match reg.show_with_limits(&token, limit.unwrap_or(20), &config.behavior_limits) {
+            let reg = server.state.sessions.read().await;
+            match reg.show_with_limits(&token, limit.unwrap_or(20), &server.config.behavior_limits)
+            {
                 Some(mut report) => {
                     // A self-inspecting holder sees the full grant (rules, prompt,
                     // expiry) but never has its own raw bearer token echoed back.
@@ -982,7 +995,7 @@ pub(super) async fn handle_admin_request(
             token,
             caller_token,
         } => {
-            let is_admin = caller_is_session_admin(config, caller);
+            let is_admin = caller_is_session_admin(server, caller);
             let is_self = !token.is_empty() && caller_token.as_deref() == Some(token.as_str());
             if !is_admin && !is_self {
                 return AdminResponse::Error {
@@ -990,13 +1003,11 @@ pub(super) async fn handle_admin_request(
                         .to_string(),
                 };
             }
-            let Some(mut report) =
-                config
-                    .sessions
-                    .read()
-                    .await
-                    .show_with_limits(&token, 20, &config.behavior_limits)
-            else {
+            let Some(mut report) = server.state.sessions.read().await.show_with_limits(
+                &token,
+                20,
+                &server.config.behavior_limits,
+            ) else {
                 return AdminResponse::Error {
                     message: format!("unknown session token: '{token}'"),
                 };
@@ -1005,7 +1016,8 @@ pub(super) async fn handle_admin_request(
                 mask_session_report_token(&mut report);
             }
             let fingerprint = audit_session_fingerprint(Some(&token));
-            let approvals = config
+            let approvals = server
+                .state
                 .approvals
                 .read()
                 .await
@@ -1016,7 +1028,8 @@ pub(super) async fn handle_admin_request(
                 })
                 .map(ApprovalSummary::from_row)
                 .collect();
-            let provisionals = config
+            let provisionals = server
+                .state
                 .provisional
                 .read()
                 .await
@@ -1027,7 +1040,8 @@ pub(super) async fn handle_admin_request(
                 })
                 .map(ProvisionalSummary::from_row)
                 .collect();
-            let requests = config
+            let requests = server
+                .state
                 .grant_requests
                 .read()
                 .await
@@ -1054,9 +1068,9 @@ pub(super) async fn handle_admin_request(
                 };
             };
             let expires_at = {
-                let sessions = config.sessions.read().await;
+                let sessions = server.state.sessions.read().await;
                 if let Some(reason) =
-                    sessions.suspension_reason(&session_token, &config.behavior_limits)
+                    sessions.suspension_reason(&session_token, &server.config.behavior_limits)
                 {
                     return AdminResponse::Error { message: reason };
                 }
@@ -1074,7 +1088,8 @@ pub(super) async fn handle_admin_request(
                     }
                 }
             };
-            let proxy = config
+            let proxy = server
+                .state
                 .protocol_registry
                 .read()
                 .await
@@ -1123,7 +1138,7 @@ pub(super) async fn handle_admin_request(
                     };
                 }
             };
-            match config.secrets.set(&principal, &key, &value).await {
+            match server.state.secrets.set(&principal, &key, &value).await {
                 Ok(()) => {
                     tracing::info!(target: "guard::audit",
                         "[AUDIT] SECRET_SET caller={} principal={} key={}",
@@ -1152,7 +1167,7 @@ pub(super) async fn handle_admin_request(
                     };
                 }
             };
-            match config.secrets.delete(&principal, &key).await {
+            match server.state.secrets.delete(&principal, &key).await {
                 Ok(()) => {
                     tracing::info!(target: "guard::audit",
                         "[AUDIT] SECRET_DELETE caller={} principal={} key={}",
@@ -1181,7 +1196,7 @@ pub(super) async fn handle_admin_request(
                     };
                 }
             };
-            match config.secrets.get(&principal, &key).await {
+            match server.state.secrets.get(&principal, &key).await {
                 Ok(value) => AdminResponse::SecretExists {
                     exists: value.is_some(),
                 },
@@ -1199,8 +1214,8 @@ pub(super) async fn handle_admin_request(
                     };
                 }
             };
-            if config.daemon_principal.eq_ci(&principal) {
-                match config.secrets.list_all().await {
+            if server.config.daemon_principal.eq_ci(&principal) {
+                match server.state.secrets.list_all().await {
                     Ok(pairs) => {
                         let mut keys: Vec<String> = pairs.into_iter().map(|(_, key)| key).collect();
                         keys.sort();
@@ -1211,7 +1226,7 @@ pub(super) async fn handle_admin_request(
                     },
                 }
             } else {
-                match config.secrets.list(&principal).await {
+                match server.state.secrets.list(&principal).await {
                     Ok(keys) => AdminResponse::SecretList { keys },
                     Err(e) => AdminResponse::Error {
                         message: format!("failed to list secrets: {}", e),
@@ -1219,7 +1234,7 @@ pub(super) async fn handle_admin_request(
                 }
             }
         }
-        AdminRequest::SecretListDetailed => match config.secrets.list_all().await {
+        AdminRequest::SecretListDetailed => match server.state.secrets.list_all().await {
             Ok(pairs) => {
                 let legacy = legacy_sentinel();
                 let mut items: Vec<SecretDetail> = pairs
@@ -1258,33 +1273,38 @@ pub(super) async fn handle_admin_request(
         },
         AdminRequest::Ping => {
             let now = now_unix();
-            let mode = config
+            let mode = server
+                .state
                 .evaluator
                 .mode()
                 .map(|m| m.as_str().to_string())
                 .unwrap_or_else(|| "readonly".to_string());
             AdminResponse::Ping {
                 version: env!("CARGO_PKG_VERSION").to_string(),
-                uptime_secs: now.saturating_sub(config.started_at_unix),
+                uptime_secs: now.saturating_sub(server.config.started_at_unix),
                 mode,
-                dry_run: config.dry_run,
+                dry_run: server.config.dry_run,
             }
         }
         AdminRequest::Status => {
             let now = now_unix();
-            let session_count = config.sessions.read().await.list().len();
-            let cache_size = config.evaluator.cache_size().await;
-            let learned_rule_count = config.evaluator.learned_rule_count().await;
-            let deny_shape_count = config.evaluator.deny_shape_count().await;
-            let allow_promotion_observation_count =
-                config.evaluator.allow_promotion_observation_count().await;
-            let mode = config
+            let session_count = server.state.sessions.read().await.list().len();
+            let cache_size = server.state.evaluator.cache_size().await;
+            let learned_rule_count = server.state.evaluator.learned_rule_count().await;
+            let deny_shape_count = server.state.evaluator.deny_shape_count().await;
+            let allow_promotion_observation_count = server
+                .state
+                .evaluator
+                .allow_promotion_observation_count()
+                .await;
+            let mode = server
+                .state
                 .evaluator
                 .mode()
                 .map(|m| m.as_str().to_string())
                 .unwrap_or_else(|| "readonly".to_string());
             let (verb_catalog_hash, verb_catalog_changed_unix) = {
-                let mut catalog = config.verbs.write().await;
+                let mut catalog = server.state.verbs.write().await;
                 if let Err(error) = catalog.reload_if_stale() {
                     tracing::warn!("verb catalog reload failed during status: {}", error);
                 }
@@ -1294,53 +1314,59 @@ pub(super) async fn handle_admin_request(
             AdminResponse::Status {
                 status: ServerStatus {
                     version: env!("CARGO_PKG_VERSION").to_string(),
-                    started_at_unix: config.started_at_unix,
-                    uptime_secs: now.saturating_sub(config.started_at_unix),
-                    socket_path: config.socket_path.as_ref().map(|p| p.display().to_string()),
-                    tcp_port: config.tcp_port,
+                    started_at_unix: server.config.started_at_unix,
+                    uptime_secs: now.saturating_sub(server.config.started_at_unix),
+                    socket_path: server
+                        .config
+                        .socket_path
+                        .as_ref()
+                        .map(|p| p.display().to_string()),
+                    tcp_port: server.config.tcp_port,
                     mode,
-                    llm_enabled: config.evaluator.llm_enabled(),
-                    llm_model_chain: config.evaluator.llm_model_chain(),
-                    static_policy: config.evaluator.has_static_policy(),
-                    preflight: config.preflight,
-                    redact: config.redact,
-                    dry_run: config.dry_run,
-                    cache_enabled: config.evaluator.cache_enabled(),
+                    llm_enabled: server.state.evaluator.llm_enabled(),
+                    llm_model_chain: server.state.evaluator.llm_model_chain(),
+                    static_policy: server.state.evaluator.has_static_policy(),
+                    preflight: server.config.preflight,
+                    redact: server.config.redact,
+                    dry_run: server.config.dry_run,
+                    cache_enabled: server.state.evaluator.cache_enabled(),
                     cache_size,
-                    learning_enabled: config.evaluator.learning_enabled(),
+                    learning_enabled: server.state.evaluator.learning_enabled(),
                     learned_rule_count,
-                    deny_learning_enabled: config.evaluator.deny_learning_enabled(),
+                    deny_learning_enabled: server.state.evaluator.deny_learning_enabled(),
                     deny_shape_count,
-                    allow_promotion_enabled: config.evaluator.allow_promotion_enabled(),
+                    allow_promotion_enabled: server.state.evaluator.allow_promotion_enabled(),
                     allow_promotion_observation_count,
                     session_count,
-                    daemon_uid: config.daemon_uid,
-                    exec_identity: if config.exec_as_caller {
+                    daemon_uid: server.config.daemon_uid,
+                    exec_identity: if server.config.exec_as_caller {
                         "caller".to_string()
                     } else {
                         "daemon".to_string()
                     },
-                    state_db_path: config
+                    state_db_path: server
+                        .config
                         .state_db_path
                         .as_ref()
                         .map(|path| path.display().to_string()),
-                    secret_backend: config.secrets.backend_name().to_string(),
-                    gate: config.gate.as_str().to_string(),
-                    pending_provisionals: config.provisional.read().await.outstanding(),
-                    pending_approvals: config.approvals.read().await.outstanding(),
+                    secret_backend: server.state.secrets.backend_name().to_string(),
+                    gate: server.config.gate.as_str().to_string(),
+                    pending_provisionals: server.state.provisional.read().await.outstanding(),
+                    pending_approvals: server.state.approvals.read().await.outstanding(),
                     verb_catalog_hash,
                     verb_catalog_changed_unix,
-                    command_admission: config.command_admission.snapshot(),
+                    command_admission: server.state.command_admission.snapshot(),
                 },
             }
         }
-        AdminRequest::Confirm { handle } => handle_confirm(config, caller, &handle).await,
-        AdminRequest::Revert { handle } => handle_manual_revert(config, caller, &handle).await,
-        AdminRequest::Approve { handle } => handle_approve(config, caller, &handle).await,
-        AdminRequest::Deny { handle } => handle_deny(config, caller, &handle).await,
+        AdminRequest::Confirm { handle } => handle_confirm(server, caller, &handle).await,
+        AdminRequest::Revert { handle } => handle_manual_revert(server, caller, &handle).await,
+        AdminRequest::Approve { handle } => handle_approve(server, caller, &handle).await,
+        AdminRequest::Deny { handle } => handle_deny(server, caller, &handle).await,
         AdminRequest::Provisionals => {
-            let (is_daemon, caller_key) = caller_scope(config, caller);
-            let items = config
+            let (is_daemon, caller_key) = caller_scope(server, caller);
+            let items = server
+                .state
                 .provisional
                 .read()
                 .await
@@ -1352,8 +1378,9 @@ pub(super) async fn handle_admin_request(
             AdminResponse::Provisionals { items }
         }
         AdminRequest::ApprovalList => {
-            let (is_daemon, caller_key) = caller_scope(config, caller);
-            let items = config
+            let (is_daemon, caller_key) = caller_scope(server, caller);
+            let items = server
+                .state
                 .approvals
                 .read()
                 .await
@@ -1365,8 +1392,8 @@ pub(super) async fn handle_admin_request(
             AdminResponse::Approvals { items }
         }
         AdminRequest::ApprovalShow { handle } => {
-            let (is_daemon, caller_key) = caller_scope(config, caller);
-            let found = config.approvals.read().await.get(&handle).cloned();
+            let (is_daemon, caller_key) = caller_scope(server, caller);
+            let found = server.state.approvals.read().await.get(&handle).cloned();
             match found {
                 // Handle is an unguessable bearer secret; the owner (or daemon)
                 // may read its status and result. Others get NotFound, not a
@@ -1382,15 +1409,15 @@ pub(super) async fn handle_admin_request(
             }
         }
         AdminRequest::ApprovalNote { handle, text } => {
-            handle_approval_note(config, caller, &handle, &text).await
+            handle_approval_note(server, caller, &handle, &text).await
         }
         AdminRequest::VerbList => {
             let items = {
-                let mut cat = config.verbs.write().await;
+                let mut cat = server.state.verbs.write().await;
                 if let Err(e) = cat.reload_if_stale() {
                     tracing::warn!("verb catalog reload failed: {}", e);
                 }
-                let current_stamp = config.evaluator.verb_promotion_stamp();
+                let current_stamp = server.state.evaluator.verb_promotion_stamp();
                 cat.list()
                     .iter()
                     .map(|v| VerbSummary {
@@ -1416,7 +1443,7 @@ pub(super) async fn handle_admin_request(
             AdminResponse::Verbs { items }
         }
         AdminRequest::VerbShow { name } => {
-            let mut catalog = config.verbs.write().await;
+            let mut catalog = server.state.verbs.write().await;
             if let Err(error) = catalog.reload_if_stale() {
                 tracing::warn!("verb catalog reload failed: {}", error);
             }
@@ -1430,12 +1457,14 @@ pub(super) async fn handle_admin_request(
                 },
             }
         }
-        AdminRequest::VerbDelete { name } => match config.verbs.write().await.delete_verb(&name) {
-            Ok(_) => AdminResponse::Ok,
-            Err(error) => AdminResponse::Error {
-                message: error.to_string(),
-            },
-        },
+        AdminRequest::VerbDelete { name } => {
+            match server.state.verbs.write().await.delete_verb(&name) {
+                Ok(_) => AdminResponse::Ok,
+                Err(error) => AdminResponse::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
         AdminRequest::VerbCreate {
             prose,
             binary_hint,
@@ -1447,7 +1476,8 @@ pub(super) async fn handle_admin_request(
                     message: "verb create requires non-empty --prompt prose".to_string(),
                 };
             }
-            let mut verb = match config
+            let mut verb = match server
+                .state
                 .evaluator
                 .synthesize_verb(&prose, binary_hint.as_deref())
                 .await
@@ -1476,7 +1506,7 @@ pub(super) async fn handle_admin_request(
                     message: format!("synthesized verb rejected by the safety gate: {e}"),
                 };
             }
-            let mut cat = config.verbs.write().await;
+            let mut cat = server.state.verbs.write().await;
             let result = if preview {
                 cat.validate_candidate(&verb)
             } else {
@@ -1503,14 +1533,14 @@ pub(super) async fn handle_admin_request(
             }
         }
         AdminRequest::VerbCoverageList => {
-            let items = match &config.api_coverage {
+            let items = match &server.state.api_coverage {
                 Some(store) => store.read().await.coverage(),
                 None => Vec::new(),
             };
             AdminResponse::VerbCoverage { items }
         }
         AdminRequest::VerbCoverageClear => {
-            let Some(store) = &config.api_coverage else {
+            let Some(store) = &server.state.api_coverage else {
                 return AdminResponse::VerbCoverageCleared { removed: 0 };
             };
             match store.write().await.clear_generated() {
@@ -1524,10 +1554,10 @@ pub(super) async fn handle_admin_request(
             }
         }
         AdminRequest::SavedGrantList => AdminResponse::SavedGrants {
-            items: config.saved_grants.read().await.list(),
+            items: server.state.saved_grants.read().await.list(),
         },
         AdminRequest::SavedGrantShow { name } => {
-            match config.saved_grants.read().await.get(&name).cloned() {
+            match server.state.saved_grants.read().await.get(&name).cloned() {
                 Some(grant) => AdminResponse::SavedGrant { grant },
                 None => AdminResponse::Error {
                     message: format!("unknown saved grant: '{name}'"),
@@ -1535,13 +1565,13 @@ pub(super) async fn handle_admin_request(
             }
         }
         AdminRequest::SavedGrantSave { grant } => {
-            let before = config.saved_grants.read().await.clone();
-            let result = config.saved_grants.write().await.insert(grant);
+            let before = server.state.saved_grants.read().await.clone();
+            let result = server.state.saved_grants.write().await.insert(grant);
             match result {
                 Ok(grant) => {
-                    if let Some(store) = &config.session_store {
+                    if let Some(store) = &server.state.session_store {
                         if let Err(error) = store.save_saved_grant(grant.clone()).await {
-                            *config.saved_grants.write().await = before;
+                            *server.state.saved_grants.write().await = before;
                             return AdminResponse::Error {
                                 message: format!("failed to persist saved grant: {error}"),
                             };
@@ -1578,9 +1608,9 @@ pub(super) async fn handle_admin_request(
             evaluation_mode,
             auto_approve_requests,
         } => {
-            let before = config.saved_grants.read().await.clone();
+            let before = server.state.saved_grants.read().await.clone();
             let result = {
-                let mut catalog = config.saved_grants.write().await;
+                let mut catalog = server.state.saved_grants.write().await;
                 let Some(mut grant) = catalog.get(&name).cloned() else {
                     return AdminResponse::Error {
                         message: format!("unknown saved grant: '{name}'"),
@@ -1653,9 +1683,9 @@ pub(super) async fn handle_admin_request(
             };
             match result {
                 Ok(grant) => {
-                    if let Some(store) = &config.session_store {
+                    if let Some(store) = &server.state.session_store {
                         if let Err(error) = store.save_saved_grant(grant.clone()).await {
-                            *config.saved_grants.write().await = before;
+                            *server.state.saved_grants.write().await = before;
                             return AdminResponse::Error {
                                 message: format!("failed to persist saved grant: {error}"),
                             };
@@ -1669,27 +1699,27 @@ pub(super) async fn handle_admin_request(
             }
         }
         AdminRequest::SavedGrantDelete { name } => {
-            let mut staged_grants = config.saved_grants.read().await.clone();
+            let mut staged_grants = server.state.saved_grants.read().await.clone();
             if staged_grants.remove(&name).is_none() {
                 return AdminResponse::Error {
                     message: format!("unknown saved grant: '{name}'"),
                 };
             }
-            let mut staged_verbs = config.verbs.read().await.clone();
+            let mut staged_verbs = server.state.verbs.read().await.clone();
             if let Err(error) = staged_verbs.remove_saved_grant_verbs(&name) {
                 return AdminResponse::Error {
                     message: error.to_string(),
                 };
             }
-            if let Some(store) = &config.session_store {
+            if let Some(store) = &server.state.session_store {
                 if let Err(error) = store.delete_saved_grant(name).await {
                     return AdminResponse::Error {
                         message: format!("failed to delete saved grant: {error}"),
                     };
                 }
             }
-            *config.saved_grants.write().await = staged_grants;
-            *config.verbs.write().await = staged_verbs;
+            *server.state.saved_grants.write().await = staged_grants;
+            *server.state.verbs.write().await = staged_verbs;
             AdminResponse::Ok
         }
         AdminRequest::SavedGrantRegenerate {
@@ -1697,16 +1727,16 @@ pub(super) async fn handle_admin_request(
             prompt,
             proposal_id,
         } => {
-            let Some(existing) = config.saved_grants.read().await.get(&name).cloned() else {
+            let Some(existing) = server.state.saved_grants.read().await.get(&name).cloned() else {
                 return AdminResponse::Error {
                     message: format!("unknown saved grant: '{name}'"),
                 };
             };
-            let regime = config.evaluator.verb_promotion_stamp().to_string();
+            let regime = server.state.evaluator.verb_promotion_stamp().to_string();
             let (prompt, synthesized, is_apply) = if let Some(proposal_id) = proposal_id {
                 let proposal = match decode_regeneration_proposal(
                     &proposal_id,
-                    config.regeneration_proposal_key.as_ref(),
+                    server.config.regeneration_proposal_key.as_ref(),
                 ) {
                     Ok(proposal) => proposal,
                     Err(message) => return AdminResponse::Error { message },
@@ -1733,7 +1763,8 @@ pub(super) async fn handle_admin_request(
                         message: "regeneration requires --prompt or a saved prompt".to_string(),
                     };
                 };
-                let synthesized = match config.evaluator.synthesize_verb(&prompt, None).await {
+                let synthesized = match server.state.evaluator.synthesize_verb(&prompt, None).await
+                {
                     Ok(verb) => verb,
                     Err(error) => {
                         return AdminResponse::Error {
@@ -1768,8 +1799,8 @@ pub(super) async fn handle_admin_request(
             updated.prompt_append = Some(prompt.clone());
             updated.generated_verbs = vec![verb.clone()];
             let staged = stage_saved_grant_regeneration(
-                &*config.saved_grants.read().await,
-                &*config.verbs.read().await,
+                &*server.state.saved_grants.read().await,
+                &*server.state.verbs.read().await,
                 &name,
                 updated,
                 verb.clone(),
@@ -1788,7 +1819,7 @@ pub(super) async fn handle_admin_request(
                 };
                 let proposal_id = match encode_regeneration_proposal(
                     &proposal,
-                    config.regeneration_proposal_key.as_ref(),
+                    server.config.regeneration_proposal_key.as_ref(),
                 ) {
                     Ok(id) => id,
                     Err(message) => return AdminResponse::Error { message },
@@ -1804,15 +1835,15 @@ pub(super) async fn handle_admin_request(
                     changed,
                 };
             }
-            if let Some(store) = &config.session_store {
+            if let Some(store) = &server.state.session_store {
                 if let Err(error) = store.save_saved_grant(updated.clone()).await {
                     return AdminResponse::Error {
                         message: format!("failed to persist regenerated saved grant: {error}"),
                     };
                 }
             }
-            *config.saved_grants.write().await = staged_grants;
-            *config.verbs.write().await = staged_verbs;
+            *server.state.saved_grants.write().await = staged_grants;
+            *server.state.verbs.write().await = staged_verbs;
             AdminResponse::SavedGrantRegenerated {
                 grant: updated,
                 added,
@@ -1827,7 +1858,7 @@ pub(super) async fn handle_admin_request(
             prompt,
             delta,
         } => {
-            if !caller_is_session_admin(config, caller)
+            if !caller_is_session_admin(server, caller)
                 && caller_token.as_deref() != Some(session_token.as_str())
             {
                 return AdminResponse::Error {
@@ -1835,21 +1866,21 @@ pub(super) async fn handle_admin_request(
                         .to_string(),
                 };
             }
-            prune_grant_requests(config).await;
+            prune_grant_requests(server).await;
             let (
                 issued_saved_grant,
                 issued_saved_revision,
                 issued_session_revision,
                 session_expires_at,
             ) = {
-                let registry = config.sessions.read().await;
+                let registry = server.state.sessions.read().await;
                 if !registry.has(&session_token) {
                     return AdminResponse::Error {
                         message: format!("unknown active session: '{session_token}'"),
                     };
                 }
                 if let Some(reason) =
-                    registry.suspension_reason(&session_token, &config.behavior_limits)
+                    registry.suspension_reason(&session_token, &server.config.behavior_limits)
                 {
                     return AdminResponse::Error {
                         message: format!("session is suspended: {reason}"),
@@ -1896,7 +1927,7 @@ pub(super) async fn handle_admin_request(
                 request.expires_unix = request.expires_unix.min(session_expires_at);
             }
             let selected = match issued_saved_grant.as_deref() {
-                Some(name) => config.saved_grants.read().await.get(name).cloned(),
+                Some(name) => server.state.saved_grants.read().await.get(name).cloned(),
                 None => None,
             };
             let auto_approved = selected.is_some_and(|grant| {
@@ -1904,9 +1935,9 @@ pub(super) async fn handle_admin_request(
                     && grant.auto_approve_requests
                     && grant.contains_delta(&request.delta)
             });
-            let _transition = config.grant_request_transition_gate.lock().await;
+            let _transition = server.state.grant_request_transition_gate.lock().await;
             {
-                let mut requests = config.grant_requests.write().await;
+                let mut requests = server.state.grant_requests.write().await;
                 if requests.len() >= MAX_GRANT_REQUESTS {
                     return AdminResponse::Error {
                         message: "grant request queue is full; wait for an existing request to be decided or expire"
@@ -1931,9 +1962,14 @@ pub(super) async fn handle_admin_request(
                 }
                 requests.insert(request.handle.clone(), request.clone());
             }
-            if let Some(store) = &config.session_store {
+            if let Some(store) = &server.state.session_store {
                 if let Err(error) = store.save_grant_request(request.clone()).await {
-                    config.grant_requests.write().await.remove(&request.handle);
+                    server
+                        .state
+                        .grant_requests
+                        .write()
+                        .await
+                        .remove(&request.handle);
                     return AdminResponse::Error {
                         message: format!("failed to persist grant request: {error}"),
                     };
@@ -1948,19 +1984,20 @@ pub(super) async fn handle_admin_request(
                     Some("within the saved grant auto-approval ceiling".to_string());
                 approved.next_action = "guard session status".to_string();
                 if let Err(message) =
-                    apply_and_persist_grant_request_delta_if_current(config, &pending, &approved)
+                    apply_and_persist_grant_request_delta_if_current(server, &pending, &approved)
                         .await
                 {
                     return AdminResponse::Error { message };
                 }
                 request = approved;
             }
-            config
+            server
+                .state
                 .grant_requests
                 .write()
                 .await
                 .insert(request.handle.clone(), request.clone());
-            emit_grant_request_event(config, &request, "grant_request_submitted");
+            emit_grant_request_event(server, &request, "grant_request_submitted");
             AdminResponse::GrantRequest {
                 request: redact_grant_request(request),
             }
@@ -1969,8 +2006,8 @@ pub(super) async fn handle_admin_request(
             session_token,
             caller_token,
         } => {
-            prune_grant_requests(config).await;
-            let is_admin = caller_is_session_admin(config, caller);
+            prune_grant_requests(server).await;
+            let is_admin = caller_is_session_admin(server, caller);
             if !is_admin {
                 let Some(target) = session_token.as_deref() else {
                     return AdminResponse::Error {
@@ -1983,13 +2020,14 @@ pub(super) async fn handle_admin_request(
                             .to_string(),
                     };
                 }
-                if !config.sessions.read().await.has(target) {
+                if !server.state.sessions.read().await.has(target) {
                     return AdminResponse::Error {
                         message: format!("unknown active session: '{target}'"),
                     };
                 }
             }
-            let items = config
+            let items = server
+                .state
                 .grant_requests
                 .read()
                 .await
@@ -2009,10 +2047,16 @@ pub(super) async fn handle_admin_request(
             handle,
             session_token,
         } => {
-            prune_grant_requests(config).await;
-            let request = config.grant_requests.read().await.get(&handle).cloned();
+            prune_grant_requests(server).await;
+            let request = server
+                .state
+                .grant_requests
+                .read()
+                .await
+                .get(&handle)
+                .cloned();
             match request.filter(|request| {
-                caller_is_session_admin(config, caller)
+                caller_is_session_admin(server, caller)
                     || session_token
                         .as_deref()
                         .is_some_and(|token| token == request.session_token)
@@ -2026,24 +2070,30 @@ pub(super) async fn handle_admin_request(
             }
         }
         AdminRequest::GrantRequestApprove { handle } => {
-            decide_grant_request(config, &handle, true, "approved by operator").await
+            decide_grant_request(server, &handle, true, "approved by operator").await
         }
         AdminRequest::GrantRequestDeny { handle, reason } => {
-            decide_grant_request(config, &handle, false, &reason).await
+            decide_grant_request(server, &handle, false, &reason).await
         }
         AdminRequest::GrantRequestWithdraw {
             handle,
             session_token,
         } => {
-            prune_grant_requests(config).await;
-            let _transition = config.grant_request_transition_gate.lock().await;
-            let current = config.grant_requests.read().await.get(&handle).cloned();
+            prune_grant_requests(server).await;
+            let _transition = server.state.grant_request_transition_gate.lock().await;
+            let current = server
+                .state
+                .grant_requests
+                .read()
+                .await
+                .get(&handle)
+                .cloned();
             let Some(current) = current else {
                 return AdminResponse::Error {
                     message: format!("unknown grant request: '{handle}'"),
                 };
             };
-            if !caller_is_session_admin(config, caller)
+            if !caller_is_session_admin(server, caller)
                 && session_token
                     .as_deref()
                     .is_none_or(|token| token != current.session_token)
@@ -2064,23 +2114,24 @@ pub(super) async fn handle_admin_request(
             request.status = GrantRequestStatus::Withdrawn;
             request.decided_unix = Some(now_unix());
             request.next_action = format!("guard grant request show {handle}");
-            if let Some(store) = &config.session_store {
+            if let Some(store) = &server.state.session_store {
                 if let Err(error) = store
                     .compare_and_swap_grant_request(current.clone(), request.clone())
                     .await
                 {
-                    reconcile_grant_request_from_store(config, &handle).await;
+                    reconcile_grant_request_from_store(server, &handle).await;
                     return AdminResponse::Error {
                         message: format!("grant request transition conflict: {error}"),
                     };
                 }
             }
-            config
+            server
+                .state
                 .grant_requests
                 .write()
                 .await
                 .insert(handle, request.clone());
-            emit_grant_request_event(config, &request, "grant_request_withdrawn");
+            emit_grant_request_event(server, &request, "grant_request_withdrawn");
             AdminResponse::GrantRequest {
                 request: redact_grant_request(request),
             }
@@ -2095,7 +2146,7 @@ pub(super) async fn handle_admin_request(
                     message: "evaluation batch requires 1 to 64 commands".to_string(),
                 };
             }
-            let is_admin = caller_is_session_admin(config, caller);
+            let is_admin = caller_is_session_admin(server, caller);
             if !is_admin && session_token.is_none() {
                 return AdminResponse::Error {
                     message: "batch evaluation requires an active caller-owned session".to_string(),
@@ -2108,13 +2159,15 @@ pub(super) async fn handle_admin_request(
                 };
             }
             if let Some(token) = session_token.as_deref() {
-                let registry = config.sessions.read().await;
+                let registry = server.state.sessions.read().await;
                 if !registry.has(token) {
                     return AdminResponse::Error {
                         message: format!("unknown active session: '{token}'"),
                     };
                 }
-                if let Some(reason) = registry.suspension_reason(token, &config.behavior_limits) {
+                if let Some(reason) =
+                    registry.suspension_reason(token, &server.config.behavior_limits)
+                {
                     return AdminResponse::Error {
                         message: format!("session is suspended: {reason}"),
                     };
@@ -2125,32 +2178,33 @@ pub(super) async fn handle_admin_request(
             // validation, cwd, session revision, policy, typed coverage,
             // environment/secret authorization, and evaluator cache context
             // with a subsequent real run without creating holds or history.
-            let mut preview = config.clone();
-            preview.dry_run = true;
-            preview.admission_preview = true;
-            preview.session_store = None;
-            preview.sessions = std::sync::Arc::new(tokio::sync::RwLock::new(
-                config.sessions.read().await.clone(),
+            let mut preview = server.clone();
+            preview.config.dry_run = true;
+            preview.config.admission_preview = true;
+            preview.state.session_store = None;
+            preview.state.sessions = std::sync::Arc::new(tokio::sync::RwLock::new(
+                server.state.sessions.read().await.clone(),
             ));
-            preview.verbs =
-                std::sync::Arc::new(tokio::sync::RwLock::new(config.verbs.read().await.clone()));
-            preview.saved_grants = std::sync::Arc::new(tokio::sync::RwLock::new(
-                config.saved_grants.read().await.clone(),
+            preview.state.verbs = std::sync::Arc::new(tokio::sync::RwLock::new(
+                server.state.verbs.read().await.clone(),
             ));
-            preview.grant_requests =
+            preview.state.saved_grants = std::sync::Arc::new(tokio::sync::RwLock::new(
+                server.state.saved_grants.read().await.clone(),
+            ));
+            preview.state.grant_requests =
                 std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::BTreeMap::new()));
-            preview.grant_request_transition_gate =
+            preview.state.grant_request_transition_gate =
                 std::sync::Arc::new(tokio::sync::Mutex::new(()));
-            preview.provisional = std::sync::Arc::new(tokio::sync::RwLock::new(
+            preview.state.provisional = std::sync::Arc::new(tokio::sync::RwLock::new(
                 guard::gating::provisional::ProvisionalRegistry::new(),
             ));
-            preview.approvals = std::sync::Arc::new(tokio::sync::RwLock::new(
+            preview.state.approvals = std::sync::Arc::new(tokio::sync::RwLock::new(
                 guard::gating::approval::ApprovalRegistry::new(),
             ));
-            preview.read_grants = std::sync::Arc::new(tokio::sync::RwLock::new(
+            preview.state.read_grants = std::sync::Arc::new(tokio::sync::RwLock::new(
                 guard::gating::read_grant::GrantReadRegistry::new(),
             ));
-            preview.notify_hook = None;
+            preview.state.notify_hook = None;
             let mut items = Vec::with_capacity(commands.len());
             for command in commands {
                 let rendered = command_line(&command.binary, &command.args);
@@ -2292,13 +2346,19 @@ fn stage_saved_grant_regeneration(
 }
 
 async fn decide_grant_request(
-    config: &ServerConfig,
+    server: &ServerContext,
     handle: &str,
     approve: bool,
     reason: &str,
 ) -> AdminResponse {
-    let _transition = config.grant_request_transition_gate.lock().await;
-    let request = config.grant_requests.read().await.get(handle).cloned();
+    let _transition = server.state.grant_request_transition_gate.lock().await;
+    let request = server
+        .state
+        .grant_requests
+        .read()
+        .await
+        .get(handle)
+        .cloned();
     let Some(mut request) = request else {
         return AdminResponse::Error {
             message: format!("unknown grant request: '{handle}'"),
@@ -2313,8 +2373,8 @@ async fn decide_grant_request(
         };
     }
     if request.expires_unix == 0 || now_unix() >= request.expires_unix {
-        config.grant_requests.write().await.remove(handle);
-        if let Some(store) = &config.session_store {
+        server.state.grant_requests.write().await.remove(handle);
+        if let Some(store) = &server.state.session_store {
             if let Err(error) = store.delete_grant_requests(vec![handle.to_string()]).await {
                 return AdminResponse::Error {
                     message: format!("failed to retire expired grant request: {error}"),
@@ -2327,7 +2387,7 @@ async fn decide_grant_request(
     }
     let pending = request.clone();
     if approve {
-        if let Err(message) = validate_grant_request_for_approval(config, &request).await {
+        if let Err(message) = validate_grant_request_for_approval(server, &request).await {
             return AdminResponse::Error { message };
         }
         request.status = GrantRequestStatus::Approved;
@@ -2342,47 +2402,49 @@ async fn decide_grant_request(
     request.decided_reason = Some(reason.to_string());
     if approve {
         if let Err(message) =
-            apply_and_persist_grant_request_delta_if_current(config, &pending, &request).await
+            apply_and_persist_grant_request_delta_if_current(server, &pending, &request).await
         {
-            reconcile_grant_request_from_store(config, handle).await;
+            reconcile_grant_request_from_store(server, handle).await;
             return AdminResponse::Error { message };
         }
-    } else if let Some(store) = &config.session_store {
+    } else if let Some(store) = &server.state.session_store {
         if let Err(error) = store
             .compare_and_swap_grant_request(pending, request.clone())
             .await
         {
-            reconcile_grant_request_from_store(config, handle).await;
+            reconcile_grant_request_from_store(server, handle).await;
             return AdminResponse::Error {
                 message: format!("grant request transition conflict: {error}"),
             };
         }
     }
-    config
+    server
+        .state
         .grant_requests
         .write()
         .await
         .insert(handle.to_string(), request.clone());
-    emit_grant_request_event(config, &request, "grant_request_decided");
+    emit_grant_request_event(server, &request, "grant_request_decided");
     AdminResponse::GrantRequest {
         request: redact_grant_request(request),
     }
 }
 
-async fn reconcile_grant_request_from_store(config: &ServerConfig, handle: &str) {
-    let Some(store) = &config.session_store else {
+async fn reconcile_grant_request_from_store(server: &ServerContext, handle: &str) {
+    let Some(store) = &server.state.session_store else {
         return;
     };
     match store.load_grant_request(handle.to_string()).await {
         Ok(Some(durable)) => {
-            config
+            server
+                .state
                 .grant_requests
                 .write()
                 .await
                 .insert(handle.to_string(), durable);
         }
         Ok(None) => {
-            config.grant_requests.write().await.remove(handle);
+            server.state.grant_requests.write().await.remove(handle);
         }
         Err(error) => tracing::warn!(
             "failed to reconcile grant request '{}' after transition conflict: {}",
@@ -2393,11 +2455,11 @@ async fn reconcile_grant_request_from_store(config: &ServerConfig, handle: &str)
 }
 
 async fn apply_and_persist_grant_request_delta_if_current(
-    config: &ServerConfig,
+    server: &ServerContext,
     pending: &GrantRequest,
     approved: &GrantRequest,
 ) -> Result<(), String> {
-    let mut sessions = config.sessions.write().await;
+    let mut sessions = server.state.sessions.write().await;
     if sessions.effective_revision_key(&pending.session_token) != pending.issued_session_revision {
         return Err(format!(
             "grant request '{}' no longer matches the issued session revision; submit a new request",
@@ -2422,7 +2484,7 @@ async fn apply_and_persist_grant_request_delta_if_current(
     staged
         .apply_delta(&pending.session_token, &pending.delta)
         .ok_or_else(|| format!("unknown active session: '{}'", pending.session_token))?;
-    if let Some(store) = &config.session_store {
+    if let Some(store) = &server.state.session_store {
         store
             .commit_grant_request_approval(pending.clone(), approved.clone(), staged.clone())
             .await
@@ -2433,7 +2495,7 @@ async fn apply_and_persist_grant_request_delta_if_current(
 }
 
 async fn validate_grant_request_for_approval(
-    config: &ServerConfig,
+    server: &ServerContext,
     request: &GrantRequest,
 ) -> Result<(), String> {
     if request.expires_unix == 0 || now_unix() >= request.expires_unix {
@@ -2442,7 +2504,7 @@ async fn validate_grant_request_for_approval(
             request.handle
         ));
     }
-    let sessions = config.sessions.read().await;
+    let sessions = server.state.sessions.read().await;
     let current_session_revision = sessions.effective_revision_key(&request.session_token);
     if current_session_revision != request.issued_session_revision {
         return Err(format!(
@@ -2467,7 +2529,7 @@ async fn validate_grant_request_for_approval(
         request.saved_grant.as_deref(),
         request.issued_saved_revision,
     ) {
-        let current = config.saved_grants.read().await.get(name).cloned();
+        let current = server.state.saved_grants.read().await.get(name).cloned();
         if current.as_ref().map(|grant| grant.revision) != Some(revision) {
             return Err(format!(
                 "saved grant '{name}' changed after request issuance; submit a new request"
@@ -2475,7 +2537,8 @@ async fn validate_grant_request_for_approval(
         }
     }
     if !request.delta.override_markers.is_empty() {
-        let available = config
+        let available = server
+            .state
             .verbs
             .read()
             .await
@@ -2496,9 +2559,9 @@ async fn validate_grant_request_for_approval(
     Ok(())
 }
 
-pub(super) async fn prune_grant_requests(config: &ServerConfig) {
+pub(super) async fn prune_grant_requests(server: &ServerContext) {
     let now = now_unix();
-    let mut requests = config.grant_requests.write().await;
+    let mut requests = server.state.grant_requests.write().await;
     let mut removed = requests
         .iter()
         .filter(|(_, request)| {
@@ -2523,7 +2586,7 @@ pub(super) async fn prune_grant_requests(config: &ServerConfig) {
         retained_count = retained_count.saturating_sub(1);
     }
     if !removed.is_empty() {
-        if let Some(store) = &config.session_store {
+        if let Some(store) = &server.state.session_store {
             if let Err(error) = store.delete_grant_requests(removed.clone()).await {
                 tracing::warn!("failed to prune expired grant requests: {error}");
                 return;
@@ -2540,8 +2603,8 @@ fn redact_grant_request(mut request: GrantRequest) -> GrantRequest {
     request
 }
 
-fn emit_grant_request_event(config: &ServerConfig, request: &GrantRequest, event: &'static str) {
-    config.emit_event(NotifyEvent {
+fn emit_grant_request_event(server: &ServerContext, request: &GrantRequest, event: &'static str) {
+    server.emit_event(NotifyEvent {
         event,
         at_unix: now_unix(),
         handle: Some(request.handle.clone()),
@@ -2556,32 +2619,32 @@ fn emit_grant_request_event(config: &ServerConfig, request: &GrantRequest, event
 /// daemon (operator) when its principal equals the daemon's; row visibility is
 /// then either daemon-wide or scoped to the caller's own principal via
 /// `scope_eq` (so two unauthenticated `None` callers never share rows).
-fn caller_scope(config: &ServerConfig, caller: &CallerIdentity) -> (bool, Option<PrincipalKey>) {
+fn caller_scope(server: &ServerContext, caller: &CallerIdentity) -> (bool, Option<PrincipalKey>) {
     let p = caller.principal();
     (
-        matches!(p, Some(ref k) if config.daemon_principal.eq_ci(k)),
+        matches!(p, Some(ref k) if server.config.daemon_principal.eq_ci(k)),
         p,
     )
 }
 
 async fn handle_confirm(
-    config: &ServerConfig,
+    server: &ServerContext,
     caller: &CallerIdentity,
     handle: &str,
 ) -> AdminResponse {
     let updated = {
-        let mut reg = config.provisional.write().await;
+        let mut reg = server.state.provisional.write().await;
         reg.confirm(handle)
     };
     match updated {
         Ok(p) => {
-            persist_provisional(config, &p).await;
-            forget_proxy_provenance(config, handle).await;
+            persist_provisional(server, &p).await;
+            forget_proxy_provenance(server, handle).await;
             // The change is kept and the revert will never fire; drop its
             // persisted body so a secret-bearing snapshot is not left on disk.
             remove_revert_body(&p);
             tracing::info!(target: "guard::audit", "[AUDIT] CONFIRM handle={} caller={}", handle, caller);
-            config.emit_event(NotifyEvent {
+            server.emit_event(NotifyEvent {
                 event: "decision_made",
                 at_unix: now_unix(),
                 handle: Some(handle.to_string()),
@@ -2672,12 +2735,12 @@ mod regeneration_tests {
 }
 
 async fn handle_manual_revert(
-    config: &ServerConfig,
+    server: &ServerContext,
     caller: &CallerIdentity,
     handle: &str,
 ) -> AdminResponse {
     let claimed = {
-        let mut reg = config.provisional.write().await;
+        let mut reg = server.state.provisional.write().await;
         reg.begin_revert(handle)
     };
     let p = match claimed {
@@ -2688,8 +2751,8 @@ async fn handle_manual_revert(
             }
         }
     };
-    persist_provisional(config, &p).await;
-    let outcome = finish_revert(config, &p, caller, "manual").await;
+    persist_provisional(server, &p).await;
+    let outcome = finish_revert(server, &p, caller, "manual").await;
     AdminResponse::GateAction {
         message: outcome.0,
         exit_code: outcome.1,
@@ -2699,12 +2762,12 @@ async fn handle_manual_revert(
 }
 
 async fn handle_approve(
-    config: &ServerConfig,
+    server: &ServerContext,
     caller: &CallerIdentity,
     handle: &str,
 ) -> AdminResponse {
     let snapshot = {
-        let mut reg = config.approvals.write().await;
+        let mut reg = server.state.approvals.write().await;
         reg.begin_approve(handle)
     };
     let snapshot = match snapshot {
@@ -2722,22 +2785,22 @@ async fn handle_approve(
     // by the daemon principal, which peer credentials assign only to the
     // daemon's own gate sink.
     if is_api_proxy_sentinel(&snapshot.binary)
-        && matches!(&snapshot.principal, Some(p) if config.daemon_principal.eq_ci(p))
+        && matches!(&snapshot.principal, Some(p) if server.config.daemon_principal.eq_ci(p))
     {
         let now = now_unix();
         {
-            let mut reg = config.approvals.write().await;
+            let mut reg = server.state.approvals.write().await;
             reg.set_result(handle, now, None, None, None);
         }
-        if let Some(a) = config.approvals.read().await.get(handle).cloned() {
-            persist_approval(config, &a).await;
+        if let Some(a) = server.state.approvals.read().await.get(handle).cloned() {
+            persist_approval(server, &a).await;
         }
         tracing::info!(target: "guard::audit",
             "[AUDIT] APPROVED handle={} caller={} (api-proxy request released)",
             handle,
             caller
         );
-        config.emit_event(NotifyEvent {
+        server.emit_event(NotifyEvent {
             event: "decision_made",
             at_unix: now,
             handle: Some(handle.to_string()),
@@ -2757,7 +2820,7 @@ async fn handle_approve(
     // since it was held, the approved artifact may no longer mean what the
     // operator reviewed. Void the approval rather than execute a stale rendering.
     if let Some(vname) = &snapshot.verb_name {
-        let current = config.verbs.read().await.version();
+        let current = server.state.verbs.read().await.version();
         if snapshot.catalog_version != Some(current) {
             let now = now_unix();
             let detail = format!(
@@ -2765,11 +2828,11 @@ async fn handle_approve(
                 vname
             );
             {
-                let mut reg = config.approvals.write().await;
+                let mut reg = server.state.approvals.write().await;
                 reg.set_exec_failed(handle, now, detail.clone());
             }
-            if let Some(a) = config.approvals.read().await.get(handle).cloned() {
-                persist_approval(config, &a).await;
+            if let Some(a) = server.state.approvals.read().await.get(handle).cloned() {
+                persist_approval(server, &a).await;
             }
             tracing::warn!(target: "guard::audit",
                 "[AUDIT] APPROVE_VOIDED handle={} caller={} session_fingerprint={} {}",
@@ -2781,7 +2844,7 @@ async fn handle_approve(
                     .unwrap_or("none"),
                 audit_escape(&detail)
             );
-            config.emit_event(NotifyEvent {
+            server.emit_event(NotifyEvent {
                 event: "decision_made",
                 at_unix: now,
                 handle: Some(handle.to_string()),
@@ -2795,11 +2858,11 @@ async fn handle_approve(
     }
     // Persist the Approving transition before exec so an interrupted exec is
     // recoverable (startup recovery routes Approving -> ExecFailed).
-    if let Some(a) = config.approvals.read().await.get(handle).cloned() {
-        persist_approval(config, &a).await;
+    if let Some(a) = server.state.approvals.read().await.get(handle).cloned() {
+        persist_approval(server, &a).await;
     }
     let reason = format!("operator-approved held command {}", handle);
-    let result = execute_snapshot(config, &snapshot, &reason).await;
+    let result = execute_snapshot(server, &snapshot, &reason).await;
     let now = now_unix();
     let (message, exit, stdout, stderr) = match result.exec {
         ExecOutcome::Completed {
@@ -2808,7 +2871,7 @@ async fn handle_approve(
             stderr,
         } => {
             {
-                let mut reg = config.approvals.write().await;
+                let mut reg = server.state.approvals.write().await;
                 reg.set_result(handle, now, exit_code, stdout.clone(), stderr.clone());
             }
             tracing::info!(target: "guard::audit",
@@ -2830,7 +2893,7 @@ async fn handle_approve(
         }
         ExecOutcome::Failed { reason: detail, .. } => {
             {
-                let mut reg = config.approvals.write().await;
+                let mut reg = server.state.approvals.write().await;
                 reg.set_exec_failed(handle, now, detail.clone());
             }
             tracing::error!(target: "guard::audit",
@@ -2857,10 +2920,10 @@ async fn handle_approve(
             None,
         ),
     };
-    if let Some(a) = config.approvals.read().await.get(handle).cloned() {
-        persist_approval(config, &a).await;
+    if let Some(a) = server.state.approvals.read().await.get(handle).cloned() {
+        persist_approval(server, &a).await;
     }
-    config.emit_event(NotifyEvent {
+    server.emit_event(NotifyEvent {
         event: "decision_made",
         at_unix: now,
         handle: Some(handle.to_string()),
@@ -2890,7 +2953,7 @@ async fn handle_approve(
 /// matches the snapshot) may note its own; nobody else. Returns the updated hold
 /// view (including the thread) so the caller can render it.
 pub(super) async fn handle_approval_note(
-    config: &ServerConfig,
+    server: &ServerContext,
     caller: &CallerIdentity,
     handle: &str,
     text: &str,
@@ -2901,9 +2964,9 @@ pub(super) async fn handle_approval_note(
             message: "note text must not be empty".to_string(),
         };
     }
-    let (is_operator, caller_key) = caller_scope(config, caller);
+    let (is_operator, caller_key) = caller_scope(server, caller);
     let author = {
-        let reg = config.approvals.read().await;
+        let reg = server.state.approvals.read().await;
         match reg.get(handle) {
             Some(_) if is_operator => "operator",
             Some(a) if caller.is_local_peer() && scope_eq(&a.snapshot.principal, &caller_key) => {
@@ -2920,15 +2983,15 @@ pub(super) async fn handle_approval_note(
     };
     let now = now_unix();
     let result = {
-        let mut reg = config.approvals.write().await;
+        let mut reg = server.state.approvals.write().await;
         reg.add_note(handle, author, text, now)
     };
     match result {
         Ok(()) => {
-            let updated = config.approvals.read().await.get(handle).cloned();
+            let updated = server.state.approvals.read().await.get(handle).cloned();
             match updated {
                 Some(a) => {
-                    persist_approval(config, &a).await;
+                    persist_approval(server, &a).await;
                     tracing::info!(target: "guard::audit",
                         "[AUDIT] APPROVAL_NOTE handle={} author={} caller={}",
                         handle,
@@ -2951,21 +3014,21 @@ pub(super) async fn handle_approval_note(
 }
 
 async fn handle_deny(
-    config: &ServerConfig,
+    server: &ServerContext,
     caller: &CallerIdentity,
     handle: &str,
 ) -> AdminResponse {
     let now = now_unix();
     let result = {
-        let mut reg = config.approvals.write().await;
+        let mut reg = server.state.approvals.write().await;
         reg.deny(handle, now, "operator denied".to_string())
     };
     match result {
         Ok(()) => {
             let session_fingerprint =
-                if let Some(a) = config.approvals.read().await.get(handle).cloned() {
+                if let Some(a) = server.state.approvals.read().await.get(handle).cloned() {
                     let session_fingerprint = a.snapshot.session_fingerprint.clone();
-                    persist_approval(config, &a).await;
+                    persist_approval(server, &a).await;
                     session_fingerprint
                 } else {
                     None
@@ -2976,7 +3039,7 @@ async fn handle_deny(
                 caller,
                 session_fingerprint.as_deref().unwrap_or("none")
             );
-            config.emit_event(NotifyEvent {
+            server.emit_event(NotifyEvent {
                 event: "decision_made",
                 at_unix: now,
                 handle: Some(handle.to_string()),

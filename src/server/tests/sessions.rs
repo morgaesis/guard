@@ -113,7 +113,11 @@ async fn kubeconfig_issuance_is_local_live_session_scoped_and_secret_free() {
     let token = "finite-kube-session-token";
     let mut grant = granted_session(Vec::new(), Vec::new());
     grant.expires_at = Some(guard::env::now_unix() + 60);
-    cfg.sessions.write().await.grant(token.to_string(), grant);
+    cfg.state
+        .sessions
+        .write()
+        .await
+        .grant(token.to_string(), grant);
 
     let proxy = guard::proxy::ApiProxy::new(
         "127.0.0.1:18443".parse().unwrap(),
@@ -126,7 +130,8 @@ async fn kubeconfig_issuance_is_local_live_session_scoped_and_secret_free() {
         guard::proxy::ApiPolicy::deny_all(),
         None,
     );
-    cfg.protocol_registry
+    cfg.state
+        .protocol_registry
         .write()
         .await
         .insert("cluster-a".to_string(), Arc::new(proxy));
@@ -168,7 +173,7 @@ async fn kubeconfig_issuance_is_local_live_session_scoped_and_secret_free() {
         AdminResponse::Error { .. }
     ));
 
-    cfg.sessions.write().await.revoke(token);
+    cfg.state.sessions.write().await.revoke(token);
     assert!(matches!(
         handle_admin_request(&cfg, &CallerIdentity::Unix { uid: 1_001 }, request()).await,
         AdminResponse::Error { .. }
@@ -177,7 +182,8 @@ async fn kubeconfig_issuance_is_local_live_session_scoped_and_secret_free() {
     let expired = "expired-kube-session";
     let mut expired_grant = granted_session(Vec::new(), Vec::new());
     expired_grant.expires_at = Some(guard::env::now_unix());
-    cfg.sessions
+    cfg.state
+        .sessions
         .write()
         .await
         .grant(expired.to_string(), expired_grant);
@@ -198,9 +204,9 @@ async fn kubeconfig_issuance_is_local_live_session_scoped_and_secret_free() {
 #[tokio::test]
 async fn session_grant_validates_activated_verbs_and_exact_override_markers() {
     let (mut cfg, _) = make_test_config();
-    cfg.daemon_uid = 777;
-    cfg.daemon_principal = PrincipalKey::from_uid(777);
-    cfg.verbs = Arc::new(RwLock::new(
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.state.verbs = Arc::new(RwLock::new(
         VerbCatalog::from_yaml(
             r#"
 verbs:
@@ -325,9 +331,9 @@ fn request_with_session(binary: &str, args: Vec<String>, token: String) -> Execu
 #[tokio::test]
 async fn session_allow_cannot_bypass_binary_floor() {
     let (mut cfg, _) = make_test_config();
-    cfg.allowed_binaries = Some(vec!["echo".to_string()]);
+    cfg.config.allowed_binaries = Some(vec!["echo".to_string()]);
     let token = format!("binary-floor-glob-{}", std::process::id());
-    cfg.sessions.write().await.grant(
+    cfg.state.sessions.write().await.grant(
         token.clone(),
         granted_session(vec!["sh *".to_string()], Vec::new()),
     );
@@ -348,9 +354,9 @@ async fn session_allow_cannot_bypass_binary_floor() {
 #[tokio::test]
 async fn session_exact_allow_cannot_bypass_binary_floor() {
     let (mut cfg, _) = make_test_config();
-    cfg.allowed_binaries = Some(vec!["echo".to_string()]);
+    cfg.config.allowed_binaries = Some(vec!["echo".to_string()]);
     let token = format!("binary-floor-exact-{}", std::process::id());
-    cfg.sessions.write().await.grant(
+    cfg.state.sessions.write().await.grant(
         token.clone(),
         granted_session(
             Vec::new(),
@@ -377,9 +383,9 @@ async fn session_exact_allow_cannot_bypass_binary_floor() {
 #[tokio::test]
 async fn session_allow_routes_through_consequence_gate() {
     let (mut cfg, _) = make_test_config();
-    cfg.gate = GateMode::Consequence;
+    cfg.config.gate = GateMode::Consequence;
     let token = format!("session-gate-{}", std::process::id());
-    cfg.sessions.write().await.grant(
+    cfg.state.sessions.write().await.grant(
         token.clone(),
         granted_session(vec!["true".to_string()], Vec::new()),
     );
@@ -404,7 +410,7 @@ async fn cwd_request_does_not_match_legacy_session_allow_glob() {
     let (cfg, _) = make_test_config();
     let temp = tempfile::tempdir().unwrap();
     let token = format!("cwd-legacy-glob-{}", std::process::id());
-    cfg.sessions.write().await.grant(
+    cfg.state.sessions.write().await.grant(
         token.clone(),
         granted_session(vec!["pwd".to_string()], Vec::new()),
     );
@@ -428,7 +434,7 @@ async fn cwd_request_matches_cwd_bound_exact_session_allow_only() {
     let other = tempfile::tempdir().unwrap();
     let allowed_cwd = allowed.path().canonicalize().unwrap();
     let token = format!("cwd-exact-{}", std::process::id());
-    cfg.sessions.write().await.grant(
+    cfg.state.sessions.write().await.grant(
         token.clone(),
         granted_session(
             Vec::new(),
@@ -487,7 +493,7 @@ async fn static_only_session_miss_denies_before_evaluator() {
     let (cfg, _) = make_test_config();
     let token = format!("static-only-{}", std::process::id());
     {
-        let mut sessions = cfg.sessions.write().await;
+        let mut sessions = cfg.state.sessions.write().await;
         sessions.grant(
             token.clone(),
             SessionGrant {
@@ -577,8 +583,8 @@ fn session_source_reports_cache_separately_from_static_policy() {
 #[test]
 fn tcp_admin_token_validation_is_separate_from_exec_token() {
     let (mut cfg, _) = make_test_config();
-    cfg.auth_token = Some("exec-token".into());
-    cfg.admin_token = Some("admin-token".into());
+    cfg.config.auth_token = Some("exec-token".into());
+    cfg.config.admin_token = Some("admin-token".into());
 
     assert!(cfg.validate_token(Some("exec-token")).is_ok());
     assert!(cfg.validate_admin_token(Some("admin-token")).is_ok());
@@ -598,8 +604,8 @@ fn tcp_admin_token_validation_is_separate_from_exec_token() {
 #[tokio::test]
 async fn session_list_is_user_visible_but_prompt_is_hidden() {
     let (mut cfg, _) = make_test_config();
-    cfg.daemon_uid = 777;
-    cfg.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
 
     let daemon = CallerIdentity::Unix { uid: 777 };
     let user = CallerIdentity::Unix { uid: 20_002 };
@@ -659,8 +665,8 @@ async fn session_list_is_user_visible_but_prompt_is_hidden() {
 #[tokio::test]
 async fn session_list_shows_current_session_details_without_raw_token_for_user() {
     let (mut cfg, _) = make_test_config();
-    cfg.daemon_uid = 777;
-    cfg.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
 
     let daemon = CallerIdentity::Unix { uid: 777 };
     let user = CallerIdentity::Unix { uid: 20_002 };
@@ -725,8 +731,8 @@ async fn session_list_shows_current_session_details_without_raw_token_for_user()
 #[tokio::test]
 async fn session_show_reports_recent_stats() {
     let (mut cfg, _) = make_test_config();
-    cfg.daemon_uid = 777;
-    cfg.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
 
     let daemon = CallerIdentity::Unix { uid: 777 };
     let token = format!("session-show-{}", std::process::id());
@@ -759,7 +765,7 @@ async fn session_show_reports_recent_stats() {
         .unwrap_or(0);
 
     {
-        let mut reg = cfg.sessions.write().await;
+        let mut reg = cfg.state.sessions.write().await;
         reg.record_interaction(
             &token,
             SessionInteraction {
@@ -822,8 +828,8 @@ async fn session_show_reports_recent_stats() {
 #[tokio::test]
 async fn session_show_self_token_sees_full_grant() {
     let (mut cfg, _) = make_test_config();
-    cfg.daemon_uid = 777;
-    cfg.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
 
     let daemon = CallerIdentity::Unix { uid: 777 };
     let user = CallerIdentity::Unix { uid: 20_003 };
@@ -884,14 +890,15 @@ async fn session_show_self_token_sees_full_grant() {
 #[tokio::test]
 async fn session_status_self_view_redacts_bearer_and_keeps_decision_trace() {
     let (mut cfg, _) = make_test_config();
-    cfg.daemon_uid = 777;
-    cfg.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
     let token = "status-bearer-must-not-be-returned".to_string();
-    cfg.sessions
+    cfg.state
+        .sessions
         .write()
         .await
         .grant(token.clone(), granted_session(Vec::new(), Vec::new()));
-    cfg.sessions.write().await.record_interaction(
+    cfg.state.sessions.write().await.record_interaction(
         &token,
         SessionInteraction {
             at_unix: guard::env::now_unix(),
@@ -935,8 +942,8 @@ async fn session_status_self_view_redacts_bearer_and_keeps_decision_trace() {
 #[tokio::test]
 async fn session_show_other_token_denied_for_non_admin() {
     let (mut cfg, _) = make_test_config();
-    cfg.daemon_uid = 777;
-    cfg.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
 
     let daemon = CallerIdentity::Unix { uid: 777 };
     let attacker = CallerIdentity::Unix { uid: 20_004 };
@@ -996,9 +1003,9 @@ async fn session_show_other_token_denied_for_non_admin() {
 #[tokio::test]
 async fn session_new_from_profile_mints_expected_grant() {
     let (mut cfg, _) = make_test_config();
-    cfg.daemon_uid = 777;
-    cfg.daemon_principal = PrincipalKey::from_uid(777);
-    cfg.saved_grants = std::sync::Arc::new(tokio::sync::RwLock::new(
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.state.saved_grants = std::sync::Arc::new(tokio::sync::RwLock::new(
         SavedGrantCatalog::from_yaml(
             "profiles:\n  - name: cert-manager-rotation\n    ttl_secs: 1800\n    allow:\n      - \"kubectl get certificate *\"\n    deny:\n      - \"kubectl delete namespace *\"\n    prompt_append: \"rotating cert-manager certificates\"\n",
         )
@@ -1031,7 +1038,7 @@ async fn session_new_from_profile_mints_expected_grant() {
     .await;
     assert!(matches!(resp, AdminResponse::Ok));
 
-    let reg = cfg.sessions.read().await;
+    let reg = cfg.state.sessions.read().await;
     let summary = reg
         .list()
         .into_iter()
@@ -1057,8 +1064,8 @@ async fn session_new_from_profile_mints_expected_grant() {
 #[tokio::test]
 async fn session_new_unknown_profile_fails_clearly() {
     let (mut cfg, _) = make_test_config();
-    cfg.daemon_uid = 777;
-    cfg.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
     // The profile catalog is left empty.
 
     let daemon = CallerIdentity::Unix { uid: 777 };
@@ -1093,7 +1100,7 @@ async fn session_new_unknown_profile_fails_clearly() {
         other => panic!("expected error, got {:?}", other),
     }
     // A failed lookup must not install an (empty, unrestricted) grant.
-    let reg = cfg.sessions.read().await;
+    let reg = cfg.state.sessions.read().await;
     assert!(
         reg.list().into_iter().all(|g| g.token != token),
         "no grant should be installed for an unknown profile"
@@ -1103,9 +1110,9 @@ async fn session_new_unknown_profile_fails_clearly() {
 #[tokio::test]
 async fn profile_grant_still_deny_short_circuits_and_falls_through() {
     let (mut cfg, _) = make_test_config();
-    cfg.daemon_uid = 777;
-    cfg.daemon_principal = PrincipalKey::from_uid(777);
-    cfg.saved_grants = std::sync::Arc::new(tokio::sync::RwLock::new(
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.state.saved_grants = std::sync::Arc::new(tokio::sync::RwLock::new(
         SavedGrantCatalog::from_yaml(
             "profiles:\n  - name: scoped\n    allow:\n      - \"kubectl get *\"\n    deny:\n      - \"kubectl delete *\"\n",
         )
@@ -1136,7 +1143,7 @@ async fn profile_grant_still_deny_short_circuits_and_falls_through() {
     .await;
     assert!(matches!(resp, AdminResponse::Ok));
 
-    let reg = cfg.sessions.read().await;
+    let reg = cfg.state.sessions.read().await;
     let summary = reg
         .list()
         .into_iter()
@@ -1149,9 +1156,9 @@ async fn profile_grant_still_deny_short_circuits_and_falls_through() {
 #[tokio::test]
 async fn grant_requests_use_the_issued_ceiling_and_redact_session_tokens() {
     let (mut cfg, _) = make_test_config();
-    cfg.daemon_uid = 777;
-    cfg.daemon_principal = PrincipalKey::from_uid(777);
-    cfg.saved_grants = Arc::new(RwLock::new(
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.state.saved_grants = Arc::new(RwLock::new(
         SavedGrantCatalog::from_yaml(
             "grants:\n  - name: bounded\n    prompt_append: bounded task\n    ttl_secs: 300\n    auto_approve_requests: true\n  - name: other\n    prompt_append: other task\n    ttl_secs: 3600\n    auto_approve_requests: true\n",
         )
@@ -1225,7 +1232,7 @@ async fn grant_requests_use_the_issued_ceiling_and_redact_session_tokens() {
             if request.status == crate::grant_profile::GrantRequestStatus::Approved
                 && request.session_token.starts_with("sha256:")
     ));
-    cfg.sessions.write().await.grant(
+    cfg.state.sessions.write().await.grant(
         "other-live-session".to_string(),
         granted_session(Vec::new(), Vec::new()),
     );
@@ -1287,17 +1294,18 @@ async fn grant_requests_use_the_issued_ceiling_and_redact_session_tokens() {
 #[tokio::test]
 async fn grant_request_submit_enforces_suspension_quota_and_aggregate_size() {
     let (mut cfg, _) = make_test_config();
-    cfg.daemon_uid = 777;
-    cfg.daemon_principal = PrincipalKey::from_uid(777);
-    cfg.behavior_limits.max_denials = Some(1);
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.config.behavior_limits.max_denials = Some(1);
     let worker = CallerIdentity::Unix { uid: 778 };
     for token in ["suspended-request", "quota-request", "large-request"] {
-        cfg.sessions
+        cfg.state
+            .sessions
             .write()
             .await
             .grant(token.to_string(), granted_session(Vec::new(), Vec::new()));
     }
-    cfg.sessions.write().await.record_interaction(
+    cfg.state.sessions.write().await.record_interaction(
         "suspended-request",
         SessionInteraction {
             command: "denied".to_string(),
@@ -1344,7 +1352,8 @@ async fn grant_request_submit_enforces_suspension_quota_and_aggregate_size() {
             format!("request-{index}"),
         )
         .unwrap();
-        cfg.grant_requests
+        cfg.state
+            .grant_requests
             .write()
             .await
             .insert(request.handle.clone(), request);
@@ -1374,16 +1383,16 @@ async fn grant_request_submit_enforces_suspension_quota_and_aggregate_size() {
 #[tokio::test]
 async fn auto_and_operator_approval_fail_without_partial_session_authority() {
     let (mut cfg, _) = make_test_config();
-    cfg.daemon_uid = 777;
-    cfg.daemon_principal = PrincipalKey::from_uid(777);
-    cfg.saved_grants = Arc::new(RwLock::new(
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.state.saved_grants = Arc::new(RwLock::new(
         SavedGrantCatalog::from_yaml(
             "grants:\n  - name: automatic\n    ttl_secs: 300\n    prompt_append: automatic work\n    auto_approve_requests: true\n  - name: reviewed\n    ttl_secs: 300\n    prompt_append: reviewed work\n    auto_approve_requests: false\n",
         )
         .unwrap(),
     ));
     let tmp = tempfile::tempdir().unwrap();
-    cfg.session_store = Some(
+    cfg.state.session_store = Some(
         SessionStore::open(tmp.path().join("state.db"), 3600)
             .await
             .unwrap(),
@@ -1430,11 +1439,13 @@ async fn auto_and_operator_approval_fail_without_partial_session_authority() {
     };
 
     let auto_revision = cfg
+        .state
         .sessions
         .read()
         .await
         .effective_revision_key("automatic-approval");
-    cfg.session_store
+    cfg.state
+        .session_store
         .as_ref()
         .unwrap()
         .fail_next_approval_for_test();
@@ -1443,7 +1454,8 @@ async fn auto_and_operator_approval_fail_without_partial_session_authority() {
         AdminResponse::Error { message } if message.contains("approval transaction failure")
     ));
     assert_eq!(
-        cfg.sessions
+        cfg.state
+            .sessions
             .read()
             .await
             .effective_revision_key("automatic-approval"),
@@ -1451,6 +1463,7 @@ async fn auto_and_operator_approval_fail_without_partial_session_authority() {
     );
 
     let reviewed_revision = cfg
+        .state
         .sessions
         .read()
         .await
@@ -1459,7 +1472,8 @@ async fn auto_and_operator_approval_fail_without_partial_session_authority() {
     let AdminResponse::GrantRequest { request } = response else {
         panic!("expected pending request")
     };
-    cfg.session_store
+    cfg.state
+        .session_store
         .as_ref()
         .unwrap()
         .fail_next_approval_for_test();
@@ -1475,14 +1489,15 @@ async fn auto_and_operator_approval_fail_without_partial_session_authority() {
         AdminResponse::Error { message } if message.contains("approval transaction failure")
     ));
     assert_eq!(
-        cfg.sessions
+        cfg.state
+            .sessions
             .read()
             .await
             .effective_revision_key("operator-approval"),
         reviewed_revision
     );
     assert_eq!(
-        cfg.grant_requests.read().await[&request.handle].status,
+        cfg.state.grant_requests.read().await[&request.handle].status,
         crate::grant_profile::GrantRequestStatus::Pending
     );
 }
@@ -1494,16 +1509,16 @@ async fn terminal_grant_request_races_have_one_durable_authority_outcome() {
         crate::grant_profile::GrantRequestStatus::Denied,
     ] {
         let (mut cfg, _) = make_test_config();
-        cfg.daemon_uid = 777;
-        cfg.daemon_principal = PrincipalKey::from_uid(777);
-        cfg.saved_grants = Arc::new(RwLock::new(
+        cfg.config.daemon_uid = 777;
+        cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+        cfg.state.saved_grants = Arc::new(RwLock::new(
             SavedGrantCatalog::from_yaml(
                 "grants:\n  - name: reviewed\n    ttl_secs: 300\n    prompt_append: reviewed work\n    auto_approve_requests: false\n",
             )
             .unwrap(),
         ));
         let tmp = tempfile::tempdir().unwrap();
-        cfg.session_store = Some(
+        cfg.state.session_store = Some(
             SessionStore::open(tmp.path().join("state.db"), 3600)
                 .await
                 .unwrap(),
@@ -1534,7 +1549,12 @@ async fn terminal_grant_request_races_have_one_durable_authority_outcome() {
             .await,
             AdminResponse::Ok
         ));
-        let issued_revision = cfg.sessions.read().await.effective_revision_key(&token);
+        let issued_revision = cfg
+            .state
+            .sessions
+            .read()
+            .await
+            .effective_revision_key(&token);
         let submitted = handle_admin_request(
             &cfg,
             &worker,
@@ -1611,7 +1631,7 @@ async fn terminal_grant_request_races_have_one_durable_authority_outcome() {
             "the losing transition must report a conflict: {responses:?}"
         );
 
-        let store = cfg.session_store.as_ref().unwrap();
+        let store = cfg.state.session_store.as_ref().unwrap();
         let durable = store
             .load_grant_request(handle.clone())
             .await
@@ -1624,10 +1644,15 @@ async fn terminal_grant_request_races_have_one_durable_authority_outcome() {
                 | crate::grant_profile::GrantRequestStatus::Withdrawn
         ));
         assert_eq!(
-            cfg.grant_requests.read().await[&handle].status,
+            cfg.state.grant_requests.read().await[&handle].status,
             durable.status
         );
-        let live_revision = cfg.sessions.read().await.effective_revision_key(&token);
+        let live_revision = cfg
+            .state
+            .sessions
+            .read()
+            .await
+            .effective_revision_key(&token);
         let durable_revision = store
             .load_registry()
             .await
@@ -1645,8 +1670,8 @@ async fn terminal_grant_request_races_have_one_durable_authority_outcome() {
 #[tokio::test]
 async fn saved_grant_edit_uses_explicit_clear_and_tristate_operations() {
     let (mut cfg, _) = make_test_config();
-    cfg.daemon_uid = 777;
-    cfg.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
     let daemon = CallerIdentity::Unix { uid: 777 };
     let source = SavedGrantCatalog::from_yaml(
         "grants:\n  - name: editable\n    description: original\n    activated_verbs: [inspect]\n    override_markers: [operator:inspect]\n    secret_names: [service/*]\n    ttl_secs: 300\n    prompt_append: original prompt\n    auto_approve_requests: true\n",
@@ -1754,16 +1779,16 @@ async fn saved_grant_regeneration_previews_exact_apply_and_enforces_both_cas_key
         .unwrap()
     };
     let (mut cfg, _) = make_test_config();
-    cfg.evaluator = Arc::new(evaluator("regime-a"));
-    cfg.saved_grants = Arc::new(RwLock::new(
+    cfg.state.evaluator = Arc::new(evaluator("regime-a"));
+    cfg.state.saved_grants = Arc::new(RwLock::new(
         SavedGrantCatalog::from_yaml(
             "grants:\n  - name: bounded\n    prompt_append: inspect one host\n",
         )
         .unwrap(),
     ));
-    cfg.daemon_principal = PrincipalKey::from_uid(cfg.daemon_uid);
+    cfg.config.daemon_principal = PrincipalKey::from_uid(cfg.config.daemon_uid);
     let daemon = CallerIdentity::Unix {
-        uid: cfg.daemon_uid,
+        uid: cfg.config.daemon_uid,
     };
     let preview = || AdminRequest::SavedGrantRegenerate {
         name: "bounded".to_string(),
@@ -1812,8 +1837,9 @@ async fn saved_grant_regeneration_previews_exact_apply_and_enforces_both_cas_key
         panic!("expected regeneration proposal, got {response:?}");
     };
     assert_eq!(source_revision, 1);
-    assert_eq!(regime, cfg.evaluator.verb_promotion_stamp());
+    assert_eq!(regime, cfg.state.evaluator.verb_promotion_stamp());
     assert!(cfg
+        .state
         .saved_grants
         .read()
         .await
@@ -1857,7 +1883,7 @@ async fn saved_grant_regeneration_previews_exact_apply_and_enforces_both_cas_key
     else {
         panic!()
     };
-    cfg.evaluator = Arc::new(evaluator("regime-b"));
+    cfg.state.evaluator = Arc::new(evaluator("regime-b"));
     assert!(matches!(
         handle_admin_request(&cfg, &daemon, apply(stale_regime)).await,
         AdminResponse::Error { message } if message.contains("evaluator regime changed")
@@ -1867,15 +1893,15 @@ async fn saved_grant_regeneration_previews_exact_apply_and_enforces_both_cas_key
 #[tokio::test]
 async fn grant_request_show_and_withdraw_require_the_issuing_session() {
     let (mut cfg, _) = make_test_config();
-    cfg.daemon_uid = 777;
-    cfg.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
     let daemon = CallerIdentity::Unix { uid: 777 };
     let worker = CallerIdentity::Unix { uid: 778 };
-    cfg.sessions.write().await.grant(
+    cfg.state.sessions.write().await.grant(
         "owner-session".to_string(),
         granted_session(Vec::new(), Vec::new()),
     );
-    cfg.sessions.write().await.grant(
+    cfg.state.sessions.write().await.grant(
         "victim-session".to_string(),
         granted_session(Vec::new(), Vec::new()),
     );
@@ -1990,16 +2016,17 @@ async fn grant_request_show_and_withdraw_require_the_issuing_session() {
 #[tokio::test]
 async fn withdraw_and_prune_keep_memory_when_persistence_fails() {
     let (mut cfg, _) = make_test_config();
-    cfg.daemon_uid = 777;
-    cfg.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
     let tmp = tempfile::tempdir().unwrap();
-    cfg.session_store = Some(
+    cfg.state.session_store = Some(
         SessionStore::open(tmp.path().join("state.db"), 3600)
             .await
             .unwrap(),
     );
     let token = "persisted-request-owner".to_string();
-    cfg.sessions
+    cfg.state
+        .sessions
         .write()
         .await
         .grant(token.clone(), granted_session(Vec::new(), Vec::new()));
@@ -2014,11 +2041,12 @@ async fn withdraw_and_prune_keep_memory_when_persistence_fails() {
     )
     .unwrap();
     let handle = request.handle.clone();
-    cfg.grant_requests
+    cfg.state
+        .grant_requests
         .write()
         .await
         .insert(handle.clone(), request.clone());
-    let store = cfg.session_store.as_ref().unwrap();
+    let store = cfg.state.session_store.as_ref().unwrap();
     store.save_grant_request(request.clone()).await.unwrap();
     store.fail_next_write_for_test();
 
@@ -2033,7 +2061,7 @@ async fn withdraw_and_prune_keep_memory_when_persistence_fails() {
     .await;
     assert!(matches!(response, AdminResponse::Error { .. }));
     assert_eq!(
-        cfg.grant_requests.read().await[&handle].status,
+        cfg.state.grant_requests.read().await[&handle].status,
         crate::grant_profile::GrantRequestStatus::Pending
     );
     assert_eq!(
@@ -2042,14 +2070,15 @@ async fn withdraw_and_prune_keep_memory_when_persistence_fails() {
     );
 
     request.expires_unix = 1;
-    cfg.grant_requests
+    cfg.state
+        .grant_requests
         .write()
         .await
         .insert(handle.clone(), request.clone());
     store.save_grant_request(request).await.unwrap();
     store.fail_next_write_for_test();
     crate::server::admin::prune_grant_requests(&cfg).await;
-    assert!(cfg.grant_requests.read().await.contains_key(&handle));
+    assert!(cfg.state.grant_requests.read().await.contains_key(&handle));
     assert!(store
         .load_grant_requests()
         .await
@@ -2061,13 +2090,14 @@ async fn withdraw_and_prune_keep_memory_when_persistence_fails() {
 #[tokio::test]
 async fn evaluate_batch_requires_owned_live_unsuspended_session_or_admin() {
     let (mut cfg, _) = make_test_config();
-    cfg.daemon_uid = 777;
-    cfg.daemon_principal = PrincipalKey::from_uid(777);
-    cfg.behavior_limits.max_denials = Some(1);
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.config.behavior_limits.max_denials = Some(1);
     let daemon = CallerIdentity::Unix { uid: 777 };
     let worker = CallerIdentity::Unix { uid: 778 };
     for token in ["batch-owner", "batch-victim"] {
-        cfg.sessions
+        cfg.state
+            .sessions
             .write()
             .await
             .grant(token.to_string(), granted_session(Vec::new(), Vec::new()));
@@ -2099,12 +2129,17 @@ async fn evaluate_batch_requires_owned_live_unsuspended_session_or_admin() {
         AdminResponse::Error { message } if message.contains("only batch-evaluate for itself")
     ));
     let before = (
-        cfg.approvals.read().await.list().len(),
-        cfg.provisional.read().await.list().len(),
-        cfg.read_grants.read().await.list().len(),
-        cfg.grant_requests.read().await.len(),
-        cfg.verbs.read().await.list().len(),
-        cfg.sessions.read().await.interactions_snapshot().len(),
+        cfg.state.approvals.read().await.list().len(),
+        cfg.state.provisional.read().await.list().len(),
+        cfg.state.read_grants.read().await.list().len(),
+        cfg.state.grant_requests.read().await.len(),
+        cfg.state.verbs.read().await.list().len(),
+        cfg.state
+            .sessions
+            .read()
+            .await
+            .interactions_snapshot()
+            .len(),
     );
     assert!(matches!(
         handle_admin_request(
@@ -2119,12 +2154,17 @@ async fn evaluate_batch_requires_owned_live_unsuspended_session_or_admin() {
         AdminResponse::EvaluationBatch { .. }
     ));
     let after = (
-        cfg.approvals.read().await.list().len(),
-        cfg.provisional.read().await.list().len(),
-        cfg.read_grants.read().await.list().len(),
-        cfg.grant_requests.read().await.len(),
-        cfg.verbs.read().await.list().len(),
-        cfg.sessions.read().await.interactions_snapshot().len(),
+        cfg.state.approvals.read().await.list().len(),
+        cfg.state.provisional.read().await.list().len(),
+        cfg.state.read_grants.read().await.list().len(),
+        cfg.state.grant_requests.read().await.len(),
+        cfg.state.verbs.read().await.list().len(),
+        cfg.state
+            .sessions
+            .read()
+            .await
+            .interactions_snapshot()
+            .len(),
     );
     assert_eq!(
         after, before,
@@ -2135,7 +2175,7 @@ async fn evaluate_batch_requires_owned_live_unsuspended_session_or_admin() {
         AdminResponse::EvaluationBatch { .. }
     ));
 
-    cfg.sessions.write().await.record_interaction(
+    cfg.state.sessions.write().await.record_interaction(
         "batch-owner",
         SessionInteraction {
             command: "denied".to_string(),
@@ -2175,11 +2215,11 @@ async fn evaluate_batch_seeds_the_identical_real_run_cache_key() {
     )
     .unwrap();
     let (mut cfg, _) = make_test_config();
-    cfg.evaluator = Arc::new(evaluator);
+    cfg.state.evaluator = Arc::new(evaluator);
     let token = "batch-cache-owner".to_string();
     let mut grant = granted_session(Vec::new(), Vec::new());
     grant.static_only = false;
-    cfg.sessions.write().await.grant(token.clone(), grant);
+    cfg.state.sessions.write().await.grant(token.clone(), grant);
     let cwd = tempfile::tempdir().unwrap();
     let cwd = cwd.path().canonicalize().unwrap();
     let command = guard::wire::BatchCommand {
@@ -2263,7 +2303,7 @@ async fn evaluate_batch_seeds_the_identical_real_run_cache_key() {
         changed.decision_source, "llm",
         "a different plain environment value must not reuse the preview cache entry"
     );
-    let admission = cfg.command_admission.snapshot();
+    let admission = cfg.state.command_admission.snapshot();
     assert_eq!(admission.handler_admitted, 3);
     assert_eq!(admission.evaluator_admitted, 3);
 }
@@ -2271,9 +2311,9 @@ async fn evaluate_batch_seeds_the_identical_real_run_cache_key() {
 #[tokio::test]
 async fn grant_request_approval_rejects_expiry_and_stale_saved_revision() {
     let (mut cfg, _) = make_test_config();
-    cfg.daemon_uid = 777;
-    cfg.daemon_principal = PrincipalKey::from_uid(777);
-    cfg.saved_grants = Arc::new(RwLock::new(
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.state.saved_grants = Arc::new(RwLock::new(
         SavedGrantCatalog::from_yaml(
             "grants:\n  - name: reviewed\n    prompt_append: reviewed task\n    auto_approve_requests: false\n",
         )
@@ -2319,7 +2359,8 @@ async fn grant_request_approval_rejects_expiry_and_stale_saved_revision() {
     let AdminResponse::GrantRequest { request } = first else {
         panic!()
     };
-    cfg.grant_requests
+    cfg.state
+        .grant_requests
         .write()
         .await
         .get_mut(&request.handle)
@@ -2375,10 +2416,10 @@ async fn grant_request_approval_rejects_expiry_and_stale_saved_revision() {
 #[tokio::test]
 async fn grant_request_binds_unsaved_session_revision_and_prunes_expired_rows() {
     let (mut cfg, _) = make_test_config();
-    cfg.daemon_uid = 777;
-    cfg.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
     let tmp = tempfile::tempdir().unwrap();
-    cfg.session_store = Some(
+    cfg.state.session_store = Some(
         SessionStore::open(tmp.path().join("state.db"), 3600)
             .await
             .unwrap(),
@@ -2386,7 +2427,8 @@ async fn grant_request_binds_unsaved_session_revision_and_prunes_expired_rows() 
     let daemon = CallerIdentity::Unix { uid: 777 };
     let worker = CallerIdentity::Unix { uid: 778 };
     let token = "unsaved-revision".to_string();
-    cfg.sessions
+    cfg.state
+        .sessions
         .write()
         .await
         .grant(token.clone(), granted_session(Vec::new(), Vec::new()));
@@ -2405,7 +2447,8 @@ async fn grant_request_binds_unsaved_session_revision_and_prunes_expired_rows() 
     let AdminResponse::GrantRequest { request } = stale else {
         panic!()
     };
-    cfg.sessions
+    cfg.state
+        .sessions
         .write()
         .await
         .set_label(&token, Some("changed".to_string()));
@@ -2424,6 +2467,7 @@ async fn grant_request_binds_unsaved_session_revision_and_prunes_expired_rows() 
         panic!()
     };
     let mut expired_row = cfg
+        .state
         .grant_requests
         .write()
         .await
@@ -2431,11 +2475,13 @@ async fn grant_request_binds_unsaved_session_revision_and_prunes_expired_rows() 
         .unwrap()
         .clone();
     expired_row.expires_unix = 1;
-    cfg.grant_requests
+    cfg.state
+        .grant_requests
         .write()
         .await
         .insert(request.handle.clone(), expired_row.clone());
-    cfg.session_store
+    cfg.state
+        .session_store
         .as_ref()
         .unwrap()
         .save_grant_request(expired_row)
@@ -2451,11 +2497,13 @@ async fn grant_request_binds_unsaved_session_revision_and_prunes_expired_rows() 
     )
     .await;
     assert!(!cfg
+        .state
         .grant_requests
         .read()
         .await
         .contains_key(&request.handle));
     assert!(cfg
+        .state
         .session_store
         .as_ref()
         .unwrap()
@@ -2469,11 +2517,12 @@ async fn grant_request_binds_unsaved_session_revision_and_prunes_expired_rows() 
 #[tokio::test]
 async fn grant_request_queue_is_bounded_and_recovers_capacity_from_expiry() {
     let (mut cfg, _) = make_test_config();
-    cfg.daemon_uid = 777;
-    cfg.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
     let worker = CallerIdentity::Unix { uid: 778 };
     let token = "bounded-queue-0".to_string();
-    cfg.sessions
+    cfg.state
+        .sessions
         .write()
         .await
         .grant(token.clone(), granted_session(Vec::new(), Vec::new()));
@@ -2488,7 +2537,8 @@ async fn grant_request_queue_is_bounded_and_recovers_capacity_from_expiry() {
             "queued".to_string(),
         )
         .unwrap();
-        cfg.grant_requests
+        cfg.state
+            .grant_requests
             .write()
             .await
             .insert(request.handle.clone(), request);
@@ -2507,7 +2557,8 @@ async fn grant_request_queue_is_bounded_and_recovers_capacity_from_expiry() {
         handle_admin_request(&cfg, &worker, submit()).await,
         AdminResponse::Error { message } if message.contains("queue is full")
     ));
-    cfg.grant_requests
+    cfg.state
+        .grant_requests
         .write()
         .await
         .values_mut()
@@ -2518,19 +2569,19 @@ async fn grant_request_queue_is_bounded_and_recovers_capacity_from_expiry() {
         handle_admin_request(&cfg, &worker, submit()).await,
         AdminResponse::GrantRequest { .. }
     ));
-    assert_eq!(cfg.grant_requests.read().await.len(), 1024);
+    assert_eq!(cfg.state.grant_requests.read().await.len(), 1024);
 }
 
 #[tokio::test]
 async fn session_maintenance_has_one_owner_and_skips_noop_persistence() {
     let (mut cfg, _) = make_test_config();
     let tmp = tempfile::tempdir().expect("tempdir");
-    cfg.session_store = Some(
+    cfg.state.session_store = Some(
         SessionStore::open(tmp.path().join("state.db"), 3600)
             .await
             .expect("open store"),
     );
-    cfg.sessions.write().await.grant(
+    cfg.state.sessions.write().await.grant(
         "expired".into(),
         SessionGrant {
             allow: vec!["true".into()],

@@ -25,7 +25,7 @@ use guard::redact::{audit_escape, command_line};
 use std::path::PathBuf;
 
 use super::execute::persist_session_snapshot;
-use super::{deterministic_credential_deny_reason, ServerConfig};
+use super::{deterministic_credential_deny_reason, ServerContext};
 
 const SESSION_AUTO_AMEND_MAX_ALLOW_RISK: i32 = 2;
 const SESSION_AUTO_AMEND_MIN_DENY_RISK: i32 = 5;
@@ -124,7 +124,7 @@ pub(super) fn deny_session_auto_amend_candidate(
 }
 
 pub(super) async fn amend_session_exact_rule(
-    config: &ServerConfig,
+    server: &ServerContext,
     token: &str,
     decision: SessionAmendment,
     binary: String,
@@ -132,22 +132,22 @@ pub(super) async fn amend_session_exact_rule(
     cwd: Option<PathBuf>,
 ) -> Result<bool> {
     let (amended, before, after) = {
-        let mut reg = config.sessions.write().await;
+        let mut reg = server.state.sessions.write().await;
         let before = reg.clone();
         let amended = reg
             .amend_exact(token, decision, binary, args, cwd)
             .ok_or_else(|| anyhow::anyhow!("session token is revoked, expired, or unknown"))?;
         (amended, before, reg.clone())
     };
-    if let Err(err) = persist_session_snapshot(config.session_store.clone(), after).await {
-        *config.sessions.write().await = before;
+    if let Err(err) = persist_session_snapshot(server.state.session_store.clone(), after).await {
+        *server.state.sessions.write().await = before;
         return Err(err);
     }
     Ok(amended)
 }
 
 pub(super) async fn maybe_auto_amend_session_after_llm(
-    config: &ServerConfig,
+    server: &ServerContext,
     token: Option<&str>,
     decision: SessionAmendment,
     binary: &str,
@@ -157,7 +157,7 @@ pub(super) async fn maybe_auto_amend_session_after_llm(
 ) -> Option<String> {
     let token = token?;
     let enabled = {
-        let reg = config.sessions.read().await;
+        let reg = server.state.sessions.read().await;
         reg.auto_amend_for(token)
     };
     if !enabled {
@@ -173,7 +173,7 @@ pub(super) async fn maybe_auto_amend_session_after_llm(
     }
 
     match amend_session_exact_rule(
-        config,
+        server,
         token,
         decision,
         binary.to_string(),
@@ -208,13 +208,14 @@ pub(super) async fn maybe_auto_amend_session_after_llm(
 /// (already-decided) denied request's response. Failures are logged, not
 /// surfaced to the caller.
 pub(super) async fn maybe_promote_deny_shape(
-    config: &ServerConfig,
+    server: &ServerContext,
     binary: &str,
     args: &[String],
     command_line: &str,
     reason: &str,
 ) -> Option<String> {
-    let outcome = match config
+    let outcome = match server
+        .state
         .evaluator
         .record_learned_denial(binary, args, command_line, reason)
         .await
@@ -235,7 +236,7 @@ pub(super) async fn maybe_promote_deny_shape(
     if !outcome.ready_to_synthesize {
         return hint;
     }
-    let evaluator = config.evaluator.clone();
+    let evaluator = server.state.evaluator.clone();
     tokio::spawn(async move {
         match evaluator.try_promote_deny_shape(&outcome).await {
             Ok(true) => {
@@ -265,16 +266,15 @@ pub(super) async fn maybe_promote_deny_shape(
 /// detached background task that confirms and appends a trusted verb to the
 /// catalog. Mirrors `maybe_promote_deny_shape`'s split between a fast inline
 /// bookkeeping write and a backgrounded LLM round trip, with one difference:
-/// on success this also appends to `config.verbs`, since a promoted verb (an
+/// on success this also appends to `server.state.verbs`, since a promoted verb (an
 /// allow) has to land somewhere the daemon actually consults, unlike a deny
 /// shape, which lives entirely inside the evaluator. There is deliberately no
 /// operator notification anywhere in this path -- see the `gating::allow_promotion`
 /// module docs for why an allow-side auto-promotion is designed to need none:
 /// the promoted-or-not state is fully recoverable from `guard verb list` at
 /// any time, so there is nothing time-sensitive for a human to be paged about.
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn maybe_promote_allow_verb(
-    config: &ServerConfig,
+    server: &ServerContext,
     binary: &str,
     args: &[String],
     command_line: &str,
@@ -282,7 +282,8 @@ pub(super) async fn maybe_promote_allow_verb(
     reversibility: Option<Reversibility>,
     reason: &str,
 ) {
-    let outcome = match config
+    let outcome = match server
+        .state
         .evaluator
         .record_learned_approval_for_promotion(
             binary,
@@ -304,8 +305,8 @@ pub(super) async fn maybe_promote_allow_verb(
     if !outcome.ready_to_synthesize {
         return;
     }
-    let evaluator = config.evaluator.clone();
-    let verbs = config.verbs.clone();
+    let evaluator = server.state.evaluator.clone();
+    let verbs = server.state.verbs.clone();
     tokio::spawn(async move {
         // `Ok(None)` here means "not confident yet" or a transient LLM
         // failure -- both should keep retrying as more evidence accumulates,
@@ -365,7 +366,7 @@ pub(super) async fn maybe_promote_allow_verb(
 }
 
 pub(super) async fn learning_notice(
-    config: &ServerConfig,
+    server: &ServerContext,
     outcome: &LearningOutcome,
 ) -> Option<String> {
     let mut notice = if outcome.is_candidate {
@@ -385,7 +386,8 @@ pub(super) async fn learning_notice(
     let Some(shim) = &outcome.shim else {
         return Some(notice);
     };
-    let mode = config
+    let mode = server
+        .state
         .evaluator
         .learned_auto_shim_mode()
         .await
@@ -401,7 +403,7 @@ pub(super) async fn learning_notice(
             ));
         }
         AutoShimMode::Create if outcome.is_candidate => {
-            let Some(ref shim_dir) = config.shim_dir else {
+            let Some(ref shim_dir) = server.config.shim_dir else {
                 notice.push_str(&format!(
                     " Shim `{}` could be created after configuring a shim directory.",
                     shim.name

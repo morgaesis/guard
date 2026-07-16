@@ -23,7 +23,7 @@ use tracing_subscriber::fmt::MakeWriter;
 #[cfg(unix)]
 use tracing_subscriber::{layer::SubscriberExt, Layer};
 
-use super::ServerConfig;
+use super::{ServerConfig, ServerContext, ServerState};
 
 /// Shared-buffer writer for the tracing fmt subscriber. Lets us capture
 /// emitted log lines and assert on their contents.
@@ -47,78 +47,58 @@ impl<'a> MakeWriter<'a> for SharedBuf {
     }
 }
 
-fn make_test_config() -> (ServerConfig, SharedBuf) {
+fn make_test_config() -> (ServerContext, SharedBuf) {
     // LLM disabled, no static policy → policy_allowed() never hits
     // this path; we manufacture results directly for audit tests.
     let eval_config = EvalConfig::default().llm_enabled(false);
     let evaluator = Evaluator::new(eval_config).expect("build evaluator");
     let secrets = SecretManager::with_backend(EnvBackend::default());
-    let mut cfg = ServerConfig::new(
-        None,
-        None,
-        evaluator,
-        secrets,
-        false,
-        None,
-        None,
-        None,
-        None,
-        None,
-        false,
-        ToolRegistry::isolated_for_tests(),
-        Vec::new(),
-        false,
-        SessionRegistry::new(),
-        None,
-        false,
-        None,
-    );
+    let mut cfg = ServerContext {
+        config: ServerConfig::default(),
+        state: ServerState::new(
+            evaluator,
+            secrets,
+            ToolRegistry::isolated_for_tests(),
+            SessionRegistry::new(),
+            None,
+        ),
+    };
     let secret_root = tempfile::tempdir()
         .expect("secret-file test parent")
         .keep()
         .join("secret-files");
     super::secure_fs::prepare_private_root(&secret_root).expect("prepare secret-file test root");
-    cfg.secret_file_root = Some(secret_root);
+    cfg.config.secret_file_root = Some(secret_root);
     let buf = SharedBuf(Arc::new(Mutex::new(Vec::new())));
     (cfg, buf)
 }
 
-pub(super) fn config_for_proposal_test() -> ServerConfig {
+pub(super) fn config_for_proposal_test() -> ServerContext {
     make_test_config().0
 }
 
-fn paranoid_test_config() -> ServerConfig {
+fn paranoid_test_config() -> ServerContext {
     let eval_config = EvalConfig::default()
         .llm_enabled(false)
         .mode(PolicyMode::Paranoid);
     let evaluator = Evaluator::new(eval_config).expect("build evaluator");
     let secrets = SecretManager::with_backend(EnvBackend::default());
-    let mut cfg = ServerConfig::new(
-        None,
-        None,
-        evaluator,
-        secrets,
-        false,
-        None,
-        None,
-        None,
-        None,
-        None,
-        false,
-        ToolRegistry::isolated_for_tests(),
-        Vec::new(),
-        false,
-        SessionRegistry::new(),
-        None,
-        false,
-        None,
-    );
+    let mut cfg = ServerContext {
+        config: ServerConfig::default(),
+        state: ServerState::new(
+            evaluator,
+            secrets,
+            ToolRegistry::isolated_for_tests(),
+            SessionRegistry::new(),
+            None,
+        ),
+    };
     let secret_root = tempfile::tempdir()
         .expect("secret-file test parent")
         .keep()
         .join("secret-files");
     super::secure_fs::prepare_private_root(&secret_root).expect("prepare secret-file test root");
-    cfg.secret_file_root = Some(secret_root);
+    cfg.config.secret_file_root = Some(secret_root);
     cfg
 }
 

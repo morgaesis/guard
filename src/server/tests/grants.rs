@@ -14,6 +14,8 @@ use crate::server::wire::CallerIdentity;
 #[cfg(unix)]
 use crate::server::wire::{ExecOutcome, ExecuteRequest};
 #[cfg(unix)]
+use crate::server::RequestContext;
+#[cfg(unix)]
 use crate::session::SessionGrant;
 #[cfg(unix)]
 use guard::gating::read_grant::{ReadGrant, ReadGrantStatus};
@@ -131,7 +133,7 @@ async fn read_grant_revert_marks_seeded_grant_revoked() {
     // Empty ACL entries keep revocation free of any real setfacl call, so the
     // test does not depend on ACL tooling being installed.
     let now = now_unix();
-    cfg.read_grants.write().await.insert(ReadGrant {
+    cfg.state.read_grants.write().await.insert(ReadGrant {
         handle: "hA".to_string(),
         principal: Some(PrincipalKey::from_uid(4242)),
         granting_session: Some("session-A".to_string()),
@@ -146,6 +148,7 @@ async fn read_grant_revert_marks_seeded_grant_revoked() {
     });
 
     let claimed = cfg
+        .state
         .read_grants
         .write()
         .await
@@ -154,7 +157,7 @@ async fn read_grant_revert_marks_seeded_grant_revoked() {
     finish_read_grant_revert(&cfg, &claimed, "test").await;
 
     assert_eq!(
-        cfg.read_grants.read().await.get(&key).unwrap().status,
+        cfg.state.read_grants.read().await.get(&key).unwrap().status,
         ReadGrantStatus::Revoked,
         "the active grant must be marked revoked"
     );
@@ -219,13 +222,15 @@ async fn read_grant_retry_returns_original_failure_when_grant_denied() {
     };
     let mut sink = tokio::io::sink();
     let result = exec_with_read_grant_retry_with_secret_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &caller,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
         request,
-        &cfg,
-        &caller,
         "test allow".to_string(),
-        0,
-        false,
-        &mut sink,
         None,
     )
     .await;
@@ -234,7 +239,7 @@ async fn read_grant_retry_returns_original_failure_when_grant_denied() {
         other => panic!("expected the original failure, got {other:?}"),
     }
     assert!(
-        cfg.read_grants.read().await.list().is_empty(),
+        cfg.state.read_grants.read().await.list().is_empty(),
         "a denied grant must leave no grant row"
     );
 }
@@ -269,10 +274,10 @@ async fn read_grant_retry_grants_and_reruns_after_permission_denied() {
 
     let (mut cfg, _buf) = make_test_config();
     // The grantee must resolve to a real account for the ACL to apply.
-    cfg.daemon_uid = unsafe { libc::geteuid() };
+    cfg.config.daemon_uid = unsafe { libc::geteuid() };
     // A session allow rule authorizes the grant deterministically, so the
     // test never reaches the (unconfigured) evaluator.
-    cfg.sessions.write().await.grant(
+    cfg.state.sessions.write().await.grant(
         "sess-retry".to_string(),
         SessionGrant {
             allow: vec!["grant-read*".to_string()],
@@ -320,13 +325,15 @@ async fn read_grant_retry_grants_and_reruns_after_permission_denied() {
     };
     let mut sink = tokio::io::sink();
     let result = exec_with_read_grant_retry_with_secret_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &caller,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
         request,
-        &cfg,
-        &caller,
         "test allow".to_string(),
-        0,
-        false,
-        &mut sink,
         None,
     )
     .await;
@@ -339,6 +346,7 @@ async fn read_grant_retry_grants_and_reruns_after_permission_denied() {
         other => panic!("expected a completed retry, got {other:?}"),
     }
     let grant = cfg
+        .state
         .read_grants
         .read()
         .await
@@ -350,6 +358,7 @@ async fn read_grant_retry_grants_and_reruns_after_permission_denied() {
 
     // Cleanup: revoke so no ACL outlives the test.
     let cleanup = cfg
+        .state
         .read_grants
         .write()
         .await
@@ -580,17 +589,18 @@ async fn expired_read_grant_is_auto_revoked() {
         status: ReadGrantStatus::Active,
         revert_detail: None,
     };
-    cfg.read_grants.write().await.insert(grant.clone());
+    cfg.state.read_grants.write().await.insert(grant.clone());
 
     // The sweeper's due-claim drives the timer: an expired Active grant is
     // taken and then reverted.
-    let due = cfg.read_grants.write().await.take_due(now_unix());
+    let due = cfg.state.read_grants.write().await.take_due(now_unix());
     assert_eq!(due.len(), 1);
     finish_read_grant_revert(&cfg, &due[0], "expiry").await;
 
     assert!(!getfacl_user_has_traverse(&priv_dir, TEST_GRANTEE_UID).await);
     assert_eq!(
-        cfg.read_grants
+        cfg.state
+            .read_grants
             .read()
             .await
             .get(&grant.target_path)

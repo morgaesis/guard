@@ -37,8 +37,8 @@ fn raw_request(binary: &str, args: &[&str], session_token: Option<&str>) -> Exec
 #[tokio::test]
 async fn raw_command_collects_all_typed_matches_and_executes_selected_cell() {
     let (mut cfg, _buf) = make_test_config();
-    cfg.gate = GateMode::Consequence;
-    cfg.verbs = Arc::new(RwLock::new(
+    cfg.config.gate = GateMode::Consequence;
+    cfg.state.verbs = Arc::new(RwLock::new(
         VerbCatalog::from_yaml(
             r#"
 verbs:
@@ -82,8 +82,8 @@ verbs:
 #[tokio::test]
 async fn session_verb_needs_exact_marker_to_override_baseline_evaluation() {
     let (mut cfg, _buf) = make_test_config();
-    cfg.gate = GateMode::Consequence;
-    cfg.verbs = Arc::new(RwLock::new(
+    cfg.config.gate = GateMode::Consequence;
+    cfg.state.verbs = Arc::new(RwLock::new(
         VerbCatalog::from_yaml(
             r#"
 verbs:
@@ -124,7 +124,8 @@ verbs:
         auto_amend: false,
         granted_at: 0,
     };
-    cfg.sessions
+    cfg.state
+        .sessions
         .write()
         .await
         .grant("typed".to_string(), grant(Vec::new()));
@@ -140,7 +141,7 @@ verbs:
     assert_eq!(without_marker.verb_matches.len(), 2);
     assert!(without_marker.verb_guidance.is_some());
 
-    cfg.sessions.write().await.grant(
+    cfg.state.sessions.write().await.grant(
         "typed".to_string(),
         grant(vec!["operator:apply".to_string()]),
     );
@@ -161,7 +162,7 @@ verbs:
 #[tokio::test]
 async fn typed_evaluation_keeps_consequence_gate_after_static_policy_allow() {
     let (mut cfg, _buf) = make_test_config();
-    cfg.gate = GateMode::Consequence;
+    cfg.config.gate = GateMode::Consequence;
     let tmp = tempfile::tempdir().expect("tempdir");
     let policy = tmp.path().join("policy.yaml");
     std::fs::write(
@@ -169,11 +170,11 @@ async fn typed_evaluation_keeps_consequence_gate_after_static_policy_allow() {
         "policy:\n  commands:\n    allow:\n      - \"true apply\"\n",
     )
     .expect("write policy");
-    cfg.evaluator = Arc::new(
+    cfg.state.evaluator = Arc::new(
         Evaluator::new(EvalConfig::default().llm_enabled(false).policy_path(policy))
             .expect("build static evaluator"),
     );
-    cfg.verbs = Arc::new(RwLock::new(
+    cfg.state.verbs = Arc::new(RwLock::new(
         VerbCatalog::from_yaml(
             r#"
 verbs:
@@ -215,12 +216,12 @@ verbs:
 #[tokio::test]
 async fn trusted_verb_irreversible_still_holds_for_approval() {
     let (mut cfg, _buf) = make_test_config();
-    cfg.gate = GateMode::Consequence;
+    cfg.config.gate = GateMode::Consequence;
     let catalog = VerbCatalog::from_yaml(
             "verbs:\n  - name: danger-op\n    binary: true\n    consequence: irreversible\n    trusted: true\n",
         )
         .unwrap();
-    cfg.verbs = Arc::new(RwLock::new(catalog));
+    cfg.state.verbs = Arc::new(RwLock::new(catalog));
 
     let request = ExecuteRequest {
         binary: String::new(),
@@ -266,12 +267,12 @@ async fn trusted_verb_irreversible_still_holds_for_approval() {
 #[tokio::test]
 async fn trusted_verb_reversible_executes_now() {
     let (mut cfg, _buf) = make_test_config();
-    cfg.gate = GateMode::Consequence;
+    cfg.config.gate = GateMode::Consequence;
     let catalog = VerbCatalog::from_yaml(
             "verbs:\n  - name: safe-op\n    binary: true\n    consequence: reversible\n    trusted: true\n",
         )
         .unwrap();
-    cfg.verbs = Arc::new(RwLock::new(catalog));
+    cfg.state.verbs = Arc::new(RwLock::new(catalog));
 
     let request = ExecuteRequest {
         binary: String::new(),
@@ -319,12 +320,12 @@ async fn trusted_verb_reversible_executes_now() {
 #[tokio::test]
 async fn raw_command_reverse_matches_trusted_verb_and_executes_now() {
     let (mut cfg, _buf) = make_test_config();
-    cfg.gate = GateMode::Consequence;
+    cfg.config.gate = GateMode::Consequence;
     let catalog = VerbCatalog::from_yaml(
             "verbs:\n  - name: safe-op\n    binary: true\n    consequence: reversible\n    trusted: true\n",
         )
         .unwrap();
-    cfg.verbs = Arc::new(RwLock::new(catalog));
+    cfg.state.verbs = Arc::new(RwLock::new(catalog));
 
     let request = ExecuteRequest {
         binary: "true".to_string(),
@@ -361,8 +362,8 @@ async fn raw_command_reverse_matches_trusted_verb_and_executes_now() {
 #[tokio::test]
 async fn trusted_reverse_match_cannot_skip_evaluator_for_untyped_ansible_config() {
     let (mut cfg, _buf) = make_test_config();
-    cfg.gate = GateMode::Consequence;
-    cfg.verbs = Arc::new(RwLock::new(
+    cfg.config.gate = GateMode::Consequence;
+    cfg.state.verbs = Arc::new(RwLock::new(
         VerbCatalog::from_yaml(
             r#"
 verbs:
@@ -397,7 +398,7 @@ verbs:
     assert_eq!(trace.verb_matches.len(), 1);
     assert_eq!(trace.verb_matches[0].action, "evaluate");
     assert!(!trace.failed_dimensions.is_empty());
-    let admission = cfg.command_admission.snapshot();
+    let admission = cfg.state.command_admission.snapshot();
     assert_eq!(admission.handler_admitted, 1);
     assert_eq!(admission.evaluator_admitted, 1);
 }
@@ -405,8 +406,8 @@ verbs:
 #[tokio::test]
 async fn trusted_reverse_match_accepts_exact_typed_ansible_config() {
     let (mut cfg, _buf) = make_test_config();
-    cfg.gate = GateMode::Consequence;
-    cfg.verbs = Arc::new(RwLock::new(
+    cfg.config.gate = GateMode::Consequence;
+    cfg.state.verbs = Arc::new(RwLock::new(
         VerbCatalog::from_yaml(
             r#"
 verbs:
@@ -441,7 +442,7 @@ verbs:
     assert_eq!(trace.verb_matches.len(), 1);
     assert_eq!(trace.verb_matches[0].action, "preauthorized");
     assert!(trace.failed_dimensions.is_empty());
-    let admission = cfg.command_admission.snapshot();
+    let admission = cfg.state.command_admission.snapshot();
     assert_eq!(admission.handler_admitted, 1);
     assert_eq!(admission.evaluator_attempted, 0);
 }
@@ -456,15 +457,15 @@ verbs:
 #[tokio::test]
 async fn stale_auto_promoted_verb_is_not_trusted() {
     let (mut cfg, _buf) = make_test_config();
-    cfg.gate = GateMode::Consequence;
+    cfg.config.gate = GateMode::Consequence;
     let catalog = VerbCatalog::from_yaml(
         "verbs:\n  - name: auto-op\n    binary: true\n    consequence: reversible\n    \
              trusted: true\n    auto_promoted: true\n    promotion_stamp: definitely-stale\n",
     )
     .unwrap();
-    cfg.verbs = Arc::new(RwLock::new(catalog));
+    cfg.state.verbs = Arc::new(RwLock::new(catalog));
     assert_ne!(
-        cfg.evaluator.verb_promotion_stamp(),
+        cfg.state.evaluator.verb_promotion_stamp(),
         "definitely-stale",
         "the fixture stamp must not accidentally collide with a real stamp"
     );
@@ -508,7 +509,7 @@ async fn stale_auto_promoted_verb_is_not_trusted() {
 #[tokio::test]
 async fn verb_list_reports_staleness_corrected_trust_and_provenance() {
     let (mut cfg, _buf) = make_test_config();
-    let current_stamp = cfg.evaluator.verb_promotion_stamp().to_string();
+    let current_stamp = cfg.state.evaluator.verb_promotion_stamp().to_string();
     let catalog = VerbCatalog::from_yaml(&format!(
         "verbs:\n\
              - name: fresh-auto\n  binary: true\n  consequence: reversible\n  trusted: true\n  \
@@ -518,7 +519,7 @@ async fn verb_list_reports_staleness_corrected_trust_and_provenance() {
              - name: hand-authored\n  binary: true\n  consequence: reversible\n  trusted: true\n"
     ))
     .unwrap();
-    cfg.verbs = Arc::new(RwLock::new(catalog));
+    cfg.state.verbs = Arc::new(RwLock::new(catalog));
 
     let response = handle_admin_request(
         &cfg,

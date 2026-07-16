@@ -12,6 +12,8 @@ use crate::server::transport::emit_audit_events;
 use crate::server::wire::{
     AdminRequest, AdminResponse, CallerIdentity, ExecOutcome, ExecuteRequest, ExecuteResult,
 };
+#[cfg(unix)]
+use crate::server::RequestContext;
 use crate::server::{
     binary_exists_on_path, dangerous_env_name, deterministic_credential_deny_reason,
     deterministic_safe_allow_reason, invalid_shell_secret_reference, is_valid_secret_key,
@@ -250,11 +252,13 @@ async fn secret_exposure_is_audited_only_after_successful_spawn() {
 
     let audit = production_audit_buffer();
     let (cfg, _) = make_test_config();
-    cfg.sessions
+    cfg.state
+        .sessions
         .write()
         .await
         .grant(token.to_string(), unrestricted_session());
-    cfg.secrets
+    cfg.state
+        .secrets
         .set(
             &principal,
             "test/secret-exposure-success",
@@ -270,13 +274,15 @@ async fn secret_exposure_is_audited_only_after_successful_spawn() {
     );
     let mut sink = tokio::io::sink();
     let result = exec_after_approval_with_secret_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &caller,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
         request,
-        &cfg,
-        &caller,
         "test allow".into(),
-        0,
-        false,
-        &mut sink,
         None,
     )
     .await;
@@ -296,11 +302,13 @@ async fn secret_exposure_is_audited_only_after_successful_spawn() {
     assert!(!logs.contains("secret-value-never-logged"));
 
     let (cfg, _) = make_test_config();
-    cfg.sessions
+    cfg.state
+        .sessions
         .write()
         .await
         .grant(token.to_string(), unrestricted_session());
-    cfg.secrets
+    cfg.state
+        .secrets
         .set(
             &principal,
             "test/secret-exposure-failed-spawn",
@@ -316,13 +324,15 @@ async fn secret_exposure_is_audited_only_after_successful_spawn() {
     );
     let mut sink = tokio::io::sink();
     let result = exec_after_approval_with_secret_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &caller,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
         request,
-        &cfg,
-        &caller,
         "test allow".into(),
-        0,
-        false,
-        &mut sink,
         None,
     )
     .await;
@@ -340,7 +350,8 @@ async fn saved_grant_entitlement_covers_tool_config_secret_refs() {
     let caller = CallerIdentity::Unix { uid: 1000 };
     let principal = PrincipalKey::from_uid(1000);
     let (cfg, _) = make_test_config();
-    cfg.secrets
+    cfg.state
+        .secrets
         .set(&principal, "broker/token", "never-printed")
         .await
         .unwrap();
@@ -350,7 +361,7 @@ async fn saved_grant_entitlement_covers_tool_config_secret_refs() {
         "tools:\n  true:\n    secrets:\n      BROKER_TOKEN: broker/token\n",
     )
     .unwrap();
-    *cfg.tool_registry.write().await =
+    *cfg.state.tool_registry.write().await =
         crate::tool_config::ToolRegistry::load(tools.path()).unwrap();
     let mut grant = SessionGrant {
         allow: Vec::new(),
@@ -369,7 +380,8 @@ async fn saved_grant_entitlement_covers_tool_config_secret_refs() {
     };
     grant.scope.saved_grant = Some("no-secrets".to_string());
     grant.scope.secret_names = Vec::new();
-    cfg.sessions
+    cfg.state
+        .sessions
         .write()
         .await
         .grant("tool-secret-session".to_string(), grant);
@@ -377,13 +389,15 @@ async fn saved_grant_entitlement_covers_tool_config_secret_refs() {
     request.session_token = Some("tool-secret-session".to_string());
     let mut sink = tokio::io::sink();
     let result = exec_after_approval_with_secret_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &caller,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
         request,
-        &cfg,
-        &caller,
         "test allow".to_string(),
-        0,
-        false,
-        &mut sink,
         None,
     )
     .await;
@@ -400,7 +414,7 @@ async fn saved_grant_entitlement_covers_tool_config_secret_refs() {
 async fn expired_denial_escalation_does_not_deduplicate_a_fresh_handle() {
     let (cfg, _) = make_test_config();
     let token = "denial-escalation-session".to_string();
-    cfg.sessions.write().await.grant(
+    cfg.state.sessions.write().await.grant(
         token.clone(),
         SessionGrant {
             allow: Vec::new(),
@@ -424,6 +438,7 @@ async fn expired_denial_escalation_does_not_deduplicate_a_fresh_handle() {
     let first = execute_command(request.clone(), &cfg, &caller).await;
     assert!(!first.policy_allowed());
     let first_handle = cfg
+        .state
         .grant_requests
         .read()
         .await
@@ -431,7 +446,8 @@ async fn expired_denial_escalation_does_not_deduplicate_a_fresh_handle() {
         .next()
         .unwrap()
         .clone();
-    cfg.grant_requests
+    cfg.state
+        .grant_requests
         .write()
         .await
         .get_mut(&first_handle)
@@ -440,7 +456,7 @@ async fn expired_denial_escalation_does_not_deduplicate_a_fresh_handle() {
 
     let second = execute_command(request, &cfg, &caller).await;
     assert!(!second.policy_allowed());
-    let requests = cfg.grant_requests.read().await;
+    let requests = cfg.state.grant_requests.read().await;
     assert_eq!(requests.len(), 1);
     let second_handle = requests.keys().next().unwrap();
     assert_ne!(second_handle, &first_handle);
@@ -450,7 +466,7 @@ async fn expired_denial_escalation_does_not_deduplicate_a_fresh_handle() {
 async fn denial_escalation_dedup_is_bound_to_session_revision() {
     let (cfg, _) = make_test_config();
     let token = "revision-bound-denial".to_string();
-    cfg.sessions.write().await.grant(
+    cfg.state.sessions.write().await.grant(
         token.clone(),
         SessionGrant {
             allow: Vec::new(),
@@ -475,6 +491,7 @@ async fn denial_escalation_dedup_is_bound_to_session_revision() {
         .await
         .policy_allowed());
     let first_revision = cfg
+        .state
         .grant_requests
         .read()
         .await
@@ -484,14 +501,15 @@ async fn denial_escalation_dedup_is_bound_to_session_revision() {
         .issued_session_revision
         .clone();
 
-    cfg.sessions
+    cfg.state
+        .sessions
         .write()
         .await
         .set_label(&token, Some("changed-authority".to_string()));
     assert!(!execute_command(request, &cfg, &caller)
         .await
         .policy_allowed());
-    let requests = cfg.grant_requests.read().await;
+    let requests = cfg.state.grant_requests.read().await;
     assert_eq!(requests.len(), 2);
     assert!(requests
         .values()
@@ -505,7 +523,7 @@ async fn streaming_secret_exposure_is_recorded_even_on_nonzero_exit() {
     let caller = CallerIdentity::Unix { uid: 1000 };
     let principal = PrincipalKey::from_uid(1000);
     let (cfg, buf) = make_test_config();
-    cfg.sessions.write().await.grant(
+    cfg.state.sessions.write().await.grant(
         "streaming-session-token-never-logged".to_string(),
         unrestricted_session(),
     );
@@ -513,7 +531,11 @@ async fn streaming_secret_exposure_is_recorded_even_on_nonzero_exit() {
         ("service/primary", "primary-value-never-logged"),
         ("service/secondary", "secondary-value-never-logged"),
     ] {
-        cfg.secrets.set(&principal, name, value).await.unwrap();
+        cfg.state
+            .secrets
+            .set(&principal, name, value)
+            .await
+            .unwrap();
     }
 
     let mut request = basic_request("/bin/false", Vec::new());
@@ -528,13 +550,15 @@ async fn streaming_secret_exposure_is_recorded_even_on_nonzero_exit() {
     let (result, logs) = capture_async(
         &buf,
         exec_after_approval_with_secret_authority(
+            &mut RequestContext {
+                server: &cfg,
+                caller: &caller,
+                depth: 0,
+                stream_output: true,
+                stream_writer: &mut sink,
+            },
             request,
-            &cfg,
-            &caller,
             "test allow".into(),
-            0,
-            true,
-            &mut sink,
             None,
         ),
     )
@@ -791,7 +815,8 @@ async fn missing_requested_secret_denies_before_policy_evaluation() {
 #[tokio::test]
 async fn invalid_secret_shell_reference_denies_before_policy_evaluation() {
     let (cfg, _) = make_test_config();
-    cfg.secrets
+    cfg.state
+        .secrets
         .set(
             &PrincipalKey::from_uid(1000),
             "opnsense-apikey-secret",
@@ -932,7 +957,7 @@ async fn repeated_llm_denials_append_count_hint_at_threshold_only() {
     .unwrap();
 
     let (mut cfg, _) = make_test_config();
-    cfg.evaluator = Arc::new(evaluator);
+    cfg.state.evaluator = Arc::new(evaluator);
     let caller = CallerIdentity::Unix { uid: 1000 };
 
     let first = execute_command(
@@ -1015,13 +1040,13 @@ async fn deterministic_safe_allow_uses_no_evaluator_admission() {
     )
     .await;
     assert!(result.policy_allowed(), "got: {:?}", result.exec);
-    let counters = cfg.command_admission.snapshot();
+    let counters = cfg.state.command_admission.snapshot();
     assert_eq!(counters.handler_admitted, 1);
     assert_eq!(counters.evaluator_attempted, 0);
     let status = handle_admin_request(
         &cfg,
         &CallerIdentity::Unix {
-            uid: cfg.daemon_uid,
+            uid: cfg.config.daemon_uid,
         },
         AdminRequest::Status,
     )
@@ -1186,8 +1211,8 @@ async fn audit_allowed_and_completed_emits_only_policy_event() {
 #[tokio::test]
 async fn secret_list_is_per_user_namespaced() {
     let (mut cfg, _) = make_test_config();
-    cfg.daemon_uid = 777;
-    cfg.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
 
     // Unique key so parallel tests sharing the EnvBackend don't
     // collide.
@@ -1251,7 +1276,8 @@ async fn secret_list_is_per_user_namespaced() {
 
     // A's secret still there, value "alice" intact.
     assert_eq!(
-        cfg.secrets
+        cfg.state
+            .secrets
             .get(&PrincipalKey::from_uid(20_000), &key)
             .await
             .unwrap()
@@ -1260,7 +1286,8 @@ async fn secret_list_is_per_user_namespaced() {
     );
     // B's is gone.
     assert_eq!(
-        cfg.secrets
+        cfg.state
+            .secrets
             .get(&PrincipalKey::from_uid(20_001), &key)
             .await
             .unwrap(),
@@ -1281,11 +1308,12 @@ async fn secret_list_is_per_user_namespaced() {
 #[tokio::test]
 async fn exec_secret_injection_is_isolated_per_uid() {
     let (mut cfg, _) = make_test_config();
-    cfg.daemon_uid = 777;
+    cfg.config.daemon_uid = 777;
     let key = format!("EXEC_ISO_{}", std::process::id());
 
     // user_a stores THE secret.
-    cfg.secrets
+    cfg.state
+        .secrets
         .set(&PrincipalKey::from_uid(30_000), &key, "alice-value")
         .await
         .unwrap();
@@ -1323,6 +1351,7 @@ async fn exec_secret_injection_is_isolated_per_uid() {
 
     // Cleanup.
     let _ = cfg
+        .state
         .secrets
         .delete(&PrincipalKey::from_uid(30_000), &key)
         .await;
@@ -1334,7 +1363,7 @@ async fn extra_child_env_forwards_named_var_to_child() {
     // The daemon forwards GUARD_CHILD_TEST_PT to children only because it is
     // listed in extra_child_env; the value comes from the daemon's own env.
     std::env::set_var("GUARD_CHILD_TEST_PT", "brokered-value-xyz");
-    cfg.extra_child_env = vec!["GUARD_CHILD_TEST_PT".to_string()];
+    cfg.config.extra_child_env = vec!["GUARD_CHILD_TEST_PT".to_string()];
 
     #[cfg(unix)]
     let (bin, args) = (
@@ -1352,7 +1381,7 @@ async fn extra_child_env_forwards_named_var_to_child() {
 
     let token = format!("child-env-{}", std::process::id());
     {
-        let mut sessions = cfg.sessions.write().await;
+        let mut sessions = cfg.state.sessions.write().await;
         sessions.grant(
             token.clone(),
             SessionGrant {
@@ -1416,7 +1445,7 @@ async fn local_caller_cwd_is_canonicalized_and_used_for_execution() {
     std::fs::create_dir(&real).unwrap();
     std::os::unix::fs::symlink(&real, &link).unwrap();
     let token = format!("cwd-session-{}", std::process::id());
-    cfg.sessions.write().await.grant(
+    cfg.state.sessions.write().await.grant(
         token.clone(),
         SessionGrant {
             allow: Vec::new(),
@@ -1463,7 +1492,7 @@ async fn default_service_execution_does_not_forward_ssh_auth_sock() {
     std::env::set_var("SSH_AUTH_SOCK", "/tmp/fake-caller-agent.sock");
 
     let token = format!("ssh-auth-sock-{}", std::process::id());
-    cfg.sessions.write().await.grant(
+    cfg.state.sessions.write().await.grant(
         token.clone(),
         SessionGrant {
             allow: vec!["sh *".into()],
@@ -1505,7 +1534,7 @@ async fn default_service_execution_does_not_forward_ssh_auth_sock() {
 async fn caller_env_cannot_supply_ssh_auth_sock() {
     let (cfg, _) = make_test_config();
     let token = format!("caller-ssh-auth-sock-{}", std::process::id());
-    cfg.sessions.write().await.grant(
+    cfg.state.sessions.write().await.grant(
         token.clone(),
         SessionGrant {
             allow: vec!["sh *".into()],
@@ -1553,11 +1582,11 @@ async fn guard_configured_ssh_auth_sock_is_forwarded_to_child() {
         "tools:\n  sh:\n    env:\n      SSH_AUTH_SOCK: /run/guard/broker-agent.sock\n",
     )
     .unwrap();
-    *cfg.tool_registry.write().await =
+    *cfg.state.tool_registry.write().await =
         crate::tool_config::ToolRegistry::load(tools.path()).unwrap();
 
     let token = format!("trusted-ssh-auth-sock-{}", std::process::id());
-    cfg.sessions.write().await.grant(
+    cfg.state.sessions.write().await.grant(
         token.clone(),
         SessionGrant {
             allow: vec!["sh *".into()],
@@ -1607,11 +1636,11 @@ async fn caller_env_cannot_override_guard_tool_env() {
         "tools:\n  sh:\n    env:\n      BROKER_ENDPOINT: guard-owned\n",
     )
     .unwrap();
-    *cfg.tool_registry.write().await =
+    *cfg.state.tool_registry.write().await =
         crate::tool_config::ToolRegistry::load(tools.path()).unwrap();
 
     let token = format!("tool-env-collision-{}", std::process::id());
-    cfg.sessions.write().await.grant(
+    cfg.state.sessions.write().await.grant(
         token.clone(),
         SessionGrant {
             allow: vec!["sh *".into()],
@@ -1663,9 +1692,10 @@ async fn caller_secret_cannot_override_guard_tool_env() {
         "tools:\n  sh:\n    env:\n      BROKER_TOKEN: guard-owned\n",
     )
     .unwrap();
-    *cfg.tool_registry.write().await =
+    *cfg.state.tool_registry.write().await =
         crate::tool_config::ToolRegistry::load(tools.path()).unwrap();
-    cfg.secrets
+    cfg.state
+        .secrets
         .set(
             &PrincipalKey::from_uid(1000),
             "CALLER_TOKEN",
@@ -1675,7 +1705,7 @@ async fn caller_secret_cannot_override_guard_tool_env() {
         .unwrap();
 
     let token = format!("tool-secret-collision-{}", std::process::id());
-    cfg.sessions.write().await.grant(
+    cfg.state.sessions.write().await.grant(
         token.clone(),
         SessionGrant {
             allow: vec!["sh *".into()],
@@ -1726,10 +1756,10 @@ async fn caller_env_cannot_override_daemon_child_env() {
     let (mut cfg, _) = make_test_config();
     let _restore = EnvRestore::capture("GUARD_CHILD_ENDPOINT");
     std::env::set_var("GUARD_CHILD_ENDPOINT", "daemon-owned");
-    cfg.extra_child_env = vec!["GUARD_CHILD_ENDPOINT".to_string()];
+    cfg.config.extra_child_env = vec!["GUARD_CHILD_ENDPOINT".to_string()];
 
     let token = format!("child-env-collision-{}", std::process::id());
-    cfg.sessions.write().await.grant(
+    cfg.state.sessions.write().await.grant(
         token.clone(),
         SessionGrant {
             allow: vec!["sh *".into()],
@@ -1780,21 +1810,21 @@ async fn caller_env_cannot_override_daemon_child_env() {
 #[tokio::test]
 async fn redaction_covers_effective_tool_child_and_request_env_values() {
     let (mut cfg, _) = make_test_config();
-    cfg.redact = true;
+    cfg.config.redact = true;
     let _restore = EnvRestore::capture("GUARD_CHILD_SECRET");
     std::env::set_var("GUARD_CHILD_SECRET", "daemon-child-secret-value");
-    cfg.extra_child_env = vec!["GUARD_CHILD_SECRET".to_string()];
+    cfg.config.extra_child_env = vec!["GUARD_CHILD_SECRET".to_string()];
     let tools = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(
         tools.path(),
         "tools:\n  sh:\n    env:\n      TOOL_SECRET: guard-tool-secret-value\n",
     )
     .unwrap();
-    *cfg.tool_registry.write().await =
+    *cfg.state.tool_registry.write().await =
         crate::tool_config::ToolRegistry::load(tools.path()).unwrap();
 
     let token = format!("env-redaction-{}", std::process::id());
-    cfg.sessions.write().await.grant(
+    cfg.state.sessions.write().await.grant(
         token.clone(),
         SessionGrant {
             allow: vec!["sh *".into()],
@@ -1887,7 +1917,7 @@ async fn ansible_discovers_config_from_cwd_without_inherited_ansible_config() {
 
     let project_cwd = project.canonicalize().unwrap();
     let token = format!("ansible-cwd-{}", std::process::id());
-    cfg.sessions.write().await.grant(
+    cfg.state.sessions.write().await.grant(
         token.clone(),
         SessionGrant {
             allow: Vec::new(),
@@ -1960,7 +1990,7 @@ async fn shim_dir_only_path_fails_without_recursing_into_primary_shim() {
     use std::os::unix::fs::PermissionsExt;
     perms.set_mode(0o755);
     std::fs::set_permissions(&shim_path, perms).unwrap();
-    cfg.shim_dir = Some(shim_dir.path().to_path_buf());
+    cfg.config.shim_dir = Some(shim_dir.path().to_path_buf());
     let _path_restore = EnvRestore::capture("PATH");
     let inherited_path = std::env::var_os("PATH").unwrap_or_default();
     let test_path = std::env::join_paths(
@@ -1971,7 +2001,7 @@ async fn shim_dir_only_path_fails_without_recursing_into_primary_shim() {
     std::env::set_var("PATH", test_path);
 
     let token = format!("shim-recursion-{}", std::process::id());
-    cfg.sessions.write().await.grant(
+    cfg.state.sessions.write().await.grant(
         token.clone(),
         SessionGrant {
             allow: vec!["missing-tool".into()],
@@ -2015,8 +2045,8 @@ async fn allowed_binary_floor_does_not_permit_shim_dir_recursion() {
     use std::os::unix::fs::PermissionsExt;
     perms.set_mode(0o755);
     std::fs::set_permissions(&shim_path, perms).unwrap();
-    cfg.shim_dir = Some(shim_dir.path().to_path_buf());
-    cfg.allowed_binaries = Some(vec!["allowed-tool".to_string()]);
+    cfg.config.shim_dir = Some(shim_dir.path().to_path_buf());
+    cfg.config.allowed_binaries = Some(vec!["allowed-tool".to_string()]);
     let _path_restore = EnvRestore::capture("PATH");
     let inherited_path = std::env::var_os("PATH").unwrap_or_default();
     let test_path = std::env::join_paths(
@@ -2027,7 +2057,7 @@ async fn allowed_binary_floor_does_not_permit_shim_dir_recursion() {
     std::env::set_var("PATH", test_path);
 
     let token = format!("shim-allow-bin-{}", std::process::id());
-    cfg.sessions.write().await.grant(
+    cfg.state.sessions.write().await.grant(
         token.clone(),
         SessionGrant {
             allow: vec!["allowed-tool".into()],
@@ -2094,7 +2124,8 @@ fn containment_context_presents_the_complete_chain_to_the_evaluator() {
 async fn secret_file_exists_only_for_child_lifetime_and_failure_exit_cleans_it() {
     let (cfg, _) = make_test_config();
     let principal = PrincipalKey::from_uid(1000);
-    cfg.secrets
+    cfg.state
+        .secrets
         .set(&principal, "child-file-secret", "expected-value")
         .await
         .unwrap();
@@ -2112,13 +2143,15 @@ async fn secret_file_exists_only_for_child_lifetime_and_failure_exit_cleans_it()
     );
     let mut sink = tokio::io::sink();
     let result = exec_after_approval_with_secret_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &CallerIdentity::Unix { uid: 1000 },
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
         request,
-        &cfg,
-        &CallerIdentity::Unix { uid: 1000 },
         "test allow".to_string(),
-        0,
-        false,
-        &mut sink,
         None,
     )
     .await;
@@ -2132,7 +2165,7 @@ async fn secret_file_exists_only_for_child_lifetime_and_failure_exit_cleans_it()
     };
     assert!(!std::path::Path::new(&path).exists());
     assert_eq!(
-        std::fs::read_dir(cfg.secret_file_root.as_ref().unwrap())
+        std::fs::read_dir(cfg.config.secret_file_root.as_ref().unwrap())
             .unwrap()
             .count(),
         0
@@ -2142,9 +2175,10 @@ async fn secret_file_exists_only_for_child_lifetime_and_failure_exit_cleans_it()
 #[tokio::test]
 async fn secret_file_is_strictly_refused_with_exec_as_caller() {
     let (mut cfg, _) = make_test_config();
-    cfg.exec_as_caller = true;
+    cfg.config.exec_as_caller = true;
     let principal = PrincipalKey::from_uid(1000);
-    cfg.secrets
+    cfg.state
+        .secrets
         .set(&principal, "caller-file-secret", "value")
         .await
         .unwrap();

@@ -14,7 +14,7 @@ use crate::server::wire::{
     AdminRequest, AdminResponse, CallerIdentity, ExecOutcome, ExecuteRequest, ExecuteResult,
     RevertSpec,
 };
-use crate::server::{ServerConfig, APPROVAL_TTL_SECS};
+use crate::server::{RequestContext, ServerContext, APPROVAL_TTL_SECS};
 use crate::session::SessionGrant;
 #[cfg(unix)]
 use crate::session_store::SessionStore;
@@ -35,8 +35,9 @@ use super::make_test_config;
 
 /// Capture the live session authority the way the daemon does before routing
 /// (`route_gated_allow` receives it in `GateInputs::authority`).
-async fn live_authority(cfg: &ServerConfig, token: &str) -> Option<SessionAuthoritySnapshot> {
-    cfg.sessions
+async fn live_authority(cfg: &ServerContext, token: &str) -> Option<SessionAuthoritySnapshot> {
+    cfg.state
+        .sessions
         .read()
         .await
         .authority_snapshot(token)
@@ -69,11 +70,11 @@ use std::task::{Context, Poll};
 fn gating_config(
     operator_uid: u32,
     agent_uid: u32,
-) -> (ServerConfig, CallerIdentity, CallerIdentity) {
+) -> (ServerContext, CallerIdentity, CallerIdentity) {
     let (mut cfg, _) = make_test_config();
-    cfg.gate = GateMode::Consequence;
-    cfg.daemon_uid = operator_uid;
-    cfg.daemon_principal = PrincipalKey::from_uid(operator_uid);
+    cfg.config.gate = GateMode::Consequence;
+    cfg.config.daemon_uid = operator_uid;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(operator_uid);
     let operator = CallerIdentity::Unix { uid: operator_uid };
     let agent = CallerIdentity::Unix { uid: agent_uid };
     (cfg, operator, agent)
@@ -174,7 +175,8 @@ async fn containment_stays_armed_when_client_stream_drops_after_launch() {
     let escaped_marker = temp.path().join("background-child-survived");
     let (cfg, _operator, agent) = gating_config(7001, 1000);
     let agent_principal = agent.principal();
-    cfg.secrets
+    cfg.state
+        .secrets
         .set(
             agent_principal.as_ref().unwrap(),
             "stream-file-secret",
@@ -204,14 +206,17 @@ async fn containment_stays_armed_when_client_stream_drops_after_launch() {
     let mut writer = FlakyWriter::failing_after(0);
 
     let result = arm_containment_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: true,
+            stream_writer: // stream_output: exercise the streaming failure path
+        &mut writer,
+        },
         request,
-        &cfg,
-        &agent,
         agent_principal,
         "recoverable change".to_string(),
-        0,
-        true, // stream_output: exercise the streaming failure path
-        &mut writer,
         None,
     )
     .await;
@@ -228,7 +233,7 @@ async fn containment_stays_armed_when_client_stream_drops_after_launch() {
     // Invariant: the provisional is STILL ARMED with forward_done set, so the
     // sweeper's take_due can fire the auto-revert. It must NOT have been
     // dropped (that would leak the unconfirmed mutation).
-    let reg = cfg.provisional.read().await;
+    let reg = cfg.state.provisional.read().await;
     let rows = reg.list();
     assert_eq!(rows.len(), 1, "the armed provisional must be retained");
     let p = &rows[0];
@@ -243,7 +248,7 @@ async fn containment_stays_armed_when_client_stream_drops_after_launch() {
         Some(&"stream-file-secret".to_string())
     );
     assert_eq!(
-        std::fs::read_dir(cfg.secret_file_root.as_ref().unwrap())
+        std::fs::read_dir(cfg.config.secret_file_root.as_ref().unwrap())
             .unwrap()
             .count(),
         0,
@@ -272,14 +277,16 @@ async fn containment_dropped_when_forward_fails_to_spawn() {
     let mut sink = tokio::io::sink();
 
     let result = arm_containment_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
         request,
-        &cfg,
-        &agent,
         agent_principal,
         "recoverable change".to_string(),
-        0,
-        false,
-        &mut sink,
         None,
     )
     .await;
@@ -292,7 +299,7 @@ async fn containment_dropped_when_forward_fails_to_spawn() {
     }
 
     // The provisional was dropped: nothing ran, so nothing to revert.
-    let reg = cfg.provisional.read().await;
+    let reg = cfg.state.provisional.read().await;
     assert!(
         reg.list().is_empty(),
         "a never-launched forward must drop its provisional"
@@ -311,14 +318,16 @@ async fn contain_then_operator_confirm_keeps_change_nonoperator_refused() {
     let request = contain_request("true", &[], RevertSpec::new("true", Vec::new()));
     let mut sink = tokio::io::sink();
     let result = arm_containment_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
         request,
-        &cfg,
-        &agent,
         agent_principal,
         "recoverable change".to_string(),
-        0,
-        false,
-        &mut sink,
         None,
     )
     .await;
@@ -347,7 +356,13 @@ async fn contain_then_operator_confirm_keeps_change_nonoperator_refused() {
         other => panic!("non-operator confirm must be refused, got {:?}", other),
     }
     assert_eq!(
-        cfg.provisional.read().await.get(&handle).unwrap().status,
+        cfg.state
+            .provisional
+            .read()
+            .await
+            .get(&handle)
+            .unwrap()
+            .status,
         ProvisionalStatus::Armed,
         "a refused confirm must not change state"
     );
@@ -364,13 +379,20 @@ async fn contain_then_operator_confirm_keeps_change_nonoperator_refused() {
     .await;
     assert!(matches!(ok, AdminResponse::GateAction { .. }));
     assert_eq!(
-        cfg.provisional.read().await.get(&handle).unwrap().status,
+        cfg.state
+            .provisional
+            .read()
+            .await
+            .get(&handle)
+            .unwrap()
+            .status,
         ProvisionalStatus::Confirmed
     );
 
     // A confirmed provisional is never due, even far past any deadline: the
     // sweeper's take_due step yields nothing to revert.
     let due = cfg
+        .state
         .provisional
         .write()
         .await
@@ -393,14 +415,16 @@ async fn contain_then_deadline_triggers_sweeper_autorevert() {
     request.confirm_within_secs = Some(1);
     let mut sink = tokio::io::sink();
     let result = arm_containment_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
         request,
-        &cfg,
-        &agent,
         agent_principal,
         "recoverable change".to_string(),
-        0,
-        false,
-        &mut sink,
         None,
     )
     .await;
@@ -412,6 +436,7 @@ async fn contain_then_deadline_triggers_sweeper_autorevert() {
     // Sweeper step: claim every armed-and-due provisional (simulate the
     // deadline by passing a `now` well past it), then run each revert.
     let due = cfg
+        .state
         .provisional
         .write()
         .await
@@ -427,7 +452,13 @@ async fn contain_then_deadline_triggers_sweeper_autorevert() {
 
     // The `true` revert exits 0 -> Reverted.
     assert_eq!(
-        cfg.provisional.read().await.get(&handle).unwrap().status,
+        cfg.state
+            .provisional
+            .read()
+            .await
+            .get(&handle)
+            .unwrap()
+            .status,
         ProvisionalStatus::Reverted,
         "auto-revert must roll the unconfirmed change back"
     );
@@ -440,11 +471,13 @@ async fn due_confirm_check_reuses_secret_bindings_and_keeps_the_change() {
     let revert_marker = temp.path().join("revert-ran");
     let (cfg, _operator, agent) = gating_config(7_021, 1_000);
     let principal = agent.principal().expect("agent principal");
-    cfg.sessions
+    cfg.state
+        .sessions
         .write()
         .await
         .grant("check-session".to_string(), active_session());
-    cfg.secrets
+    cfg.state
+        .secrets
         .set(&principal, "check-token", "expected-check-secret")
         .await
         .expect("seed check secret");
@@ -468,14 +501,16 @@ async fn due_confirm_check_reuses_secret_bindings_and_keeps_the_change() {
         .insert("CHECK_TOKEN_FILE".into(), "check-token".into());
     let mut sink = tokio::io::sink();
     let result = arm_containment_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
         request,
-        &cfg,
-        &agent,
         Some(principal),
         "verified change".into(),
-        0,
-        false,
-        &mut sink,
         live_authority(&cfg, "check-session").await,
     )
     .await;
@@ -484,6 +519,7 @@ async fn due_confirm_check_reuses_secret_bindings_and_keeps_the_change() {
         other => panic!("expected provisional, got {other:?}"),
     };
     let due = cfg
+        .state
         .provisional
         .write()
         .await
@@ -492,7 +528,14 @@ async fn due_confirm_check_reuses_secret_bindings_and_keeps_the_change() {
     let outcome = finish_due_provisional(&cfg, &due[0]).await;
 
     assert_eq!(outcome.1, Some(0));
-    let row = cfg.provisional.read().await.get(&handle).cloned().unwrap();
+    let row = cfg
+        .state
+        .provisional
+        .read()
+        .await
+        .get(&handle)
+        .cloned()
+        .unwrap();
     assert_eq!(row.status, ProvisionalStatus::Confirmed);
     assert_eq!(
         row.session_fingerprint.as_deref(),
@@ -521,14 +564,16 @@ async fn due_failed_confirm_check_runs_the_rollback() {
     let request = contain_request("true", &[], revert);
     let mut sink = tokio::io::sink();
     let result = arm_containment_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
         request,
-        &cfg,
-        &agent,
         agent.principal(),
         "failed verification change".into(),
-        0,
-        false,
-        &mut sink,
         None,
     )
     .await;
@@ -537,6 +582,7 @@ async fn due_failed_confirm_check_runs_the_rollback() {
         other => panic!("expected provisional, got {other:?}"),
     };
     let due = cfg
+        .state
         .provisional
         .write()
         .await
@@ -545,7 +591,13 @@ async fn due_failed_confirm_check_runs_the_rollback() {
 
     assert_eq!(outcome.1, Some(0));
     assert_eq!(
-        cfg.provisional.read().await.get(&handle).unwrap().status,
+        cfg.state
+            .provisional
+            .read()
+            .await
+            .get(&handle)
+            .unwrap()
+            .status,
         ProvisionalStatus::Reverted
     );
     assert!(revert_marker.exists(), "failed check must roll back");
@@ -557,7 +609,7 @@ async fn containment_check_cannot_bypass_the_server_binary_floor() {
     let temp = tempfile::tempdir().expect("tempdir");
     let forward_marker = temp.path().join("forward-ran");
     let (mut cfg, _operator, agent) = gating_config(7_023, 1_000);
-    cfg.allowed_binaries = Some(vec!["sh".into(), "true".into()]);
+    cfg.config.allowed_binaries = Some(vec!["sh".into(), "true".into()]);
     let mut revert = RevertSpec::new("true", Vec::new());
     revert.confirm_check = Some(crate::server::CommandSpec {
         binary: "false".into(),
@@ -570,14 +622,16 @@ async fn containment_check_cannot_bypass_the_server_binary_floor() {
     );
     let mut sink = tokio::io::sink();
     let result = arm_containment_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
         request,
-        &cfg,
-        &agent,
         agent.principal(),
         "binary floor test".into(),
-        0,
-        false,
-        &mut sink,
         None,
     )
     .await;
@@ -591,7 +645,7 @@ async fn containment_check_cannot_bypass_the_server_binary_floor() {
         other => panic!("expected pre-exec failure, got {other:?}"),
     }
     assert!(!forward_marker.exists());
-    assert!(cfg.provisional.read().await.list().is_empty());
+    assert!(cfg.state.provisional.read().await.list().is_empty());
 }
 
 /// A persisted provisional keeps only a secret-file reference. After a
@@ -614,8 +668,9 @@ async fn provisional_revert_reresolves_secret_after_restart() {
     let restart_value = "resolved-after-restart";
 
     let (mut cfg, _operator, agent) = gating_config(7_016, agent_uid);
-    cfg.session_store = Some(store.clone());
-    cfg.secrets
+    cfg.state.session_store = Some(store.clone());
+    cfg.state
+        .secrets
         .set(&agent_principal, &secret_key, initial_value)
         .await
         .expect("seed forward secret");
@@ -639,14 +694,16 @@ async fn provisional_revert_reresolves_secret_after_restart() {
 
     let mut sink = tokio::io::sink();
     let result = arm_containment_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
         request,
-        &cfg,
-        &agent,
         Some(agent_principal.clone()),
         "recoverable change".to_string(),
-        0,
-        false,
-        &mut sink,
         None,
     )
     .await;
@@ -668,7 +725,8 @@ async fn provisional_revert_reresolves_secret_after_restart() {
     assert!(!persisted_json.contains(initial_value));
     assert!(!persisted_json.contains(restart_value));
 
-    cfg.secrets
+    cfg.state
+        .secrets
         .delete(&agent_principal, &secret_key)
         .await
         .expect("remove secret before restart");
@@ -677,12 +735,13 @@ async fn provisional_revert_reresolves_secret_after_restart() {
     // completed forward remains armed; this test then models an immediate
     // operator revert while its named secret is unavailable.
     let (mut restarted, _operator, _agent) = gating_config(7_016, agent_uid);
-    restarted.session_store = Some(store.clone());
+    restarted.state.session_store = Some(store.clone());
     let (registry, moved) = guard::gating::provisional::ProvisionalRegistry::from_rows(persisted);
     assert!(moved.is_empty());
-    *restarted.provisional.write().await = registry;
+    *restarted.state.provisional.write().await = registry;
 
     let missing_claim = restarted
+        .state
         .provisional
         .write()
         .await
@@ -699,6 +758,7 @@ async fn provisional_revert_reresolves_secret_after_restart() {
     assert!(message.contains("deferred"), "got: {message}");
     assert_eq!(
         restarted
+            .state
             .provisional
             .read()
             .await
@@ -710,11 +770,13 @@ async fn provisional_revert_reresolves_secret_after_restart() {
     assert!(!output.exists());
 
     restarted
+        .state
         .secrets
         .set(&agent_principal, &secret_key, restart_value)
         .await
         .expect("restore live secret after deferred revert");
     let retry = restarted
+        .state
         .provisional
         .write()
         .await
@@ -729,6 +791,7 @@ async fn provisional_revert_reresolves_secret_after_restart() {
     );
 
     restarted
+        .state
         .secrets
         .delete(&agent_principal, &secret_key)
         .await
@@ -747,7 +810,7 @@ async fn containment_refuses_plain_env_before_forward_exec() {
         .await
         .expect("open store");
     let (mut cfg, _operator, agent) = gating_config(7_017, 1_000);
-    cfg.session_store = Some(store.clone());
+    cfg.state.session_store = Some(store.clone());
     let mut request = contain_request(
         "sh",
         &["-c", &format!("touch '{}'", marker.display())],
@@ -759,14 +822,16 @@ async fn containment_refuses_plain_env_before_forward_exec() {
 
     let mut sink = tokio::io::sink();
     let result = arm_containment_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
         request,
-        &cfg,
-        &agent,
         agent.principal(),
         "recoverable change".to_string(),
-        0,
-        false,
-        &mut sink,
         None,
     )
     .await;
@@ -782,7 +847,7 @@ async fn containment_refuses_plain_env_before_forward_exec() {
     }
     assert!(!marker.exists(), "forward command must not have run");
     assert!(
-        cfg.provisional.read().await.list().is_empty(),
+        cfg.state.provisional.read().await.list().is_empty(),
         "plain env must not reach the provisional registry"
     );
     assert!(
@@ -803,7 +868,7 @@ async fn api_revert_without_running_proxy_defers_to_operator() {
     let now = now_unix();
     let provisional = Provisional {
         handle: handle.clone(),
-        principal: Some(cfg.daemon_principal.clone()),
+        principal: Some(cfg.config.daemon_principal.clone()),
         binary: "(api-proxy)".to_string(),
         args: vec!["delete labels/bug in o/r".to_string()],
         cwd: None,
@@ -839,7 +904,11 @@ async fn api_revert_without_running_proxy_defers_to_operator() {
         revert_exit: None,
         revert_detail: None,
     };
-    cfg.provisional.write().await.insert(provisional.clone());
+    cfg.state
+        .provisional
+        .write()
+        .await
+        .insert(provisional.clone());
 
     // A missing proxy is recoverable: the change is still live, so the revert
     // is deferred to the operator (NeedsOperatorDecision) rather than burned as
@@ -847,7 +916,14 @@ async fn api_revert_without_running_proxy_defers_to_operator() {
     let (message, exit) = finish_revert(&cfg, &provisional, &CallerIdentity::Unknown, "auto").await;
     assert!(message.contains("deferred"), "got: {message}");
     assert_eq!(exit, None);
-    let row = cfg.provisional.read().await.get(&handle).cloned().unwrap();
+    let row = cfg
+        .state
+        .provisional
+        .read()
+        .await
+        .get(&handle)
+        .cloned()
+        .unwrap();
     assert_eq!(row.status, ProvisionalStatus::NeedsOperatorDecision);
     assert!(row
         .revert_detail
@@ -898,7 +974,8 @@ async fn api_revert_executes_through_registered_proxy_upstream() {
     ));
     let upstream_target = proxy.upstream().base().to_string();
     let upstream_identity = proxy.upstream_identity_fingerprint();
-    cfg.protocol_registry
+    cfg.state
+        .protocol_registry
         .write()
         .await
         .insert("github".to_string(), proxy);
@@ -910,7 +987,7 @@ async fn api_revert_executes_through_registered_proxy_upstream() {
     let now = now_unix();
     let provisional = Provisional {
         handle: handle.clone(),
-        principal: Some(cfg.daemon_principal.clone()),
+        principal: Some(cfg.config.daemon_principal.clone()),
         binary: "(api-proxy)".to_string(),
         args: vec!["delete labels/bug in o/r".to_string()],
         cwd: None,
@@ -946,12 +1023,23 @@ async fn api_revert_executes_through_registered_proxy_upstream() {
         revert_exit: None,
         revert_detail: None,
     };
-    cfg.provisional.write().await.insert(provisional.clone());
+    cfg.state
+        .provisional
+        .write()
+        .await
+        .insert(provisional.clone());
 
     let (message, exit) = finish_revert(&cfg, &provisional, &CallerIdentity::Unknown, "auto").await;
     assert!(message.contains("reverted"), "got: {message}");
     assert_eq!(exit, Some(0));
-    let row = cfg.provisional.read().await.get(&handle).cloned().unwrap();
+    let row = cfg
+        .state
+        .provisional
+        .read()
+        .await
+        .get(&handle)
+        .cloned()
+        .unwrap();
     assert_eq!(row.status, ProvisionalStatus::Reverted);
 
     let raw = captured.lock().unwrap().clone();
@@ -974,7 +1062,7 @@ async fn api_revert_executes_through_registered_proxy_upstream() {
 async fn api_provisional_binds_session_and_upstream_identity() {
     let (cfg, _operator, _agent) = gating_config(7016, 1000);
     let sink = DaemonGateSink {
-        config: cfg.clone(),
+        server: cfg.clone(),
         endpoint: "cluster-a".to_string(),
         protocol: "kubernetes".to_string(),
         snapshot_dir: std::env::temp_dir(),
@@ -1000,7 +1088,14 @@ async fn api_provisional_binds_session_and_upstream_identity() {
     .await
     .expect("provisional armed");
 
-    let row = cfg.provisional.read().await.get(&handle).cloned().unwrap();
+    let row = cfg
+        .state
+        .provisional
+        .read()
+        .await
+        .get(&handle)
+        .cloned()
+        .unwrap();
     assert_eq!(
         row.session_fingerprint.as_deref(),
         Some("session-fingerprint")
@@ -1043,7 +1138,18 @@ async fn recoverable_with_unaffirmable_revert_is_held_for_review() {
         authority: None,
     };
     let mut sink = tokio::io::sink();
-    let result = route_gated_allow(request, &cfg, &agent, inputs, 0, false, &mut sink).await;
+    let result = route_gated_allow(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        request,
+        inputs,
+    )
+    .await;
 
     let handle = match &result.exec {
         ExecOutcome::Held { handle, .. } => handle.clone(),
@@ -1055,12 +1161,18 @@ async fn recoverable_with_unaffirmable_revert_is_held_for_review() {
         result.policy_reason()
     );
     assert_eq!(
-        cfg.provisional.read().await.outstanding(),
+        cfg.state.provisional.read().await.outstanding(),
         0,
         "an unaffirmable rollback must never arm a containment envelope"
     );
     assert_eq!(
-        cfg.approvals.read().await.get(&handle).unwrap().status,
+        cfg.state
+            .approvals
+            .read()
+            .await
+            .get(&handle)
+            .unwrap()
+            .status,
         ApprovalStatus::Pending,
         "the forward command must be queued for an operator decision"
     );
@@ -1069,25 +1181,37 @@ async fn recoverable_with_unaffirmable_revert_is_held_for_review() {
 #[tokio::test]
 async fn post_evaluator_session_revoke_or_expiry_fails_before_arm_or_hold() {
     let (cfg, _operator, agent) = gating_config(7022, 1000);
-    cfg.sessions
+    cfg.state
+        .sessions
         .write()
         .await
         .grant("revoked-during-eval".to_string(), active_session());
     let revoked_authority = cfg
+        .state
         .sessions
         .read()
         .await
         .authority_snapshot("revoked-during-eval")
         .unwrap()
         .into();
-    assert!(cfg.sessions.write().await.revoke("revoked-during-eval"));
+    assert!(cfg
+        .state
+        .sessions
+        .write()
+        .await
+        .revoke("revoked-during-eval"));
     let mut contained = contain_request("true", &[], RevertSpec::new("true", Vec::new()));
     contained.session_token = Some("revoked-during-eval".to_string());
     let mut sink = tokio::io::sink();
     let denied = route_gated_allow(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
         contained,
-        &cfg,
-        &agent,
         GateInputs {
             reason: "evaluator approved before revoke".to_string(),
             risk: Some(2),
@@ -1097,20 +1221,19 @@ async fn post_evaluator_session_revoke_or_expiry_fails_before_arm_or_hold() {
             bypass: false,
             authority: Some(revoked_authority),
         },
-        0,
-        false,
-        &mut sink,
     )
     .await;
     assert!(!denied.policy_allowed());
     assert!(denied.policy_reason().contains("revoked"));
-    assert_eq!(cfg.provisional.read().await.outstanding(), 0);
+    assert_eq!(cfg.state.provisional.read().await.outstanding(), 0);
 
-    cfg.sessions
+    cfg.state
+        .sessions
         .write()
         .await
         .grant("expired-during-eval".to_string(), active_session());
     let expired_authority = cfg
+        .state
         .sessions
         .read()
         .await
@@ -1119,7 +1242,8 @@ async fn post_evaluator_session_revoke_or_expiry_fails_before_arm_or_hold() {
         .into();
     let mut expired = active_session();
     expired.expires_at = Some(now_unix().saturating_sub(1));
-    cfg.sessions
+    cfg.state
+        .sessions
         .write()
         .await
         .grant("expired-during-eval".to_string(), expired);
@@ -1127,9 +1251,14 @@ async fn post_evaluator_session_revoke_or_expiry_fails_before_arm_or_hold() {
     held.revert = None;
     held.session_token = Some("expired-during-eval".to_string());
     let denied = route_gated_allow(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
         held,
-        &cfg,
-        &agent,
         GateInputs {
             reason: "evaluator approved before expiry".to_string(),
             risk: Some(9),
@@ -1139,14 +1268,11 @@ async fn post_evaluator_session_revoke_or_expiry_fails_before_arm_or_hold() {
             bypass: false,
             authority: Some(expired_authority),
         },
-        0,
-        false,
-        &mut sink,
     )
     .await;
     assert!(!denied.policy_allowed());
     assert!(denied.policy_reason().contains("expired"));
-    assert_eq!(cfg.approvals.read().await.outstanding(), 0);
+    assert_eq!(cfg.state.approvals.read().await.outstanding(), 0);
 }
 
 #[cfg(unix)]
@@ -1154,11 +1280,12 @@ async fn post_evaluator_session_revoke_or_expiry_fails_before_arm_or_hold() {
 async fn session_status_does_not_cross_expose_same_principal_provisionals() {
     let (cfg, _operator, agent) = gating_config(7024, 1000);
     for token in ["status-session-a", "status-session-b"] {
-        cfg.sessions
+        cfg.state
+            .sessions
             .write()
             .await
             .grant(token.to_string(), active_session());
-        cfg.provisional.write().await.insert(Provisional {
+        cfg.state.provisional.write().await.insert(Provisional {
             handle: format!("provisional-{token}"),
             principal: agent.principal(),
             binary: "true".to_string(),
@@ -1172,7 +1299,12 @@ async fn session_status_does_not_cross_expose_same_principal_provisionals() {
             confirm_check_args: Vec::new(),
             control_path: Some("test".to_string()),
             session_fingerprint: Some(audit_session_fingerprint(Some(token))),
-            session_revision: cfg.sessions.read().await.effective_revision_key(token),
+            session_revision: cfg
+                .state
+                .sessions
+                .read()
+                .await
+                .effective_revision_key(token),
             secret_entitlements: None,
             api_revert: None,
             reason: "test".to_string(),
@@ -1232,17 +1364,24 @@ async fn hold_then_operator_approve_executes_snapshot_nonoperator_refused() {
     };
     let mut sink = tokio::io::sink();
     let held = hold_for_approval_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
         request,
-        &cfg,
-        &agent,
         agent_principal,
-        "needs sign-off".to_string(),
-        Some(9),
-        Some(Reversibility::Irreversible),
-        None,
-        false,
-        &mut sink,
-        None,
+        GateInputs {
+            reason: "needs sign-off".to_string(),
+            risk: Some(9),
+            reversibility: Some(Reversibility::Irreversible),
+            revert_preauthorized: false,
+            verb: None,
+            bypass: false,
+            authority: None,
+        },
     )
     .await;
     let handle = match &held.exec {
@@ -1269,7 +1408,13 @@ async fn hold_then_operator_approve_executes_snapshot_nonoperator_refused() {
         other => panic!("non-operator approve must be refused, got {:?}", other),
     }
     assert_eq!(
-        cfg.approvals.read().await.get(&handle).unwrap().status,
+        cfg.state
+            .approvals
+            .read()
+            .await
+            .get(&handle)
+            .unwrap()
+            .status,
         ApprovalStatus::Pending,
         "a refused approve must not change state"
     );
@@ -1291,7 +1436,13 @@ async fn hold_then_operator_approve_executes_snapshot_nonoperator_refused() {
         other => panic!("operator approve should execute, got {:?}", other),
     }
     assert_eq!(
-        cfg.approvals.read().await.get(&handle).unwrap().status,
+        cfg.state
+            .approvals
+            .read()
+            .await
+            .get(&handle)
+            .unwrap()
+            .status,
         ApprovalStatus::Approved
     );
 }
@@ -1301,7 +1452,8 @@ async fn hold_then_operator_approve_executes_snapshot_nonoperator_refused() {
 async fn approval_rejects_tool_secret_rotated_after_hold() {
     let (cfg, operator, agent) = gating_config(7023, 1000);
     let principal = agent.principal().unwrap();
-    cfg.secrets
+    cfg.state
+        .secrets
         .set(&principal, "broker/token", "held-value")
         .await
         .unwrap();
@@ -1311,7 +1463,7 @@ async fn approval_rejects_tool_secret_rotated_after_hold() {
         "tools:\n  true:\n    secrets:\n      BROKER_TOKEN: broker/token\n",
     )
     .unwrap();
-    *cfg.tool_registry.write().await =
+    *cfg.state.tool_registry.write().await =
         crate::tool_config::ToolRegistry::load(tools.path()).unwrap();
     let request = ExecuteRequest {
         binary: "true".to_string(),
@@ -1333,23 +1485,31 @@ async fn approval_rejects_tool_secret_rotated_after_hold() {
     };
     let mut sink = tokio::io::sink();
     let held = hold_for_approval_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
         request,
-        &cfg,
-        &agent,
         Some(principal.clone()),
-        "tool secret hold".to_string(),
-        Some(9),
-        Some(Reversibility::Irreversible),
-        None,
-        false,
-        &mut sink,
-        None,
+        GateInputs {
+            reason: "tool secret hold".to_string(),
+            risk: Some(9),
+            reversibility: Some(Reversibility::Irreversible),
+            revert_preauthorized: false,
+            verb: None,
+            bypass: false,
+            authority: None,
+        },
     )
     .await;
     let ExecOutcome::Held { handle, .. } = held.exec else {
         panic!("expected held command")
     };
     let snapshot = cfg
+        .state
         .approvals
         .read()
         .await
@@ -1380,7 +1540,7 @@ async fn approval_rejects_tool_secret_rotated_after_hold() {
         "tools:\n  true:\n    secrets:\n      RENAMED_TOKEN: broker/token\n",
     )
     .unwrap();
-    *cfg.tool_registry.write().await =
+    *cfg.state.tool_registry.write().await =
         crate::tool_config::ToolRegistry::load(tools.path()).unwrap();
     let remapped_result = execute_snapshot(&cfg, &snapshot, "operator approved").await;
     assert!(matches!(
@@ -1394,9 +1554,10 @@ async fn approval_rejects_tool_secret_rotated_after_hold() {
         "tools:\n  true:\n    secrets:\n      BROKER_TOKEN: broker/token\n",
     )
     .unwrap();
-    *cfg.tool_registry.write().await =
+    *cfg.state.tool_registry.write().await =
         crate::tool_config::ToolRegistry::load(tools.path()).unwrap();
-    cfg.secrets
+    cfg.state
+        .secrets
         .set(&principal, "broker/token", "rotated-value")
         .await
         .unwrap();
@@ -1415,7 +1576,14 @@ async fn approval_rejects_tool_secret_rotated_after_hold() {
             ..
         }
     ));
-    let approval = cfg.approvals.read().await.get(&handle).cloned().unwrap();
+    let approval = cfg
+        .state
+        .approvals
+        .read()
+        .await
+        .get(&handle)
+        .cloned()
+        .unwrap();
     assert_eq!(approval.status, ApprovalStatus::ExecFailed);
     assert!(approval
         .decided_reason
@@ -1425,9 +1593,10 @@ async fn approval_rejects_tool_secret_rotated_after_hold() {
 }
 
 /// Wait (bounded) for a pending approval row to appear and return its handle.
-async fn wait_for_pending_hold(cfg: &ServerConfig) -> String {
+async fn wait_for_pending_hold(cfg: &ServerContext) -> String {
     for _ in 0..100 {
         let pending: Vec<String> = cfg
+            .state
             .approvals
             .read()
             .await
@@ -1453,7 +1622,7 @@ async fn wait_for_pending_hold(cfg: &ServerConfig) -> String {
 async fn kube_proxy_hold_routes_through_approval_queue() {
     let (cfg, operator, _agent) = gating_config(7013, 1000);
     let sink = Arc::new(DaemonGateSink {
-        config: cfg.clone(),
+        server: cfg.clone(),
         endpoint: "default".to_string(),
         protocol: "kubernetes".to_string(),
         snapshot_dir: std::env::temp_dir(),
@@ -1485,7 +1654,8 @@ async fn kube_proxy_hold_routes_through_approval_queue() {
     });
     let handle = wait_for_pending_hold(&cfg).await;
     assert_eq!(
-        cfg.approvals
+        cfg.state
+            .approvals
             .read()
             .await
             .get(&handle)
@@ -1496,7 +1666,8 @@ async fn kube_proxy_hold_routes_through_approval_queue() {
         Some("session-fingerprint")
     );
     assert_eq!(
-        cfg.approvals
+        cfg.state
+            .approvals
             .read()
             .await
             .get(&handle)
@@ -1528,7 +1699,13 @@ async fn kube_proxy_hold_routes_through_approval_queue() {
         other => panic!("expected Approved, got {:?}", other),
     }
     assert_eq!(
-        cfg.approvals.read().await.get(&handle).unwrap().status,
+        cfg.state
+            .approvals
+            .read()
+            .await
+            .get(&handle)
+            .unwrap()
+            .status,
         ApprovalStatus::Approved
     );
 
@@ -1563,7 +1740,13 @@ async fn kube_proxy_hold_routes_through_approval_queue() {
         other => panic!("expected Denied, got {:?}", other),
     }
     assert_eq!(
-        cfg.approvals.read().await.get(&handle).unwrap().status,
+        cfg.state
+            .approvals
+            .read()
+            .await
+            .get(&handle)
+            .unwrap()
+            .status,
         ApprovalStatus::Denied
     );
 
@@ -1583,7 +1766,16 @@ async fn kube_proxy_hold_routes_through_approval_queue() {
     waiter.abort();
     let mut retired = false;
     for _ in 0..100 {
-        if cfg.approvals.read().await.get(&handle).unwrap().status == ApprovalStatus::ExecFailed {
+        if cfg
+            .state
+            .approvals
+            .read()
+            .await
+            .get(&handle)
+            .unwrap()
+            .status
+            == ApprovalStatus::ExecFailed
+        {
             retired = true;
             break;
         }
@@ -1626,24 +1818,31 @@ async fn nonstreaming_wait_approval_returns_promptly_on_decision() {
     let waiter = tokio::spawn(async move {
         let mut sink = tokio::io::sink();
         hold_for_approval_with_authority(
+            &mut RequestContext {
+                server: &cfg2,
+                caller: &agent,
+                depth: 0,
+                stream_output: false,
+                stream_writer: &mut sink,
+            },
             request,
-            &cfg2,
-            &agent,
             agent_principal,
-            "destructive".to_string(),
-            Some(10),
-            Some(Reversibility::Irreversible),
-            None,
-            false,
-            &mut sink,
-            None,
+            GateInputs {
+                reason: "destructive".to_string(),
+                risk: Some(10),
+                reversibility: Some(Reversibility::Irreversible),
+                revert_preauthorized: false,
+                verb: None,
+                bypass: false,
+                authority: None,
+            },
         )
         .await
     });
 
     let handle = wait_for_pending_hold(&cfg).await;
     {
-        let mut reg = cfg.approvals.write().await;
+        let mut reg = cfg.state.approvals.write().await;
         reg.deny(&handle, now_unix(), "operator rejected".to_string())
             .unwrap();
     }
@@ -1668,7 +1867,8 @@ async fn hold_then_ttl_expiry_denies_fail_closed() {
     let (cfg, _operator, agent) = gating_config(7006, 1000);
     let agent_principal = agent.principal();
     let session_token = new_handle();
-    cfg.sessions
+    cfg.state
+        .sessions
         .write()
         .await
         .grant(session_token.clone(), active_session());
@@ -1693,17 +1893,24 @@ async fn hold_then_ttl_expiry_denies_fail_closed() {
     };
     let mut sink = tokio::io::sink();
     let held = hold_for_approval_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
         request,
-        &cfg,
-        &agent,
         agent_principal,
-        "destructive".to_string(),
-        Some(10),
-        Some(Reversibility::Irreversible),
-        None,
-        false,
-        &mut sink,
-        live_authority(&cfg, &session_token).await,
+        GateInputs {
+            reason: "destructive".to_string(),
+            risk: Some(10),
+            reversibility: Some(Reversibility::Irreversible),
+            revert_preauthorized: false,
+            verb: None,
+            bypass: false,
+            authority: live_authority(&cfg, &session_token).await,
+        },
     )
     .await;
     let handle = match &held.exec {
@@ -1714,13 +1921,21 @@ async fn hold_then_ttl_expiry_denies_fail_closed() {
     // Sweeper step: expire every pending hold past its TTL. Pass a `now` far
     // beyond the TTL so the deadline has certainly passed.
     let expired = cfg
+        .state
         .approvals
         .write()
         .await
         .expire_due(now_unix() + APPROVAL_TTL_SECS + 10_000);
     assert_eq!(expired, vec![handle.clone()]);
 
-    let row = cfg.approvals.read().await.get(&handle).cloned().unwrap();
+    let row = cfg
+        .state
+        .approvals
+        .read()
+        .await
+        .get(&handle)
+        .cloned()
+        .unwrap();
     let expected_session_fingerprint = audit_session_fingerprint(Some(&session_token));
     assert_eq!(
         row.snapshot.session_fingerprint.as_deref(),
@@ -1761,7 +1976,11 @@ async fn approve_rejected_when_bound_secret_value_changed() {
     let (cfg, _operator, agent) = gating_config(7201, 4201);
     let agent_principal = agent.principal();
     let p = agent_principal.clone().expect("agent principal");
-    cfg.secrets.set(&p, "BIND_TEST_KEY", "v1").await.unwrap();
+    cfg.state
+        .secrets
+        .set(&p, "BIND_TEST_KEY", "v1")
+        .await
+        .unwrap();
 
     let mut secret_files = HashMap::new();
     secret_files.insert("INJECTED_FILE".to_string(), "BIND_TEST_KEY".to_string());
@@ -1785,17 +2004,24 @@ async fn approve_rejected_when_bound_secret_value_changed() {
     };
     let mut sink = tokio::io::sink();
     let held = hold_for_approval_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
         request,
-        &cfg,
-        &agent,
         agent_principal.clone(),
-        "needs review".to_string(),
-        Some(8),
-        Some(Reversibility::Irreversible),
-        None,
-        false,
-        &mut sink,
-        None,
+        GateInputs {
+            reason: "needs review".to_string(),
+            risk: Some(8),
+            reversibility: Some(Reversibility::Irreversible),
+            revert_preauthorized: false,
+            verb: None,
+            bypass: false,
+            authority: None,
+        },
     )
     .await;
     let handle = match &held.exec {
@@ -1804,6 +2030,7 @@ async fn approve_rejected_when_bound_secret_value_changed() {
     };
 
     let snapshot = cfg
+        .state
         .approvals
         .read()
         .await
@@ -1823,7 +2050,8 @@ async fn approve_rejected_when_bound_secret_value_changed() {
     assert!(!persisted.contains("v1"));
 
     // The same principal swaps the value the operator was reviewing.
-    cfg.secrets
+    cfg.state
+        .secrets
         .set(&p, "BIND_TEST_KEY", "v2-tampered")
         .await
         .unwrap();
@@ -1841,7 +2069,7 @@ async fn approve_rejected_when_bound_secret_value_changed() {
         other => panic!("expected a fail-closed rejection, got {:?}", other),
     }
 
-    let _ = cfg.secrets.delete(&p, "BIND_TEST_KEY").await;
+    let _ = cfg.state.secrets.delete(&p, "BIND_TEST_KEY").await;
 }
 
 /// When the bound value is unchanged, the binding check passes (it does not
@@ -1851,7 +2079,11 @@ async fn approve_passes_binding_when_secret_value_unchanged() {
     let (cfg, _operator, agent) = gating_config(7202, 4202);
     let agent_principal = agent.principal();
     let p = agent_principal.clone().expect("agent principal");
-    cfg.secrets.set(&p, "BIND_OK_KEY", "stable").await.unwrap();
+    cfg.state
+        .secrets
+        .set(&p, "BIND_OK_KEY", "stable")
+        .await
+        .unwrap();
 
     let mut secret_files = HashMap::new();
     secret_files.insert("INJECTED_FILE".to_string(), "BIND_OK_KEY".to_string());
@@ -1875,17 +2107,24 @@ async fn approve_passes_binding_when_secret_value_unchanged() {
     };
     let mut sink = tokio::io::sink();
     let held = hold_for_approval_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
         request,
-        &cfg,
-        &agent,
         agent_principal.clone(),
-        "needs review".to_string(),
-        Some(8),
-        Some(Reversibility::Irreversible),
-        None,
-        false,
-        &mut sink,
-        None,
+        GateInputs {
+            reason: "needs review".to_string(),
+            risk: Some(8),
+            reversibility: Some(Reversibility::Irreversible),
+            revert_preauthorized: false,
+            verb: None,
+            bypass: false,
+            authority: None,
+        },
     )
     .await;
     let handle = match &held.exec {
@@ -1893,6 +2132,7 @@ async fn approve_passes_binding_when_secret_value_unchanged() {
         other => panic!("expected Held, got {:?}", other),
     };
     let snapshot = cfg
+        .state
         .approvals
         .read()
         .await
@@ -1914,14 +2154,14 @@ async fn approve_passes_binding_when_secret_value_unchanged() {
         );
     }
     assert_eq!(
-        std::fs::read_dir(cfg.secret_file_root.as_ref().unwrap())
+        std::fs::read_dir(cfg.config.secret_file_root.as_ref().unwrap())
             .unwrap()
             .count(),
         0,
         "held approval execution must clean its secret-file lease"
     );
 
-    let _ = cfg.secrets.delete(&p, "BIND_OK_KEY").await;
+    let _ = cfg.state.secrets.delete(&p, "BIND_OK_KEY").await;
 }
 
 /// The binding is mandatory: a secret that is UNRESOLVED at hold is bound by
@@ -1934,7 +2174,7 @@ async fn approve_rejected_when_unresolved_secret_appears_after_hold() {
     let agent_principal = agent.principal();
     let p = agent_principal.clone().expect("agent principal");
     // The secret does NOT exist at hold time.
-    let _ = cfg.secrets.delete(&p, "BIND_LATE_KEY").await;
+    let _ = cfg.state.secrets.delete(&p, "BIND_LATE_KEY").await;
 
     let mut secrets = HashMap::new();
     secrets.insert("INJECTED".to_string(), "BIND_LATE_KEY".to_string());
@@ -1958,17 +2198,24 @@ async fn approve_rejected_when_unresolved_secret_appears_after_hold() {
     };
     let mut sink = tokio::io::sink();
     let held = hold_for_approval_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
         request,
-        &cfg,
-        &agent,
         agent_principal.clone(),
-        "needs review".to_string(),
-        Some(8),
-        Some(Reversibility::Irreversible),
-        None,
-        false,
-        &mut sink,
-        None,
+        GateInputs {
+            reason: "needs review".to_string(),
+            risk: Some(8),
+            reversibility: Some(Reversibility::Irreversible),
+            revert_preauthorized: false,
+            verb: None,
+            bypass: false,
+            authority: None,
+        },
     )
     .await;
     let handle = match &held.exec {
@@ -1976,6 +2223,7 @@ async fn approve_rejected_when_unresolved_secret_appears_after_hold() {
         other => panic!("expected Held, got {:?}", other),
     };
     let snapshot = cfg
+        .state
         .approvals
         .read()
         .await
@@ -1990,7 +2238,8 @@ async fn approve_rejected_when_unresolved_secret_appears_after_hold() {
     );
 
     // The caller now creates the previously-absent secret with a chosen value.
-    cfg.secrets
+    cfg.state
+        .secrets
         .set(&p, "BIND_LATE_KEY", "sneaked-in")
         .await
         .unwrap();
@@ -2008,7 +2257,7 @@ async fn approve_rejected_when_unresolved_secret_appears_after_hold() {
         other => panic!("expected a fail-closed rejection, got {:?}", other),
     }
 
-    let _ = cfg.secrets.delete(&p, "BIND_LATE_KEY").await;
+    let _ = cfg.state.secrets.delete(&p, "BIND_LATE_KEY").await;
 }
 
 /// The approval discussion thread accepts notes from the operator and from
@@ -2038,17 +2287,24 @@ async fn approval_note_operator_and_owner_post_others_refused() {
     };
     let mut sink = tokio::io::sink();
     let held = hold_for_approval_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
         request,
-        &cfg,
-        &agent,
         agent_principal.clone(),
-        "review".to_string(),
-        Some(8),
-        Some(Reversibility::Irreversible),
-        None,
-        false,
-        &mut sink,
-        None,
+        GateInputs {
+            reason: "review".to_string(),
+            risk: Some(8),
+            reversibility: Some(Reversibility::Irreversible),
+            revert_preauthorized: false,
+            verb: None,
+            bypass: false,
+            authority: None,
+        },
     )
     .await;
     let handle = match &held.exec {
@@ -2092,7 +2348,8 @@ async fn approval_note_operator_and_owner_post_others_refused() {
     ));
 
     // Once decided, the thread is frozen.
-    cfg.approvals
+    cfg.state
+        .approvals
         .write()
         .await
         .deny(&handle, now_unix(), "denied".to_string())
@@ -2155,10 +2412,10 @@ async fn approve_voided_when_verb_catalog_version_changed() {
     };
     assert_ne!(
         approval.snapshot.catalog_version,
-        Some(cfg.verbs.read().await.version()),
+        Some(cfg.state.verbs.read().await.version()),
         "test precondition: the stamped version must differ from live"
     );
-    cfg.approvals.write().await.enqueue(approval);
+    cfg.state.approvals.write().await.enqueue(approval);
 
     let voided = handle_admin_request(
         &cfg,
@@ -2180,7 +2437,13 @@ async fn approve_voided_when_verb_catalog_version_changed() {
 
     // The hold is terminal (ExecFailed), not Approved: nothing executed.
     assert_eq!(
-        cfg.approvals.read().await.get(&handle).unwrap().status,
+        cfg.state
+            .approvals
+            .read()
+            .await
+            .get(&handle)
+            .unwrap()
+            .status,
         ApprovalStatus::ExecFailed
     );
 }
@@ -2188,7 +2451,7 @@ async fn approve_voided_when_verb_catalog_version_changed() {
 #[tokio::test]
 async fn approved_snapshot_rechecks_binary_floor_before_exec() {
     let (mut cfg, _, agent) = gating_config(7015, 1000);
-    cfg.allowed_binaries = Some(vec!["echo".to_string()]);
+    cfg.config.allowed_binaries = Some(vec!["echo".to_string()]);
     let snapshot = ApprovalSnapshot {
         binary: "sh".to_string(),
         args: vec!["-c".to_string(), "true".to_string()],
@@ -2223,7 +2486,8 @@ async fn approved_snapshot_rechecks_binary_floor_before_exec() {
 async fn stored_entitlements_cover_tool_secrets_for_approval_check_and_revert() {
     let (cfg, _, agent) = gating_config(7020, 1000);
     let principal = agent.principal().unwrap();
-    cfg.secrets
+    cfg.state
+        .secrets
         .set(&principal, "broker/token", "never-printed")
         .await
         .unwrap();
@@ -2233,7 +2497,7 @@ async fn stored_entitlements_cover_tool_secrets_for_approval_check_and_revert() 
         "tools:\n  true:\n    secrets:\n      BROKER_TOKEN: broker/token\n",
     )
     .unwrap();
-    *cfg.tool_registry.write().await =
+    *cfg.state.tool_registry.write().await =
         crate::tool_config::ToolRegistry::load(tools.path()).unwrap();
 
     let snapshot = ApprovalSnapshot {
@@ -2301,11 +2565,16 @@ async fn stored_entitlements_cover_tool_secrets_for_approval_check_and_revert() 
         ExecOutcome::Failed { started: false, ref reason }
             if reason.contains("does not entitle secret 'broker/token'")
     ));
-    cfg.provisional.write().await.insert(provisional.clone());
+    cfg.state
+        .provisional
+        .write()
+        .await
+        .insert(provisional.clone());
     let (_, exit) = finish_revert(&cfg, &provisional, &agent, "test").await;
     assert_eq!(exit, None);
     assert!(matches!(
-        cfg.provisional
+        cfg.state
+            .provisional
             .read()
             .await
             .get(&provisional.handle)
@@ -2328,7 +2597,7 @@ async fn stored_entitlements_cover_tool_secrets_for_approval_check_and_revert() 
             ..
         }
     ));
-    cfg.provisional.write().await.insert(viable.clone());
+    cfg.state.provisional.write().await.insert(viable.clone());
     let (_, exit) = finish_revert(&cfg, &viable, &agent, "test").await;
     assert_eq!(exit, Some(0));
 }
@@ -2338,7 +2607,7 @@ async fn stored_entitlements_cover_tool_secrets_for_approval_check_and_revert() 
 async fn approved_snapshot_rejects_changed_session_revision() {
     let (cfg, _, agent) = gating_config(7021, 1000);
     let token = "held-session-revision";
-    cfg.sessions.write().await.grant(
+    cfg.state.sessions.write().await.grant(
         token.to_string(),
         SessionGrant {
             allow: Vec::new(),
@@ -2357,6 +2626,7 @@ async fn approved_snapshot_rejects_changed_session_revision() {
         },
     );
     let revision = cfg
+        .state
         .sessions
         .read()
         .await
@@ -2378,7 +2648,7 @@ async fn approved_snapshot_rejects_changed_session_revision() {
         principal: agent.principal(),
         secret_binding: None,
     };
-    assert!(cfg.sessions.write().await.revoke(token));
+    assert!(cfg.state.sessions.write().await.revoke(token));
     let result = execute_snapshot(&cfg, &snapshot, "operator approved").await;
     assert!(matches!(
         result.exec,
@@ -2586,7 +2856,11 @@ async fn provisional_revert_executes_in_snapshotted_cwd() {
         revert_exit: None,
         revert_detail: None,
     };
-    cfg.provisional.write().await.insert(provisional.clone());
+    cfg.state
+        .provisional
+        .write()
+        .await
+        .insert(provisional.clone());
 
     let (_message, exit) = finish_revert(&cfg, &provisional, &agent, "test").await;
 

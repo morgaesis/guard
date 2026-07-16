@@ -117,7 +117,7 @@ pub struct EvalConfig {
     pub deny_shapes: Option<Arc<RwLock<DenyShapeStore>>>,
     /// Optional auto-verb-promotion observation store -- see
     /// `gating::allow_promotion`. Bookkeeping only; the verb catalog itself
-    /// (where a promoted verb actually lands) lives in `server::ServerConfig`,
+    /// (where a promoted verb actually lands) lives in `server::ServerState`,
     /// not here.
     pub allow_promotion: Option<Arc<RwLock<AllowPromotionStore>>>,
 }

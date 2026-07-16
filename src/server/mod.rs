@@ -114,212 +114,239 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.ct_eq(b).into()
 }
 
+/// Immutable startup configuration for one daemon instance. The entrypoint
+/// fills it in (CLI flags, environment, derived identity) before `Server::run`;
+/// nothing changes it while the daemon serves.
 #[derive(Clone)]
-struct ServerConfig {
-    pub socket_path: Option<PathBuf>,
-    pub tcp_port: Option<u16>,
-    pub evaluator: Arc<Evaluator>,
-    pub secrets: Arc<SecretManager>,
-    pub redact: bool,
-    pub auth_token: Option<String>,
-    pub admin_token: Option<String>,
+pub(crate) struct ServerConfig {
+    pub(crate) socket_path: Option<PathBuf>,
+    pub(crate) tcp_port: Option<u16>,
+    pub(crate) redact: bool,
+    pub(crate) auth_token: Option<String>,
+    pub(crate) admin_token: Option<String>,
     /// Unix-socket transport option; carried but never read on Windows.
     #[cfg_attr(windows, allow(dead_code))]
-    pub socket_group: Option<String>,
+    pub(crate) socket_group: Option<String>,
     /// Unix-socket peer-UID allowlist; carried but never read on Windows.
     #[cfg_attr(windows, allow(dead_code))]
-    pub allowed_uids: Option<Vec<u32>>,
-    pub shim_dir: Option<PathBuf>,
-    pub dry_run: bool,
+    pub(crate) allowed_uids: Option<Vec<u32>>,
+    pub(crate) shim_dir: Option<PathBuf>,
+    pub(crate) dry_run: bool,
     /// Internal non-executing admission preview. It shares evaluator cache
     /// reads/writes but suppresses every other learned or durable side effect.
-    pub admission_preview: bool,
-    pub tool_registry: Arc<RwLock<ToolRegistry>>,
+    pub(crate) admission_preview: bool,
     /// Known secret values for exact-match output redaction.
-    pub redact_secrets: Vec<String>,
+    pub(crate) redact_secrets: Vec<String>,
     /// When true, run deterministic pre-LLM checks (executable existence on
     /// PATH, credential-disclosure pattern deny). When false, the evaluator
     /// is the only authority on whether a command is allowed.
-    pub preflight: bool,
-    /// Session grant registry. Grants here extend or narrow the policy
-    /// decision for a specific session token.
-    pub sessions: Arc<RwLock<SessionRegistry>>,
-    pub session_store: Option<SessionStore>,
-    /// Shared task-ownership guard. Cloned server configurations can start
-    /// session maintenance at most once for this daemon instance.
-    pub session_maintenance_started: Arc<AtomicBool>,
+    pub(crate) preflight: bool,
     /// When true, approved Unix-socket requests execute as the connecting
     /// user instead of the daemon UID.
-    pub exec_as_caller: bool,
+    pub(crate) exec_as_caller: bool,
     /// Wall-clock unix seconds when the daemon started. Surfaced via the
     /// Status admin RPC so callers can compute uptime.
-    pub started_at_unix: u64,
+    pub(crate) started_at_unix: u64,
     /// Effective UID of the daemon process. Admin RPCs require the
     /// caller to be this UID; there is no token-based elevation.
-    pub daemon_uid: u32,
+    pub(crate) daemon_uid: u32,
     /// The daemon's own cross-platform principal: its uid on Unix, its process
     /// SID on Windows. Operator/admin RPCs require the caller's principal to
     /// equal this - the single "is the operator" source of truth on both
     /// platforms.
-    pub daemon_principal: PrincipalKey,
-    pub state_db_path: Option<PathBuf>,
+    pub(crate) daemon_principal: PrincipalKey,
+    pub(crate) state_db_path: Option<PathBuf>,
     /// Consequence-gating mode. `Off` preserves legacy behavior; `Consequence`
     /// routes LLM-approved commands by reversibility.
-    pub gate: GateMode,
-    /// Containment-envelope state (recoverable provisionals).
-    pub provisional: Arc<RwLock<ProvisionalRegistry>>,
-    /// Operator-approval state (held irreversible commands).
-    pub approvals: Arc<RwLock<ApprovalRegistry>>,
+    pub(crate) gate: GateMode,
     /// Held-command lifetime. `u64::MAX` represents an unbounded operator hold.
-    pub approval_ttl_secs: u64,
-    /// Operator-authored verb catalog (the typed, least-expressive interface).
-    pub verbs: Arc<RwLock<VerbCatalog>>,
-    /// Reusable grants and their generated typed verbs.
-    pub saved_grants: Arc<RwLock<SavedGrantCatalog>>,
-    /// Durable requests to amend a live or saved grant.
-    pub grant_requests: Arc<RwLock<std::collections::BTreeMap<String, GrantRequest>>>,
-    /// Serializes terminal transitions so memory and durable state observe one
-    /// winner for approve, deny, and withdraw races.
-    pub grant_request_transition_gate: Arc<Mutex<()>>,
+    pub(crate) approval_ttl_secs: u64,
     /// Daemon-lifetime authentication key for stateless regeneration
     /// proposals. Cloned configurations share the same key so internal preview
     /// configurations can verify proposals without exposing authority.
-    pub regeneration_proposal_key: Arc<[u8; 32]>,
+    pub(crate) regeneration_proposal_key: Arc<[u8; 32]>,
     /// Optional server-wide binary allow-list. `None` (the default) imposes no
     /// restriction. When `Some`, only binaries permitted by [`binary_allowed`]
     /// may execute, on every route (raw run, verb, and gated approval), as a
     /// hard floor independent of the LLM decision. Set by the daemon entrypoint
     /// from `--allow-bin` / `GUARD_ALLOW_BIN`.
-    pub allowed_binaries: Option<Vec<String>>,
+    pub(crate) allowed_binaries: Option<Vec<String>>,
     /// Extra environment variable names the daemon forwards from its own
     /// environment to executed children, in addition to the built-in
     /// platform allowlist. Operator-declared via `--child-env` /
     /// `GUARD_CHILD_ENV`, this is how brokered credentials reach a tool
     /// generically without per-tool code - e.g. `KUBECONFIG` so brokered
     /// kubectl/helm read a config the agent cannot see.
-    pub extra_child_env: Vec<String>,
-    /// Optional API proxies hosted alongside the gate socket. When set,
-    /// the daemon terminates brokered clients' TLS, gates each API operation
-    /// against the operator policy, and re-originates to the upstream with the
-    /// credentials only the daemon holds.
-    pub protocol_registry:
-        Arc<RwLock<std::collections::HashMap<String, Arc<guard::proxy::ApiProxy>>>>,
-    /// Evaluator-generated API verb coverage shared by all API judges and the
-    /// operator inspection RPCs.
-    pub api_coverage: Option<Arc<RwLock<guard::gating::api_promotion::ApiPromotionStore>>>,
-    /// Active filesystem read grants (Unix-only). Time-boxed POSIX ACL read
-    /// grants issued by the automatic retry path; the sweeper revokes them at
-    /// expiry and startup reconciliation revokes any that expired while the
-    /// daemon was down.
-    pub read_grants: Arc<RwLock<GrantReadRegistry>>,
+    pub(crate) extra_child_env: Vec<String>,
     /// Daemon-only root for child-lifetime secret files.
-    pub secret_file_root: Option<PathBuf>,
-    /// Optional fire-and-forget operator event hook.
-    pub notify_hook: Option<runtime::NotifyHook>,
-    /// Every brokered child stays owned by the daemon until it exits or uses a
-    /// documented detach boundary.
-    pub process_tracker: runtime::ProcessTracker,
+    pub(crate) secret_file_root: Option<PathBuf>,
     /// Optional session-scoped circuit breakers derived from persisted
     /// interactions. Every threshold is disabled by default.
-    pub behavior_limits: SessionBehaviorLimits,
-    /// Shared command-handler and evaluator admission control.
-    pub command_admission: runtime::CommandAdmission,
+    pub(crate) behavior_limits: SessionBehaviorLimits,
 }
 
-impl ServerConfig {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        socket_path: Option<PathBuf>,
-        tcp_port: Option<u16>,
-        evaluator: Evaluator,
-        secrets: SecretManager,
-        redact: bool,
-        auth_token: Option<String>,
-        admin_token: Option<String>,
-        socket_group: Option<String>,
-        allowed_uids: Option<Vec<u32>>,
-        shim_dir: Option<PathBuf>,
-        dry_run: bool,
-        tool_registry: ToolRegistry,
-        redact_secrets: Vec<String>,
-        preflight: bool,
-        sessions: SessionRegistry,
-        session_store: Option<SessionStore>,
-        exec_as_caller: bool,
-        state_db_path: Option<PathBuf>,
-    ) -> Self {
+impl Default for ServerConfig {
+    /// Baseline configuration: no listeners, no tokens, every optional
+    /// behavior off, and this process's own identity. The entrypoint
+    /// overrides the operator-facing fields via struct update syntax.
+    fn default() -> Self {
         use rand::Rng;
         let mut regeneration_proposal_key = [0u8; 32];
         rand::rng().fill_bytes(&mut regeneration_proposal_key);
         Self {
-            socket_path,
-            tcp_port,
-            evaluator: Arc::new(evaluator),
-            secrets: Arc::new(secrets),
-            redact,
-            auth_token,
-            admin_token,
-            socket_group,
-            allowed_uids,
-            shim_dir,
-            dry_run,
+            socket_path: None,
+            tcp_port: None,
+            redact: false,
+            auth_token: None,
+            admin_token: None,
+            socket_group: None,
+            allowed_uids: None,
+            shim_dir: None,
+            dry_run: false,
             admission_preview: false,
-            tool_registry: Arc::new(RwLock::new(tool_registry)),
-            redact_secrets,
-            preflight,
-            session_store,
-            session_maintenance_started: Arc::new(AtomicBool::new(false)),
-            exec_as_caller,
+            redact_secrets: Vec::new(),
+            preflight: false,
+            exec_as_caller: false,
+            started_at_unix: guard::env::now_unix(),
             daemon_uid: current_uid(),
             daemon_principal: resolve_daemon_principal(),
-            sessions: Arc::new(RwLock::new(sessions)),
-            started_at_unix: guard::env::now_unix(),
-            state_db_path,
+            state_db_path: None,
             // Gating defaults to off; the daemon entrypoint enables it and
             // populates the registries from persisted state before serving.
             gate: GateMode::Off,
-            provisional: Arc::new(RwLock::new(ProvisionalRegistry::new())),
-            approvals: Arc::new(RwLock::new(ApprovalRegistry::new())),
             approval_ttl_secs: APPROVAL_TTL_SECS,
-            verbs: Arc::new(RwLock::new(VerbCatalog::empty())),
-            saved_grants: Arc::new(RwLock::new(SavedGrantCatalog::empty())),
-            grant_requests: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
-            grant_request_transition_gate: Arc::new(Mutex::new(())),
             regeneration_proposal_key: Arc::new(regeneration_proposal_key),
             // No binary restriction by default; the entrypoint sets this from
-            // --allow-bin / GUARD_ALLOW_BIN, like the gate fields above.
+            // --allow-bin / GUARD_ALLOW_BIN, like the gate field above.
             allowed_binaries: None,
             // No extra child-env passthrough by default; the entrypoint sets
             // this from --child-env / GUARD_CHILD_ENV.
             extra_child_env: Vec::new(),
+            secret_file_root: None,
+            behavior_limits: SessionBehaviorLimits::default(),
+        }
+    }
+}
+
+/// Shared runtime state: the registries, catalogs, stores, and admission
+/// machinery every connection operates on. Each handle is independently
+/// shared, so cloning the state clones handles, not contents.
+#[derive(Clone)]
+struct ServerState {
+    evaluator: Arc<Evaluator>,
+    secrets: Arc<SecretManager>,
+    tool_registry: Arc<RwLock<ToolRegistry>>,
+    /// Session grant registry. Grants here extend or narrow the policy
+    /// decision for a specific session token.
+    sessions: Arc<RwLock<SessionRegistry>>,
+    session_store: Option<SessionStore>,
+    /// Shared task-ownership guard. Cloned contexts can start session
+    /// maintenance at most once for this daemon instance.
+    session_maintenance_started: Arc<AtomicBool>,
+    /// Containment-envelope state (recoverable provisionals).
+    provisional: Arc<RwLock<ProvisionalRegistry>>,
+    /// Operator-approval state (held irreversible commands).
+    approvals: Arc<RwLock<ApprovalRegistry>>,
+    /// Operator-authored verb catalog (the typed, least-expressive interface).
+    verbs: Arc<RwLock<VerbCatalog>>,
+    /// Reusable grants and their generated typed verbs.
+    saved_grants: Arc<RwLock<SavedGrantCatalog>>,
+    /// Durable requests to amend a live or saved grant.
+    grant_requests: Arc<RwLock<std::collections::BTreeMap<String, GrantRequest>>>,
+    /// Serializes terminal transitions so memory and durable state observe one
+    /// winner for approve, deny, and withdraw races.
+    grant_request_transition_gate: Arc<Mutex<()>>,
+    /// Optional API proxies hosted alongside the gate socket. When set,
+    /// the daemon terminates brokered clients' TLS, gates each API operation
+    /// against the operator policy, and re-originates to the upstream with the
+    /// credentials only the daemon holds.
+    protocol_registry: Arc<RwLock<std::collections::HashMap<String, Arc<guard::proxy::ApiProxy>>>>,
+    /// Evaluator-generated API verb coverage shared by all API judges and the
+    /// operator inspection RPCs.
+    api_coverage: Option<Arc<RwLock<guard::gating::api_promotion::ApiPromotionStore>>>,
+    /// Active filesystem read grants (Unix-only). Time-boxed POSIX ACL read
+    /// grants issued by the automatic retry path; the sweeper revokes them at
+    /// expiry and startup reconciliation revokes any that expired while the
+    /// daemon was down.
+    read_grants: Arc<RwLock<GrantReadRegistry>>,
+    /// Optional fire-and-forget operator event hook.
+    notify_hook: Option<runtime::NotifyHook>,
+    /// Every brokered child stays owned by the daemon until it exits or uses a
+    /// documented detach boundary.
+    process_tracker: runtime::ProcessTracker,
+    /// Shared command-handler and evaluator admission control.
+    command_admission: runtime::CommandAdmission,
+}
+
+impl ServerState {
+    fn new(
+        evaluator: Evaluator,
+        secrets: SecretManager,
+        tool_registry: ToolRegistry,
+        sessions: SessionRegistry,
+        session_store: Option<SessionStore>,
+    ) -> Self {
+        Self {
+            evaluator: Arc::new(evaluator),
+            secrets: Arc::new(secrets),
+            tool_registry: Arc::new(RwLock::new(tool_registry)),
+            sessions: Arc::new(RwLock::new(sessions)),
+            session_store,
+            session_maintenance_started: Arc::new(AtomicBool::new(false)),
+            provisional: Arc::new(RwLock::new(ProvisionalRegistry::new())),
+            approvals: Arc::new(RwLock::new(ApprovalRegistry::new())),
+            verbs: Arc::new(RwLock::new(VerbCatalog::empty())),
+            saved_grants: Arc::new(RwLock::new(SavedGrantCatalog::empty())),
+            grant_requests: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
+            grant_request_transition_gate: Arc::new(Mutex::new(())),
             protocol_registry: Arc::new(RwLock::new(std::collections::HashMap::new())),
             api_coverage: None,
             read_grants: Arc::new(RwLock::new(GrantReadRegistry::new())),
-            secret_file_root: None,
             notify_hook: None,
             process_tracker: runtime::ProcessTracker::default(),
-            behavior_limits: SessionBehaviorLimits::default(),
             command_admission: runtime::CommandAdmission::new(
                 runtime::CommandAdmissionConfig::default(),
             ),
         }
     }
+}
 
+/// One daemon's working context: the immutable startup configuration plus the
+/// shared runtime state. This is what connections, background tasks, and the
+/// admission preview thread through; cloning shares every runtime handle.
+#[derive(Clone)]
+struct ServerContext {
+    config: ServerConfig,
+    state: ServerState,
+}
+
+/// Per-request execution context threaded from the policy layer into gate
+/// routing and process spawn: the daemon context, the authenticated caller,
+/// the recursion depth, and the client output stream.
+struct RequestContext<'a, W> {
+    server: &'a ServerContext,
+    caller: &'a CallerIdentity,
+    depth: u32,
+    stream_output: bool,
+    stream_writer: &'a mut W,
+}
+
+impl ServerContext {
     pub(super) fn emit_event(&self, event: runtime::NotifyEvent) {
-        if let Some(hook) = &self.notify_hook {
+        if let Some(hook) = &self.state.notify_hook {
             hook.emit(event);
         }
     }
 
     #[cfg(unix)]
     fn validate_uid(&self, uid: u32) -> Result<()> {
-        if let Some(ref allowed) = self.allowed_uids {
+        if let Some(ref allowed) = self.config.allowed_uids {
             // The daemon's own UID is always permitted to connect: it
             // already controls the daemon process (signals, /proc), so
             // this is not a security boundary. Without this exemption
             // the daemon could not run admin RPCs against itself, which
             // breaks self-management.
-            if !allowed.contains(&uid) && uid != self.daemon_uid {
+            if !allowed.contains(&uid) && uid != self.config.daemon_uid {
                 tracing::warn!("connection rejected: uid {} not in allowed list", uid);
                 anyhow::bail!("connection not allowed for this user");
             }
@@ -336,7 +363,7 @@ impl ServerConfig {
         // Unix, its SID on Windows. One comparison, both platforms. A Unix
         // caller's principal is the uid string, equal to daemon_principal
         // exactly when uid == daemon_uid, so Unix behavior is unchanged.
-        if matches!(caller.principal(), Some(ref p) if self.daemon_principal.eq_ci(p)) {
+        if matches!(caller.principal(), Some(ref p) if self.config.daemon_principal.eq_ci(p)) {
             return Ok(());
         }
         if matches!(caller, CallerIdentity::TcpAdmin { .. }) {
@@ -346,7 +373,7 @@ impl ServerConfig {
     }
 
     fn validate_token(&self, token: Option<&str>) -> Result<()> {
-        if let Some(ref expected) = self.auth_token {
+        if let Some(ref expected) = self.config.auth_token {
             if !constant_time_eq(token.unwrap_or("").as_bytes(), expected.as_bytes()) {
                 anyhow::bail!("invalid auth token");
             }
@@ -355,7 +382,7 @@ impl ServerConfig {
     }
 
     fn validate_admin_token(&self, token: Option<&str>) -> Result<()> {
-        let Some(ref expected) = self.admin_token else {
+        let Some(ref expected) = self.config.admin_token else {
             anyhow::bail!("admin token is not configured");
         };
         if !constant_time_eq(token.unwrap_or("").as_bytes(), expected.as_bytes()) {
@@ -693,11 +720,11 @@ fn dangerous_env_name(key: &str) -> bool {
 /// the fast path back to the model. Like a trusted verb, it is a
 /// deterministic allow and intentionally precedes the evaluator.
 fn deterministic_safe_allow_reason(
-    config: &ServerConfig,
+    server: &ServerContext,
     binary: &str,
     args: &[String],
 ) -> Option<String> {
-    if matches!(config.evaluator.mode(), Some(PolicyMode::Paranoid)) {
+    if matches!(server.state.evaluator.mode(), Some(PolicyMode::Paranoid)) {
         return None;
     }
 
@@ -766,7 +793,7 @@ fn invalid_shell_secret_reference(
 
 async fn validate_request_injections(
     request: &ExecuteRequest,
-    config: &ServerConfig,
+    server: &ServerContext,
     caller: &CallerIdentity,
     command_line: &str,
 ) -> std::result::Result<(), String> {
@@ -805,7 +832,7 @@ async fn validate_request_injections(
         }
     }
 
-    if config.exec_as_caller && !request.secret_files.is_empty() {
+    if server.config.exec_as_caller && !request.secret_files.is_empty() {
         return Err(
             "--secret-file is unavailable when the daemon uses --exec-as-caller because the caller identity must not receive access to daemon-owned secret files"
                 .to_string(),
@@ -832,7 +859,7 @@ async fn validate_request_injections(
         if let Some(reason) = invalid_shell_secret_reference(command_line, env_var, secret_key) {
             return Err(reason);
         }
-        match config.secrets.get(&principal, secret_key).await {
+        match server.state.secrets.get(&principal, secret_key).await {
             Ok(Some(_)) => {}
             Ok(None) => {
                 return Err(format!(
@@ -850,7 +877,7 @@ async fn validate_request_injections(
         if !is_valid_secret_key(secret_key) {
             return Err(format!("invalid secret key: '{}'", secret_key));
         }
-        match config.secrets.get(&principal, secret_key).await {
+        match server.state.secrets.get(&principal, secret_key).await {
             Ok(Some(_)) => {}
             Ok(None) => {
                 return Err(format!(

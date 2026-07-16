@@ -146,7 +146,7 @@ pub struct AllowObservation {
     /// for the same evidence (a structural validation failure, or an
     /// unrecoverable catalog error such as a name collision) -- and is
     /// permanently excluded from further promotion attempts. Set by
-    /// `server::maybe_promote_allow_verb` via `mark_resolved` once it has a
+    /// `server::learning::maybe_promote_allow_verb` via `mark_resolved` once it has a
     /// definitive verdict; NOT set when the model simply wasn't confident yet
     /// or an LLM call transiently failed, both of which should keep
     /// retrying as more evidence accumulates.
@@ -362,7 +362,7 @@ impl AllowPromotionStore {
     }
 
     /// Permanently exclude a bucket from further promotion attempts: called
-    /// once the caller (`server::maybe_promote_allow_verb`) has a definitive
+    /// once the caller (`server::learning::maybe_promote_allow_verb`) has a definitive
     /// verdict for it -- a verb was promoted, or promotion failed for a
     /// structural reason (evidence round-trip mismatch, catalog name
     /// collision) that the same evidence will reproduce identically forever.
