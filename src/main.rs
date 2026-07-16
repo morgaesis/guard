@@ -180,7 +180,16 @@ enum MainArgs {
     #[clap(
         alias = "exec",
         disable_help_flag = true,
-        after_help = "Use `guard run <binary> --help` to pass --help to the child command."
+        after_help = "Use `guard run <binary> --help` to pass --help to the child command.\n\n\
+            Exit codes:\n  \
+            125    guard operational error (daemon unreachable, protocol failure)\n  \
+            126    denied by policy\n  \
+            127    held for operator approval\n  \
+            2      invalid guard CLI usage\n  \
+            other  the child's own exit status, propagated untranslated\n\n\
+            A child can itself exit 125-127 (`sh -c` exits 127 for a missing command;\n\
+            `git bisect skip` uses 125), so the exit code alone cannot prove a\n\
+            guard-origin outcome. Use --json and read `allowed`/`status` for certainty."
     )]
     Run {
         /// Emit one machine-readable result object instead of streaming child output.
@@ -1447,6 +1456,12 @@ enum ServerCommands {
         service: bool,
     },
     /// Connect to guard server and execute a command
+    #[clap(
+        after_help = "Guard parses its own flags anywhere on the line, so a child argument that\n\
+            matches one (--socket, --env, -h, ...) is consumed by guard instead of the\n\
+            child. Pass `--` after guard's options to forward everything that follows\n\
+            verbatim, e.g. `guard server connect -- df -h`."
+    )]
     Connect {
         /// UNIX socket path to connect to.
         #[arg(long, value_name = "PATH")]
@@ -1499,7 +1514,8 @@ enum ConfigCommands {
     },
     /// Set server socket path
     SetServer {
-        /// UNIX socket path for guard clients.
+        /// Socket path for guard clients: a UNIX domain socket path on Unix,
+        /// or a named pipe path on Windows.
         socket: String,
     },
     /// Set TCP port
@@ -2011,43 +2027,41 @@ fn log_cli_usage_error(args: &[String], error: &clap::Error) {
     );
 }
 
+/// Resolve the command path for audit logging without echoing arbitrary
+/// user-controlled argument values. The path is derived from the clap command
+/// tree itself, so new subcommands are covered automatically (see the
+/// `cli_command_path_covers_every_clap_leaf_command` test). A positional token
+/// that does not name a subcommand of the current level stops the walk; only
+/// the first token is reported verbatim so a mistyped top-level command stays
+/// visible in the audit record.
 fn cli_command_path(args: &[String]) -> String {
-    let mut parts = args
-        .iter()
-        .filter(|arg| !arg.starts_with('-'))
-        .map(String::as_str);
-    let Some(first) = parts.next() else {
+    let mut positionals = args.iter().filter(|arg| !arg.starts_with('-'));
+    let Some(first) = positionals.next() else {
         return "(top-level)".to_string();
     };
-    let Some(second) = parts.next() else {
+    let root = MainArgs::command();
+    let Some(mut current) = find_subcommand(&root, first) else {
         return first.to_string();
     };
-    let allowed_second = match first {
-        "server" => matches!(second, "start" | "connect" | "status"),
-        "secrets" | "secret" => matches!(second, "add" | "list" | "remove"),
-        "config" => matches!(
-            second,
-            "show"
-                | "set-server"
-                | "set-port"
-                | "set-token"
-                | "set-admin-token"
-                | "set-user"
-                | "clear"
-        ),
-        "mcp" => matches!(second, "serve"),
-        "session" => matches!(
-            second,
-            "new" | "grant" | "appeal" | "revoke" | "show" | "list"
-        ),
-        "verb" => matches!(second, "list" | "run" | "create"),
-        _ => false,
-    };
-    if allowed_second {
-        format!("{first} {second}")
-    } else {
-        first.to_string()
+    let mut path = vec![current.get_name().to_string()];
+    for token in positionals {
+        match find_subcommand(current, token) {
+            Some(sub) => {
+                path.push(sub.get_name().to_string());
+                current = sub;
+            }
+            None => break,
+        }
     }
+    path.join(" ")
+}
+
+/// Match a token against a command's subcommands by canonical name or alias,
+/// returning the canonical subcommand so aliases normalize in audit output.
+fn find_subcommand<'cmd>(parent: &'cmd clap::Command, token: &str) -> Option<&'cmd clap::Command> {
+    parent
+        .get_subcommands()
+        .find(|sub| sub.get_name() == token || sub.get_all_aliases().any(|alias| alias == token))
 }
 
 fn print_help_tree(admin: bool) {
