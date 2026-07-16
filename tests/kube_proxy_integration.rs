@@ -247,12 +247,44 @@ async fn ipv6_loopback_listener_serves_with_matching_tls_identity() {
     assert_eq!(response.status(), 200);
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// Reserve a loopback listener up front so the proxy's address is bound with
+/// no release-and-rebind window: the same listener is handed to
+/// [`ApiProxy::serve_on`], so a concurrently starting test can never steal the
+/// port. The bound socket doubles as the readiness signal (a client connect
+/// succeeds as soon as the listener exists), so no startup sleep is needed.
+async fn reserve_listener() -> (tokio::net::TcpListener, std::net::SocketAddr) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    (listener, addr)
+}
+
+/// Poll until `condition` holds, panicking after a generous deadline. Replaces
+/// fixed settle sleeps for asynchronous post-response bookkeeping (revert
+/// arming, hold accounting) that has no completion signal of its own.
+async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+    let start = std::time::Instant::now();
+    while !condition() {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Poll until the proxy's hot-reloader has published the policy in `yaml`.
+async fn wait_for_policy_reload(proxy: &ApiProxy, yaml: &str) {
+    let expected = ApiPolicy::from_yaml(yaml)
+        .expect("reloaded policy parses")
+        .authority_fingerprint();
+    let start = std::time::Instant::now();
+    while proxy.policy_fingerprint().await != expected {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "policy reload was not observed within 10s"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 fn kubeconfig_for(mock_base: &str) -> String {
@@ -273,8 +305,7 @@ async fn start_proxy_with(
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(policy_yaml).expect("policy");
-    let port = free_port();
-    let listen = format!("127.0.0.1:{port}").parse().unwrap();
+    let (listener, listen) = reserve_listener().await;
     let mut proxy = ApiProxy::new(listen, tls, upstream, policy, None);
     if rarity_threshold > 0 {
         proxy = proxy.with_rarity_escalation(rarity_threshold);
@@ -286,13 +317,12 @@ async fn start_proxy_with(
     if let Some(judge) = judge {
         proxy.attach_judge(judge);
     }
-    tokio::spawn(proxy.clone().serve());
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::spawn(proxy.clone().serve_on(listener));
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
         .unwrap();
-    (format!("https://127.0.0.1:{port}"), client)
+    (format!("https://{listen}"), client)
 }
 
 #[derive(Clone)]
@@ -437,20 +467,17 @@ async fn proxy_gates_redacts_and_forwards() {
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).expect("policy");
-    let port = free_port();
-    let listen = format!("127.0.0.1:{port}").parse().unwrap();
+    let (listener, listen) = reserve_listener().await;
     let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
 
     // The brokered config must point at the proxy and carry no credential.
     let brokered = proxy.brokered_kubeconfig();
     guard::proxy::validate_brokered_kubeconfig(&brokered).expect("brokered config credential-free");
-    assert!(brokered.contains(&format!("https://127.0.0.1:{port}")));
+    assert!(brokered.contains(&format!("https://{listen}")));
 
-    tokio::spawn(proxy.clone().serve());
-    // Give the listener a moment to bind.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::spawn(proxy.clone().serve_on(listener));
 
-    let base = format!("https://127.0.0.1:{port}");
+    let base = format!("https://{listen}");
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
@@ -567,17 +594,16 @@ async fn http2_multiplexes_session_authentication_failures_independently() {
         Upstream::from_kubeconfig_str(&kubeconfig_for(&mock_base), None).expect("upstream");
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
-    let port = free_port();
+    let (listener, listen) = reserve_listener().await;
     let proxy = Arc::new(ApiProxy::new(
-        format!("127.0.0.1:{port}").parse().unwrap(),
+        listen,
         tls,
         upstream,
         ApiPolicy::deny_all(),
         None,
     ));
     proxy.attach_session_sink(Arc::new(H2SessionSink));
-    tokio::spawn(proxy.serve());
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::spawn(proxy.serve_on(listener));
 
     let ca_der = base64::engine::general_purpose::STANDARD
         .decode(
@@ -597,9 +623,7 @@ async fn http2_multiplexes_session_authentication_failures_independently() {
         .with_no_client_auth();
     tls_config.alpn_protocols = vec![b"h2".to_vec()];
     let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
-    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
-        .await
-        .unwrap();
+    let tcp = tokio::net::TcpStream::connect(listen).await.unwrap();
     let server_name = pki_types::ServerName::try_from("127.0.0.1")
         .unwrap()
         .to_owned();
@@ -613,7 +637,7 @@ async fn http2_multiplexes_session_authentication_failures_independently() {
         connection.await.unwrap();
     });
 
-    let authority = format!("https://127.0.0.1:{port}/version");
+    let authority = format!("https://{listen}/version");
     let requests = vec![
         Request::builder()
             .uri(&authority)
@@ -732,18 +756,16 @@ async fn proxy_arms_auto_revert_for_writes() {
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).expect("policy");
-    let port = free_port();
-    let listen = format!("127.0.0.1:{port}").parse().unwrap();
+    let (listener, listen) = reserve_listener().await;
     let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
 
     let sink = RecordingSink::default();
     proxy.attach_gate(Arc::new(sink.clone()));
     proxy.attach_session_sink(Arc::new(LiveSessionSink));
 
-    tokio::spawn(proxy.clone().serve());
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::spawn(proxy.clone().serve_on(listener));
 
-    let base = format!("https://127.0.0.1:{port}");
+    let base = format!("https://{listen}");
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
@@ -772,11 +794,13 @@ async fn proxy_arms_auto_revert_for_writes() {
         .unwrap();
     assert_eq!(resp.status(), 200, "patch forwarded");
 
-    // Let the async arming settle.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Reverts are armed asynchronously after the response; poll for both.
+    wait_until("both writes to arm a revert", || {
+        sink.calls.lock().unwrap().len() == 2
+    })
+    .await;
 
     let calls = sink.calls.lock().unwrap();
-    assert_eq!(calls.len(), 2, "both writes armed a revert");
     assert!(calls.iter().all(|call| {
         call.session_fingerprint.as_deref() == Some("session-fingerprint")
             && call.upstream_target == mock_base
@@ -873,14 +897,12 @@ async fn proxy_denies_subresource_and_strips_identity_headers() {
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).expect("policy");
-    let port = free_port();
-    let listen = format!("127.0.0.1:{port}").parse().unwrap();
+    let (listener, listen) = reserve_listener().await;
     let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
 
-    tokio::spawn(proxy.clone().serve());
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::spawn(proxy.clone().serve_on(listener));
 
-    let base = format!("https://127.0.0.1:{port}");
+    let base = format!("https://{listen}");
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
@@ -946,17 +968,15 @@ async fn guard_session_bearer_is_validated_and_never_forwarded() {
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).unwrap();
-    let port = free_port();
-    let listen = format!("127.0.0.1:{port}").parse().unwrap();
+    let (listener, listen) = reserve_listener().await;
     let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
     proxy.attach_session_sink(Arc::new(LiveSessionSink));
-    tokio::spawn(proxy.clone().serve());
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::spawn(proxy.clone().serve_on(listener));
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
         .unwrap();
-    let base = format!("https://127.0.0.1:{port}");
+    let base = format!("https://{listen}");
 
     let response = client
         .get(format!("{base}/api/v1/namespaces/dev/pods"))
@@ -1005,27 +1025,20 @@ async fn guard_session_bearer_is_validated_and_never_forwarded() {
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).unwrap();
-    let restricted_port = free_port();
+    let (restricted_listener, restricted_listen) = reserve_listener().await;
     let restricted_proxy = Arc::new(
-        ApiProxy::new(
-            format!("127.0.0.1:{restricted_port}").parse().unwrap(),
-            tls,
-            upstream,
-            policy,
-            None,
-        )
-        .with_endpoint_context("cluster-a", "cluster-a/token"),
+        ApiProxy::new(restricted_listen, tls, upstream, policy, None)
+            .with_endpoint_context("cluster-a", "cluster-a/token"),
     );
     restricted_proxy.attach_session_sink(Arc::new(RestrictedCredentialSessionSink));
-    tokio::spawn(restricted_proxy.serve());
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::spawn(restricted_proxy.serve_on(restricted_listener));
     let restricted_client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
         .unwrap();
     let restricted = restricted_client
         .get(format!(
-            "https://127.0.0.1:{restricted_port}/api/v1/namespaces/dev/pods"
+            "https://{restricted_listen}/api/v1/namespaces/dev/pods"
         ))
         .bearer_auth("restricted-session")
         .send()
@@ -1043,8 +1056,7 @@ async fn readonly_listener_requires_session_override_and_keeps_protocol_denies()
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml("default: allow\n").unwrap();
-    let port = free_port();
-    let listen = format!("127.0.0.1:{port}").parse().unwrap();
+    let (listener, listen) = reserve_listener().await;
     let proxy = Arc::new(
         ApiProxy::new(listen, tls, upstream, policy, None)
             .with_listener_mode(ApiListenerMode::Readonly),
@@ -1052,13 +1064,12 @@ async fn readonly_listener_requires_session_override_and_keeps_protocol_denies()
     let judge = RecordingJudge::new(vec![judge_allow(Some(1), Some(Reversibility::Reversible))]);
     proxy.attach_judge(Arc::new(judge.clone()));
     proxy.attach_session_sink(Arc::new(LiveSessionSink));
-    tokio::spawn(proxy.clone().serve());
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::spawn(proxy.clone().serve_on(listener));
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
         .unwrap();
-    let base = format!("https://127.0.0.1:{port}");
+    let base = format!("https://{listen}");
 
     let unscoped = client
         .post(format!("{base}/api/v1/namespaces/dev/pods"))
@@ -1105,27 +1116,20 @@ async fn issued_session_modes_enforce_api_boundary_without_prompt_bypass() {
         "default: allow\nrules:\n  - verbs: [get]\n    resources: [configmaps]\n    namespaces: [dev]\n    action: evaluate\n  - verbs: [delete]\n    resources: [pods]\n    namespaces: [dev]\n    action: deny\n",
     )
     .unwrap();
-    let port = free_port();
+    let (listener, listen) = reserve_listener().await;
     let proxy = Arc::new(
-        ApiProxy::new(
-            format!("127.0.0.1:{port}").parse().unwrap(),
-            tls,
-            upstream,
-            policy,
-            None,
-        )
-        .with_listener_mode(ApiListenerMode::Readonly),
+        ApiProxy::new(listen, tls, upstream, policy, None)
+            .with_listener_mode(ApiListenerMode::Readonly),
     );
     let judge = ModeCoverageJudge::default();
     proxy.attach_judge(Arc::new(judge.clone()));
     proxy.attach_session_sink(Arc::new(ModeSessionSink));
-    tokio::spawn(proxy.serve());
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::spawn(proxy.serve_on(listener));
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
         .unwrap();
-    let base = format!("https://127.0.0.1:{port}");
+    let base = format!("https://{listen}");
 
     let policy_only = client
         .get(format!("{base}/api/v1/namespaces/dev/configmaps/cm"))
@@ -1198,8 +1202,7 @@ async fn session_expansion_is_revalidated_immediately_before_forward() {
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml("default: allow\n").unwrap();
-    let port = free_port();
-    let listen = format!("127.0.0.1:{port}").parse().unwrap();
+    let (listener, listen) = reserve_listener().await;
     let proxy = Arc::new(
         ApiProxy::new(listen, tls, upstream, policy, None)
             .with_listener_mode(ApiListenerMode::Readonly),
@@ -1211,17 +1214,14 @@ async fn session_expansion_is_revalidated_immediately_before_forward() {
     proxy.attach_session_sink(Arc::new(ChangingSessionSink {
         resolutions: AtomicUsize::new(0),
     }));
-    tokio::spawn(proxy.clone().serve());
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::spawn(proxy.clone().serve_on(listener));
 
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
         .unwrap();
     let response = client
-        .patch(format!(
-            "https://127.0.0.1:{port}/api/v1/namespaces/dev/pods/web"
-        ))
+        .patch(format!("https://{listen}/api/v1/namespaces/dev/pods/web"))
         .bearer_auth("live-then-edited")
         .header("content-type", "application/merge-patch+json")
         .body(r#"{"metadata":{"labels":{"checked":"true"}}}"#)
@@ -1247,43 +1247,34 @@ async fn hot_reloaded_explicit_deny_is_rechecked_after_evaluator_delay() {
     let evaluate_policy = "default: deny\nrules:\n  - verbs: [patch]\n    resources: [pods]\n    namespaces: [dev]\n    action: evaluate\n";
     std::fs::write(&policy_path, evaluate_policy).unwrap();
     let policy = ApiPolicy::load_file(&policy_path).unwrap();
-    let port = free_port();
-    let proxy = Arc::new(ApiProxy::new(
-        format!("127.0.0.1:{port}").parse().unwrap(),
-        tls,
-        upstream,
-        policy,
-        Some(policy_path.clone()),
-    ));
+    let (listener, listen) = reserve_listener().await;
+    let proxy = Arc::new(
+        ApiProxy::new(listen, tls, upstream, policy, Some(policy_path.clone()))
+            .with_policy_reload_interval(Duration::from_millis(50)),
+    );
     let started = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     proxy.attach_judge(Arc::new(BlockingJudge {
         started: started.clone(),
         release: release.clone(),
     }));
-    tokio::spawn(proxy.serve());
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::spawn(proxy.clone().serve_on(listener));
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
         .unwrap();
     let request = tokio::spawn(async move {
         client
-            .patch(format!(
-                "https://127.0.0.1:{port}/api/v1/namespaces/dev/pods/web"
-            ))
+            .patch(format!("https://{listen}/api/v1/namespaces/dev/pods/web"))
             .body("{}")
             .send()
             .await
             .unwrap()
     });
     started.notified().await;
-    std::fs::write(
-        &policy_path,
-        "default: deny\nrules:\n  - verbs: [patch]\n    resources: [pods]\n    namespaces: [dev]\n    action: deny\n",
-    )
-    .unwrap();
-    tokio::time::sleep(Duration::from_secs(6)).await;
+    let deny_policy = "default: deny\nrules:\n  - verbs: [patch]\n    resources: [pods]\n    namespaces: [dev]\n    action: deny\n";
+    std::fs::write(&policy_path, deny_policy).unwrap();
+    wait_for_policy_reload(&proxy, deny_policy).await;
     release.notify_one();
 
     let response = request.await.unwrap();
@@ -1347,21 +1338,14 @@ async fn direct_allow_revalidates_session_after_delayed_snapshot() {
         "default: deny\nrules:\n  - verbs: [patch]\n    resources: [deployments]\n    namespaces: [dev]\n    action: allow\n",
     )
     .unwrap();
-    let port = free_port();
-    let proxy = Arc::new(ApiProxy::new(
-        format!("127.0.0.1:{port}").parse().unwrap(),
-        tls,
-        upstream,
-        policy,
-        None,
-    ));
+    let (listener, listen) = reserve_listener().await;
+    let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
     proxy.attach_gate(Arc::new(RecordingSink::default()));
     let remaining = Arc::new(AtomicUsize::new(2));
     proxy.attach_session_sink(Arc::new(BudgetSessionSink {
         remaining_resolutions: remaining.clone(),
     }));
-    tokio::spawn(proxy.serve());
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::spawn(proxy.serve_on(listener));
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
@@ -1369,7 +1353,7 @@ async fn direct_allow_revalidates_session_after_delayed_snapshot() {
     let request = tokio::spawn(async move {
         client
             .patch(format!(
-                "https://127.0.0.1:{port}/apis/apps/v1/namespaces/dev/deployments/api"
+                "https://{listen}/apis/apps/v1/namespaces/dev/deployments/api"
             ))
             .bearer_auth("budget-session")
             .body("{}")
@@ -1403,17 +1387,13 @@ async fn assert_direct_allow_reload_fails_closed(next_action: &str, next_intent:
     )
     .unwrap();
     let policy = ApiPolicy::load_file(&policy_path).unwrap();
-    let port = free_port();
-    let proxy = Arc::new(ApiProxy::new(
-        format!("127.0.0.1:{port}").parse().unwrap(),
-        tls,
-        upstream,
-        policy,
-        Some(policy_path.clone()),
-    ));
+    let (listener, listen) = reserve_listener().await;
+    let proxy = Arc::new(
+        ApiProxy::new(listen, tls, upstream, policy, Some(policy_path.clone()))
+            .with_policy_reload_interval(Duration::from_millis(50)),
+    );
     proxy.attach_gate(Arc::new(RecordingSink::default()));
-    tokio::spawn(proxy.serve());
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::spawn(proxy.clone().serve_on(listener));
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
@@ -1421,7 +1401,7 @@ async fn assert_direct_allow_reload_fails_closed(next_action: &str, next_intent:
     let request = tokio::spawn(async move {
         client
             .patch(format!(
-                "https://127.0.0.1:{port}/apis/apps/v1/namespaces/dev/deployments/api"
+                "https://{listen}/apis/apps/v1/namespaces/dev/deployments/api"
             ))
             .body("{}")
             .send()
@@ -1429,10 +1409,11 @@ async fn assert_direct_allow_reload_fails_closed(next_action: &str, next_intent:
             .unwrap()
     });
     started.notified().await;
-    std::fs::write(&policy_path, format!(
+    let next_policy = format!(
         "intent: {next_intent}\ndefault: deny\nrules:\n  - verbs: [patch]\n    resources: [deployments]\n    namespaces: [dev]\n    action: {next_action}\n"
-    )).unwrap();
-    tokio::time::sleep(Duration::from_secs(6)).await;
+    );
+    std::fs::write(&policy_path, &next_policy).unwrap();
+    wait_for_policy_reload(&proxy, &next_policy).await;
     release.notify_one();
 
     assert_eq!(request.await.unwrap().status(), 403);
@@ -1473,14 +1454,12 @@ async fn proxy_self_access_review_carries_upstream_credential() {
         "default: deny\nrules:\n  - verbs: [create]\n    resources: [selfsubjectaccessreviews]\n    namespaces: [\"*\"]\n    action: allow\n",
     )
     .expect("policy");
-    let port = free_port();
-    let listen = format!("127.0.0.1:{port}").parse().unwrap();
+    let (listener, listen) = reserve_listener().await;
     let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
 
-    tokio::spawn(proxy.clone().serve());
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::spawn(proxy.clone().serve_on(listener));
 
-    let base = format!("https://127.0.0.1:{port}");
+    let base = format!("https://{listen}");
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
@@ -1669,26 +1648,19 @@ async fn start_provenance_proxy(
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).unwrap();
-    let port = free_port();
-    let proxy = Arc::new(ApiProxy::new(
-        format!("127.0.0.1:{port}").parse().unwrap(),
-        tls,
-        upstream,
-        policy,
-        None,
-    ));
+    let (listener, listen) = reserve_listener().await;
+    let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
     let sink = RecordingSink::default();
     proxy.attach_gate(Arc::new(sink.clone()));
     if let Some(session_sink) = session_sink {
         proxy.attach_session_sink(session_sink);
     }
-    tokio::spawn(proxy.serve());
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::spawn(proxy.serve_on(listener));
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
         .unwrap();
-    (format!("https://127.0.0.1:{port}"), client, sink)
+    (format!("https://{listen}"), client, sink)
 }
 
 /// A delete of a resource guard itself created earlier in the session is
@@ -1706,17 +1678,15 @@ async fn proxy_allows_contained_delete_of_created_resource() {
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).expect("policy");
-    let port = free_port();
-    let listen = format!("127.0.0.1:{port}").parse().unwrap();
+    let (listener, listen) = reserve_listener().await;
     let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
 
     let sink = RecordingSink::default();
     proxy.attach_gate(Arc::new(sink.clone()));
 
-    tokio::spawn(proxy.clone().serve());
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::spawn(proxy.clone().serve_on(listener));
 
-    let base = format!("https://127.0.0.1:{port}");
+    let base = format!("https://{listen}");
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
@@ -1751,12 +1721,10 @@ async fn proxy_allows_contained_delete_of_created_resource() {
     let status = resp.status();
     resp.bytes().await.unwrap();
     assert_eq!(status, 201, "create forwarded");
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(
-        sink.calls.lock().unwrap().len(),
-        1,
-        "the create armed exactly one revert"
-    );
+    wait_until("the create to arm exactly one revert", || {
+        sink.calls.lock().unwrap().len() == 1
+    })
+    .await;
 
     // Deleting that same resource is now contained cleanup: allowed and forwarded.
     let resp = client
@@ -1772,9 +1740,10 @@ async fn proxy_allows_contained_delete_of_created_resource() {
     );
 
     // The now-moot auto-revert for the create was resolved.
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let resolved_count = sink.resolved.lock().unwrap().len();
-    assert_eq!(resolved_count, 1, "the create's auto-revert was resolved");
+    wait_until("the create's auto-revert to resolve", || {
+        sink.resolved.lock().unwrap().len() == 1
+    })
+    .await;
     assert_eq!(
         sink.calls.lock().unwrap().len(),
         1,
@@ -1922,19 +1891,17 @@ async fn created_provenance_never_overrides_an_explicit_policy_deny() {
         "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n  - verbs: [delete]\n    resources: [pods]\n    namespaces: [dev]\n    action: deny\n",
     )
     .unwrap();
-    let port = free_port();
-    let listen = format!("127.0.0.1:{port}").parse().unwrap();
+    let (listener, listen) = reserve_listener().await;
     let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
     let sink = RecordingSink::default();
     proxy.attach_gate(Arc::new(sink.clone()));
-    tokio::spawn(proxy.clone().serve());
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::spawn(proxy.clone().serve_on(listener));
 
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
         .unwrap();
-    let base = format!("https://127.0.0.1:{port}");
+    let base = format!("https://{listen}");
     let created = client
         .post(format!("{base}/api/v1/namespaces/dev/pods"))
         .body("{}")
@@ -2006,14 +1973,12 @@ async fn proxy_fails_closed_on_non_json_secret_response() {
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).expect("policy");
-    let port = free_port();
-    let listen = format!("127.0.0.1:{port}").parse().unwrap();
+    let (listener, listen) = reserve_listener().await;
     let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
 
-    tokio::spawn(proxy.clone().serve());
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::spawn(proxy.clone().serve_on(listener));
 
-    let base = format!("https://127.0.0.1:{port}");
+    let base = format!("https://{listen}");
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
@@ -2108,17 +2073,15 @@ rules:
 "#,
     )
     .expect("policy");
-    let port = free_port();
-    let listen = format!("127.0.0.1:{port}").parse().unwrap();
+    let (listener, listen) = reserve_listener().await;
     let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
 
     let sink = RecordingSink::default();
     proxy.attach_gate(Arc::new(sink.clone()));
 
-    tokio::spawn(proxy.clone().serve());
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::spawn(proxy.clone().serve_on(listener));
 
-    let base = format!("https://127.0.0.1:{port}");
+    let base = format!("https://{listen}");
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
@@ -2215,14 +2178,12 @@ async fn proxy_redacts_helm_release_secret_without_erroring() {
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).expect("policy");
-    let port = free_port();
-    let listen = format!("127.0.0.1:{port}").parse().unwrap();
+    let (listener, listen) = reserve_listener().await;
     let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
 
-    tokio::spawn(proxy.clone().serve());
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::spawn(proxy.clone().serve_on(listener));
 
-    let base = format!("https://127.0.0.1:{port}");
+    let base = format!("https://{listen}");
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
@@ -2322,13 +2283,11 @@ rules:
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(policy_yaml).expect("policy");
-    let port = free_port();
-    let listen = format!("127.0.0.1:{port}").parse().unwrap();
+    let (listener, listen) = reserve_listener().await;
     let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
-    tokio::spawn(proxy.clone().serve());
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::spawn(proxy.clone().serve_on(listener));
 
-    let base = format!("https://127.0.0.1:{port}");
+    let base = format!("https://{listen}");
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
@@ -2351,16 +2310,14 @@ rules:
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(policy_yaml).expect("policy");
-    let port = free_port();
-    let listen = format!("127.0.0.1:{port}").parse().unwrap();
+    let (listener, listen) = reserve_listener().await;
     let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
     proxy.attach_gate(Arc::new(ApprovingSink));
     let session_sink = RecordingSessionSink::default();
     proxy.attach_session_sink(Arc::new(session_sink.clone()));
-    tokio::spawn(proxy.clone().serve());
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::spawn(proxy.clone().serve_on(listener));
 
-    let base = format!("https://127.0.0.1:{port}");
+    let base = format!("https://{listen}");
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
@@ -2384,23 +2341,19 @@ rules:
         let tls = ProxyTls::generate().expect("tls");
         let ca_pem = tls.ca_pem().to_string();
         let policy = ApiPolicy::from_yaml(policy_yaml).expect("policy");
-        let port = free_port();
-        let listen = format!("127.0.0.1:{port}").parse().unwrap();
+        let (listener, listen) = reserve_listener().await;
         let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
         proxy.attach_gate(Arc::new(DenyingSink { reason }));
         let denied_session = RecordingSessionSink::default();
         proxy.attach_session_sink(Arc::new(denied_session.clone()));
-        tokio::spawn(proxy.clone().serve());
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        tokio::spawn(proxy.clone().serve_on(listener));
 
         let client = reqwest::Client::builder()
             .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
             .build()
             .unwrap();
         let response = client
-            .delete(format!(
-                "https://127.0.0.1:{port}/api/v1/namespaces/dev/pods/web-0"
-            ))
+            .delete(format!("https://{listen}/api/v1/namespaces/dev/pods/web-0"))
             .bearer_auth("live-session")
             .send()
             .await
@@ -2429,26 +2382,19 @@ async fn held_request_captures_complete_body_before_approval_and_stalls_fail_clo
         "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: hold\n",
     )
     .unwrap();
-    let port = free_port();
+    let (listener, listen) = reserve_listener().await;
     let proxy = Arc::new(
-        ApiProxy::new(
-            format!("127.0.0.1:{port}").parse().unwrap(),
-            tls,
-            upstream,
-            policy,
-            None,
-        )
-        .with_request_body_timeout(Duration::from_millis(250)),
+        ApiProxy::new(listen, tls, upstream, policy, None)
+            .with_request_body_timeout(Duration::from_millis(250)),
     );
     let sink = SnapshotSink::default();
     proxy.attach_gate(Arc::new(sink.clone()));
-    tokio::spawn(proxy.serve());
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::spawn(proxy.serve_on(listener));
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
         .unwrap();
-    let base = format!("https://127.0.0.1:{port}");
+    let base = format!("https://{listen}");
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(4);
     let stream = futures::stream::unfold(rx, |mut receiver| async move {
@@ -2586,17 +2532,15 @@ async fn proxy_rarity_escalation_holds_only_rare_shapes() {
     let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
-    let port = free_port();
-    let listen = format!("127.0.0.1:{port}").parse().unwrap();
+    let (listener, listen) = reserve_listener().await;
     // Threshold 2: the first two occurrences of a shape are escalated.
     let proxy =
         Arc::new(ApiProxy::new(listen, tls, upstream, policy, None).with_rarity_escalation(2));
     let sink = CountingSink::default();
     proxy.attach_gate(Arc::new(sink.clone()));
-    tokio::spawn(proxy.clone().serve());
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::spawn(proxy.clone().serve_on(listener));
 
-    let base = format!("https://127.0.0.1:{port}");
+    let base = format!("https://{listen}");
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
@@ -2621,12 +2565,11 @@ async fn proxy_rarity_escalation_holds_only_rare_shapes() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let holds = *sink.holds.lock().unwrap();
-    assert_eq!(
-        holds, 3,
-        "2 holds for the first shape's rare window + 1 for the new-namespace shape"
-    );
+    wait_until(
+        "2 holds for the first shape's rare window + 1 for the new-namespace shape",
+        || *sink.holds.lock().unwrap() == 3,
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2772,12 +2715,11 @@ rules:
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "recoverable with snapshot forwards");
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(
-        sink.calls.lock().unwrap().len(),
-        1,
-        "recoverable evaluate allow arms containment revert"
-    );
+    wait_until(
+        "recoverable evaluate allow to arm a containment revert",
+        || sink.calls.lock().unwrap().len() == 1,
+    )
+    .await;
 
     let judge = RecordingJudge::new(vec![judge_allow(Some(4), Some(Reversibility::Recoverable))]);
     let (base, client) = start_proxy_with(
@@ -3163,14 +3105,13 @@ rules:
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    tokio::time::sleep(Duration::from_millis(100)).await;
     // The prior object is fetched twice on the evaluate path: once before the
     // judge to decide whether a revert is constructible (an input to the
     // verdict), and again at forward time so the armed revert restores state as
     // it was at the write, not as it was before the evaluator round trip.
-    assert_eq!(
-        gets.load(std::sync::atomic::Ordering::SeqCst),
-        2,
-        "evaluate path validates constructibility, then re-fetches fresh for arming"
-    );
+    wait_until(
+        "evaluate path to validate constructibility, then re-fetch fresh for arming",
+        || gets.load(std::sync::atomic::Ordering::SeqCst) == 2,
+    )
+    .await;
 }

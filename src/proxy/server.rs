@@ -56,7 +56,8 @@ use crate::gating::{decide_gate, GateOutcome};
 const MAX_REQ_BODY: usize = 16 * 1024 * 1024;
 const REQUEST_BODY_READ_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// How often the policy file is checked for changes (the operator "slow clock").
+/// How often the policy file is checked for changes (the operator "slow
+/// clock"). The default for [`ApiProxy::with_policy_reload_interval`].
 const POLICY_RELOAD_SECS: u64 = 5;
 
 const RESPONSE_REDACTION_MARKER: &[u8] = b"[REDACTED]";
@@ -203,6 +204,10 @@ pub struct ApiProxy {
     session_sink: OnceLock<Arc<dyn ApiSessionSink>>,
     listener_mode: ApiListenerMode,
     request_body_timeout: Duration,
+    /// How often `policy_path` is checked for changes. Production keeps the
+    /// [`POLICY_RELOAD_SECS`] default; tests inject a short interval so they
+    /// can observe a reload without a multi-second wait.
+    policy_reload_interval: Duration,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -395,6 +400,7 @@ impl ApiProxy {
             session_sink: OnceLock::new(),
             listener_mode: ApiListenerMode::Policy,
             request_body_timeout: REQUEST_BODY_READ_TIMEOUT,
+            policy_reload_interval: Duration::from_secs(POLICY_RELOAD_SECS),
         }
     }
 
@@ -418,6 +424,21 @@ impl ApiProxy {
     pub fn with_request_body_timeout(mut self, timeout: Duration) -> Self {
         self.request_body_timeout = timeout;
         self
+    }
+
+    /// Override how often `policy_path` is checked for changes. The default is
+    /// [`POLICY_RELOAD_SECS`]; tests inject a short interval so a reload can be
+    /// observed promptly.
+    pub fn with_policy_reload_interval(mut self, interval: Duration) -> Self {
+        self.policy_reload_interval = interval;
+        self
+    }
+
+    /// Digest of the currently active policy (see
+    /// [`ApiPolicy::authority_fingerprint`]). Lets a caller observe when a
+    /// hot-reload of `policy_path` has taken effect.
+    pub async fn policy_fingerprint(&self) -> String {
+        self.policy.read().await.authority_fingerprint()
     }
 
     pub fn attach_session_sink(&self, sink: Arc<dyn ApiSessionSink>) {
@@ -2484,7 +2505,7 @@ fn sanitize_shape_key(key: &str) -> String {
 async fn policy_reloader(path: PathBuf, proxy: Arc<ApiProxy>) {
     let mut last = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
     loop {
-        tokio::time::sleep(Duration::from_secs(POLICY_RELOAD_SECS)).await;
+        tokio::time::sleep(proxy.policy_reload_interval).await;
         let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
         if modified == last {
             continue;
