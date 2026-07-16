@@ -102,6 +102,7 @@ pub enum AuditKind {
     ApiRevertFileUnsafe,
     ApiRevertDirUnsafe,
     // Daemon lifecycle and admission telemetry.
+    ApiPromotionCorrupt,
     StartupRecovery,
     CommandAdmission,
     ApiJudgeSpend,
@@ -156,6 +157,7 @@ impl AuditKind {
             Self::Evaluate => "EVALUATE",
             Self::ApiRevertFileUnsafe => "API_REVERT_FILE_UNSAFE",
             Self::ApiRevertDirUnsafe => "API_REVERT_DIR_UNSAFE",
+            Self::ApiPromotionCorrupt => "API_PROMOTION_CORRUPT",
             Self::StartupRecovery => "STARTUP_RECOVERY",
             Self::CommandAdmission => "COMMAND_ADMISSION",
             Self::ApiJudgeSpend => "API_JUDGE_SPEND",
