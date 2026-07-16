@@ -4,8 +4,7 @@ use crate::session::{
 };
 use guard::gating::approval::Approval;
 use guard::gating::provisional::Provisional;
-use guard::gating::verb::CoverageAction;
-use guard::gating::{Coverage, DecisionTrace, DecisionVerbMatch, Reversibility};
+use guard::gating::{Coverage, DecisionTrace, DecisionVerbMatch};
 use guard::principal::PrincipalKey;
 use serde::{Deserialize, Serialize};
 
@@ -104,37 +103,11 @@ impl std::fmt::Display for CallerIdentity {
     }
 }
 
-/// Resolved verb context threaded into gate routing.
-#[derive(Debug, Clone)]
-pub(super) struct VerbContext {
-    pub(super) name: String,
-    pub(super) class: Reversibility,
-    pub(super) trusted: bool,
-    pub(super) params: std::collections::BTreeMap<String, String>,
-    pub(super) catalog_version: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum VerbMatchScope {
-    Baseline,
-    Session,
-}
-
-/// Structured explanation of one applicable verb coverage cell.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VerbMatchInfo {
-    pub verb: String,
-    pub cell: String,
-    pub scope: VerbMatchScope,
-    pub action: CoverageAction,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub features: Vec<String>,
-    #[serde(default)]
-    pub selected: bool,
-    #[serde(default)]
-    pub overridden: bool,
-}
+// Coverage-composition results (`gating::coverage`) surface directly in the
+// daemon's wire responses; re-export them so daemon-side code keeps its
+// existing `server::wire::*` paths.
+pub(super) use guard::gating::coverage::VerbContext;
+pub use guard::gating::coverage::{VerbMatchInfo, VerbMatchScope};
 
 /// Whether a verb's `trusted` flag still applies, given its own
 /// `auto_promoted`/`promotion_stamp` and the daemon's current stamp. A

@@ -46,7 +46,7 @@ impl Evaluator {
     /// Bookkeeping only: record one LLM approval against the auto-verb-
     /// promotion observation store (`gating::allow_promotion`). Returns an
     /// outcome flagging whether this bucket just crossed the promotion
-    /// threshold; the caller (`server::maybe_promote_allow_verb`) decides
+    /// threshold; the caller (`server::learning::maybe_promote_allow_verb`) decides
     /// whether to act on it via `try_confirm_verb_promotion`. Never grants or
     /// matches anything itself -- only appending the result to the verb
     /// catalog does that, which lives outside the `Evaluator`.
@@ -67,7 +67,7 @@ impl Evaluator {
     }
 
     /// Permanently exclude `outcome`'s bucket from further promotion
-    /// attempts. Called by `server::maybe_promote_allow_verb` once it has a
+    /// attempts. Called by `server::learning::maybe_promote_allow_verb` once it has a
     /// definitive verdict (promoted, or failed for a reason the same
     /// evidence will reproduce identically) -- never for a merely-not-
     /// confident-yet or transiently-failed attempt, both of which should

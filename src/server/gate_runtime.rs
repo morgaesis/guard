@@ -21,9 +21,9 @@ use super::wire::{
     VerbContext,
 };
 use super::{
-    ServerConfig, DEFAULT_CONFIRM_WITHIN_SECS, GATING_RETENTION_SECS, MAX_CONFIRM_WITHIN_SECS,
-    MAX_PENDING_GLOBAL, MAX_PENDING_PER_CALLER, REVERT_EXEC_TIMEOUT_SECS, SWEEPER_GRACE_SECS,
-    SWEEPER_TICK_SECS,
+    RequestContext, ServerContext, DEFAULT_CONFIRM_WITHIN_SECS, GATING_RETENTION_SECS,
+    MAX_CONFIRM_WITHIN_SECS, MAX_PENDING_GLOBAL, MAX_PENDING_PER_CALLER, REVERT_EXEC_TIMEOUT_SECS,
+    SWEEPER_GRACE_SECS, SWEEPER_TICK_SECS,
 };
 
 // ===========================================================================
@@ -127,15 +127,15 @@ fn invalid_binary_reason(binary: &str) -> Option<String> {
 /// True when a new hold/provisional would exceed the per-caller or global cap.
 /// Counts outstanding rows across both registries (a local-DoS guard).
 async fn gate_capacity_reason(
-    config: &ServerConfig,
+    server: &ServerContext,
     caller_principal: Option<&PrincipalKey>,
 ) -> Option<String> {
     let (prov_global, prov_caller) = {
-        let reg = config.provisional.read().await;
+        let reg = server.state.provisional.read().await;
         (reg.outstanding(), reg.outstanding_for(caller_principal))
     };
     let (appr_global, appr_caller) = {
-        let reg = config.approvals.read().await;
+        let reg = server.state.approvals.read().await;
         (reg.outstanding(), reg.outstanding_for(caller_principal))
     };
     let global = prov_global + appr_global;
@@ -155,8 +155,8 @@ async fn gate_capacity_reason(
     None
 }
 
-pub(super) async fn persist_provisional(config: &ServerConfig, p: &Provisional) {
-    if let Some(store) = &config.session_store {
+pub(super) async fn persist_provisional(server: &ServerContext, p: &Provisional) {
+    if let Some(store) = &server.state.session_store {
         if let Err(e) = store.save_provisional(p.clone()).await {
             tracing::warn!("failed to persist provisional {}: {}", p.handle, e);
         }
@@ -170,8 +170,9 @@ pub(super) async fn persist_provisional(config: &ServerConfig, p: &Provisional) 
 /// outlive its window, or a delete of a same-named resource an operator later
 /// recreates outside guard would still match the stale entry and bypass policy.
 /// A no-op when the proxy is not enabled or the handle was not a proxy create.
-pub(super) async fn forget_proxy_provenance(config: &ServerConfig, handle: &str) {
-    let proxies: Vec<_> = config
+pub(super) async fn forget_proxy_provenance(server: &ServerContext, handle: &str) {
+    let proxies: Vec<_> = server
+        .state
         .protocol_registry
         .read()
         .await
@@ -247,7 +248,7 @@ pub(super) fn remove_revert_body(p: &Provisional) {
 /// client disconnected while waiting), so the queue never offers the operator
 /// an approval that releases nothing. Disarmed on a normal decision.
 struct ProxyHoldOrphanGuard {
-    config: ServerConfig,
+    server: ServerContext,
     handle: String,
     armed: bool,
 }
@@ -257,12 +258,12 @@ impl Drop for ProxyHoldOrphanGuard {
         if !self.armed {
             return;
         }
-        let config = self.config.clone();
+        let server = self.server.clone();
         let handle = self.handle.clone();
         tokio::spawn(async move {
             let now = now_unix();
             {
-                let mut reg = config.approvals.write().await;
+                let mut reg = server.state.approvals.write().await;
                 match reg.get(&handle).map(|a| a.status) {
                     Some(s) if s.is_pending() => {}
                     _ => return,
@@ -275,9 +276,9 @@ impl Drop for ProxyHoldOrphanGuard {
                 );
             }
             let session_fingerprint =
-                if let Some(a) = config.approvals.read().await.get(&handle).cloned() {
+                if let Some(a) = server.state.approvals.read().await.get(&handle).cloned() {
                     let session_fingerprint = a.snapshot.session_fingerprint.clone();
-                    persist_approval(&config, &a).await;
+                    persist_approval(&server, &a).await;
                     session_fingerprint
                 } else {
                     None
@@ -286,7 +287,7 @@ impl Drop for ProxyHoldOrphanGuard {
                 "[AUDIT] HOLD_ORPHANED handle={} (api-proxy client disconnected)",
                 handle
             );
-            config.emit_event(NotifyEvent {
+            server.emit_event(NotifyEvent {
                 event: "decision_made",
                 at_unix: now,
                 handle: Some(handle),
@@ -300,13 +301,13 @@ impl Drop for ProxyHoldOrphanGuard {
 }
 
 /// Bridges the API proxy's synthesized reverts into the daemon's consequence
-/// machinery. Holds a clone of the server config (which shares the provisional
+/// machinery. Holds a clone of the server server (which shares the provisional
 /// registry and state store), and a directory for stored HTTP revert bodies.
 /// The proxy acts as the daemon principal, so the operator manages
 /// proxy-armed provisionals with the same
 /// `guard confirm` / `guard provisionals` / `guard revert` commands.
 pub(super) struct DaemonGateSink {
-    pub(super) config: ServerConfig,
+    pub(super) server: ServerContext,
     pub(super) endpoint: String,
     pub(super) protocol: String,
     pub(super) snapshot_dir: PathBuf,
@@ -342,16 +343,16 @@ impl guard::proxy::GateSink for DaemonGateSink {
         // provisional queue is full. The evaluate path consults this before
         // forwarding a write it would only forward because a revert was
         // promised, so it holds rather than forward an uncontainable write.
-        let principal = Some(self.config.daemon_principal.clone());
+        let principal = Some(self.server.config.daemon_principal.clone());
         self.snapshot_dir_safe
-            && gate_capacity_reason(&self.config, principal.as_ref())
+            && gate_capacity_reason(&self.server, principal.as_ref())
                 .await
                 .is_none()
     }
 
     async fn arm_revert(&self, mutation: guard::proxy::ApiMutation) -> Option<String> {
-        let principal = Some(self.config.daemon_principal.clone());
-        if let Some(reason) = gate_capacity_reason(&self.config, principal.as_ref()).await {
+        let principal = Some(self.server.config.daemon_principal.clone());
+        if let Some(reason) = gate_capacity_reason(&self.server, principal.as_ref()).await {
             tracing::warn!("api-proxy auto-revert not armed: {}", reason);
             return None;
         }
@@ -417,13 +418,14 @@ impl guard::proxy::GateSink for DaemonGateSink {
             revert_detail: None,
             api_revert: Some(api_revert),
         };
-        persist_provisional(&self.config, &provisional).await;
-        self.config
+        persist_provisional(&self.server, &provisional).await;
+        self.server
+            .state
             .provisional
             .write()
             .await
             .insert(provisional.clone());
-        self.config.emit_event(NotifyEvent {
+        self.server.emit_event(NotifyEvent {
             event: "provisional_armed",
             at_unix: now,
             handle: Some(handle.clone()),
@@ -442,8 +444,8 @@ impl guard::proxy::GateSink for DaemonGateSink {
         session_context: Option<&guard::proxy::ApiSessionContext>,
     ) -> guard::proxy::HoldDecision {
         use guard::proxy::HoldDecision;
-        let principal = Some(self.config.daemon_principal.clone());
-        if let Some(why) = gate_capacity_reason(&self.config, principal.as_ref()).await {
+        let principal = Some(self.server.config.daemon_principal.clone());
+        if let Some(why) = gate_capacity_reason(&self.server, principal.as_ref()).await {
             return HoldDecision::Denied { reason: why };
         }
         let handle = new_handle();
@@ -503,7 +505,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
             reversibility: None,
             decision_trace: Some(guard::gating::DecisionTrace::source("api_proxy")),
             created_unix: now,
-            ttl_secs: self.config.approval_ttl_secs,
+            ttl_secs: self.server.config.approval_ttl_secs,
             status: ApprovalStatus::Pending,
             decided_unix: None,
             decided_reason: None,
@@ -513,12 +515,13 @@ impl guard::proxy::GateSink for DaemonGateSink {
             notes: Vec::new(),
         };
         let notify = self
-            .config
+            .server
+            .state
             .approvals
             .write()
             .await
             .enqueue(approval.clone());
-        persist_approval(&self.config, &approval).await;
+        persist_approval(&self.server, &approval).await;
         tracing::info!(target: "guard::audit",
             "[AUDIT] HELD handle={} caller=(api-proxy) session={} api=\"{}\" body_sha256={} ttl={}s",
             handle,
@@ -527,9 +530,9 @@ impl guard::proxy::GateSink for DaemonGateSink {
                 .unwrap_or("none"),
             guard::redact::audit_escape(&api_snapshot.label),
             api_snapshot.body_sha256,
-            self.config.approval_ttl_secs
+            self.server.config.approval_ttl_secs
         );
-        self.config.emit_event(NotifyEvent {
+        self.server.emit_event(NotifyEvent {
             event: "hold_created",
             at_unix: now,
             handle: Some(handle.clone()),
@@ -541,17 +544,17 @@ impl guard::proxy::GateSink for DaemonGateSink {
         // If the brokered client disconnects while parked, this future is
         // dropped mid-await; the guard then retires the orphaned hold.
         let mut orphan_guard = ProxyHoldOrphanGuard {
-            config: self.config.clone(),
+            server: self.server.clone(),
             handle: handle.clone(),
             armed: true,
         };
         // The sweeper expires the row at its TTL and wakes this waiter; the
         // slack past the TTL is a backstop against a missed wakeup, not a
         // second policy timer.
-        let deadline = (self.config.approval_ttl_secs != u64::MAX).then(|| {
+        let deadline = (self.server.config.approval_ttl_secs != u64::MAX).then(|| {
             tokio::time::Instant::now()
                 .checked_add(std::time::Duration::from_secs(
-                    self.config.approval_ttl_secs.saturating_add(60),
+                    self.server.config.approval_ttl_secs.saturating_add(60),
                 ))
                 .unwrap_or_else(tokio::time::Instant::now)
         });
@@ -564,7 +567,15 @@ impl guard::proxy::GateSink for DaemonGateSink {
             tokio::pin!(notified);
             notified.as_mut().enable();
 
-            match self.config.approvals.read().await.get(&handle).cloned() {
+            match self
+                .server
+                .state
+                .approvals
+                .read()
+                .await
+                .get(&handle)
+                .cloned()
+            {
                 Some(a) if a.status == ApprovalStatus::Approved => {
                     orphan_guard.armed = false;
                     return HoldDecision::Approved { handle };
@@ -609,17 +620,17 @@ impl guard::proxy::GateSink for DaemonGateSink {
         // the timer; the sweeper then never tries to delete an absent object. A
         // handle that is already terminal is a no-op.
         let updated = {
-            let mut reg = self.config.provisional.write().await;
+            let mut reg = self.server.state.provisional.write().await;
             reg.confirm(handle)
         };
         match updated {
             Ok(p) => {
-                persist_provisional(&self.config, &p).await;
+                persist_provisional(&self.server, &p).await;
                 tracing::info!(
                     "api-proxy: resolved auto-revert {} (created object deleted by workload)",
                     handle
                 );
-                self.config.emit_event(NotifyEvent {
+                self.server.emit_event(NotifyEvent {
                     event: "decision_made",
                     at_unix: now_unix(),
                     handle: Some(handle.to_string()),
@@ -634,16 +645,16 @@ impl guard::proxy::GateSink for DaemonGateSink {
     }
 }
 
-async fn delete_provisional_row(config: &ServerConfig, handle: &str) {
-    if let Some(store) = &config.session_store {
+async fn delete_provisional_row(server: &ServerContext, handle: &str) {
+    if let Some(store) = &server.state.session_store {
         if let Err(e) = store.delete_provisional(handle.to_string()).await {
             tracing::warn!("failed to delete provisional {}: {}", handle, e);
         }
     }
 }
 
-pub(super) async fn persist_approval(config: &ServerConfig, a: &Approval) {
-    if let Some(store) = &config.session_store {
+pub(super) async fn persist_approval(server: &ServerContext, a: &Approval) {
+    if let Some(store) = &server.state.session_store {
         if let Err(e) = store.save_approval(a.clone()).await {
             tracing::warn!("failed to persist approval {}: {}", a.handle, e);
         }
@@ -670,14 +681,14 @@ enum RevertAssessment {
 /// unverified rollback. An operator-authored verb revert is the slow clock and is
 /// not routed here.
 async fn assess_revert(
-    config: &ServerConfig,
+    server: &ServerContext,
     forward: &ExecuteRequest,
     revert: &RevertSpec,
 ) -> RevertAssessment {
     if let Some(reason) = invalid_binary_reason(&revert.binary) {
         return RevertAssessment::NeedsReview(reason);
     }
-    if !binary_allowed(&config.allowed_binaries, &revert.binary) {
+    if !binary_allowed(&server.config.allowed_binaries, &revert.binary) {
         return RevertAssessment::NeedsReview(format!(
             "rollback binary '{}' is outside the server allow-list",
             revert.binary
@@ -689,7 +700,7 @@ async fn assess_revert(
                 "invalid confirmation-check command: {reason}"
             ));
         }
-        if !binary_allowed(&config.allowed_binaries, &check.binary) {
+        if !binary_allowed(&server.config.allowed_binaries, &check.binary) {
             return RevertAssessment::NeedsReview(format!(
                 "confirmation-check binary '{}' is outside the server allow-list",
                 check.binary
@@ -740,7 +751,8 @@ async fn assess_revert(
             .as_deref()
             .unwrap_or("none; deadline always rolls back")
     );
-    match config
+    match server
+        .state
         .evaluator
         .evaluate_with_context(&revert_line, Some(&context))
         .await
@@ -819,14 +831,15 @@ impl From<(String, Option<Vec<String>>)> for SessionAuthoritySnapshot {
 }
 
 async fn session_authority_is_current(
-    config: &ServerConfig,
+    server: &ServerContext,
     request: &ExecuteRequest,
     expected: Option<&SessionAuthoritySnapshot>,
 ) -> bool {
     let Some(token) = request.session_token.as_deref() else {
         return expected.is_none();
     };
-    let current = config
+    let current = server
+        .state
         .sessions
         .read()
         .await
@@ -837,21 +850,18 @@ async fn session_authority_is_current(
 
 /// Route an approved command through the consequence gate.
 pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
+    context: &mut RequestContext<'_, W>,
     request: ExecuteRequest,
-    config: &ServerConfig,
-    caller: &CallerIdentity,
-    inputs: GateInputs,
-    depth: u32,
-    stream_output: bool,
-    stream_writer: &mut W,
+    mut inputs: GateInputs,
 ) -> ExecuteResult {
+    let server = context.server;
     if request.session_token.is_some() {
         let Some(expected) = inputs.authority.as_ref() else {
             return ExecuteResult::denied(
                 "session authority was not captured before execution routing",
             );
         };
-        if !session_authority_is_current(config, &request, Some(expected)).await {
+        if !session_authority_is_current(server, &request, Some(expected)).await {
             return ExecuteResult::denied(
                 "session expired, was revoked, or changed while the command was being evaluated",
             );
@@ -863,15 +873,11 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
         .map(|snapshot| snapshot.secret_entitlements.clone());
 
     // Gating off, or an operator-authored static-policy allow: execute directly.
-    if !config.gate.is_on() || inputs.bypass {
+    if !server.config.gate.is_on() || inputs.bypass {
         return exec_with_read_grant_retry_with_secret_authority(
+            context,
             request,
-            config,
-            caller,
             inputs.reason,
-            depth,
-            stream_output,
-            stream_writer,
             secret_authority,
         )
         .await;
@@ -879,7 +885,7 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
 
     // The row owner is the caller's cross-platform principal (uid string on
     // Unix, SID on Windows). A non-Unix caller is no longer dropped to None.
-    let caller_principal = caller.principal();
+    let caller_principal = context.caller.principal();
     let force_hold = request.require_approval.unwrap_or(false);
     let revert_available = request.revert.is_some();
     let outcome = decide_gate(
@@ -892,13 +898,9 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
     match outcome {
         GateOutcome::ExecuteNow => {
             exec_with_read_grant_retry_with_secret_authority(
+                context,
                 request,
-                config,
-                caller,
                 inputs.reason,
-                depth,
-                stream_output,
-                stream_writer,
                 secret_authority,
             )
             .await
@@ -916,75 +918,48 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
                     || revert.control_path.is_some();
                 if requires_live_assessment {
                     if let RevertAssessment::NeedsReview(why) =
-                        assess_revert(config, &request, &revert).await
+                        assess_revert(server, &request, &revert).await
                     {
-                        let hold_reason = format!(
+                        inputs.reason = format!(
                             "{} [held for operator review: containment envelope not validated: {}]",
                             inputs.reason, why
                         );
                         return hold_for_approval_with_authority(
+                            context,
                             request,
-                            config,
-                            caller,
                             caller_principal,
-                            hold_reason,
-                            inputs.risk,
-                            inputs.reversibility,
-                            inputs.verb,
-                            stream_output,
-                            stream_writer,
-                            inputs.authority,
+                            inputs,
                         )
                         .await;
                     }
                 }
             }
             arm_containment_with_authority(
+                context,
                 request,
-                config,
-                caller,
                 caller_principal,
                 inputs.reason,
-                depth,
-                stream_output,
-                stream_writer,
                 inputs.authority,
             )
             .await
         }
         GateOutcome::Hold => {
-            hold_for_approval_with_authority(
-                request,
-                config,
-                caller,
-                caller_principal,
-                inputs.reason,
-                inputs.risk,
-                inputs.reversibility,
-                inputs.verb,
-                stream_output,
-                stream_writer,
-                inputs.authority,
-            )
-            .await
+            hold_for_approval_with_authority(context, request, caller_principal, inputs).await
         }
     }
 }
 
 /// Arm a containment envelope: persist the provisional, run the forward command,
 /// then mark it armed with an auto-revert deadline.
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn arm_containment_with_authority<W: AsyncWrite + Unpin>(
+    context: &mut RequestContext<'_, W>,
     request: ExecuteRequest,
-    config: &ServerConfig,
-    caller: &CallerIdentity,
     caller_principal: Option<PrincipalKey>,
     reason: String,
-    depth: u32,
-    stream_output: bool,
-    stream_writer: &mut W,
     authority: Option<SessionAuthoritySnapshot>,
 ) -> ExecuteResult {
+    let server = context.server;
+    let caller = context.caller;
     // decide_gate only returns Contain when a revert is present.
     let revert = match request.revert.clone() {
         Some(r) => r,
@@ -994,7 +969,7 @@ pub(super) async fn arm_containment_with_authority<W: AsyncWrite + Unpin>(
     if let Some(why) = invalid_binary_reason(&revert.binary) {
         return ExecuteResult::exec_failed(reason, why);
     }
-    if !binary_allowed(&config.allowed_binaries, &revert.binary) {
+    if !binary_allowed(&server.config.allowed_binaries, &revert.binary) {
         return ExecuteResult::exec_failed(
             reason,
             format!(
@@ -1010,7 +985,7 @@ pub(super) async fn arm_containment_with_authority<W: AsyncWrite + Unpin>(
                 format!("invalid confirmation-check command: {why}"),
             );
         }
-        if !binary_allowed(&config.allowed_binaries, &check.binary) {
+        if !binary_allowed(&server.config.allowed_binaries, &check.binary) {
             return ExecuteResult::exec_failed(
                 reason,
                 format!(
@@ -1021,7 +996,7 @@ pub(super) async fn arm_containment_with_authority<W: AsyncWrite + Unpin>(
         }
     }
 
-    if config.dry_run {
+    if server.config.dry_run {
         return ExecuteResult::dry_run_gated(
             format!(
                 "{} [GATE] would execute inside a containment envelope (auto-revert: {} {})",
@@ -1048,7 +1023,7 @@ pub(super) async fn arm_containment_with_authority<W: AsyncWrite + Unpin>(
     // The rollback was assessed by the gate router before this point (free-form
     // reverts are policy- and sensibility-checked; a verb revert is the
     // operator-authored slow clock), so the envelope is armed here directly.
-    if let Some(why) = gate_capacity_reason(config, caller_principal.as_ref()).await {
+    if let Some(why) = gate_capacity_reason(server, caller_principal.as_ref()).await {
         return ExecuteResult::denied(why);
     }
 
@@ -1062,7 +1037,7 @@ pub(super) async fn arm_containment_with_authority<W: AsyncWrite + Unpin>(
         .confirm_within_secs
         .unwrap_or(DEFAULT_CONFIRM_WITHIN_SECS)
         .clamp(1, MAX_CONFIRM_WITHIN_SECS);
-    if !session_authority_is_current(config, &request, authority.as_ref()).await {
+    if !session_authority_is_current(server, &request, authority.as_ref()).await {
         return ExecuteResult::denied(
             "session expired, was revoked, or changed before containment could be armed",
         );
@@ -1130,18 +1105,19 @@ pub(super) async fn arm_containment_with_authority<W: AsyncWrite + Unpin>(
 
     // Commit BEFORE exec so a crash between exec and arm still leaves a
     // recoverable revert (startup recovery routes it to needs_operator_decision).
-    persist_provisional(config, &provisional).await;
-    config.provisional.write().await.insert(provisional.clone());
+    persist_provisional(server, &provisional).await;
+    server
+        .state
+        .provisional
+        .write()
+        .await
+        .insert(provisional.clone());
 
     let session_fingerprint = audit_session_fingerprint(request.session_token.as_deref());
     let result = exec_after_approval_with_secret_authority(
+        context,
         request,
-        config,
-        caller,
         reason.clone(),
-        depth,
-        stream_output,
-        stream_writer,
         Some(provisional.secret_entitlements.clone()),
     )
     .await;
@@ -1154,12 +1130,12 @@ pub(super) async fn arm_containment_with_authority<W: AsyncWrite + Unpin>(
             stderr,
         } => {
             let updated = {
-                let mut reg = config.provisional.write().await;
+                let mut reg = server.state.provisional.write().await;
                 reg.mark_forward_done(&handle, exit_code);
                 reg.get(&handle).cloned()
             };
             if let Some(u) = updated {
-                persist_provisional(config, &u).await;
+                persist_provisional(server, &u).await;
             }
             tracing::info!(target: "guard::audit",
                 "[AUDIT] PROVISIONAL handle={} caller={} session_fingerprint={} deadline={} window={}s revert=\"{}\"",
@@ -1170,7 +1146,7 @@ pub(super) async fn arm_containment_with_authority<W: AsyncWrite + Unpin>(
                 window,
                 audit_command_line(&revert.binary, &revert.args)
             );
-            config.emit_event(NotifyEvent {
+            server.emit_event(NotifyEvent {
                 event: "provisional_armed",
                 at_unix: now_unix(),
                 handle: Some(handle.clone()),
@@ -1196,12 +1172,12 @@ pub(super) async fn arm_containment_with_authority<W: AsyncWrite + Unpin>(
         // forward done so the deadline is honored, and surface the failure.
         ExecOutcome::Failed { started: true, .. } => {
             let updated = {
-                let mut reg = config.provisional.write().await;
+                let mut reg = server.state.provisional.write().await;
                 reg.mark_forward_done(&handle, None);
                 reg.get(&handle).cloned()
             };
             if let Some(u) = updated {
-                persist_provisional(config, &u).await;
+                persist_provisional(server, &u).await;
             }
             tracing::warn!(target: "guard::audit",
                 "[AUDIT] PROVISIONAL_INTERRUPTED handle={} caller={} session_fingerprint={} deadline={} (forward launched then failed; auto-revert armed)",
@@ -1215,29 +1191,33 @@ pub(super) async fn arm_containment_with_authority<W: AsyncWrite + Unpin>(
         _ => {
             // The child never ran (spawn/setup failure) - nothing to revert.
             // Drop the provisional and return the failure as-is.
-            config.provisional.write().await.remove(&handle);
-            delete_provisional_row(config, &handle).await;
+            server.state.provisional.write().await.remove(&handle);
+            delete_provisional_row(server, &handle).await;
             result
         }
     }
 }
 
 /// Hold an irreversible/uncertain/high-risk command for operator approval.
-#[allow(clippy::too_many_arguments)]
+/// Consumes the routed [`GateInputs`]; `revert_preauthorized` and `bypass`
+/// have already been acted on by the router and are ignored here.
 pub(super) async fn hold_for_approval_with_authority<W: AsyncWrite + Unpin>(
+    context: &mut RequestContext<'_, W>,
     request: ExecuteRequest,
-    config: &ServerConfig,
-    caller: &CallerIdentity,
     caller_principal: Option<PrincipalKey>,
-    reason: String,
-    risk: Option<i32>,
-    reversibility: Option<Reversibility>,
-    verb: Option<VerbContext>,
-    stream_output: bool,
-    stream_writer: &mut W,
-    authority: Option<SessionAuthoritySnapshot>,
+    inputs: GateInputs,
 ) -> ExecuteResult {
-    if config.dry_run {
+    let server = context.server;
+    let caller = context.caller;
+    let GateInputs {
+        reason,
+        risk,
+        reversibility,
+        verb,
+        authority,
+        ..
+    } = inputs;
+    if server.config.dry_run {
         return ExecuteResult::dry_run_gated(
             format!(
                 "{} [GATE] would be held for operator approval (irreversible/uncertain)",
@@ -1246,7 +1226,7 @@ pub(super) async fn hold_for_approval_with_authority<W: AsyncWrite + Unpin>(
             Coverage::hold(),
         );
     }
-    if let Some(why) = gate_capacity_reason(config, caller_principal.as_ref()).await {
+    if let Some(why) = gate_capacity_reason(server, caller_principal.as_ref()).await {
         return ExecuteResult::denied(why);
     }
 
@@ -1254,12 +1234,12 @@ pub(super) async fn hold_for_approval_with_authority<W: AsyncWrite + Unpin>(
     let now = now_unix();
 
     let tool_secret_sources = {
-        let mut registry = config.tool_registry.write().await;
+        let mut registry = server.state.tool_registry.write().await;
         let _ = registry.reload_if_stale();
         match registry
             .resolve_env(
                 &request.binary,
-                &config.secrets,
+                &server.state.secrets,
                 caller_principal.as_ref(),
                 caller.user_key().as_deref(),
             )
@@ -1288,7 +1268,7 @@ pub(super) async fn hold_for_approval_with_authority<W: AsyncWrite + Unpin>(
             let salt = hex_encode(&rand::random::<u128>().to_le_bytes());
             let mut hashes = std::collections::BTreeMap::new();
             for (env_var, secret_name) in request.secrets.iter().chain(&request.secret_files) {
-                let entry = match config.secrets.get(&principal, secret_name).await {
+                let entry = match server.state.secrets.get(&principal, secret_name).await {
                     Ok(Some(value)) => hash_secret_value(&salt, &value),
                     _ => SECRET_BINDING_UNRESOLVED.to_string(),
                 };
@@ -1296,7 +1276,7 @@ pub(super) async fn hold_for_approval_with_authority<W: AsyncWrite + Unpin>(
             }
             let mut tool_hashes = std::collections::BTreeMap::new();
             for (env_var, secret_name) in tool_secret_sources {
-                let entry = match config.secrets.get(&principal, &secret_name).await {
+                let entry = match server.state.secrets.get(&principal, &secret_name).await {
                     Ok(Some(value)) => hash_secret_value(&salt, &value),
                     _ => SECRET_BINDING_UNRESOLVED.to_string(),
                 };
@@ -1317,7 +1297,7 @@ pub(super) async fn hold_for_approval_with_authority<W: AsyncWrite + Unpin>(
         _ => None,
     };
 
-    if !session_authority_is_current(config, &request, authority.as_ref()).await {
+    if !session_authority_is_current(server, &request, authority.as_ref()).await {
         return ExecuteResult::denied(
             "session expired, was revoked, or changed before approval hold creation",
         );
@@ -1373,7 +1353,7 @@ pub(super) async fn hold_for_approval_with_authority<W: AsyncWrite + Unpin>(
         reversibility,
         decision_trace: Some(guard::gating::DecisionTrace::source("evaluator")),
         created_unix: now,
-        ttl_secs: config.approval_ttl_secs,
+        ttl_secs: server.config.approval_ttl_secs,
         status: ApprovalStatus::Pending,
         decided_unix: None,
         decided_reason: None,
@@ -1383,8 +1363,13 @@ pub(super) async fn hold_for_approval_with_authority<W: AsyncWrite + Unpin>(
         notes: Vec::new(),
     };
 
-    let notify = config.approvals.write().await.enqueue(approval.clone());
-    persist_approval(config, &approval).await;
+    let notify = server
+        .state
+        .approvals
+        .write()
+        .await
+        .enqueue(approval.clone());
+    persist_approval(server, &approval).await;
     tracing::info!(target: "guard::audit",
         "[AUDIT] HELD handle={} caller={} session_fingerprint={} risk={:?} class={:?} cmd=\"{}\" ttl={}s",
         handle,
@@ -1393,9 +1378,9 @@ pub(super) async fn hold_for_approval_with_authority<W: AsyncWrite + Unpin>(
         risk,
         reversibility.map(|r| r.as_str()),
         audit_command_line(&request.binary, &request.args),
-        config.approval_ttl_secs
+        server.config.approval_ttl_secs
     );
-    config.emit_event(NotifyEvent {
+    server.emit_event(NotifyEvent {
         event: "hold_created",
         at_unix: now_unix(),
         handle: Some(handle.clone()),
@@ -1410,7 +1395,15 @@ pub(super) async fn hold_for_approval_with_authority<W: AsyncWrite + Unpin>(
 
     match request.wait_approval_secs {
         Some(wait) => {
-            wait_for_decision(config, &handle, notify, wait, stream_output, stream_writer).await
+            wait_for_decision(
+                server,
+                &handle,
+                notify,
+                wait,
+                context.stream_output,
+                context.stream_writer,
+            )
+            .await
         }
         None => ExecuteResult::held(reason, handle, Coverage::hold()),
     }
@@ -1420,7 +1413,7 @@ pub(super) async fn hold_for_approval_with_authority<W: AsyncWrite + Unpin>(
 /// emitting keepalives on the streaming path so the connection stays open, then
 /// return the real outcome. On timeout the command stays held.
 async fn wait_for_decision<W: AsyncWrite + Unpin>(
-    config: &ServerConfig,
+    server: &ServerContext,
     handle: &str,
     notify: std::sync::Arc<tokio::sync::Notify>,
     wait_secs: u64,
@@ -1443,7 +1436,7 @@ async fn wait_for_decision<W: AsyncWrite + Unpin>(
         tokio::pin!(notified);
         notified.as_mut().enable();
 
-        if let Some(a) = config.approvals.read().await.get(handle).cloned() {
+        if let Some(a) = server.state.approvals.read().await.get(handle).cloned() {
             if a.status.is_decided() {
                 return approval_to_result(&a);
             }
@@ -1540,11 +1533,11 @@ pub(super) fn hash_secret_value(salt_hex: &str, value: &str) -> String {
 /// Execute an approved snapshot verbatim under the original caller's identity,
 /// with no client stream. Used by `guard approve`.
 pub(super) async fn execute_snapshot(
-    config: &ServerConfig,
+    server: &ServerContext,
     snapshot: &ApprovalSnapshot,
     reason: &str,
 ) -> ExecuteResult {
-    if !binary_allowed(&config.allowed_binaries, &snapshot.binary) {
+    if !binary_allowed(&server.config.allowed_binaries, &snapshot.binary) {
         return ExecuteResult::exec_failed(
             reason.to_string(),
             format!(
@@ -1557,7 +1550,8 @@ pub(super) async fn execute_snapshot(
         snapshot.session_fingerprint.as_deref(),
         snapshot.session_revision.as_deref(),
     ) {
-        let current = config
+        let current = server
+            .state
             .sessions
             .read()
             .await
@@ -1574,12 +1568,12 @@ pub(super) async fn execute_snapshot(
     let caller = reconstruct_caller(snapshot.principal.clone(), &CallerIdentity::Unknown);
 
     let current_tool_sources = {
-        let mut registry = config.tool_registry.write().await;
+        let mut registry = server.state.tool_registry.write().await;
         let _ = registry.reload_if_stale();
         match registry
             .resolve_env(
                 &snapshot.binary,
-                &config.secrets,
+                &server.state.secrets,
                 snapshot.principal.as_ref(),
                 caller.user_key().as_deref(),
             )
@@ -1635,7 +1629,7 @@ pub(super) async fn execute_snapshot(
                     ),
                 );
             };
-            let resolved = match config.secrets.get(&principal, secret_name).await {
+            let resolved = match server.state.secrets.get(&principal, secret_name).await {
                 Ok(v) => v,
                 Err(e) => {
                     return ExecuteResult::exec_failed(
@@ -1675,7 +1669,7 @@ pub(super) async fn execute_snapshot(
                         .to_string(),
                 );
             }
-            return execute_snapshot_request(config, snapshot, reason, &caller).await;
+            return execute_snapshot_request(server, snapshot, reason, &caller).await;
         };
         if current_tool_sources.len() != tool_hashes.len()
             || current_tool_sources.iter().any(|(env_var, secret_name)| {
@@ -1691,7 +1685,12 @@ pub(super) async fn execute_snapshot(
             );
         }
         for bound in tool_hashes.values() {
-            let resolved = match config.secrets.get(&principal, &bound.secret_name).await {
+            let resolved = match server
+                .state
+                .secrets
+                .get(&principal, &bound.secret_name)
+                .await
+            {
                 Ok(value) => value,
                 Err(error) => {
                     return ExecuteResult::exec_failed(
@@ -1718,11 +1717,11 @@ pub(super) async fn execute_snapshot(
             }
         }
     }
-    execute_snapshot_request(config, snapshot, reason, &caller).await
+    execute_snapshot_request(server, snapshot, reason, &caller).await
 }
 
 async fn execute_snapshot_request(
-    config: &ServerConfig,
+    server: &ServerContext,
     snapshot: &ApprovalSnapshot,
     reason: &str,
     caller: &CallerIdentity,
@@ -1758,14 +1757,17 @@ async fn execute_snapshot_request(
         verb: None,
     };
     let mut sink = tokio::io::sink();
-    exec_after_approval_with_secret_authority(
-        request,
-        config,
+    let mut context = RequestContext {
+        server,
         caller,
+        depth: 0,
+        stream_output: false,
+        stream_writer: &mut sink,
+    };
+    exec_after_approval_with_secret_authority(
+        &mut context,
+        request,
         reason.to_string(),
-        0,
-        false,
-        &mut sink,
         Some(snapshot.secret_entitlements.clone()),
     )
     .await
@@ -1774,7 +1776,7 @@ async fn execute_snapshot_request(
 /// The single background task that drives time-based gate transitions: fires due
 /// auto-reverts (after a startup grace so it can never race startup recovery) and
 /// expires unattended holds (fail-closed). Runs only when gating is enabled.
-pub(super) async fn gating_sweeper(config: ServerConfig) {
+pub(super) async fn gating_sweeper(server: ServerContext) {
     // Startup recovery has already run synchronously; this grace is belt-and-
     // suspenders so no revert can fire in the first window after boot. The
     // default is operator-overridable (and test harnesses shorten it) but is
@@ -1793,11 +1795,11 @@ pub(super) async fn gating_sweeper(config: ServerConfig) {
         // Expire unattended holds FIRST (fail-closed deny on a timer). Doing this
         // before the reverts guarantees the fail-closed promise is met every tick
         // even if a revert is slow.
-        let expired = { config.approvals.write().await.expire_due(now) };
+        let expired = { server.state.approvals.write().await.expire_due(now) };
         for h in &expired {
-            let row = config.approvals.read().await.get(h).cloned();
+            let row = server.state.approvals.read().await.get(h).cloned();
             if let Some(a) = row {
-                persist_approval(&config, &a).await;
+                persist_approval(&server, &a).await;
                 tracing::warn!(target: "guard::audit",
                     "[AUDIT] APPROVAL_EXPIRED handle={} session_fingerprint={} (fail-closed deny)",
                     h,
@@ -1806,7 +1808,7 @@ pub(super) async fn gating_sweeper(config: ServerConfig) {
                         .as_deref()
                         .unwrap_or("none")
                 );
-                config.emit_event(NotifyEvent {
+                server.emit_event(NotifyEvent {
                     event: "decision_made",
                     at_unix: now,
                     handle: Some(h.clone()),
@@ -1824,10 +1826,10 @@ pub(super) async fn gating_sweeper(config: ServerConfig) {
         // RevertFailed and stays queryable), and reverts are dispatched as
         // independent tasks so a burst of slow rollbacks cannot serialize and push
         // out the next tick's fail-closed expiry sweep.
-        let due = { config.provisional.write().await.take_due(now) };
+        let due = { server.state.provisional.write().await.take_due(now) };
         for p in due {
-            persist_provisional(&config, &p).await;
-            config.emit_event(NotifyEvent {
+            persist_provisional(&server, &p).await;
+            server.emit_event(NotifyEvent {
                 event: "provisional_due",
                 at_unix: now,
                 handle: Some(p.handle.clone()),
@@ -1836,7 +1838,7 @@ pub(super) async fn gating_sweeper(config: ServerConfig) {
                 status: Some("reverting".to_string()),
                 behavior: None,
             });
-            let cfg = config.clone();
+            let cfg = server.clone();
             tokio::spawn(async move {
                 let _ = finish_due_provisional(&cfg, &p).await;
             });
@@ -1846,10 +1848,10 @@ pub(super) async fn gating_sweeper(config: ServerConfig) {
         // unlike a provisional revert it is always safe to run unattended; there
         // is no needs-operator-decision path. Persist the Reverting transition
         // before running so a crash mid-revocation recovers to Active and retries.
-        let due_grants = { config.read_grants.write().await.take_due(now) };
+        let due_grants = { server.state.read_grants.write().await.take_due(now) };
         for g in due_grants {
-            persist_read_grant(&config, &g).await;
-            let cfg = config.clone();
+            persist_read_grant(&server, &g).await;
+            let cfg = server.clone();
             tokio::spawn(async move {
                 finish_read_grant_revert(&cfg, &g, "expiry").await;
             });
@@ -1857,52 +1859,55 @@ pub(super) async fn gating_sweeper(config: ServerConfig) {
 
         // Bound the tables: drop terminal rows past the retention window.
         let pruned_p = {
-            config
+            server
+                .state
                 .provisional
                 .write()
                 .await
                 .prune_terminal(now, GATING_RETENTION_SECS)
         };
         for h in pruned_p {
-            delete_provisional_row(&config, &h).await;
+            delete_provisional_row(&server, &h).await;
         }
         let pruned_a = {
-            config
+            server
+                .state
                 .approvals
                 .write()
                 .await
                 .prune_decided(now, GATING_RETENTION_SECS)
         };
         for h in pruned_a {
-            if let Some(store) = &config.session_store {
+            if let Some(store) = &server.state.session_store {
                 if let Err(e) = store.delete_approval(h.clone()).await {
                     tracing::warn!("failed to delete pruned approval {}: {}", h, e);
                 }
             }
         }
         let pruned_g = {
-            config
+            server
+                .state
                 .read_grants
                 .write()
                 .await
                 .prune_terminal(now, GATING_RETENTION_SECS)
         };
         for path in pruned_g {
-            delete_read_grant_row(&config, &path).await;
+            delete_read_grant_row(&server, &path).await;
         }
     }
 }
 
 /// Run the revert for a provisional under the original caller's identity, with no
 /// client stream. Used by the sweeper and `guard revert`.
-async fn run_provisional_revert(config: &ServerConfig, p: &Provisional) -> ExecuteResult {
+async fn run_provisional_revert(server: &ServerContext, p: &Provisional) -> ExecuteResult {
     if let Some(reason) = invalid_binary_reason(&p.revert_binary) {
         return ExecuteResult::exec_failed(
             format!("auto-revert of provisional {}", p.handle),
             reason,
         );
     }
-    if !binary_allowed(&config.allowed_binaries, &p.revert_binary) {
+    if !binary_allowed(&server.config.allowed_binaries, &p.revert_binary) {
         return ExecuteResult::exec_failed(
             format!("auto-revert of provisional {}", p.handle),
             format!(
@@ -1939,20 +1944,26 @@ async fn run_provisional_revert(config: &ServerConfig, p: &Provisional) -> Execu
         verb: None,
     };
     let mut sink = tokio::io::sink();
+    let mut context = RequestContext {
+        server,
+        caller: &caller,
+        depth: 0,
+        stream_output: false,
+        stream_writer: &mut sink,
+    };
     exec_after_approval_with_secret_authority(
+        &mut context,
         request,
-        config,
-        &caller,
         format!("auto-revert of provisional {}", p.handle),
-        0,
-        false,
-        &mut sink,
         Some(p.secret_entitlements.clone()),
     )
     .await
 }
 
-pub(super) async fn run_provisional_check(config: &ServerConfig, p: &Provisional) -> ExecuteResult {
+pub(super) async fn run_provisional_check(
+    server: &ServerContext,
+    p: &Provisional,
+) -> ExecuteResult {
     let binary = p.confirm_check_binary.as_deref().unwrap_or_default();
     if let Some(reason) = invalid_binary_reason(binary) {
         return ExecuteResult::exec_failed(
@@ -1960,7 +1971,7 @@ pub(super) async fn run_provisional_check(config: &ServerConfig, p: &Provisional
             format!("invalid confirmation-check command: {reason}"),
         );
     }
-    if !binary_allowed(&config.allowed_binaries, binary) {
+    if !binary_allowed(&server.config.allowed_binaries, binary) {
         return ExecuteResult::exec_failed(
             format!("confirmation check for provisional {}", p.handle),
             format!(
@@ -1997,29 +2008,32 @@ pub(super) async fn run_provisional_check(config: &ServerConfig, p: &Provisional
         ssh_hostkey: None,
     };
     let mut sink = tokio::io::sink();
+    let mut context = RequestContext {
+        server,
+        caller: &caller,
+        depth: 0,
+        stream_output: false,
+        stream_writer: &mut sink,
+    };
     exec_after_approval_with_secret_authority(
+        &mut context,
         request,
-        config,
-        &caller,
         format!("confirmation check for provisional {}", p.handle),
-        0,
-        false,
-        &mut sink,
         Some(p.secret_entitlements.clone()),
     )
     .await
 }
 
 pub(super) async fn finish_due_provisional(
-    config: &ServerConfig,
+    server: &ServerContext,
     p: &Provisional,
 ) -> (String, Option<i32>) {
     if p.confirm_check_binary.is_none() {
-        return finish_revert(config, p, &CallerIdentity::Unknown, "auto").await;
+        return finish_revert(server, p, &CallerIdentity::Unknown, "auto").await;
     }
     let checked = tokio::time::timeout(
         std::time::Duration::from_secs(REVERT_EXEC_TIMEOUT_SECS),
-        run_provisional_check(config, p),
+        run_provisional_check(server, p),
     )
     .await;
     let check_exit = checked.ok().and_then(|result| match result.exec {
@@ -2028,13 +2042,13 @@ pub(super) async fn finish_due_provisional(
     });
     if check_exit == Some(0) {
         let confirmed = {
-            let mut registry = config.provisional.write().await;
+            let mut registry = server.state.provisional.write().await;
             registry.confirm_after_check(&p.handle)
         };
         match confirmed {
             Ok(row) => {
-                persist_provisional(config, &row).await;
-                forget_proxy_provenance(config, &p.handle).await;
+                persist_provisional(server, &row).await;
+                forget_proxy_provenance(server, &p.handle).await;
                 remove_revert_body(p);
                 tracing::info!(target: "guard::audit",
                     "[AUDIT] PROVISIONAL_AUTO_CONFIRMED handle={} check=\"{}\" control_path={:?}",
@@ -2045,7 +2059,7 @@ pub(super) async fn finish_due_provisional(
                     ),
                     p.control_path
                 );
-                config.emit_event(NotifyEvent {
+                server.emit_event(NotifyEvent {
                     event: "decision_made",
                     at_unix: now_unix(),
                     handle: Some(p.handle.clone()),
@@ -2073,15 +2087,15 @@ pub(super) async fn finish_due_provisional(
         p.handle,
         check_exit
     );
-    finish_revert(config, p, &CallerIdentity::Unknown, "auto-check-failed").await
+    finish_revert(server, p, &CallerIdentity::Unknown, "auto-check-failed").await
 }
 
 async fn run_api_revert(
-    config: &ServerConfig,
+    server: &ServerContext,
     p: &Provisional,
     api: &ApiRevertPlan,
 ) -> Result<(), RevertError> {
-    let registry = config.protocol_registry.read().await;
+    let registry = server.state.protocol_registry.read().await;
     let proxy = if api.endpoint.is_empty() {
         let mut matches = registry
             .values()
@@ -2189,19 +2203,19 @@ enum RevertError {
 }
 
 async fn defer_revert(
-    config: &ServerConfig,
+    server: &ServerContext,
     p: &Provisional,
     caller: &CallerIdentity,
     kind: &str,
     detail: String,
 ) -> (String, Option<i32>) {
     let updated = {
-        let mut reg = config.provisional.write().await;
+        let mut reg = server.state.provisional.write().await;
         reg.set_needs_operator_decision(&p.handle, detail.clone());
         reg.get(&p.handle).cloned()
     };
     if let Some(u) = &updated {
-        persist_provisional(config, u).await;
+        persist_provisional(server, u).await;
     }
     tracing::error!(target: "guard::audit",
         "[AUDIT] REVERT_DEFERRED handle={} caller={} kind={} reason={}",
@@ -2210,7 +2224,7 @@ async fn defer_revert(
         kind,
         guard::redact::audit_escape(&detail)
     );
-    config.emit_event(NotifyEvent {
+    server.emit_event(NotifyEvent {
         event: "decision_made",
         at_unix: now_unix(),
         handle: Some(p.handle.clone()),
@@ -2228,7 +2242,7 @@ async fn defer_revert(
 /// Run a claimed (`Reverting`) provisional's revert and record the outcome.
 /// Returns `(message, exit_code)`.
 pub(super) async fn finish_revert(
-    config: &ServerConfig,
+    server: &ServerContext,
     p: &Provisional,
     caller: &CallerIdentity,
     kind: &str,
@@ -2238,7 +2252,7 @@ pub(super) async fn finish_revert(
     let (status_ok, exit, detail) = if let Some(api) = &p.api_revert {
         match tokio::time::timeout(
             std::time::Duration::from_secs(REVERT_EXEC_TIMEOUT_SECS),
-            run_api_revert(config, p, api),
+            run_api_revert(server, p, api),
         )
         .await
         {
@@ -2247,7 +2261,7 @@ pub(super) async fn finish_revert(
             // operator instead of terminal-failing, so a restart or flag change
             // does not silently strand a live mutation.
             Ok(Err(RevertError::Retryable(detail))) => {
-                return defer_revert(config, p, caller, kind, detail).await;
+                return defer_revert(server, p, caller, kind, detail).await;
             }
             Ok(Err(RevertError::Failed(reason))) => (false, None, Some(reason)),
             Err(_) => (
@@ -2262,7 +2276,7 @@ pub(super) async fn finish_revert(
     } else {
         match tokio::time::timeout(
             std::time::Duration::from_secs(REVERT_EXEC_TIMEOUT_SECS),
-            run_provisional_revert(config, p),
+            run_provisional_revert(server, p),
         )
         .await
         {
@@ -2277,7 +2291,7 @@ pub(super) async fn finish_revert(
                     ..
                 } if !p.secret_keys.is_empty() || !p.secret_file_keys.is_empty() => {
                     return defer_revert(
-                        config,
+                        server,
                         p,
                         caller,
                         kind,
@@ -2299,7 +2313,7 @@ pub(super) async fn finish_revert(
         }
     };
     let updated = {
-        let mut reg = config.provisional.write().await;
+        let mut reg = server.state.provisional.write().await;
         if status_ok {
             reg.set_reverted(&p.handle, exit);
         } else {
@@ -2314,13 +2328,13 @@ pub(super) async fn finish_revert(
         reg.get(&p.handle).cloned()
     };
     if let Some(u) = &updated {
-        persist_provisional(config, u).await;
+        persist_provisional(server, u).await;
     }
     // The revert is terminal (whether it succeeded or failed); drop any
     // api-proxy provenance tied to it so it cannot outlive its window, and
     // remove the persisted revert body so secret-bearing snapshots do not
     // accumulate on disk.
-    forget_proxy_provenance(config, &p.handle).await;
+    forget_proxy_provenance(server, &p.handle).await;
     remove_revert_body(p);
     if status_ok {
         tracing::info!(target: "guard::audit",
@@ -2330,7 +2344,7 @@ pub(super) async fn finish_revert(
             kind,
             exit
         );
-        config.emit_event(NotifyEvent {
+        server.emit_event(NotifyEvent {
             event: "decision_made",
             at_unix: now_unix(),
             handle: Some(p.handle.clone()),
@@ -2352,7 +2366,7 @@ pub(super) async fn finish_revert(
             exit,
             detail
         );
-        config.emit_event(NotifyEvent {
+        server.emit_event(NotifyEvent {
             event: "decision_made",
             at_unix: now_unix(),
             handle: Some(p.handle.clone()),

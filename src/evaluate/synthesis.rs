@@ -49,7 +49,7 @@ impl Evaluator {
 
     /// Bookkeeping only: record one LLM denial. Returns an outcome flagging
     /// whether this bucket just crossed the synthesis threshold; the caller
-    /// (`server::maybe_promote_deny_shape`) decides whether to act on it via
+    /// (`server::learning::maybe_promote_deny_shape`) decides whether to act on it via
     /// `try_promote_deny_shape`. Never grants or matches anything itself.
     pub async fn record_learned_denial(
         &self,

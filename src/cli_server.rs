@@ -915,11 +915,9 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 .map(|path| format!("guard server listening on socket {}", path.display()));
 
             tracing::info!("Creating server instance...");
-            let mut srv = server::Server::new(
+            let config = server::ServerConfig {
                 socket_path,
                 tcp_port,
-                evaluator,
-                secrets,
                 redact,
                 auth_token,
                 admin_token,
@@ -927,13 +925,19 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 allowed_uids,
                 shim_dir,
                 dry_run,
-                tool_registry,
                 redact_secrets,
                 preflight,
-                sessions,
-                session_store,
                 exec_as_caller,
                 state_db_path,
+                ..server::ServerConfig::default()
+            };
+            let mut srv = server::Server::new(
+                config,
+                evaluator,
+                secrets,
+                tool_registry,
+                sessions,
+                session_store,
             )?;
             srv.set_gate(gate_mode);
             srv.set_approval_ttl(approval_ttl);

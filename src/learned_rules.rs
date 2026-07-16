@@ -2,7 +2,7 @@
 //!
 //! This module tracks commands the LLM evaluator has approved more than once
 //! at low risk and, once a pattern crosses `min_approvals`, returns a
-//! `LearningOutcome` the caller (`server::learning_notice`) turns into an
+//! `LearningOutcome` the caller (`server::learning::learning_notice`) turns into an
 //! operator-facing notice.
 //!
 //! It deliberately does NOT grant a bypass itself. An agent's own repeated

@@ -15,7 +15,7 @@ use guard::gating::verb::VerbCatalog;
 use guard::gating::GateMode;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
@@ -42,13 +42,14 @@ use super::wire::{
     ExecuteStreamMessage, IncomingMessage,
 };
 use super::{
-    ServerConfig, DEFAULT_CONFIRM_WITHIN_SECS, MAX_REQUEST_BYTES, SESSION_MAINTENANCE_INTERVAL_SECS,
+    ServerConfig, ServerContext, ServerState, DEFAULT_CONFIRM_WITHIN_SECS, MAX_REQUEST_BYTES,
+    SESSION_MAINTENANCE_INTERVAL_SECS,
 };
 use crate::session::{SessionDecisionSource, SessionExecStatus, SessionInteraction};
 
 #[derive(Clone)]
 struct DaemonApiSessionSink {
-    config: ServerConfig,
+    server: ServerContext,
 }
 
 fn api_session_exec_status(allowed: bool, held: bool) -> SessionExecStatus {
@@ -66,9 +67,9 @@ fn api_session_exec_status(allowed: bool, held: bool) -> SessionExecStatus {
 #[async_trait::async_trait]
 impl guard::proxy::ApiSessionSink for DaemonApiSessionSink {
     async fn resolve(&self, token: &str) -> Option<guard::proxy::ApiSessionContext> {
-        let registry = self.config.sessions.read().await;
+        let registry = self.server.state.sessions.read().await;
         if registry
-            .suspension_reason(token, &self.config.behavior_limits)
+            .suspension_reason(token, &self.server.config.behavior_limits)
             .is_some()
         {
             return None;
@@ -102,7 +103,7 @@ impl guard::proxy::ApiSessionSink for DaemonApiSessionSink {
 
     async fn record(&self, token: &str, event: guard::proxy::ApiSessionEvent) {
         record_live_session_interaction(
-            &self.config,
+            &self.server,
             Some(token),
             SessionInteraction {
                 at_unix: 0,
@@ -128,7 +129,7 @@ impl guard::proxy::ApiSessionSink for DaemonApiSessionSink {
 /// Validate the immutable authority that a persisted rollback depends on.
 /// This checks identities and secret names only. Secret values never enter the
 /// recovery reason, audit stream, or notification payload.
-async fn provisional_recovery_error(config: &ServerConfig, row: &Provisional) -> Option<String> {
+async fn provisional_recovery_error(server: &ServerContext, row: &Provisional) -> Option<String> {
     if row.status != ProvisionalStatus::Armed || !row.forward_done {
         return None;
     }
@@ -155,7 +156,7 @@ async fn provisional_recovery_error(config: &ServerConfig, row: &Provisional) ->
             }
         }
         for name in secret_names {
-            match config.secrets.get(principal, name).await {
+            match server.state.secrets.get(principal, name).await {
                 Ok(Some(_)) => {}
                 Ok(None) => {
                     return Some(format!(
@@ -176,7 +177,7 @@ async fn provisional_recovery_error(config: &ServerConfig, row: &Provisional) ->
         if !row
             .principal
             .as_ref()
-            .is_some_and(|principal| config.daemon_principal.eq_ci(principal))
+            .is_some_and(|principal| server.config.daemon_principal.eq_ci(principal))
         {
             return Some(
                 "persisted API rollback principal is not the daemon principal".to_string(),
@@ -190,7 +191,7 @@ async fn provisional_recovery_error(config: &ServerConfig, row: &Provisional) ->
                 "persisted API rollback lacks exact endpoint or credential identity".to_string(),
             );
         }
-        let registry = config.protocol_registry.read().await;
+        let registry = server.state.protocol_registry.read().await;
         let Some(proxy) = registry.get(&api.endpoint) else {
             return Some(format!(
                 "persisted API rollback endpoint '{}' is unavailable",
@@ -222,27 +223,17 @@ mod api_session_event_tests {
     use guard::evaluate::{EvalConfig, Evaluator};
     use std::collections::BTreeMap;
 
-    fn recovery_config() -> ServerConfig {
-        ServerConfig::new(
-            None,
-            None,
-            Evaluator::new(EvalConfig::default().llm_enabled(false)).unwrap(),
-            SecretManager::with_backend(EnvBackend::default()),
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
-            ToolRegistry::isolated_for_tests(),
-            Vec::new(),
-            false,
-            SessionRegistry::new(),
-            None,
-            false,
-            None,
-        )
+    fn recovery_context() -> ServerContext {
+        ServerContext {
+            config: ServerConfig::default(),
+            state: ServerState::new(
+                Evaluator::new(EvalConfig::default().llm_enabled(false)).unwrap(),
+                SecretManager::with_backend(EnvBackend::default()),
+                ToolRegistry::isolated_for_tests(),
+                SessionRegistry::new(),
+                None,
+            ),
+        }
     }
 
     fn armed_command() -> Provisional {
@@ -292,17 +283,18 @@ mod api_session_event_tests {
 
     #[tokio::test]
     async fn restart_authority_revalidation_rejects_missing_secret() {
-        let config = recovery_config();
+        let server = recovery_context();
         let mut row = armed_command();
         row.secret_keys
             .insert("TOKEN".to_string(), "rollback/token".to_string());
         row.secret_entitlements = Some(vec!["rollback/token".to_string()]);
-        let error = provisional_recovery_error(&config, &row)
+        let error = provisional_recovery_error(&server, &row)
             .await
             .expect("missing secret invalidates recovery authority");
         assert!(error.contains("unavailable"));
 
-        config
+        server
+            .state
             .secrets
             .set(
                 row.principal.as_ref().unwrap(),
@@ -311,12 +303,12 @@ mod api_session_event_tests {
             )
             .await
             .unwrap();
-        assert!(provisional_recovery_error(&config, &row).await.is_none());
+        assert!(provisional_recovery_error(&server, &row).await.is_none());
     }
 
     #[tokio::test]
     async fn restart_authority_revalidation_rejects_api_identity_change() {
-        let config = recovery_config();
+        let server = recovery_context();
         let proxy = Arc::new(guard::proxy::ApiProxy::new(
             "127.0.0.1:18443".parse().unwrap(),
             guard::proxy::ProxyTls::generate().unwrap(),
@@ -328,13 +320,14 @@ mod api_session_event_tests {
             guard::proxy::ApiPolicy::deny_all(),
             None,
         ));
-        config
+        server
+            .state
             .protocol_registry
             .write()
             .await
             .insert("cluster-a".to_string(), proxy.clone());
         let mut row = armed_command();
-        row.principal = Some(config.daemon_principal.clone());
+        row.principal = Some(server.config.daemon_principal.clone());
         row.api_revert = Some(guard::gating::provisional::ApiRevertPlan {
             endpoint: "cluster-a".to_string(),
             protocol: "kubernetes".to_string(),
@@ -344,65 +337,36 @@ mod api_session_event_tests {
             path: "/api/v1/namespaces/dev/configmaps/test".to_string(),
             body_file: None,
         });
-        let error = provisional_recovery_error(&config, &row)
+        let error = provisional_recovery_error(&server, &row)
             .await
             .expect("changed endpoint identity invalidates recovery authority");
         assert!(error.contains("frozen protocol, target, and credential identity"));
 
         row.api_revert.as_mut().unwrap().upstream_identity = proxy.upstream_identity_fingerprint();
-        assert!(provisional_recovery_error(&config, &row).await.is_none());
+        assert!(provisional_recovery_error(&server, &row).await.is_none());
     }
 }
 
 #[derive(Clone)]
 pub struct Server {
-    config: ServerConfig,
+    context: ServerContext,
 }
 
 impl Server {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        socket_path: Option<PathBuf>,
-        tcp_port: Option<u16>,
+        config: ServerConfig,
         evaluator: Evaluator,
         secrets: SecretManager,
-        redact: bool,
-        auth_token: Option<String>,
-        admin_token: Option<String>,
-        socket_group: Option<String>,
-        allowed_uids: Option<Vec<u32>>,
-        shim_dir: Option<PathBuf>,
-        dry_run: bool,
         tool_registry: ToolRegistry,
-        redact_secrets: Vec<String>,
-        preflight: bool,
         sessions: SessionRegistry,
         session_store: Option<SessionStore>,
-        exec_as_caller: bool,
-        state_db_path: Option<PathBuf>,
     ) -> Result<Self> {
-        let config = ServerConfig::new(
-            socket_path,
-            tcp_port,
-            evaluator,
-            secrets,
-            redact,
-            auth_token,
-            admin_token,
-            socket_group,
-            allowed_uids,
-            shim_dir,
-            dry_run,
-            tool_registry,
-            redact_secrets,
-            preflight,
-            sessions,
-            session_store,
-            exec_as_caller,
-            state_db_path,
-        );
-        let mut server = Self { config };
+        let state = ServerState::new(evaluator, secrets, tool_registry, sessions, session_store);
+        let mut server = Self {
+            context: ServerContext { config, state },
+        };
         let root = server
+            .context
             .config
             .state_db_path
             .as_ref()
@@ -411,59 +375,59 @@ impl Server {
             .unwrap_or_else(|| std::env::temp_dir().join("guard-secret-files"));
         super::secure_fs::prepare_private_root(&root)
             .with_context(|| format!("prepare secret-file root {}", root.display()))?;
-        server.config.secret_file_root = Some(root);
+        server.context.config.secret_file_root = Some(root);
         Ok(server)
     }
 
     /// Enable consequence gating. Must be called before `run`.
     pub fn set_gate(&mut self, gate: GateMode) {
-        self.config.gate = gate;
+        self.context.config.gate = gate;
     }
 
     pub fn set_approval_ttl(&mut self, ttl_secs: u64) {
-        self.config.approval_ttl_secs = ttl_secs;
+        self.context.config.approval_ttl_secs = ttl_secs;
     }
 
     /// Configure the optional operator notification command.
     pub fn set_notify_hook(&mut self, command: Vec<String>, timeout_secs: u64) {
-        self.config.notify_hook = super::runtime::NotifyHook::new(command, timeout_secs);
+        self.context.state.notify_hook = super::runtime::NotifyHook::new(command, timeout_secs);
     }
 
     pub fn set_behavior_limits(&mut self, limits: crate::session::SessionBehaviorLimits) {
-        self.config.behavior_limits = limits;
+        self.context.config.behavior_limits = limits;
     }
 
-    pub fn set_command_admission(&mut self, config: super::runtime::CommandAdmissionConfig) {
-        self.config.command_admission = super::runtime::CommandAdmission::new(config);
+    pub fn set_command_admission(&mut self, admission: super::runtime::CommandAdmissionConfig) {
+        self.context.state.command_admission = super::runtime::CommandAdmission::new(admission);
     }
 
     /// Install the operator-defined verb catalog. Must be called before `run`.
     pub fn set_verbs(&mut self, catalog: VerbCatalog) {
-        self.config.verbs = Arc::new(RwLock::new(catalog));
+        self.context.state.verbs = Arc::new(RwLock::new(catalog));
     }
 
     /// Install reusable grants. Must be called before `run`.
     pub fn set_saved_grants(&mut self, catalog: SavedGrantCatalog) {
-        self.config.saved_grants = Arc::new(RwLock::new(catalog));
+        self.context.state.saved_grants = Arc::new(RwLock::new(catalog));
     }
 
     /// Restrict which binaries may execute. `None` imposes no restriction (the
     /// default); an empty list denies everything. Must be called before `run`.
     pub fn set_allowed_binaries(&mut self, allowed: Option<Vec<String>>) {
-        self.config.allowed_binaries = allowed;
+        self.context.config.allowed_binaries = allowed;
     }
 
     /// Set the operator-declared extra child-env passthrough list (see
     /// [`ServerConfig::extra_child_env`]). Must be called before `run`.
     pub fn set_extra_child_env(&mut self, vars: Vec<String>) {
-        self.config.extra_child_env = vars;
+        self.context.config.extra_child_env = vars;
     }
 
     pub fn set_api_coverage(
         &mut self,
         store: Option<Arc<RwLock<guard::gating::api_promotion::ApiPromotionStore>>>,
     ) {
-        self.config.api_coverage = store;
+        self.context.state.api_coverage = store;
     }
 
     /// Attach an API proxy to run alongside the gate socket. Must be
@@ -474,9 +438,10 @@ impl Server {
         proxy: Arc<guard::proxy::ApiProxy>,
     ) {
         proxy.attach_session_sink(Arc::new(DaemonApiSessionSink {
-            config: self.config.clone(),
+            server: self.context.clone(),
         }));
-        self.config
+        self.context
+            .state
             .protocol_registry
             .write()
             .await
@@ -488,7 +453,7 @@ impl Server {
     /// provisionals become `needs_operator_decision`; interrupted approvals
     /// become `exec_failed`. Both are surfaced via a high-severity audit line.
     async fn startup_gating(&self) {
-        let Some(store) = &self.config.session_store else {
+        let Some(store) = &self.context.state.session_store else {
             self.install_saved_grant_verbs().await;
             tracing::info!(
                 "No state database configured: saved grants, grant requests, sessions, and gate state are process-local"
@@ -501,7 +466,7 @@ impl Server {
             store.load_saved_grant_tombstones().await,
         ) {
             (Ok(rows), Ok(tombstones)) => {
-                let mut grants = self.config.saved_grants.write().await;
+                let mut grants = self.context.state.saved_grants.write().await;
                 if let Err(error) = grants.overlay_rows(rows) {
                     tracing::error!("failed to validate saved grants: {}", error);
                     *grants = crate::grant_profile::SavedGrantCatalog::empty();
@@ -515,18 +480,18 @@ impl Server {
                     rows.err(),
                     tombstones.err()
                 );
-                *self.config.saved_grants.write().await =
+                *self.context.state.saved_grants.write().await =
                     crate::grant_profile::SavedGrantCatalog::empty();
             }
         }
         self.install_saved_grant_verbs().await;
         match store.load_grant_requests().await {
             Ok(rows) => {
-                *self.config.grant_requests.write().await = rows
+                *self.context.state.grant_requests.write().await = rows
                     .into_iter()
                     .map(|request| (request.handle.clone(), request))
                     .collect();
-                super::admin::prune_grant_requests(&self.config).await;
+                super::admin::prune_grant_requests(&self.context).await;
             }
             Err(error) => tracing::error!("failed to load grant requests: {}", error),
         }
@@ -536,6 +501,7 @@ impl Server {
                 let mut rows = rows;
                 #[cfg(windows)]
                 if let Some(state_parent) = self
+                    .context
                     .config
                     .state_db_path
                     .as_ref()
@@ -579,7 +545,7 @@ impl Server {
                 }
                 let mut invalid = Vec::new();
                 for row in &mut rows {
-                    if let Some(reason) = provisional_recovery_error(&self.config, row).await {
+                    if let Some(reason) = provisional_recovery_error(&self.context, row).await {
                         row.status = ProvisionalStatus::NeedsOperatorDecision;
                         row.revert_detail = Some(reason.clone());
                         invalid.push((row.handle.clone(), reason));
@@ -609,7 +575,7 @@ impl Server {
                                     e
                                 );
                             }
-                            self.config.emit_event(NotifyEvent {
+                            self.context.emit_event(NotifyEvent {
                                 event: "startup_recovery_escalated",
                                 at_unix: now_unix(),
                                 handle: Some(handle.clone()),
@@ -621,7 +587,7 @@ impl Server {
                         }
                     }
                 }
-                *self.config.provisional.write().await = reg;
+                *self.context.state.provisional.write().await = reg;
             }
             Err(e) => tracing::error!("failed to load provisional state: {}", e),
         }
@@ -657,7 +623,7 @@ impl Server {
                     .filter(|a| {
                         a.status == ApprovalStatus::Pending
                             && is_api_proxy_sentinel(&a.snapshot.binary)
-                            && matches!(&a.snapshot.principal, Some(p) if self.config.daemon_principal.eq_ci(p))
+                            && matches!(&a.snapshot.principal, Some(p) if self.context.config.daemon_principal.eq_ci(p))
                     })
                     .map(|a| a.handle)
                     .collect();
@@ -680,7 +646,7 @@ impl Server {
                         orphaned
                     );
                 }
-                *self.config.approvals.write().await = reg;
+                *self.context.state.approvals.write().await = reg;
             }
             Err(e) => tracing::error!("failed to load approval state: {}", e),
         }
@@ -688,7 +654,8 @@ impl Server {
 
     async fn install_saved_grant_verbs(&self) {
         let generated = self
-            .config
+            .context
+            .state
             .saved_grants
             .read()
             .await
@@ -696,7 +663,7 @@ impl Server {
             .into_iter()
             .flat_map(|grant| grant.generated_verbs)
             .collect::<Vec<_>>();
-        let mut verbs = self.config.verbs.write().await;
+        let mut verbs = self.context.state.verbs.write().await;
         for verb in generated {
             if let Err(error) = verbs.upsert_saved_grant_verb(verb) {
                 tracing::error!("failed to install generated saved-grant verb: {}", error);
@@ -711,7 +678,7 @@ impl Server {
     /// deadline.
     #[cfg(unix)]
     async fn startup_read_grants(&self) {
-        let Some(store) = &self.config.session_store else {
+        let Some(store) = &self.context.state.session_store else {
             return;
         };
         let rows = match store.load_read_grants().await {
@@ -733,7 +700,7 @@ impl Server {
                             grant.handle,
                             guard::redact::audit_escape(&grant.target_path)
                         );
-                        delete_read_grant_row(&self.config, &grant.target_path).await;
+                        delete_read_grant_row(&self.context, &grant.target_path).await;
                     }
                     Err(e) => {
                         tracing::warn!(target: "guard::audit",
@@ -749,17 +716,17 @@ impl Server {
                 surviving.insert(grant);
             }
         }
-        *self.config.read_grants.write().await = surviving;
+        *self.context.state.read_grants.write().await = surviving;
     }
 
     pub async fn run(&self) -> Result<()> {
         tracing::info!("Server::run() called");
-        let _process_shutdown = self.config.process_tracker.shutdown_guard();
+        let _process_shutdown = self.context.state.process_tracker.shutdown_guard();
 
         // Load durable authorization state. Consequence rows also receive
         // boot-safe recovery when gating is enabled.
-        if self.config.gate.is_on() {
-            tracing::info!("Consequence gating: {}", self.config.gate);
+        if self.context.config.gate.is_on() {
+            tracing::info!("Consequence gating: {}", self.context.config.gate);
         }
         self.startup_gating().await;
         // Reconcile persisted read grants (revoke expired, re-arm live).
@@ -770,36 +737,37 @@ impl Server {
         // and read-grant expiries (Unix, gate-independent), so it runs whenever
         // either is live. Without this a read grant could outlive its TTL simply
         // because the daemon runs without consequence gating.
-        if self.config.gate.is_on() || cfg!(unix) {
-            let config = self.config.clone();
-            tokio::spawn(async move { gating_sweeper(config).await });
+        if self.context.config.gate.is_on() || cfg!(unix) {
+            let server = self.context.clone();
+            tokio::spawn(async move { gating_sweeper(server).await });
         }
-        if self.config.session_store.is_some() && claim_session_maintenance(&self.config) {
-            let config = self.config.clone();
-            tokio::spawn(async move { session_maintenance(config).await });
+        if self.context.state.session_store.is_some() && claim_session_maintenance(&self.context) {
+            let server = self.context.clone();
+            tokio::spawn(async move { session_maintenance(server).await });
         }
 
         let mut futures = Vec::new();
 
-        if let Some(ref socket_path) = self.config.socket_path {
+        if let Some(ref socket_path) = self.context.config.socket_path {
             tracing::info!("Starting local listener on {}", socket_path.display());
             let path = socket_path.clone();
-            let config = self.config.clone();
+            let server = self.context.clone();
             futures.push(tokio::spawn(async move {
-                Self::run_local_static(&path, &config).await
+                Self::run_local_static(&path, &server).await
             }));
         }
 
-        if let Some(port) = self.config.tcp_port {
+        if let Some(port) = self.context.config.tcp_port {
             tracing::info!("Starting TCP listener on port {}", port);
-            let config = self.config.clone();
+            let server = self.context.clone();
             futures.push(tokio::spawn(async move {
-                Self::run_tcp_static(port, &config).await
+                Self::run_tcp_static(port, &server).await
             }));
         }
 
         let proxies: Vec<_> = self
-            .config
+            .context
+            .state
             .protocol_registry
             .read()
             .await
@@ -810,7 +778,7 @@ impl Server {
             // The auto-revert envelope needs the consequence sweeper, which only
             // runs under `--gate consequence`. Without it the proxy still gates
             // (allow/deny/hold/redact) but forwards recoverable writes unwrapped.
-            if self.config.gate.is_on() {
+            if self.context.config.gate.is_on() {
                 // With a state DB the revert dir lives beside it (systemd
                 // StateDirectory, 0700). Without one, provisionals are
                 // process-local and not recovered across restart, so a fresh
@@ -818,6 +786,7 @@ impl Server {
                 // both sufficient and immune to a pre-created fixed-name dir a
                 // local attacker could own.
                 let snapshot_dir = match self
+                    .context
                     .config
                     .state_db_path
                     .as_ref()
@@ -870,7 +839,7 @@ impl Server {
                     );
                 }
                 proxy.attach_gate(Arc::new(DaemonGateSink {
-                    config: self.config.clone(),
+                    server: self.context.clone(),
                     endpoint,
                     protocol: proxy.protocol_name().to_string(),
                     snapshot_dir,
@@ -909,7 +878,7 @@ impl Server {
                 for handle in abort_handles {
                     handle.abort();
                 }
-                self.config.process_tracker.terminate_all();
+                self.context.state.process_tracker.terminate_all();
                 return Ok(());
             }
         };
@@ -920,7 +889,7 @@ impl Server {
         for task in remaining {
             task.abort();
         }
-        self.config.process_tracker.terminate_all();
+        self.context.state.process_tracker.terminate_all();
         match result {
             Ok(Ok(())) => anyhow::bail!("listener exited unexpectedly"),
             Ok(Err(error)) => {
@@ -936,19 +905,19 @@ impl Server {
 
     /// Platform dispatch for the local listener: UNIX domain socket on Unix,
     /// named pipe on Windows.
-    async fn run_local_static(socket_path: &Path, config: &ServerConfig) -> Result<()> {
+    async fn run_local_static(socket_path: &Path, server: &ServerContext) -> Result<()> {
         #[cfg(unix)]
         {
-            Self::run_unix_static(socket_path, config).await
+            Self::run_unix_static(socket_path, server).await
         }
         #[cfg(windows)]
         {
-            Self::run_pipe_static(socket_path, config).await
+            Self::run_pipe_static(socket_path, server).await
         }
     }
 
     #[cfg(windows)]
-    async fn run_pipe_static(socket_path: &Path, config: &ServerConfig) -> Result<()> {
+    async fn run_pipe_static(socket_path: &Path, context: &ServerContext) -> Result<()> {
         let pipe_name = winplat::pipe_name(socket_path);
         tracing::info!("guard server listening on named pipe {}", pipe_name);
 
@@ -964,9 +933,9 @@ impl Server {
             let connected = server;
             server = winplat::create_pipe_server(&pipe_name, false)?;
 
-            let config = config.clone();
+            let context = context.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_client_pipe(connected, &config).await {
+                if let Err(e) = handle_client_pipe(connected, &context).await {
                     tracing::error!("client handler error: {}", e);
                 }
             });
@@ -974,19 +943,19 @@ impl Server {
     }
 
     #[cfg(unix)]
-    async fn run_unix_static(socket_path: &Path, config: &ServerConfig) -> Result<()> {
+    async fn run_unix_static(socket_path: &Path, server: &ServerContext) -> Result<()> {
         let listener =
-            Self::prepare_unix_listener(socket_path, config.socket_group.as_deref()).await?;
+            Self::prepare_unix_listener(socket_path, server.config.socket_group.as_deref()).await?;
 
         tracing::info!("guard server listening on {}", socket_path.display());
 
         loop {
             match listener.accept().await {
                 Ok((stream, _peer_addr)) => {
-                    let config = config.clone();
+                    let server = server.clone();
 
                     tokio::spawn(async move {
-                        if let Err(e) = handle_client_unix(stream, &config).await {
+                        if let Err(e) = handle_client_unix(stream, &server).await {
                             tracing::error!("client handler error: {}", e);
                         }
                     });
@@ -1057,7 +1026,7 @@ impl Server {
         }
     }
 
-    async fn run_tcp_static(port: u16, config: &ServerConfig) -> Result<()> {
+    async fn run_tcp_static(port: u16, server: &ServerContext) -> Result<()> {
         let addr = format!("127.0.0.1:{}", port);
         let listener = TcpListener::bind(&addr)
             .await
@@ -1068,10 +1037,10 @@ impl Server {
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
-                    let config = config.clone();
+                    let server = server.clone();
 
                     tokio::spawn(async move {
-                        if let Err(e) = handle_client_tcp(stream, &config).await {
+                        if let Err(e) = handle_client_tcp(stream, &server).await {
                             tracing::error!("client handler error: {}", e);
                         }
                     });
@@ -1350,23 +1319,23 @@ pub(crate) mod winplat {
 }
 
 #[cfg(unix)]
-async fn handle_client_unix(stream: UnixStream, config: &ServerConfig) -> Result<()> {
+async fn handle_client_unix(stream: UnixStream, server: &ServerContext) -> Result<()> {
     let uid = stream
         .peer_cred()
         .context("failed to read peer credentials")?
         .uid();
     tracing::info!("handle_client_unix: peer uid = {}", uid);
 
-    if let Err(e) = config.validate_uid(uid) {
+    if let Err(e) = server.validate_uid(uid) {
         tracing::warn!("uid {} rejected: {}", uid, e);
         return Err(e);
     }
 
-    serve_connection(stream, CallerIdentity::Unix { uid }, config).await
+    serve_connection(stream, CallerIdentity::Unix { uid }, server).await
 }
 
 #[cfg(windows)]
-async fn handle_client_pipe(stream: NamedPipeServer, config: &ServerConfig) -> Result<()> {
+async fn handle_client_pipe(stream: NamedPipeServer, server: &ServerContext) -> Result<()> {
     let caller = match winplat::client_sid(&stream) {
         Ok(sid) => {
             tracing::info!("named pipe client sid = {}", sid);
@@ -1384,7 +1353,7 @@ async fn handle_client_pipe(stream: NamedPipeServer, config: &ServerConfig) -> R
             return Err(e);
         }
     };
-    serve_connection(stream, caller, config).await
+    serve_connection(stream, caller, server).await
 }
 
 /// One request line read under the transport size cap.
@@ -1450,7 +1419,11 @@ fn validation_error_response(reason: String) -> ExecuteResponse {
 
 /// Drive the request/response protocol for one connected client, independent of
 /// the underlying transport (UNIX socket or Windows named pipe).
-async fn serve_connection<S>(stream: S, caller: CallerIdentity, config: &ServerConfig) -> Result<()>
+async fn serve_connection<S>(
+    stream: S,
+    caller: CallerIdentity,
+    server: &ServerContext,
+) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -1493,7 +1466,7 @@ where
 
         let request = match incoming {
             IncomingMessage::Admin { admin, .. } => {
-                let resp = handle_admin_request(config, &caller, *admin).await;
+                let resp = handle_admin_request(server, &caller, *admin).await;
                 writer
                     .write_all(serde_json::to_string(&resp)?.as_bytes())
                     .await?;
@@ -1503,8 +1476,8 @@ where
             IncomingMessage::Execute(req) => *req,
         };
 
-        if let Err(_e) = config.validate_token(request.auth_token.as_deref()) {
-            config.log_audit_policy(
+        if let Err(_e) = server.validate_token(request.auth_token.as_deref()) {
+            server.log_audit_policy(
                 &caller,
                 request.session_token.as_deref(),
                 &request.binary,
@@ -1521,12 +1494,12 @@ where
         }
 
         let result = if request.stream {
-            execute_command_streaming(request.clone(), config, &caller, &mut writer).await
+            execute_command_streaming(request.clone(), server, &caller, &mut writer).await
         } else {
-            execute_command(request.clone(), config, &caller).await
+            execute_command(request.clone(), server, &caller).await
         };
         emit_exec_audit_events(
-            config,
+            server,
             &caller,
             request.session_token.as_deref(),
             &request.binary,
@@ -1557,7 +1530,7 @@ where
 /// the audit-format tests assert on both events through one entry point.
 #[cfg(test)]
 pub(super) fn emit_audit_events(
-    config: &ServerConfig,
+    server: &ServerContext,
     caller: &CallerIdentity,
     binary: &str,
     args: &[String],
@@ -1565,7 +1538,7 @@ pub(super) fn emit_audit_events(
 ) {
     // Always emit the policy decision - this is the event historical
     // grep patterns (`[AUDIT] ALLOWED` / `[AUDIT] DENIED`) key on.
-    config.log_audit_policy(
+    server.log_audit_policy(
         caller,
         None,
         binary,
@@ -1578,12 +1551,12 @@ pub(super) fn emit_audit_events(
     // audit stream can distinguish "LLM denied" from "LLM approved but
     // exec failed". Ignored by legacy grep patterns.
     if let ExecOutcome::Failed { reason, .. } = &result.exec {
-        config.log_audit_exec_failed(caller, None, binary, args, reason);
+        server.log_audit_exec_failed(caller, None, binary, args, reason);
     }
 }
 
 fn emit_exec_audit_events(
-    config: &ServerConfig,
+    server: &ServerContext,
     caller: &CallerIdentity,
     session_token: Option<&str>,
     binary: &str,
@@ -1591,11 +1564,11 @@ fn emit_exec_audit_events(
     result: &ExecuteResult,
 ) {
     if let ExecOutcome::Failed { reason, .. } = &result.exec {
-        config.log_audit_exec_failed(caller, session_token, binary, args, reason);
+        server.log_audit_exec_failed(caller, session_token, binary, args, reason);
     }
 }
 
-async fn session_maintenance(config: ServerConfig) {
+async fn session_maintenance(server: ServerContext) {
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(
         SESSION_MAINTENANCE_INTERVAL_SECS,
     ));
@@ -1605,14 +1578,15 @@ async fn session_maintenance(config: ServerConfig) {
     tick.tick().await;
     loop {
         tick.tick().await;
-        if let Err(error) = session_maintenance_once(&config).await {
+        if let Err(error) = session_maintenance_once(&server).await {
             tracing::warn!("session state maintenance failed: {}", error);
         }
     }
 }
 
-pub(super) fn claim_session_maintenance(config: &ServerConfig) -> bool {
-    config
+pub(super) fn claim_session_maintenance(server: &ServerContext) -> bool {
+    server
+        .state
         .session_maintenance_started
         .compare_exchange(
             false,
@@ -1623,12 +1597,12 @@ pub(super) fn claim_session_maintenance(config: &ServerConfig) -> bool {
         .is_ok()
 }
 
-pub(super) async fn session_maintenance_once(config: &ServerConfig) -> Result<bool> {
-    let Some(store) = &config.session_store else {
+pub(super) async fn session_maintenance_once(server: &ServerContext) -> Result<bool> {
+    let Some(store) = &server.state.session_store else {
         return Ok(false);
     };
     let snapshot = {
-        let mut sessions = config.sessions.write().await;
+        let mut sessions = server.state.sessions.write().await;
         if !sessions.purge_expired() {
             return Ok(false);
         }
@@ -1641,7 +1615,7 @@ pub(super) async fn session_maintenance_once(config: &ServerConfig) -> Result<bo
     Ok(true)
 }
 
-async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig) -> Result<()> {
+async fn handle_client_tcp(stream: tokio::net::TcpStream, server: &ServerContext) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
 
@@ -1683,7 +1657,7 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
                     CallerIdentity::Tcp {
                         token: "<tcp>".to_string(),
                     }
-                } else if let Err(e) = config.validate_admin_token(admin_token.as_deref()) {
+                } else if let Err(e) = server.validate_admin_token(admin_token.as_deref()) {
                     let resp = AdminResponse::Error {
                         message: format!("admin RPC refused: {}", e),
                     };
@@ -1697,7 +1671,7 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
                         token: admin_token.unwrap_or_else(|| "<missing>".to_string()),
                     }
                 };
-                let resp = handle_admin_request(config, &caller, *admin).await;
+                let resp = handle_admin_request(server, &caller, *admin).await;
                 writer
                     .write_all(serde_json::to_string(&resp)?.as_bytes())
                     .await?;
@@ -1707,9 +1681,9 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
             IncomingMessage::Execute(req) => *req,
         };
 
-        if let Err(_e) = config.validate_token(request.auth_token.as_deref()) {
+        if let Err(_e) = server.validate_token(request.auth_token.as_deref()) {
             let caller = CallerIdentity::Unknown;
-            config.log_audit_policy(
+            server.log_audit_policy(
                 &caller,
                 request.session_token.as_deref(),
                 &request.binary,
@@ -1732,12 +1706,12 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, config: &ServerConfig)
                 .unwrap_or_else(|| "<none>".to_string()),
         };
         let result = if request.stream {
-            execute_command_streaming(request.clone(), config, &caller, &mut writer).await
+            execute_command_streaming(request.clone(), server, &caller, &mut writer).await
         } else {
-            execute_command(request.clone(), config, &caller).await
+            execute_command(request.clone(), server, &caller).await
         };
         emit_exec_audit_events(
-            config,
+            server,
             &caller,
             request.session_token.as_deref(),
             &request.binary,
