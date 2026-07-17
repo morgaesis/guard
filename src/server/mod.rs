@@ -84,6 +84,7 @@ mod execute;
 mod gate_runtime;
 mod grants;
 mod learning;
+mod metrics;
 mod runtime;
 mod secure_fs;
 #[cfg(test)]
@@ -191,6 +192,10 @@ pub(crate) struct ServerConfig {
     /// Append-only hash-chained audit log location. `None` disables the
     /// durable sink (audit events then reach stderr/journald only).
     pub(crate) audit_log_path: Option<PathBuf>,
+    /// Optional read-only metrics/health listener address. `None` (the default)
+    /// runs no listener; when set, the daemon serves `/healthz`, `/metrics`, and
+    /// `/metrics.json` and refuses to start if the bind fails.
+    pub(crate) metrics_addr: Option<std::net::SocketAddr>,
 }
 
 impl Default for ServerConfig {
@@ -233,6 +238,7 @@ impl Default for ServerConfig {
             secret_file_root: None,
             behavior_limits: SessionBehaviorLimits::default(),
             audit_log_path: None,
+            metrics_addr: None,
         }
     }
 }
@@ -289,6 +295,10 @@ struct ServerState {
     /// when no state directory resolves; audit events then reach only the
     /// stderr projection, matching the pre-sink deployment.
     audit: Option<Arc<guard::audit::AuditLog>>,
+    /// Read-only metrics counters. Fed from the audit emission choke point when
+    /// the daemon installs this instance as the process-global event observer,
+    /// and read by the optional metrics/health listener.
+    metrics: Arc<metrics::Metrics>,
 }
 
 impl ServerState {
@@ -321,6 +331,7 @@ impl ServerState {
                 runtime::CommandAdmissionConfig::default(),
             ),
             audit: None,
+            metrics: Arc::new(metrics::Metrics::default()),
         }
     }
 }
@@ -926,12 +937,14 @@ async fn validate_request_injections(
         match server.state.secrets.get(&principal, secret_key).await {
             Ok(Some(_)) => {}
             Ok(None) => {
+                server.state.metrics.record_secret_resolution_failure();
                 return Err(format!(
                     "secret not found: '{}' (required by --secret {})",
                     secret_key, env_var
                 ));
             }
             Err(e) => {
+                server.state.metrics.record_secret_resolution_failure();
                 return Err(format!("failed to read secret '{}': {}", secret_key, e));
             }
         }
@@ -944,12 +957,16 @@ async fn validate_request_injections(
         match server.state.secrets.get(&principal, secret_key).await {
             Ok(Some(_)) => {}
             Ok(None) => {
+                server.state.metrics.record_secret_resolution_failure();
                 return Err(format!(
                     "secret not found: '{}' (required by --secret-file {})",
                     secret_key, env_var
                 ));
             }
-            Err(e) => return Err(format!("failed to read secret '{}': {}", secret_key, e)),
+            Err(e) => {
+                server.state.metrics.record_secret_resolution_failure();
+                return Err(format!("failed to read secret '{}': {}", secret_key, e));
+            }
         }
     }
 

@@ -581,6 +581,26 @@ pub fn tail_records(path: &Path, limit: usize) -> std::io::Result<Vec<serde_json
         .collect())
 }
 
+/// A process-wide observer of every emitted event's kind. The daemon installs
+/// one so read-only metrics counters and the audit log share a single source of
+/// truth: an event is counted at exactly the point it is audited. The observer
+/// receives only the typed [`AuditKind`], never any free-text field, so it
+/// cannot carry command text, secret names, or reasons into a metrics surface.
+pub trait EventObserver: Send + Sync {
+    fn observe(&self, kind: AuditKind);
+}
+
+/// Process-global event observer. First install wins (one daemon per process),
+/// matching [`install_global_sink`].
+static EVENT_OBSERVER: std::sync::OnceLock<std::sync::Arc<dyn EventObserver>> =
+    std::sync::OnceLock::new();
+
+/// Install the process-global event observer. First install wins; later calls
+/// are ignored. Processes that never install one (the CLI) simply do not count.
+pub fn install_event_observer(observer: std::sync::Arc<dyn EventObserver>) {
+    let _ = EVENT_OBSERVER.set(observer);
+}
+
 /// The single emission path for audit events.
 ///
 /// Always renders the stderr `[AUDIT]` projection; when a durable sink is
@@ -590,6 +610,12 @@ pub fn tail_records(path: &Path, limit: usize) -> std::io::Result<Vec<serde_json
 /// false only when a configured sink failed to append; callers gating
 /// auditable actions must then fail closed.
 pub fn emit(sink: Option<&AuditLog>, event: &AuditEvent) -> bool {
+    // Count the event at the same choke point that renders and durably records
+    // it. This is a single relaxed atomic increment inside the observer; it
+    // never blocks and never sees any free-text field.
+    if let Some(observer) = EVENT_OBSERVER.get() {
+        observer.observe(event.kind);
+    }
     tracing::info!(target: "guard::audit", "[AUDIT] {}", event.render_line());
     match sink {
         None => true,
