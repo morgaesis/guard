@@ -1155,7 +1155,10 @@ async fn audit_line_injection_via_argv_is_escaped() {
 
 /// `guard audit verify` / `guard audit tail` admin RPCs: the daemon principal
 /// can walk the chain and read records; any other caller is rejected before
-/// the handler runs (daemon-principal-only read path).
+/// the handler runs (daemon-principal-only read path). Unix-only because the
+/// test asserts the daemon-principal check through a uid-based caller; on
+/// Windows the daemon principal is a process SID a test cannot forge.
+#[cfg(unix)]
 #[tokio::test]
 async fn audit_verify_and_tail_admin_rpcs() {
     let (mut cfg, _buf) = make_test_config();
