@@ -61,6 +61,17 @@ struct CommandAdmissionCounters {
     evaluator_circuit_rejections: AtomicU64,
 }
 
+/// Coarse, identifier-free concurrency gauges for the read-only metrics
+/// surface. Read at scrape time; never on the request hot path.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ConcurrencyGauges {
+    pub handler_capacity: u64,
+    pub handler_available: u64,
+    pub evaluator_capacity: u64,
+    pub evaluator_available: u64,
+    pub active_principal_scopes: u64,
+}
+
 #[derive(Clone)]
 pub(super) struct CommandAdmission {
     config: CommandAdmissionConfig,
@@ -286,6 +297,21 @@ impl CommandAdmission {
                 .counters
                 .evaluator_circuit_rejections
                 .load(Ordering::Relaxed),
+        }
+    }
+
+    /// Point-in-time concurrency gauges for the read-only metrics surface:
+    /// the global handler/evaluator semaphore capacity and how many permits are
+    /// currently available (in-flight = capacity - available), plus the number
+    /// of live per-principal scopes. Coarse and identifier-free.
+    pub(super) fn concurrency_gauges(&self) -> ConcurrencyGauges {
+        let active_scopes = self.scopes.lock().map(|states| states.len()).unwrap_or(0);
+        ConcurrencyGauges {
+            handler_capacity: self.config.handler_concurrency as u64,
+            handler_available: self.handler.available_permits() as u64,
+            evaluator_capacity: self.config.evaluator_concurrency as u64,
+            evaluator_available: self.evaluator.available_permits() as u64,
+            active_principal_scopes: active_scopes as u64,
         }
     }
 

@@ -76,6 +76,7 @@ group.
 |---|---|---|
 | `GUARD_STATE_DB` | XDG state directory | SQLite sessions, saved grants, requests, holds, provisionals, and history. |
 | `GUARD_AUDIT_LOG` | `audit.jsonl` in the state directory | Append-only hash-chained JSONL audit log. |
+| `GUARD_METRICS_ADDR` | unset | Read-only metrics/health listener address; unset runs none. |
 | `GUARD_HISTORY_RETENTION_SECS` | `86400` | Retention for ended sessions and interactions. |
 | `GUARD_CACHE` | `true` | Evaluator decision cache. |
 | `GUARD_CACHE_CAPACITY` | `1024` | Maximum cached decisions. |
@@ -203,6 +204,38 @@ restarts. External rotation, truncation, or edits break the chain by design,
 and `guard audit verify` reports the break instead of hiding it. To start a
 fresh chain, archive the file and remove it; the daemon then begins a new
 chain at the genesis constant.
+
+## Metrics and health
+
+`--metrics-addr <addr>` / `GUARD_METRICS_ADDR` enables an optional, off-by-default
+read-only HTTP listener. A bare port binds `127.0.0.1`; a full `ADDR:PORT` binds
+that address, with a warning when it is not loopback. The listener is
+unauthenticated, so restrict it to localhost or a trusted network. If an
+explicitly requested address cannot bind, the daemon refuses to start.
+
+| Path | Response |
+|---|---|
+| `GET /healthz` | `200 ok` liveness. |
+| `GET /metrics` | Prometheus text exposition. |
+| `GET /metrics.json` | The same numbers as JSON. |
+
+Counters come from the same emission path as the audit log, so a decision is
+counted exactly when it is audited: `guard_decisions_total{outcome}` (allowed,
+denied, held, exec_failed), the provisional/auto-revert lifecycle
+(`guard_provisional_armed_total`, `..._confirmed_total`, `..._reverted_total`,
+`guard_revert_failed_total`), operator-approval resolution
+(`guard_approvals_{approved,denied,expired}_total`),
+`guard_secret_resolution_failures_total`, and `guard_audit_events_total`. Gauges
+are read from the live registries and semaphores at scrape time: pending
+approvals, armed and outstanding provisionals, handler/evaluator in-flight versus
+capacity, and active principal count. Evaluator call and error counts come from
+the admission counters (`guard_evaluator_attempted_total`, `..._errors_total`,
+and related).
+
+The surface exposes only coarse numeric counters and gauges. It carries no
+command text, arguments, secret names, reasons, or argv, and the only labels are
+fixed constants such as `outcome="denied"`. Reading it never gates or slows a
+request: counters are lock-free atomics and gauges are read only at scrape time.
 
 ## SSH host keys
 

@@ -364,6 +364,11 @@ impl Server {
     ) -> Result<Self> {
         let mut state =
             ServerState::new(evaluator, secrets, tool_registry, sessions, session_store);
+        // Count every audited event at the single audit emission choke point by
+        // installing this daemon's metrics as the process-global observer, so
+        // the read-only metrics surface and the audit log share one source of
+        // truth. First install wins, matching the audit sink.
+        guard::audit::install_event_observer(state.metrics.clone());
         // Open the durable audit sink before serving anything: a daemon that
         // cannot record audit events refuses to start (fail closed).
         if let Some(path) = &config.audit_log_path {
@@ -419,6 +424,12 @@ impl Server {
 
     pub fn set_command_admission(&mut self, admission: super::runtime::CommandAdmissionConfig) {
         self.context.state.command_admission = super::runtime::CommandAdmission::new(admission);
+    }
+
+    /// Enable the optional read-only metrics/health listener. `None` (the
+    /// default) runs no listener. Must be called before `run`.
+    pub fn set_metrics_addr(&mut self, addr: Option<std::net::SocketAddr>) {
+        self.context.config.metrics_addr = addr;
     }
 
     /// Install the operator-defined verb catalog. Must be called before `run`.
@@ -892,6 +903,19 @@ impl Server {
             );
             let proxy = proxy.clone();
             futures.push(tokio::spawn(async move { proxy.serve().await }));
+        }
+
+        // Optional read-only metrics/health listener. Bind synchronously so an
+        // explicitly requested listener that cannot bind fails startup loudly,
+        // before the daemon reports itself up. The metrics path never gates or
+        // slows a request: counters are lock-free atomics and gauges are read
+        // only here, at scrape time.
+        if let Some(addr) = self.context.config.metrics_addr {
+            let listener = super::metrics::bind(addr).await?;
+            let state = self.context.state.clone();
+            futures.push(tokio::spawn(async move {
+                super::metrics::serve(listener, state).await
+            }));
         }
 
         if futures.is_empty() {

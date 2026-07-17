@@ -1200,6 +1200,14 @@ enum ServerCommands {
         #[arg(long = "audit-log", value_name = "PATH")]
         audit_log: Option<PathBuf>,
 
+        /// Serve a read-only metrics/health surface on ADDR (GET /healthz,
+        /// /metrics Prometheus text, /metrics.json). Off unless set. A bare
+        /// port binds 127.0.0.1. Unauthenticated and free of any command,
+        /// argument, secret, or reason text - coarse counters only. The daemon
+        /// refuses to start if the bind fails. Env: GUARD_METRICS_ADDR.
+        #[arg(long = "metrics-addr", value_name = "ADDR")]
+        metrics_addr: Option<String>,
+
         /// Retain ended session grants and command interactions for this many
         /// seconds. Env: GUARD_HISTORY_RETENTION_SECS. Default: 86400.
         #[arg(long = "history-retention", value_name = "SECONDS")]
