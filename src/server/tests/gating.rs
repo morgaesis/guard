@@ -117,6 +117,9 @@ fn active_session() -> SessionGrant {
         static_only: false,
         auto_amend: false,
         granted_at: 0,
+        owner: crate::session::SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(
+            1000,
+        )),
     }
 }
 
@@ -2623,6 +2626,9 @@ async fn approved_snapshot_rejects_changed_session_revision() {
             static_only: false,
             auto_amend: false,
             granted_at: 0,
+            owner: crate::session::SessionOwner::Principal(
+                guard::principal::PrincipalKey::from_uid(1000),
+            ),
         },
     );
     let revision = cfg

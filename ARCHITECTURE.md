@@ -149,6 +149,15 @@ SID is the operator principal. Agents run under another principal and cannot
 approve holds, confirm provisionals, change grants, edit verbs, or inspect daemon
 secret ownership.
 
+Each session is bound to an owner principal at creation. Every local path that
+consumes a session's authority requires the requesting peer's kernel-read
+principal to equal that owner, so a leaked or replayed handle is unusable by a
+different local peer; the operator principal is exempt and administers all
+sessions. The operator declares the owner when issuing a session for an agent
+that runs under a different uid. A session with no bound owner (carried across
+the principal-binding migration) is refused for execution and API use until
+reissued.
+
 TCP has no peer principal. It uses separate execution and admin bearers and
 refuses consequence gating and per-principal secret injection.
 

@@ -22,6 +22,16 @@ guard session status
 `GUARD_SESSION` is bearer authority. Keep the token out of logs and command
 output. Audit and history use a stable fingerprint instead of the token bytes.
 
+Each issued session is bound to an owner principal. It defaults to the principal
+that issues the grant; when the operator and the consuming agent run under
+different local identities, name the agent with `--owner <uid|sid>` on `guard
+grant issue`, `guard session new`, or `guard session grant`. Only the owning
+principal (or the daemon/operator principal) may execute under the session,
+appeal it, issue its brokered kubeconfig, batch-evaluate against it, or inspect
+it; a different local peer that learns the token is refused with a `session
+principal mismatch` audit reason. A session token is not transferable between
+principals: reissue for a new owner rather than sharing a handle.
+
 ## Authority and precedence
 
 An issued session may expand a global readonly or evaluator posture inside the

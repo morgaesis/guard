@@ -2,7 +2,8 @@ use crate::grant_profile::{EvaluationMode, GrantRequest, GrantRequestStatus};
 use crate::secrets::legacy_sentinel;
 use crate::session::{
     HistoricalGrant, IssuedGrantScope, SessionAmendment, SessionDecision, SessionDecisionSource,
-    SessionExecStatus, SessionGrant, SessionGrantSummary, SessionInteraction, SessionReport,
+    SessionExecStatus, SessionGrant, SessionGrantSummary, SessionInteraction, SessionOwner,
+    SessionReport,
 };
 use guard::audit::{AuditEvent, AuditKind};
 use guard::gating::verb::{
@@ -25,8 +26,9 @@ use super::learning::{
 };
 use super::runtime::NotifyEvent;
 use super::wire::{
-    verb_effective_trust, AdminRequest, AdminResponse, ApprovalSummary, CallerIdentity,
-    ExecOutcome, ProvisionalSummary, SecretDetail, ServerStatus, VerbSummary,
+    authorize_session_use, verb_effective_trust, AdminRequest, AdminResponse, ApprovalSummary,
+    CallerIdentity, ExecOutcome, ProvisionalSummary, SecretDetail, ServerStatus, SessionAuthz,
+    VerbSummary, SESSION_PRINCIPAL_MISMATCH, SESSION_UNOWNED_REFUSED,
 };
 use super::{is_valid_secret_key, ServerContext};
 
@@ -301,13 +303,118 @@ fn caller_is_session_admin(server: &ServerContext, caller: &CallerIdentity) -> b
         || matches!(caller, CallerIdentity::TcpAdmin { .. })
 }
 
+/// Whether `caller` may see a session's full detail: the operator sees every
+/// session, and a non-operator peer sees only sessions it owns (its
+/// server-read principal equals the session owner). This is the visibility half
+/// of principal binding - a leaked token no longer lets a different local peer
+/// read another user's grant.
 fn caller_can_view_session(
     server: &ServerContext,
     caller: &CallerIdentity,
-    token: &str,
-    visible_token: Option<&str>,
+    owner: &SessionOwner,
 ) -> bool {
-    caller_is_session_admin(server, caller) || visible_token == Some(token)
+    matches!(
+        authorize_session_use(owner, caller, &server.config.daemon_principal),
+        SessionAuthz::Allowed
+    )
+}
+
+/// Authorize a non-admin caller to inspect a specific session (`session show`
+/// / `session status`). The caller must be the session's bound owner, verified
+/// against the principal the daemon reads itself. Emits a `SESSION_SHOW_REJECTED`
+/// audit event carrying the greppable principal-mismatch reason on refusal, and
+/// never confirms the session's existence to a non-owner.
+async fn authorize_session_inspection(
+    server: &ServerContext,
+    caller: &CallerIdentity,
+    token: &str,
+) -> Result<(), AdminResponse> {
+    let owner = server.state.sessions.read().await.owner_for(token);
+    let decision = match &owner {
+        Some(owner) => authorize_session_use(owner, caller, &server.config.daemon_principal),
+        // No active grant for this token: a non-owner must not learn whether the
+        // session ever existed, and cannot prove ownership of a gone session.
+        None => SessionAuthz::Mismatch,
+    };
+    match decision {
+        SessionAuthz::Allowed => Ok(()),
+        SessionAuthz::Unowned => {
+            server.emit_audit_ungated(
+                AuditEvent::new(AuditKind::SessionShowRejected)
+                    .caller(caller)
+                    .reason(SESSION_UNOWNED_REFUSED),
+            );
+            Err(AdminResponse::Error {
+                message: format!("not authorized: {SESSION_UNOWNED_REFUSED}"),
+            })
+        }
+        SessionAuthz::Mismatch => {
+            server.emit_audit_ungated(
+                AuditEvent::new(AuditKind::SessionShowRejected)
+                    .caller(caller)
+                    .reason(SESSION_PRINCIPAL_MISMATCH),
+            );
+            Err(AdminResponse::Error {
+                message: format!(
+                    "not authorized: {SESSION_PRINCIPAL_MISMATCH}; a session may only be inspected by its owning principal"
+                ),
+            })
+        }
+    }
+}
+
+/// Enforce that `caller` owns `token` before an admin RPC exercises that
+/// session's authority (kubeconfig issuance, batch evaluation). Returns `None`
+/// when the caller is the owner or the operator; otherwise emits an
+/// `ADMIN_REJECTED` audit event with the greppable reason and returns the error
+/// response to send back. An unknown/expired token is reported as such. These
+/// are authority-use paths, so an `Unowned` legacy session is refused for
+/// everyone (including the operator), matching the execute path.
+async fn enforce_session_owner_for_admin(
+    server: &ServerContext,
+    caller: &CallerIdentity,
+    token: &str,
+    context: &str,
+) -> Option<AdminResponse> {
+    let owner = server.state.sessions.read().await.owner_for(token);
+    let Some(owner) = owner else {
+        return Some(AdminResponse::Error {
+            message: format!("unknown, expired, or revoked session for {context}"),
+        });
+    };
+    if matches!(owner, SessionOwner::Unowned) {
+        server.emit_audit_ungated(
+            AuditEvent::new(AuditKind::AdminRejected)
+                .caller(caller)
+                .reason(SESSION_UNOWNED_REFUSED),
+        );
+        return Some(AdminResponse::Error {
+            message: format!("{context} refused: {SESSION_UNOWNED_REFUSED}"),
+        });
+    }
+    match authorize_session_use(&owner, caller, &server.config.daemon_principal) {
+        SessionAuthz::Allowed => None,
+        SessionAuthz::Unowned => {
+            server.emit_audit_ungated(
+                AuditEvent::new(AuditKind::AdminRejected)
+                    .caller(caller)
+                    .reason(SESSION_UNOWNED_REFUSED),
+            );
+            Some(AdminResponse::Error {
+                message: format!("{context} refused: {SESSION_UNOWNED_REFUSED}"),
+            })
+        }
+        SessionAuthz::Mismatch => {
+            server.emit_audit_ungated(
+                AuditEvent::new(AuditKind::AdminRejected)
+                    .caller(caller)
+                    .reason(SESSION_PRINCIPAL_MISMATCH),
+            );
+            Some(AdminResponse::Error {
+                message: format!("{context} refused: {SESSION_PRINCIPAL_MISMATCH}"),
+            })
+        }
+    }
 }
 
 fn redact_session_summary_for_list(grant: &mut SessionGrantSummary, admin: bool, can_view: bool) {
@@ -326,6 +433,8 @@ fn redact_session_summary_for_list(grant: &mut SessionGrantSummary, admin: bool,
         grant.activated_verbs.clear();
         grant.override_markers.clear();
         grant.generated_notes.clear();
+        // Do not reveal which principal owns another user's session.
+        grant.owner = SessionOwner::Unowned;
         if grant.prompt_append.is_some() {
             grant.prompt_append = Some("(hidden)".to_string());
         }
@@ -348,6 +457,8 @@ fn redact_historical_grant_for_list(grant: &mut HistoricalGrant, admin: bool, ca
         grant.activated_verbs.clear();
         grant.override_markers.clear();
         grant.generated_notes.clear();
+        // Do not reveal which principal owns another user's session.
+        grant.owner = SessionOwner::Unowned;
         if grant.prompt_append.is_some() {
             grant.prompt_append = Some("(hidden)".to_string());
         }
@@ -389,7 +500,7 @@ async fn handle_session_appeal(
         };
     }
 
-    let (exists, decision, session_prompt) = {
+    let (exists, decision, session_prompt, owner) = {
         let reg = server.state.sessions.read().await;
         (
             reg.has(&token),
@@ -397,8 +508,24 @@ async fn handle_session_appeal(
             // caller cwd authority. Cwd-bound grants are checked on ExecuteRequest.
             reg.check(&token, &binary, &args, None),
             reg.prompt_append_for(&token),
+            reg.owner_for(&token),
         )
     };
+    // An appeal amends session authority, so it is operator-gated
+    // (`requires_daemon_uid`) and not part of the bearer-replay surface. A
+    // session that predates principal binding still cannot be amended: refuse it
+    // fail-closed so the operator reissues rather than silently extending a
+    // session with no verifiable owner.
+    if matches!(owner, Some(SessionOwner::Unowned)) {
+        server.emit_audit_ungated(
+            AuditEvent::new(AuditKind::AdminRejected)
+                .caller(caller)
+                .reason(SESSION_UNOWNED_REFUSED),
+        );
+        return AdminResponse::Error {
+            message: format!("session appeal refused: {SESSION_UNOWNED_REFUSED}"),
+        };
+    }
     if !exists {
         return AdminResponse::Error {
             message: format!(
@@ -655,12 +782,28 @@ pub(super) async fn handle_admin_request(
             evaluation_mode,
             static_only,
             auto_amend,
+            owner: owner_input,
         } => {
             if token.is_empty() {
                 return AdminResponse::Error {
                     message: "session token must not be empty".to_string(),
                 };
             }
+            // Bind the session to a principal at creation. An operator can name
+            // the consuming agent explicitly (the different-uid deployment); when
+            // omitted the session is owned by the authenticated local operator
+            // that issues it, or the daemon principal for an admin-token caller.
+            let session_owner = if let Some(raw) = owner_input
+                .as_deref()
+                .map(str::trim)
+                .filter(|raw| !raw.is_empty())
+            {
+                SessionOwner::Principal(PrincipalKey::from_raw(raw))
+            } else if let Some(principal) = caller.principal().filter(|_| caller.is_local_peer()) {
+                SessionOwner::Principal(principal)
+            } else {
+                SessionOwner::Principal(server.config.daemon_principal.clone())
+            };
             // Expand a saved grant before normal validation and installation.
             // Unknown names fail instead of minting an empty session.
             let mut saved_scope = IssuedGrantScope::default();
@@ -770,6 +913,7 @@ pub(super) async fn handle_admin_request(
                 auto_amend && !matches!(saved_scope.evaluation_mode, EvaluationMode::PolicyOnly);
             let expires_at = ttl_secs.map(|secs| now_unix() + secs);
             let effective_evaluation_mode = saved_scope.evaluation_mode;
+            let owner_label = session_owner.label();
             let mut generated_notes = Vec::new();
             if let Some(name) = saved_grant.as_deref() {
                 generated_notes.push(format!("issued from saved grant '{name}'"));
@@ -788,6 +932,7 @@ pub(super) async fn handle_admin_request(
                 static_only,
                 auto_amend,
                 granted_at: 0, // SessionRegistry::grant fills the current time
+                owner: session_owner,
             };
             let (before, after) = {
                 let mut reg = server.state.sessions.write().await;
@@ -811,7 +956,8 @@ pub(super) async fn handle_admin_request(
                     .field("saved_grant", format!("{saved_grant:?}"))
                     .field("ttl", format!("{ttl_secs:?}"))
                     .field("evaluation_mode", effective_evaluation_mode)
-                    .field("auto_amend", auto_amend),
+                    .field("auto_amend", auto_amend)
+                    .field("owner", owner_label),
             );
             AdminResponse::Ok
         }
@@ -926,13 +1072,12 @@ pub(super) async fn handle_admin_request(
             }
             let reg = server.state.sessions.read().await;
             let is_admin = caller_is_session_admin(server, caller);
-            let visible_token = visible_token.as_deref();
+            let _ = visible_token;
             let grants = reg
                 .list()
                 .into_iter()
                 .map(|mut grant| {
-                    let can_view =
-                        caller_can_view_session(server, caller, &grant.token, visible_token);
+                    let can_view = caller_can_view_session(server, caller, &grant.owner);
                     redact_session_summary_for_list(&mut grant, is_admin, can_view);
                     grant.redact_credentials();
                     grant
@@ -942,8 +1087,7 @@ pub(super) async fn handle_admin_request(
                 reg.list_history(since_unix)
                     .into_iter()
                     .map(|mut grant| {
-                        let can_view =
-                            caller_can_view_session(server, caller, &grant.token, visible_token);
+                        let can_view = caller_can_view_session(server, caller, &grant.owner);
                         redact_historical_grant_for_list(&mut grant, is_admin, can_view);
                         grant.redact_credentials();
                         grant
@@ -966,24 +1110,16 @@ pub(super) async fn handle_admin_request(
             if let Err(err) = persist_current_sessions(server).await {
                 tracing::warn!("failed to persist purged session state: {}", err);
             }
+            let _ = caller_token;
             let is_admin = caller_is_session_admin(server, caller);
-            // A non-admin caller may inspect only the grant on its own token: the
-            // token it presents as its identity ($GUARD_SESSION) must equal the
-            // token it is asking about. That token is the same bearer credential
-            // used for session auth, so equality is proof the caller holds it.
-            // Merely naming another session's token is not enough -- that path
-            // returns a denial, never the grant's contents.
-            let is_self = !token.is_empty() && caller_token.as_deref() == Some(token.as_str());
-            if !is_admin && !is_self {
-                server.emit_audit_ungated(
-                    AuditEvent::new(AuditKind::SessionShowRejected)
-                        .caller(caller)
-                        .reason("not the token holder"),
-                );
-                return AdminResponse::Error {
-                    message: "not authorized: a session token may only inspect its own grant"
-                        .to_string(),
-                };
+            // A non-admin caller may inspect only a session it owns: the
+            // authenticated peer principal the daemon reads itself must equal the
+            // session's bound owner. Presenting the bearer token is no longer
+            // sufficient - a leaked token cannot be used by another local peer.
+            if !is_admin {
+                if let Err(response) = authorize_session_inspection(server, caller, &token).await {
+                    return response;
+                }
             }
             let reg = server.state.sessions.read().await;
             match reg.show_with_limits(&token, limit.unwrap_or(20), &server.config.behavior_limits)
@@ -1009,13 +1145,12 @@ pub(super) async fn handle_admin_request(
             token,
             caller_token,
         } => {
+            let _ = caller_token;
             let is_admin = caller_is_session_admin(server, caller);
-            let is_self = !token.is_empty() && caller_token.as_deref() == Some(token.as_str());
-            if !is_admin && !is_self {
-                return AdminResponse::Error {
-                    message: "not authorized: a session token may only inspect its own status"
-                        .to_string(),
-                };
+            if !is_admin {
+                if let Err(response) = authorize_session_inspection(server, caller, &token).await {
+                    return response;
+                }
             }
             let Some(mut report) = server.state.sessions.read().await.show_with_limits(
                 &token,
@@ -1082,6 +1217,19 @@ pub(super) async fn handle_admin_request(
                         .to_string(),
                 };
             };
+            // Only the session's owning principal (or the operator) may mint a
+            // kubeconfig that carries the session bearer. This binds API-proxy
+            // authority to the same principal that owns the session.
+            if let Some(response) = enforce_session_owner_for_admin(
+                server,
+                caller,
+                &session_token,
+                "brokered kubeconfig issuance",
+            )
+            .await
+            {
+                return response;
+            }
             let expires_at = {
                 let sessions = server.state.sessions.read().await;
                 if let Some(reason) =
@@ -2209,17 +2357,22 @@ pub(super) async fn handle_admin_request(
                     message: "evaluation batch requires 1 to 64 commands".to_string(),
                 };
             }
+            let _ = caller_token;
             let is_admin = caller_is_session_admin(server, caller);
             if !is_admin && session_token.is_none() {
                 return AdminResponse::Error {
                     message: "batch evaluation requires an active caller-owned session".to_string(),
                 };
             }
-            if !is_admin && caller_token.as_deref() != session_token.as_deref() {
-                return AdminResponse::Error {
-                    message: "not authorized: a session may only batch-evaluate for itself"
-                        .to_string(),
-                };
+            // A non-admin caller may batch-evaluate only against a session it
+            // owns, verified by the daemon-read principal rather than by the
+            // bearer token it presents.
+            if let Some(token) = session_token.as_deref() {
+                if let Some(response) =
+                    enforce_session_owner_for_admin(server, caller, token, "batch evaluation").await
+                {
+                    return response;
+                }
             }
             if let Some(token) = session_token.as_deref() {
                 let registry = server.state.sessions.read().await;

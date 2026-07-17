@@ -2,7 +2,7 @@ use crate::grant_profile::{GrantRequest, SavedGrant};
 use crate::session::{
     session_grant_revision_key, HistoricalGrant, HistoricalStatus, IssuedGrantScope,
     SessionDecisionSource, SessionExactRule, SessionExecStatus, SessionGrant, SessionInteraction,
-    SessionRegistry,
+    SessionOwner, SessionRegistry,
 };
 use anyhow::{Context, Result};
 use guard::gating::approval::Approval;
@@ -20,7 +20,13 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 /// Version 6 sanitizes persisted command-derived text (recorded argv, deny
 /// reasons, prompts, learned exact rules) with credential redaction; see
 /// `sanitize_persisted_credentials`.
-const SCHEMA_VERSION: i64 = 6;
+///
+/// Version 7 binds every live and historical session to the authenticated
+/// principal that created it (`owner_json` on `session_grants` and
+/// `session_history`). Rows carried forward from v6 default to the `Unowned`
+/// sentinel, which is refused for any authority use until the session is
+/// reissued.
+const SCHEMA_VERSION: i64 = 7;
 const VACUUM_MIN_PAGES: u64 = 512;
 const VACUUM_MIN_FREE_PAGES: u64 = 128;
 
@@ -100,7 +106,7 @@ impl SessionStore {
         let mut grants = HashMap::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT token, allow_json, deny_json, allow_exact_json, deny_exact_json, activated_verbs_json, override_markers_json, scope_json, expires_at, prompt_append, generated_notes_json, granted_at, static_only, auto_amend
+                "SELECT token, allow_json, deny_json, allow_exact_json, deny_exact_json, activated_verbs_json, override_markers_json, scope_json, expires_at, prompt_append, generated_notes_json, granted_at, static_only, auto_amend, owner_json
                  FROM session_grants",
             )?;
             let rows = stmt.query_map([], |row| {
@@ -125,6 +131,7 @@ impl SessionStore {
                         granted_at: decode_u64(row.get(11)?)?,
                         static_only: decode_bool(row.get(12)?)?,
                         auto_amend: decode_bool(row.get(13)?)?,
+                        owner: decode_owner(&row.get::<_, String>(14)?)?,
                     },
                 ))
             })?;
@@ -137,7 +144,7 @@ impl SessionStore {
         let mut history = Vec::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT token, allow_json, deny_json, allow_exact_json, deny_exact_json, activated_verbs_json, override_markers_json, scope_json, granted_at, expires_at, ended_at, status, prompt_append, generated_notes_json, static_only, auto_amend
+                "SELECT token, allow_json, deny_json, allow_exact_json, deny_exact_json, activated_verbs_json, override_markers_json, scope_json, granted_at, expires_at, ended_at, status, prompt_append, generated_notes_json, static_only, auto_amend, owner_json
                  FROM session_history
                  ORDER BY ended_at ASC, id ASC",
             )?;
@@ -164,6 +171,7 @@ impl SessionStore {
                     generated_notes: decode_vec(&row.get::<_, String>(13)?)?,
                     static_only: decode_bool(row.get(14)?)?,
                     auto_amend: decode_bool(row.get(15)?)?,
+                    owner: decode_owner(&row.get::<_, String>(16)?)?,
                 })
             })?;
             for row in rows {
@@ -249,8 +257,8 @@ impl SessionStore {
         for (token, grant) in snapshot.grants_snapshot() {
             tx.execute(
                 "INSERT INTO session_grants
-                 (token, allow_json, deny_json, allow_exact_json, deny_exact_json, activated_verbs_json, override_markers_json, scope_json, expires_at, prompt_append, generated_notes_json, granted_at, static_only, auto_amend)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                 (token, allow_json, deny_json, allow_exact_json, deny_exact_json, activated_verbs_json, override_markers_json, scope_json, expires_at, prompt_append, generated_notes_json, granted_at, static_only, auto_amend, owner_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     token,
                     encode_vec(&grant.allow)?,
@@ -265,7 +273,8 @@ impl SessionStore {
                     encode_vec(&grant.generated_notes)?,
                     encode_u64(grant.granted_at)?,
                     encode_bool(grant.static_only),
-                    encode_bool(grant.auto_amend)
+                    encode_bool(grant.auto_amend),
+                    encode_owner(&grant.owner)?
                 ],
             )?;
         }
@@ -273,8 +282,8 @@ impl SessionStore {
         for grant in snapshot.history_snapshot() {
             tx.execute(
                 "INSERT INTO session_history
-                 (token, allow_json, deny_json, allow_exact_json, deny_exact_json, activated_verbs_json, override_markers_json, scope_json, granted_at, expires_at, ended_at, status, prompt_append, generated_notes_json, static_only, auto_amend)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                 (token, allow_json, deny_json, allow_exact_json, deny_exact_json, activated_verbs_json, override_markers_json, scope_json, granted_at, expires_at, ended_at, status, prompt_append, generated_notes_json, static_only, auto_amend, owner_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 params![
                     grant.token,
                     encode_vec(&grant.allow)?,
@@ -291,7 +300,8 @@ impl SessionStore {
                     grant.prompt_append,
                     encode_vec(&grant.generated_notes)?,
                     encode_bool(grant.static_only),
-                    encode_bool(grant.auto_amend)
+                    encode_bool(grant.auto_amend),
+                    encode_owner(&grant.owner)?
                 ],
             )?;
         }
@@ -326,7 +336,7 @@ impl SessionStore {
 
     fn load_session_grant(conn: &Connection, token: &str) -> Result<Option<SessionGrant>> {
         conn.query_row(
-            "SELECT allow_json, deny_json, allow_exact_json, deny_exact_json, activated_verbs_json, override_markers_json, scope_json, expires_at, prompt_append, generated_notes_json, granted_at, static_only, auto_amend
+            "SELECT allow_json, deny_json, allow_exact_json, deny_exact_json, activated_verbs_json, override_markers_json, scope_json, expires_at, prompt_append, generated_notes_json, granted_at, static_only, auto_amend, owner_json
              FROM session_grants WHERE token = ?1",
             params![token],
             |row| {
@@ -344,6 +354,7 @@ impl SessionStore {
                     granted_at: decode_u64(row.get(10)?)?,
                     static_only: decode_bool(row.get(11)?)?,
                     auto_amend: decode_bool(row.get(12)?)?,
+                    owner: decode_owner(&row.get::<_, String>(13)?)?,
                 })
             },
         )
@@ -417,7 +428,8 @@ impl SessionStore {
                 generated_notes_json TEXT NOT NULL DEFAULT '[]',
                 granted_at INTEGER NOT NULL,
                 static_only INTEGER NOT NULL DEFAULT 0,
-                auto_amend INTEGER NOT NULL DEFAULT 0
+                auto_amend INTEGER NOT NULL DEFAULT 0,
+                owner_json TEXT NOT NULL DEFAULT '\"unowned\"'
             );
             CREATE TABLE IF NOT EXISTS session_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -436,7 +448,8 @@ impl SessionStore {
                 prompt_append TEXT,
                 generated_notes_json TEXT NOT NULL DEFAULT '[]',
                 static_only INTEGER NOT NULL DEFAULT 0,
-                auto_amend INTEGER NOT NULL DEFAULT 0
+                auto_amend INTEGER NOT NULL DEFAULT 0,
+                owner_json TEXT NOT NULL DEFAULT '\"unowned\"'
             );
             CREATE INDEX IF NOT EXISTS idx_session_history_token ON session_history(token);
             CREATE INDEX IF NOT EXISTS idx_session_history_ended_at ON session_history(ended_at);
@@ -594,6 +607,21 @@ impl SessionStore {
             "TEXT NOT NULL DEFAULT '[]'",
         )?;
         ensure_column(&tx, "session_interactions", "decision_trace_json", "TEXT")?;
+        // Schema v7: bind sessions to their creating principal. Rows migrated
+        // from v6 default to the `Unowned` sentinel and are refused for
+        // execution until reissued.
+        ensure_column(
+            &tx,
+            "session_grants",
+            "owner_json",
+            &format!("TEXT NOT NULL DEFAULT {OWNER_JSON_DEFAULT}"),
+        )?;
+        ensure_column(
+            &tx,
+            "session_history",
+            "owner_json",
+            &format!("TEXT NOT NULL DEFAULT {OWNER_JSON_DEFAULT}"),
+        )?;
         // Databases written before schema v6 may hold credential material that
         // transited a command line (recorded argv, learned rules, prompts).
         // Sanitize once as part of the migration; the version bump below makes
@@ -668,6 +696,18 @@ impl SessionStore {
             "TEXT NOT NULL DEFAULT '[]'",
         )?;
         ensure_column(conn, "session_interactions", "decision_trace_json", "TEXT")?;
+        ensure_column(
+            conn,
+            "session_grants",
+            "owner_json",
+            &format!("TEXT NOT NULL DEFAULT {OWNER_JSON_DEFAULT}"),
+        )?;
+        ensure_column(
+            conn,
+            "session_history",
+            "owner_json",
+            &format!("TEXT NOT NULL DEFAULT {OWNER_JSON_DEFAULT}"),
+        )?;
         Ok(())
     }
 
@@ -1354,6 +1394,15 @@ fn encode_scope(scope: &IssuedGrantScope) -> Result<String> {
     serde_json::to_string(scope).context("failed to encode issued grant scope")
 }
 
+/// The default `owner_json` column value: the legacy `Unowned` sentinel, applied
+/// to session rows written before schema v7 so they are refused for authority
+/// use until reissued. Must stay in sync with `SessionOwner`'s serialization.
+const OWNER_JSON_DEFAULT: &str = "'\"unowned\"'";
+
+fn encode_owner(owner: &SessionOwner) -> Result<String> {
+    serde_json::to_string(owner).context("failed to encode session owner")
+}
+
 #[cfg(unix)]
 fn prepare_state_path(path: &Path) -> Result<()> {
     let parent = path
@@ -1593,6 +1642,16 @@ fn decode_scope(value: &str) -> rusqlite::Result<IssuedGrantScope> {
     })
 }
 
+fn decode_owner(value: &str) -> rusqlite::Result<SessionOwner> {
+    serde_json::from_str(value).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(
+            value.len(),
+            rusqlite::types::Type::Text,
+            Box::new(err),
+        )
+    })
+}
+
 fn encode_exact_vec(values: &[SessionExactRule]) -> rusqlite::Result<String> {
     serde_json::to_string(values).map_err(|err| {
         rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
@@ -1790,6 +1849,7 @@ mod tests {
                 granted_at: 0,
                 static_only: false,
                 auto_amend: false,
+                owner: SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(1000)),
             },
         );
         store.persist_registry(&registry).await.unwrap();
@@ -2047,6 +2107,7 @@ mod tests {
                 granted_at: 0,
                 static_only: false,
                 auto_amend: false,
+                owner: SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(1000)),
             },
         );
         store.persist_registry(&registry).await.unwrap();
@@ -2133,6 +2194,7 @@ mod tests {
             granted_at: 0,
             static_only: false,
             auto_amend: false,
+            owner: SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(1000)),
         };
 
         let mut registry = SessionRegistry::new();
@@ -2253,6 +2315,55 @@ mod tests {
         let registry = store.load_registry().await.expect("load registry");
         let prompt = registry.prompt_append_for("tok").expect("prompt");
         assert!(!prompt.contains("SyntheticHunter2Value"));
+    }
+
+    #[tokio::test]
+    async fn v6_migration_stamps_unowned_owner_and_bumps_to_v7() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("state.db");
+        {
+            // Seed a database as a pre-v7 daemon left it: the session tables have
+            // no owner column, and a live session row carries no owner.
+            let store = SessionStore::open(path.clone(), 24 * 60 * 60)
+                .await
+                .expect("open store");
+            drop(store);
+            let conn = Connection::open(&path).expect("reopen seeded db");
+            conn.execute("ALTER TABLE session_grants DROP COLUMN owner_json", [])
+                .expect("drop grant owner column");
+            conn.execute("ALTER TABLE session_history DROP COLUMN owner_json", [])
+                .expect("drop history owner column");
+            conn.execute(
+                "INSERT INTO session_grants (token, allow_json, deny_json, scope_json, granted_at)
+                 VALUES ('legacy', '[\"true\"]', '[]', '{}', 1)",
+                [],
+            )
+            .expect("seed ownerless session");
+            conn.pragma_update(None, "user_version", 6)
+                .expect("set previous schema version");
+            drop(conn);
+        }
+
+        // Opening migrates 6 -> 7, adding the owner column with the Unowned
+        // sentinel default.
+        let store = SessionStore::open(path.clone(), 24 * 60 * 60)
+            .await
+            .expect("migrate store");
+        let registry = store.load_registry().await.expect("load registry");
+        assert_eq!(
+            registry.owner_for("legacy"),
+            Some(SessionOwner::Unowned),
+            "a session carried across the migration must be stamped Unowned, \
+             which the execute path refuses fail-closed until reissue"
+        );
+        drop(store);
+
+        let conn = Connection::open(&path).expect("reopen migrated db");
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(version, 7);
     }
 
     #[tokio::test]
@@ -2503,6 +2614,7 @@ mod tests {
                 granted_at: now.saturating_sub(2),
                 static_only: true,
                 auto_amend: true,
+                owner: SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(4242)),
             },
         );
         let registry = SessionRegistry::from_parts(
@@ -2524,6 +2636,7 @@ mod tests {
                 generated_notes: Vec::new(),
                 static_only: false,
                 auto_amend: false,
+                owner: SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(4343)),
             }],
             vec![(
                 "tok".into(),

@@ -123,6 +123,9 @@ verbs:
         static_only: false,
         auto_amend: false,
         granted_at: 0,
+        owner: crate::session::SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(
+            1000,
+        )),
     };
     cfg.state
         .sessions
