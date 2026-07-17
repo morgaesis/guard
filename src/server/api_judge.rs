@@ -221,7 +221,10 @@ impl ApiJudgeSpend {
             {
                 states.remove(&oldest);
             } else {
-                tracing::warn!(target: "guard::audit", "[AUDIT] API_JUDGE_SPEND event=completion_scope_capacity");
+                let _ = guard::audit::emit_global(
+                    &guard::audit::AuditEvent::new(guard::audit::AuditKind::ApiJudgeSpend)
+                        .field("event", "completion_scope_capacity"),
+                );
                 return;
             }
         }
@@ -255,15 +258,24 @@ impl ApiJudgeSpend {
     }
 
     fn audit(&self, event: &str) {
-        tracing::info!(target: "guard::audit",
-            "[AUDIT] API_JUDGE_SPEND event={} attempted={} admitted={} rate_limited={} concurrency_limited={} evaluator_errors={} circuit_rejections={}",
-            event,
-            self.attempted.load(Ordering::Relaxed),
-            self.admitted.load(Ordering::Relaxed),
-            self.rate_limited.load(Ordering::Relaxed),
-            self.concurrency_limited.load(Ordering::Relaxed),
-            self.evaluator_errors.load(Ordering::Relaxed),
-            self.circuit_rejections.load(Ordering::Relaxed),
+        let _ = guard::audit::emit_global(
+            &guard::audit::AuditEvent::new(guard::audit::AuditKind::ApiJudgeSpend)
+                .field("event", event)
+                .field("attempted", self.attempted.load(Ordering::Relaxed))
+                .field("admitted", self.admitted.load(Ordering::Relaxed))
+                .field("rate_limited", self.rate_limited.load(Ordering::Relaxed))
+                .field(
+                    "concurrency_limited",
+                    self.concurrency_limited.load(Ordering::Relaxed),
+                )
+                .field(
+                    "evaluator_errors",
+                    self.evaluator_errors.load(Ordering::Relaxed),
+                )
+                .field(
+                    "circuit_rejections",
+                    self.circuit_rejections.load(Ordering::Relaxed),
+                ),
         );
     }
 }
@@ -417,12 +429,19 @@ impl ApiJudge for DaemonApiJudge {
                 guard.learned_deny(summary, &request_stamp)
             };
             if let Some(hit) = hit {
-                tracing::info!(
-                    target: "guard::audit",
-                    "[AUDIT] API_VERB_COVERAGE_HIT decision=deny scope={} {} denials={}",
-                    if summary.session_fingerprint.is_some() { "session" } else { "global" },
-                    hit.shape.audit_label(),
-                    hit.denials
+                let _ = guard::audit::emit_global(
+                    &guard::audit::AuditEvent::new(guard::audit::AuditKind::ApiVerbCoverageHit)
+                        .field("decision", "deny")
+                        .field(
+                            "scope",
+                            if summary.session_fingerprint.is_some() {
+                                "session"
+                            } else {
+                                "global"
+                            },
+                        )
+                        .field("shape", hit.shape.audit_label())
+                        .field("denials", hit.denials),
                 );
                 // Return the original denial reason verbatim so the client sees
                 // exactly what a fresh evaluator denial would say. Disclosing
@@ -437,14 +456,21 @@ impl ApiJudge for DaemonApiJudge {
                     guard.learned_allow(summary, &request_stamp)
                 };
                 if let Some(hit) = hit {
-                    tracing::info!(
-                        target: "guard::audit",
-                        "[AUDIT] API_VERB_COVERAGE_HIT decision=allow scope={} {} approvals={} risk={} reversibility={}",
-                        if summary.session_fingerprint.is_some() { "session" } else { "global" },
-                        hit.shape.audit_label(),
-                        hit.approvals,
-                        hit.risk,
-                        hit.reversibility
+                    let _ = guard::audit::emit_global(
+                        &guard::audit::AuditEvent::new(guard::audit::AuditKind::ApiVerbCoverageHit)
+                            .field("decision", "allow")
+                            .field(
+                                "scope",
+                                if summary.session_fingerprint.is_some() {
+                                    "session"
+                                } else {
+                                    "global"
+                                },
+                            )
+                            .field("shape", hit.shape.audit_label())
+                            .field("approvals", hit.approvals)
+                            .field("risk", hit.risk)
+                            .field("reversibility", hit.reversibility),
                     );
                     return ApiJudgeVerdict::Allow {
                         reason: "API evaluator approved request".to_string(),
@@ -470,14 +496,27 @@ impl ApiJudge for DaemonApiJudge {
                 };
                 if let Some(hit) = deny {
                     if hit.provenance == ApiCoverageProvenance::Operator {
-                        tracing::info!(target: "guard::audit",
-                            "[AUDIT] API_VERB_COVERAGE_HIT decision=deny scope=global provenance=operator {} denials={}",
-                            hit.shape.audit_label(), hit.denials);
+                        let _ = guard::audit::emit_global(
+                            &guard::audit::AuditEvent::new(
+                                guard::audit::AuditKind::ApiVerbCoverageHit,
+                            )
+                            .field("decision", "deny")
+                            .field("scope", "global")
+                            .field("provenance", "operator")
+                            .field("shape", hit.shape.audit_label())
+                            .field("denials", hit.denials),
+                        );
                         return ApiJudgeVerdict::Deny { reason: hit.reason };
                     }
-                    tracing::info!(target: "guard::audit",
-                        "[AUDIT] API_VERB_COVERAGE_ESCALATE scope=session global_generated_deny=true {} denials={}",
-                        hit.shape.audit_label(), hit.denials);
+                    let _ = guard::audit::emit_global(
+                        &guard::audit::AuditEvent::new(
+                            guard::audit::AuditKind::ApiVerbCoverageEscalate,
+                        )
+                        .field("scope", "session")
+                        .field("global_generated_deny", true)
+                        .field("shape", hit.shape.audit_label())
+                        .field("denials", hit.denials),
+                    );
                 }
             }
         }
@@ -556,13 +595,15 @@ impl DaemonApiJudge {
                 risk,
                 reversibility,
             })) => {
-                tracing::info!(
-                    target: "guard::audit",
-                    "[AUDIT] API_VERB_COVERAGE_ACTIVATED decision=allow {} approvals={} risk={} reversibility={}",
-                    shape.audit_label(),
-                    approvals,
-                    risk,
-                    reversibility
+                let _ = guard::audit::emit_global(
+                    &guard::audit::AuditEvent::new(
+                        guard::audit::AuditKind::ApiVerbCoverageActivated,
+                    )
+                    .field("decision", "allow")
+                    .field("shape", shape.audit_label())
+                    .field("approvals", approvals)
+                    .field("risk", risk)
+                    .field("reversibility", reversibility),
                 );
             }
             Ok(Some(ApiPromotionOutcome::DenyLearned { .. })) => {}
@@ -581,11 +622,13 @@ impl DaemonApiJudge {
         };
         match outcome {
             Ok(Some(ApiPromotionOutcome::DenyLearned { shape, denials })) => {
-                tracing::info!(
-                    target: "guard::audit",
-                    "[AUDIT] API_VERB_COVERAGE_ACTIVATED decision=deny {} denials={}",
-                    shape.audit_label(),
-                    denials
+                let _ = guard::audit::emit_global(
+                    &guard::audit::AuditEvent::new(
+                        guard::audit::AuditKind::ApiVerbCoverageActivated,
+                    )
+                    .field("decision", "deny")
+                    .field("shape", shape.audit_label())
+                    .field("denials", denials),
                 );
             }
             Ok(Some(ApiPromotionOutcome::AllowPromoted { .. })) => {}

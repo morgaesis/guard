@@ -51,12 +51,11 @@ pub(super) async fn handle_grant_read(
         CallerIdentity::Unix { uid } => *uid,
         _ => {
             let reason = "read grants require a local Unix socket caller".to_string();
-            server.log_audit_policy(
+            server.audit_deny(
                 caller,
                 session_token.as_deref(),
                 AUTO_READ_GRANT_LABEL,
                 &grant_read_audit_args(&path, ttl),
-                false,
                 &reason,
             );
             return ExecuteResult::denied(reason);
@@ -70,12 +69,11 @@ pub(super) async fn handle_grant_read(
         Ok(p) => p,
         Err(e) => {
             let reason = format!("read-grant denied: cannot resolve '{path}': {e}");
-            server.log_audit_policy(
+            server.audit_deny(
                 caller,
                 session_token.as_deref(),
                 AUTO_READ_GRANT_LABEL,
                 &grant_read_audit_args(&path, ttl),
-                false,
                 &reason,
             );
             return ExecuteResult::denied(reason);
@@ -86,12 +84,11 @@ pub(super) async fn handle_grant_read(
 
     // 1. Hard static credential deny-list, BEFORE the evaluator.
     if let Some(reason) = credential_path_deny_reason(&canonical_str) {
-        server.log_audit_policy(
+        server.audit_deny(
             caller,
             session_token.as_deref(),
             AUTO_READ_GRANT_LABEL,
             &audit_args,
-            false,
             &reason,
         );
         return ExecuteResult::denied(reason);
@@ -112,24 +109,22 @@ pub(super) async fn handle_grant_read(
         if !exists {
             let reason =
                 format!("unknown session token: '{token}' is revoked, expired, or never existed");
-            server.log_audit_policy(
+            server.audit_deny(
                 caller,
                 session_token.as_deref(),
                 AUTO_READ_GRANT_LABEL,
                 &audit_args,
-                false,
                 &reason,
             );
             return ExecuteResult::denied(reason);
         }
         match decision {
             Some((SessionDecision::Deny, reason)) => {
-                server.log_audit_policy(
+                server.audit_deny(
                     caller,
                     session_token.as_deref(),
                     AUTO_READ_GRANT_LABEL,
                     &audit_args,
-                    false,
                     &reason,
                 );
                 return ExecuteResult::denied(reason);
@@ -138,12 +133,11 @@ pub(super) async fn handle_grant_read(
             None if static_only => {
                 let reason =
                     "session policy-only mode: read is outside active verb coverage".to_string();
-                server.log_audit_policy(
+                server.audit_deny(
                     caller,
                     session_token.as_deref(),
                     AUTO_READ_GRANT_LABEL,
                     &audit_args,
-                    false,
                     &reason,
                 );
                 return ExecuteResult::denied(reason);
@@ -188,24 +182,22 @@ pub(super) async fn handle_grant_read(
         {
             guard::evaluate::EvalResult::Allow { reason, .. } => allow_reason = Some(reason),
             guard::evaluate::EvalResult::Deny { reason, .. } => {
-                server.log_audit_policy(
+                server.audit_deny(
                     caller,
                     session_token.as_deref(),
                     AUTO_READ_GRANT_LABEL,
                     &audit_args,
-                    false,
                     &reason,
                 );
                 return ExecuteResult::denied(reason);
             }
             guard::evaluate::EvalResult::Error(e) => {
                 let reason = format!("evaluation error: {e}");
-                server.log_audit_policy(
+                server.audit_deny(
                     caller,
                     session_token.as_deref(),
                     AUTO_READ_GRANT_LABEL,
                     &audit_args,
-                    false,
                     &reason,
                 );
                 return ExecuteResult::denied(reason);
@@ -214,15 +206,19 @@ pub(super) async fn handle_grant_read(
     }
     let reason = allow_reason.unwrap_or_default();
 
+    // One ALLOWED record for the whole grant flow, emitted BEFORE anything
+    // acts on the decision. If it cannot be made durable, fail closed.
+    if !server.audit_allow(
+        caller,
+        session_token.as_deref(),
+        AUTO_READ_GRANT_LABEL,
+        &audit_args,
+        &reason,
+    ) {
+        return ExecuteResult::denied(super::AUDIT_UNAVAILABLE_REASON);
+    }
+
     if server.config.dry_run {
-        server.log_audit_policy(
-            caller,
-            session_token.as_deref(),
-            AUTO_READ_GRANT_LABEL,
-            &audit_args,
-            true,
-            &reason,
-        );
         return ExecuteResult::completed(
             reason,
             Some(0),
@@ -245,14 +241,6 @@ pub(super) async fn handle_grant_read(
         Ok(ctx) => ctx.gid,
         Err(e) => {
             let reason = format!("grantee uid {grantee_uid} could not be resolved: {e}");
-            server.log_audit_policy(
-                caller,
-                session_token.as_deref(),
-                AUTO_READ_GRANT_LABEL,
-                &audit_args,
-                true,
-                &reason,
-            );
             return ExecuteResult::exec_failed(reason.clone(), reason);
         }
     };
@@ -264,12 +252,11 @@ pub(super) async fn handle_grant_read(
         Ok(home) => home,
         Err(e) => {
             let reason = format!("read-grant denied: {e}");
-            server.log_audit_policy(
+            server.audit_deny(
                 caller,
                 session_token.as_deref(),
                 AUTO_READ_GRANT_LABEL,
                 &audit_args,
-                false,
                 &reason,
             );
             return ExecuteResult::denied(reason);
@@ -284,12 +271,11 @@ pub(super) async fn handle_grant_read(
         Ok(planned) => planned,
         Err(e) => {
             let reason = format!("read-grant denied: {e}");
-            server.log_audit_policy(
+            server.audit_deny(
                 caller,
                 session_token.as_deref(),
                 AUTO_READ_GRANT_LABEL,
                 &audit_args,
-                false,
                 &reason,
             );
             return ExecuteResult::denied(reason);
@@ -316,14 +302,6 @@ pub(super) async fn handle_grant_read(
         // Nothing survived the in-apply rollback, so drop the committed row too.
         delete_read_grant_row(server, &grant.target_path).await;
         let exec_reason = format!("failed to apply read grant: {e}");
-        server.log_audit_policy(
-            caller,
-            session_token.as_deref(),
-            AUTO_READ_GRANT_LABEL,
-            &audit_args,
-            true,
-            &reason,
-        );
         server.log_audit_exec_failed(
             caller,
             session_token.as_deref(),
@@ -337,23 +315,17 @@ pub(super) async fn handle_grant_read(
     let traverse_count = grant.entries.len().saturating_sub(1);
     server.state.read_grants.write().await.insert(grant.clone());
 
-    server.log_audit_policy(
-        caller,
-        session_token.as_deref(),
-        AUTO_READ_GRANT_LABEL,
-        &audit_args,
-        true,
-        &reason,
-    );
-    tracing::info!(target: "guard::audit",
-        "[AUDIT] READ_GRANT_ISSUED caller={} handle={} path=\"{}\" grantee_uid={} ttl={} traverse_grants={} session_fingerprint={}",
-        caller,
-        grant.handle,
-        guard::redact::audit_escape(&grant.target_path),
-        grantee_uid,
-        ttl,
-        traverse_count,
-        super::execute::audit_session_fingerprint(session_token.as_deref()),
+    server.emit_audit_ungated(
+        guard::audit::AuditEvent::new(guard::audit::AuditKind::ReadGrantIssued)
+            .handle(&grant.handle)
+            .caller(caller)
+            .session_fingerprint(super::execute::audit_session_fingerprint(
+                session_token.as_deref(),
+            ))
+            .field("path", &grant.target_path)
+            .field("grantee_uid", grantee_uid)
+            .field("ttl", ttl)
+            .field("traverse_grants", traverse_count),
     );
 
     let stdout = format!(
@@ -745,11 +717,11 @@ pub(super) async fn finish_read_grant_revert(
                 {
                     persist_read_grant(server, updated).await;
                 }
-                tracing::info!(target: "guard::audit",
-                    "[AUDIT] READ_GRANT_REVOKED handle={} path=\"{}\" source={}",
-                    grant.handle,
-                    guard::redact::audit_escape(&grant.target_path),
-                    source
+                server.emit_audit_ungated(
+                    guard::audit::AuditEvent::new(guard::audit::AuditKind::ReadGrantRevoked)
+                        .handle(&grant.handle)
+                        .field("path", &grant.target_path)
+                        .field("source", source),
                 );
             }
             Err(e) => {
@@ -768,12 +740,12 @@ pub(super) async fn finish_read_grant_revert(
                 {
                     persist_read_grant(server, updated).await;
                 }
-                tracing::warn!(target: "guard::audit",
-                    "[AUDIT] READ_GRANT_REVOKE_FAILED handle={} path=\"{}\" source={} detail=\"{}\"",
-                    grant.handle,
-                    guard::redact::audit_escape(&grant.target_path),
-                    source,
-                    guard::redact::audit_escape(&e.to_string())
+                server.emit_audit_ungated(
+                    guard::audit::AuditEvent::new(guard::audit::AuditKind::ReadGrantRevokeFailed)
+                        .handle(&grant.handle)
+                        .field("path", &grant.target_path)
+                        .field("source", source)
+                        .field("detail", e),
                 );
             }
         }

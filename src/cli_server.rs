@@ -72,6 +72,10 @@ fn default_state_db_path() -> Option<PathBuf> {
     default_guard_state_dir().map(|dir| dir.join("state.db"))
 }
 
+fn default_audit_log_path() -> Option<PathBuf> {
+    default_guard_state_dir().map(|dir| dir.join("audit.jsonl"))
+}
+
 pub(crate) fn resolve_history_retention(
     configured: Option<u64>,
     environment: Option<String>,
@@ -203,6 +207,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             learn_allow_min_approvals,
             dry_run,
             state_db,
+            audit_log,
             history_retention,
             exec_as_caller,
             system_prompt,
@@ -388,6 +393,31 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 .or_else(default_state_db_path);
             if let Some(ref path) = state_db_path {
                 tracing::info!("State DB: {}", path.display());
+            }
+
+            // Structured audit log: default on, in the state directory. The
+            // JSONL file is the authoritative audit record; the stderr
+            // [AUDIT] lines are a projection of the same events.
+            let audit_log_path = audit_log
+                .or_else(|| {
+                    guard_env("AUDIT_LOG")
+                        .filter(|value| !value.is_empty())
+                        .map(PathBuf::from)
+                })
+                .or_else(|| {
+                    state_db_path
+                        .as_ref()
+                        .and_then(|path| path.parent())
+                        .map(|dir| dir.join("audit.jsonl"))
+                })
+                .or_else(default_audit_log_path);
+            if let Some(ref path) = audit_log_path {
+                tracing::info!("Audit log: {}", path.display());
+            } else {
+                tracing::warn!(
+                    "no state directory resolved; the structured audit log is disabled and audit \
+                     events reach stderr only"
+                );
             }
 
             let exec_as_caller = exec_as_caller
@@ -929,6 +959,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 preflight,
                 exec_as_caller,
                 state_db_path,
+                audit_log_path,
                 ..server::ServerConfig::default()
             };
             let mut srv = server::Server::new(

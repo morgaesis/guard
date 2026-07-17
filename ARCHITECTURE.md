@@ -165,10 +165,15 @@ grant requests, holds, provisionals, scoped read grants, and bounded interaction
 history. Schema versioning rejects newer unsupported databases. Retention and
 compaction bound historical storage.
 
-Structured `guard::audit` output is the audit source of truth. It remains active
-independently of diagnostic filtering. SQLite supports state recovery and
-session queries but does not replace journald, Windows service logging, or
-remote log shipping.
+The audit source of truth is an append-only, hash-chained JSONL file in the
+state directory: every audit event is a typed record carrying a sequence
+number and the SHA-256 of the previous record, so truncation, edits, or
+reordering are detectable (`guard audit verify`, `guard audit tail`). The
+stderr `[AUDIT]` lines on the `guard::audit` target are a projection of the
+same typed events and remain active independently of diagnostic filtering.
+Auditable actions fail closed when the file cannot be appended. SQLite
+supports state recovery and session queries but does not replace journald,
+Windows service logging, or remote log shipping.
 
 ## Evaluator boundary
 

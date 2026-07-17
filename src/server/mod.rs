@@ -38,6 +38,11 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
+/// Denial reason used when an allow decision cannot be durably recorded in
+/// the audit log. Auditable actions fail closed rather than run unaudited.
+pub(crate) const AUDIT_UNAVAILABLE_REASON: &str =
+    "audit log unavailable: the allow decision could not be durably recorded; failing closed";
+
 const MAX_GUARD_DEPTH: u32 = 5;
 const MAX_REQUEST_BYTES: usize = 1_048_576; // 1MB
 const MAX_OUTPUT_BYTES: usize = 10_485_760; // 10MB
@@ -102,7 +107,7 @@ pub use wire::{
 pub(crate) use wire::{ExecuteStreamMessage, IncomingMessage};
 
 use execute::{audit_command_line, audit_session_fingerprint};
-use guard::redact::audit_escape;
+use guard::audit::{AuditEvent, AuditKind};
 use wire::CallerIdentity;
 
 /// Constant-time byte comparison for bearer credentials (auth tokens, admin
@@ -183,6 +188,9 @@ pub(crate) struct ServerConfig {
     /// Optional session-scoped circuit breakers derived from persisted
     /// interactions. Every threshold is disabled by default.
     pub(crate) behavior_limits: SessionBehaviorLimits,
+    /// Append-only hash-chained audit log location. `None` disables the
+    /// durable sink (audit events then reach stderr/journald only).
+    pub(crate) audit_log_path: Option<PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -224,6 +232,7 @@ impl Default for ServerConfig {
             extra_child_env: Vec::new(),
             secret_file_root: None,
             behavior_limits: SessionBehaviorLimits::default(),
+            audit_log_path: None,
         }
     }
 }
@@ -276,6 +285,10 @@ struct ServerState {
     process_tracker: runtime::ProcessTracker,
     /// Shared command-handler and evaluator admission control.
     command_admission: runtime::CommandAdmission,
+    /// Durable hash-chained audit sink. `None` in bare test contexts and
+    /// when no state directory resolves; audit events then reach only the
+    /// stderr projection, matching the pre-sink deployment.
+    audit: Option<Arc<guard::audit::AuditLog>>,
 }
 
 impl ServerState {
@@ -307,6 +320,7 @@ impl ServerState {
             command_admission: runtime::CommandAdmission::new(
                 runtime::CommandAdmissionConfig::default(),
             ),
+            audit: None,
         }
     }
 }
@@ -391,11 +405,29 @@ impl ServerContext {
         Ok(())
     }
 
+    /// The single audit emission path for this daemon: renders the stderr
+    /// `[AUDIT]` projection and appends the JSONL record when a durable sink
+    /// is configured. Returns false only when a configured sink failed to
+    /// append; callers gating auditable actions must then fail closed.
+    #[must_use]
+    pub(super) fn emit_audit(&self, event: AuditEvent) -> bool {
+        guard::audit::emit(self.state.audit.as_deref(), &event)
+    }
+
+    /// Emit an audit event whose durability does not gate any action (the
+    /// recorded fact already happened, or the outcome is already a denial).
+    /// A sink failure still logs an error through the emission path.
+    pub(super) fn emit_audit_ungated(&self, event: AuditEvent) {
+        let _ = self.emit_audit(event);
+    }
+
     /// Log the LLM policy decision. This is the primary audit event and
     /// uses the historical `[AUDIT] ALLOWED` / `[AUDIT] DENIED` prefixes
     /// so existing grep patterns (harness scripts, review agents) keep
     /// working. It reflects only the policy verdict, not whether the
-    /// command subsequently managed to exec.
+    /// command subsequently managed to exec. Returns whether the record is
+    /// durable; an allow that cannot be durably audited must fail closed.
+    #[must_use]
     fn log_audit_policy(
         &self,
         caller: &CallerIdentity,
@@ -404,16 +436,48 @@ impl ServerContext {
         args: &[String],
         allowed: bool,
         reason: &str,
+    ) -> bool {
+        let kind = if allowed {
+            AuditKind::Allowed
+        } else {
+            AuditKind::Denied
+        };
+        self.emit_audit(
+            AuditEvent::new(kind)
+                .caller(caller)
+                .session_fingerprint(audit_session_fingerprint(session_token))
+                .cmd(audit_command_line(binary, args))
+                .reason(reason),
+        )
+    }
+
+    /// Record a policy denial. Durability never gates a denial: the request
+    /// is already refused, which is the fail-closed outcome.
+    fn audit_deny(
+        &self,
+        caller: &CallerIdentity,
+        session_token: Option<&str>,
+        binary: &str,
+        args: &[String],
+        reason: &str,
     ) {
-        let action = if allowed { "ALLOWED" } else { "DENIED" };
-        tracing::info!(target: "guard::audit",
-            "[AUDIT] {} caller={} session_fingerprint={} cmd=\"{}\" reason=\"{}\"",
-            action,
-            caller,
-            audit_session_fingerprint(session_token),
-            audit_command_line(binary, args),
-            audit_escape(reason)
-        );
+        let _ = self.log_audit_policy(caller, session_token, binary, args, false, reason);
+    }
+
+    /// Record a policy allow. Returns whether the record is durable; the
+    /// caller must fail closed (deny instead of act) on false.
+    /// Currently consumed only by the Unix-only read-grant flow.
+    #[cfg_attr(windows, allow(dead_code))]
+    #[must_use]
+    fn audit_allow(
+        &self,
+        caller: &CallerIdentity,
+        session_token: Option<&str>,
+        binary: &str,
+        args: &[String],
+        reason: &str,
+    ) -> bool {
+        self.log_audit_policy(caller, session_token, binary, args, true, reason)
     }
 
     /// Log a failed exec attempt. Only emitted when the policy allowed
@@ -429,12 +493,12 @@ impl ServerContext {
         args: &[String],
         reason: &str,
     ) {
-        tracing::info!(target: "guard::audit",
-            "[AUDIT] EXEC_FAILED caller={} session_fingerprint={} cmd=\"{}\" reason=\"{}\"",
-            caller,
-            audit_session_fingerprint(session_token),
-            audit_command_line(binary, args),
-            audit_escape(reason)
+        self.emit_audit_ungated(
+            AuditEvent::new(AuditKind::ExecFailed)
+                .caller(caller)
+                .session_fingerprint(audit_session_fingerprint(session_token))
+                .cmd(audit_command_line(binary, args))
+                .reason(reason),
         );
     }
 }

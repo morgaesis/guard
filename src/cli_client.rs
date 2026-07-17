@@ -625,6 +625,111 @@ pub(crate) async fn handle_approvals(
     }
 }
 
+pub(crate) async fn handle_audit_verify(socket: Option<String>, json: bool) -> Result<()> {
+    let (client, source) = gate_client(socket);
+    match client
+        .send_admin(server::AdminRequest::AuditVerify)
+        .await
+        .map_err(|e| describe_connect_failure(e, &client, source))?
+    {
+        server::AdminResponse::AuditVerification { path, verification } => {
+            if json {
+                return print_json(&serde_json::json!({
+                    "schema_version": JSON_SCHEMA_VERSION,
+                    "type": "audit_verification",
+                    "path": path,
+                    "intact": verification.intact,
+                    "records": verification.records,
+                    "broken_at_seq": verification.broken_at_seq,
+                    "detail": verification.detail,
+                }));
+            }
+            let color = color_enabled_for_stdout();
+            if verification.intact {
+                println!(
+                    "{}: {} record(s) verified ({})",
+                    paint("audit chain intact", AnsiColor::Green, color),
+                    verification.records,
+                    path
+                );
+                Ok(())
+            } else {
+                println!(
+                    "{} at seq {}: {}",
+                    paint("audit chain BROKEN", AnsiColor::Red, color),
+                    verification
+                        .broken_at_seq
+                        .map(|seq| seq.to_string())
+                        .unwrap_or_else(|| "?".to_string()),
+                    verification.detail.as_deref().unwrap_or("unknown anomaly")
+                );
+                println!(
+                    "{} record(s) verified before the break ({})",
+                    verification.records, path
+                );
+                std::process::exit(1);
+            }
+        }
+        server::AdminResponse::Error { message } => {
+            eprintln!("error: {}", message);
+            std::process::exit(1);
+        }
+        other => {
+            eprintln!("unexpected response: {:?}", other);
+            std::process::exit(1);
+        }
+    }
+}
+
+pub(crate) async fn handle_audit_tail(
+    socket: Option<String>,
+    n: Option<usize>,
+    json: bool,
+) -> Result<()> {
+    let (client, source) = gate_client(socket);
+    match client
+        .send_admin(server::AdminRequest::AuditTail { limit: n })
+        .await
+        .map_err(|e| describe_connect_failure(e, &client, source))?
+    {
+        server::AdminResponse::AuditRecords { path, items } => {
+            if json {
+                return print_json(&serde_json::json!({
+                    "schema_version": JSON_SCHEMA_VERSION,
+                    "type": "audit_records",
+                    "path": path,
+                    "items": items,
+                }));
+            }
+            if items.is_empty() {
+                println!("(no audit records)");
+            }
+            for item in &items {
+                match serde_json::from_value::<guard::audit::AuditRecord>(item.clone()) {
+                    Ok(record) => println!(
+                        "seq={} {} [AUDIT] {}",
+                        record.seq,
+                        format_timestamp(record.ts),
+                        record.event.render_line()
+                    ),
+                    // A line that does not parse is shown raw rather than
+                    // hidden, so a tampered tail stays visible in reads too.
+                    Err(_) => println!("(unparseable) {}", item),
+                }
+            }
+            Ok(())
+        }
+        server::AdminResponse::Error { message } => {
+            eprintln!("error: {}", message);
+            std::process::exit(1);
+        }
+        other => {
+            eprintln!("unexpected response: {:?}", other);
+            std::process::exit(1);
+        }
+    }
+}
+
 pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
     match subcommand {
         VerbCommands::List { socket, json } => {
@@ -2621,7 +2726,9 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
         | server::AdminResponse::SavedGrantRegenerationProposal { .. }
         | server::AdminResponse::GrantRequests { .. }
         | server::AdminResponse::GrantRequest { .. }
-        | server::AdminResponse::EvaluationBatch { .. } => {
+        | server::AdminResponse::EvaluationBatch { .. }
+        | server::AdminResponse::AuditVerification { .. }
+        | server::AdminResponse::AuditRecords { .. } => {
             // session subcommands never request these response variants.
             eprintln!("unexpected response from session admin call");
             std::process::exit(1);

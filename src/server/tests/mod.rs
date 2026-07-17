@@ -13,14 +13,11 @@ use guard::evaluate::{EvalConfig, Evaluator};
 use guard::policy::PolicyMode;
 use std::future::Future;
 use std::io::Write;
-#[cfg(unix)]
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use tracing::instrument::WithSubscriber;
-#[cfg(unix)]
 use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::fmt::MakeWriter;
-#[cfg(unix)]
 use tracing_subscriber::{layer::SubscriberExt, Layer};
 
 use super::{ServerConfig, ServerContext, ServerState};
@@ -77,6 +74,19 @@ pub(super) fn config_for_proposal_test() -> ServerContext {
     make_test_config().0
 }
 
+/// Attach a real durable audit sink (in a tempdir) to a test context. The
+/// tempdir handle keeps the file alive for the test's lifetime.
+fn attach_test_audit_log(
+    cfg: &mut ServerContext,
+) -> (tempfile::TempDir, Arc<guard::audit::AuditLog>) {
+    let dir = tempfile::tempdir().expect("audit test dir");
+    let log = Arc::new(
+        guard::audit::AuditLog::open(dir.path().join("audit.jsonl")).expect("open audit log"),
+    );
+    cfg.state.audit = Some(log.clone());
+    (dir, log)
+}
+
 fn paranoid_test_config() -> ServerContext {
     let eval_config = EvalConfig::default()
         .llm_enabled(false)
@@ -112,6 +122,12 @@ async fn capture_async<F>(buf: &SharedBuf, future: F) -> (F::Output, String)
 where
     F: Future,
 {
+    // Anchor the process-global dispatcher BEFORE creating any scoped
+    // subscriber. Without a registered global dispatcher, tracing's callsite
+    // interest cache can transiently read `never` while scoped dispatchers
+    // churn, silently dropping an event emitted inside the capture scope
+    // (observed as an empty capture buffer under parallel test runs).
+    let _ = production_audit_buffer();
     let _capture_lock = TRACE_CAPTURE_LOCK.lock().await;
     let subscriber = tracing_subscriber::fmt()
         .with_writer(buf.clone())
@@ -125,7 +141,6 @@ where
     (output, String::from_utf8_lossy(&bytes).to_string())
 }
 
-#[cfg(unix)]
 fn production_audit_buffer() -> SharedBuf {
     static BUFFER: OnceLock<SharedBuf> = OnceLock::new();
     BUFFER
