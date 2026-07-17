@@ -42,6 +42,36 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// Build the evaluator decision-cache key.
+///
+/// The key binds three independent dimensions so a memoized verdict is only
+/// ever served back to an identical request made under identical authority:
+///   - the structured request (`command`, plus daemon-supplied execution
+///     context such as cwd/env when it is cacheable via `prompt_context`),
+///   - the caller's authorization scope (`cache_scope`: the authenticated
+///     principal and the session-grant revision), so a verdict decided for one
+///     principal or one session revision is never reused for another.
+///
+/// A revoked or re-issued session changes its session scope and a different
+/// caller changes its principal, so either shift misses the cache and forces a
+/// fresh evaluation. `cache_scope == None` leaves the key unscoped for internal
+/// daemon callers (grant preview, appeal re-eval, API-judge summaries) that do
+/// not carry a per-principal execution identity.
+fn scoped_cache_key(
+    command: &str,
+    prompt_context: Option<&str>,
+    cache_scope: Option<&str>,
+) -> String {
+    let request = match prompt_context {
+        Some(context) => format!("{command}\n\n[GUARD EVALUATION CONTEXT]\n{context}"),
+        None => command.to_string(),
+    };
+    match cache_scope {
+        Some(scope) => format!("[GUARD CACHE SCOPE]\n{scope}\n\n{request}"),
+        None => request,
+    }
+}
+
 pub struct Evaluator {
     policy_engine: Option<PolicyEngine>,
     llm_config: LlmConfig,
@@ -228,6 +258,53 @@ impl Evaluator {
         }
     }
 
+    /// Seed the decision cache with a verdict under the exact scoped key the LLM
+    /// path would write. Stands in for a real evaluator invocation so the
+    /// scope-isolation matrix can be exercised without a live provider.
+    #[cfg(test)]
+    pub(crate) async fn seed_scoped_cache_for_test(
+        &self,
+        command: &str,
+        prompt_context: Option<&str>,
+        cache_scope: Option<&str>,
+        result: EvalResult,
+    ) {
+        let key = scoped_cache_key(command, prompt_context, cache_scope);
+        let cached = match result {
+            EvalResult::Allow {
+                reason,
+                risk,
+                reversibility,
+                ..
+            } => CachedResult::Allow {
+                reason,
+                risk,
+                reversibility,
+            },
+            EvalResult::Deny { reason, risk, .. } => CachedResult::Deny { reason, risk },
+            EvalResult::Error(_) => return,
+        };
+        if let Some(cache) = &self.cache {
+            cache.write().await.insert(key, cached);
+        }
+    }
+
+    /// Probe the decision cache under the scoped key. `Some` means a hit -- the
+    /// stored verdict is reused and the evaluator is NOT re-invoked; `None`
+    /// means a miss that would force a fresh evaluation.
+    #[cfg(test)]
+    pub(crate) async fn probe_scoped_cache_for_test(
+        &self,
+        command: &str,
+        prompt_context: Option<&str>,
+        cache_scope: Option<&str>,
+    ) -> Option<EvalResult> {
+        let key = scoped_cache_key(command, prompt_context, cache_scope);
+        let cache = self.cache.as_ref()?;
+        let guard = cache.read().await;
+        guard.get(&key)
+    }
+
     pub fn learning_enabled(&self) -> bool {
         self.learned_rules.is_some()
     }
@@ -331,21 +408,39 @@ impl Evaluator {
         prompt_append: Option<&str>,
         reevaluate: bool,
     ) -> EvalResult {
-        self.evaluate_with_reevaluate_inner(command, prompt_append, reevaluate, false)
+        self.evaluate_with_reevaluate_inner(command, prompt_append, reevaluate, false, None)
             .await
     }
 
-    /// Same as `evaluate_with_reevaluate`, but a non-empty prompt can still be
-    /// cached under a prompt-qualified key. This is for daemon-supplied
-    /// execution metadata such as cwd, not caller/session authorization prose.
-    pub async fn evaluate_with_cacheable_context(
+    /// Same as `evaluate_with_reevaluate`, but the decision cache is additionally
+    /// bound to `cache_scope` -- the caller's authenticated principal and
+    /// session-grant revision. A cache hit therefore requires the same
+    /// principal, the same session revision, and the same structured request; a
+    /// different caller or a revoked/re-issued session (revision bump) misses
+    /// and is re-evaluated. This is the path the command executor uses so a
+    /// verdict decided for one user's session is never served to another user
+    /// or replayed from a since-revoked grant.
+    ///
+    /// When `cache_prompt_context` is true, a non-empty `prompt_append` is
+    /// folded into the cache key (daemon-supplied execution metadata such as
+    /// cwd, not caller/session authorization prose); when false, a session
+    /// prompt bypasses the cache entirely.
+    pub async fn evaluate_scoped(
         &self,
         command: &str,
         prompt_append: Option<&str>,
         reevaluate: bool,
+        cache_prompt_context: bool,
+        cache_scope: Option<&str>,
     ) -> EvalResult {
-        self.evaluate_with_reevaluate_inner(command, prompt_append, reevaluate, true)
-            .await
+        self.evaluate_with_reevaluate_inner(
+            command,
+            prompt_append,
+            reevaluate,
+            cache_prompt_context,
+            cache_scope,
+        )
+        .await
     }
 
     async fn evaluate_with_reevaluate_inner(
@@ -354,18 +449,13 @@ impl Evaluator {
         prompt_append: Option<&str>,
         reevaluate: bool,
         cache_prompt_context: bool,
+        cache_scope: Option<&str>,
     ) -> EvalResult {
         let session_prompt_active = prompt_append.map(|s| !s.trim().is_empty()).unwrap_or(false);
         let cache_blocked_by_prompt = session_prompt_active && !cache_prompt_context;
-        let cache_key = if session_prompt_active && cache_prompt_context {
-            format!(
-                "{}\n\n[GUARD EVALUATION CONTEXT]\n{}",
-                command,
-                prompt_append.unwrap_or_default()
-            )
-        } else {
-            command.to_string()
-        };
+        let prompt_context = (session_prompt_active && cache_prompt_context)
+            .then(|| prompt_append.unwrap_or_default());
+        let cache_key = scoped_cache_key(command, prompt_context, cache_scope);
 
         // Pre-LLM fast-reject: an explicit deny pattern (or deny-decision
         // group rule) rejects without an LLM call. A command that matches
@@ -524,6 +614,96 @@ mod tests {
         assert!(
             cache.read().await.is_empty(),
             "session-prompted call must not seed the cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_cache_isolates_principals_and_sessions() {
+        use crate::principal::{eval_cache_scope, PrincipalKey};
+
+        // The cache is present independent of the LLM toggle; disabling the LLM
+        // keeps the test offline while we drive the scoped cache directly. A
+        // hit (Some) means the verdict is reused and the evaluator is NOT
+        // re-invoked; a miss (None) means a fresh evaluation would run.
+        let evaluator =
+            Evaluator::new(EvalConfig::default().llm_enabled(false)).expect("build evaluator");
+
+        let user_a = PrincipalKey::from_uid(1000);
+        let user_b = PrincipalKey::from_uid(1001);
+        let command = "curl https://example.com";
+
+        // Session scopes as the daemon builds them: a per-session fingerprint
+        // folded with the grant revision. A reissued session gets a fresh
+        // fingerprint; an amend/coverage change bumps the revision suffix.
+        let session_1 = eval_cache_scope(Some(&user_a), Some("sha256:aaaa:rev1"), 0);
+        let session_2 = eval_cache_scope(Some(&user_a), Some("sha256:bbbb:rev1"), 0);
+        let session_1_reissued = eval_cache_scope(Some(&user_a), Some("sha256:cccc:rev1"), 0);
+        let session_1_amended = eval_cache_scope(Some(&user_a), Some("sha256:aaaa:rev2"), 0);
+        let user_b_session = eval_cache_scope(Some(&user_b), Some("sha256:aaaa:rev1"), 0);
+
+        // A verdict is decided once for user A's session 1 and cached.
+        evaluator
+            .seed_scoped_cache_for_test(
+                command,
+                None,
+                Some(&session_1),
+                EvalResult::Allow {
+                    reason: "A-only".into(),
+                    source: EvalSource::Llm,
+                    risk: Some(2),
+                    reversibility: None,
+                },
+            )
+            .await;
+
+        // (a) same principal + same session + identical command -> HIT.
+        match evaluator
+            .probe_scoped_cache_for_test(command, None, Some(&session_1))
+            .await
+        {
+            Some(EvalResult::Allow { reason, source, .. }) => {
+                assert_eq!(reason, "A-only");
+                assert_eq!(source, EvalSource::Cache);
+            }
+            other => panic!("expected cache HIT for the originating session, got {other:?}"),
+        }
+
+        // (b) distinct session, same principal -> MISS.
+        assert!(
+            evaluator
+                .probe_scoped_cache_for_test(command, None, Some(&session_2))
+                .await
+                .is_none(),
+            "a distinct session for the same principal must miss"
+        );
+
+        // (c) distinct principal, identical command -> MISS. The security case:
+        // user B must never be served user A's cached verdict.
+        assert!(
+            evaluator
+                .probe_scoped_cache_for_test(command, None, Some(&user_b_session))
+                .await
+                .is_none(),
+            "cross-principal reuse must never hit"
+        );
+
+        // (d) revoked-then-reissued session (fresh session identity) -> MISS.
+        assert!(
+            evaluator
+                .probe_scoped_cache_for_test(command, None, Some(&session_1_reissued))
+                .await
+                .is_none(),
+            "a reissued session must miss the pre-revocation verdict"
+        );
+
+        // Amended authority under the same session identity (revision bump) also
+        // misses, so a grant whose authority widened is re-evaluated.
+        assert!(
+            evaluator
+                .probe_scoped_cache_for_test(command, None, Some(&session_1_amended))
+                .await
+                .is_none(),
+            "an authority revision bump must miss"
         );
     }
 

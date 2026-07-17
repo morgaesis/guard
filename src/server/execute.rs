@@ -27,6 +27,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -707,6 +708,40 @@ async fn capture_session_authority(
         .map(SessionAuthoritySnapshot::from)
         .map(Some)
         .ok_or_else(|| "session expired or was revoked before execution routing".to_string())
+}
+
+/// Per-process counter that hands every unauthenticated request a unique
+/// evaluator-cache scope, so an unauthenticated caller can neither be served
+/// nor seed another caller's cached verdict (mirrors `principal::scope_eq`).
+static UNAUTHENTICATED_EVAL_SCOPE_NONCE: AtomicU64 = AtomicU64::new(0);
+
+/// Build the evaluator decision-cache scope for this request. Binds the cached
+/// verdict to the authenticated principal and, when a session is in play, to a
+/// per-session fingerprint folded with the session-grant revision, so a verdict
+/// decided for one user's session is never reused for another user or replayed
+/// after the session's authority changes (amend, coverage change, or
+/// revoke-and-reissue).
+pub(super) fn evaluation_cache_scope(
+    caller: &CallerIdentity,
+    session_token: Option<&str>,
+    authority: Option<&SessionAuthoritySnapshot>,
+) -> String {
+    let principal = caller.principal();
+    let session = session_token.map(|token| {
+        format!(
+            "{}:{}",
+            audit_session_fingerprint(Some(token)),
+            authority
+                .map(|snapshot| snapshot.revision.as_str())
+                .unwrap_or("<no-revision>"),
+        )
+    });
+    let nonce = if principal.is_none() {
+        UNAUTHENTICATED_EVAL_SCOPE_NONCE.fetch_add(1, Ordering::Relaxed)
+    } else {
+        0
+    };
+    guard::principal::eval_cache_scope(principal.as_ref(), session.as_deref(), nonce)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1455,27 +1490,22 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
             .await
         }
     };
-    let eval_result = if evaluation_prompt.is_some() {
-        server
-            .state
-            .evaluator
-            .evaluate_with_cacheable_context(
-                &command_line,
-                evaluation_prompt.as_deref(),
-                request.reevaluate,
-            )
-            .await
-    } else {
-        server
-            .state
-            .evaluator
-            .evaluate_with_reevaluate(
-                &command_line,
-                evaluation_prompt.as_deref(),
-                request.reevaluate,
-            )
-            .await
-    };
+    let cache_scope = evaluation_cache_scope(
+        phase.caller,
+        request.session_token.as_deref(),
+        evaluated_authority.as_ref(),
+    );
+    let eval_result = server
+        .state
+        .evaluator
+        .evaluate_scoped(
+            &command_line,
+            evaluation_prompt.as_deref(),
+            request.reevaluate,
+            evaluation_prompt.is_some(),
+            Some(cache_scope.as_str()),
+        )
+        .await;
     let provider_spend = matches!(
         &eval_result,
         guard::evaluate::EvalResult::Allow {
