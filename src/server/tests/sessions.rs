@@ -1,6 +1,7 @@
 use crate::grant_profile::{EvaluationMode, SavedGrantCatalog};
 use crate::server::admin::handle_admin_request;
-use crate::server::execute::{execute_command, session_source_from_eval};
+use crate::server::execute::{evaluation_cache_scope, execute_command, session_source_from_eval};
+use crate::server::gate_runtime::SessionAuthoritySnapshot;
 use crate::server::learning::{
     allow_session_auto_amend_candidate, deny_session_auto_amend_candidate,
 };
@@ -3078,4 +3079,51 @@ async fn principal_binding_appeal_refuses_unowned_session() {
         appeal,
         AdminResponse::Error { message } if message.contains("predates principal binding")
     ));
+}
+
+// The evaluator memoizes verdicts, so the executor must feed it a cache scope
+// that a verdict decided for one user's session can never be reused for another
+// user or replayed after the session's authority changes. This proves the
+// scope the executor derives is distinct across the two-UID / two-session
+// matrix and stable for an identical (principal, session, revision).
+#[test]
+fn evaluation_cache_scope_isolates_principals_and_sessions() {
+    let user_a = CallerIdentity::Unix { uid: 1000 };
+    let user_b = CallerIdentity::Unix { uid: 1001 };
+    let rev1 = SessionAuthoritySnapshot::from(("rev1".to_string(), None));
+    let rev2 = SessionAuthoritySnapshot::from(("rev2".to_string(), None));
+
+    // (a) Same principal + same session token + same revision is stable.
+    let a_s1 = evaluation_cache_scope(&user_a, Some("session-token-a1"), Some(&rev1));
+    assert_eq!(
+        a_s1,
+        evaluation_cache_scope(&user_a, Some("session-token-a1"), Some(&rev1))
+    );
+
+    // (c) Distinct principal, otherwise identical inputs, must never collide.
+    assert_ne!(
+        a_s1,
+        evaluation_cache_scope(&user_b, Some("session-token-a1"), Some(&rev1))
+    );
+
+    // (b) A distinct session (different token) for the same principal differs.
+    assert_ne!(
+        a_s1,
+        evaluation_cache_scope(&user_a, Some("session-token-a2"), Some(&rev1))
+    );
+
+    // (d) A reissued/amended session bumps the revision suffix.
+    assert_ne!(
+        a_s1,
+        evaluation_cache_scope(&user_a, Some("session-token-a1"), Some(&rev2))
+    );
+
+    // A sessionless request for the same principal is its own scope.
+    assert_ne!(a_s1, evaluation_cache_scope(&user_a, None, None));
+
+    // Unauthenticated callers never share a scope, even for the same command.
+    assert_ne!(
+        evaluation_cache_scope(&CallerIdentity::Unknown, None, None),
+        evaluation_cache_scope(&CallerIdentity::Unknown, None, None)
+    );
 }
