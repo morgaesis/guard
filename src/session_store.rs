@@ -1718,10 +1718,27 @@ mod tests {
         std::fs::symlink_metadata(path).unwrap().mode() & 0o777
     }
 
+    /// Create a temporary directory pinned to mode 0700.
+    ///
+    /// tempfile::tempdir() inherits the process umask, so on hosts with a
+    /// group-writable umask (e.g. 007 -> mode 0770) the directory is created
+    /// group-writable. When the state database lives in a subdirectory of the
+    /// tempdir, the tempdir is a non-immediate ancestor, which
+    /// validate_state_ancestor rejects (only the immediate parent is exempt,
+    /// since secure_state_parent tightens it to 0700). Pinning the tempdir to
+    /// 0700 keeps these tests umask-independent.
+    #[cfg(unix)]
+    fn secure_tempdir() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("restrict tempdir permissions");
+        tmp
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn state_store_creates_private_parent_database_and_sidecars() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = secure_tempdir();
         let parent = tmp.path().join("private-state");
         let path = parent.join("state.db");
         let store = SessionStore::open(path.clone(), 3600).await.unwrap();
@@ -1747,7 +1764,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn state_store_repairs_owned_existing_modes_and_protects_raw_bearers() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = secure_tempdir();
         let parent = tmp.path().join("state");
         std::fs::create_dir(&parent).unwrap();
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777)).unwrap();
@@ -1790,7 +1807,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn legacy_v4_migration_is_private_and_adds_decision_traces() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = secure_tempdir();
         let parent = tmp.path().join("migration-state");
         std::fs::create_dir(&parent).unwrap();
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777)).unwrap();
