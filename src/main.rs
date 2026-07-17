@@ -637,6 +637,11 @@ enum GrantCommands {
         label: Option<String>,
         #[arg(long)]
         evaluation_mode: Option<String>,
+        /// Principal (Unix uid or Windows SID) that owns the issued session. Set
+        /// this when minting a session for an agent that runs under a different
+        /// local identity than the operator. Defaults to the issuing principal.
+        #[arg(long)]
+        owner: Option<String>,
         #[arg(long)]
         socket: Option<String>,
     },
@@ -773,6 +778,11 @@ enum SessionCommands {
         /// Disable automatic exact-rule amendment for this grant.
         #[arg(long = "no-auto-amend", hide = true, action = ArgAction::SetTrue)]
         no_auto_amend: bool,
+        /// Principal (Unix uid or Windows SID) that owns the session. Set when
+        /// minting a session for an agent that runs under a different local
+        /// identity. Defaults to the issuing principal.
+        #[arg(long, value_name = "PRINCIPAL")]
+        owner: Option<String>,
         /// Server socket path (defaults to configured)
         #[arg(long, value_name = "PATH")]
         socket: Option<String>,
@@ -826,6 +836,11 @@ enum SessionCommands {
         /// Disable automatic exact-rule amendment for this grant.
         #[arg(long = "no-auto-amend", hide = true, action = ArgAction::SetTrue)]
         no_auto_amend: bool,
+        /// Principal (Unix uid or Windows SID) that owns the session. Set when
+        /// installing a session for an agent that runs under a different local
+        /// identity. Defaults to the issuing principal.
+        #[arg(long, value_name = "PRINCIPAL")]
+        owner: Option<String>,
         /// Server socket path (defaults to configured)
         #[arg(long, value_name = "PATH")]
         socket: Option<String>,

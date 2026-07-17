@@ -56,6 +56,9 @@ fn unrestricted_session() -> SessionGrant {
         static_only: false,
         auto_amend: false,
         granted_at: 0,
+        owner: crate::session::SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(
+            1000,
+        )),
     }
 }
 
@@ -377,6 +380,9 @@ async fn saved_grant_entitlement_covers_tool_config_secret_refs() {
         static_only: false,
         auto_amend: false,
         granted_at: 0,
+        owner: crate::session::SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(
+            1000,
+        )),
     };
     grant.scope.saved_grant = Some("no-secrets".to_string());
     grant.scope.secret_names = Vec::new();
@@ -430,6 +436,9 @@ async fn expired_denial_escalation_does_not_deduplicate_a_fresh_handle() {
             static_only: false,
             auto_amend: false,
             granted_at: 0,
+            owner: crate::session::SessionOwner::Principal(
+                guard::principal::PrincipalKey::from_uid(1000),
+            ),
         },
     );
     let mut request = basic_request("echo", vec!["blocked".to_string()]);
@@ -482,6 +491,9 @@ async fn denial_escalation_dedup_is_bound_to_session_revision() {
             static_only: false,
             auto_amend: false,
             granted_at: 0,
+            owner: crate::session::SessionOwner::Principal(
+                guard::principal::PrincipalKey::from_uid(1000),
+            ),
         },
     );
     let mut request = basic_request("echo", vec!["blocked".to_string()]);
@@ -1512,6 +1524,9 @@ async fn extra_child_env_forwards_named_var_to_child() {
                 static_only: true,
                 auto_amend: false,
                 granted_at: 0,
+                owner: crate::session::SessionOwner::Principal(
+                    guard::principal::PrincipalKey::from_uid(1000),
+                ),
             },
         );
     }
@@ -1579,6 +1594,9 @@ async fn local_caller_cwd_is_canonicalized_and_used_for_execution() {
             static_only: true,
             auto_amend: false,
             granted_at: 0,
+            owner: crate::session::SessionOwner::Principal(
+                guard::principal::PrincipalKey::from_uid(1000),
+            ),
         },
     );
 
@@ -1622,6 +1640,9 @@ async fn default_service_execution_does_not_forward_ssh_auth_sock() {
             static_only: true,
             auto_amend: false,
             granted_at: 0,
+            owner: crate::session::SessionOwner::Principal(
+                guard::principal::PrincipalKey::from_uid(1000),
+            ),
         },
     );
 
@@ -1664,6 +1685,9 @@ async fn caller_env_cannot_supply_ssh_auth_sock() {
             static_only: true,
             auto_amend: false,
             granted_at: 0,
+            owner: crate::session::SessionOwner::Principal(
+                guard::principal::PrincipalKey::from_uid(1000),
+            ),
         },
     );
 
@@ -1716,6 +1740,9 @@ async fn guard_configured_ssh_auth_sock_is_forwarded_to_child() {
             static_only: true,
             auto_amend: false,
             granted_at: 0,
+            owner: crate::session::SessionOwner::Principal(
+                guard::principal::PrincipalKey::from_uid(1000),
+            ),
         },
     );
 
@@ -1770,6 +1797,9 @@ async fn caller_env_cannot_override_guard_tool_env() {
             static_only: true,
             auto_amend: false,
             granted_at: 0,
+            owner: crate::session::SessionOwner::Principal(
+                guard::principal::PrincipalKey::from_uid(1000),
+            ),
         },
     );
 
@@ -1835,6 +1865,9 @@ async fn caller_secret_cannot_override_guard_tool_env() {
             static_only: true,
             auto_amend: false,
             granted_at: 0,
+            owner: crate::session::SessionOwner::Principal(
+                guard::principal::PrincipalKey::from_uid(1000),
+            ),
         },
     );
 
@@ -1889,6 +1922,9 @@ async fn caller_env_cannot_override_daemon_child_env() {
             static_only: true,
             auto_amend: false,
             granted_at: 0,
+            owner: crate::session::SessionOwner::Principal(
+                guard::principal::PrincipalKey::from_uid(1000),
+            ),
         },
     );
 
@@ -1954,6 +1990,9 @@ async fn redaction_covers_effective_tool_child_and_request_env_values() {
             static_only: true,
             auto_amend: false,
             granted_at: 0,
+            owner: crate::session::SessionOwner::Principal(
+                guard::principal::PrincipalKey::from_uid(1000),
+            ),
         },
     );
 
@@ -2051,6 +2090,9 @@ async fn ansible_discovers_config_from_cwd_without_inherited_ansible_config() {
             static_only: true,
             auto_amend: false,
             granted_at: 0,
+            owner: crate::session::SessionOwner::Principal(
+                guard::principal::PrincipalKey::from_uid(1000),
+            ),
         },
     );
 
@@ -2131,6 +2173,9 @@ async fn shim_dir_only_path_fails_without_recursing_into_primary_shim() {
             static_only: true,
             auto_amend: false,
             granted_at: 0,
+            owner: crate::session::SessionOwner::Principal(
+                guard::principal::PrincipalKey::from_uid(1000),
+            ),
         },
     );
 
@@ -2187,6 +2232,9 @@ async fn allowed_binary_floor_does_not_permit_shim_dir_recursion() {
             static_only: true,
             auto_amend: false,
             granted_at: 0,
+            owner: crate::session::SessionOwner::Principal(
+                guard::principal::PrincipalKey::from_uid(1000),
+            ),
         },
     );
 

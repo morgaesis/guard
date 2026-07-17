@@ -14,6 +14,7 @@
 use crate::grant_profile::{EvaluationMode, GrantRequestDelta};
 use guard::env::now_unix;
 use guard::policy::{Decision, PolicyRule};
+use guard::principal::PrincipalKey;
 use guard::redact::{command_line, redact_output_text};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
@@ -25,6 +26,40 @@ use std::path::{Path, PathBuf};
 /// to debug what an agent did yesterday" use case without growing the
 /// persisted interaction history unboundedly.
 pub const DEFAULT_HISTORY_RETENTION_SECS: u64 = 24 * 60 * 60;
+
+/// The authenticated principal a live session is bound to. Every path that
+/// consumes a session's authority (execute, appeal, kubeconfig issuance, batch
+/// evaluation, self-inspection) requires the requesting peer's server-read
+/// principal to match this owner, so a leaked or replayed bearer token cannot be
+/// used by a different local peer in the socket group. The daemon (operator)
+/// principal is exempt and retains cross-session administration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionOwner {
+    /// Bound to the authenticated principal (Unix uid or Windows SID, carried by
+    /// [`PrincipalKey`]) that the session was issued for.
+    Principal(PrincipalKey),
+    /// A session persisted before principal binding (state schema < 7). It has
+    /// no verifiable owner and is refused for any authority use fail-closed; the
+    /// operator must reissue (or revoke) it. Never written for new sessions.
+    Unowned,
+}
+
+impl SessionOwner {
+    /// A short, stable label for audit fields and operator display.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Principal(p) => p.to_string(),
+            Self::Unowned => "unowned".to_string(),
+        }
+    }
+}
+
+/// Default owner for records deserialized from state written before schema v7:
+/// the legacy sentinel, refused for authority use until reissued.
+fn default_session_owner() -> SessionOwner {
+    SessionOwner::Unowned
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionGrant {
@@ -71,6 +106,11 @@ pub struct SessionGrant {
     /// list` to show grant age.
     #[serde(default)]
     pub granted_at: u64,
+    /// The authenticated principal this session is bound to. Populated from the
+    /// server-read peer identity at issuance; enforced on every authority path.
+    /// Sessions deserialized from pre-v7 state default to `Unowned`.
+    #[serde(default = "default_session_owner")]
+    pub owner: SessionOwner,
 }
 
 pub(crate) fn session_grant_revision_key(grant: &SessionGrant) -> Option<String> {
@@ -287,6 +327,10 @@ pub struct HistoricalGrant {
     /// state-DB columns (see `session_store`). Never serialized on the wire.
     #[serde(default, skip_serializing)]
     pub auto_amend: bool,
+    /// The principal the ended session was bound to, preserved for the audit
+    /// trail. Pre-v7 history rows default to `Unowned`.
+    #[serde(default = "default_session_owner")]
+    pub owner: SessionOwner,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,6 +369,10 @@ pub struct SessionGrantSummary {
     pub prompt_append: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub generated_notes: Vec<String>,
+    /// The principal the session is bound to. Surfaced to operators (and the
+    /// self-inspecting owner) so ownership is visible in `session list`/`show`.
+    #[serde(default = "default_session_owner")]
+    pub owner: SessionOwner,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -600,6 +648,18 @@ impl SessionRegistry {
         !grant.is_expired(now_unix())
     }
 
+    /// The owner principal bound to a live (non-expired) session, or `None` when
+    /// the token is unknown/expired. Callers use this to enforce that only the
+    /// owning principal (or the daemon/operator principal) may exercise the
+    /// session's authority.
+    pub fn owner_for(&self, token: &str) -> Option<SessionOwner> {
+        let grant = self.grants.get(token)?;
+        if grant.is_expired(now_unix()) {
+            return None;
+        }
+        Some(grant.owner.clone())
+    }
+
     pub fn list(&self) -> Vec<SessionGrantSummary> {
         let now = now_unix();
         self.grants
@@ -618,6 +678,7 @@ impl SessionRegistry {
                 granted_at: g.granted_at,
                 prompt_append: g.prompt_append.clone(),
                 generated_notes: g.generated_notes.clone(),
+                owner: g.owner.clone(),
             })
             .collect()
     }
@@ -678,6 +739,7 @@ impl SessionRegistry {
                     granted_at: grant.granted_at,
                     prompt_append: grant.prompt_append.clone(),
                     generated_notes: grant.generated_notes.clone(),
+                    owner: grant.owner.clone(),
                 })
             }
         });
@@ -1250,6 +1312,7 @@ fn historical(
         generated_notes: grant.generated_notes,
         static_only: grant.static_only,
         auto_amend: grant.auto_amend,
+        owner: grant.owner,
     }
 }
 
@@ -1275,6 +1338,7 @@ mod tests {
                 generated_notes: Vec::new(),
                 static_only: false,
                 auto_amend: false,
+                owner: SessionOwner::Principal(PrincipalKey::from_uid(1000)),
             },
         );
         reg
@@ -1426,6 +1490,9 @@ mod tests {
                 generated_notes: Vec::new(),
                 static_only: false,
                 auto_amend: false,
+                owner: crate::session::SessionOwner::Principal(
+                    guard::principal::PrincipalKey::from_uid(1000),
+                ),
             },
         );
         assert!(reg.check("tok", "mkdir", &["/tmp".into()], None).is_none());
@@ -1458,6 +1525,9 @@ mod tests {
                 generated_notes: Vec::new(),
                 static_only: false,
                 auto_amend: false,
+                owner: crate::session::SessionOwner::Principal(
+                    guard::principal::PrincipalKey::from_uid(1000),
+                ),
             },
         );
         assert_eq!(
@@ -1484,6 +1554,9 @@ mod tests {
             generated_notes: Vec::new(),
             static_only: false,
             auto_amend: false,
+            owner: crate::session::SessionOwner::Principal(
+                guard::principal::PrincipalKey::from_uid(1000),
+            ),
         };
         reg.grant("tok".to_string(), grant("inspect development pods"));
         let (before, _) = reg.api_authority_for("tok").unwrap();
@@ -1513,6 +1586,9 @@ mod tests {
                 generated_notes: Vec::new(),
                 static_only: false,
                 auto_amend: false,
+                owner: crate::session::SessionOwner::Principal(
+                    guard::principal::PrincipalKey::from_uid(1000),
+                ),
             },
         );
         assert!(reg.prompt_append_for("tok").is_none());
@@ -1537,6 +1613,9 @@ mod tests {
                 generated_notes: Vec::new(),
                 static_only: false,
                 auto_amend: false,
+                owner: crate::session::SessionOwner::Principal(
+                    guard::principal::PrincipalKey::from_uid(1000),
+                ),
             },
         );
         reg.grant(
@@ -1555,6 +1634,9 @@ mod tests {
                 generated_notes: Vec::new(),
                 static_only: false,
                 auto_amend: false,
+                owner: crate::session::SessionOwner::Principal(
+                    guard::principal::PrincipalKey::from_uid(1000),
+                ),
             },
         );
         let listed = reg.list();
@@ -1588,6 +1670,9 @@ mod tests {
                 generated_notes: Vec::new(),
                 static_only: true,
                 auto_amend: true,
+                owner: crate::session::SessionOwner::Principal(
+                    guard::principal::PrincipalKey::from_uid(1000),
+                ),
             },
         );
         assert!(reg.static_only_for("tok"));
@@ -1626,6 +1711,9 @@ mod tests {
                 generated_notes: Vec::new(),
                 static_only: false,
                 auto_amend: false,
+                owner: crate::session::SessionOwner::Principal(
+                    guard::principal::PrincipalKey::from_uid(1000),
+                ),
             },
         );
         let before = reg.revision();
@@ -1659,6 +1747,9 @@ mod tests {
                 generated_notes: Vec::new(),
                 static_only: false,
                 auto_amend: false,
+                owner: crate::session::SessionOwner::Principal(
+                    guard::principal::PrincipalKey::from_uid(1000),
+                ),
             },
         );
         reg.revoke("a");
@@ -1886,6 +1977,9 @@ mod tests {
                 generated_notes: vec![format!("migrated from token={FIXTURE_BEARER_JWT}")],
                 static_only: false,
                 auto_amend: false,
+                owner: crate::session::SessionOwner::Principal(
+                    guard::principal::PrincipalKey::from_uid(1000),
+                ),
             },
         );
         let prompt = reg.prompt_append_for("tok").unwrap();
@@ -1926,6 +2020,9 @@ mod tests {
                 generated_notes: Vec::new(),
                 static_only: false,
                 auto_amend: false,
+                owner: crate::session::SessionOwner::Principal(
+                    guard::principal::PrincipalKey::from_uid(1000),
+                ),
             },
         );
         let registry = SessionRegistry::from_parts(
@@ -2000,6 +2097,9 @@ mod tests {
             granted_at: 1,
             prompt_append: None,
             generated_notes: Vec::new(),
+            owner: crate::session::SessionOwner::Principal(
+                guard::principal::PrincipalKey::from_uid(1000),
+            ),
         };
         let json = serde_json::to_value(summary).unwrap();
         for hidden in ["allow", "deny", "allow_exact", "deny_exact"] {

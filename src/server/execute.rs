@@ -1,7 +1,7 @@
 use crate::injection::is_valid_env_name;
 use crate::session::{
     SessionAmendment, SessionDecision, SessionDecisionSource, SessionExecStatus,
-    SessionInteraction, SessionRegistry,
+    SessionInteraction, SessionOwner, SessionRegistry,
 };
 use crate::session_store::SessionStore;
 #[cfg(unix)]
@@ -48,8 +48,9 @@ use super::runtime::NotifyEvent;
 use super::transport::{write_policy_decision, write_stream_message};
 use super::wire::ExecOutcome;
 use super::wire::{
-    verb_trust_is_current, CallerIdentity, ExecuteRequest, ExecuteResult, ExecuteStreamMessage,
-    OutputStream, RevertSpec, SshHostKeyMode, VerbContext, VerbMatchInfo, VerbMatchScope,
+    authorize_session_use, verb_trust_is_current, CallerIdentity, ExecuteRequest, ExecuteResult,
+    ExecuteStreamMessage, OutputStream, RevertSpec, SessionAuthz, SshHostKeyMode, VerbContext,
+    VerbMatchInfo, VerbMatchScope, SESSION_PRINCIPAL_MISMATCH, SESSION_UNOWNED_REFUSED,
 };
 use super::{
     binary_exists_on_path, child_env_allowlist, dangerous_env_name,
@@ -974,7 +975,7 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
 ) -> Result<ExecuteRequest, ExecuteResult> {
     let server = phase.server;
     if let Some(ref token) = request.session_token {
-        let (decision, exists, static_only, suspension) = {
+        let (decision, exists, static_only, suspension, owner) = {
             let reg = server.state.sessions.read().await;
             let decision = reg.check(
                 token,
@@ -987,6 +988,7 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
                 reg.has(token),
                 reg.static_only_for(token),
                 reg.suspension_reason(token, &server.config.behavior_limits),
+                reg.owner_for(token),
             )
         };
         if !exists {
@@ -1009,6 +1011,55 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
             )
             .await;
             return Err(ExecuteResult::denied(reason));
+        }
+        // Principal binding: a session's authority may be exercised only by the
+        // principal that owns it (or the daemon/operator), verified against the
+        // identity the daemon reads itself - never a client-supplied value. This
+        // closes the bearer-replay hole where any local peer in the socket group
+        // who learned a handle inherited another user's authority. Enforced here,
+        // before the command runs, so it also gates provisional arming and every
+        // downstream consequence-gated action taken under this session.
+        if let Some(owner) = owner {
+            let reason = match &owner {
+                // A session that predates principal binding has no verifiable
+                // owner: refuse execution fail-closed for everyone (the operator
+                // reissues or revokes it).
+                SessionOwner::Unowned => Some(format!(
+                    "session '{token}' {SESSION_UNOWNED_REFUSED}"
+                )),
+                SessionOwner::Principal(_) => match authorize_session_use(
+                    &owner,
+                    phase.caller,
+                    &server.config.daemon_principal,
+                ) {
+                    SessionAuthz::Allowed => None,
+                    SessionAuthz::Mismatch => Some(format!(
+                        "{SESSION_PRINCIPAL_MISMATCH}: caller {} is not the owner of session '{token}'",
+                        phase.caller
+                    )),
+                    // Unreachable for a Principal owner, but fail closed.
+                    SessionAuthz::Unowned => Some(format!(
+                        "session '{token}' {SESSION_UNOWNED_REFUSED}"
+                    )),
+                },
+            };
+            if let Some(reason) = reason {
+                server.audit_deny(
+                    phase.caller,
+                    phase.session_token.as_deref(),
+                    &request.binary,
+                    &request.args,
+                    &reason,
+                );
+                let _ = write_policy_decision(
+                    phase.stream_output,
+                    &mut *phase.stream_writer,
+                    false,
+                    &reason,
+                )
+                .await;
+                return Err(ExecuteResult::denied(reason));
+            }
         }
         if let Some(reason) = suspension {
             return Err(deny_and_record(

@@ -75,6 +75,19 @@ impl guard::proxy::ApiSessionSink for DaemonApiSessionSink {
         {
             return None;
         }
+        // The API proxy is a loopback TLS listener that carries a session bearer
+        // but no kernel-authenticated local principal, so owner==caller cannot be
+        // re-verified per request (see the security model's TCP/principal note);
+        // ownership is bound at issuance, where `KubeconfigIssue` requires the
+        // owning local peer. A session that predates principal binding has no
+        // verifiable owner and is refused fail-closed here, matching the execute
+        // path, so a legacy bearer cannot be replayed through the proxy.
+        if matches!(
+            registry.owner_for(token),
+            Some(crate::session::SessionOwner::Unowned)
+        ) {
+            return None;
+        }
         let (fingerprint, intent) = registry.api_authority_for(token)?;
         let (revision, secret_entitlements) = registry.authority_snapshot(token)?;
         let evaluation_mode = registry.evaluation_mode_for(token).unwrap_or_default();

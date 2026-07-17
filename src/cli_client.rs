@@ -1196,6 +1196,7 @@ pub(crate) async fn handle_grant(subcommand: GrantCommands) -> Result<()> {
             ttl,
             label,
             evaluation_mode,
+            owner,
             socket,
         } => {
             let token = generate_session_token();
@@ -1222,6 +1223,7 @@ pub(crate) async fn handle_grant(subcommand: GrantCommands) -> Result<()> {
                     evaluation_mode: mode,
                     static_only: false,
                     auto_amend: false,
+                    owner,
                 })
                 .await
                 .map_err(|error| describe_connect_failure(error, &client, source))?;
@@ -2175,6 +2177,7 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
         static_only,
         auto_amend,
         no_auto_amend,
+        owner,
         socket,
     } = &subcommand
     {
@@ -2225,6 +2228,7 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                     .transpose()?,
                 static_only: *static_only,
                 auto_amend,
+                owner: owner.clone(),
             };
             match client
                 .send_admin(request)
@@ -2277,6 +2281,7 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
             static_only,
             auto_amend,
             no_auto_amend,
+            owner,
             socket,
         } => {
             let prompt_append = read_grant_prompt(prompt, prompt_file.as_ref())?;
@@ -2305,6 +2310,7 @@ pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
                         .transpose()?,
                     static_only,
                     auto_amend,
+                    owner,
                 },
             )
         }

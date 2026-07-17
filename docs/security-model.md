@@ -75,10 +75,29 @@ Loopback TCP carries execution and admin bearer tokens but no kernel-authenticat
 local principal. It therefore refuses consequence gating and per-principal
 credential injection. The execution token cannot perform admin RPCs.
 
-Session tokens are bearer authority. Guard fingerprints them in logs and
+Every session is bound at creation to the authenticated principal it is issued
+for (a Unix uid or Windows SID). On every local path that consumes a session's
+authority - execution, appeals, kubeconfig issuance, batch evaluation, and
+self-inspection - the daemon requires the requesting peer's kernel-authenticated
+principal to equal the session owner, using the identity it reads itself rather
+than any client-supplied value. A different local peer in the socket group that
+learns or replays a handle is refused with a distinct `session principal
+mismatch` audit reason. The daemon (operator) principal is exempt and retains
+cross-session inspection and administration; a non-owner non-operator peer sees
+only its own sessions. The operator names the owning principal when issuing a
+session for an agent that runs under a different uid.
+
+A session that predates principal binding has no verifiable owner and is refused
+fail-closed for execution and API use with a `session predates principal
+binding` reason; the operator reissues or revokes it.
+
+Session tokens remain bearer authority on the loopback API-proxy transport,
+which carries no kernel-authenticated principal: ownership is bound there at
+issuance (brokered kubeconfig issuance requires the owning local peer) and
+cannot be re-verified per request. Guard fingerprints tokens in logs and
 history. Expiry, revocation, suspension, and saved-grant revision checks occur
-before execution or API forwarding. Treat a leaked session token as an active
-grant until revoked or expired.
+before execution or API forwarding. Treat a leaked session token used over the
+API proxy as an active grant until revoked or expired.
 
 ## Holds, rollback, and autonomy
 
