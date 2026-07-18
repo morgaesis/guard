@@ -1,4 +1,4 @@
-FROM gcr.io/oss-fuzz-base/base-builder-rust:latest@sha256:d1b7545a6a5680d66886e9ee729f6575e0e885143a1bb74289f14e7e91de3463
+FROM gcr.io/oss-fuzz-base/base-builder-rust:latest@sha256:0654a50594fa3e8aa1fc36484f3218359c06e68c13a197f21293371ef074b418
 
 # The dependency tree needs a newer nightly than the base image ships
 # (libsqlite3-sys's build script uses the unstable `cfg_select` feature), so
