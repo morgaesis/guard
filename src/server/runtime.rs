@@ -636,12 +636,22 @@ mod tests {
         });
 
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-        while !output.exists() && tokio::time::Instant::now() < deadline {
+        let value: serde_json::Value = loop {
+            match tokio::fs::read(&output).await {
+                Ok(bytes) => {
+                    if let Ok(value) = serde_json::from_slice(&bytes) {
+                        break value;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("notify output: {error}"),
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "notify hook did not produce valid JSON before the deadline"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        let value: serde_json::Value =
-            serde_json::from_slice(&tokio::fs::read(&output).await.expect("notify output"))
-                .expect("valid JSON");
+        };
         assert_eq!(value["event"], "provisional_due");
         assert_eq!(value["handle"], "p1");
     }

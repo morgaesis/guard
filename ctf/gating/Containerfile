@@ -5,7 +5,7 @@
 #
 # Build context is the repo root. `.dockerignore` restricts the context to the
 # source and fixture paths this harness copies.
-FROM docker.io/library/rust@sha256:606f3248aa86ce49e0b98d9e0bbffde042adeb18982320f97bcc218615de1c99
+FROM docker.io/library/rust@sha256:77fac8b98f9f46062bb680b6d25d5bcaabfc400143952ebc572e924bcbedc3fa
 
 WORKDIR /src
 ARG CARGO_BUILD_JOBS=1

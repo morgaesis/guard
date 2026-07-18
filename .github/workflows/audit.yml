@@ -32,7 +32,7 @@ jobs:
           rustflags: ""
 
       - name: Rust Cache
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
 
       - name: Install cargo-audit
         run: cargo install cargo-audit --version 0.22.2 --locked
@@ -55,7 +55,7 @@ jobs:
           rustflags: ""
 
       - name: Rust Cache
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
 
       - name: Install cargo-deny
         run: cargo install cargo-deny --version 0.20.2 --locked
@@ -78,7 +78,7 @@ jobs:
           rustflags: ""
 
       - name: Rust Cache
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
 
       - name: Install cargo-outdated
         run: cargo install cargo-outdated --version 0.19.0 --locked
@@ -101,7 +101,7 @@ jobs:
           rustflags: ""
 
       - name: Rust Cache
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
 
       - name: Install cargo-machete
         run: cargo install cargo-machete --version 0.9.2 --locked
@@ -180,14 +180,14 @@ jobs:
           persist-credentials: false
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@99df26d4f13ea111d4ec1a7dddef6063f76b97e9  # v4.37.0
+        uses: github/codeql-action/init@7188fc363630916deb702c7fdcf4e481b751f97a  # v4.37.1
         with:
           languages: ${{ matrix.language }}
           build-mode: none
           queries: security-extended
 
       - name: Analyze
-        uses: github/codeql-action/analyze@99df26d4f13ea111d4ec1a7dddef6063f76b97e9  # v4.37.0
+        uses: github/codeql-action/analyze@7188fc363630916deb702c7fdcf4e481b751f97a  # v4.37.1
 
   zizmor:
     name: GitHub Actions Security
@@ -235,6 +235,6 @@ jobs:
           retention-days: 5
 
       - name: Upload Scorecard results to code scanning
-        uses: github/codeql-action/upload-sarif@99df26d4f13ea111d4ec1a7dddef6063f76b97e9  # v4.37.0
+        uses: github/codeql-action/upload-sarif@7188fc363630916deb702c7fdcf4e481b751f97a  # v4.37.1
         with:
           sarif_file: results.sarif

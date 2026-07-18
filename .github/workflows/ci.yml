@@ -72,7 +72,7 @@ jobs:
           rustflags: ""
 
       - name: Rust Cache
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
         with:
           shared-key: test
           cache-workspace-crates: true
@@ -170,14 +170,14 @@ jobs:
       # reusable only for an exact rerun with the same toolchain and runner image.
       - name: Restore exact binary
         id: binary-cache
-        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25  # v5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: target/${{ matrix.target }}/release/${{ matrix.binary }}
           key: ${{ steps.build-environment.outputs.cache_key }}
 
       - name: Rust Cache
         if: steps.binary-cache.outputs.cache-hit != 'true'
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
         with:
           shared-key: release-${{ matrix.target }}
           cache-workspace-crates: true
@@ -206,7 +206,7 @@ jobs:
           steps.binary-cache.outputs.cache-hit != 'true' &&
           github.event_name == 'push' &&
           github.ref == 'refs/heads/main'
-        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25  # v5
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: target/${{ matrix.target }}/release/${{ matrix.binary }}
           key: ${{ steps.binary-cache.outputs.cache-primary-key }}
