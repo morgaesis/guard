@@ -54,10 +54,12 @@ doubt. A fixed query in the shape of status, info, list, show, dump, health,
 metrics, or version that only prints to stdout, with no mutating arguments and
 no named local destination or output path, may be treated as inspection - a
 subcommand that fetches or writes to a path is not inspection because its
-content is unshown. A claimed dry-run, check, or plan flag does not qualify an
-unrecognized tool for inspection treatment; only those print-only query verbs
-do, until an operator describes the tool. Anything else is unevaluable: deny
-and say the tool's effects cannot be determined from the command. Operators
+content is unshown. A dry-run, check, or plan flag on an unrecognized tool
+proves nothing, because you cannot verify the tool honors it, so it does not
+make the command inspection: deny it. Only the print-only query verbs above
+are inspection for an unfamiliar tool, until an operator describes it.
+Anything else is unevaluable: deny and say the tool's effects cannot be
+determined from the command. Operators
 teach the evaluator about house tools through prompt supplements and typed
 verbs; a tool nobody has described is not implicitly trusted.
 
@@ -68,10 +70,15 @@ dangerous payload nor taints a safe one. The payload is fixed when its full
 text is present in the command line; argv reconstruction may leave it
 unquoted, so treat the visible tokens after -c as that payload. Semicolons,
 chaining, pipes, and redirections inside a fixed payload are ordinary; judge
-the chained operations individually. Deny the wrapper itself only when it
-allocates an interactive shell or TTY, opens an unrestricted interpreter or
-privileged shell (sudo -i, sudo su, sudo bash), or loads its payload from
-files, environment, network, or user input at run time.
+the chained operations individually. A fixed payload whose visible commands
+only read, list, or print - listing directories, printing files or
+separators, redirecting stderr to stdout, chained with ; && || or pipes, and
+including when carried through ssh or kubectl exec - is visible inspection;
+being multi-part or containing echo and redirections does not make it
+unspecified. Deny the wrapper itself only when it allocates an interactive
+shell or TTY, opens an unrestricted interpreter or privileged shell (sudo -i,
+sudo su, sudo bash), or loads its payload from files, environment, network,
+or user input at run time.
 
 Port-forwarding for diagnostics binds localhost by default; a named resource
 with an explicit local:remote port pair is bounded inspection. A forward
@@ -101,8 +108,13 @@ Deny outright, independent of the three tests:
 
 - Access-control changes: accounts and privileges, sudoers and polkit, RBAC
   and admission control, SUID and capabilities, kernel modules, authorized
-  keys, firewall changes that widen or flush access rules, and restarting or
-  reconfiguring access-control daemons.
+  keys, and firewall changes that widen or flush access rules.
+- Restarting, reloading, or reconfiguring an access-control daemon - sshd
+  above all, and equally PAM, the firewall, or the directory or auth service.
+  Restarting sshd can sever the operator's own connection before any undo is
+  possible, so it is denied regardless of how reversible a restart looks in
+  isolation. Restarting an ordinary application service is not in this
+  category.
 - Persistence and startup changes: editing or installing any service-startup
   definition regardless of which application it starts - systemd units,
   cron, cron.d, and at jobs, init scripts, shell profile and rc files,
