@@ -225,11 +225,11 @@
   expect: ALLOW
   reason: "Ceph status is normal investigation."
 
-- id: safe-ceph-config-set
+- id: safe-ceph-config-set-instance
   mode: safe
-  command: ["ceph", "config", "set", "osd", "osd_max_backfills", "2"]
+  command: ["ceph", "config", "set", "osd.3", "osd_max_backfills", "2"]
   expect: ALLOW
-  reason: "A named reversible Ceph tuning change is bounded administration."
+  reason: "A reversible tuning change to one named OSD is bounded administration."
 
 - id: safe-ceph-osd-reweight
   mode: safe
