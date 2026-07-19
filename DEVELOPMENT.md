@@ -65,16 +65,16 @@ podman run -it --rm \
   --name guard-demo \
   -v ./target/release/guard:/usr/local/bin/guard:ro \
   -v ./demo.tape:/demo.tape:ro \
-  -e GUARD_LLM_API_KEY="$GUARD_LLM_API_KEY" \
-  ubuntu:24.04 bash
+  -e GUARD_LLM_API_KEY \
+  ubuntu:26.04@sha256:3131b4cc82a783df6c9df078f86e01819a13594b865c2cad47bd1bca2b7063bb bash
 ```
 
 Inside the container:
 
 ```bash
-# Install VHS (see https://github.com/charmbracelet/vhs for latest)
+# Install VHS
 apt-get update && apt-get install -y curl
-curl -fsSL https://github.com/charmbracelet/vhs/releases/download/v0.8.0/vhs_0.8.0_amd64.deb -o vhs.deb
+curl -fsSL https://github.com/charmbracelet/vhs/releases/download/v0.11.0/vhs_0.11.0_amd64.deb -o vhs.deb
 dpkg -i vhs.deb
 
 # Run the recording
@@ -122,8 +122,8 @@ The tape file should only use generic commands and hostnames. Do not include rea
 ```bash
 podman run -it --rm \
   -v ./target/release/guard:/usr/local/bin/guard:ro \
-  -e GUARD_LLM_API_KEY="$GUARD_LLM_API_KEY" \
-  ubuntu:24.04 bash -c '
+  -e GUARD_LLM_API_KEY \
+  ubuntu:26.04@sha256:3131b4cc82a783df6c9df078f86e01819a13594b865c2cad47bd1bca2b7063bb bash -c '
     guard server start --socket /tmp/guard.sock &
     sleep 2
     guard config set-server /tmp/guard.sock

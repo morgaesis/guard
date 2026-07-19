@@ -1,16 +1,20 @@
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.5.0
+    rev: v6.0.0
     hooks:
       - id: check-merge-conflict
       - id: check-toml
       - id: check-yaml
+        exclude: ^fuzz/corpus/
       - id: end-of-file-fixer
+        exclude: ^fuzz/corpus/
       - id: trailing-whitespace
+        exclude: ^fuzz/corpus/
       - id: mixed-line-ending
+        exclude: ^fuzz/corpus/
 
   - repo: https://github.com/compilerla/conventional-pre-commit
-    rev: v3.4.0
+    rev: v4.4.0
     hooks:
       - id: conventional-pre-commit
         stages: [commit-msg]
