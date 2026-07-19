@@ -37,6 +37,15 @@ not in command-line arguments.
 `--system-prompt-append <path>` and `GUARD_PROMPT_APPEND` add local context
 without replacing the base prompt.
 
+The append file is the operator's channel for tool knowledge the evaluator
+lacks. The safe-mode prompt judges unfamiliar tools unevaluable and denies
+their mutations (the readonly prompt instead leans toward allowing ambiguous
+read-only work), so a host that runs in-house or niche tooling under safe mode
+describes each such tool there: what its mutation surface is, which invocations
+are inspection, and which argument shapes are out of bounds. Typed verbs are
+the deterministic alternative for tools whose semantics should not depend on
+evaluator judgment at all.
+
 `--policy <yaml>` is an optional pre-evaluator deny path. With the evaluator
 enabled, policy allow patterns do not skip evaluation. `--no-evaluator` makes
 static policy the decision source. Typed verbs are the deterministic allow

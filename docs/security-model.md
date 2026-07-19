@@ -35,6 +35,25 @@ turning evidenced regions into deterministic argv or API coverage. Generated
 coverage remains regime-stamped, bounded, and unable to override explicit
 operator boundaries.
 
+Trusting the evaluator's judgment is a design position. Safe mode gives an
+agent broad maintenance authority so a daemon can hold wide host access and
+remain useful for local debugging and administration without an operator in
+the loop. A wrong allow is an instruction defect: the correction is the mode
+prompt, an operator prompt supplement, the verb catalog, or a regression
+case - never routine holds or a stripped-down daemon. Frequent holds train
+operators to approve reflexively, which is worse than a well-instructed
+evaluator. Holds are reserved for the genuinely irreversible tail.
+
+The safe-mode envelope is visible, bounded, recoverable: a mutation is
+approvable when its complete effect is stated in the command text, its
+targets are enumerable from the text, and routine means undo it. Execution
+whose effects are defined in files, remote content, or tool state -
+configuration-management applies, infrastructure-as-code, chart releases,
+opaque scripts - fails visibility by construction and is denied toward the
+grant escalation path. Tools outside the evaluator's knowledge are
+unevaluable, not implicitly trusted; operators describe house tools through
+prompt supplements (`--system-prompt-append`) or typed verbs.
+
 Session overlays intentionally expand baseline evaluator or readonly coverage
 inside activated verb regions. This gives a short-lived agent bounded mutation
 authority without changing the global posture. The exact session revision and
