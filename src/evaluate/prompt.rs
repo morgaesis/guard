@@ -6,7 +6,10 @@
 pub(super) const SYSTEM_PROMPT_READONLY: &str =
     include_str!("../../config/system-prompt-readonly.md");
 
-/// SAFE mode prompt: allow almost everything, rely on env_clear + output redaction.
+/// SAFE mode prompt: confident maintenance inside the visible/bounded/recoverable
+/// envelope. Mutations whose effects live outside the command text (playbooks,
+/// charts, plans, opaque scripts, unfamiliar tools) are denied toward the grant
+/// escalation path rather than judged by tool name.
 pub(super) const SYSTEM_PROMPT_SAFE: &str = include_str!("../../config/system-prompt-safe.md");
 
 /// PARANOID mode prompt: block everything except basic read-only inspection.
