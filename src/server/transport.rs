@@ -6,6 +6,7 @@ use crate::tool_config::ToolRegistry;
 #[cfg(unix)]
 use anyhow::bail;
 use anyhow::{Context, Result};
+use guard::audit::{AuditEvent, AuditKind};
 use guard::evaluate::Evaluator;
 use guard::gating::approval::{ApprovalRegistry, ApprovalStatus};
 use guard::gating::provisional::{Provisional, ProvisionalRegistry, ProvisionalStatus};
@@ -72,6 +73,19 @@ impl guard::proxy::ApiSessionSink for DaemonApiSessionSink {
             .suspension_reason(token, &self.server.config.behavior_limits)
             .is_some()
         {
+            return None;
+        }
+        // The API proxy is a loopback TLS listener that carries a session bearer
+        // but no kernel-authenticated local principal, so owner==caller cannot be
+        // re-verified per request (see the security model's TCP/principal note);
+        // ownership is bound at issuance, where `KubeconfigIssue` requires the
+        // owning local peer. A session that predates principal binding has no
+        // verifiable owner and is refused fail-closed here, matching the execute
+        // path, so a legacy bearer cannot be replayed through the proxy.
+        if matches!(
+            registry.owner_for(token),
+            Some(crate::session::SessionOwner::Unowned)
+        ) {
             return None;
         }
         let (fingerprint, intent) = registry.api_authority_for(token)?;
@@ -361,7 +375,31 @@ impl Server {
         sessions: SessionRegistry,
         session_store: Option<SessionStore>,
     ) -> Result<Self> {
-        let state = ServerState::new(evaluator, secrets, tool_registry, sessions, session_store);
+        let mut state =
+            ServerState::new(evaluator, secrets, tool_registry, sessions, session_store);
+        // Count every audited event at the single audit emission choke point by
+        // installing this daemon's metrics as the process-global observer, so
+        // the read-only metrics surface and the audit log share one source of
+        // truth. First install wins, matching the audit sink.
+        guard::audit::install_event_observer(state.metrics.clone());
+        // Open the durable audit sink before serving anything: a daemon that
+        // cannot record audit events refuses to start (fail closed).
+        if let Some(path) = &config.audit_log_path {
+            let log = guard::audit::AuditLog::open(path)
+                .with_context(|| format!("open audit log {}", path.display()))?;
+            #[cfg(windows)]
+            if !super::secure_fs::harden_existing_private_path(path, false) {
+                anyhow::bail!(
+                    "audit log {} could not be restricted to the daemon principal",
+                    path.display()
+                );
+            }
+            let log = Arc::new(log);
+            // The same chain also backs context-free emitters (the API proxy,
+            // admission/spend telemetry) via the process-global sink.
+            guard::audit::install_global_sink(log.clone());
+            state.audit = Some(log);
+        }
         let mut server = Self {
             context: ServerContext { config, state },
         };
@@ -399,6 +437,12 @@ impl Server {
 
     pub fn set_command_admission(&mut self, admission: super::runtime::CommandAdmissionConfig) {
         self.context.state.command_admission = super::runtime::CommandAdmission::new(admission);
+    }
+
+    /// Enable the optional read-only metrics/health listener. `None` (the
+    /// default) runs no listener. Must be called before `run`.
+    pub fn set_metrics_addr(&mut self, addr: Option<std::net::SocketAddr>) {
+        self.context.config.metrics_addr = addr;
     }
 
     /// Install the operator-defined verb catalog. Must be called before `run`.
@@ -528,10 +572,10 @@ impl Server {
                                 "persisted API-revert body failed the Windows daemon-only ACL check"
                                     .to_string(),
                             );
-                            tracing::error!(
-                                "[AUDIT] API_REVERT_FILE_UNSAFE handle={} path=\"{}\"",
-                                row.handle,
-                                body_file.display()
+                            self.context.emit_audit_ungated(
+                                AuditEvent::new(AuditKind::ApiRevertFileUnsafe)
+                                    .handle(&row.handle)
+                                    .field("path", body_file.display()),
                             );
                             if let Err(e) = store.save_provisional(row.clone()).await {
                                 tracing::warn!(
@@ -561,10 +605,19 @@ impl Server {
                 }
                 escalated.sort_by(|left, right| left.0.cmp(&right.0));
                 if !escalated.is_empty() {
-                    tracing::warn!(target: "guard::audit",
-                        "[AUDIT] STARTUP_RECOVERY provisionals_needing_decision={} handles={:?}",
-                        escalated.len(),
-                        escalated.iter().map(|(handle, _)| handle).collect::<Vec<_>>()
+                    self.context.emit_audit_ungated(
+                        AuditEvent::new(AuditKind::StartupRecovery)
+                            .field("provisionals_needing_decision", escalated.len())
+                            .field(
+                                "handles",
+                                format!(
+                                    "{:?}",
+                                    escalated
+                                        .iter()
+                                        .map(|(handle, _)| handle)
+                                        .collect::<Vec<_>>()
+                                ),
+                            ),
                     );
                     for (handle, reason) in &escalated {
                         if let Some(p) = reg.get(handle) {
@@ -597,10 +650,11 @@ impl Server {
                 let now = now_unix();
                 let (mut reg, recovered) = ApprovalRegistry::from_rows(rows, now);
                 if !recovered.is_empty() {
-                    tracing::warn!(target: "guard::audit",
-                        "[AUDIT] STARTUP_RECOVERY approvals_exec_failed={} handles={:?} (exec interrupted by restart)",
-                        recovered.len(),
-                        recovered
+                    self.context.emit_audit_ungated(
+                        AuditEvent::new(AuditKind::StartupRecovery)
+                            .reason("exec interrupted by restart")
+                            .field("approvals_exec_failed", recovered.len())
+                            .field("handles", format!("{recovered:?}")),
                     );
                     for h in &recovered {
                         if let Some(a) = reg.get(h) {
@@ -640,10 +694,10 @@ impl Server {
                     }
                 }
                 if !orphaned.is_empty() {
-                    tracing::warn!(target: "guard::audit",
-                        "[AUDIT] STARTUP_RECOVERY api_proxy_holds_retired={} handles={:?}",
-                        orphaned.len(),
-                        orphaned
+                    self.context.emit_audit_ungated(
+                        AuditEvent::new(AuditKind::StartupRecovery)
+                            .field("api_proxy_holds_retired", orphaned.len())
+                            .field("handles", format!("{orphaned:?}")),
                     );
                 }
                 *self.context.state.approvals.write().await = reg;
@@ -695,19 +749,21 @@ impl Server {
             if grant.status == ReadGrantStatus::Active && now >= grant.expires_unix {
                 match revoke_read_grant_acls(&grant).await {
                     Ok(()) => {
-                        tracing::warn!(target: "guard::audit",
-                            "[AUDIT] READ_GRANT_REVOKED handle={} path=\"{}\" source=startup-expired",
-                            grant.handle,
-                            guard::redact::audit_escape(&grant.target_path)
+                        self.context.emit_audit_ungated(
+                            AuditEvent::new(AuditKind::ReadGrantRevoked)
+                                .handle(&grant.handle)
+                                .field("path", &grant.target_path)
+                                .field("source", "startup-expired"),
                         );
                         delete_read_grant_row(&self.context, &grant.target_path).await;
                     }
                     Err(e) => {
-                        tracing::warn!(target: "guard::audit",
-                            "[AUDIT] READ_GRANT_REVOKE_FAILED handle={} path=\"{}\" source=startup-expired detail=\"{}\"",
-                            grant.handle,
-                            guard::redact::audit_escape(&grant.target_path),
-                            guard::redact::audit_escape(&e.to_string())
+                        self.context.emit_audit_ungated(
+                            AuditEvent::new(AuditKind::ReadGrantRevokeFailed)
+                                .handle(&grant.handle)
+                                .field("path", &grant.target_path)
+                                .field("source", "startup-expired")
+                                .field("detail", e),
                         );
                         surviving.insert(grant);
                     }
@@ -833,9 +889,10 @@ impl Server {
                 #[cfg(not(any(unix, windows)))]
                 let snapshot_dir_safe = false;
                 if !snapshot_dir_safe {
-                    tracing::error!(target: "guard::audit",
-                        "[AUDIT] API_REVERT_DIR_UNSAFE path=\"{}\" (not owner-only; body-bearing auto-reverts are disabled)",
-                        snapshot_dir.display()
+                    self.context.emit_audit_ungated(
+                        AuditEvent::new(AuditKind::ApiRevertDirUnsafe)
+                            .reason("not owner-only; body-bearing auto-reverts are disabled")
+                            .field("path", snapshot_dir.display()),
                     );
                 }
                 proxy.attach_gate(Arc::new(DaemonGateSink {
@@ -859,6 +916,19 @@ impl Server {
             );
             let proxy = proxy.clone();
             futures.push(tokio::spawn(async move { proxy.serve().await }));
+        }
+
+        // Optional read-only metrics/health listener. Bind synchronously so an
+        // explicitly requested listener that cannot bind fails startup loudly,
+        // before the daemon reports itself up. The metrics path never gates or
+        // slows a request: counters are lock-free atomics and gauges are read
+        // only here, at scrape time.
+        if let Some(addr) = self.context.config.metrics_addr {
+            let listener = super::metrics::bind(addr).await?;
+            let state = self.context.state.clone();
+            futures.push(tokio::spawn(async move {
+                super::metrics::serve(listener, state).await
+            }));
         }
 
         if futures.is_empty() {
@@ -1477,12 +1547,11 @@ where
         };
 
         if let Err(_e) = server.validate_token(request.auth_token.as_deref()) {
-            server.log_audit_policy(
+            server.audit_deny(
                 &caller,
                 request.session_token.as_deref(),
                 &request.binary,
                 &request.args,
-                false,
                 "invalid auth token",
             );
             let resp = validation_error_response("invalid auth token".to_string());
@@ -1538,7 +1607,7 @@ pub(super) fn emit_audit_events(
 ) {
     // Always emit the policy decision - this is the event historical
     // grep patterns (`[AUDIT] ALLOWED` / `[AUDIT] DENIED`) key on.
-    server.log_audit_policy(
+    let _ = server.log_audit_policy(
         caller,
         None,
         binary,
@@ -1683,12 +1752,11 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, server: &ServerContext
 
         if let Err(_e) = server.validate_token(request.auth_token.as_deref()) {
             let caller = CallerIdentity::Unknown;
-            server.log_audit_policy(
+            server.audit_deny(
                 &caller,
                 request.session_token.as_deref(),
                 &request.binary,
                 &request.args,
-                false,
                 "invalid auth token",
             );
             let resp = validation_error_response("invalid auth token".to_string());

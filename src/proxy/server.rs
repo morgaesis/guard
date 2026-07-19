@@ -853,11 +853,14 @@ impl ApiProxy {
                     .as_ref()
                     .map(|context| context.fingerprint.as_str()),
             ) {
-                tracing::info!(
-                    target: "guard::audit",
-                    "ALLOW {} (contained: guard-created this session, auto-revert {} remains armed until delete succeeds)",
-                    label,
-                    created.handle
+                let _ = crate::audit::emit_global(
+                    &crate::audit::AuditEvent::new(crate::audit::AuditKind::Evaluate)
+                        .handle(&created.handle)
+                        .reason(
+                            "contained: guard-created this session, auto-revert remains armed                              until delete succeeds",
+                        )
+                        .field("decision", "allow")
+                        .field("label", &label),
                 );
                 return self
                     .forward_contained_cleanup(req, &path, &query, op, conn_id, created)
@@ -1006,11 +1009,13 @@ impl ApiProxy {
 
         match judge.judge(&summary).await {
             ApiJudgeVerdict::Deny { reason } => {
-                tracing::info!(
-                    target: "guard::audit",
-                    "[AUDIT] EVALUATE decision=deny risk=none reversibility=none reason={} label={}",
-                    crate::redact::audit_escape(&reason),
-                    crate::redact::audit_escape(&label)
+                let _ = crate::audit::emit_global(
+                    &crate::audit::AuditEvent::new(crate::audit::AuditKind::Evaluate)
+                        .reason(&reason)
+                        .field("decision", "deny")
+                        .field("risk", "none")
+                        .field("reversibility", "none")
+                        .field("label", &label),
                 );
                 self.status_resp(
                     StatusCode::FORBIDDEN,
@@ -1027,11 +1032,13 @@ impl ApiProxy {
                 // failed call in the operator queue with no decision an operator
                 // could usefully make, so denying fails closed without flooding
                 // the queue.
-                tracing::info!(
-                    target: "guard::audit",
-                    "[AUDIT] EVALUATE decision=error risk=none reversibility=none reason={} label={}",
-                    crate::redact::audit_escape(&error),
-                    crate::redact::audit_escape(&label)
+                let _ = crate::audit::emit_global(
+                    &crate::audit::AuditEvent::new(crate::audit::AuditKind::Evaluate)
+                        .reason(&error)
+                        .field("decision", "error")
+                        .field("risk", "none")
+                        .field("reversibility", "none")
+                        .field("label", &label),
                 );
                 self.status_resp(
                     StatusCode::FORBIDDEN,
@@ -1047,13 +1054,13 @@ impl ApiProxy {
                 risk,
                 reversibility,
             } => {
-                tracing::info!(
-                    target: "guard::audit",
-                    "[AUDIT] EVALUATE decision=allow risk={:?} reversibility={:?} reason={} label={}",
-                    risk,
-                    reversibility,
-                    crate::redact::audit_escape(&reason),
-                    crate::redact::audit_escape(&label)
+                let _ = crate::audit::emit_global(
+                    &crate::audit::AuditEvent::new(crate::audit::AuditKind::Evaluate)
+                        .reason(&reason)
+                        .field("decision", "allow")
+                        .field("risk", format!("{risk:?}"))
+                        .field("reversibility", format!("{reversibility:?}"))
+                        .field("label", &label),
                 );
                 let outcome = decide_gate(reversibility, risk, prepared.is_constructible(), false);
                 match outcome {

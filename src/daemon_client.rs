@@ -116,6 +116,8 @@ impl Client {
             AdminRequest::SecretList => "secret_list",
             AdminRequest::SecretListDetailed => "secret_list_detailed",
             AdminRequest::Status => "status",
+            AdminRequest::AuditVerify => "audit_verify",
+            AdminRequest::AuditTail { .. } => "audit_tail",
             AdminRequest::Ping => "ping",
             AdminRequest::Confirm { .. } => "confirm",
             AdminRequest::Revert { .. } => "revert",

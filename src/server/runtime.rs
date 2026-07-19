@@ -61,6 +61,17 @@ struct CommandAdmissionCounters {
     evaluator_circuit_rejections: AtomicU64,
 }
 
+/// Coarse, identifier-free concurrency gauges for the read-only metrics
+/// surface. Read at scrape time; never on the request hot path.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ConcurrencyGauges {
+    pub handler_capacity: u64,
+    pub handler_available: u64,
+    pub evaluator_capacity: u64,
+    pub evaluator_available: u64,
+    pub active_principal_scopes: u64,
+}
+
 #[derive(Clone)]
 pub(super) struct CommandAdmission {
     config: CommandAdmissionConfig,
@@ -289,20 +300,41 @@ impl CommandAdmission {
         }
     }
 
+    /// Point-in-time concurrency gauges for the read-only metrics surface:
+    /// the global handler/evaluator semaphore capacity and how many permits are
+    /// currently available (in-flight = capacity - available), plus the number
+    /// of live per-principal scopes. Coarse and identifier-free.
+    pub(super) fn concurrency_gauges(&self) -> ConcurrencyGauges {
+        let active_scopes = self.scopes.lock().map(|states| states.len()).unwrap_or(0);
+        ConcurrencyGauges {
+            handler_capacity: self.config.handler_concurrency as u64,
+            handler_available: self.handler.available_permits() as u64,
+            evaluator_capacity: self.config.evaluator_concurrency as u64,
+            evaluator_available: self.evaluator.available_permits() as u64,
+            active_principal_scopes: active_scopes as u64,
+        }
+    }
+
     fn audit(&self, event: &str) {
         let counters = self.snapshot();
-        tracing::info!(target: "guard::audit",
-            "[AUDIT] COMMAND_ADMISSION event={} handler_attempted={} handler_admitted={} handler_rejected={} evaluator_attempted={} evaluator_admitted={} evaluator_rate_limited={} evaluator_concurrency_limited={} evaluator_errors={} evaluator_circuit_rejections={}",
-            event,
-            counters.handler_attempted,
-            counters.handler_admitted,
-            counters.handler_rejected,
-            counters.evaluator_attempted,
-            counters.evaluator_admitted,
-            counters.evaluator_rate_limited,
-            counters.evaluator_concurrency_limited,
-            counters.evaluator_errors,
-            counters.evaluator_circuit_rejections
+        let _ = guard::audit::emit_global(
+            &guard::audit::AuditEvent::new(guard::audit::AuditKind::CommandAdmission)
+                .field("event", event)
+                .field("handler_attempted", counters.handler_attempted)
+                .field("handler_admitted", counters.handler_admitted)
+                .field("handler_rejected", counters.handler_rejected)
+                .field("evaluator_attempted", counters.evaluator_attempted)
+                .field("evaluator_admitted", counters.evaluator_admitted)
+                .field("evaluator_rate_limited", counters.evaluator_rate_limited)
+                .field(
+                    "evaluator_concurrency_limited",
+                    counters.evaluator_concurrency_limited,
+                )
+                .field("evaluator_errors", counters.evaluator_errors)
+                .field(
+                    "evaluator_circuit_rejections",
+                    counters.evaluator_circuit_rejections,
+                ),
         );
     }
 }

@@ -2,6 +2,8 @@
 // gating clock.
 pub(super) use guard::env::now_unix;
 
+use guard::audit::{AuditEvent, AuditKind};
+
 use guard::gating::approval::{Approval, ApprovalSnapshot, ApprovalStatus};
 use guard::gating::provisional::{ApiRevertPlan, Provisional, ProvisionalStatus};
 use guard::gating::{decide_gate, Coverage, GateOutcome, Reversibility};
@@ -283,9 +285,10 @@ impl Drop for ProxyHoldOrphanGuard {
                 } else {
                     None
                 };
-            tracing::info!(target: "guard::audit",
-                "[AUDIT] HOLD_ORPHANED handle={} (api-proxy client disconnected)",
-                handle
+            server.emit_audit_ungated(
+                AuditEvent::new(AuditKind::HoldOrphaned)
+                    .handle(&handle)
+                    .reason("api-proxy client disconnected"),
             );
             server.emit_event(NotifyEvent {
                 event: "decision_made",
@@ -522,15 +525,18 @@ impl guard::proxy::GateSink for DaemonGateSink {
             .await
             .enqueue(approval.clone());
         persist_approval(&self.server, &approval).await;
-        tracing::info!(target: "guard::audit",
-            "[AUDIT] HELD handle={} caller=(api-proxy) session={} api=\"{}\" body_sha256={} ttl={}s",
-            handle,
-            session_context
-                .map(|context| context.fingerprint.as_str())
-                .unwrap_or("none"),
-            guard::redact::audit_escape(&api_snapshot.label),
-            api_snapshot.body_sha256,
-            self.server.config.approval_ttl_secs
+        self.server.emit_audit_ungated(
+            AuditEvent::new(AuditKind::Held)
+                .handle(&handle)
+                .caller("(api-proxy)")
+                .session_fingerprint(
+                    session_context
+                        .map(|context| context.fingerprint.as_str())
+                        .unwrap_or("none"),
+                )
+                .field("api", &api_snapshot.label)
+                .field("body_sha256", &api_snapshot.body_sha256)
+                .field("ttl", format!("{}s", self.server.config.approval_ttl_secs)),
         );
         self.server.emit_event(NotifyEvent {
             event: "hold_created",
@@ -1137,14 +1143,14 @@ pub(super) async fn arm_containment_with_authority<W: AsyncWrite + Unpin>(
             if let Some(u) = updated {
                 persist_provisional(server, &u).await;
             }
-            tracing::info!(target: "guard::audit",
-                "[AUDIT] PROVISIONAL handle={} caller={} session_fingerprint={} deadline={} window={}s revert=\"{}\"",
-                handle,
-                caller,
-                session_fingerprint,
-                now.saturating_add(window),
-                window,
-                audit_command_line(&revert.binary, &revert.args)
+            server.emit_audit_ungated(
+                AuditEvent::new(AuditKind::Provisional)
+                    .handle(&handle)
+                    .caller(caller)
+                    .session_fingerprint(&session_fingerprint)
+                    .field("deadline", now.saturating_add(window))
+                    .field("window", format!("{window}s"))
+                    .field("revert", audit_command_line(&revert.binary, &revert.args)),
             );
             server.emit_event(NotifyEvent {
                 event: "provisional_armed",
@@ -1179,12 +1185,13 @@ pub(super) async fn arm_containment_with_authority<W: AsyncWrite + Unpin>(
             if let Some(u) = updated {
                 persist_provisional(server, &u).await;
             }
-            tracing::warn!(target: "guard::audit",
-                "[AUDIT] PROVISIONAL_INTERRUPTED handle={} caller={} session_fingerprint={} deadline={} (forward launched then failed; auto-revert armed)",
-                handle,
-                caller,
-                session_fingerprint,
-                now.saturating_add(window)
+            server.emit_audit_ungated(
+                AuditEvent::new(AuditKind::ProvisionalInterrupted)
+                    .handle(&handle)
+                    .caller(caller)
+                    .session_fingerprint(&session_fingerprint)
+                    .reason("forward launched then failed; auto-revert armed")
+                    .field("deadline", now.saturating_add(window)),
             );
             result
         }
@@ -1370,15 +1377,15 @@ pub(super) async fn hold_for_approval_with_authority<W: AsyncWrite + Unpin>(
         .await
         .enqueue(approval.clone());
     persist_approval(server, &approval).await;
-    tracing::info!(target: "guard::audit",
-        "[AUDIT] HELD handle={} caller={} session_fingerprint={} risk={:?} class={:?} cmd=\"{}\" ttl={}s",
-        handle,
-        caller,
-        audit_session_fingerprint(request.session_token.as_deref()),
-        risk,
-        reversibility.map(|r| r.as_str()),
-        audit_command_line(&request.binary, &request.args),
-        server.config.approval_ttl_secs
+    server.emit_audit_ungated(
+        AuditEvent::new(AuditKind::Held)
+            .handle(&handle)
+            .caller(caller)
+            .session_fingerprint(audit_session_fingerprint(request.session_token.as_deref()))
+            .cmd(audit_command_line(&request.binary, &request.args))
+            .field("risk", format!("{risk:?}"))
+            .field("class", format!("{:?}", reversibility.map(|r| r.as_str())))
+            .field("ttl", format!("{}s", server.config.approval_ttl_secs)),
     );
     server.emit_event(NotifyEvent {
         event: "hold_created",
@@ -1800,13 +1807,13 @@ pub(super) async fn gating_sweeper(server: ServerContext) {
             let row = server.state.approvals.read().await.get(h).cloned();
             if let Some(a) = row {
                 persist_approval(&server, &a).await;
-                tracing::warn!(target: "guard::audit",
-                    "[AUDIT] APPROVAL_EXPIRED handle={} session_fingerprint={} (fail-closed deny)",
-                    h,
-                    a.snapshot
-                        .session_fingerprint
-                        .as_deref()
-                        .unwrap_or("none")
+                server.emit_audit_ungated(
+                    AuditEvent::new(AuditKind::ApprovalExpired)
+                        .handle(h)
+                        .session_fingerprint(
+                            a.snapshot.session_fingerprint.as_deref().unwrap_or("none"),
+                        )
+                        .reason("fail-closed deny"),
                 );
                 server.emit_event(NotifyEvent {
                     event: "decision_made",
@@ -2050,14 +2057,17 @@ pub(super) async fn finish_due_provisional(
                 persist_provisional(server, &row).await;
                 forget_proxy_provenance(server, &p.handle).await;
                 remove_revert_body(p);
-                tracing::info!(target: "guard::audit",
-                    "[AUDIT] PROVISIONAL_AUTO_CONFIRMED handle={} check=\"{}\" control_path={:?}",
-                    p.handle,
-                    audit_command_line(
-                        p.confirm_check_binary.as_deref().unwrap_or_default(),
-                        &p.confirm_check_args
-                    ),
-                    p.control_path
+                server.emit_audit_ungated(
+                    AuditEvent::new(AuditKind::ProvisionalAutoConfirmed)
+                        .handle(&p.handle)
+                        .field(
+                            "check",
+                            audit_command_line(
+                                p.confirm_check_binary.as_deref().unwrap_or_default(),
+                                &p.confirm_check_args,
+                            ),
+                        )
+                        .field("control_path", format!("{:?}", p.control_path)),
                 );
                 server.emit_event(NotifyEvent {
                     event: "decision_made",
@@ -2082,10 +2092,11 @@ pub(super) async fn finish_due_provisional(
             }
         }
     }
-    tracing::warn!(target: "guard::audit",
-        "[AUDIT] PROVISIONAL_CHECK_FAILED handle={} exit={:?}; running rollback",
-        p.handle,
-        check_exit
+    server.emit_audit_ungated(
+        AuditEvent::new(AuditKind::ProvisionalCheckFailed)
+            .handle(&p.handle)
+            .reason("running rollback")
+            .field("exit", format!("{check_exit:?}")),
     );
     finish_revert(server, p, &CallerIdentity::Unknown, "auto-check-failed").await
 }
@@ -2217,12 +2228,12 @@ async fn defer_revert(
     if let Some(u) = &updated {
         persist_provisional(server, u).await;
     }
-    tracing::error!(target: "guard::audit",
-        "[AUDIT] REVERT_DEFERRED handle={} caller={} kind={} reason={}",
-        p.handle,
-        caller,
-        kind,
-        guard::redact::audit_escape(&detail)
+    server.emit_audit_ungated(
+        AuditEvent::new(AuditKind::RevertDeferred)
+            .handle(&p.handle)
+            .caller(caller)
+            .reason(&detail)
+            .field("kind", kind),
     );
     server.emit_event(NotifyEvent {
         event: "decision_made",
@@ -2337,12 +2348,12 @@ pub(super) async fn finish_revert(
     forget_proxy_provenance(server, &p.handle).await;
     remove_revert_body(p);
     if status_ok {
-        tracing::info!(target: "guard::audit",
-            "[AUDIT] REVERT handle={} caller={} kind={} exit={:?}",
-            p.handle,
-            caller,
-            kind,
-            exit
+        server.emit_audit_ungated(
+            AuditEvent::new(AuditKind::Revert)
+                .handle(&p.handle)
+                .caller(caller)
+                .field("kind", kind)
+                .field("exit", format!("{exit:?}")),
         );
         server.emit_event(NotifyEvent {
             event: "decision_made",
@@ -2358,13 +2369,13 @@ pub(super) async fn finish_revert(
             exit,
         )
     } else {
-        tracing::error!(target: "guard::audit",
-            "[AUDIT] REVERT_FAILED handle={} caller={} kind={} exit={:?} detail={:?}",
-            p.handle,
-            caller,
-            kind,
-            exit,
-            detail
+        server.emit_audit_ungated(
+            AuditEvent::new(AuditKind::RevertFailed)
+                .handle(&p.handle)
+                .caller(caller)
+                .field("kind", kind)
+                .field("exit", format!("{exit:?}"))
+                .field("detail", format!("{detail:?}")),
         );
         server.emit_event(NotifyEvent {
             event: "decision_made",

@@ -72,6 +72,10 @@ fn default_state_db_path() -> Option<PathBuf> {
     default_guard_state_dir().map(|dir| dir.join("state.db"))
 }
 
+fn default_audit_log_path() -> Option<PathBuf> {
+    default_guard_state_dir().map(|dir| dir.join("audit.jsonl"))
+}
+
 pub(crate) fn resolve_history_retention(
     configured: Option<u64>,
     environment: Option<String>,
@@ -154,6 +158,21 @@ fn default_verbs_path() -> Option<PathBuf> {
     default_guard_state_dir().map(|dir| dir.join("verbs.yaml"))
 }
 
+/// Parse a `--metrics-addr` value: a full `ADDR:PORT` socket address, or a bare
+/// port that binds loopback (`127.0.0.1:PORT`).
+fn parse_metrics_addr(value: &str) -> Result<std::net::SocketAddr> {
+    let value = value.trim();
+    if let Ok(addr) = value.parse::<std::net::SocketAddr>() {
+        return Ok(addr);
+    }
+    if let Ok(port) = value.parse::<u16>() {
+        return Ok(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+    }
+    anyhow::bail!(
+        "invalid metrics address '{value}': expected ADDR:PORT (e.g. 127.0.0.1:9105) or a bare port"
+    )
+}
+
 fn default_guard_state_dir() -> Option<PathBuf> {
     if let Some(dir) = dirs::state_dir() {
         return Some(dir.join("guard"));
@@ -203,6 +222,8 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             learn_allow_min_approvals,
             dry_run,
             state_db,
+            audit_log,
+            metrics_addr,
             history_retention,
             exec_as_caller,
             system_prompt,
@@ -388,6 +409,43 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 .or_else(default_state_db_path);
             if let Some(ref path) = state_db_path {
                 tracing::info!("State DB: {}", path.display());
+            }
+
+            // Structured audit log: default on, in the state directory. The
+            // JSONL file is the authoritative audit record; the stderr
+            // [AUDIT] lines are a projection of the same events.
+            let audit_log_path = audit_log
+                .or_else(|| {
+                    guard_env("AUDIT_LOG")
+                        .filter(|value| !value.is_empty())
+                        .map(PathBuf::from)
+                })
+                .or_else(|| {
+                    state_db_path
+                        .as_ref()
+                        .and_then(|path| path.parent())
+                        .map(|dir| dir.join("audit.jsonl"))
+                })
+                .or_else(default_audit_log_path);
+            if let Some(ref path) = audit_log_path {
+                tracing::info!("Audit log: {}", path.display());
+            } else {
+                tracing::warn!(
+                    "no state directory resolved; the structured audit log is disabled and audit \
+                     events reach stderr only"
+                );
+            }
+
+            // Optional read-only metrics/health listener: flag wins, else
+            // GUARD_METRICS_ADDR. Resolved (and validated) before the heavy
+            // startup work so a bad address fails fast. `None` runs no listener.
+            let metrics_listen = metrics_addr
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| guard_env("METRICS_ADDR").filter(|value| !value.trim().is_empty()))
+                .map(|value| parse_metrics_addr(&value))
+                .transpose()?;
+            if let Some(addr) = metrics_listen {
+                tracing::info!("Metrics/health surface: {}", addr);
             }
 
             let exec_as_caller = exec_as_caller
@@ -929,6 +987,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 preflight,
                 exec_as_caller,
                 state_db_path,
+                audit_log_path,
                 ..server::ServerConfig::default()
             };
             let mut srv = server::Server::new(
@@ -941,6 +1000,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             )?;
             srv.set_gate(gate_mode);
             srv.set_approval_ttl(approval_ttl);
+            srv.set_metrics_addr(metrics_listen);
             let command_defaults = server::CommandAdmissionConfig::default();
             srv.set_command_admission(server::CommandAdmissionConfig {
                 handler_concurrency: command_max_concurrency

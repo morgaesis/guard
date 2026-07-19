@@ -1,6 +1,7 @@
 use crate::grant_profile::{EvaluationMode, SavedGrantCatalog};
 use crate::server::admin::handle_admin_request;
-use crate::server::execute::{execute_command, session_source_from_eval};
+use crate::server::execute::{evaluation_cache_scope, execute_command, session_source_from_eval};
+use crate::server::gate_runtime::SessionAuthoritySnapshot;
 use crate::server::learning::{
     allow_session_auto_amend_candidate, deny_session_auto_amend_candidate,
 };
@@ -37,6 +38,9 @@ fn granted_session(allow: Vec<String>, allow_exact: Vec<SessionExactRule>) -> Se
         static_only: true,
         auto_amend: false,
         granted_at: 0,
+        owner: crate::session::SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(
+            1000,
+        )),
     }
 }
 
@@ -109,10 +113,15 @@ async fn run_verb_synthesis_llm(listener: tokio::net::TcpListener) {
 
 #[tokio::test]
 async fn kubeconfig_issuance_is_local_live_session_scoped_and_secret_free() {
-    let (cfg, audit) = make_test_config();
+    let (mut cfg, audit) = make_test_config();
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
     let token = "finite-kube-session-token";
     let mut grant = granted_session(Vec::new(), Vec::new());
     grant.expires_at = Some(guard::env::now_unix() + 60);
+    // The session is owned by uid 1001; only that principal (or the operator)
+    // may mint a kubeconfig carrying its bearer.
+    grant.owner = crate::session::SessionOwner::Principal(PrincipalKey::from_uid(1_001));
     cfg.state
         .sessions
         .write()
@@ -140,6 +149,7 @@ async fn kubeconfig_issuance_is_local_live_session_scoped_and_secret_free() {
         endpoint: "cluster-a".to_string(),
         session_token: token.to_string(),
     };
+    // The owning principal (uid 1001) issues successfully.
     let (response, logs) = capture_async(
         &audit,
         handle_admin_request(&cfg, &CallerIdentity::Unix { uid: 1_001 }, request()),
@@ -157,8 +167,21 @@ async fn kubeconfig_issuance_is_local_live_session_scoped_and_secret_free() {
         "raw session token entered audit output"
     );
 
+    // A different local principal that merely knows the handle is denied with
+    // the greppable principal-mismatch reason: this is the bearer-replay hole
+    // the ownership binding closes.
+    match handle_admin_request(&cfg, &CallerIdentity::Unix { uid: 1_002 }, request()).await {
+        AdminResponse::Error { message } => {
+            assert!(
+                message.contains("session principal mismatch"),
+                "expected principal mismatch, got: {message}"
+            );
+        }
+        other => panic!("expected mismatch denial, got {other:?}"),
+    }
+    // The operator (daemon principal) retains cross-session authority.
     assert!(matches!(
-        handle_admin_request(&cfg, &CallerIdentity::Unix { uid: 1_002 }, request()).await,
+        handle_admin_request(&cfg, &CallerIdentity::Unix { uid: 777 }, request()).await,
         AdminResponse::KubeconfigIssued { .. }
     ));
     assert!(matches!(
@@ -251,6 +274,7 @@ verbs:
             evaluation_mode: None,
             static_only: false,
             auto_amend: false,
+            owner: None,
         },
     )
     .await;
@@ -273,6 +297,7 @@ verbs:
             evaluation_mode: None,
             static_only: false,
             auto_amend: false,
+            owner: None,
         },
     )
     .await;
@@ -298,6 +323,7 @@ verbs:
             evaluation_mode: None,
             static_only: false,
             auto_amend: false,
+            owner: None,
         },
     )
     .await;
@@ -510,6 +536,9 @@ async fn static_only_session_miss_denies_before_evaluator() {
                 static_only: true,
                 auto_amend: false,
                 granted_at: 0,
+                owner: crate::session::SessionOwner::Principal(
+                    guard::principal::PrincipalKey::from_uid(1000),
+                ),
             },
         );
     }
@@ -635,6 +664,9 @@ async fn session_inspection_surfaces_redact_credentials_in_text_and_json() {
             generated_notes: Vec::new(),
             static_only: false,
             auto_amend: false,
+            owner: crate::session::SessionOwner::Principal(
+                guard::principal::PrincipalKey::from_uid(1000),
+            ),
         },
     );
     let registry = crate::session::SessionRegistry::from_parts(
@@ -791,6 +823,7 @@ async fn session_list_is_user_visible_but_prompt_is_hidden() {
             evaluation_mode: None,
             static_only: false,
             auto_amend: false,
+            owner: None,
         },
     )
     .await;
@@ -852,6 +885,7 @@ async fn session_list_shows_current_session_details_without_raw_token_for_user()
             evaluation_mode: None,
             static_only: false,
             auto_amend: false,
+            owner: Some("20002".to_string()),
         },
     )
     .await;
@@ -917,6 +951,7 @@ async fn session_show_reports_recent_stats() {
             evaluation_mode: None,
             static_only: false,
             auto_amend: false,
+            owner: None,
         },
     )
     .await;
@@ -1015,12 +1050,13 @@ async fn session_show_self_token_sees_full_grant() {
             evaluation_mode: None,
             static_only: false,
             auto_amend: false,
+            owner: Some("20003".to_string()),
         },
     )
     .await;
     assert!(matches!(grant, AdminResponse::Ok));
 
-    // The holder presents its own token as both identity and target.
+    // The owning principal inspects its own session.
     let show = handle_admin_request(
         &cfg,
         &user,
@@ -1131,6 +1167,7 @@ async fn session_show_other_token_denied_for_non_admin() {
                 evaluation_mode: None,
                 static_only: false,
                 auto_amend: false,
+                owner: None,
             },
         )
         .await;
@@ -1151,8 +1188,8 @@ async fn session_show_other_token_denied_for_non_admin() {
     match show {
         AdminResponse::Error { message } => {
             assert!(
-                message.contains("only inspect its own grant"),
-                "expected a clear authorization denial, got: {message}"
+                message.contains("session principal mismatch"),
+                "expected a principal-mismatch denial, got: {message}"
             );
             assert!(
                 !message.contains("secret operator context"),
@@ -1196,6 +1233,7 @@ async fn session_new_from_profile_mints_expected_grant() {
             evaluation_mode: None,
             static_only: false,
             auto_amend: false,
+            owner: None,
         },
     )
     .await;
@@ -1250,6 +1288,7 @@ async fn session_new_unknown_profile_fails_clearly() {
             evaluation_mode: None,
             static_only: false,
             auto_amend: false,
+            owner: None,
         },
     )
     .await;
@@ -1301,6 +1340,7 @@ async fn profile_grant_still_deny_short_circuits_and_falls_through() {
             evaluation_mode: None,
             static_only: false,
             auto_amend: false,
+            owner: None,
         },
     )
     .await;
@@ -1348,6 +1388,7 @@ async fn grant_requests_use_the_issued_ceiling_and_redact_session_tokens() {
                 evaluation_mode: None,
                 static_only: false,
                 auto_amend: false,
+                owner: None,
             },
         )
         .await,
@@ -1584,6 +1625,7 @@ async fn auto_and_operator_approval_fail_without_partial_session_authority() {
                     evaluation_mode: None,
                     static_only: false,
                     auto_amend: false,
+                    owner: None,
                 },
             )
             .await,
@@ -1707,6 +1749,7 @@ async fn terminal_grant_request_races_have_one_durable_authority_outcome() {
                     evaluation_mode: None,
                     static_only: false,
                     auto_amend: false,
+                    owner: None,
                 },
             )
             .await,
@@ -2258,12 +2301,16 @@ async fn evaluate_batch_requires_owned_live_unsuspended_session_or_admin() {
     cfg.config.behavior_limits.max_denials = Some(1);
     let daemon = CallerIdentity::Unix { uid: 777 };
     let worker = CallerIdentity::Unix { uid: 778 };
-    for token in ["batch-owner", "batch-victim"] {
+    // batch-owner belongs to the worker; batch-victim belongs to another
+    // principal, so the worker may batch-evaluate the former but not the latter.
+    for (token, owner_uid) in [("batch-owner", 778u32), ("batch-victim", 999u32)] {
+        let mut grant = granted_session(Vec::new(), Vec::new());
+        grant.owner = crate::session::SessionOwner::Principal(PrincipalKey::from_uid(owner_uid));
         cfg.state
             .sessions
             .write()
             .await
-            .grant(token.to_string(), granted_session(Vec::new(), Vec::new()));
+            .grant(token.to_string(), grant);
     }
     let commands = vec![guard::wire::BatchCommand {
         binary: "true".to_string(),
@@ -2289,7 +2336,7 @@ async fn evaluate_batch_requires_owned_live_unsuspended_session_or_admin() {
             evaluate(Some("batch-victim".to_string()), Some("batch-owner".to_string())),
         )
         .await,
-        AdminResponse::Error { message } if message.contains("only batch-evaluate for itself")
+        AdminResponse::Error { message } if message.contains("session principal mismatch")
     ));
     let before = (
         cfg.state.approvals.read().await.list().len(),
@@ -2503,6 +2550,7 @@ async fn grant_request_approval_rejects_expiry_and_stale_saved_revision() {
                 evaluation_mode: None,
                 static_only: false,
                 auto_amend: false,
+                owner: None,
             },
         )
         .await,
@@ -2760,6 +2808,9 @@ async fn session_maintenance_has_one_owner_and_skips_noop_persistence() {
             granted_at: 0,
             static_only: false,
             auto_amend: false,
+            owner: crate::session::SessionOwner::Principal(
+                guard::principal::PrincipalKey::from_uid(1000),
+            ),
         },
     );
 
@@ -2771,4 +2822,308 @@ async fn session_maintenance_has_one_owner_and_skips_noop_persistence() {
     assert!(!session_maintenance_once(&cfg)
         .await
         .expect("skip unchanged state"));
+}
+
+// ---------------------------------------------------------------------------
+// Principal binding: two-UID regression matrix.
+//
+// Every path that consumes a session's authority must accept the owning
+// principal, deny a different local peer that merely holds the same handle with
+// the greppable `session principal mismatch` reason, and keep the daemon
+// (operator) principal cross-session. Legacy `Unowned` sessions are refused for
+// execution fail-closed, and a revoked session is denied regardless of caller.
+// ---------------------------------------------------------------------------
+
+/// A live session that allows `true` and is bound to `owner_uid`.
+fn session_owned_by(owner_uid: u32) -> crate::session::SessionGrant {
+    let mut grant = granted_session(vec!["true".to_string()], Vec::new());
+    grant.static_only = false;
+    grant.owner = crate::session::SessionOwner::Principal(PrincipalKey::from_uid(owner_uid));
+    grant
+}
+
+#[tokio::test]
+async fn principal_binding_execute_owner_ok_other_denied_admin_ok() {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    let token = format!("exec-owner-{}", std::process::id());
+    cfg.state
+        .sessions
+        .write()
+        .await
+        .grant(token.clone(), session_owned_by(1001));
+
+    // Owner executes.
+    let owner = execute_command(
+        request_with_session("true", Vec::new(), token.clone()),
+        &cfg,
+        &CallerIdentity::Unix { uid: 1001 },
+    )
+    .await;
+    assert!(owner.policy_allowed(), "owner must execute its own session");
+
+    // A different local peer that learned the handle is denied with the
+    // greppable mismatch reason - the bearer-replay hole is closed.
+    let other = execute_command(
+        request_with_session("true", Vec::new(), token.clone()),
+        &cfg,
+        &CallerIdentity::Unix { uid: 1002 },
+    )
+    .await;
+    assert!(!other.policy_allowed());
+    assert!(
+        other.policy_reason().contains("session principal mismatch"),
+        "got: {}",
+        other.policy_reason()
+    );
+
+    // The daemon/operator principal keeps cross-session authority.
+    let admin = execute_command(
+        request_with_session("true", Vec::new(), token.clone()),
+        &cfg,
+        &CallerIdentity::Unix { uid: 777 },
+    )
+    .await;
+    assert!(admin.policy_allowed(), "operator retains cross-session use");
+
+    // A TCP (principal-less) caller cannot satisfy owner==caller either.
+    let tcp = execute_command(
+        request_with_session("true", Vec::new(), token),
+        &cfg,
+        &CallerIdentity::Tcp {
+            token: "exec-token".to_string(),
+        },
+    )
+    .await;
+    assert!(!tcp.policy_allowed());
+    assert!(tcp.policy_reason().contains("session principal mismatch"));
+}
+
+#[tokio::test]
+async fn principal_binding_unowned_session_refused_for_execute() {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    let token = format!("exec-unowned-{}", std::process::id());
+    let mut grant = session_owned_by(1001);
+    grant.owner = crate::session::SessionOwner::Unowned;
+    cfg.state.sessions.write().await.grant(token.clone(), grant);
+
+    // Even the operator cannot execute an ownerless legacy session: it fails
+    // closed and must be reissued.
+    for caller in [
+        CallerIdentity::Unix { uid: 1001 },
+        CallerIdentity::Unix { uid: 777 },
+    ] {
+        let result = execute_command(
+            request_with_session("true", Vec::new(), token.clone()),
+            &cfg,
+            &caller,
+        )
+        .await;
+        assert!(!result.policy_allowed(), "unowned session must not execute");
+        assert!(
+            result
+                .policy_reason()
+                .contains("predates principal binding"),
+            "got: {}",
+            result.policy_reason()
+        );
+    }
+}
+
+#[tokio::test]
+async fn principal_binding_revoked_session_denies_regardless_of_principal() {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    let token = format!("exec-revoked-{}", std::process::id());
+    cfg.state
+        .sessions
+        .write()
+        .await
+        .grant(token.clone(), session_owned_by(1001));
+    assert!(cfg.state.sessions.write().await.revoke(&token));
+
+    for caller in [
+        CallerIdentity::Unix { uid: 1001 },
+        CallerIdentity::Unix { uid: 777 },
+    ] {
+        let result = execute_command(
+            request_with_session("true", Vec::new(), token.clone()),
+            &cfg,
+            &caller,
+        )
+        .await;
+        assert!(!result.policy_allowed(), "revoked session must never run");
+        assert!(result.policy_reason().contains("unknown session token"));
+    }
+}
+
+#[tokio::test]
+async fn principal_binding_show_and_status_two_uid() {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    let token = format!("show-owner-{}", std::process::id());
+    cfg.state
+        .sessions
+        .write()
+        .await
+        .grant(token.clone(), session_owned_by(1001));
+
+    async fn show_as(cfg: &crate::server::ServerContext, uid: u32, token: &str) -> AdminResponse {
+        handle_admin_request(
+            cfg,
+            &CallerIdentity::Unix { uid },
+            AdminRequest::SessionShow {
+                token: token.to_string(),
+                limit: Some(20),
+                caller_token: Some(token.to_string()),
+            },
+        )
+        .await
+    }
+    async fn status_as(cfg: &crate::server::ServerContext, uid: u32, token: &str) -> AdminResponse {
+        handle_admin_request(
+            cfg,
+            &CallerIdentity::Unix { uid },
+            AdminRequest::SessionStatus {
+                token: token.to_string(),
+                caller_token: Some(token.to_string()),
+            },
+        )
+        .await
+    }
+
+    // Owner sees its own grant.
+    assert!(matches!(
+        show_as(&cfg, 1001, &token).await,
+        AdminResponse::SessionShow { .. }
+    ));
+    // A different peer with the same handle is denied with the mismatch reason.
+    match show_as(&cfg, 1002, &token).await {
+        AdminResponse::Error { message } => {
+            assert!(
+                message.contains("session principal mismatch"),
+                "got: {message}"
+            );
+        }
+        other => panic!("expected mismatch denial, got {other:?}"),
+    }
+    // Operator inspects any session.
+    assert!(matches!(
+        show_as(&cfg, 777, &token).await,
+        AdminResponse::SessionShow { .. }
+    ));
+
+    // Status mirrors show.
+    assert!(matches!(
+        status_as(&cfg, 1001, &token).await,
+        AdminResponse::SessionStatus { .. }
+    ));
+    assert!(matches!(
+        status_as(&cfg, 1002, &token).await,
+        AdminResponse::Error { .. }
+    ));
+    assert!(matches!(
+        status_as(&cfg, 777, &token).await,
+        AdminResponse::SessionStatus { .. }
+    ));
+}
+
+#[tokio::test]
+async fn principal_binding_hold_confirm_is_operator_only() {
+    // Confirm/approve/deny are daemon-UID-only: a non-operator peer that holds a
+    // handle cannot confirm a provisional or approve a hold. This keeps a
+    // corrupted agent from confirming its own gated action.
+    let (mut cfg, _) = make_test_config();
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    let refused = handle_admin_request(
+        &cfg,
+        &CallerIdentity::Unix { uid: 1002 },
+        AdminRequest::Confirm {
+            handle: "any-handle".to_string(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        refused,
+        AdminResponse::Error { message } if message.contains("daemon principal")
+    ));
+}
+
+#[tokio::test]
+async fn principal_binding_appeal_refuses_unowned_session() {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    let token = format!("appeal-unowned-{}", std::process::id());
+    let mut grant = session_owned_by(1001);
+    grant.owner = crate::session::SessionOwner::Unowned;
+    cfg.state.sessions.write().await.grant(token.clone(), grant);
+
+    let appeal = handle_admin_request(
+        &cfg,
+        &CallerIdentity::Unix { uid: 777 },
+        AdminRequest::SessionAppeal {
+            token: token.clone(),
+            binary: "true".to_string(),
+            args: Vec::new(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        appeal,
+        AdminResponse::Error { message } if message.contains("predates principal binding")
+    ));
+}
+
+// The evaluator memoizes verdicts, so the executor must feed it a cache scope
+// that a verdict decided for one user's session can never be reused for another
+// user or replayed after the session's authority changes. This proves the
+// scope the executor derives is distinct across the two-UID / two-session
+// matrix and stable for an identical (principal, session, revision).
+#[test]
+fn evaluation_cache_scope_isolates_principals_and_sessions() {
+    let user_a = CallerIdentity::Unix { uid: 1000 };
+    let user_b = CallerIdentity::Unix { uid: 1001 };
+    let rev1 = SessionAuthoritySnapshot::from(("rev1".to_string(), None));
+    let rev2 = SessionAuthoritySnapshot::from(("rev2".to_string(), None));
+
+    // (a) Same principal + same session token + same revision is stable.
+    let a_s1 = evaluation_cache_scope(&user_a, Some("session-token-a1"), Some(&rev1));
+    assert_eq!(
+        a_s1,
+        evaluation_cache_scope(&user_a, Some("session-token-a1"), Some(&rev1))
+    );
+
+    // (c) Distinct principal, otherwise identical inputs, must never collide.
+    assert_ne!(
+        a_s1,
+        evaluation_cache_scope(&user_b, Some("session-token-a1"), Some(&rev1))
+    );
+
+    // (b) A distinct session (different token) for the same principal differs.
+    assert_ne!(
+        a_s1,
+        evaluation_cache_scope(&user_a, Some("session-token-a2"), Some(&rev1))
+    );
+
+    // (d) A reissued/amended session bumps the revision suffix.
+    assert_ne!(
+        a_s1,
+        evaluation_cache_scope(&user_a, Some("session-token-a1"), Some(&rev2))
+    );
+
+    // A sessionless request for the same principal is its own scope.
+    assert_ne!(a_s1, evaluation_cache_scope(&user_a, None, None));
+
+    // Unauthenticated callers never share a scope, even for the same command.
+    assert_ne!(
+        evaluation_cache_scope(&CallerIdentity::Unknown, None, None),
+        evaluation_cache_scope(&CallerIdentity::Unknown, None, None)
+    );
 }

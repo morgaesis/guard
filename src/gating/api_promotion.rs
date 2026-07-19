@@ -294,11 +294,14 @@ impl ApiPromotionStore {
                     Err(e) => {
                         let quarantine = config.path.with_extension("corrupt");
                         let _ = std::fs::rename(&config.path, &quarantine);
-                        tracing::error!(target: "guard::audit",
-                            "[AUDIT] API_PROMOTION_CORRUPT path=\"{}\" quarantined=\"{}\" error={} (starting from an empty store)",
-                            crate::redact::audit_escape(&config.path.display().to_string()),
-                            crate::redact::audit_escape(&quarantine.display().to_string()),
-                            crate::redact::audit_escape(&e.to_string())
+                        let _ = crate::audit::emit_global(
+                            &crate::audit::AuditEvent::new(
+                                crate::audit::AuditKind::ApiPromotionCorrupt,
+                            )
+                            .reason("starting from an empty store")
+                            .field("path", config.path.display())
+                            .field("quarantined", quarantine.display())
+                            .field("error", &e),
                         );
                         ApiPromotionFile::default()
                     }

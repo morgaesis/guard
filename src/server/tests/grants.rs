@@ -293,6 +293,9 @@ async fn read_grant_retry_grants_and_reruns_after_permission_denied() {
             granted_at: 0,
             static_only: false,
             auto_amend: false,
+            owner: crate::session::SessionOwner::Principal(
+                guard::principal::PrincipalKey::from_uid(1000),
+            ),
         },
     );
 

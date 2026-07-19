@@ -82,6 +82,37 @@ pub fn scope_eq(a: &Option<PrincipalKey>, b: &Option<PrincipalKey>) -> bool {
     matches!((a, b), (Some(x), Some(y)) if x.eq_ci(y))
 }
 
+/// Build the evaluator decision-cache scope for a caller.
+///
+/// The evaluator memoizes verdicts, so the cache key must bind every dimension
+/// of authority that could change the decision, or a verdict decided for one
+/// caller/session could be replayed for another. This scope contributes two of
+/// those dimensions on top of the structured request itself:
+///   - the authenticated `principal` (Unix uid / Windows SID), so user A's
+///     cached allow is never served to user B, and
+///   - `session_scope`, a per-session identifier folded with the session-grant
+///     revision, so a distinct session, or the same session after its authority
+///     changes (amend, coverage change, revoke-and-reissue), misses the cache.
+///
+/// An unauthenticated caller (`principal == None`) gets a unique, never-matching
+/// scope built from `unauthenticated_nonce`, mirroring [`scope_eq`]'s rule that
+/// absent identity never compares equal: such a caller can neither be served
+/// nor seed another caller's cached verdict.
+pub fn eval_cache_scope(
+    principal: Option<&PrincipalKey>,
+    session_scope: Option<&str>,
+    unauthenticated_nonce: u64,
+) -> String {
+    match principal {
+        Some(principal) => format!(
+            "principal={}\nsession={}",
+            principal,
+            session_scope.unwrap_or("<no-session>")
+        ),
+        None => format!("unauthenticated-nonce={unauthenticated_nonce}"),
+    }
+}
+
 /// Deserialize a row owner from either the current string form (a
 /// [`PrincipalKey`]) or the legacy numeric `caller_uid` form, so
 /// provisional/approval rows written by an older (uid-only) daemon are
@@ -136,6 +167,32 @@ mod tests {
         assert_eq!(a, "S_1_5_21_1_2_3_1001");
         assert_ne!(a, b);
         assert!(a.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+    }
+
+    #[test]
+    fn eval_cache_scope_isolates_principals_and_sessions() {
+        let a = PrincipalKey::from_uid(1000);
+        let b = PrincipalKey::from_uid(1001);
+
+        // Same principal + same session scope is a stable, reusable scope.
+        let a_s1 = eval_cache_scope(Some(&a), Some("fp1:rev1"), 0);
+        assert_eq!(a_s1, eval_cache_scope(Some(&a), Some("fp1:rev1"), 0));
+
+        // A different principal with an otherwise identical session scope must
+        // never collide (the cross-user verdict-reuse hole).
+        assert_ne!(a_s1, eval_cache_scope(Some(&b), Some("fp1:rev1"), 0));
+
+        // A distinct session (different fingerprint) for the same principal.
+        assert_ne!(a_s1, eval_cache_scope(Some(&a), Some("fp2:rev1"), 0));
+
+        // Same session identity, bumped authority revision (amend/coverage).
+        assert_ne!(a_s1, eval_cache_scope(Some(&a), Some("fp1:rev2"), 0));
+
+        // An unauthenticated caller never shares a scope, even with itself.
+        assert_ne!(
+            eval_cache_scope(None, None, 0),
+            eval_cache_scope(None, None, 1)
+        );
     }
 
     #[test]

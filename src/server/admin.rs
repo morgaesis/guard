@@ -2,13 +2,15 @@ use crate::grant_profile::{EvaluationMode, GrantRequest, GrantRequestStatus};
 use crate::secrets::legacy_sentinel;
 use crate::session::{
     HistoricalGrant, IssuedGrantScope, SessionAmendment, SessionDecision, SessionDecisionSource,
-    SessionExecStatus, SessionGrant, SessionGrantSummary, SessionInteraction, SessionReport,
+    SessionExecStatus, SessionGrant, SessionGrantSummary, SessionInteraction, SessionOwner,
+    SessionReport,
 };
+use guard::audit::{AuditEvent, AuditKind};
 use guard::gating::verb::{
     CoverageAction, CoverageProbe, CoverageProvenance, Verb, VerbCoverageCell,
 };
 use guard::principal::{scope_eq, PrincipalKey};
-use guard::redact::{audit_escape, command_line, redact_output, redact_output_text};
+use guard::redact::{command_line, redact_output, redact_output_text};
 
 use super::execute::{
     audit_session_fingerprint, persist_current_sessions, persist_session_snapshot,
@@ -24,8 +26,9 @@ use super::learning::{
 };
 use super::runtime::NotifyEvent;
 use super::wire::{
-    verb_effective_trust, AdminRequest, AdminResponse, ApprovalSummary, CallerIdentity,
-    ExecOutcome, ProvisionalSummary, SecretDetail, ServerStatus, VerbSummary,
+    authorize_session_use, verb_effective_trust, AdminRequest, AdminResponse, ApprovalSummary,
+    CallerIdentity, ExecOutcome, ProvisionalSummary, SecretDetail, ServerStatus, SessionAuthz,
+    VerbSummary, SESSION_PRINCIPAL_MISMATCH, SESSION_UNOWNED_REFUSED,
 };
 use super::{is_valid_secret_key, ServerContext};
 
@@ -300,13 +303,118 @@ fn caller_is_session_admin(server: &ServerContext, caller: &CallerIdentity) -> b
         || matches!(caller, CallerIdentity::TcpAdmin { .. })
 }
 
+/// Whether `caller` may see a session's full detail: the operator sees every
+/// session, and a non-operator peer sees only sessions it owns (its
+/// server-read principal equals the session owner). This is the visibility half
+/// of principal binding - a leaked token no longer lets a different local peer
+/// read another user's grant.
 fn caller_can_view_session(
     server: &ServerContext,
     caller: &CallerIdentity,
-    token: &str,
-    visible_token: Option<&str>,
+    owner: &SessionOwner,
 ) -> bool {
-    caller_is_session_admin(server, caller) || visible_token == Some(token)
+    matches!(
+        authorize_session_use(owner, caller, &server.config.daemon_principal),
+        SessionAuthz::Allowed
+    )
+}
+
+/// Authorize a non-admin caller to inspect a specific session (`session show`
+/// / `session status`). The caller must be the session's bound owner, verified
+/// against the principal the daemon reads itself. Emits a `SESSION_SHOW_REJECTED`
+/// audit event carrying the greppable principal-mismatch reason on refusal, and
+/// never confirms the session's existence to a non-owner.
+async fn authorize_session_inspection(
+    server: &ServerContext,
+    caller: &CallerIdentity,
+    token: &str,
+) -> Result<(), AdminResponse> {
+    let owner = server.state.sessions.read().await.owner_for(token);
+    let decision = match &owner {
+        Some(owner) => authorize_session_use(owner, caller, &server.config.daemon_principal),
+        // No active grant for this token: a non-owner must not learn whether the
+        // session ever existed, and cannot prove ownership of a gone session.
+        None => SessionAuthz::Mismatch,
+    };
+    match decision {
+        SessionAuthz::Allowed => Ok(()),
+        SessionAuthz::Unowned => {
+            server.emit_audit_ungated(
+                AuditEvent::new(AuditKind::SessionShowRejected)
+                    .caller(caller)
+                    .reason(SESSION_UNOWNED_REFUSED),
+            );
+            Err(AdminResponse::Error {
+                message: format!("not authorized: {SESSION_UNOWNED_REFUSED}"),
+            })
+        }
+        SessionAuthz::Mismatch => {
+            server.emit_audit_ungated(
+                AuditEvent::new(AuditKind::SessionShowRejected)
+                    .caller(caller)
+                    .reason(SESSION_PRINCIPAL_MISMATCH),
+            );
+            Err(AdminResponse::Error {
+                message: format!(
+                    "not authorized: {SESSION_PRINCIPAL_MISMATCH}; a session may only be inspected by its owning principal"
+                ),
+            })
+        }
+    }
+}
+
+/// Enforce that `caller` owns `token` before an admin RPC exercises that
+/// session's authority (kubeconfig issuance, batch evaluation). Returns `None`
+/// when the caller is the owner or the operator; otherwise emits an
+/// `ADMIN_REJECTED` audit event with the greppable reason and returns the error
+/// response to send back. An unknown/expired token is reported as such. These
+/// are authority-use paths, so an `Unowned` legacy session is refused for
+/// everyone (including the operator), matching the execute path.
+async fn enforce_session_owner_for_admin(
+    server: &ServerContext,
+    caller: &CallerIdentity,
+    token: &str,
+    context: &str,
+) -> Option<AdminResponse> {
+    let owner = server.state.sessions.read().await.owner_for(token);
+    let Some(owner) = owner else {
+        return Some(AdminResponse::Error {
+            message: format!("unknown, expired, or revoked session for {context}"),
+        });
+    };
+    if matches!(owner, SessionOwner::Unowned) {
+        server.emit_audit_ungated(
+            AuditEvent::new(AuditKind::AdminRejected)
+                .caller(caller)
+                .reason(SESSION_UNOWNED_REFUSED),
+        );
+        return Some(AdminResponse::Error {
+            message: format!("{context} refused: {SESSION_UNOWNED_REFUSED}"),
+        });
+    }
+    match authorize_session_use(&owner, caller, &server.config.daemon_principal) {
+        SessionAuthz::Allowed => None,
+        SessionAuthz::Unowned => {
+            server.emit_audit_ungated(
+                AuditEvent::new(AuditKind::AdminRejected)
+                    .caller(caller)
+                    .reason(SESSION_UNOWNED_REFUSED),
+            );
+            Some(AdminResponse::Error {
+                message: format!("{context} refused: {SESSION_UNOWNED_REFUSED}"),
+            })
+        }
+        SessionAuthz::Mismatch => {
+            server.emit_audit_ungated(
+                AuditEvent::new(AuditKind::AdminRejected)
+                    .caller(caller)
+                    .reason(SESSION_PRINCIPAL_MISMATCH),
+            );
+            Some(AdminResponse::Error {
+                message: format!("{context} refused: {SESSION_PRINCIPAL_MISMATCH}"),
+            })
+        }
+    }
 }
 
 fn redact_session_summary_for_list(grant: &mut SessionGrantSummary, admin: bool, can_view: bool) {
@@ -325,6 +433,8 @@ fn redact_session_summary_for_list(grant: &mut SessionGrantSummary, admin: bool,
         grant.activated_verbs.clear();
         grant.override_markers.clear();
         grant.generated_notes.clear();
+        // Do not reveal which principal owns another user's session.
+        grant.owner = SessionOwner::Unowned;
         if grant.prompt_append.is_some() {
             grant.prompt_append = Some("(hidden)".to_string());
         }
@@ -347,6 +457,8 @@ fn redact_historical_grant_for_list(grant: &mut HistoricalGrant, admin: bool, ca
         grant.activated_verbs.clear();
         grant.override_markers.clear();
         grant.generated_notes.clear();
+        // Do not reveal which principal owns another user's session.
+        grant.owner = SessionOwner::Unowned;
         if grant.prompt_append.is_some() {
             grant.prompt_append = Some("(hidden)".to_string());
         }
@@ -388,7 +500,7 @@ async fn handle_session_appeal(
         };
     }
 
-    let (exists, decision, session_prompt) = {
+    let (exists, decision, session_prompt, owner) = {
         let reg = server.state.sessions.read().await;
         (
             reg.has(&token),
@@ -396,8 +508,24 @@ async fn handle_session_appeal(
             // caller cwd authority. Cwd-bound grants are checked on ExecuteRequest.
             reg.check(&token, &binary, &args, None),
             reg.prompt_append_for(&token),
+            reg.owner_for(&token),
         )
     };
+    // An appeal amends session authority, so it is operator-gated
+    // (`requires_daemon_uid`) and not part of the bearer-replay surface. A
+    // session that predates principal binding still cannot be amended: refuse it
+    // fail-closed so the operator reissues rather than silently extending a
+    // session with no verifiable owner.
+    if matches!(owner, Some(SessionOwner::Unowned)) {
+        server.emit_audit_ungated(
+            AuditEvent::new(AuditKind::AdminRejected)
+                .caller(caller)
+                .reason(SESSION_UNOWNED_REFUSED),
+        );
+        return AdminResponse::Error {
+            message: format!("session appeal refused: {SESSION_UNOWNED_REFUSED}"),
+        };
+    }
     if !exists {
         return AdminResponse::Error {
             message: format!(
@@ -528,12 +656,13 @@ async fn handle_session_appeal(
                 },
             )
             .await;
-            tracing::info!(target: "guard::audit",
-                "[AUDIT] SESSION_APPEAL caller={} token_fingerprint={} allowed=true amended={} cmd={}",
-                caller,
-                audit_session_fingerprint(Some(&token)),
-                amended,
-                audit_escape(&redact_output(&command_line))
+            server.emit_audit_ungated(
+                AuditEvent::new(AuditKind::SessionAppeal)
+                    .caller(caller)
+                    .cmd(redact_output(&command_line))
+                    .field("token_fingerprint", audit_session_fingerprint(Some(&token)))
+                    .field("allowed", true)
+                    .field("amended", amended),
             );
             AdminResponse::SessionAppeal {
                 allowed: true,
@@ -594,12 +723,13 @@ async fn handle_session_appeal(
                 },
             )
             .await;
-            tracing::info!(target: "guard::audit",
-                "[AUDIT] SESSION_APPEAL caller={} token_fingerprint={} allowed=false amended={} cmd={}",
-                caller,
-                audit_session_fingerprint(Some(&token)),
-                amended,
-                audit_escape(&redact_output(&command_line))
+            server.emit_audit_ungated(
+                AuditEvent::new(AuditKind::SessionAppeal)
+                    .caller(caller)
+                    .cmd(redact_output(&command_line))
+                    .field("token_fingerprint", audit_session_fingerprint(Some(&token)))
+                    .field("allowed", false)
+                    .field("amended", amended),
             );
             AdminResponse::SessionAppeal {
                 allowed: false,
@@ -626,7 +756,11 @@ pub(super) async fn handle_admin_request(
 ) -> AdminResponse {
     if request.requires_daemon_uid() {
         if let Err(e) = server.validate_admin(caller) {
-            tracing::warn!(target: "guard::audit", "[AUDIT] ADMIN_REJECTED caller={} reason=\"{}\"", caller, audit_escape(&e.to_string()));
+            server.emit_audit_ungated(
+                AuditEvent::new(AuditKind::AdminRejected)
+                    .caller(caller)
+                    .reason(e.to_string()),
+            );
             return AdminResponse::Error {
                 message: e.to_string(),
             };
@@ -648,12 +782,28 @@ pub(super) async fn handle_admin_request(
             evaluation_mode,
             static_only,
             auto_amend,
+            owner: owner_input,
         } => {
             if token.is_empty() {
                 return AdminResponse::Error {
                     message: "session token must not be empty".to_string(),
                 };
             }
+            // Bind the session to a principal at creation. An operator can name
+            // the consuming agent explicitly (the different-uid deployment); when
+            // omitted the session is owned by the authenticated local operator
+            // that issues it, or the daemon principal for an admin-token caller.
+            let session_owner = if let Some(raw) = owner_input
+                .as_deref()
+                .map(str::trim)
+                .filter(|raw| !raw.is_empty())
+            {
+                SessionOwner::Principal(PrincipalKey::from_raw(raw))
+            } else if let Some(principal) = caller.principal().filter(|_| caller.is_local_peer()) {
+                SessionOwner::Principal(principal)
+            } else {
+                SessionOwner::Principal(server.config.daemon_principal.clone())
+            };
             // Expand a saved grant before normal validation and installation.
             // Unknown names fail instead of minting an empty session.
             let mut saved_scope = IssuedGrantScope::default();
@@ -763,6 +913,7 @@ pub(super) async fn handle_admin_request(
                 auto_amend && !matches!(saved_scope.evaluation_mode, EvaluationMode::PolicyOnly);
             let expires_at = ttl_secs.map(|secs| now_unix() + secs);
             let effective_evaluation_mode = saved_scope.evaluation_mode;
+            let owner_label = session_owner.label();
             let mut generated_notes = Vec::new();
             if let Some(name) = saved_grant.as_deref() {
                 generated_notes.push(format!("issued from saved grant '{name}'"));
@@ -781,6 +932,7 @@ pub(super) async fn handle_admin_request(
                 static_only,
                 auto_amend,
                 granted_at: 0, // SessionRegistry::grant fills the current time
+                owner: session_owner,
             };
             let (before, after) = {
                 let mut reg = server.state.sessions.write().await;
@@ -797,14 +949,15 @@ pub(super) async fn handle_admin_request(
                     message: format!("failed to persist session grant: {}", err),
                 };
             }
-            tracing::info!(target: "guard::audit",
-                "[AUDIT] SESSION_GRANT caller={} token_fingerprint={} saved_grant={:?} ttl={:?} evaluation_mode={} auto_amend={}",
-                caller,
-                audit_session_fingerprint(Some(&token)),
-                saved_grant,
-                ttl_secs,
-                effective_evaluation_mode,
-                auto_amend,
+            server.emit_audit_ungated(
+                AuditEvent::new(AuditKind::SessionGrant)
+                    .caller(caller)
+                    .field("token_fingerprint", audit_session_fingerprint(Some(&token)))
+                    .field("saved_grant", format!("{saved_grant:?}"))
+                    .field("ttl", format!("{ttl_secs:?}"))
+                    .field("evaluation_mode", effective_evaluation_mode)
+                    .field("auto_amend", auto_amend)
+                    .field("owner", owner_label),
             );
             AdminResponse::Ok
         }
@@ -828,11 +981,11 @@ pub(super) async fn handle_admin_request(
                     message: format!("failed to persist session revoke: {}", err),
                 };
             }
-            tracing::info!(target: "guard::audit",
-                "[AUDIT] SESSION_REVOKE caller={} token_fingerprint={} existed={}",
-                caller,
-                audit_session_fingerprint(Some(&token)),
-                removed
+            server.emit_audit_ungated(
+                AuditEvent::new(AuditKind::SessionRevoke)
+                    .caller(caller)
+                    .field("token_fingerprint", audit_session_fingerprint(Some(&token)))
+                    .field("existed", removed),
             );
             AdminResponse::Ok
         }
@@ -919,13 +1072,12 @@ pub(super) async fn handle_admin_request(
             }
             let reg = server.state.sessions.read().await;
             let is_admin = caller_is_session_admin(server, caller);
-            let visible_token = visible_token.as_deref();
+            let _ = visible_token;
             let grants = reg
                 .list()
                 .into_iter()
                 .map(|mut grant| {
-                    let can_view =
-                        caller_can_view_session(server, caller, &grant.token, visible_token);
+                    let can_view = caller_can_view_session(server, caller, &grant.owner);
                     redact_session_summary_for_list(&mut grant, is_admin, can_view);
                     grant.redact_credentials();
                     grant
@@ -935,8 +1087,7 @@ pub(super) async fn handle_admin_request(
                 reg.list_history(since_unix)
                     .into_iter()
                     .map(|mut grant| {
-                        let can_view =
-                            caller_can_view_session(server, caller, &grant.token, visible_token);
+                        let can_view = caller_can_view_session(server, caller, &grant.owner);
                         redact_historical_grant_for_list(&mut grant, is_admin, can_view);
                         grant.redact_credentials();
                         grant
@@ -959,23 +1110,16 @@ pub(super) async fn handle_admin_request(
             if let Err(err) = persist_current_sessions(server).await {
                 tracing::warn!("failed to persist purged session state: {}", err);
             }
+            let _ = caller_token;
             let is_admin = caller_is_session_admin(server, caller);
-            // A non-admin caller may inspect only the grant on its own token: the
-            // token it presents as its identity ($GUARD_SESSION) must equal the
-            // token it is asking about. That token is the same bearer credential
-            // used for session auth, so equality is proof the caller holds it.
-            // Merely naming another session's token is not enough -- that path
-            // returns a denial, never the grant's contents.
-            let is_self = !token.is_empty() && caller_token.as_deref() == Some(token.as_str());
-            if !is_admin && !is_self {
-                tracing::warn!(target: "guard::audit",
-                    "[AUDIT] SESSION_SHOW_REJECTED caller={} reason=\"not the token holder\"",
-                    caller
-                );
-                return AdminResponse::Error {
-                    message: "not authorized: a session token may only inspect its own grant"
-                        .to_string(),
-                };
+            // A non-admin caller may inspect only a session it owns: the
+            // authenticated peer principal the daemon reads itself must equal the
+            // session's bound owner. Presenting the bearer token is no longer
+            // sufficient - a leaked token cannot be used by another local peer.
+            if !is_admin {
+                if let Err(response) = authorize_session_inspection(server, caller, &token).await {
+                    return response;
+                }
             }
             let reg = server.state.sessions.read().await;
             match reg.show_with_limits(&token, limit.unwrap_or(20), &server.config.behavior_limits)
@@ -1001,13 +1145,12 @@ pub(super) async fn handle_admin_request(
             token,
             caller_token,
         } => {
+            let _ = caller_token;
             let is_admin = caller_is_session_admin(server, caller);
-            let is_self = !token.is_empty() && caller_token.as_deref() == Some(token.as_str());
-            if !is_admin && !is_self {
-                return AdminResponse::Error {
-                    message: "not authorized: a session token may only inspect its own status"
-                        .to_string(),
-                };
+            if !is_admin {
+                if let Err(response) = authorize_session_inspection(server, caller, &token).await {
+                    return response;
+                }
             }
             let Some(mut report) = server.state.sessions.read().await.show_with_limits(
                 &token,
@@ -1074,6 +1217,19 @@ pub(super) async fn handle_admin_request(
                         .to_string(),
                 };
             };
+            // Only the session's owning principal (or the operator) may mint a
+            // kubeconfig that carries the session bearer. This binds API-proxy
+            // authority to the same principal that owns the session.
+            if let Some(response) = enforce_session_owner_for_admin(
+                server,
+                caller,
+                &session_token,
+                "brokered kubeconfig issuance",
+            )
+            .await
+            {
+                return response;
+            }
             let expires_at = {
                 let sessions = server.state.sessions.read().await;
                 if let Some(reason) =
@@ -1121,13 +1277,13 @@ pub(super) async fn handle_admin_request(
                     message: "brokered kubeconfig generation failed closed".to_string(),
                 };
             }
-            tracing::info!(target: "guard::audit",
-                "[AUDIT] KUBECONFIG_ISSUED caller={} principal={} endpoint={} session_fingerprint={} expires_at={}",
-                caller,
-                principal,
-                audit_escape(&endpoint),
-                audit_session_fingerprint(Some(&session_token)),
-                expires_at
+            server.emit_audit_ungated(
+                AuditEvent::new(AuditKind::KubeconfigIssued)
+                    .caller(caller)
+                    .session_fingerprint(audit_session_fingerprint(Some(&session_token)))
+                    .field("principal", &principal)
+                    .field("endpoint", &endpoint)
+                    .field("expires_at", expires_at),
             );
             AdminResponse::KubeconfigIssued { yaml, expires_at }
         }
@@ -1147,11 +1303,11 @@ pub(super) async fn handle_admin_request(
             };
             match server.state.secrets.set(&principal, &key, &value).await {
                 Ok(()) => {
-                    tracing::info!(target: "guard::audit",
-                        "[AUDIT] SECRET_SET caller={} principal={} key={}",
-                        caller,
-                        principal,
-                        key
+                    server.emit_audit_ungated(
+                        AuditEvent::new(AuditKind::SecretSet)
+                            .caller(caller)
+                            .field("principal", &principal)
+                            .field("key", &key),
                     );
                     AdminResponse::Ok
                 }
@@ -1176,11 +1332,11 @@ pub(super) async fn handle_admin_request(
             };
             match server.state.secrets.delete(&principal, &key).await {
                 Ok(()) => {
-                    tracing::info!(target: "guard::audit",
-                        "[AUDIT] SECRET_DELETE caller={} principal={} key={}",
-                        caller,
-                        principal,
-                        key
+                    server.emit_audit_ungated(
+                        AuditEvent::new(AuditKind::SecretDelete)
+                            .caller(caller)
+                            .field("principal", &principal)
+                            .field("key", &key),
                     );
                     AdminResponse::Ok
                 }
@@ -1291,6 +1447,51 @@ pub(super) async fn handle_admin_request(
                 uptime_secs: now.saturating_sub(server.config.started_at_unix),
                 mode,
                 dry_run: server.config.dry_run,
+            }
+        }
+        AdminRequest::AuditVerify => {
+            let Some(path) = server.config.audit_log_path.clone() else {
+                return AdminResponse::Error {
+                    message: "no audit log is configured (the daemon resolved no state directory)"
+                        .to_string(),
+                };
+            };
+            let display = path.display().to_string();
+            match tokio::task::spawn_blocking(move || guard::audit::verify_chain(&path)).await {
+                Ok(Ok(verification)) => AdminResponse::AuditVerification {
+                    path: display,
+                    verification,
+                },
+                Ok(Err(e)) => AdminResponse::Error {
+                    message: format!("failed to read audit log {display}: {e}"),
+                },
+                Err(e) => AdminResponse::Error {
+                    message: format!("audit verification task failed: {e}"),
+                },
+            }
+        }
+        AdminRequest::AuditTail { limit } => {
+            let Some(path) = server.config.audit_log_path.clone() else {
+                return AdminResponse::Error {
+                    message: "no audit log is configured (the daemon resolved no state directory)"
+                        .to_string(),
+                };
+            };
+            let display = path.display().to_string();
+            let limit = limit.unwrap_or(20).max(1);
+            match tokio::task::spawn_blocking(move || guard::audit::tail_records(&path, limit))
+                .await
+            {
+                Ok(Ok(items)) => AdminResponse::AuditRecords {
+                    path: display,
+                    items,
+                },
+                Ok(Err(e)) => AdminResponse::Error {
+                    message: format!("failed to read audit log {display}: {e}"),
+                },
+                Err(e) => AdminResponse::Error {
+                    message: format!("audit tail task failed: {e}"),
+                },
             }
         }
         AdminRequest::Status => {
@@ -1522,11 +1723,11 @@ pub(super) async fn handle_admin_request(
             match result {
                 Ok(()) => {
                     if !preview {
-                        tracing::info!(target: "guard::audit",
-                            "[AUDIT] VERB_CREATED name={} consequence={} trusted={}",
-                            audit_escape(&verb.name),
-                            verb.consequence.as_str(),
-                            verb.trusted
+                        server.emit_audit_ungated(
+                            AuditEvent::new(AuditKind::VerbCreated)
+                                .field("name", &verb.name)
+                                .field("consequence", verb.consequence.as_str())
+                                .field("trusted", verb.trusted),
                         );
                     }
                     AdminResponse::VerbCreated {
@@ -1552,7 +1753,10 @@ pub(super) async fn handle_admin_request(
             };
             match store.write().await.clear_generated() {
                 Ok(removed) => {
-                    tracing::info!(target: "guard::audit", "[AUDIT] API_VERB_COVERAGE_CLEARED removed={}", removed);
+                    server.emit_audit_ungated(
+                        AuditEvent::new(AuditKind::ApiVerbCoverageCleared)
+                            .field("removed", removed),
+                    );
                     AdminResponse::VerbCoverageCleared { removed }
                 }
                 Err(error) => AdminResponse::Error {
@@ -2153,17 +2357,22 @@ pub(super) async fn handle_admin_request(
                     message: "evaluation batch requires 1 to 64 commands".to_string(),
                 };
             }
+            let _ = caller_token;
             let is_admin = caller_is_session_admin(server, caller);
             if !is_admin && session_token.is_none() {
                 return AdminResponse::Error {
                     message: "batch evaluation requires an active caller-owned session".to_string(),
                 };
             }
-            if !is_admin && caller_token.as_deref() != session_token.as_deref() {
-                return AdminResponse::Error {
-                    message: "not authorized: a session may only batch-evaluate for itself"
-                        .to_string(),
-                };
+            // A non-admin caller may batch-evaluate only against a session it
+            // owns, verified by the daemon-read principal rather than by the
+            // bearer token it presents.
+            if let Some(token) = session_token.as_deref() {
+                if let Some(response) =
+                    enforce_session_owner_for_admin(server, caller, token, "batch evaluation").await
+                {
+                    return response;
+                }
             }
             if let Some(token) = session_token.as_deref() {
                 let registry = server.state.sessions.read().await;
@@ -2648,6 +2857,17 @@ async fn handle_confirm(
     caller: &CallerIdentity,
     handle: &str,
 ) -> AdminResponse {
+    // The CONFIRM record must be durable BEFORE the auto-revert is disarmed;
+    // an unauditable confirm fails closed and leaves the revert armed.
+    if !server.emit_audit(
+        AuditEvent::new(AuditKind::Confirm)
+            .handle(handle)
+            .caller(caller),
+    ) {
+        return AdminResponse::Error {
+            message: super::AUDIT_UNAVAILABLE_REASON.to_string(),
+        };
+    }
     let updated = {
         let mut reg = server.state.provisional.write().await;
         reg.confirm(handle)
@@ -2659,7 +2879,6 @@ async fn handle_confirm(
             // The change is kept and the revert will never fire; drop its
             // persisted body so a secret-bearing snapshot is not left on disk.
             remove_revert_body(&p);
-            tracing::info!(target: "guard::audit", "[AUDIT] CONFIRM handle={} caller={}", handle, caller);
             server.emit_event(NotifyEvent {
                 event: "decision_made",
                 at_unix: now_unix(),
@@ -2804,6 +3023,25 @@ async fn handle_approve(
         && matches!(&snapshot.principal, Some(p) if server.config.daemon_principal.eq_ci(p))
     {
         let now = now_unix();
+        // The APPROVED record must be durable BEFORE the parked API request is
+        // released to the proxy waiter; fail closed otherwise.
+        if !server.emit_audit(
+            AuditEvent::new(AuditKind::Approved)
+                .handle(handle)
+                .caller(caller)
+                .reason("api-proxy request released"),
+        ) {
+            {
+                let mut reg = server.state.approvals.write().await;
+                reg.set_exec_failed(handle, now, super::AUDIT_UNAVAILABLE_REASON.to_string());
+            }
+            if let Some(a) = server.state.approvals.read().await.get(handle).cloned() {
+                persist_approval(server, &a).await;
+            }
+            return AdminResponse::Error {
+                message: super::AUDIT_UNAVAILABLE_REASON.to_string(),
+            };
+        }
         {
             let mut reg = server.state.approvals.write().await;
             reg.set_result(handle, now, None, None, None);
@@ -2811,11 +3049,6 @@ async fn handle_approve(
         if let Some(a) = server.state.approvals.read().await.get(handle).cloned() {
             persist_approval(server, &a).await;
         }
-        tracing::info!(target: "guard::audit",
-            "[AUDIT] APPROVED handle={} caller={} (api-proxy request released)",
-            handle,
-            caller
-        );
         server.emit_event(NotifyEvent {
             event: "decision_made",
             at_unix: now,
@@ -2850,15 +3083,12 @@ async fn handle_approve(
             if let Some(a) = server.state.approvals.read().await.get(handle).cloned() {
                 persist_approval(server, &a).await;
             }
-            tracing::warn!(target: "guard::audit",
-                "[AUDIT] APPROVE_VOIDED handle={} caller={} session_fingerprint={} {}",
-                handle,
-                caller,
-                snapshot
-                    .session_fingerprint
-                    .as_deref()
-                    .unwrap_or("none"),
-                audit_escape(&detail)
+            server.emit_audit_ungated(
+                AuditEvent::new(AuditKind::ApproveVoided)
+                    .handle(handle)
+                    .caller(caller)
+                    .session_fingerprint(snapshot.session_fingerprint.as_deref().unwrap_or("none"))
+                    .reason(&detail),
             );
             server.emit_event(NotifyEvent {
                 event: "decision_made",
@@ -2877,6 +3107,28 @@ async fn handle_approve(
     if let Some(a) = server.state.approvals.read().await.get(handle).cloned() {
         persist_approval(server, &a).await;
     }
+    // The APPROVED record must be durable BEFORE the held snapshot executes;
+    // an unauditable release fails closed and the hold is marked exec-failed
+    // so it cannot be replayed unaudited.
+    if !server.emit_audit(
+        AuditEvent::new(AuditKind::Approved)
+            .handle(handle)
+            .caller(caller)
+            .session_fingerprint(snapshot.session_fingerprint.as_deref().unwrap_or("none"))
+            .cmd(snapshot.command_line()),
+    ) {
+        let now = now_unix();
+        {
+            let mut reg = server.state.approvals.write().await;
+            reg.set_exec_failed(handle, now, super::AUDIT_UNAVAILABLE_REASON.to_string());
+        }
+        if let Some(a) = server.state.approvals.read().await.get(handle).cloned() {
+            persist_approval(server, &a).await;
+        }
+        return AdminResponse::Error {
+            message: super::AUDIT_UNAVAILABLE_REASON.to_string(),
+        };
+    }
     let reason = format!("operator-approved held command {}", handle);
     let result = execute_snapshot(server, &snapshot, &reason).await;
     let now = now_unix();
@@ -2890,15 +3142,12 @@ async fn handle_approve(
                 let mut reg = server.state.approvals.write().await;
                 reg.set_result(handle, now, exit_code, stdout.clone(), stderr.clone());
             }
-            tracing::info!(target: "guard::audit",
-                "[AUDIT] APPROVED handle={} caller={} session_fingerprint={} exit={:?}",
-                handle,
-                caller,
-                snapshot
-                    .session_fingerprint
-                    .as_deref()
-                    .unwrap_or("none"),
-                exit_code
+            server.emit_audit_ungated(
+                AuditEvent::new(AuditKind::ApprovedExecuted)
+                    .handle(handle)
+                    .caller(caller)
+                    .session_fingerprint(snapshot.session_fingerprint.as_deref().unwrap_or("none"))
+                    .field("exit", format!("{exit_code:?}")),
             );
             (
                 format!("approved and executed {} (exit {:?})", handle, exit_code),
@@ -2912,15 +3161,12 @@ async fn handle_approve(
                 let mut reg = server.state.approvals.write().await;
                 reg.set_exec_failed(handle, now, detail.clone());
             }
-            tracing::error!(target: "guard::audit",
-                "[AUDIT] APPROVE_EXEC_FAILED handle={} caller={} session_fingerprint={} detail={}",
-                handle,
-                caller,
-                snapshot
-                    .session_fingerprint
-                    .as_deref()
-                    .unwrap_or("none"),
-                audit_escape(&detail)
+            server.emit_audit_ungated(
+                AuditEvent::new(AuditKind::ApproveExecFailed)
+                    .handle(handle)
+                    .caller(caller)
+                    .session_fingerprint(snapshot.session_fingerprint.as_deref().unwrap_or("none"))
+                    .field("detail", &detail),
             );
             (
                 format!("approved {} but execution failed: {}", handle, detail),
@@ -3008,11 +3254,11 @@ pub(super) async fn handle_approval_note(
             match updated {
                 Some(a) => {
                     persist_approval(server, &a).await;
-                    tracing::info!(target: "guard::audit",
-                        "[AUDIT] APPROVAL_NOTE handle={} author={} caller={}",
-                        handle,
-                        audit_escape(author),
-                        caller
+                    server.emit_audit_ungated(
+                        AuditEvent::new(AuditKind::ApprovalNote)
+                            .handle(handle)
+                            .caller(caller)
+                            .field("author", author),
                     );
                     AdminResponse::ApprovalShow {
                         item: ApprovalSummary::from_row(&a),
@@ -3049,11 +3295,11 @@ async fn handle_deny(
                 } else {
                     None
                 };
-            tracing::info!(target: "guard::audit",
-                "[AUDIT] DENIED_HOLD handle={} caller={} session_fingerprint={}",
-                handle,
-                caller,
-                session_fingerprint.as_deref().unwrap_or("none")
+            server.emit_audit_ungated(
+                AuditEvent::new(AuditKind::DeniedHold)
+                    .handle(handle)
+                    .caller(caller)
+                    .session_fingerprint(session_fingerprint.as_deref().unwrap_or("none")),
             );
             server.emit_event(NotifyEvent {
                 event: "decision_made",

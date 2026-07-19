@@ -1,6 +1,7 @@
 use crate::grant_profile::{EvaluationMode, GrantRequest, GrantRequestDelta, SavedGrant};
 use crate::session::{
-    HistoricalGrant, SessionDecisionSource, SessionExecStatus, SessionGrantSummary, SessionReport,
+    HistoricalGrant, SessionDecisionSource, SessionExecStatus, SessionGrantSummary, SessionOwner,
+    SessionReport,
 };
 use guard::gating::approval::Approval;
 use guard::gating::provisional::Provisional;
@@ -104,6 +105,64 @@ impl std::fmt::Display for CallerIdentity {
     }
 }
 
+/// Distinct, greppable substring shared by every session principal-mismatch
+/// denial across the execute, appeal, kubeconfig, batch, and self-inspection
+/// paths, so an operator can grep the audit stream for one phrase.
+pub(super) const SESSION_PRINCIPAL_MISMATCH: &str = "session principal mismatch";
+
+/// Distinct, greppable substring for the fail-closed refusal of a session that
+/// predates principal binding (state schema < 7). The operator must reissue the
+/// session (or revoke it) before its authority can be used again.
+pub(super) const SESSION_UNOWNED_REFUSED: &str =
+    "session predates principal binding; reissue or revoke it";
+
+/// Result of checking whether a caller may exercise a session's authority.
+pub(super) enum SessionAuthz {
+    /// The caller is the owning principal, or the daemon/operator principal.
+    Allowed,
+    /// The caller's authenticated principal is not the session owner.
+    Mismatch,
+    /// The session is `Unowned` (legacy) and the caller is not the operator.
+    Unowned,
+}
+
+/// Server-side session-ownership decision. Uses only the principal the daemon
+/// reads itself (`caller.principal()`), never a client-supplied value. The
+/// daemon/operator principal keeps cross-session authority; any other caller
+/// must be the exact owning principal on a kernel-authenticated local peer.
+///
+/// `Unowned` legacy sessions resolve to `Allowed` for the operator (so it can
+/// inspect and revoke them) and `Unowned` for everyone else. Execution paths
+/// additionally refuse `Unowned` for the operator too, fail-closed, at their
+/// own call site.
+pub(super) fn authorize_session_use(
+    owner: &SessionOwner,
+    caller: &CallerIdentity,
+    daemon_principal: &PrincipalKey,
+) -> SessionAuthz {
+    let caller_principal = caller.principal();
+    let is_operator = matches!(&caller_principal, Some(p) if daemon_principal.eq_ci(p))
+        || matches!(caller, CallerIdentity::TcpAdmin { .. });
+    match owner {
+        SessionOwner::Unowned => {
+            if is_operator {
+                SessionAuthz::Allowed
+            } else {
+                SessionAuthz::Unowned
+            }
+        }
+        SessionOwner::Principal(owner_key) => {
+            if is_operator {
+                return SessionAuthz::Allowed;
+            }
+            match &caller_principal {
+                Some(p) if caller.is_local_peer() && owner_key.eq_ci(p) => SessionAuthz::Allowed,
+                _ => SessionAuthz::Mismatch,
+            }
+        }
+    }
+}
+
 // Coverage-composition results (`gating::coverage`) surface directly in the
 // daemon's wire responses; re-export them so daemon-side code keeps its
 // existing `server::wire::*` paths.
@@ -192,6 +251,15 @@ pub enum AdminRequest {
         static_only: bool,
         #[serde(default)]
         auto_amend: bool,
+        /// The principal (Unix uid or Windows SID string) the issued session is
+        /// bound to. The operator sets this when minting a session for an agent
+        /// that runs under a different local identity; when omitted the session
+        /// is owned by the authenticated caller that issues it (the daemon
+        /// principal for an operator-issued grant). Only the owning principal, or
+        /// the daemon/operator principal, may later exercise the session's
+        /// authority.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner: Option<String>,
     },
     SessionAppeal {
         token: String,
@@ -433,6 +501,14 @@ pub enum AdminRequest {
         caller_token: Option<String>,
         commands: Vec<BatchCommand>,
     },
+    /// Walk the hash-chained audit log and report whether it is intact.
+    /// Daemon-principal only: the audit file is daemon-owned state.
+    AuditVerify,
+    /// Read the last `limit` records of the audit log. Daemon-principal only.
+    AuditTail {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+    },
 }
 
 impl AdminRequest {
@@ -600,6 +676,14 @@ pub enum AdminResponse {
     },
     EvaluationBatch {
         items: Vec<BatchEvaluation>,
+    },
+    AuditVerification {
+        path: String,
+        verification: guard::audit::ChainVerification,
+    },
+    AuditRecords {
+        path: String,
+        items: Vec<serde_json::Value>,
     },
 }
 

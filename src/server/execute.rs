@@ -1,7 +1,7 @@
 use crate::injection::is_valid_env_name;
 use crate::session::{
     SessionAmendment, SessionDecision, SessionDecisionSource, SessionExecStatus,
-    SessionInteraction, SessionRegistry,
+    SessionInteraction, SessionOwner, SessionRegistry,
 };
 use crate::session_store::SessionStore;
 #[cfg(unix)]
@@ -14,7 +14,7 @@ use guard::gating::coverage::{
 use guard::gating::verb::CoverageAction;
 use guard::gating::{Coverage, DecisionTrace, DecisionVerbMatch};
 use guard::redact::{
-    audit_escape, command_line, redact_exact_secrets, redact_output, redact_output_text,
+    command_line, redact_exact_secrets, redact_output, redact_output_text,
     redact_output_with_state, RedactionState,
 };
 use sha2::{Digest, Sha256};
@@ -27,6 +27,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -48,8 +49,9 @@ use super::runtime::NotifyEvent;
 use super::transport::{write_policy_decision, write_stream_message};
 use super::wire::ExecOutcome;
 use super::wire::{
-    verb_trust_is_current, CallerIdentity, ExecuteRequest, ExecuteResult, ExecuteStreamMessage,
-    OutputStream, RevertSpec, SshHostKeyMode, VerbContext, VerbMatchInfo, VerbMatchScope,
+    authorize_session_use, verb_trust_is_current, CallerIdentity, ExecuteRequest, ExecuteResult,
+    ExecuteStreamMessage, OutputStream, RevertSpec, SessionAuthz, SshHostKeyMode, VerbContext,
+    VerbMatchInfo, VerbMatchScope, SESSION_PRINCIPAL_MISMATCH, SESSION_UNOWNED_REFUSED,
 };
 use super::{
     binary_exists_on_path, child_env_allowlist, dangerous_env_name,
@@ -58,24 +60,31 @@ use super::{
 };
 use super::{DEFAULT_CONFIRM_WITHIN_SECS, MAX_CONFIRM_WITHIN_SECS};
 
+/// Emit the ALLOWED/DENIED policy record for one execute request. Returns
+/// whether the record is durable; an allow that cannot be durably audited
+/// must fail closed before anything acts on it.
+#[must_use]
 pub(super) fn log_audit_policy_for_request(
     server: &ServerContext,
     caller: &CallerIdentity,
     request: &ExecuteRequest,
     allowed: bool,
     reason: &str,
-) {
+) -> bool {
     if let Some(cwd) = &request.cwd {
-        let action = if allowed { "ALLOWED" } else { "DENIED" };
-        tracing::info!(target: "guard::audit",
-            "[AUDIT] {} caller={} session_fingerprint={} cwd=\"{}\" cmd=\"{}\" reason=\"{}\"",
-            action,
-            caller,
-            audit_session_fingerprint(request.session_token.as_deref()),
-            audit_escape(&cwd.display().to_string()),
-            audit_command_line(&request.binary, &request.args),
-            audit_escape(reason)
-        );
+        let kind = if allowed {
+            guard::audit::AuditKind::Allowed
+        } else {
+            guard::audit::AuditKind::Denied
+        };
+        server.emit_audit(
+            guard::audit::AuditEvent::new(kind)
+                .caller(caller)
+                .session_fingerprint(audit_session_fingerprint(request.session_token.as_deref()))
+                .cwd(cwd.display().to_string())
+                .cmd(audit_command_line(&request.binary, &request.args))
+                .reason(reason),
+        )
     } else {
         server.log_audit_policy(
             caller,
@@ -84,7 +93,7 @@ pub(super) fn log_audit_policy_for_request(
             &request.args,
             allowed,
             reason,
-        );
+        )
     }
 }
 
@@ -136,7 +145,7 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
     {
         Ok(permit) => permit,
         Err(reason) => {
-            log_audit_policy_for_request(server, caller, &request, false, reason);
+            let _ = log_audit_policy_for_request(server, caller, &request, false, reason);
             return ExecuteResult::denied(reason);
         }
     };
@@ -559,11 +568,13 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
                 request.handle, request.handle, request.handle
             ));
                 if created {
-                    tracing::warn!(
-                        target: "guard::audit",
-                        "[AUDIT] OPERATOR_NOTIFICATION kind=grant_request handle={} session={}",
-                        request.handle,
-                        audit_session_fingerprint(Some(token))
+                    phase.server.emit_audit_ungated(
+                        guard::audit::AuditEvent::new(
+                            guard::audit::AuditKind::OperatorNotification,
+                        )
+                        .handle(&request.handle)
+                        .field("kind", "grant_request")
+                        .field("session", audit_session_fingerprint(Some(token))),
                     );
                     phase.server.emit_event(NotifyEvent {
                         event: "grant_request_created",
@@ -580,7 +591,7 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
             }
         }
     }
-    log_audit_policy_for_request(phase.server, phase.caller, request, false, &reason);
+    let _ = log_audit_policy_for_request(phase.server, phase.caller, request, false, &reason);
     let _ = write_policy_decision(
         phase.stream_output,
         &mut *phase.stream_writer,
@@ -699,6 +710,40 @@ async fn capture_session_authority(
         .ok_or_else(|| "session expired or was revoked before execution routing".to_string())
 }
 
+/// Per-process counter that hands every unauthenticated request a unique
+/// evaluator-cache scope, so an unauthenticated caller can neither be served
+/// nor seed another caller's cached verdict (mirrors `principal::scope_eq`).
+static UNAUTHENTICATED_EVAL_SCOPE_NONCE: AtomicU64 = AtomicU64::new(0);
+
+/// Build the evaluator decision-cache scope for this request. Binds the cached
+/// verdict to the authenticated principal and, when a session is in play, to a
+/// per-session fingerprint folded with the session-grant revision, so a verdict
+/// decided for one user's session is never reused for another user or replayed
+/// after the session's authority changes (amend, coverage change, or
+/// revoke-and-reissue).
+pub(super) fn evaluation_cache_scope(
+    caller: &CallerIdentity,
+    session_token: Option<&str>,
+    authority: Option<&SessionAuthoritySnapshot>,
+) -> String {
+    let principal = caller.principal();
+    let session = session_token.map(|token| {
+        format!(
+            "{}:{}",
+            audit_session_fingerprint(Some(token)),
+            authority
+                .map(|snapshot| snapshot.revision.as_str())
+                .unwrap_or("<no-revision>"),
+        )
+    });
+    let nonce = if principal.is_none() {
+        UNAUTHENTICATED_EVAL_SCOPE_NONCE.fetch_add(1, Ordering::Relaxed)
+    } else {
+        0
+    };
+    guard::principal::eval_cache_scope(principal.as_ref(), session.as_deref(), nonce)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct EvaluationConstraints {
     unresolved_plan: bool,
@@ -745,12 +790,11 @@ async fn resolve_verb_context<W: AsyncWrite + Unpin>(
             }
             Err(e) => {
                 let reason = format!("verb error: {}", e);
-                server.log_audit_policy(
+                server.audit_deny(
                     phase.caller,
                     phase.session_token.as_deref(),
                     &invocation.name,
                     &[],
-                    false,
                     &reason,
                 );
                 let _ = write_policy_decision(
@@ -966,7 +1010,7 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
 ) -> Result<ExecuteRequest, ExecuteResult> {
     let server = phase.server;
     if let Some(ref token) = request.session_token {
-        let (decision, exists, static_only, suspension) = {
+        let (decision, exists, static_only, suspension, owner) = {
             let reg = server.state.sessions.read().await;
             let decision = reg.check(
                 token,
@@ -979,6 +1023,7 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
                 reg.has(token),
                 reg.static_only_for(token),
                 reg.suspension_reason(token, &server.config.behavior_limits),
+                reg.owner_for(token),
             )
         };
         if !exists {
@@ -986,12 +1031,11 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
                 "unknown session token: '{}' is revoked, expired, or never existed",
                 token
             );
-            server.log_audit_policy(
+            server.audit_deny(
                 phase.caller,
                 phase.session_token.as_deref(),
                 &request.binary,
                 &request.args,
-                false,
                 &reason,
             );
             let _ = write_policy_decision(
@@ -1002,6 +1046,55 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
             )
             .await;
             return Err(ExecuteResult::denied(reason));
+        }
+        // Principal binding: a session's authority may be exercised only by the
+        // principal that owns it (or the daemon/operator), verified against the
+        // identity the daemon reads itself - never a client-supplied value. This
+        // closes the bearer-replay hole where any local peer in the socket group
+        // who learned a handle inherited another user's authority. Enforced here,
+        // before the command runs, so it also gates provisional arming and every
+        // downstream consequence-gated action taken under this session.
+        if let Some(owner) = owner {
+            let reason = match &owner {
+                // A session that predates principal binding has no verifiable
+                // owner: refuse execution fail-closed for everyone (the operator
+                // reissues or revokes it).
+                SessionOwner::Unowned => Some(format!(
+                    "session '{token}' {SESSION_UNOWNED_REFUSED}"
+                )),
+                SessionOwner::Principal(_) => match authorize_session_use(
+                    &owner,
+                    phase.caller,
+                    &server.config.daemon_principal,
+                ) {
+                    SessionAuthz::Allowed => None,
+                    SessionAuthz::Mismatch => Some(format!(
+                        "{SESSION_PRINCIPAL_MISMATCH}: caller {} is not the owner of session '{token}'",
+                        phase.caller
+                    )),
+                    // Unreachable for a Principal owner, but fail closed.
+                    SessionAuthz::Unowned => Some(format!(
+                        "session '{token}' {SESSION_UNOWNED_REFUSED}"
+                    )),
+                },
+            };
+            if let Some(reason) = reason {
+                server.audit_deny(
+                    phase.caller,
+                    phase.session_token.as_deref(),
+                    &request.binary,
+                    &request.args,
+                    &reason,
+                );
+                let _ = write_policy_decision(
+                    phase.stream_output,
+                    &mut *phase.stream_writer,
+                    false,
+                    &reason,
+                )
+                .await;
+                return Err(ExecuteResult::denied(reason));
+            }
         }
         if let Some(reason) = suspension {
             return Err(deny_and_record(
@@ -1031,7 +1124,10 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
                     if force_evaluate {
                         return Ok(request);
                     }
-                    log_audit_policy_for_request(server, phase.caller, &request, true, &reason);
+                    if !log_audit_policy_for_request(server, phase.caller, &request, true, &reason)
+                    {
+                        return Err(ExecuteResult::denied(super::AUDIT_UNAVAILABLE_REASON));
+                    }
                     if let Err(e) = write_policy_decision(
                         phase.stream_output,
                         &mut *phase.stream_writer,
@@ -1184,7 +1280,9 @@ async fn try_static_fast_allow<W: AsyncWrite + Unpin>(
         if let Some(reason) =
             deterministic_safe_allow_reason(server, &request.binary, &request.args)
         {
-            log_audit_policy_for_request(server, phase.caller, &request, true, &reason);
+            if !log_audit_policy_for_request(server, phase.caller, &request, true, &reason) {
+                return Err(ExecuteResult::denied(super::AUDIT_UNAVAILABLE_REASON));
+            }
             if let Err(e) = write_policy_decision(
                 phase.stream_output,
                 &mut *phase.stream_writer,
@@ -1289,7 +1387,9 @@ async fn try_trusted_verb_allow<W: AsyncWrite + Unpin>(
     if let Some(vc) = verb_ctx.clone() {
         if vc.trusted {
             let reason = format!("trusted verb '{}'", vc.name);
-            log_audit_policy_for_request(phase.server, phase.caller, &request, true, &reason);
+            if !log_audit_policy_for_request(phase.server, phase.caller, &request, true, &reason) {
+                return Err(ExecuteResult::denied(super::AUDIT_UNAVAILABLE_REASON));
+            }
             if let Err(e) = write_policy_decision(
                 phase.stream_output,
                 &mut *phase.stream_writer,
@@ -1390,27 +1490,22 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
             .await
         }
     };
-    let eval_result = if evaluation_prompt.is_some() {
-        server
-            .state
-            .evaluator
-            .evaluate_with_cacheable_context(
-                &command_line,
-                evaluation_prompt.as_deref(),
-                request.reevaluate,
-            )
-            .await
-    } else {
-        server
-            .state
-            .evaluator
-            .evaluate_with_reevaluate(
-                &command_line,
-                evaluation_prompt.as_deref(),
-                request.reevaluate,
-            )
-            .await
-    };
+    let cache_scope = evaluation_cache_scope(
+        phase.caller,
+        request.session_token.as_deref(),
+        evaluated_authority.as_ref(),
+    );
+    let eval_result = server
+        .state
+        .evaluator
+        .evaluate_scoped(
+            &command_line,
+            evaluation_prompt.as_deref(),
+            request.reevaluate,
+            evaluation_prompt.is_some(),
+            Some(cache_scope.as_str()),
+        )
+        .await;
     let provider_spend = matches!(
         &eval_result,
         guard::evaluate::EvalResult::Allow {
@@ -1549,7 +1644,9 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
                 }
             }
             tracing::debug!("command allowed: {}", reason);
-            log_audit_policy_for_request(server, phase.caller, &request, true, &reason);
+            if !log_audit_policy_for_request(server, phase.caller, &request, true, &reason) {
+                return ExecuteResult::denied(super::AUDIT_UNAVAILABLE_REASON);
+            }
             if let Err(e) = write_policy_decision(
                 phase.stream_output,
                 &mut *phase.stream_writer,
@@ -1673,14 +1770,15 @@ fn caller_environment_subject(request: &ExecuteRequest) -> Option<String> {
     ))
 }
 
-/// Render a command line for an audit log entry with secret-shaped values
+/// Render a command line for an audit event with secret-shaped values
 /// masked. Argv routinely carries inline credentials (`--password=...`,
 /// `Authorization: Bearer <token>`, connection URLs); the audit trail needs
 /// the command shape, not the values, and the daemon log must not become a
-/// secret store. Control characters are escaped (`audit_escape`) so argv
-/// cannot inject forged physical audit lines.
+/// secret store. The value is stored raw in the typed event: the JSONL sink
+/// JSON-encodes it (no physical-line forgery is possible), and the stderr
+/// projection applies `audit_escape` at render time.
 pub(super) fn audit_command_line(binary: &str, args: &[String]) -> String {
-    audit_escape(&redact_output(&command_line(binary, args))).into_owned()
+    redact_output(&command_line(binary, args))
 }
 
 pub(super) async fn persist_session_snapshot(
@@ -2076,12 +2174,15 @@ pub(super) async fn exec_with_read_grant_retry_with_secret_authority<W: AsyncWri
                 // failed to apply: surface the command's own failure.
                 break;
             }
-            tracing::info!(target: "guard::audit",
-                "[AUDIT] READ_GRANT_AUTO caller={} session_fingerprint={} path=\"{}\" ttl={}s (retrying after permission denied)",
-                caller,
-                audit_session_fingerprint(request.session_token.as_deref()),
-                audit_escape(&path),
-                AUTO_READ_GRANT_TTL_SECS
+            server.emit_audit_ungated(
+                guard::audit::AuditEvent::new(guard::audit::AuditKind::ReadGrantAuto)
+                    .caller(caller)
+                    .session_fingerprint(audit_session_fingerprint(
+                        request.session_token.as_deref(),
+                    ))
+                    .reason("retrying after permission denied")
+                    .field("path", &path)
+                    .field("ttl", format!("{AUTO_READ_GRANT_TTL_SECS}s")),
             );
             result = exec_after_approval_with_secret_authority(
                 context,
@@ -2520,7 +2621,7 @@ pub(super) async fn exec_after_approval_with_secret_authority<W: AsyncWrite + Un
     let process_guard = child
         .id()
         .map(|pid| server.state.process_tracker.track(pid));
-    audit_secret_exposure(caller, &request, &exposed_secret_refs);
+    audit_secret_exposure(server, caller, &request, &exposed_secret_refs);
     let output = match child.wait_with_output().await {
         Ok(output) => output,
         Err(e) => {
@@ -2585,7 +2686,12 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
     let mut process_guard = child
         .id()
         .map(|pid| server.state.process_tracker.track(pid));
-    audit_secret_exposure(audit.caller, audit.request, &audit.exposed_secret_refs);
+    audit_secret_exposure(
+        server,
+        audit.caller,
+        audit.request,
+        &audit.exposed_secret_refs,
+    );
 
     let (tx, mut rx) = mpsc::channel::<StreamChunk>(32);
     let mut stream_tasks = Vec::new();
@@ -2688,6 +2794,7 @@ struct SpawnAuditContext<'a> {
 }
 
 fn audit_secret_exposure(
+    server: &ServerContext,
     caller: &CallerIdentity,
     request: &ExecuteRequest,
     exposed_secret_refs: &[String],
@@ -2695,12 +2802,12 @@ fn audit_secret_exposure(
     for secret_ref in exposed_secret_refs {
         let secret_name = serde_json::to_string(secret_ref)
             .unwrap_or_else(|_| "\"<invalid-secret-name>\"".to_string());
-        tracing::info!(target: "guard::audit",
-            "[AUDIT] SECRET_EXPOSED caller={} session_fingerprint={} secret={} cmd=\"{}\"",
-            caller,
-            audit_session_fingerprint(request.session_token.as_deref()),
-            secret_name,
-            audit_command_line(&request.binary, &request.args)
+        server.emit_audit_ungated(
+            guard::audit::AuditEvent::new(guard::audit::AuditKind::SecretExposed)
+                .caller(caller)
+                .session_fingerprint(audit_session_fingerprint(request.session_token.as_deref()))
+                .cmd(audit_command_line(&request.binary, &request.args))
+                .field("secret", secret_name),
         );
     }
 }
