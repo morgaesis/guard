@@ -96,11 +96,11 @@ jobs:
       - name: Run tests
         run: cargo test --all-features
 
-  # Branch protection requires a status check literally named "Test & Lint".
+  # The repository ruleset requires a status check literally named "Test & Lint".
   # The matrix job above reports as "Test & Lint (ubuntu-latest)" / "Test &
   # Lint (windows-latest)" instead, so that required context could never be
   # satisfied. This aggregator job produces the exact required name and fails
-  # if any matrix leg did not succeed, so branch protection can require one
+  # if any matrix leg did not succeed, so the repository ruleset can require one
   # stable check regardless of how many OSes the matrix covers.
   test_and_lint:
     name: Test & Lint
