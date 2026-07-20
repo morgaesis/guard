@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Synchronizes the required status checks on the protected branch with the
+# Synchronizes the required status checks in the branch ruleset with the
 # declared list below. The list is the single source of truth: the CI drift
 # guard (audit.yml, branch_protection_drift) runs this script with --check,
 # and an administrator applies changes with --apply.
@@ -9,7 +9,7 @@ set -euo pipefail
 # Usage:
 #   scripts/sync-branch-protection.sh            Print current vs intended diff.
 #   scripts/sync-branch-protection.sh --check    Diff only; exit 1 on drift,
-#                                                exit 2 when protection is unreadable.
+#                                                exit 2 when rules are unreadable.
 #   scripts/sync-branch-protection.sh --apply    Print the diff, then apply the
 #                                                intended list via the API.
 #
@@ -17,10 +17,9 @@ set -euo pipefail
 #   REPO    owner/name (default: derived from the current directory's remote)
 #   BRANCH  protected branch (default: main)
 #
-# Reading the protection endpoint and applying changes require a token with
-# repository administration permission. --check additionally tries the public
-# branch endpoint, which exposes required check contexts to lesser tokens on
-# public repositories.
+# --check works with any token that can read the repository, including the
+# default Actions token with Metadata read permission. --apply requires
+# repository administration permission.
 #
 # Every context in the list reports a conclusion (success, failure, or
 # skipped) on every pull_request event: ci.yml, audit.yml, and
@@ -71,24 +70,16 @@ case "${1:-}" in
 esac
 
 current_contexts() {
-  local out
-  if out=$(gh api "repos/${REPO}/branches/${BRANCH}/protection/required_status_checks" \
-      --jq '.contexts[]' 2>/dev/null); then
-    printf '%s\n' "$out"
-    return 0
-  fi
-  # Fallback for tokens without administration permission: the branch
-  # endpoint exposes the same contexts on public repositories.
-  if out=$(gh api "repos/${REPO}/branches/${BRANCH}" \
-      --jq '.protection.required_status_checks.contexts[]' 2>/dev/null); then
-    printf '%s\n' "$out"
-    return 0
-  fi
-  return 2
+  local rules rule
+  rules=$(gh api "repos/${REPO}/rules/branches/${BRANCH}") || return 2
+  rule=$(printf '%s\n' "$rules" \
+    | jq -e 'map(select(.type == "required_status_checks")) | if length == 0 then empty else .[0] end') \
+    || return 2
+  printf '%s\n' "$rule" | jq -r '.parameters.required_status_checks[].context'
 }
 
 if ! current=$(current_contexts); then
-  echo "error: cannot read required status checks for ${REPO}@${BRANCH}" >&2
+  echo "error: branch rules are unreadable or no required_status_checks rule exists for ${REPO}@${BRANCH}" >&2
   exit 2
 fi
 
@@ -122,16 +113,43 @@ case "$mode" in
     exit 1
     ;;
   apply)
-    # Preserve the current strict setting; this script only manages contexts.
-    strict=$(gh api "repos/${REPO}/branches/${BRANCH}/protection/required_status_checks" \
-      --jq '.strict')
-    payload=$(printf '%s\n' "${REQUIRED_CONTEXTS[@]}" \
+    rules=$(gh api "repos/${REPO}/rules/branches/${BRANCH}") || {
+      echo "error: branch rules are unreadable for ${REPO}@${BRANCH}" >&2
+      exit 2
+    }
+    ruleset_id=$(printf '%s\n' "$rules" \
+      | jq -e -r 'map(select(.type == "required_status_checks")) | if length == 0 then empty else .[0].ruleset_id end') \
+      || {
+        echo "error: no required_status_checks rule exists for ${REPO}@${BRANCH}" >&2
+        exit 2
+      }
+    required_checks=$(printf '%s\n' "${REQUIRED_CONTEXTS[@]}" \
       | jq -R . \
-      | jq -s --argjson strict "$strict" --argjson app_id "$APP_ID" \
-          '{strict: $strict, checks: map({context: ., app_id: $app_id})}')
-    printf '%s\n' "$payload" | gh api -X PATCH \
-      "repos/${REPO}/branches/${BRANCH}/protection/required_status_checks" \
+      | jq -s --argjson app_id "$APP_ID" 'map({context: ., integration_id: $app_id})')
+    payload=$(gh api "repos/${REPO}/rulesets/${ruleset_id}" \
+      | jq --argjson required_checks "$required_checks" '
+          {
+            name,
+            target,
+            enforcement,
+            conditions,
+            bypass_actors,
+            rules: (
+              .rules
+              | map(
+                  if .type == "required_status_checks" then
+                    .parameters.required_status_checks = $required_checks
+                  else
+                    .
+                  end
+                )
+            )
+          }
+          | with_entries(select(.value != null))
+        ')
+    printf '%s\n' "$payload" | gh api -X PUT \
+      "repos/${REPO}/rulesets/${ruleset_id}" \
       --input - > /dev/null
-    echo "Applied ${#REQUIRED_CONTEXTS[@]} required contexts to ${REPO}@${BRANCH}."
+    echo "Applied ${#REQUIRED_CONTEXTS[@]} required contexts to ruleset ${ruleset_id} for ${REPO}@${BRANCH}."
     ;;
 esac
