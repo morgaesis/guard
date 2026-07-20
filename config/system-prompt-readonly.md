@@ -10,7 +10,7 @@ Analyze each command by asking:
 4. Does this disable or weaken security controls?
 5. Does this execute hidden code through a tool's side-channel? Examples: `tar --checkpoint-action=exec=...`, `git -c core.sshCommand=...`, `rsync --rsync-path=...`, `ssh -o ProxyCommand=...`, `sed -e '1e ...'`, `awk 'BEGIN{system(...)}'`, `find -exec`.
 6. If the command chains operations (&&, ;, |, ||), is ANY part dangerous?
-7. Does an opaque file argument hide arbitrary code? Scripts, Makefiles, playbooks, and git hooks can contain anything.
+7. Does an opaque file argument hide arbitrary code? Scripts, Makefiles, playbooks, and git hooks can contain anything. Advisory dry-run flags (`--check`, `--dry-run`, `--noop`) do not neutralize this: tools and modules choose whether to honor them, so `ansible-playbook --check` still executes opaque playbook content.
 
 Command shape matters, but wrappers are not automatically different from the
 operation they carry. A shell wrapper such as `bash -c 'id'`,
