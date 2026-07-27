@@ -86,9 +86,9 @@ preauthorize environment bindings.
 
 ## Reverse matching
 
-Agents may call `guard verb run`, but raw commands also reverse-match the verb
-catalog. Guard collects every applicable cell, so the typed catalog remains
-authoritative without forcing agents to translate familiar commands.
+Raw commands and access intents reverse-match the verb catalog. Guard collects
+every applicable cell, so the typed catalog remains authoritative without
+forcing agents to translate familiar commands.
 
 Resolution follows these constraints:
 
@@ -107,8 +107,9 @@ past matching global generated coverage under its own intent, while protocol
 hard-denies and operator policy remain floors.
 
 Successful human output stays quiet. Machine-readable run results include all
-applicable cells. Held or denied human output identifies matching verbs and
-guidance so an agent can request the exact grant change.
+applicable cells. Held or denied human output identifies matching verbs and one
+durable access request. Denials offer ordinary, one-time, and bounded approval;
+holds offer only one-time approval.
 
 ## Baseline and session activation
 
@@ -123,18 +124,15 @@ mode on one host without making broad apply authority global.
 
 ## Generation and promotion
 
-An operator can synthesize a validated verb from prose:
-
-```bash
-guard verb create --preview --binary cmk \
-  --prompt 'List one CloudStack VM by UUID.'
-guard verb create --binary cmk \
-  --prompt 'List one CloudStack VM by UUID.'
-```
-
-Synthesized verbs cannot be trusted, use a shell or interpreter binary, or
-accept patterns with whitespace and shell metacharacters. The catalog records
-the source prose and rationale.
+`guard access request` synthesizes typed coverage when no existing verb matches
+the normalized intent. Proposed verbs cannot be baseline or trusted, use a
+shell or interpreter binary, or accept patterns with whitespace and shell
+metacharacters. Approval promotes only the reviewed matcher to trusted
+session-scoped coverage. The durable request stores the proposal and restores
+it from SQLite while its access session is active. Guard derives consequence
+locally, so unknown or mutating generated shapes remain irreversible holds. The
+operator-authored catalog is unchanged. Equivalent typed shapes are reused
+instead of duplicated.
 
 With consequence gating active, repeated eligible evaluator approvals can
 promote exact observed shapes into trusted verbs. Parameter patterns contain

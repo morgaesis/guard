@@ -17,12 +17,16 @@ use crate::server::wire::{
 use crate::server::{RequestContext, ServerContext, APPROVAL_TTL_SECS};
 use crate::session::SessionGrant;
 #[cfg(unix)]
+use crate::session::{AccessUseGrant, IssuedGrantScope, SessionOwner};
+#[cfg(unix)]
 use crate::session_store::SessionStore;
 use guard::gating::approval::{Approval, ApprovalSnapshot, ApprovalStatus};
 #[cfg(unix)]
 use guard::gating::approval::{SecretBinding, ToolSecretBinding};
 #[cfg(unix)]
 use guard::gating::provisional::{ApiRevertPlan, Provisional, ProvisionalStatus};
+#[cfg(unix)]
+use guard::gating::verb::VerbCatalog;
 use guard::gating::{Coverage, GateMode, Reversibility};
 use guard::principal::PrincipalKey;
 use std::collections::HashMap;
@@ -30,6 +34,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 #[cfg(unix)]
 use tokio::io::AsyncWrite;
+#[cfg(unix)]
+use tokio::sync::RwLock;
 
 use super::make_test_config;
 
@@ -307,6 +313,144 @@ async fn containment_dropped_when_forward_fails_to_spawn() {
         reg.list().is_empty(),
         "a never-launched forward must drop its provisional"
     );
+}
+
+/// The rollback record is the containment envelope's crash-recovery authority.
+/// If its initial write fails, the forward command must never start.
+#[cfg(unix)]
+#[tokio::test]
+async fn containment_fails_closed_when_initial_provisional_persistence_fails() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let database = temp.path().join("state.db");
+    let marker = temp.path().join("forward-ran");
+    let store = SessionStore::open(database.clone(), 3_600)
+        .await
+        .expect("open store");
+    {
+        let connection = rusqlite::Connection::open(&database).expect("open state database");
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_provisional_insert
+                 BEFORE INSERT ON gating_provisional
+                 BEGIN
+                   SELECT RAISE(FAIL, 'simulated provisional insert failure');
+                 END;",
+            )
+            .expect("install insert failure trigger");
+    }
+    let (mut cfg, _operator, agent) = gating_config(7_030, 1_000);
+    cfg.state.session_store = Some(store.clone());
+    let request = contain_request(
+        "touch",
+        &[marker.to_str().expect("marker path")],
+        RevertSpec::new("true", Vec::new()),
+    );
+    let mut sink = tokio::io::sink();
+
+    let result = arm_containment_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        request,
+        agent.principal(),
+        "recoverable change".to_string(),
+        None,
+    )
+    .await;
+
+    assert!(matches!(
+        result.exec,
+        ExecOutcome::Failed {
+            started: false,
+            ref reason,
+        } if reason.contains("rollback state was not durable")
+    ));
+    assert!(!marker.exists(), "forward command must not run");
+    assert!(cfg.state.provisional.read().await.list().is_empty());
+    assert!(store
+        .load_provisionals()
+        .await
+        .expect("load provisionals")
+        .is_empty());
+}
+
+/// A failed cleanup delete must leave a durable terminal tombstone. Startup
+/// recovery can then prove that no rollback is available for an unstarted
+/// command instead of presenting an ambiguous rollback decision.
+#[cfg(unix)]
+#[tokio::test]
+async fn spawn_failure_delete_error_persists_nonrollbackable_tombstone() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let database = temp.path().join("state.db");
+    let store = SessionStore::open(database.clone(), 3_600)
+        .await
+        .expect("open store");
+    {
+        let connection = rusqlite::Connection::open(&database).expect("open state database");
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_provisional_delete
+                 BEFORE DELETE ON gating_provisional
+                 BEGIN
+                   SELECT RAISE(FAIL, 'simulated provisional delete failure');
+                 END;",
+            )
+            .expect("install delete failure trigger");
+    }
+    let (mut cfg, _operator, agent) = gating_config(7_031, 1_000);
+    cfg.state.session_store = Some(store.clone());
+    let request = contain_request(
+        "guard-nonexistent-binary-delete-failure",
+        &[],
+        RevertSpec::new("true", Vec::new()),
+    );
+    let mut sink = tokio::io::sink();
+
+    let result = arm_containment_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        request,
+        agent.principal(),
+        "recoverable change".to_string(),
+        None,
+    )
+    .await;
+
+    assert!(matches!(
+        result.exec,
+        ExecOutcome::Failed { started: false, .. }
+    ));
+    let live = cfg.state.provisional.read().await.list();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].status, ProvisionalStatus::Reverted);
+    assert!(!live[0].forward_done);
+    assert!(live[0]
+        .revert_detail
+        .as_deref()
+        .is_some_and(|detail| detail.contains("did not start")));
+
+    let persisted = store
+        .load_provisionals()
+        .await
+        .expect("load terminal tombstone");
+    assert_eq!(persisted.len(), 1);
+    assert_eq!(persisted[0].status, ProvisionalStatus::Reverted);
+    let (mut restarted, moved) =
+        guard::gating::provisional::ProvisionalRegistry::from_rows(persisted);
+    assert!(moved.is_empty());
+    assert!(restarted.list()[0].status.is_terminal());
+    assert!(restarted
+        .take_due(now_unix().saturating_add(10_000))
+        .is_empty());
 }
 
 /// contain -> operator confirm keeps the change (no revert fires), and
@@ -1139,6 +1283,7 @@ async fn recoverable_with_unaffirmable_revert_is_held_for_review() {
         verb: None,
         bypass: false,
         authority: None,
+        consume_access_verbs: Vec::new(),
     };
     let mut sink = tokio::io::sink();
     let result = route_gated_allow(
@@ -1223,6 +1368,7 @@ async fn post_evaluator_session_revoke_or_expiry_fails_before_arm_or_hold() {
             verb: None,
             bypass: false,
             authority: Some(revoked_authority),
+            consume_access_verbs: Vec::new(),
         },
     )
     .await;
@@ -1245,11 +1391,16 @@ async fn post_evaluator_session_revoke_or_expiry_fails_before_arm_or_hold() {
         .into();
     let mut expired = active_session();
     expired.expires_at = Some(now_unix().saturating_sub(1));
-    cfg.state
-        .sessions
-        .write()
-        .await
-        .grant("expired-during-eval".to_string(), expired);
+    let mut sessions = cfg.state.sessions.write().await;
+    let mut grants = sessions.grants_snapshot();
+    grants.insert("expired-during-eval".to_string(), expired);
+    *sessions = crate::session::SessionRegistry::from_parts(
+        grants,
+        sessions.history_snapshot(),
+        sessions.interactions_snapshot(),
+        3_600,
+    );
+    drop(sessions);
     let mut held = contain_request("true", &[], RevertSpec::new("true", Vec::new()));
     held.revert = None;
     held.session_token = Some("expired-during-eval".to_string());
@@ -1270,6 +1421,7 @@ async fn post_evaluator_session_revoke_or_expiry_fails_before_arm_or_hold() {
             verb: None,
             bypass: false,
             authority: Some(expired_authority),
+            consume_access_verbs: Vec::new(),
         },
     )
     .await;
@@ -1384,6 +1536,7 @@ async fn hold_then_operator_approve_executes_snapshot_nonoperator_refused() {
             verb: None,
             bypass: false,
             authority: None,
+            consume_access_verbs: Vec::new(),
         },
     )
     .await;
@@ -1391,6 +1544,12 @@ async fn hold_then_operator_approve_executes_snapshot_nonoperator_refused() {
         ExecOutcome::Held { handle, .. } => handle.clone(),
         other => panic!("expected Held, got {:?}", other),
     };
+    let held_response = held.into_response();
+    let guidance = held_response.verb_guidance.as_deref().unwrap();
+    assert_eq!(
+        guidance,
+        format!("approve: guard access approve {handle} --once")
+    );
 
     // Non-operator approve is refused; the hold stays pending.
     let refused = handle_admin_request(
@@ -1422,19 +1581,51 @@ async fn hold_then_operator_approve_executes_snapshot_nonoperator_refused() {
         "a refused approve must not change state"
     );
 
+    for uses in [None, Some(3)] {
+        let response = handle_admin_request(
+            &cfg,
+            &operator,
+            AdminRequest::AccessApprove {
+                handles: vec![handle.clone()],
+                uses,
+            },
+        )
+        .await;
+        let AdminResponse::AccessDecisions { items } = response else {
+            panic!("expected held access decision")
+        };
+        assert!(!items[0].success);
+        assert!(items[0].message.contains("approve them with --once"));
+        assert_eq!(
+            cfg.state
+                .approvals
+                .read()
+                .await
+                .get(&handle)
+                .unwrap()
+                .status,
+            ApprovalStatus::Pending
+        );
+    }
+
     // Operator approves: the snapshot executes (`true` -> exit 0) and the row
     // becomes Approved.
     let ok = handle_admin_request(
         &cfg,
         &operator,
-        AdminRequest::Approve {
-            handle: handle.clone(),
+        AdminRequest::AccessApprove {
+            handles: vec![handle.clone()],
+            uses: Some(1),
         },
     )
     .await;
     match ok {
-        AdminResponse::GateAction { exit_code, .. } => {
-            assert_eq!(exit_code, Some(0), "approved `true` exits 0");
+        AdminResponse::AccessDecisions { items } => {
+            assert!(items[0].success);
+            assert_eq!(items[0].state, "approved");
+            assert_eq!(items[0].remaining_uses, None);
+            assert_eq!(items[0].use_policy, "unavailable");
+            assert_eq!(items[0].target.as_deref(), Some("agent:1000"));
         }
         other => panic!("operator approve should execute, got {:?}", other),
     }
@@ -1448,6 +1639,739 @@ async fn hold_then_operator_approve_executes_snapshot_nonoperator_refused() {
             .status,
         ApprovalStatus::Approved
     );
+    let AdminResponse::AccessItem { item } =
+        handle_admin_request(&cfg, &agent, AdminRequest::AccessShow { reference: handle }).await
+    else {
+        panic!("requester should inspect its held access request")
+    };
+    assert_eq!(item.state, "approved");
+    assert_eq!(item.target, "agent:1000");
+    assert_eq!(item.remaining_uses, None);
+    assert!(
+        cfg.state
+            .sessions
+            .read()
+            .await
+            .access_token_for_principal(&PrincipalKey::from_uid(1000))
+            .is_none(),
+        "one-shot held execution must not leave session authority"
+    );
+}
+
+#[tokio::test]
+async fn access_projection_excludes_and_rejects_legacy_sessions() {
+    let (cfg, operator, agent) = gating_config(7_005, 1_000);
+    let mut legacy = active_session();
+    legacy.scope.label = Some("legacy-access-projection".to_string());
+    let mut managed = active_session();
+    managed.scope.access_managed = true;
+    managed.scope.label = Some("managed-access-projection".to_string());
+    {
+        let mut sessions = cfg.state.sessions.write().await;
+        sessions.grant("legacy-access-projection".to_string(), legacy);
+        sessions.grant("managed-access-projection".to_string(), managed);
+    }
+
+    let AdminResponse::AccessItems { items } =
+        handle_admin_request(&cfg, &agent, AdminRequest::AccessList).await
+    else {
+        panic!("expected access list")
+    };
+    assert!(items.iter().any(
+        |item| item.reference == crate::session::session_reference("managed-access-projection")
+    ));
+    assert!(!items.iter().any(
+        |item| item.reference == crate::session::session_reference("legacy-access-projection")
+    ));
+
+    assert!(matches!(
+        handle_admin_request(
+            &cfg,
+            &operator,
+            AdminRequest::AccessShow {
+                reference: crate::session::session_reference("legacy-access-projection"),
+            },
+        )
+        .await,
+        AdminResponse::Error { .. }
+    ));
+    let AdminResponse::AccessItem { item } = handle_admin_request(
+        &cfg,
+        &agent,
+        AdminRequest::AccessShow {
+            reference: crate::session::session_reference("managed-access-projection"),
+        },
+    )
+    .await
+    else {
+        panic!("expected access-managed session")
+    };
+    assert_eq!(item.kind, "session");
+}
+
+#[tokio::test]
+async fn held_access_projection_expires_before_the_sweeper_and_hides_approval_options() {
+    let (cfg, _, agent) = gating_config(7_006, 1_001);
+    let handle = "held-access-projection".to_string();
+    let principal = PrincipalKey::from_uid(1_001);
+    cfg.state.approvals.write().await.enqueue(Approval {
+        handle: handle.clone(),
+        snapshot: ApprovalSnapshot {
+            binary: "true".to_string(),
+            args: Vec::new(),
+            cwd: None,
+            env: BTreeMap::new(),
+            secret_keys: BTreeMap::new(),
+            session_fingerprint: None,
+            session_revision: None,
+            secret_entitlements: None,
+            secret_file_keys: BTreeMap::new(),
+            verb_name: None,
+            verb_params: BTreeMap::new(),
+            catalog_version: None,
+            access_verbs: Vec::new(),
+            access_requests: Vec::new(),
+            principal: Some(principal),
+            secret_binding: None,
+        },
+        reason: "held access projection test".to_string(),
+        risk: None,
+        reversibility: None,
+        decision_trace: None,
+        created_unix: 0,
+        ttl_secs: 0,
+        status: ApprovalStatus::Pending,
+        decided_unix: None,
+        decided_reason: None,
+        result_exit: None,
+        result_stdout: None,
+        result_stderr: None,
+        notes: Vec::new(),
+    });
+
+    let AdminResponse::AccessItems { items } =
+        handle_admin_request(&cfg, &agent, AdminRequest::AccessList).await
+    else {
+        panic!("expected access list")
+    };
+    let listed = items
+        .iter()
+        .find(|item| item.reference == handle)
+        .expect("held access request remains visible before the sweeper");
+    assert_eq!(listed.state, "expired");
+    assert!(listed.approval_options.is_empty());
+    assert_eq!(listed.use_policy, "unavailable");
+
+    let AdminResponse::AccessItem { item: shown } = handle_admin_request(
+        &cfg,
+        &agent,
+        AdminRequest::AccessShow {
+            reference: handle.clone(),
+        },
+    )
+    .await
+    else {
+        panic!("expected held access show")
+    };
+    assert_eq!(shown.state, "expired");
+    assert!(shown.approval_options.is_empty());
+    assert_eq!(
+        cfg.state
+            .approvals
+            .read()
+            .await
+            .get(&handle)
+            .unwrap()
+            .status,
+        ApprovalStatus::Pending,
+        "projection must not mutate the held row before the sweeper"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn held_snapshot_consumes_its_originating_once_authority() {
+    let (cfg, operator, agent) = gating_config(7_025, 1_000);
+    cfg.state.sessions.write().await.grant(
+        "access-token".to_string(),
+        SessionGrant {
+            allow: Vec::new(),
+            deny: Vec::new(),
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            activated_verbs: vec!["inspect-fixture".to_string()],
+            override_markers: Vec::new(),
+            scope: IssuedGrantScope {
+                label: Some("agent:1000".to_string()),
+                access_managed: true,
+                access_grants: vec![AccessUseGrant {
+                    request: "gr-origin".to_string(),
+                    verbs: vec!["inspect-fixture".to_string()],
+                    use_limit: Some(1),
+                    remaining_uses: Some(1),
+                    pending: false,
+                }],
+                ..IssuedGrantScope::default()
+            },
+            expires_at: Some(now_unix().saturating_add(60)),
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            static_only: true,
+            auto_amend: false,
+            granted_at: now_unix(),
+            owner: SessionOwner::Principal(PrincipalKey::from_uid(1_000)),
+        },
+    );
+    let authority = live_authority(&cfg, "access-token").await;
+    let request = ExecuteRequest {
+        binary: "true".to_string(),
+        args: Vec::new(),
+        auth_token: None,
+        env: HashMap::new(),
+        secrets: HashMap::new(),
+        secret_files: HashMap::new(),
+        stream: false,
+        session_token: Some("access-token".to_string()),
+        revert: None,
+        confirm_within_secs: None,
+        reevaluate: false,
+        ssh_hostkey: None,
+        cwd: None,
+        require_approval: None,
+        wait_approval_secs: None,
+        verb: None,
+    };
+    let mut sink = tokio::io::sink();
+    let held = hold_for_approval_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        request,
+        agent.principal(),
+        GateInputs {
+            reason: "operator review required".to_string(),
+            risk: Some(8),
+            reversibility: Some(Reversibility::Irreversible),
+            revert_preauthorized: false,
+            verb: None,
+            bypass: false,
+            authority,
+            consume_access_verbs: vec!["inspect-fixture".to_string()],
+        },
+    )
+    .await;
+    let handle = match held.exec {
+        ExecOutcome::Held { handle, .. } => handle,
+        other => panic!("expected Held, got {other:?}"),
+    };
+    assert_eq!(
+        cfg.state
+            .approvals
+            .read()
+            .await
+            .get(&handle)
+            .expect("held request remains registered")
+            .snapshot
+            .access_verbs,
+        vec!["inspect-fixture".to_string()]
+    );
+    assert_eq!(
+        cfg.state
+            .approvals
+            .read()
+            .await
+            .get(&handle)
+            .expect("held request remains registered")
+            .snapshot
+            .access_requests,
+        vec!["gr-origin".to_string()]
+    );
+
+    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+        &cfg,
+        &operator,
+        AdminRequest::AccessApprove {
+            handles: vec![handle.clone()],
+            uses: Some(1),
+        },
+    )
+    .await
+    else {
+        panic!("expected held access decision")
+    };
+    assert!(items[0].success, "approval failed: {:?}", items[0]);
+    assert_eq!(items[0].remaining_uses, Some(0));
+    let AdminResponse::AccessDecisions { items: replay } = handle_admin_request(
+        &cfg,
+        &operator,
+        AdminRequest::AccessApprove {
+            handles: vec![handle],
+            uses: Some(1),
+        },
+    )
+    .await
+    else {
+        panic!("expected terminal held replay decision")
+    };
+    assert!(!replay[0].success);
+    assert_eq!(replay[0].state, "approved");
+    assert!(replay[0].message.contains("already approved"));
+    assert_eq!(
+        cfg.state
+            .sessions
+            .read()
+            .await
+            .access_grant_uses("access-token", "gr-origin"),
+        Some((Some(1), Some(0)))
+    );
+    assert_eq!(
+        cfg.state.sessions.write().await.consume_access_use(
+            "access-token",
+            &["inspect-fixture".to_string()],
+            None
+        ),
+        Err("access use limit is exhausted".to_string())
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn held_snapshot_does_not_fall_through_to_overlapping_authority() {
+    let (cfg, operator, agent) = gating_config(7_026, 1_000);
+    cfg.state.sessions.write().await.grant(
+        "access-token".to_string(),
+        SessionGrant {
+            allow: Vec::new(),
+            deny: Vec::new(),
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            activated_verbs: vec!["inspect-fixture".to_string(), "operate-fixture".to_string()],
+            override_markers: Vec::new(),
+            scope: IssuedGrantScope {
+                label: Some("agent:1000".to_string()),
+                access_managed: true,
+                access_grants: vec![
+                    AccessUseGrant {
+                        request: "a-origin".to_string(),
+                        verbs: vec!["inspect-fixture".to_string(), "operate-fixture".to_string()],
+                        use_limit: Some(1),
+                        remaining_uses: Some(1),
+                        pending: false,
+                    },
+                    AccessUseGrant {
+                        request: "b-overlap-unbounded".to_string(),
+                        verbs: vec!["inspect-fixture".to_string()],
+                        use_limit: None,
+                        remaining_uses: None,
+                        pending: false,
+                    },
+                    AccessUseGrant {
+                        request: "c-overlap-bounded".to_string(),
+                        verbs: vec!["operate-fixture".to_string()],
+                        use_limit: Some(1),
+                        remaining_uses: Some(1),
+                        pending: false,
+                    },
+                ],
+                ..IssuedGrantScope::default()
+            },
+            expires_at: Some(now_unix().saturating_add(60)),
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            static_only: true,
+            auto_amend: false,
+            granted_at: now_unix(),
+            owner: SessionOwner::Principal(PrincipalKey::from_uid(1_000)),
+        },
+    );
+    let selected_verbs = vec!["inspect-fixture".to_string(), "operate-fixture".to_string()];
+    let request = ExecuteRequest {
+        binary: "true".to_string(),
+        args: Vec::new(),
+        auth_token: None,
+        env: HashMap::new(),
+        secrets: HashMap::new(),
+        secret_files: HashMap::new(),
+        stream: false,
+        session_token: Some("access-token".to_string()),
+        revert: None,
+        confirm_within_secs: None,
+        reevaluate: false,
+        ssh_hostkey: None,
+        cwd: None,
+        require_approval: None,
+        wait_approval_secs: None,
+        verb: None,
+    };
+    let mut sink = tokio::io::sink();
+    let held = hold_for_approval_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        request,
+        agent.principal(),
+        GateInputs {
+            reason: "operator review required".to_string(),
+            risk: Some(8),
+            reversibility: Some(Reversibility::Irreversible),
+            revert_preauthorized: false,
+            verb: None,
+            bypass: false,
+            authority: live_authority(&cfg, "access-token").await,
+            consume_access_verbs: selected_verbs.clone(),
+        },
+    )
+    .await;
+    let handle = match held.exec {
+        ExecOutcome::Held { handle, .. } => handle,
+        other => panic!("expected Held, got {other:?}"),
+    };
+    assert_eq!(
+        cfg.state
+            .approvals
+            .read()
+            .await
+            .get(&handle)
+            .expect("held request")
+            .snapshot
+            .access_requests,
+        vec!["a-origin".to_string()]
+    );
+
+    let origin = vec!["a-origin".to_string()];
+    cfg.state
+        .sessions
+        .write()
+        .await
+        .consume_access_use("access-token", &selected_verbs, Some(&origin))
+        .expect("consume the bound origin before approval");
+    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+        &cfg,
+        &operator,
+        AdminRequest::AccessApprove {
+            handles: vec![handle],
+            uses: Some(1),
+        },
+    )
+    .await
+    else {
+        panic!("expected held access decision")
+    };
+    assert!(!items[0].success);
+    assert_eq!(items[0].state, "exec_failed");
+    assert!(items[0].message.contains("access use limit is exhausted"));
+    assert_eq!(
+        cfg.state
+            .sessions
+            .read()
+            .await
+            .access_grant_uses("access-token", "c-overlap-bounded"),
+        Some((Some(1), Some(1)))
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn held_snapshot_binds_and_consumes_multiple_originating_requests() {
+    let (cfg, operator, agent) = gating_config(7_027, 1_000);
+    cfg.state.sessions.write().await.grant(
+        "access-token".to_string(),
+        SessionGrant {
+            allow: Vec::new(),
+            deny: Vec::new(),
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            activated_verbs: vec!["inspect-fixture".to_string(), "operate-fixture".to_string()],
+            override_markers: Vec::new(),
+            scope: IssuedGrantScope {
+                label: Some("agent:1000".to_string()),
+                access_managed: true,
+                access_grants: vec![
+                    AccessUseGrant {
+                        request: "request-a".to_string(),
+                        verbs: vec!["inspect-fixture".to_string()],
+                        use_limit: Some(1),
+                        remaining_uses: Some(1),
+                        pending: false,
+                    },
+                    AccessUseGrant {
+                        request: "request-b".to_string(),
+                        verbs: vec!["operate-fixture".to_string()],
+                        use_limit: Some(1),
+                        remaining_uses: Some(1),
+                        pending: false,
+                    },
+                ],
+                ..IssuedGrantScope::default()
+            },
+            expires_at: Some(now_unix().saturating_add(60)),
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            static_only: true,
+            auto_amend: false,
+            granted_at: now_unix(),
+            owner: SessionOwner::Principal(PrincipalKey::from_uid(1_000)),
+        },
+    );
+    let selected_verbs = vec!["inspect-fixture".to_string(), "operate-fixture".to_string()];
+    let request = ExecuteRequest {
+        binary: "true".to_string(),
+        args: Vec::new(),
+        auth_token: None,
+        env: HashMap::new(),
+        secrets: HashMap::new(),
+        secret_files: HashMap::new(),
+        stream: false,
+        session_token: Some("access-token".to_string()),
+        revert: None,
+        confirm_within_secs: None,
+        reevaluate: false,
+        ssh_hostkey: None,
+        cwd: None,
+        require_approval: None,
+        wait_approval_secs: None,
+        verb: None,
+    };
+    let mut sink = tokio::io::sink();
+    let held = hold_for_approval_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        request,
+        agent.principal(),
+        GateInputs {
+            reason: "operator review required".to_string(),
+            risk: Some(8),
+            reversibility: Some(Reversibility::Irreversible),
+            revert_preauthorized: false,
+            verb: None,
+            bypass: false,
+            authority: live_authority(&cfg, "access-token").await,
+            consume_access_verbs: selected_verbs,
+        },
+    )
+    .await;
+    let handle = match held.exec {
+        ExecOutcome::Held { handle, .. } => handle,
+        other => panic!("expected Held, got {other:?}"),
+    };
+    assert_eq!(
+        cfg.state
+            .approvals
+            .read()
+            .await
+            .get(&handle)
+            .expect("held request")
+            .snapshot
+            .access_requests,
+        vec!["request-a".to_string(), "request-b".to_string()]
+    );
+
+    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+        &cfg,
+        &operator,
+        AdminRequest::AccessApprove {
+            handles: vec![handle],
+            uses: Some(1),
+        },
+    )
+    .await
+    else {
+        panic!("expected held access decision")
+    };
+    assert!(items[0].success, "approval failed: {:?}", items[0]);
+    assert_eq!(
+        cfg.state
+            .sessions
+            .read()
+            .await
+            .access_grant_uses("access-token", "request-a"),
+        Some((Some(1), Some(0)))
+    );
+    assert_eq!(
+        cfg.state
+            .sessions
+            .read()
+            .await
+            .access_grant_uses("access-token", "request-b"),
+        Some((Some(1), Some(0)))
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn exhausted_multi_verb_hold_requests_every_required_scope() {
+    let (mut cfg, _operator, agent) = gating_config(7_028, 1_000);
+    cfg.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            "verbs:\n  - name: inspect-fixture\n    description: Inspect fixture\n    binary: true\n    args: []\n    baseline: false\n    consequence: irreversible\n    trusted: true\n  - name: operate-fixture\n    description: Operate fixture\n    binary: true\n    args: []\n    baseline: false\n    consequence: irreversible\n    trusted: true\n",
+        )
+        .expect("load fixture verbs"),
+    ));
+    cfg.state.sessions.write().await.grant(
+        "access-token".to_string(),
+        SessionGrant {
+            allow: Vec::new(),
+            deny: Vec::new(),
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            activated_verbs: vec!["inspect-fixture".to_string(), "operate-fixture".to_string()],
+            override_markers: Vec::new(),
+            scope: IssuedGrantScope {
+                label: Some("agent:1000".to_string()),
+                access_managed: true,
+                access_grants: vec![
+                    AccessUseGrant {
+                        request: "exhausted-inspect".to_string(),
+                        verbs: vec!["inspect-fixture".to_string()],
+                        use_limit: Some(1),
+                        remaining_uses: Some(0),
+                        pending: false,
+                    },
+                    AccessUseGrant {
+                        request: "exhausted-operate".to_string(),
+                        verbs: vec!["operate-fixture".to_string()],
+                        use_limit: Some(1),
+                        remaining_uses: Some(0),
+                        pending: false,
+                    },
+                ],
+                ..IssuedGrantScope::default()
+            },
+            expires_at: Some(now_unix().saturating_add(60)),
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            static_only: true,
+            auto_amend: false,
+            granted_at: now_unix(),
+            owner: SessionOwner::Principal(PrincipalKey::from_uid(1_000)),
+        },
+    );
+    let request = ExecuteRequest {
+        binary: "true".to_string(),
+        args: Vec::new(),
+        auth_token: None,
+        env: HashMap::new(),
+        secrets: HashMap::new(),
+        secret_files: HashMap::new(),
+        stream: false,
+        session_token: Some("access-token".to_string()),
+        revert: None,
+        confirm_within_secs: None,
+        reevaluate: false,
+        ssh_hostkey: None,
+        cwd: None,
+        require_approval: None,
+        wait_approval_secs: None,
+        verb: None,
+    };
+    let selected_verbs = vec!["inspect-fixture".to_string(), "operate-fixture".to_string()];
+    let mut sink = tokio::io::sink();
+    let result = hold_for_approval_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        request,
+        agent.principal(),
+        GateInputs {
+            reason: "operator review required".to_string(),
+            risk: Some(8),
+            reversibility: Some(Reversibility::Irreversible),
+            revert_preauthorized: false,
+            verb: None,
+            bypass: false,
+            authority: live_authority(&cfg, "access-token").await,
+            consume_access_verbs: selected_verbs.clone(),
+        },
+    )
+    .await;
+
+    assert!(matches!(&result.exec, ExecOutcome::NotAttempted));
+    let mut requests = cfg
+        .state
+        .grant_requests
+        .read()
+        .await
+        .values()
+        .map(|request| {
+            (
+                request.handle.clone(),
+                request.delta.activated_verbs.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    requests.sort_by(|left, right| left.0.cmp(&right.0));
+    assert_eq!(requests.len(), 2);
+    let mut requested_verbs = requests
+        .iter()
+        .flat_map(|(_, verbs)| verbs.iter().cloned())
+        .collect::<Vec<_>>();
+    requested_verbs.sort();
+    assert_eq!(requested_verbs, selected_verbs);
+    let handles = requests
+        .iter()
+        .map(|(handle, _)| handle.clone())
+        .collect::<Vec<_>>();
+    let response = result.into_response();
+    let guidance = response.verb_guidance.expect("exact operator guidance");
+    assert!(guidance.contains(&format!("guard access approve {}", handles.join(" "))));
+    assert!(response.handle.is_none());
+    assert!(response.approval_options.is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn held_access_replay_fails_if_staged_session_was_revoked() {
+    let (cfg, _operator, agent) = gating_config(7006, 1000);
+    let snapshot = ApprovalSnapshot {
+        binary: "true".to_string(),
+        args: Vec::new(),
+        cwd: None,
+        env: std::collections::BTreeMap::new(),
+        secret_keys: std::collections::BTreeMap::new(),
+        secret_file_keys: std::collections::BTreeMap::new(),
+        secret_binding: None,
+        principal: agent.principal(),
+        session_fingerprint: None,
+        session_revision: None,
+        secret_entitlements: Some(Vec::new()),
+        verb_name: None,
+        verb_params: std::collections::BTreeMap::new(),
+        catalog_version: None,
+        access_verbs: Vec::new(),
+        access_requests: Vec::new(),
+    };
+    let access_requests = vec!["held-request".to_string()];
+    let result = super::super::gate_runtime::execute_snapshot_with_access_request(
+        &cfg,
+        &snapshot,
+        "operator approved",
+        Some(&access_requests),
+    )
+    .await;
+    assert!(matches!(
+        result.exec,
+        ExecOutcome::Failed {
+            started: false,
+            ref reason
+        } if reason.contains("expired or was revoked")
+    ));
 }
 
 #[cfg(unix)]
@@ -1505,6 +2429,7 @@ async fn approval_rejects_tool_secret_rotated_after_hold() {
             verb: None,
             bypass: false,
             authority: None,
+            consume_access_verbs: Vec::new(),
         },
     )
     .await;
@@ -1567,18 +2492,17 @@ async fn approval_rejects_tool_secret_rotated_after_hold() {
     let response = handle_admin_request(
         &cfg,
         &operator,
-        AdminRequest::Approve {
-            handle: handle.clone(),
+        AdminRequest::AccessApprove {
+            handles: vec![handle.clone()],
+            uses: Some(1),
         },
     )
     .await;
-    assert!(matches!(
-        response,
-        AdminResponse::GateAction {
-            exit_code: None,
-            ..
-        }
-    ));
+    let AdminResponse::AccessDecisions { items } = response else {
+        panic!("expected access decision result")
+    };
+    assert!(!items[0].success);
+    assert_eq!(items[0].state, "exec_failed");
     let approval = cfg
         .state
         .approvals
@@ -1593,6 +2517,189 @@ async fn approval_rejects_tool_secret_rotated_after_hold() {
         .as_deref()
         .unwrap_or_default()
         .contains("tool-configured secret value changed"));
+    assert!(
+        cfg.state
+            .sessions
+            .read()
+            .await
+            .access_token_for_principal(&principal)
+            .is_none(),
+        "a pre-admission rejection must not leave an access session"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn hold_is_not_returned_until_its_pending_state_is_durable() {
+    let (mut cfg, _operator, agent) = gating_config(7006, 1000);
+    let state = tempfile::tempdir().unwrap();
+    cfg.state.session_store = Some(
+        crate::session_store::SessionStore::open(state.path().join("state.db"), 3600)
+            .await
+            .unwrap(),
+    );
+    cfg.state
+        .session_store
+        .as_ref()
+        .unwrap()
+        .fail_next_write_for_test();
+    let request = ExecuteRequest {
+        binary: "true".to_string(),
+        args: Vec::new(),
+        auth_token: None,
+        env: HashMap::new(),
+        secrets: HashMap::new(),
+        secret_files: HashMap::new(),
+        stream: false,
+        session_token: None,
+        revert: None,
+        confirm_within_secs: None,
+        reevaluate: false,
+        ssh_hostkey: None,
+        cwd: None,
+        require_approval: None,
+        wait_approval_secs: None,
+        verb: None,
+    };
+    let mut sink = tokio::io::sink();
+    let result = hold_for_approval_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        request,
+        agent.principal(),
+        GateInputs {
+            reason: "needs sign-off".to_string(),
+            risk: Some(9),
+            reversibility: Some(Reversibility::Irreversible),
+            revert_preauthorized: false,
+            verb: None,
+            bypass: false,
+            authority: None,
+            consume_access_verbs: Vec::new(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        result.exec,
+        ExecOutcome::Failed {
+            started: false,
+            ref reason
+        } if reason.contains("failed to persist approval")
+    ));
+    assert!(cfg.state.approvals.read().await.list().is_empty());
+    assert!(cfg
+        .state
+        .session_store
+        .as_ref()
+        .unwrap()
+        .load_approvals()
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn approval_state_must_be_durable_before_a_held_snapshot_executes() {
+    let (mut cfg, operator, agent) = gating_config(7006, 1000);
+    let state = tempfile::tempdir().unwrap();
+    cfg.state.session_store = Some(
+        crate::session_store::SessionStore::open(state.path().join("state.db"), 3600)
+            .await
+            .unwrap(),
+    );
+    let output = state.path().join("must-not-exist");
+    let request = ExecuteRequest {
+        binary: "touch".to_string(),
+        args: vec![output.display().to_string()],
+        auth_token: None,
+        env: HashMap::new(),
+        secrets: HashMap::new(),
+        secret_files: HashMap::new(),
+        stream: false,
+        session_token: None,
+        revert: None,
+        confirm_within_secs: None,
+        reevaluate: false,
+        ssh_hostkey: None,
+        cwd: None,
+        require_approval: None,
+        wait_approval_secs: None,
+        verb: None,
+    };
+    let mut sink = tokio::io::sink();
+    let held = hold_for_approval_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        request,
+        agent.principal(),
+        GateInputs {
+            reason: "needs sign-off".to_string(),
+            risk: Some(9),
+            reversibility: Some(Reversibility::Irreversible),
+            revert_preauthorized: false,
+            verb: None,
+            bypass: false,
+            authority: None,
+            consume_access_verbs: Vec::new(),
+        },
+    )
+    .await;
+    let ExecOutcome::Held { handle, .. } = held.exec else {
+        panic!("expected held command")
+    };
+    cfg.state
+        .session_store
+        .as_ref()
+        .unwrap()
+        .fail_next_write_for_test();
+    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+        &cfg,
+        &operator,
+        AdminRequest::AccessApprove {
+            handles: vec![handle.clone()],
+            uses: Some(1),
+        },
+    )
+    .await
+    else {
+        panic!("expected access decision")
+    };
+    assert!(!items[0].success);
+    assert!(items[0].message.contains("failed to claim approval"));
+    assert!(
+        !output.exists(),
+        "the held snapshot executed without durable admission"
+    );
+    assert_eq!(
+        cfg.state
+            .approvals
+            .read()
+            .await
+            .get(&handle)
+            .unwrap()
+            .status,
+        ApprovalStatus::Pending
+    );
+    let durable = cfg
+        .state
+        .session_store
+        .as_ref()
+        .unwrap()
+        .load_approvals()
+        .await
+        .unwrap();
+    assert_eq!(durable[0].status, ApprovalStatus::Pending);
 }
 
 /// Wait (bounded) for a pending approval row to appear and return its handle.
@@ -1683,17 +2790,17 @@ async fn kube_proxy_hold_routes_through_approval_queue() {
     let resp = handle_admin_request(
         &cfg,
         &operator,
-        AdminRequest::Approve {
-            handle: handle.clone(),
+        AdminRequest::AccessApprove {
+            handles: vec![handle.clone()],
+            uses: Some(1),
         },
     )
     .await;
     match resp {
-        AdminResponse::GateAction {
-            message, exit_code, ..
-        } => {
-            assert!(message.contains("forwarding"), "got: {message}");
-            assert_eq!(exit_code, None, "a released API hold executes nothing");
+        AdminResponse::AccessDecisions { items } => {
+            assert!(items[0].success, "got: {:?}", items[0]);
+            assert!(items[0].message.contains("forwarding"));
+            assert_eq!(items[0].remaining_uses, None);
         }
         other => panic!("operator approve should release the hold, got {:?}", other),
     }
@@ -1710,6 +2817,15 @@ async fn kube_proxy_hold_routes_through_approval_queue() {
             .unwrap()
             .status,
         ApprovalStatus::Approved
+    );
+    assert!(
+        cfg.state
+            .sessions
+            .read()
+            .await
+            .access_token_for_principal(&cfg.config.daemon_principal)
+            .is_none(),
+        "approving an API hold must not create reusable daemon-principal authority"
     );
 
     // Deny: the waiter fails closed with the operator's reason.
@@ -1838,6 +2954,7 @@ async fn nonstreaming_wait_approval_returns_promptly_on_decision() {
                 verb: None,
                 bypass: false,
                 authority: None,
+                consume_access_verbs: Vec::new(),
             },
         )
         .await
@@ -1913,6 +3030,7 @@ async fn hold_then_ttl_expiry_denies_fail_closed() {
             verb: None,
             bypass: false,
             authority: live_authority(&cfg, &session_token).await,
+            consume_access_verbs: Vec::new(),
         },
     )
     .await;
@@ -2024,6 +3142,7 @@ async fn approve_rejected_when_bound_secret_value_changed() {
             verb: None,
             bypass: false,
             authority: None,
+            consume_access_verbs: Vec::new(),
         },
     )
     .await;
@@ -2127,6 +3246,7 @@ async fn approve_passes_binding_when_secret_value_unchanged() {
             verb: None,
             bypass: false,
             authority: None,
+            consume_access_verbs: Vec::new(),
         },
     )
     .await;
@@ -2218,6 +3338,7 @@ async fn approve_rejected_when_unresolved_secret_appears_after_hold() {
             verb: None,
             bypass: false,
             authority: None,
+            consume_access_verbs: Vec::new(),
         },
     )
     .await;
@@ -2307,6 +3428,7 @@ async fn approval_note_operator_and_owner_post_others_refused() {
             verb: None,
             bypass: false,
             authority: None,
+            consume_access_verbs: Vec::new(),
         },
     )
     .await;
@@ -2393,6 +3515,8 @@ async fn approve_voided_when_verb_catalog_version_changed() {
         verb_params: BTreeMap::new(),
         // Live catalog (VerbCatalog::empty()) has version 0; a stale stamp.
         catalog_version: Some(424_242),
+        access_verbs: Vec::new(),
+        access_requests: Vec::new(),
         principal: agent.principal(),
         secret_binding: None,
     };
@@ -2468,6 +3592,8 @@ async fn approved_snapshot_rechecks_binary_floor_before_exec() {
         verb_name: None,
         verb_params: BTreeMap::new(),
         catalog_version: None,
+        access_verbs: Vec::new(),
+        access_requests: Vec::new(),
         principal: agent.principal(),
         secret_binding: None,
     };
@@ -2516,6 +3642,8 @@ async fn stored_entitlements_cover_tool_secrets_for_approval_check_and_revert() 
         verb_name: None,
         verb_params: BTreeMap::new(),
         catalog_version: None,
+        access_verbs: Vec::new(),
+        access_requests: Vec::new(),
         principal: Some(principal.clone()),
         secret_binding: Some(SecretBinding {
             salt: "test-salt".to_string(),
@@ -2651,6 +3779,8 @@ async fn approved_snapshot_rejects_changed_session_revision() {
         verb_name: None,
         verb_params: BTreeMap::new(),
         catalog_version: None,
+        access_verbs: Vec::new(),
+        access_requests: Vec::new(),
         principal: agent.principal(),
         secret_binding: None,
     };
@@ -2682,6 +3812,8 @@ async fn approved_snapshot_rejects_dangerous_request_env_before_exec() {
         verb_name: None,
         verb_params: BTreeMap::new(),
         catalog_version: None,
+        access_verbs: Vec::new(),
+        access_requests: Vec::new(),
         principal: agent.principal(),
         secret_binding: None,
     };
@@ -2719,6 +3851,8 @@ async fn approved_snapshot_executes_in_snapshotted_cwd() {
         verb_name: None,
         verb_params: BTreeMap::new(),
         catalog_version: None,
+        access_verbs: Vec::new(),
+        access_requests: Vec::new(),
         principal: agent.principal(),
         secret_binding: None,
     };
@@ -2757,6 +3891,8 @@ async fn approved_snapshot_rejects_missing_snapshotted_cwd_before_exec() {
         verb_name: None,
         verb_params: BTreeMap::new(),
         catalog_version: None,
+        access_verbs: Vec::new(),
+        access_requests: Vec::new(),
         principal: agent.principal(),
         secret_binding: None,
     };
@@ -2803,6 +3939,8 @@ async fn approved_snapshot_rejects_retargeted_snapshotted_cwd_before_exec() {
         verb_name: None,
         verb_params: BTreeMap::new(),
         catalog_version: None,
+        access_verbs: Vec::new(),
+        access_requests: Vec::new(),
         principal: agent.principal(),
         secret_binding: None,
     };

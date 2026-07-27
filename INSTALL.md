@@ -20,13 +20,20 @@ cargo build --quiet --release
 ## Release archive
 
 ```bash
-GUARD_VERSION=v0.5.0
+GUARD_VERSION=v0.6.0
 curl -fsSLO "https://github.com/morgaesis/guard/releases/download/${GUARD_VERSION}/guard-${GUARD_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 curl -fsSLO "https://github.com/morgaesis/guard/releases/download/${GUARD_VERSION}/SHA256SUMS"
 sha256sum --check --ignore-missing SHA256SUMS
 tar -xzf "guard-${GUARD_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
-install -m 0755 guard ~/.local/bin/guard
+archive_root="guard-${GUARD_VERSION}-x86_64-unknown-linux-gnu"
+install -m 0755 "$archive_root/guard" ~/.local/bin/guard
 ```
+
+Each archive expands beneath its release-and-target directory. Linux archives
+include the binary, systemd units, operator wrapper, hardening examples, and
+generic verb examples. The Windows archive includes `guard.exe`, the PowerShell
+installer and tests, an inner binary digest manifest, and the same examples.
+Installation uses files from the expanded archive rather than a source checkout.
 
 Published targets are:
 
@@ -63,10 +70,32 @@ guard run whoami
 ```
 
 The named-pipe peer SID supplies caller identity. The dedicated service installer
-creates the bypass-resistant account and ACL layout:
+creates the service-account and protected state layout. Its stock pipe accepts
+authenticated local users as distinct principals, so use it on a single-tenant
+host or isolate the agent in its own host or VM:
+
+Verify the downloaded archive against the release `SHA256SUMS` file. In an
+elevated shell, extract that verified archive into an Administrators-and-SYSTEM
+only directory. Read the binary digest from the archive's `BINARY-SHA256` file
+and pass it explicitly. The installer copies the candidate into its protected
+maintenance tree, verifies that digest, and only then executes the staged copy:
 
 ```powershell
-deployment\windows\install-guard.ps1
+$archive = Resolve-Path '.\guard-v0.6.0-x86_64-pc-windows-msvc.tar.gz'
+$archiveHash = '<digest from the verified release SHA256SUMS>'
+$protectedRoot = 'C:\ProgramData\GuardInstall'
+New-Item -ItemType Directory -Force -Path $protectedRoot | Out-Null
+& icacls.exe $protectedRoot /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)(F)' '*S-1-5-32-544:(OI)(CI)(F)' | Out-Null
+$protectedArchive = Join-Path $protectedRoot (Split-Path -Leaf $archive)
+Copy-Item -LiteralPath $archive -Destination $protectedArchive
+if ((Get-FileHash -Algorithm SHA256 -LiteralPath $protectedArchive).Hash -ne $archiveHash) { throw 'Archive digest mismatch.' }
+& tar.exe -C $protectedRoot -xzf $protectedArchive
+$archiveRoot = 'C:\ProgramData\GuardInstall\guard-v0.6.0-x86_64-pc-windows-msvc'
+$binaryHash = ((Get-Content -LiteralPath "$archiveRoot\BINARY-SHA256" -Raw).Trim() -split '\s+')[0]
+& "$archiveRoot\deployment\windows\install-guard.ps1" `
+  -Action install `
+  -CandidateExe "$archiveRoot\guard.exe" `
+  -ExpectedSha256 $binaryHash
 ```
 
 See [DEPLOYMENT.md](DEPLOYMENT.md) for Unix and Windows principal separation.
@@ -83,10 +112,10 @@ export GUARD_ADMIN_TOKEN="..."
 guard server start --tcp-port 8123
 ```
 
-Configure the port with `guard config set-port 8123`. The client commands
-`guard config set-token <token>` and `guard config set-admin-token <token>`
-store the corresponding bearer in the restricted client configuration, but
-their required value argument can enter process listings and shell history.
+Configure the port with `guard config set-port 8123`. Pipe each bearer to
+`guard config set-token` or `guard config set-admin-token`, or run either
+command at a terminal for a hidden prompt. The commands store the bearer in the
+restricted client configuration without accepting it in process arguments.
 Prefer the local socket or named pipe for a single-host deployment.
 
 ## Next steps

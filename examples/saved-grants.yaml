@@ -4,9 +4,10 @@
 #   guard server start --socket /run/guard/guard.sock \
 #       --grants /etc/guard/saved-grants.yaml
 #
-# Issue a bounded session with:
+# Agents request matching bounded authority through the access workflow:
 #
-#   eval "$(guard grant issue ansible-host-a-apply)"
+#   agent$ guard access request "Apply bounded Ansible changes to host-a"
+#   operator$ guard access approve <request> --uses 3
 #
 # `--profiles`, GUARD_PROFILES, and legacy `profiles:` catalogs remain accepted
 # as migration aliases. Legacy command globs migrate only when they describe an

@@ -199,6 +199,21 @@ mod tests {
     }
 
     #[test]
+    fn every_mode_requires_loop_and_unrolled_consequence_equivalence() {
+        for mode in [
+            super::SYSTEM_PROMPT_READONLY,
+            super::SYSTEM_PROMPT_SAFE,
+            super::SYSTEM_PROMPT_PARANOID,
+        ] {
+            assert!(
+                mode.contains("bounded loop and its mechanically unrolled form"),
+                "mode prompt lacks the loop-equivalence contract"
+            );
+            assert!(mode.contains("same consequence"));
+        }
+    }
+
+    #[test]
     fn schema_requires_reversibility_only_when_gating() {
         let off = build_function_call_body(DEFAULT_API_URL, "m", "sys", "ls", false);
         let req_off = &off["tools"][0]["function"]["parameters"]["required"];

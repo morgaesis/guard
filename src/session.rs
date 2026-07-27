@@ -18,7 +18,7 @@ use guard::principal::PrincipalKey;
 use guard::redact::{command_line, redact_output_text};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 /// Default daemon-side history retention. Anything older than this is
@@ -114,7 +114,13 @@ pub struct SessionGrant {
 }
 
 pub(crate) fn session_grant_revision_key(grant: &SessionGrant) -> Option<String> {
-    let encoded = serde_json::to_vec(grant).ok()?;
+    let mut authority = grant.clone();
+    // Accounting metadata changes on every bounded admission but does not
+    // change the typed authority snapshot reviewed by the evaluator or gate.
+    for access in &mut authority.scope.access_grants {
+        access.remaining_uses = access.use_limit;
+    }
+    let encoded = serde_json::to_vec(&authority).ok()?;
     let digest = sha2::Sha256::digest(encoded);
     Some(
         digest[..16]
@@ -136,6 +142,55 @@ pub struct IssuedGrantScope {
     pub secret_names: Vec<String>,
     #[serde(default)]
     pub evaluation_mode: EvaluationMode,
+    /// True for sessions materialized by `guard access`. These sessions are
+    /// selected by authenticated principal when the client has no bearer.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub access_managed: bool,
+    /// Independently accounted authority installed by access approvals.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub access_grants: Vec<AccessUseGrant>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccessUseGrant {
+    pub request: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verbs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_limit: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_uses: Option<u64>,
+    /// Held-command grants remain staged until their exact snapshot reaches
+    /// admission. Ordinary concurrent commands cannot consume staged uses.
+    #[serde(default)]
+    pub pending: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessAdmission {
+    pub consumptions: Vec<AccessUseConsumption>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessUseConsumption {
+    pub request: String,
+    pub remaining_uses: Option<u64>,
+}
+
+fn access_selection_rank(grant: &SessionGrant, selected: &[usize]) -> (usize, usize, Vec<String>) {
+    let bounded = selected
+        .iter()
+        .filter(|index| grant.scope.access_grants[**index].remaining_uses.is_some())
+        .count();
+    let requests = selected
+        .iter()
+        .map(|index| grant.scope.access_grants[*index].request.clone())
+        .collect();
+    (bounded, selected.len(), requests)
 }
 
 impl SessionGrant {
@@ -168,6 +223,7 @@ fn sanitize_credentials_vec(values: &mut [String]) {
     }
 }
 
+#[cfg(test)]
 fn sanitize_credentials_rules(rules: &mut [SessionExactRule]) {
     for rule in rules {
         sanitize_credentials(&mut rule.binary);
@@ -195,6 +251,7 @@ impl SessionInteraction {
     }
 }
 
+#[cfg(test)]
 impl SessionGrantSummary {
     /// Redact credential-shaped material from every field that can carry
     /// command-derived text before the summary leaves the daemon.
@@ -208,6 +265,7 @@ impl SessionGrantSummary {
     }
 }
 
+#[cfg(test)]
 impl HistoricalGrant {
     /// See [`SessionGrantSummary::redact_credentials`].
     pub fn redact_credentials(&mut self) {
@@ -220,11 +278,12 @@ impl HistoricalGrant {
     }
 }
 
+#[cfg(test)]
 impl SessionReport {
     /// Redact credential-shaped material from every command-derived field of
     /// the report (active grant, historical grants, recent interactions).
-    /// Inspection surfaces (`session show`/`list`/`status`, text and JSON)
-    /// must never emit un-redacted command-derived text.
+    /// Session inspection projections, including access and status text or
+    /// JSON, must never emit un-redacted command-derived text.
     pub fn redact_credentials(&mut self) {
         if let Some(active) = &mut self.active {
             active.redact_credentials();
@@ -348,12 +407,16 @@ pub enum SessionAmendment {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionGrantSummary {
     pub token: String,
+    #[cfg(test)]
     #[serde(default, skip_serializing)]
     pub allow: Vec<String>,
+    #[cfg(test)]
     #[serde(default, skip_serializing)]
     pub deny: Vec<String>,
+    #[cfg(test)]
     #[serde(default, skip_serializing)]
     pub allow_exact: Vec<SessionExactRule>,
+    #[cfg(test)]
     #[serde(default, skip_serializing)]
     pub deny_exact: Vec<SessionExactRule>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -369,8 +432,8 @@ pub struct SessionGrantSummary {
     pub prompt_append: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub generated_notes: Vec<String>,
-    /// The principal the session is bound to. Surfaced to operators (and the
-    /// self-inspecting owner) so ownership is visible in `session list`/`show`.
+    /// The principal the session is bound to. Surfaced to operators and the
+    /// self-inspecting owner so access inspection makes ownership visible.
     #[serde(default = "default_session_owner")]
     pub owner: SessionOwner,
 }
@@ -602,7 +665,18 @@ impl SessionRegistry {
             .collect()
     }
 
-    pub fn grant(&mut self, token: String, mut grant: SessionGrant) {
+    /// Install a session only when its bearer token has never represented a
+    /// live or archived generation. Reusing a bearer would let records keyed
+    /// only by that token cross principal and generation boundaries.
+    pub fn grant(&mut self, token: String, mut grant: SessionGrant) -> bool {
+        if self.grants.contains_key(&token)
+            || self
+                .history
+                .iter()
+                .any(|historical| historical.token == token)
+        {
+            return false;
+        }
         self.revision += 1;
         if grant.granted_at == 0 {
             grant.granted_at = now_unix();
@@ -613,17 +687,8 @@ impl SessionRegistry {
         // silently change what the grant matches.
         sanitize_credentials_opt(&mut grant.prompt_append);
         sanitize_credentials_vec(&mut grant.generated_notes);
-        // If we are overwriting an active grant, archive the previous
-        // version so the audit trail still shows what was in effect.
-        if let Some(prev) = self.grants.remove(&token) {
-            self.history.push(historical(
-                &token,
-                prev,
-                now_unix(),
-                HistoricalStatus::Revoked,
-            ));
-        }
         self.grants.insert(token, grant);
+        true
     }
 
     pub fn revoke(&mut self, token: &str) -> bool {
@@ -660,6 +725,370 @@ impl SessionRegistry {
         Some(grant.owner.clone())
     }
 
+    /// Canonical prose-first session for an authenticated principal. At most
+    /// one active access-managed session is created per principal.
+    pub fn access_token_for_principal(&self, principal: &PrincipalKey) -> Option<String> {
+        let now = now_unix();
+        self.grants
+            .iter()
+            .filter(|(_, grant)| {
+                !grant.is_expired(now)
+                    && grant.scope.access_managed
+                    && grant.owner == SessionOwner::Principal(principal.clone())
+            })
+            .min_by_key(|(_, grant)| grant.granted_at)
+            .map(|(token, _)| token.clone())
+    }
+
+    pub fn is_access_managed(&self, token: &str) -> bool {
+        self.grants
+            .get(token)
+            .is_some_and(|grant| !grant.is_expired(now_unix()) && grant.scope.access_managed)
+    }
+
+    pub fn token_for_access_target(&self, target: &str) -> Result<Option<String>, String> {
+        let now = now_unix();
+        let mut matches = self
+            .grants
+            .iter()
+            .filter(|(_, grant)| !grant.is_expired(now))
+            .filter(|(token, grant)| {
+                grant.scope.label.as_deref() == Some(target) || session_reference(token) == target
+            })
+            .map(|(token, _)| token.clone());
+        let first = matches.next();
+        if first.is_some() && matches.next().is_some() {
+            return Err(format!("access target '{target}' is ambiguous"));
+        }
+        Ok(first)
+    }
+
+    pub fn install_access_grant(
+        &mut self,
+        token: &str,
+        uses: Option<u64>,
+        request_handle: String,
+        verbs: Vec<String>,
+    ) -> Option<bool> {
+        self.install_access_grant_with_state(token, uses, request_handle, verbs, false)
+    }
+
+    #[cfg(test)]
+    pub fn stage_access_grant(
+        &mut self,
+        token: &str,
+        uses: Option<u64>,
+        request_handle: String,
+        verbs: Vec<String>,
+    ) -> Option<bool> {
+        self.install_access_grant_with_state(token, uses, request_handle, verbs, true)
+    }
+
+    fn install_access_grant_with_state(
+        &mut self,
+        token: &str,
+        uses: Option<u64>,
+        request_handle: String,
+        mut verbs: Vec<String>,
+        pending: bool,
+    ) -> Option<bool> {
+        let grant = self.grants.get_mut(token)?;
+        if grant.is_expired(now_unix()) {
+            return None;
+        }
+        if grant
+            .scope
+            .access_grants
+            .iter()
+            .any(|existing| existing.request == request_handle)
+        {
+            return Some(false);
+        }
+        verbs.sort();
+        verbs.dedup();
+        grant.scope.access_grants.push(AccessUseGrant {
+            request: request_handle,
+            verbs,
+            use_limit: uses,
+            remaining_uses: uses,
+            pending,
+        });
+        grant
+            .scope
+            .access_grants
+            .sort_by(|left, right| left.request.cmp(&right.request));
+        self.revision = self.revision.saturating_add(1);
+        Some(true)
+    }
+
+    pub fn access_grant_uses(
+        &self,
+        token: &str,
+        request: &str,
+    ) -> Option<(Option<u64>, Option<u64>)> {
+        let grant = self.grants.get(token)?;
+        if grant.is_expired(now_unix()) {
+            return None;
+        }
+        grant
+            .scope
+            .access_grants
+            .iter()
+            .find(|access| access.request == request)
+            .map(|access| (access.use_limit, access.remaining_uses))
+    }
+
+    /// Remove staged held-access grants whose approval no longer has a live
+    /// pending row. These grants are never executable without their matching
+    /// approval claim and otherwise become phantom scope after crash recovery.
+    pub fn retain_pending_access_grants(&mut self, pending_requests: &BTreeSet<String>) -> usize {
+        let mut removed = 0;
+        for grant in self.grants.values_mut() {
+            let before = grant.scope.access_grants.len();
+            grant
+                .scope
+                .access_grants
+                .retain(|access| !access.pending || pending_requests.contains(&access.request));
+            removed += before.saturating_sub(grant.scope.access_grants.len());
+        }
+        let empty = self
+            .grants
+            .iter()
+            .filter(|(_, grant)| {
+                grant.scope.access_managed
+                    && grant.scope.access_grants.is_empty()
+                    && grant.activated_verbs.is_empty()
+                    && grant.allow.is_empty()
+                    && grant.deny.is_empty()
+                    && grant.allow_exact.is_empty()
+                    && grant.deny_exact.is_empty()
+                    && grant.override_markers.is_empty()
+                    && grant.scope.secret_names.is_empty()
+            })
+            .map(|(token, _)| token.clone())
+            .collect::<Vec<_>>();
+        for token in empty {
+            self.grants.remove(&token);
+        }
+        if removed > 0 {
+            self.revision = self.revision.saturating_add(1);
+        }
+        removed
+    }
+
+    pub fn aggregate_access_uses(&self, token: &str) -> Option<Option<u64>> {
+        let grant = self.grants.get(token)?;
+        if grant.is_expired(now_unix()) || grant.scope.access_grants.is_empty() {
+            return None;
+        }
+
+        let mut scope_verbs = grant
+            .activated_verbs
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        if scope_verbs.is_empty() {
+            scope_verbs.extend(
+                grant
+                    .scope
+                    .access_grants
+                    .iter()
+                    .filter(|access| !access.pending)
+                    .flat_map(|access| access.verbs.iter().map(String::as_str)),
+            );
+        }
+        scope_verbs.sort_unstable();
+        scope_verbs.dedup();
+        if scope_verbs.is_empty() {
+            return None;
+        }
+
+        let access_grants = grant
+            .scope
+            .access_grants
+            .iter()
+            .filter(|access| !access.pending)
+            .collect::<Vec<_>>();
+        let scope_is_usable = |verb: &str| {
+            access_grants.iter().any(|access| {
+                access.verbs.iter().any(|candidate| candidate == verb)
+                    && access.remaining_uses.is_none_or(|remaining| remaining > 0)
+            })
+        };
+        if scope_verbs.iter().any(|verb| !scope_is_usable(verb)) {
+            return Some(Some(0));
+        }
+        if scope_verbs.iter().all(|verb| {
+            access_grants.iter().any(|access| {
+                access.remaining_uses.is_none()
+                    && access.verbs.iter().any(|candidate| candidate == verb)
+            })
+        }) {
+            return Some(None);
+        }
+
+        Some(Some(
+            access_grants
+                .iter()
+                .filter(|access| {
+                    access
+                        .verbs
+                        .iter()
+                        .any(|verb| scope_verbs.contains(&verb.as_str()))
+                })
+                .filter_map(|access| access.remaining_uses)
+                .fold(0_u64, u64::saturating_add),
+        ))
+    }
+
+    /// Select the deterministic minimal set of request IDs that supplies all
+    /// selected verbs without changing accounting state.
+    pub fn select_access_requests(
+        &self,
+        token: &str,
+        selected_verbs: &[String],
+    ) -> Result<Vec<String>, String> {
+        let mut staged = self.clone();
+        staged
+            .consume_access_use(token, selected_verbs, None)
+            .map(|admission| {
+                admission
+                    .consumptions
+                    .into_iter()
+                    .map(|consumption| consumption.request)
+                    .collect()
+            })
+    }
+
+    pub fn consume_access_use(
+        &mut self,
+        token: &str,
+        selected_verbs: &[String],
+        preferred_requests: Option<&[String]>,
+    ) -> Result<AccessAdmission, String> {
+        let grant = self
+            .grants
+            .get_mut(token)
+            .ok_or_else(|| "session expired or was revoked before admission".to_string())?;
+        if grant.is_expired(now_unix()) {
+            return Err("session expired or was revoked before admission".to_string());
+        }
+        let mut selected_verbs = selected_verbs
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        selected_verbs.sort_unstable();
+        selected_verbs.dedup();
+
+        let preferred_requests = preferred_requests
+            .map(|requests| requests.iter().map(String::as_str).collect::<BTreeSet<_>>());
+        let mut applicable = grant
+            .scope
+            .access_grants
+            .iter()
+            .enumerate()
+            .filter(|(_, access)| {
+                preferred_requests
+                    .as_ref()
+                    .map_or(!access.pending, |requests| {
+                        requests.contains(access.request.as_str())
+                    })
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        applicable.sort_by(|left, right| {
+            grant.scope.access_grants[*left]
+                .request
+                .cmp(&grant.scope.access_grants[*right].request)
+        });
+        if selected_verbs.is_empty()
+            || selected_verbs.iter().any(|selected| {
+                !applicable.iter().any(|index| {
+                    grant.scope.access_grants[*index]
+                        .verbs
+                        .iter()
+                        .any(|verb| verb == selected)
+                })
+            })
+        {
+            return Err("selected session authority has no access grant".to_string());
+        }
+
+        let usable = applicable
+            .iter()
+            .copied()
+            .filter(|index| {
+                let access = &grant.scope.access_grants[*index];
+                access.remaining_uses.is_none_or(|remaining| remaining > 0)
+            })
+            .collect::<Vec<_>>();
+        if selected_verbs.iter().any(|selected| {
+            !usable.iter().any(|index| {
+                grant.scope.access_grants[*index]
+                    .verbs
+                    .iter()
+                    .any(|verb| verb == selected)
+            })
+        }) {
+            return Err("access use limit is exhausted".to_string());
+        }
+
+        let mut covers = BTreeMap::new();
+        covers.insert(vec![false; selected_verbs.len()], Vec::<usize>::new());
+        for index in usable {
+            let coverage = selected_verbs
+                .iter()
+                .map(|selected| {
+                    grant.scope.access_grants[index]
+                        .verbs
+                        .iter()
+                        .any(|verb| verb == selected)
+                })
+                .collect::<Vec<_>>();
+            let prior = covers.clone();
+            for (covered, selected) in prior {
+                let next = covered
+                    .iter()
+                    .zip(&coverage)
+                    .map(|(left, right)| *left || *right)
+                    .collect::<Vec<_>>();
+                if next == covered {
+                    continue;
+                }
+                let mut candidate = selected;
+                candidate.push(index);
+                let candidate_rank = access_selection_rank(grant, &candidate);
+                if covers
+                    .get(&next)
+                    .is_none_or(|existing| candidate_rank < access_selection_rank(grant, existing))
+                {
+                    covers.insert(next, candidate);
+                }
+            }
+        }
+        let selected = covers
+            .remove(&vec![true; selected_verbs.len()])
+            .ok_or_else(|| "access use limit is exhausted".to_string())?;
+
+        let mut consumptions = Vec::with_capacity(selected.len());
+        for index in selected {
+            let access = &mut grant.scope.access_grants[index];
+            let remaining = access.remaining_uses.map(|remaining| remaining - 1);
+            access.remaining_uses = remaining;
+            consumptions.push(AccessUseConsumption {
+                request: access.request.clone(),
+                remaining_uses: remaining,
+            });
+        }
+        if consumptions
+            .iter()
+            .any(|consumption| consumption.remaining_uses.is_some())
+        {
+            self.revision = self.revision.saturating_add(1);
+        }
+        Ok(AccessAdmission { consumptions })
+    }
+
     pub fn list(&self) -> Vec<SessionGrantSummary> {
         let now = now_unix();
         self.grants
@@ -667,9 +1096,13 @@ impl SessionRegistry {
             .filter(|(_, g)| !g.is_expired(now))
             .map(|(token, g)| SessionGrantSummary {
                 token: token.clone(),
+                #[cfg(test)]
                 allow: g.allow.clone(),
+                #[cfg(test)]
                 deny: g.deny.clone(),
+                #[cfg(test)]
                 allow_exact: g.allow_exact.clone(),
+                #[cfg(test)]
                 deny_exact: g.deny_exact.clone(),
                 activated_verbs: g.activated_verbs.clone(),
                 override_markers: g.override_markers.clone(),
@@ -685,6 +1118,7 @@ impl SessionRegistry {
 
     /// Return historical grants no older than `since_unix`. When
     /// `since_unix` is None, return everything still in retention.
+    #[cfg(test)]
     pub fn list_history(&self, since_unix: Option<u64>) -> Vec<HistoricalGrant> {
         self.history
             .iter()
@@ -728,9 +1162,13 @@ impl SessionRegistry {
             } else {
                 Some(SessionGrantSummary {
                     token: token.to_string(),
+                    #[cfg(test)]
                     allow: grant.allow.clone(),
+                    #[cfg(test)]
                     deny: grant.deny.clone(),
+                    #[cfg(test)]
                     allow_exact: grant.allow_exact.clone(),
+                    #[cfg(test)]
                     deny_exact: grant.deny_exact.clone(),
                     activated_verbs: grant.activated_verbs.clone(),
                     override_markers: grant.override_markers.clone(),
@@ -773,7 +1211,7 @@ impl SessionRegistry {
             match interaction.exec_status {
                 // Provisional commands did execute (inside a containment
                 // envelope); held commands did not run. The fine-grained gating
-                // states are surfaced by `guard provisionals` / `guard approvals`.
+                // states are surfaced by `guard provisionals` / `guard access list`.
                 SessionExecStatus::Completed
                 | SessionExecStatus::CompletedAfterApproval
                 | SessionExecStatus::Provisional => stats.completed += 1,
@@ -1000,17 +1438,7 @@ impl SessionRegistry {
         session_grant_revision_key(grant)
     }
 
-    pub fn extend(&mut self, token: &str, ttl_secs: u64) -> Option<u64> {
-        let grant = self.grants.get_mut(token)?;
-        if grant.is_expired(now_unix()) {
-            return None;
-        }
-        let expires_at = now_unix().saturating_add(ttl_secs);
-        grant.expires_at = Some(expires_at);
-        self.revision = self.revision.saturating_add(1);
-        Some(expires_at)
-    }
-
+    #[cfg(test)]
     pub fn set_label(&mut self, token: &str, label: Option<String>) -> Option<bool> {
         let grant = self.grants.get_mut(token)?;
         if grant.is_expired(now_unix()) {
@@ -1062,24 +1490,6 @@ impl SessionRegistry {
             self.revision = self.revision.saturating_add(1);
         }
         Some(changed)
-    }
-
-    pub fn revoke_filtered(&mut self, label: Option<&str>, saved_grant: Option<&str>) -> usize {
-        let tokens = self
-            .grants
-            .iter()
-            .filter(|(_, grant)| {
-                label.is_none_or(|label| grant.scope.label.as_deref() == Some(label))
-                    && saved_grant
-                        .is_none_or(|name| grant.scope.saved_grant.as_deref() == Some(name))
-            })
-            .map(|(token, _)| token.clone())
-            .collect::<Vec<_>>();
-        let mut revoked = 0;
-        for token in tokens {
-            revoked += usize::from(self.revoke(&token));
-        }
-        revoked
     }
 
     pub fn auto_amend_for(&self, token: &str) -> bool {
@@ -1269,6 +1679,17 @@ impl SessionRegistry {
 
         None
     }
+}
+
+pub fn session_reference(token: &str) -> String {
+    let digest = sha2::Sha256::digest(token.as_bytes());
+    format!(
+        "session:{}",
+        digest[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
 }
 
 /// Stable, value-insensitive behavioral bucket matching the command-learning
@@ -1560,7 +1981,16 @@ mod tests {
         };
         reg.grant("tok".to_string(), grant("inspect development pods"));
         let (before, _) = reg.api_authority_for("tok").unwrap();
-        reg.grant("tok".to_string(), grant("apply development pods"));
+        assert_eq!(
+            reg.apply_delta(
+                "tok",
+                &crate::grant_profile::GrantRequestDelta {
+                    prompt_append: Some("apply development pods".to_string()),
+                    ..crate::grant_profile::GrantRequestDelta::default()
+                },
+            ),
+            Some(true)
+        );
         let (after, intent) = reg.api_authority_for("tok").unwrap();
 
         assert_ne!(before, after);
@@ -2108,5 +2538,272 @@ mod tests {
         assert_eq!(json["override_markers"][0], "operator:apply");
         assert_eq!(json["scope"]["saved_grant"], "incident");
         assert_eq!(json["scope"]["saved_revision"], 7);
+    }
+
+    #[test]
+    fn bounded_access_uses_are_principal_scoped_and_revision_stable() {
+        let principal = PrincipalKey::from_uid(1001);
+        let mut registry = SessionRegistry::new();
+        registry.grant(
+            "opaque-token".to_string(),
+            SessionGrant {
+                allow: Vec::new(),
+                deny: Vec::new(),
+                allow_exact: Vec::new(),
+                deny_exact: Vec::new(),
+                activated_verbs: vec!["inspect".to_string()],
+                override_markers: Vec::new(),
+                scope: IssuedGrantScope {
+                    label: Some("agent:1001".to_string()),
+                    access_managed: true,
+                    access_grants: vec![AccessUseGrant {
+                        request: "gr-once".to_string(),
+                        verbs: vec!["inspect".to_string()],
+                        use_limit: Some(1),
+                        remaining_uses: Some(1),
+                        pending: false,
+                    }],
+                    ..IssuedGrantScope::default()
+                },
+                expires_at: Some(now_unix().saturating_add(60)),
+                prompt_append: None,
+                generated_notes: Vec::new(),
+                static_only: false,
+                auto_amend: false,
+                granted_at: 0,
+                owner: SessionOwner::Principal(principal.clone()),
+            },
+        );
+        assert_eq!(
+            registry.access_token_for_principal(&principal).as_deref(),
+            Some("opaque-token")
+        );
+        let revision = registry.effective_revision_key("opaque-token");
+        assert_eq!(
+            registry.consume_access_use(
+                "opaque-token",
+                &["inspect".to_string()],
+                Some(&["gr-once".to_string()]),
+            ),
+            Ok(AccessAdmission {
+                consumptions: vec![AccessUseConsumption {
+                    request: "gr-once".to_string(),
+                    remaining_uses: Some(0),
+                }],
+            })
+        );
+        assert_eq!(registry.effective_revision_key("opaque-token"), revision);
+        let consumed_revision = registry.effective_revision_key("opaque-token");
+        assert_eq!(
+            registry.stage_access_grant(
+                "opaque-token",
+                Some(1),
+                "zz-held".to_string(),
+                vec!["inspect".to_string()]
+            ),
+            Some(true)
+        );
+        assert_ne!(
+            registry.effective_revision_key("opaque-token"),
+            consumed_revision,
+            "installing distinct authority must change the effective revision"
+        );
+        assert_eq!(
+            registry.consume_access_use("opaque-token", &["inspect".to_string()], None),
+            Err("access use limit is exhausted".to_string())
+        );
+        assert_eq!(
+            registry.access_grant_uses("opaque-token", "zz-held"),
+            Some((Some(1), Some(1)))
+        );
+        assert_eq!(
+            registry.consume_access_use(
+                "opaque-token",
+                &["inspect".to_string()],
+                Some(&["zz-held".to_string()]),
+            ),
+            Ok(AccessAdmission {
+                consumptions: vec![AccessUseConsumption {
+                    request: "zz-held".to_string(),
+                    remaining_uses: Some(0),
+                }],
+            })
+        );
+        assert_eq!(
+            registry
+                .token_for_access_target(&session_reference("opaque-token"))
+                .unwrap()
+                .as_deref(),
+            Some("opaque-token")
+        );
+        assert!(registry.revoke("opaque-token"));
+        let history = registry.list_history(None);
+        let original = history[0]
+            .scope
+            .access_grants
+            .iter()
+            .find(|grant| grant.request == "gr-once")
+            .unwrap();
+        assert_eq!(original.use_limit, Some(1));
+        assert_eq!(original.remaining_uses, Some(0));
+    }
+
+    fn registry_with_access_grants(
+        activated_verbs: &[&str],
+        access_grants: Vec<AccessUseGrant>,
+    ) -> SessionRegistry {
+        let mut registry = SessionRegistry::new();
+        registry.grant(
+            "access-token".to_string(),
+            SessionGrant {
+                allow: Vec::new(),
+                deny: Vec::new(),
+                allow_exact: Vec::new(),
+                deny_exact: Vec::new(),
+                activated_verbs: activated_verbs
+                    .iter()
+                    .map(|verb| (*verb).to_string())
+                    .collect(),
+                override_markers: Vec::new(),
+                scope: IssuedGrantScope {
+                    access_managed: true,
+                    access_grants,
+                    ..IssuedGrantScope::default()
+                },
+                expires_at: Some(now_unix().saturating_add(60)),
+                prompt_append: None,
+                generated_notes: Vec::new(),
+                static_only: false,
+                auto_amend: false,
+                granted_at: 0,
+                owner: SessionOwner::Principal(PrincipalKey::from_uid(1001)),
+            },
+        );
+        registry
+    }
+
+    #[test]
+    fn unbounded_access_does_not_cover_an_exhausted_selected_scope() {
+        let mut registry = registry_with_access_grants(
+            &["verb-a", "verb-b"],
+            vec![
+                AccessUseGrant {
+                    request: "unbounded-a".to_string(),
+                    verbs: vec!["verb-a".to_string()],
+                    use_limit: None,
+                    remaining_uses: None,
+                    pending: false,
+                },
+                AccessUseGrant {
+                    request: "exhausted-b".to_string(),
+                    verbs: vec!["verb-b".to_string()],
+                    use_limit: Some(1),
+                    remaining_uses: Some(0),
+                    pending: false,
+                },
+            ],
+        );
+        let selected = vec!["verb-a".to_string(), "verb-b".to_string()];
+
+        assert_eq!(
+            registry.aggregate_access_uses("access-token"),
+            Some(Some(0))
+        );
+        assert_eq!(
+            registry.consume_access_use("access-token", &selected, None),
+            Err("access use limit is exhausted".to_string())
+        );
+        assert_eq!(
+            registry.access_grant_uses("access-token", "exhausted-b"),
+            Some((Some(1), Some(0)))
+        );
+    }
+
+    #[test]
+    fn distinct_bounded_selected_scopes_are_consumed_atomically() {
+        let mut registry = registry_with_access_grants(
+            &["verb-a", "verb-b"],
+            vec![
+                AccessUseGrant {
+                    request: "bounded-a".to_string(),
+                    verbs: vec!["verb-a".to_string()],
+                    use_limit: Some(1),
+                    remaining_uses: Some(1),
+                    pending: false,
+                },
+                AccessUseGrant {
+                    request: "bounded-b".to_string(),
+                    verbs: vec!["verb-b".to_string()],
+                    use_limit: Some(2),
+                    remaining_uses: Some(2),
+                    pending: false,
+                },
+            ],
+        );
+        let selected = vec!["verb-a".to_string(), "verb-b".to_string()];
+
+        assert_eq!(
+            registry.consume_access_use("access-token", &selected, None),
+            Ok(AccessAdmission {
+                consumptions: vec![
+                    AccessUseConsumption {
+                        request: "bounded-a".to_string(),
+                        remaining_uses: Some(0),
+                    },
+                    AccessUseConsumption {
+                        request: "bounded-b".to_string(),
+                        remaining_uses: Some(1),
+                    },
+                ],
+            })
+        );
+        assert_eq!(
+            registry.access_grant_uses("access-token", "bounded-a"),
+            Some((Some(1), Some(0)))
+        );
+        assert_eq!(
+            registry.access_grant_uses("access-token", "bounded-b"),
+            Some((Some(2), Some(1)))
+        );
+        assert_eq!(
+            registry.aggregate_access_uses("access-token"),
+            Some(Some(0))
+        );
+
+        assert_eq!(
+            registry.consume_access_use("access-token", &selected, None),
+            Err("access use limit is exhausted".to_string())
+        );
+        assert_eq!(
+            registry.access_grant_uses("access-token", "bounded-b"),
+            Some((Some(2), Some(1)))
+        );
+    }
+
+    #[test]
+    fn legacy_session_revision_fixture_is_stable() {
+        let grant = SessionGrant {
+            allow: vec!["true".to_string()],
+            deny: Vec::new(),
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            activated_verbs: vec!["inspect".to_string()],
+            override_markers: Vec::new(),
+            scope: IssuedGrantScope::default(),
+            expires_at: Some(4_000_000_000),
+            prompt_append: Some("bounded maintenance".to_string()),
+            generated_notes: Vec::new(),
+            static_only: true,
+            auto_amend: false,
+            granted_at: 1_700_000_000,
+            owner: SessionOwner::Principal(PrincipalKey::from_uid(1000)),
+        };
+        let encoded = serde_json::to_value(&grant).unwrap();
+        assert!(encoded["scope"].get("access_managed").is_none());
+        assert!(encoded["scope"].get("access_grants").is_none());
+        assert_eq!(
+            session_grant_revision_key(&grant).as_deref(),
+            Some("d3c4c21d1957a398b33d830ee97bf28d")
+        );
     }
 }

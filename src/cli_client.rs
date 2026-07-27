@@ -1,14 +1,14 @@
 use super::{
-    color_enabled_for_stderr, color_enabled_for_stdout, format_optional_timestamp,
-    format_timestamp, paint, print_json, AnsiColor, ApiCommands, ConfigCommands, GrantCommands,
-    GrantRequestCommands, McpCommands, SessionCommands, VerbCommands, VerbCoverageCommands,
-    EXIT_GUARD_DENIED, EXIT_GUARD_HELD, JSON_SCHEMA_VERSION,
+    color_enabled_for_stderr, color_enabled_for_stdout, format_timestamp, paint, print_json,
+    AccessCommands, AnsiColor, ApiCommands, ConfigCommands, McpCommands, VerbCommands,
+    VerbCoverageCommands, EXIT_GUARD_ACCESS_DECISION_FAILED, EXIT_GUARD_DENIED, EXIT_GUARD_ERROR,
+    EXIT_GUARD_HELD, JSON_SCHEMA_VERSION,
 };
-use crate::{client_config, daemon_client, defaults, mcp, server, session};
+use crate::{client_config, daemon_client, defaults, mcp, server};
 use anyhow::{Context, Result};
 use guard::env::guard_env;
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 
 /// Consequence-gating options parsed from `guard run` flags.
@@ -35,6 +35,54 @@ pub(crate) enum SshHostKeyCliMode {
     OnlyExisting,
     AcceptNew,
     AcceptAll,
+}
+
+fn client_config_error(message: impl Into<String>) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": JSON_SCHEMA_VERSION,
+        "type": "client_config_error",
+        "error": {
+            "code": "invalid_client_config",
+            "message": message.into(),
+        },
+    })
+}
+
+/// Load the client configuration without silently selecting a default
+/// endpoint when a configured file is unreadable or malformed.
+pub(crate) fn load_client_config(json: bool) -> Result<client_config::ClientConfig> {
+    match client_config::ClientConfig::load().context("failed to load client config") {
+        Ok(config) => Ok(config),
+        Err(error) if json => {
+            // Keep stdout machine-readable for commands that promised JSON.
+            // If stdout itself is broken, there is no secondary human payload.
+            let _ = print_json(&client_config_error(format!("{error:#}")));
+            std::process::exit(EXIT_GUARD_ERROR);
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn read_secret_input(prompt: &str) -> Result<String> {
+    let value = if std::io::stdin().is_terminal() {
+        rpassword::prompt_password(prompt)?
+    } else {
+        let mut value = String::new();
+        std::io::stdin()
+            .read_to_string(&mut value)
+            .context("failed to read secret value from stdin")?;
+        if value.ends_with('\n') {
+            value.pop();
+            if value.ends_with('\r') {
+                value.pop();
+            }
+        }
+        value
+    };
+    if value.is_empty() {
+        anyhow::bail!("secret value must not be empty");
+    }
+    Ok(value)
 }
 
 impl From<SshHostKeyCliMode> for server::SshHostKeyMode {
@@ -107,6 +155,45 @@ fn print_verb_guidance(response: &server::ExecuteResponse) {
     }
 }
 
+fn access_request_guidance_lines(response: &server::ExecuteResponse) -> Vec<String> {
+    if !response.access_requests.is_empty() {
+        return response
+            .access_requests
+            .iter()
+            .flat_map(|request| {
+                let mut lines = vec![format!("request: {}", request.reference)];
+                lines.extend(
+                    request
+                        .approval_options
+                        .iter()
+                        .map(|command| format!("approve: {command}")),
+                );
+                lines.push(format!("inspect: guard access show {}", request.reference));
+                lines
+            })
+            .collect();
+    }
+
+    let Some(reference) = response.handle.as_deref() else {
+        return Vec::new();
+    };
+    let mut lines = vec![format!("request: {reference}")];
+    lines.extend(
+        response
+            .approval_options
+            .iter()
+            .map(|command| format!("approve: {command}")),
+    );
+    lines.push(format!("inspect: guard access show {reference}"));
+    lines
+}
+
+fn print_access_request_guidance(response: &server::ExecuteResponse) {
+    for line in access_request_guidance_lines(response) {
+        eprintln!("  {line}");
+    }
+}
+
 pub(crate) async fn run_exec(
     binary: String,
     args: Vec<String>,
@@ -116,7 +203,7 @@ pub(crate) async fn run_exec(
     json: bool,
     explain: bool,
 ) -> Result<()> {
-    let config = client_config::ClientConfig::load().ok().unwrap_or_default();
+    let config = load_client_config(json)?;
 
     let (socket_path, tcp_port, endpoint_source) =
         resolve_client_endpoint_with_source(None, &config);
@@ -218,8 +305,7 @@ pub(crate) async fn run_exec(
                 resp.reason
             );
             eprintln!("  handle:  {}", handle);
-            eprintln!("  approve: guard approve {}", handle);
-            eprintln!("  poll:    guard approvals {}", handle);
+            print_access_request_guidance(&resp);
             eprintln!("  result:  not executed until approved");
             print_coverage(&resp.coverage);
             print_verb_guidance(&resp);
@@ -298,6 +384,7 @@ pub(crate) async fn run_exec(
             paint("DENIED", AnsiColor::Red, color),
             resp.reason
         );
+        print_access_request_guidance(&resp);
         print_verb_guidance(&resp);
         std::process::exit(EXIT_GUARD_DENIED);
     }
@@ -343,98 +430,30 @@ fn exit_for_execute_response(response: &server::ExecuteResponse) -> ! {
 }
 
 /// Resolve the admin endpoint and build a client for a gate-control RPC.
-fn gate_client(socket_override: Option<String>) -> (daemon_client::Client, EndpointSource) {
-    let config = client_config::ClientConfig::load().ok().unwrap_or_default();
+fn gate_client(
+    socket_override: Option<String>,
+    json: bool,
+) -> Result<(daemon_client::Client, EndpointSource)> {
+    let config = load_client_config(json)?;
     let (socket_path, tcp_port, source) =
         resolve_client_endpoint_with_source(socket_override, &config);
     let mut client = daemon_client::Client::new(socket_path, tcp_port);
     if let Some(token) = config.auth_token {
         client = client.with_auth(token);
     }
-    (client, source)
+    Ok((client, source))
 }
 
 pub(crate) async fn handle_api(command: ApiCommands) -> Result<()> {
     match command {
-        ApiCommands::Kubeconfig {
-            endpoint,
-            output,
-            socket,
-        } => {
-            let session_token = std::env::var("GUARD_SESSION")
-                .ok()
-                .filter(|token| guard::proxy::valid_guard_session_token(token))
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "guard api kubeconfig requires a valid GUARD_SESSION environment variable"
-                    )
-                })?;
-            let (client, source) = gate_client(socket);
-            let response = client
-                .send_admin(server::AdminRequest::KubeconfigIssue {
-                    endpoint,
-                    session_token,
-                })
-                .await
-                .map_err(|error| describe_connect_failure(error, &client, source))?;
-            match response {
-                server::AdminResponse::KubeconfigIssued { yaml, .. } => {
-                    if let Some(path) = output {
-                        write_client_private_file(&path, yaml.as_bytes())?;
-                    } else {
-                        print!("{yaml}");
-                    }
-                    Ok(())
-                }
-                server::AdminResponse::Error { message } => Err(anyhow::anyhow!(message)),
-                _ => Err(anyhow::anyhow!("unexpected kubeconfig issuance response")),
-            }
-        }
+        ApiCommands::Kubeconfig { .. } => anyhow::bail!(
+            "`guard api kubeconfig` has been removed because access-managed sessions are command-only; use approved kubectl or helm command verbs"
+        ),
     }
-}
-
-fn write_client_private_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!("output path has no file name: {}", path.display()))?;
-    let temporary = parent.join(format!(
-        ".{}.guard-{:016x}.tmp",
-        file_name.to_string_lossy(),
-        rand::random::<u64>()
-    ));
-    let result = (|| -> Result<()> {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        }
-        let mut file = options
-            .open(&temporary)
-            .with_context(|| format!("create private kubeconfig {}", temporary.display()))?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        #[cfg(not(unix))]
-        if path.exists() {
-            anyhow::bail!("refusing to replace existing kubeconfig {}", path.display());
-        }
-        std::fs::rename(&temporary, path)
-            .with_context(|| format!("install kubeconfig {}", path.display()))?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result
 }
 
 pub(crate) async fn handle_provisionals(socket: Option<String>, json: bool) -> Result<()> {
-    let (client, source) = gate_client(socket);
+    let (client, source) = gate_client(socket, json)?;
     match client
         .send_admin(server::AdminRequest::Provisionals)
         .await
@@ -484,149 +503,8 @@ pub(crate) async fn handle_provisionals(socket: Option<String>, json: bool) -> R
     }
 }
 
-pub(crate) async fn handle_approval_note_cmd(
-    socket: Option<String>,
-    handle: String,
-    text: String,
-) -> Result<()> {
-    let (client, source) = gate_client(socket);
-    match client
-        .send_admin(server::AdminRequest::ApprovalNote { handle, text })
-        .await
-        .map_err(|e| describe_connect_failure(e, &client, source))?
-    {
-        server::AdminResponse::ApprovalShow { item } => {
-            let color = color_enabled_for_stdout();
-            println!(
-                "[{}] handle={} cmd={:?}",
-                paint(&item.status, AnsiColor::Yellow, color),
-                item.handle,
-                item.command
-            );
-            for n in &item.notes {
-                println!(
-                    "  note [{}] {}: {}",
-                    format_timestamp(n.at_unix),
-                    n.author,
-                    n.text
-                );
-            }
-            Ok(())
-        }
-        server::AdminResponse::Error { message } => {
-            eprintln!("error: {}", message);
-            std::process::exit(1);
-        }
-        other => {
-            eprintln!("unexpected response: {:?}", other);
-            std::process::exit(1);
-        }
-    }
-}
-
-pub(crate) async fn handle_approvals(
-    socket: Option<String>,
-    handle: Option<String>,
-    json: bool,
-) -> Result<()> {
-    let (client, source) = gate_client(socket);
-    let request = match handle {
-        Some(h) => server::AdminRequest::ApprovalShow { handle: h },
-        None => server::AdminRequest::ApprovalList,
-    };
-    match client
-        .send_admin(request)
-        .await
-        .map_err(|e| describe_connect_failure(e, &client, source))?
-    {
-        server::AdminResponse::Approvals { items } => {
-            if json {
-                return print_json(&serde_json::json!({
-                    "schema_version": JSON_SCHEMA_VERSION,
-                    "type": "approval_list",
-                    "items": items,
-                }));
-            }
-            if items.is_empty() {
-                println!("(no approvals)");
-            }
-            let color = color_enabled_for_stdout();
-            for a in &items {
-                let status_color = match a.status.as_str() {
-                    "approved" => AnsiColor::Green,
-                    "denied" | "expired" | "exec_failed" => AnsiColor::Red,
-                    _ => AnsiColor::Yellow,
-                };
-                println!(
-                    "[{}] handle={} risk={:?} class={:?} created={} deadline={} cmd={:?} fp={} reason={:?}",
-                    paint(&a.status, status_color, color),
-                    a.handle,
-                    a.risk,
-                    a.reversibility,
-                    format_timestamp(a.created_unix),
-                    format_timestamp(a.deadline_unix),
-                    a.command,
-                    a.fingerprint,
-                    a.reason
-                );
-            }
-            Ok(())
-        }
-        server::AdminResponse::ApprovalShow { item } => {
-            if json {
-                return print_json(&serde_json::json!({
-                    "schema_version": JSON_SCHEMA_VERSION,
-                    "type": "approval",
-                    "item": item,
-                }));
-            }
-            let color = color_enabled_for_stdout();
-            println!(
-                "[{}] handle={} risk={:?} class={:?} created={} deadline={} cmd={:?} fp={}",
-                paint(&item.status, AnsiColor::Yellow, color),
-                item.handle,
-                item.risk,
-                item.reversibility,
-                format_timestamp(item.created_unix),
-                format_timestamp(item.deadline_unix),
-                item.command,
-                item.fingerprint
-            );
-            if let Some(code) = item.exit_code {
-                println!("exit_code={}", code);
-            }
-            if let Some(out) = &item.stdout {
-                print!("{}", out);
-            }
-            if let Some(err) = &item.stderr {
-                eprint!("{}", err);
-            }
-            if let Some(reason) = &item.decided_reason {
-                println!("decision: {}", reason);
-            }
-            for n in &item.notes {
-                println!(
-                    "  note [{}] {}: {}",
-                    format_timestamp(n.at_unix),
-                    n.author,
-                    n.text
-                );
-            }
-            Ok(())
-        }
-        server::AdminResponse::Error { message } => {
-            eprintln!("error: {}", message);
-            std::process::exit(1);
-        }
-        _ => {
-            eprintln!("unexpected response");
-            std::process::exit(1);
-        }
-    }
-}
-
 pub(crate) async fn handle_audit_verify(socket: Option<String>, json: bool) -> Result<()> {
-    let (client, source) = gate_client(socket);
+    let (client, source) = gate_client(socket, json)?;
     match client
         .send_admin(server::AdminRequest::AuditVerify)
         .await
@@ -686,7 +564,7 @@ pub(crate) async fn handle_audit_tail(
     n: Option<usize>,
     json: bool,
 ) -> Result<()> {
-    let (client, source) = gate_client(socket);
+    let (client, source) = gate_client(socket, json)?;
     match client
         .send_admin(server::AdminRequest::AuditTail { limit: n })
         .await
@@ -733,7 +611,7 @@ pub(crate) async fn handle_audit_tail(
 pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
     match subcommand {
         VerbCommands::List { socket, json } => {
-            let (client, source) = gate_client(socket);
+            let (client, source) = gate_client(socket, json)?;
             match client
                 .send_admin(server::AdminRequest::VerbList)
                 .await
@@ -792,6 +670,32 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                     }
                     Ok(())
                 }
+                server::AdminResponse::VerbMenu { items } => {
+                    if json {
+                        return print_json(&serde_json::json!({
+                            "schema_version": JSON_SCHEMA_VERSION,
+                            "type": "verb_list",
+                            "projection": "agent_menu",
+                            "items": items,
+                        }));
+                    }
+                    if items.is_empty() {
+                        println!("(no verbs; start the daemon with --verbs <catalog.yaml>)");
+                    }
+                    for verb in &items {
+                        println!(
+                            "{} [{}]{} - {}",
+                            verb.name,
+                            verb.consequence,
+                            if verb.has_revert { " revertable" } else { "" },
+                            verb.description
+                        );
+                        for parameter in &verb.params {
+                            println!("    --param {parameter}=<value>");
+                        }
+                    }
+                    Ok(())
+                }
                 server::AdminResponse::Error { message } => {
                     eprintln!("error: {}", message);
                     std::process::exit(1);
@@ -803,7 +707,7 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
             }
         }
         VerbCommands::Show { name, socket, json } => {
-            let (client, source) = gate_client(socket);
+            let (client, source) = gate_client(socket, json)?;
             let response = client
                 .send_admin(server::AdminRequest::VerbShow { name })
                 .await
@@ -822,7 +726,7 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
             }
         }
         VerbCommands::Delete { name, socket } => {
-            let (client, source) = gate_client(socket);
+            let (client, source) = gate_client(socket, false)?;
             match client
                 .send_admin(server::AdminRequest::VerbDelete { name })
                 .await
@@ -845,7 +749,7 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
             json,
             explain,
         } => {
-            let config = client_config::ClientConfig::load().ok().unwrap_or_default();
+            let config = load_client_config(json)?;
             let (socket_path, tcp_port, endpoint_source) =
                 resolve_client_endpoint_with_source(socket, &config);
             let param_map: std::collections::BTreeMap<String, String> =
@@ -923,7 +827,7 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
             socket,
             json,
         } => {
-            let (client, source) = gate_client(socket);
+            let (client, source) = gate_client(socket, json)?;
             let req = server::AdminRequest::VerbCreate {
                 prose: prompt,
                 binary_hint: binary,
@@ -973,7 +877,7 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
         }
         VerbCommands::Coverage { command } => match command {
             VerbCoverageCommands::List { socket, json } => {
-                let (client, source) = gate_client(socket);
+                let (client, source) = gate_client(socket, json)?;
                 match client
                     .send_admin(server::AdminRequest::VerbCoverageList)
                     .await
@@ -1022,7 +926,7 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                 }
             }
             VerbCoverageCommands::Clear { socket, json } => {
-                let (client, source) = gate_client(socket);
+                let (client, source) = gate_client(socket, json)?;
                 match client
                     .send_admin(server::AdminRequest::VerbCoverageClear)
                     .await
@@ -1048,428 +952,263 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
     }
 }
 
-pub(crate) async fn handle_grant(subcommand: GrantCommands) -> Result<()> {
-    use crate::grant_profile::{EvaluationMode, GrantCeiling, GrantRequestDelta, SavedGrant};
-    use std::str::FromStr;
-
-    let (socket, request, json) = match subcommand {
-        GrantCommands::Save {
-            name,
-            description,
-            verbs,
-            override_markers,
-            secret_names,
-            ceiling_verbs,
-            ceiling_secrets,
-            ceiling_ttl,
-            ceiling_modes,
-            allow_prompt_append,
-            ttl,
-            prompt,
-            evaluation_mode,
-            auto_approve,
+pub(crate) async fn handle_access(command: AccessCommands) -> Result<()> {
+    let (socket, request, json) = match command {
+        AccessCommands::Request {
+            intent,
             socket,
             json,
-        } => {
-            let evaluation_mode = EvaluationMode::from_str(&evaluation_mode)?;
-            let ceiling_modes = ceiling_modes
-                .iter()
-                .map(|mode| EvaluationMode::from_str(mode))
-                .collect::<Result<Vec<_>, _>>()?;
-            let grant = SavedGrant {
-                name,
-                label: None,
-                description: description.unwrap_or_default(),
-                activated_verbs: verbs.clone(),
-                override_markers,
-                secret_names: secret_names.clone(),
-                ttl_secs: ttl,
-                prompt_append: prompt,
-                evaluation_mode,
-                auto_approve_requests: auto_approve,
-                ceiling: GrantCeiling {
-                    verbs: if ceiling_verbs.is_empty() {
-                        verbs
-                    } else {
-                        ceiling_verbs
-                    },
-                    secret_names: if ceiling_secrets.is_empty() {
-                        secret_names
-                    } else {
-                        ceiling_secrets
-                    },
-                    max_ttl_secs: ceiling_ttl.or(ttl),
-                    allow_prompt_append,
-                    evaluation_modes: if ceiling_modes.is_empty() {
-                        vec![evaluation_mode]
-                    } else {
-                        ceiling_modes
-                    },
-                },
-                generated_verbs: Vec::new(),
-                revision: 0,
-                created_unix: 0,
-                updated_unix: 0,
-            };
-            (socket, server::AdminRequest::SavedGrantSave { grant }, json)
-        }
-        GrantCommands::Edit {
-            name,
-            description,
-            verbs,
-            clear_verbs,
-            override_markers,
-            clear_override_markers,
-            secret_names,
-            clear_secrets,
-            ceiling_verbs,
-            clear_ceiling_verbs,
-            ceiling_secrets,
-            clear_ceiling_secrets,
-            ceiling_ttl,
-            clear_ceiling_ttl,
-            ceiling_modes,
-            clear_ceiling_modes,
-            allow_prompt_append,
-            ttl,
-            clear_ttl,
-            prompt,
-            evaluation_mode,
-            auto_approve,
-            socket,
-            json,
-        } => {
-            let evaluation_mode = evaluation_mode
-                .as_deref()
-                .map(EvaluationMode::from_str)
-                .transpose()?;
-            let ceiling_modes = ceiling_modes
-                .iter()
-                .map(|mode| EvaluationMode::from_str(mode))
-                .collect::<Result<Vec<_>, _>>()?;
-            (
-                socket,
-                server::AdminRequest::SavedGrantEdit {
-                    name,
-                    description,
-                    activated_verbs: verbs,
-                    clear_verbs,
-                    override_markers,
-                    clear_override_markers,
-                    secret_names,
-                    clear_secrets,
-                    ceiling_verbs,
-                    clear_ceiling_verbs,
-                    ceiling_secrets,
-                    clear_ceiling_secrets,
-                    ceiling_ttl_secs: ceiling_ttl,
-                    clear_ceiling_ttl,
-                    ceiling_modes,
-                    clear_ceiling_modes,
-                    allow_prompt_append,
-                    ttl_secs: ttl,
-                    clear_ttl,
-                    prompt_append: prompt,
-                    evaluation_mode,
-                    auto_approve_requests: auto_approve,
-                },
-                json,
-            )
-        }
-        GrantCommands::Regenerate {
-            name,
-            prompt,
-            apply,
+        } => (socket, server::AdminRequest::AccessRequest { intent }, json),
+        AccessCommands::Approve {
+            requests,
+            once,
+            uses,
             socket,
             json,
         } => (
             socket,
-            server::AdminRequest::SavedGrantRegenerate {
-                name,
-                prompt,
-                proposal_id: apply,
+            server::AdminRequest::AccessApprove {
+                handles: requests,
+                uses: if once { Some(1) } else { uses },
             },
             json,
         ),
-        GrantCommands::Issue {
-            name,
-            ttl,
-            label,
-            evaluation_mode,
-            owner,
+        AccessCommands::Deny {
+            requests,
+            reason,
             socket,
-        } => {
-            let token = generate_session_token();
-            let mode = evaluation_mode
-                .as_deref()
-                .map(EvaluationMode::from_str)
-                .transpose()?;
-            let config = client_config::ClientConfig::load().ok().unwrap_or_default();
-            let (socket_path, tcp_port, source) =
-                resolve_client_endpoint_with_source(socket, &config);
-            let client = admin_client(socket_path, tcp_port, &config);
-            let response = client
-                .send_admin(server::AdminRequest::SessionGrant {
-                    token: token.clone(),
-                    allow: Vec::new(),
-                    deny: Vec::new(),
-                    activated_verbs: Vec::new(),
-                    override_markers: Vec::new(),
-                    ttl_secs: ttl,
-                    prompt_append: None,
-                    prose: None,
-                    saved_grant: Some(name),
-                    profile: None,
-                    evaluation_mode: mode,
-                    static_only: false,
-                    auto_amend: false,
-                    owner,
-                })
-                .await
-                .map_err(|error| describe_connect_failure(error, &client, source))?;
-            return match response {
-                server::AdminResponse::Ok => {
-                    if let Some(label) = label {
-                        let label_error = match client
-                            .send_admin(server::AdminRequest::SessionLabel {
-                                token: token.clone(),
-                                label,
-                            })
-                            .await
-                        {
-                            Ok(server::AdminResponse::Ok) => None,
-                            Ok(server::AdminResponse::Error { message }) => Some(message),
-                            Ok(other) => Some(format!("unexpected admin response: {other:?}")),
-                            Err(error) => Some(error.to_string()),
-                        };
-                        if let Some(label_error) = label_error {
-                            let revoke_error = match client
-                                .send_admin(server::AdminRequest::SessionRevoke {
-                                    token: token.clone(),
-                                })
-                                .await
-                            {
-                                Ok(server::AdminResponse::Ok) => None,
-                                Ok(server::AdminResponse::Error { message }) => Some(message),
-                                Ok(other) => Some(format!(
-                                    "unexpected revoke response after label failure: {other:?}"
-                                )),
-                                Err(error) => Some(error.to_string()),
-                            };
-                            return Err(anyhow::anyhow!(revoke_error.map_or(
-                                label_error.clone(),
-                                |error| format!(
-                                    "{label_error}; also failed to revoke the issued session: {error}"
-                                )
-                            )));
-                        }
-                    }
-                    println!("export GUARD_SESSION={token}");
-                    eprintln!("next: guard session show {token}");
-                    Ok(())
-                }
-                server::AdminResponse::Error { message } => Err(anyhow::anyhow!(message)),
-                other => Err(anyhow::anyhow!("unexpected admin response: {other:?}")),
-            };
-        }
-        GrantCommands::List { socket, json } => {
-            (socket, server::AdminRequest::SavedGrantList, json)
-        }
-        GrantCommands::Show { name, socket, json } => {
-            (socket, server::AdminRequest::SavedGrantShow { name }, json)
-        }
-        GrantCommands::Delete { name, socket } => (
+            json,
+        } => (
             socket,
-            server::AdminRequest::SavedGrantDelete { name },
-            false,
-        ),
-        GrantCommands::Request(command) => match command {
-            GrantRequestCommands::Submit {
-                session,
-                saved_grant,
-                justification,
-                prompt_append,
-                verbs,
-                secret_names,
-                override_markers,
-                ttl,
-                evaluation_mode,
-                socket,
-                json,
-            } => {
-                let caller_token = std::env::var("GUARD_SESSION")
-                    .ok()
-                    .filter(|value| !value.is_empty());
-                let session = session
-                    .or_else(|| caller_token.clone())
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("grant request submit requires --session or GUARD_SESSION")
-                    })?;
-                let evaluation_mode = evaluation_mode
-                    .as_deref()
-                    .map(EvaluationMode::from_str)
-                    .transpose()?;
-                (
-                    socket,
-                    server::AdminRequest::GrantRequestSubmit {
-                        session_token: session,
-                        caller_token,
-                        saved_grant,
-                        prompt: justification,
-                        delta: GrantRequestDelta {
-                            activated_verbs: verbs,
-                            override_markers,
-                            secret_names,
-                            ttl_secs: ttl,
-                            prompt_append,
-                            evaluation_mode,
-                        },
-                    },
-                    json,
-                )
-            }
-            GrantRequestCommands::List { socket, json } => {
-                let session_token = std::env::var("GUARD_SESSION")
-                    .ok()
-                    .filter(|value| !value.is_empty());
-                (
-                    socket,
-                    server::AdminRequest::GrantRequestList {
-                        caller_token: session_token.clone(),
-                        session_token,
-                    },
-                    json,
-                )
-            }
-            GrantRequestCommands::Show {
-                handle,
-                socket,
-                json,
-            } => {
-                let session_token = std::env::var("GUARD_SESSION")
-                    .ok()
-                    .filter(|value| !value.is_empty());
-                (
-                    socket,
-                    server::AdminRequest::GrantRequestShow {
-                        handle,
-                        session_token,
-                    },
-                    json,
-                )
-            }
-            GrantRequestCommands::Approve { handle, socket } => (
-                socket,
-                server::AdminRequest::GrantRequestApprove { handle },
-                false,
-            ),
-            GrantRequestCommands::Deny {
-                handle,
+            server::AdminRequest::AccessDeny {
+                handles: requests,
                 reason,
-                socket,
-            } => (
-                socket,
-                server::AdminRequest::GrantRequestDeny { handle, reason },
-                false,
-            ),
-            GrantRequestCommands::Withdraw { handle, socket } => {
-                let session_token = std::env::var("GUARD_SESSION")
-                    .ok()
-                    .filter(|value| !value.is_empty());
-                (
-                    socket,
-                    server::AdminRequest::GrantRequestWithdraw {
-                        handle,
-                        session_token,
-                    },
-                    false,
-                )
-            }
-        },
+            },
+            json,
+        ),
+        AccessCommands::Revoke {
+            target,
+            socket,
+            json,
+        } => (socket, server::AdminRequest::AccessRevoke { target }, json),
+        AccessCommands::Extend {
+            target,
+            intent,
+            once,
+            uses,
+            socket,
+            json,
+        } => (
+            socket,
+            server::AdminRequest::AccessExtend {
+                target,
+                intent,
+                uses: if once { Some(1) } else { uses },
+            },
+            json,
+        ),
+        AccessCommands::List { socket, json } => (socket, server::AdminRequest::AccessList, json),
+        AccessCommands::Show {
+            reference,
+            socket,
+            json,
+        } => (socket, server::AdminRequest::AccessShow { reference }, json),
     };
-
-    let config = client_config::ClientConfig::load().ok().unwrap_or_default();
+    let config = load_client_config(json)?;
     let (socket_path, tcp_port, source) = resolve_client_endpoint_with_source(socket, &config);
     let client = admin_client(socket_path, tcp_port, &config);
-    let response = client
-        .send_admin(request)
-        .await
-        .map_err(|error| describe_connect_failure(error, &client, source))?;
+    let response = match client.send_admin(request).await {
+        Ok(response) => response,
+        Err(error) => {
+            let error = describe_connect_failure(error, &client, source);
+            if json {
+                exit_access_json_error(error.to_string());
+            }
+            return Err(error);
+        }
+    };
+    let decision_failed = access_decision_failed(&response);
     if json {
-        return print_json(&serde_json::json!({
-            "schema_version": JSON_SCHEMA_VERSION,
-            "type": "grant",
-            "response": response,
-        }));
+        let document = match access_json_response(&response) {
+            Ok(document) => document,
+            Err(message) => exit_access_json_error(message),
+        };
+        print_json(&document)?;
+        if decision_failed {
+            std::process::exit(EXIT_GUARD_ACCESS_DECISION_FAILED);
+        }
+        return Ok(());
     }
     match response {
-        server::AdminResponse::Ok => println!("ok"),
-        server::AdminResponse::SavedGrants { items } => {
+        server::AdminResponse::AccessItems { items } => {
             if items.is_empty() {
-                println!("(no saved grants)");
+                println!("(no access requests or sessions)");
             }
-            for grant in items {
+            for item in items {
                 println!(
-                    "{} revision={} mode={} verbs={:?} secrets={:?}",
-                    grant.name,
-                    grant.revision,
-                    grant.evaluation_mode,
-                    grant.all_activated_verbs(),
-                    grant.secret_names
+                    "{} requester={} target={} scope={} expiry={} uses={} state={} next={}",
+                    item.reference,
+                    item.requester,
+                    item.target,
+                    if item.effective_scope.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        item.effective_scope.join(",")
+                    },
+                    item.expires_unix
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    if item.use_policy == "bounded" {
+                        item.remaining_uses
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "0".to_string())
+                    } else {
+                        item.use_policy.clone()
+                    },
+                    item.state,
+                    item.next_action,
                 );
             }
         }
-        server::AdminResponse::SavedGrant { grant } => {
-            println!("{}", serde_json::to_string_pretty(&grant)?);
-            println!("next: guard grant issue {}", grant.name);
+        server::AdminResponse::AccessItem { item } => {
+            println!("{}", access_item_human(&item));
         }
-        server::AdminResponse::SavedGrantRegenerated {
-            grant,
-            added,
-            removed,
-            changed,
-        } => {
-            println!("{}", serde_json::to_string_pretty(&grant)?);
-            println!("added={added:?} removed={removed:?} changed={changed:?}");
-        }
-        server::AdminResponse::SavedGrantRegenerationProposal {
-            name,
-            source_revision,
-            regime,
-            proposal_id,
-            candidate,
-            added,
-            removed,
-            changed,
-        } => {
-            println!("{}", serde_json::to_string_pretty(&candidate)?);
-            println!("added={added:?} removed={removed:?} changed={changed:?}");
-            println!("source_revision={source_revision} regime={regime}");
-            println!("apply: guard grant regenerate {name} --apply {proposal_id}");
-        }
-        server::AdminResponse::GrantRequests { items } => {
-            for request in items {
+        server::AdminResponse::AccessDecisions { items } => {
+            for item in items {
                 println!(
-                    "{} status={} session={} next={}",
-                    request.handle,
-                    request.status.as_str(),
-                    request.session_token,
-                    request.next_action
+                    "{} success={} state={} target={} uses={} message={}",
+                    item.request,
+                    item.success,
+                    item.state,
+                    item.target.as_deref().unwrap_or("none"),
+                    if item.use_policy == "bounded" {
+                        item.remaining_uses
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "0".to_string())
+                    } else {
+                        item.use_policy
+                    },
+                    item.message,
                 );
             }
         }
-        server::AdminResponse::GrantRequest { request } => {
-            println!("{}", serde_json::to_string_pretty(&request)?);
-            println!("next: {}", request.next_action);
-        }
-        server::AdminResponse::Error { message } => return Err(anyhow::anyhow!(message)),
-        other => return Err(anyhow::anyhow!("unexpected admin response: {other:?}")),
+        server::AdminResponse::Error { message } => anyhow::bail!(message),
+        other => anyhow::bail!("unexpected access response: {other:?}"),
+    }
+    if decision_failed {
+        std::process::exit(EXIT_GUARD_ACCESS_DECISION_FAILED);
     }
     Ok(())
 }
 
-/// Print a gated response (shared by `guard run` and `guard verb run`).
+fn access_json_error(message: impl Into<String>) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": JSON_SCHEMA_VERSION,
+        "type": "access_error",
+        "error": message.into(),
+    })
+}
+
+fn access_json_response(response: &server::AdminResponse) -> Result<serde_json::Value, String> {
+    let kind = match response {
+        server::AdminResponse::AccessItems { .. } => "access_list",
+        server::AdminResponse::AccessItem { .. } => "access_item",
+        server::AdminResponse::AccessDecisions { .. } => "access_decisions",
+        server::AdminResponse::Error { message } => return Err(message.clone()),
+        other => return Err(format!("unexpected access response: {other:?}")),
+    };
+    Ok(serde_json::json!({
+        "schema_version": JSON_SCHEMA_VERSION,
+        "type": kind,
+        "response": response,
+    }))
+}
+
+fn access_decision_failed(response: &server::AdminResponse) -> bool {
+    matches!(
+        response,
+        server::AdminResponse::AccessDecisions { items }
+            if items.iter().any(|item| !item.success)
+    )
+}
+
+fn exit_access_json_error(message: impl Into<String>) -> ! {
+    // A broken stdout cannot carry the promised JSON document. Suppress a
+    // second, human-formatted diagnostic so machine consumers never receive
+    // mixed output from an access command in JSON mode.
+    let _ = print_json(&access_json_error(message));
+    std::process::exit(EXIT_GUARD_ERROR);
+}
+
+fn access_item_human(item: &server::AccessItem) -> String {
+    let scope = if item.effective_scope.is_empty() {
+        "none".to_string()
+    } else {
+        item.effective_scope.join(",")
+    };
+    let expiry = item
+        .expires_unix
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let uses = if item.use_policy == "bounded" {
+        item.remaining_uses
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "0".to_string())
+    } else {
+        item.use_policy.clone()
+    };
+    let mut lines = vec![
+        format!("access {} {}", item.kind, item.reference),
+        format!("state: {}", item.state),
+        format!("requester: {}", item.requester),
+        format!("target: {}", item.target),
+        format!("scope: {scope}"),
+        format!("expiry: {expiry}"),
+        format!("uses: {uses}"),
+    ];
+    if let Some(intent) = &item.intent {
+        lines.push(format!("intent: {intent}"));
+    }
+    if let Some(reason) = &item.decided_reason {
+        lines.push(format!("reason: {reason}"));
+    }
+    if !item.capabilities.is_empty() {
+        lines.push("capabilities:".to_string());
+        for capability in &item.capabilities {
+            lines.push(format!(
+                "  {}: {} consequence={} baseline={} trusted={} revert={}",
+                capability.verb,
+                capability.description,
+                capability.consequence,
+                capability.baseline,
+                capability.trusted,
+                if capability.has_revert {
+                    "available"
+                } else {
+                    "none"
+                },
+            ));
+            if !capability.baseline {
+                let matcher = serde_json::to_string(&capability.matcher)
+                    .expect("serde_json::Value serialization cannot fail");
+                lines.push(format!("    matcher: {matcher}"));
+                lines.push(format!("    matcher_digest: {}", capability.matcher_digest));
+            }
+            if let Some(plan) = &capability.credential_plan {
+                lines.push(format!("    credential_plan: {plan}"));
+            }
+            if let Some(evidence) = &capability.evidence {
+                lines.push(format!("    evidence: {evidence}"));
+            }
+        }
+    }
+    lines.push(format!("next: {}", item.next_action));
+    for command in &item.approval_options {
+        lines.push(format!("approval: {command}"));
+    }
+    lines.join("\n")
+}
+
 fn render_gated_response(
     resp: &server::ExecuteResponse,
     streamed: bool,
@@ -1486,8 +1225,8 @@ fn render_gated_response(
                 resp.reason
             );
             eprintln!("  handle:  {}", handle);
-            eprintln!("  approve: guard approve {}", handle);
-            eprintln!("  poll:    guard approvals {}", handle);
+            print_access_request_guidance(resp);
+            print_verb_guidance(resp);
             eprintln!("  result:  not executed until approved");
             print_coverage(&resp.coverage);
             std::process::exit(EXIT_GUARD_HELD);
@@ -1553,6 +1292,8 @@ fn render_gated_response(
                     label,
                     resp.reason
                 );
+                print_access_request_guidance(resp);
+                print_verb_guidance(resp);
                 std::process::exit(EXIT_GUARD_DENIED);
             }
         }
@@ -1564,12 +1305,10 @@ pub(crate) async fn handle_gate_action(
     action: &str,
     handle: String,
 ) -> Result<()> {
-    let (client, source) = gate_client(socket);
+    let (client, source) = gate_client(socket, false)?;
     let request = match action {
         "confirm" => server::AdminRequest::Confirm { handle },
         "revert" => server::AdminRequest::Revert { handle },
-        "approve" => server::AdminRequest::Approve { handle },
-        "deny" => server::AdminRequest::Deny { handle },
         _ => unreachable!("unknown gate action"),
     };
     match client
@@ -1611,18 +1350,16 @@ pub(crate) async fn run_mcp(subcommand: McpCommands) -> Result<()> {
         McpCommands::Serve {
             socket,
             tcp_port,
-            token,
             tool_name,
             http,
-            http_token,
         } => {
-            let config = client_config::ClientConfig::load().ok().unwrap_or_default();
+            let config = load_client_config(false)?;
             let (mut socket_path, mut resolved_tcp_port) = resolve_client_endpoint(socket, &config);
             if let Some(port) = tcp_port {
                 socket_path = None;
                 resolved_tcp_port = Some(port);
             }
-            let auth_token = token.or(config.auth_token);
+            let auth_token = resolve_mcp_daemon_token(&config);
             let session_token = std::env::var("GUARD_SESSION")
                 .ok()
                 .filter(|value| !value.is_empty());
@@ -1634,11 +1371,9 @@ pub(crate) async fn run_mcp(subcommand: McpCommands) -> Result<()> {
                 ),
                 None => None,
             };
-            // Bearer source: --http-token wins, else GUARD_MCP_TOKEN. Only
-            // meaningful with --http; validate() rejects --http without a token.
-            let http_token = http_token
-                .filter(|t| !t.is_empty())
-                .or_else(|| guard_env("MCP_TOKEN").filter(|t| !t.is_empty()));
+            // HTTP MCP credentials never enter argv. validate() rejects HTTP
+            // mode unless GUARD_MCP_TOKEN supplies a nonempty bearer.
+            let http_token = guard_env("MCP_TOKEN").filter(|token| !token.is_empty());
 
             let mcp_config = mcp::McpConfig {
                 socket_path,
@@ -1653,6 +1388,10 @@ pub(crate) async fn run_mcp(subcommand: McpCommands) -> Result<()> {
             mcp::serve(mcp_config).await
         }
     }
+}
+
+fn resolve_mcp_daemon_token(config: &client_config::ClientConfig) -> Option<String> {
+    config.auth_token.clone()
 }
 
 /// Where the resolved endpoint came from. Decides the remediation hint
@@ -1854,7 +1593,7 @@ fn absolute_path(path: &str) -> String {
 }
 
 pub(crate) async fn handle_status(socket: Option<String>, json: bool) -> Result<()> {
-    let config = client_config::ClientConfig::load().ok().unwrap_or_default();
+    let config = load_client_config(json)?;
     let (socket_path, tcp_port, source) = resolve_client_endpoint_with_source(socket, &config);
     let client = admin_client(socket_path.clone(), tcp_port, &config);
 
@@ -2038,729 +1777,13 @@ pub(crate) async fn handle_status(socket: Option<String>, json: bool) -> Result<
     }
 }
 
-/// Format a session prompt for `guard session list` output. Without
-/// `full`, prompts longer than 60 chars are ellipsized so the listing
-/// stays terminal-readable; `--full` prints the entire prompt.
-fn format_prompt(prompt: Option<&str>, full: bool) -> String {
-    match prompt {
-        None => "(none)".to_string(),
-        Some(s) if full => format!("\"{}\"", s),
-        Some(s) => {
-            let preview: String = s.chars().take(60).collect();
-            if s.chars().count() > 60 {
-                format!("\"{}...\"", preview)
-            } else {
-                format!("\"{}\"", preview)
-            }
-        }
-    }
-}
-
-fn read_grant_prompt(
-    prompt: Option<String>,
-    prompt_file: Option<&PathBuf>,
-) -> Result<Option<String>> {
-    match prompt_file {
-        Some(path) => Ok(Some(std::fs::read_to_string(path).with_context(|| {
-            format!("failed to read --prompt-file {}", path.display())
-        })?)),
-        None => Ok(prompt),
-    }
-}
-
-/// Parse a `--since` value into an absolute unix-seconds threshold.
-/// Accepts plain integer seconds or simple suffixes: `s`, `m`, `h`, `d`.
-fn parse_since_to_unix(value: &str) -> Result<u64> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!("--since must not be empty");
-    }
-    let (num_part, multiplier) = if let Some(stripped) = trimmed.strip_suffix('s') {
-        (stripped, 1u64)
-    } else if let Some(stripped) = trimmed.strip_suffix('m') {
-        (stripped, 60u64)
-    } else if let Some(stripped) = trimmed.strip_suffix('h') {
-        (stripped, 3600u64)
-    } else if let Some(stripped) = trimmed.strip_suffix('d') {
-        (stripped, 86400u64)
-    } else {
-        (trimmed, 1u64)
-    };
-    let n: u64 = num_part
-        .parse()
-        .with_context(|| format!("invalid --since value: '{}'", value))?;
-    let now = guard::env::now_unix();
-    Ok(now.saturating_sub(n.saturating_mul(multiplier)))
-}
-
-/// Mint a 128-bit session token as 32 lowercase hex chars. Uniqueness
-/// collision is the only failure mode and is statistically irrelevant
-/// at any plausible grant volume.
-fn generate_session_token() -> String {
-    use rand::Rng;
-    let mut bytes = [0u8; 16];
-    rand::rng().fill_bytes(&mut bytes);
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
-fn resolve_session_auto_amend(
-    prose: Option<&str>,
-    auto_amend: bool,
-    no_auto_amend: bool,
-    static_only: bool,
-) -> bool {
-    if static_only || no_auto_amend {
-        false
-    } else {
-        auto_amend || prose.map(|value| !value.trim().is_empty()).unwrap_or(false)
-    }
-}
-
-/// Complete authority-bearing input for `session new`. Keeping the emptiness
-/// predicate on the typed input prevents a newly added flag from minting an
-/// unconfigured bearer because a hand-maintained boolean forgot it.
-#[derive(Clone, Copy)]
-pub(crate) struct SessionAuthorityInput<'a> {
-    pub(crate) prose: &'a Option<String>,
-    pub(crate) saved_grant: &'a Option<String>,
-    pub(crate) allow: &'a [String],
-    pub(crate) deny: &'a [String],
-    pub(crate) activated_verbs: &'a [String],
-    pub(crate) override_markers: &'a [String],
-    pub(crate) ttl: &'a Option<u64>,
-    pub(crate) prompt: &'a Option<String>,
-    pub(crate) evaluation_mode: &'a Option<String>,
-    pub(crate) prompt_file: &'a Option<PathBuf>,
-    pub(crate) static_only: bool,
-    pub(crate) auto_amend: bool,
-    pub(crate) no_auto_amend: bool,
-}
-
-impl SessionAuthorityInput<'_> {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.prose.is_none()
-            && self.saved_grant.is_none()
-            && self.allow.is_empty()
-            && self.deny.is_empty()
-            && self.activated_verbs.is_empty()
-            && self.override_markers.is_empty()
-            && self.ttl.is_none()
-            && self.prompt.is_none()
-            && self.evaluation_mode.is_none()
-            && self.prompt_file.is_none()
-            && !self.static_only
-            && !self.auto_amend
-            && !self.no_auto_amend
-    }
-}
-
-pub(crate) async fn handle_session(subcommand: SessionCommands) -> Result<()> {
-    use crate::grant_profile::EvaluationMode;
-    use std::str::FromStr;
-
-    let config = client_config::ClientConfig::load().ok().unwrap_or_default();
-
-    // `session new` is special: it mints a token before deciding what to
-    // send. If no grant flags are present we just print and exit; otherwise
-    // we send a SessionGrant for the freshly-minted token.
-    if let SessionCommands::New {
-        prose,
-        saved_grant,
-        allow,
-        deny,
-        activated_verbs,
-        override_markers,
-        ttl,
-        prompt,
-        evaluation_mode,
-        prompt_file,
-        static_only,
-        auto_amend,
-        no_auto_amend,
-        owner,
-        socket,
-    } = &subcommand
-    {
-        let token = generate_session_token();
-        let has_grant = !SessionAuthorityInput {
-            prose,
-            saved_grant,
-            allow,
-            deny,
-            activated_verbs,
-            override_markers,
-            ttl,
-            prompt,
-            evaluation_mode,
-            prompt_file,
-            static_only: *static_only,
-            auto_amend: *auto_amend,
-            no_auto_amend: *no_auto_amend,
-        }
-        .is_empty();
-
-        if has_grant {
-            let prompt_append = read_grant_prompt(prompt.clone(), prompt_file.as_ref())?;
-            let auto_amend = resolve_session_auto_amend(
-                prose.as_deref(),
-                *auto_amend,
-                *no_auto_amend,
-                *static_only,
-            );
-
-            let (socket_path, tcp_port, source) =
-                resolve_client_endpoint_with_source(socket.clone(), &config);
-            let client = admin_client(socket_path, tcp_port, &config);
-            let request = server::AdminRequest::SessionGrant {
-                token: token.clone(),
-                allow: allow.clone(),
-                deny: deny.clone(),
-                activated_verbs: activated_verbs.clone(),
-                override_markers: override_markers.clone(),
-                ttl_secs: *ttl,
-                prompt_append,
-                prose: prose.clone(),
-                saved_grant: saved_grant.clone(),
-                profile: None,
-                evaluation_mode: evaluation_mode
-                    .as_deref()
-                    .map(EvaluationMode::from_str)
-                    .transpose()?,
-                static_only: *static_only,
-                auto_amend,
-                owner: owner.clone(),
-            };
-            match client
-                .send_admin(request)
-                .await
-                .map_err(|e| describe_connect_failure(e, &client, source))?
-            {
-                server::AdminResponse::Ok => {}
-                server::AdminResponse::Error { message } => {
-                    eprintln!("error: {}", message);
-                    std::process::exit(1);
-                }
-                other => {
-                    eprintln!("unexpected admin response: {:?}", other);
-                    std::process::exit(1);
-                }
-            }
-        }
-
-        // Eval-friendly export line on stdout; status on stderr so it does
-        // not pollute the captured value.
-        println!("export GUARD_SESSION={}", token);
-        if has_grant {
-            eprintln!("granted session {}", token);
-        } else {
-            eprintln!(
-                "minted session {} (no saved grant installed; issue a saved grant or activate typed verbs before use)",
-                token
-            );
-        }
-        return Ok(());
-    }
-
-    let mut print_full_prompt = false;
-    let mut json_output = false;
-
-    let (socket_override, request) = match subcommand {
-        SessionCommands::New { .. } => unreachable!("handled above"),
-        SessionCommands::Grant {
-            token,
-            prose,
-            allow,
-            deny,
-            activated_verbs,
-            override_markers,
-            ttl,
-            prompt,
-            saved_grant,
-            evaluation_mode,
-            prompt_file,
-            static_only,
-            auto_amend,
-            no_auto_amend,
-            owner,
-            socket,
-        } => {
-            let prompt_append = read_grant_prompt(prompt, prompt_file.as_ref())?;
-            let auto_amend = resolve_session_auto_amend(
-                prose.as_deref(),
-                auto_amend,
-                no_auto_amend,
-                static_only,
-            );
-            (
-                socket,
-                server::AdminRequest::SessionGrant {
-                    token,
-                    allow,
-                    deny,
-                    activated_verbs,
-                    override_markers,
-                    ttl_secs: ttl,
-                    prompt_append,
-                    prose,
-                    saved_grant,
-                    profile: None,
-                    evaluation_mode: evaluation_mode
-                        .as_deref()
-                        .map(EvaluationMode::from_str)
-                        .transpose()?,
-                    static_only,
-                    auto_amend,
-                    owner,
-                },
-            )
-        }
-        SessionCommands::Appeal {
-            token,
-            socket,
-            binary,
-            args,
-        } => (
-            socket,
-            server::AdminRequest::SessionAppeal {
-                token,
-                binary,
-                args,
-            },
-        ),
-        SessionCommands::Revoke { token, socket } => {
-            (socket, server::AdminRequest::SessionRevoke { token })
-        }
-        SessionCommands::Extend { token, ttl, socket } => (
-            socket,
-            server::AdminRequest::SessionExtend {
-                token,
-                ttl_secs: ttl,
-            },
-        ),
-        SessionCommands::Label {
-            token,
-            label,
-            socket,
-        } => (socket, server::AdminRequest::SessionLabel { token, label }),
-        SessionCommands::RevokeMatching {
-            label,
-            saved_grant,
-            socket,
-        } => (
-            socket,
-            server::AdminRequest::SessionRevokeFiltered { label, saved_grant },
-        ),
-        SessionCommands::Show {
-            token,
-            limit,
-            socket,
-            json,
-        } => {
-            json_output = json;
-            let self_token = std::env::var("GUARD_SESSION")
-                .ok()
-                .filter(|value| !value.is_empty());
-            let target = token.or_else(|| self_token.clone()).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "guard session show needs a <token> argument or GUARD_SESSION to be set"
-                )
-            })?;
-            (
-                socket,
-                server::AdminRequest::SessionShow {
-                    token: target,
-                    limit: Some(limit),
-                    caller_token: self_token,
-                },
-            )
-        }
-        SessionCommands::Status {
-            token,
-            socket,
-            json,
-        } => {
-            json_output = json;
-            let self_token = std::env::var("GUARD_SESSION")
-                .ok()
-                .filter(|value| !value.is_empty());
-            let target = token.or_else(|| self_token.clone()).ok_or_else(|| {
-                anyhow::anyhow!("guard session status needs a <token> argument or GUARD_SESSION")
-            })?;
-            (
-                socket,
-                server::AdminRequest::SessionStatus {
-                    token: target,
-                    caller_token: self_token,
-                },
-            )
-        }
-        SessionCommands::List {
-            history,
-            since,
-            full,
-            socket,
-            json,
-        } => {
-            json_output = json;
-            let since_unix = match since.as_deref() {
-                Some(s) => Some(parse_since_to_unix(s)?),
-                None => None,
-            };
-            // --since implies --history; pure --history with no
-            // since shows the entire retention window.
-            let include_history = history || since_unix.is_some();
-            print_full_prompt = full;
-            (
-                socket,
-                server::AdminRequest::SessionList {
-                    include_history,
-                    since_unix,
-                    visible_token: std::env::var("GUARD_SESSION")
-                        .ok()
-                        .filter(|value| !value.is_empty()),
-                },
-            )
-        }
-    };
-
-    let (socket_path, tcp_port, source) =
-        resolve_client_endpoint_with_source(socket_override, &config);
-    let client = admin_client(socket_path, tcp_port, &config);
-
-    match client
-        .send_admin(request)
-        .await
-        .map_err(|e| describe_connect_failure(e, &client, source))?
-    {
-        server::AdminResponse::Ok => {
-            println!("ok");
-        }
-        server::AdminResponse::SessionBulkRevoked { count } => {
-            println!("revoked={count}");
-        }
-        server::AdminResponse::Error { message } => {
-            eprintln!("error: {}", message);
-            std::process::exit(1);
-        }
-        server::AdminResponse::SessionList {
-            mut grants,
-            mut history,
-        } => {
-            if json_output {
-                if !print_full_prompt {
-                    for grant in &mut grants {
-                        truncate_prompt(&mut grant.prompt_append);
-                    }
-                    for entry in &mut history {
-                        truncate_prompt(&mut entry.prompt_append);
-                    }
-                }
-                return print_json(&serde_json::json!({
-                    "schema_version": JSON_SCHEMA_VERSION,
-                    "type": "session_list",
-                    "active": grants,
-                    "history": history,
-                }));
-            }
-            if grants.is_empty() && history.is_empty() {
-                println!("(no session grants)");
-            } else {
-                let color = color_enabled_for_stdout();
-                for g in &grants {
-                    let label = paint("[active]", AnsiColor::Green, color);
-                    println!(
-                        "{} token={} verbs={:?} overrides={:?} mode={} grant={:?} revision={:?} granted_at={} expires_at={} prompt={}",
-                        label,
-                        g.token,
-                        g.activated_verbs,
-                        g.override_markers,
-                        g.scope.evaluation_mode,
-                        g.scope.saved_grant,
-                        g.scope.saved_revision,
-                        format_timestamp(g.granted_at),
-                        format_optional_timestamp(g.expires_at),
-                        format_prompt(g.prompt_append.as_deref(), print_full_prompt),
-                    );
-                }
-                for h in &history {
-                    let label = match h.status {
-                        server::HistoricalStatus::Revoked => {
-                            paint("[revoked]", AnsiColor::Yellow, color)
-                        }
-                        server::HistoricalStatus::Expired => {
-                            paint("[expired]", AnsiColor::Red, color)
-                        }
-                    };
-                    println!(
-                        "{} token={} verbs={:?} overrides={:?} mode={} grant={:?} revision={:?} granted_at={} ended_at={} expires_at={} prompt={}",
-                        label,
-                        h.token,
-                        h.activated_verbs,
-                        h.override_markers,
-                        h.scope.evaluation_mode,
-                        h.scope.saved_grant,
-                        h.scope.saved_revision,
-                        format_timestamp(h.granted_at),
-                        format_timestamp(h.ended_at),
-                        format_optional_timestamp(h.expires_at),
-                        format_prompt(h.prompt_append.as_deref(), print_full_prompt),
-                    );
-                }
-            }
-        }
-        server::AdminResponse::SessionShow { report } => {
-            if json_output {
-                return print_json(&serde_json::json!({
-                    "schema_version": JSON_SCHEMA_VERSION,
-                    "type": "session",
-                    "report": report,
-                }));
-            }
-            if let Some(active) = report.active {
-                println!(
-                    "token={} status=active mode={} grant={:?} revision={:?} granted_at={} expires_at={} verbs={:?} overrides={:?}",
-                    active.token,
-                    active.scope.evaluation_mode,
-                    active.scope.saved_grant,
-                    active.scope.saved_revision,
-                    format_timestamp(active.granted_at),
-                    format_optional_timestamp(active.expires_at),
-                    active.activated_verbs,
-                    active.override_markers,
-                );
-                println!(
-                    "prompt={}",
-                    format_prompt(active.prompt_append.as_deref(), true)
-                );
-                println!("notes={:?}", active.generated_notes);
-            } else {
-                println!("status=inactive");
-            }
-
-            for entry in &report.history {
-                let label = match entry.status {
-                    server::HistoricalStatus::Revoked => "revoked",
-                    server::HistoricalStatus::Expired => "expired",
-                };
-                println!(
-                    "history status={} mode={} grant={:?} revision={:?} granted_at={} ended_at={} expires_at={} verbs={:?} overrides={:?} prompt={}",
-                    label,
-                    entry.scope.evaluation_mode,
-                    entry.scope.saved_grant,
-                    entry.scope.saved_revision,
-                    format_timestamp(entry.granted_at),
-                    format_timestamp(entry.ended_at),
-                    format_optional_timestamp(entry.expires_at),
-                    entry.activated_verbs,
-                    entry.override_markers,
-                    format_prompt(entry.prompt_append.as_deref(), true),
-                );
-            }
-
-            println!(
-                "stats total={} allowed={} denied={} completed={} exec_failed={} dry_run={} not_attempted={}",
-                report.stats.total,
-                report.stats.allowed,
-                report.stats.denied,
-                report.stats.completed,
-                report.stats.exec_failed,
-                report.stats.dry_run,
-                report.stats.not_attempted,
-            );
-            println!(
-                "behavior evaluator_calls={} cache_hits={} holds={} novel_shapes={} novel_shape_rate={}% suspended={}",
-                report.stats.evaluator_calls,
-                report.stats.cache_hits,
-                report.stats.holds,
-                report.stats.novel_shapes,
-                report.stats.novel_shape_rate_percent,
-                report.stats.suspended,
-            );
-            if let Some(reason) = &report.stats.suspension_reason {
-                println!("suspension_reason={reason:?}");
-            }
-            if !report.stats.source_counts.is_empty() {
-                let sources = report
-                    .stats
-                    .source_counts
-                    .iter()
-                    .map(|(source, count)| format!("{source}={count}"))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                println!("sources {}", sources);
-            }
-            let histogram = report
-                .stats
-                .risk_histogram
-                .iter()
-                .enumerate()
-                .filter(|(_, count)| **count > 0)
-                .map(|(risk, count)| format!("{risk}={count}"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            println!(
-                "risk_histogram {}",
-                if histogram.is_empty() {
-                    "(none)".to_string()
-                } else {
-                    histogram
-                }
-            );
-            if report.recent.is_empty() {
-                println!("recent (none)");
-            } else {
-                let color = color_enabled_for_stdout();
-                for interaction in &report.recent {
-                    let exec = match interaction.exec_status {
-                        session::SessionExecStatus::NotAttempted => "not_attempted",
-                        session::SessionExecStatus::Completed => "completed",
-                        session::SessionExecStatus::CompletedAfterApproval => {
-                            "completed_after_approval"
-                        }
-                        session::SessionExecStatus::Failed => "failed",
-                        session::SessionExecStatus::DryRun => "dry_run",
-                        session::SessionExecStatus::Held => "held",
-                        session::SessionExecStatus::Provisional => "provisional",
-                    };
-                    let allowed = if interaction.allowed {
-                        paint("true", AnsiColor::Green, color)
-                    } else {
-                        paint("false", AnsiColor::Red, color)
-                    };
-                    println!(
-                        "recent at={} allowed={} source={:?} risk={} exec={} exit={} exposed_secrets={:?} cmd={:?} reason={:?}",
-                        format_timestamp(interaction.at_unix),
-                        allowed,
-                        interaction.source,
-                        interaction
-                            .risk
-                            .map(|risk| risk.to_string())
-                            .unwrap_or_else(|| "-".to_string()),
-                        exec,
-                        interaction
-                            .exit_code
-                            .map(|code| code.to_string())
-                            .unwrap_or_else(|| "-".to_string()),
-                        interaction.exposed_secret_refs,
-                        interaction.command,
-                        interaction.reason,
-                    );
-                }
-            }
-        }
-        server::AdminResponse::SessionStatus {
-            report,
-            approvals,
-            provisionals,
-            requests,
-        } => {
-            if json_output {
-                return print_json(&serde_json::json!({
-                    "schema_version": JSON_SCHEMA_VERSION,
-                    "type": "session_status",
-                    "report": report,
-                    "approvals": approvals,
-                    "provisionals": provisionals,
-                    "requests": requests,
-                }));
-            }
-            println!(
-                "active={} approvals={} provisionals={} grant_requests={}",
-                report.active.is_some(),
-                approvals.len(),
-                provisionals.len(),
-                requests.len()
-            );
-            for request in requests {
-                println!(
-                    "request={} status={} next={}",
-                    request.handle,
-                    request.status.as_str(),
-                    request.next_action
-                );
-            }
-            for approval in approvals {
-                println!(
-                    "approval={} status={} next=guard approvals {}",
-                    approval.handle, approval.status, approval.handle
-                );
-            }
-            for provisional in provisionals {
-                println!(
-                    "provisional={} status={} next=guard provisionals",
-                    provisional.handle, provisional.status
-                );
-            }
-        }
-        server::AdminResponse::SessionAppeal {
-            allowed,
-            amended,
-            pattern,
-            reason,
-            risk,
-        } => {
-            println!(
-                "allowed={} amended={} risk={} pattern={} reason={}",
-                allowed,
-                amended,
-                risk.map(|value| value.to_string())
-                    .unwrap_or_else(|| "(none)".to_string()),
-                pattern.unwrap_or_else(|| "(none)".to_string()),
-                reason
-            );
-            if !allowed {
-                std::process::exit(1);
-            }
-        }
-        server::AdminResponse::Status { .. }
-        | server::AdminResponse::Ping { .. }
-        | server::AdminResponse::SecretExists { .. }
-        | server::AdminResponse::SecretList { .. }
-        | server::AdminResponse::SecretListDetailed { .. }
-        | server::AdminResponse::KubeconfigIssued { .. }
-        | server::AdminResponse::GateAction { .. }
-        | server::AdminResponse::Provisionals { .. }
-        | server::AdminResponse::Approvals { .. }
-        | server::AdminResponse::ApprovalShow { .. }
-        | server::AdminResponse::Verbs { .. }
-        | server::AdminResponse::VerbCreated { .. }
-        | server::AdminResponse::VerbCoverage { .. }
-        | server::AdminResponse::VerbCoverageCleared { .. }
-        | server::AdminResponse::SavedGrants { .. }
-        | server::AdminResponse::SavedGrant { .. }
-        | server::AdminResponse::SavedGrantRegenerated { .. }
-        | server::AdminResponse::SavedGrantRegenerationProposal { .. }
-        | server::AdminResponse::GrantRequests { .. }
-        | server::AdminResponse::GrantRequest { .. }
-        | server::AdminResponse::EvaluationBatch { .. }
-        | server::AdminResponse::AuditVerification { .. }
-        | server::AdminResponse::AuditRecords { .. } => {
-            // session subcommands never request these response variants.
-            eprintln!("unexpected response from session admin call");
-            std::process::exit(1);
-        }
-    }
-
-    Ok(())
-}
-
-fn truncate_prompt(prompt: &mut Option<String>) {
-    let Some(value) = prompt else {
-        return;
-    };
-    if value.chars().count() > 60 {
-        *value = format!("{}...", value.chars().take(60).collect::<String>());
-    }
-}
-
 pub(crate) async fn handle_config(subcommand: ConfigCommands) -> Result<()> {
     // Surface load errors loudly for every subcommand - this catches the
     // relative-XDG_CONFIG_HOME case that can otherwise fall through silently
     // and risked writing to the default path instead of the intended one.
     match subcommand {
         ConfigCommands::Show { json } => {
-            let config =
-                client_config::ClientConfig::load().context("failed to load client config")?;
+            let config = load_client_config(json)?;
             if json {
                 return print_json(&serde_json::json!({
                     "schema_version": JSON_SCHEMA_VERSION,
@@ -2799,8 +1822,7 @@ pub(crate) async fn handle_config(subcommand: ConfigCommands) -> Result<()> {
             );
         }
         ConfigCommands::SetServer { socket } => {
-            let mut config =
-                client_config::ClientConfig::load().context("failed to load client config")?;
+            let mut config = load_client_config(false)?;
             let socket = normalize_server_socket_value(socket);
             config.server_socket = Some(socket.clone());
             config.server_tcp_port = None;
@@ -2808,30 +1830,26 @@ pub(crate) async fn handle_config(subcommand: ConfigCommands) -> Result<()> {
             println!("Server socket set to {}", socket);
         }
         ConfigCommands::SetPort { port } => {
-            let mut config =
-                client_config::ClientConfig::load().context("failed to load client config")?;
+            let mut config = load_client_config(false)?;
             config.server_tcp_port = Some(port);
             config.server_socket = None;
             config.save()?;
             println!("Server port set");
         }
-        ConfigCommands::SetToken { token } => {
-            let mut config =
-                client_config::ClientConfig::load().context("failed to load client config")?;
-            config.auth_token = Some(token);
+        ConfigCommands::SetToken => {
+            let mut config = load_client_config(false)?;
+            config.auth_token = Some(read_secret_input("Execution token: ")?);
             config.save()?;
             println!("Token set");
         }
-        ConfigCommands::SetAdminToken { token } => {
-            let mut config =
-                client_config::ClientConfig::load().context("failed to load client config")?;
-            config.admin_token = Some(token);
+        ConfigCommands::SetAdminToken => {
+            let mut config = load_client_config(false)?;
+            config.admin_token = Some(read_secret_input("Admin token: ")?);
             config.save()?;
             println!("Admin token set");
         }
         ConfigCommands::SetUser { user } => {
-            let mut config =
-                client_config::ClientConfig::load().context("failed to load client config")?;
+            let mut config = load_client_config(false)?;
             config.default_user = Some(user);
             config.save()?;
             println!("Default user set");
@@ -2855,6 +1873,167 @@ mod tests {
             server_tcp_port: port,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn mcp_resolves_only_the_execution_token() {
+        let config = client_config::ClientConfig {
+            auth_token: Some("configured-exec".to_string()),
+            admin_token: Some("configured-admin".to_string()),
+            ..Default::default()
+        };
+        let auth_token = resolve_mcp_daemon_token(&config);
+        assert_eq!(auth_token.as_deref(), Some("configured-exec"));
+    }
+
+    #[test]
+    fn client_config_errors_use_one_versioned_shape() {
+        let document = client_config_error("malformed client configuration");
+        assert_eq!(document["schema_version"], JSON_SCHEMA_VERSION);
+        assert_eq!(document["type"], "client_config_error");
+        assert_eq!(document["error"]["code"], "invalid_client_config");
+        assert_eq!(
+            document["error"]["message"],
+            "malformed client configuration"
+        );
+        assert_eq!(document.as_object().map(serde_json::Map::len), Some(3));
+    }
+
+    #[test]
+    fn denied_guidance_lists_every_durable_request_exactly() {
+        let response = server::ExecuteResponse {
+            allowed: false,
+            reason: "access required".to_string(),
+            exit_code: None,
+            stdout: None,
+            stderr: None,
+            status: None,
+            handle: Some("legacy-handle".to_string()),
+            approval_options: vec!["legacy approval".to_string()],
+            access_requests: vec![
+                server::AccessRequestGuidance {
+                    reference: "gr-11111111111111111111111111111111".to_string(),
+                    approval_options: vec![
+                        "guard access approve gr-11111111111111111111111111111111".to_string(),
+                        "guard access approve gr-11111111111111111111111111111111 --once"
+                            .to_string(),
+                    ],
+                },
+                server::AccessRequestGuidance {
+                    reference: "gr-22222222222222222222222222222222".to_string(),
+                    approval_options: vec![
+                        "guard access approve gr-22222222222222222222222222222222 --uses 3"
+                            .to_string(),
+                    ],
+                },
+            ],
+            coverage: None,
+            verb_matches: Vec::new(),
+            verb_guidance: Some("request access".to_string()),
+            decision_source: "access_gate".to_string(),
+            decision_trace: None,
+        };
+
+        assert_eq!(
+            access_request_guidance_lines(&response),
+            vec![
+                "request: gr-11111111111111111111111111111111",
+                "approve: guard access approve gr-11111111111111111111111111111111",
+                "approve: guard access approve gr-11111111111111111111111111111111 --once",
+                "inspect: guard access show gr-11111111111111111111111111111111",
+                "request: gr-22222222222222222222222222222222",
+                "approve: guard access approve gr-22222222222222222222222222222222 --uses 3",
+                "inspect: guard access show gr-22222222222222222222222222222222",
+            ]
+        );
+    }
+
+    #[test]
+    fn access_json_errors_use_one_versioned_shape() {
+        for message in [
+            "daemon unavailable",
+            "invalid daemon response",
+            "request rejected",
+            "unexpected access response",
+        ] {
+            let document = access_json_error(message);
+            assert_eq!(document["schema_version"], JSON_SCHEMA_VERSION);
+            assert_eq!(document["type"], "access_error");
+            assert_eq!(document["error"], message);
+            assert_eq!(document.as_object().map(serde_json::Map::len), Some(3));
+        }
+    }
+
+    #[test]
+    fn access_json_response_rejects_daemon_errors_and_unexpected_variants() {
+        let error = access_json_response(&server::AdminResponse::Error {
+            message: "denied by daemon".to_string(),
+        })
+        .unwrap_err();
+        assert_eq!(error, "denied by daemon");
+
+        let error = access_json_response(&server::AdminResponse::Ok).unwrap_err();
+        assert!(error.starts_with("unexpected access response:"));
+    }
+
+    #[test]
+    fn access_json_batch_is_one_document_and_any_failed_item_sets_exit_status() {
+        let response = server::AdminResponse::AccessDecisions {
+            items: vec![
+                server::AccessDecisionResult {
+                    request: "request-ok".to_string(),
+                    success: true,
+                    state: "approved".to_string(),
+                    target: Some("session:one".to_string()),
+                    remaining_uses: Some(1),
+                    use_policy: "bounded".to_string(),
+                    message: "approved".to_string(),
+                },
+                server::AccessDecisionResult {
+                    request: "request-failed".to_string(),
+                    success: false,
+                    state: "failed".to_string(),
+                    target: None,
+                    remaining_uses: None,
+                    use_policy: "unavailable".to_string(),
+                    message: "not found".to_string(),
+                },
+            ],
+        };
+        let document = access_json_response(&response).unwrap();
+        assert_eq!(document["schema_version"], JSON_SCHEMA_VERSION);
+        assert_eq!(document["type"], "access_decisions");
+        assert_eq!(
+            document["response"]["items"].as_array().map(Vec::len),
+            Some(2)
+        );
+        assert!(access_decision_failed(&response));
+
+        let all_failed = server::AdminResponse::AccessDecisions {
+            items: vec![server::AccessDecisionResult {
+                request: "request-failed".to_string(),
+                success: false,
+                state: "failed".to_string(),
+                target: None,
+                remaining_uses: None,
+                use_policy: "unavailable".to_string(),
+                message: "not found".to_string(),
+            }],
+        };
+        assert!(access_decision_failed(&all_failed));
+
+        let all_succeeded = server::AdminResponse::AccessDecisions {
+            items: vec![server::AccessDecisionResult {
+                request: "request-ok".to_string(),
+                success: true,
+                state: "approved".to_string(),
+                target: Some("session:one".to_string()),
+                remaining_uses: None,
+                use_policy: "unlimited".to_string(),
+                message: "approved".to_string(),
+            }],
+        };
+        assert!(!access_decision_failed(&all_succeeded));
     }
 
     #[test]
@@ -2999,6 +2178,8 @@ mod tests {
             stderr: Some("err".to_string()),
             status: Some(server::GateStatus::Executed),
             handle: None,
+            approval_options: Vec::new(),
+            access_requests: Vec::new(),
             coverage: None,
             verb_matches: Vec::new(),
             verb_guidance: None,
@@ -3019,37 +2200,5 @@ mod tests {
         assert_eq!(envelope["response"]["exit_code"], 75);
         assert_eq!(envelope["response"]["stdout"], "out");
         assert_eq!(envelope["response"]["stderr"], "err");
-    }
-
-    #[test]
-    fn json_session_list_prompt_truncation_matches_human_default() {
-        let mut prompt = Some("x".repeat(61));
-        truncate_prompt(&mut prompt);
-        assert_eq!(prompt, Some(format!("{}...", "x".repeat(60))));
-
-        let mut short = Some("short".to_string());
-        truncate_prompt(&mut short);
-        assert_eq!(short.as_deref(), Some("short"));
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn kubeconfig_output_is_private_and_replaced_without_following_symlinks() {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-        let temp = tempfile::tempdir().unwrap();
-        let output = temp.path().join("guard.kubeconfig");
-        write_client_private_file(&output, b"first").unwrap();
-        let first = std::fs::metadata(&output).unwrap();
-        assert_eq!(first.permissions().mode() & 0o777, 0o600);
-        assert_eq!(first.uid(), unsafe { libc::geteuid() });
-
-        let victim = temp.path().join("victim");
-        std::fs::write(&victim, "unchanged").unwrap();
-        std::fs::remove_file(&output).unwrap();
-        std::os::unix::fs::symlink(&victim, &output).unwrap();
-        write_client_private_file(&output, b"replacement").unwrap();
-        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "unchanged");
-        assert_eq!(std::fs::read_to_string(&output).unwrap(), "replacement");
     }
 }

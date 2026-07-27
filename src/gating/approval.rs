@@ -98,6 +98,14 @@ pub struct ApprovalSnapshot {
     pub verb_name: Option<String>,
     pub verb_params: BTreeMap<String, String>,
     pub catalog_version: Option<u64>,
+    /// Session-scoped access verbs selected when this immutable hold was
+    /// created. Approval consumes their original bounded authority.
+    #[serde(default)]
+    pub access_verbs: Vec<String>,
+    /// Exact access-request IDs selected without consumption when the hold was
+    /// created. Replay may consume only this bound set.
+    #[serde(default)]
+    pub access_requests: Vec<String>,
     /// Principal of the original caller, to reconstruct exec identity.
     /// Deserializes from the legacy numeric `caller_uid` form so rows written by
     /// an older daemon survive an upgrade.
@@ -311,7 +319,7 @@ impl ApprovalRegistry {
     /// Operator approves: `Pending` -> `Approving`. Returns the immutable
     /// snapshot for the daemon to execute. No fields are accepted from the
     /// approver; exec replays the snapshot verbatim.
-    pub fn begin_approve(&mut self, handle: &str) -> Result<ApprovalSnapshot, GateError> {
+    pub fn begin_approve(&mut self, handle: &str, now: u64) -> Result<ApprovalSnapshot, GateError> {
         let a = self
             .items
             .get_mut(handle)
@@ -320,6 +328,16 @@ impl ApprovalRegistry {
             return Err(GateError::WrongState {
                 handle: handle.to_string(),
                 detail: format!("already {}", a.status.as_str()),
+            });
+        }
+        if now >= a.deadline_unix() {
+            a.status = ApprovalStatus::Expired;
+            a.decided_unix = Some(now);
+            a.decided_reason = Some("expired without operator approval".to_string());
+            self.wake(handle);
+            return Err(GateError::WrongState {
+                handle: handle.to_string(),
+                detail: "expired without operator approval".to_string(),
             });
         }
         a.status = ApprovalStatus::Approving;
@@ -355,6 +373,70 @@ impl ApprovalRegistry {
         self.wake(handle);
     }
 
+    /// Build a note transition without changing registry state or waking a
+    /// waiter. The server persists the returned row with an exact CAS, then
+    /// installs it through [`Self::install_persisted`].
+    pub fn prepare_note(
+        &self,
+        handle: &str,
+        author: &str,
+        text: &str,
+        now: u64,
+    ) -> Result<Approval, GateError> {
+        let mut approval = self
+            .items
+            .get(handle)
+            .cloned()
+            .ok_or_else(|| GateError::NotFound(handle.to_string()))?;
+        if approval.status != ApprovalStatus::Pending {
+            return Err(GateError::WrongState {
+                handle: handle.to_string(),
+                detail: format!("already {}; its thread is closed", approval.status.as_str()),
+            });
+        }
+        approval.notes.push(ApprovalNote {
+            at_unix: now,
+            author: author.to_string(),
+            text: text.to_string(),
+        });
+        Ok(approval)
+    }
+
+    /// Build a denial without changing registry state or waking its waiter.
+    pub fn prepare_denial(
+        &self,
+        handle: &str,
+        now: u64,
+        reason: String,
+    ) -> Result<Approval, GateError> {
+        let mut approval = self
+            .items
+            .get(handle)
+            .cloned()
+            .ok_or_else(|| GateError::NotFound(handle.to_string()))?;
+        if approval.status != ApprovalStatus::Pending {
+            return Err(GateError::WrongState {
+                handle: handle.to_string(),
+                detail: format!("already {}", approval.status.as_str()),
+            });
+        }
+        approval.status = ApprovalStatus::Denied;
+        approval.decided_unix = Some(now);
+        approval.decided_reason = Some(reason);
+        Ok(approval)
+    }
+
+    /// Install a row after its durable transition commits. Existing notifier
+    /// identity is preserved; terminal transitions wake the waiter only after
+    /// SQLite is authoritative.
+    pub fn install_persisted(&mut self, approval: Approval, wake: bool) {
+        let handle = approval.handle.clone();
+        self.items.insert(handle.clone(), approval);
+        if wake {
+            self.wake(&handle);
+        }
+    }
+
     /// Append a note to a pending hold's discussion thread. Allowed only while
     /// the hold is undecided; a decided hold's thread is frozen. The caller
     /// (server) authorizes who may post (operator or the hold's requester).
@@ -365,40 +447,15 @@ impl ApprovalRegistry {
         text: &str,
         now: u64,
     ) -> Result<(), GateError> {
-        let a = self
-            .items
-            .get_mut(handle)
-            .ok_or_else(|| GateError::NotFound(handle.to_string()))?;
-        if !a.status.is_pending() {
-            return Err(GateError::WrongState {
-                handle: handle.to_string(),
-                detail: format!("already {}; its thread is closed", a.status.as_str()),
-            });
-        }
-        a.notes.push(ApprovalNote {
-            at_unix: now,
-            author: author.to_string(),
-            text: text.to_string(),
-        });
+        let approval = self.prepare_note(handle, author, text, now)?;
+        self.install_persisted(approval, false);
         Ok(())
     }
 
     /// Operator denies a pending hold and wakes any waiter.
     pub fn deny(&mut self, handle: &str, now: u64, reason: String) -> Result<(), GateError> {
-        let a = self
-            .items
-            .get_mut(handle)
-            .ok_or_else(|| GateError::NotFound(handle.to_string()))?;
-        if !a.status.is_pending() {
-            return Err(GateError::WrongState {
-                handle: handle.to_string(),
-                detail: format!("already {}", a.status.as_str()),
-            });
-        }
-        a.status = ApprovalStatus::Denied;
-        a.decided_unix = Some(now);
-        a.decided_reason = Some(reason);
-        self.wake(handle);
+        let approval = self.prepare_denial(handle, now, reason)?;
+        self.install_persisted(approval, true);
         Ok(())
     }
 
@@ -468,6 +525,8 @@ mod tests {
             verb_name: None,
             verb_params: BTreeMap::new(),
             catalog_version: None,
+            access_verbs: Vec::new(),
+            access_requests: Vec::new(),
             principal: Some(PrincipalKey::from_uid(1001)),
             secret_binding: None,
         }
@@ -497,7 +556,7 @@ mod tests {
     fn approve_executes_from_snapshot_only() {
         let mut r = ApprovalRegistry::new();
         r.enqueue(held("h1", 100, 3600));
-        let snap = r.begin_approve("h1").unwrap();
+        let snap = r.begin_approve("h1", 1).unwrap();
         assert_eq!(snap.binary, "rm");
         assert_eq!(r.get("h1").unwrap().status, ApprovalStatus::Approving);
         r.set_result("h1", 200, Some(0), Some("done".into()), None);
@@ -510,9 +569,9 @@ mod tests {
     fn cannot_approve_twice() {
         let mut r = ApprovalRegistry::new();
         r.enqueue(held("h1", 100, 3600));
-        r.begin_approve("h1").unwrap();
+        r.begin_approve("h1", 1).unwrap();
         assert!(matches!(
-            r.begin_approve("h1"),
+            r.begin_approve("h1", 1),
             Err(GateError::WrongState { .. })
         ));
     }
@@ -523,7 +582,27 @@ mod tests {
         r.enqueue(held("h1", 100, 3600));
         r.deny("h1", 150, "operator rejected".into()).unwrap();
         assert_eq!(r.get("h1").unwrap().status, ApprovalStatus::Denied);
-        assert!(r.begin_approve("h1").is_err());
+        assert!(r.begin_approve("h1", 1).is_err());
+    }
+
+    #[test]
+    fn notes_and_denial_accept_exactly_pending() {
+        let mut registry = ApprovalRegistry::new();
+        registry.enqueue(held("claimed", 100, 3600));
+        registry.begin_approve("claimed", 150).unwrap();
+
+        assert!(matches!(
+            registry.add_note("claimed", "operator", "late note", 151),
+            Err(GateError::WrongState { .. })
+        ));
+        assert!(matches!(
+            registry.deny("claimed", 151, "late denial".to_string()),
+            Err(GateError::WrongState { .. })
+        ));
+        assert_eq!(
+            registry.get("claimed").unwrap().status,
+            ApprovalStatus::Approving
+        );
     }
 
     #[test]
@@ -535,6 +614,19 @@ mod tests {
         assert_eq!(expired, vec!["h1".to_string()]);
         assert_eq!(r.get("h1").unwrap().status, ApprovalStatus::Expired);
         assert_eq!(r.get("h2").unwrap().status, ApprovalStatus::Pending);
+    }
+
+    #[test]
+    fn approval_checks_deadline_even_before_the_sweeper_runs() {
+        let mut registry = ApprovalRegistry::new();
+        registry.enqueue(held("expired", 100, 50));
+        assert!(matches!(
+            registry.begin_approve("expired", 150),
+            Err(GateError::WrongState { .. })
+        ));
+        let expired = registry.get("expired").unwrap();
+        assert_eq!(expired.status, ApprovalStatus::Expired);
+        assert_eq!(expired.decided_unix, Some(150));
     }
 
     #[test]

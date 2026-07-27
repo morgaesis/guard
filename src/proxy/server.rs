@@ -1750,6 +1750,9 @@ impl ApiProxy {
                     ));
                 }
             };
+            if let Some(reason) = self.protocol.reject_misleading_redaction(&value) {
+                return Ok(self.status_resp(StatusCode::FORBIDDEN, &reason, "Forbidden"));
+            }
             let n = self.protocol.redact_response(&mut value);
             tracing::info!(target: "guard::apiproxy", "redacted {n} Secret object(s) on {path}");
             let out = serde_json::to_vec(&value).context("re-serialize redacted Secret")?;

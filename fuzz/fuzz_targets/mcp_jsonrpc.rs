@@ -2,10 +2,10 @@
 
 //! Fuzz the MCP server's untrusted input: JSON-RPC envelope extraction and
 //! the typed tool-argument shapes (`tools/call` params, guard_run arguments,
-//! batch evaluation, session status).
+//! batch evaluation, and access inspection).
 
 use guard::wire::mcp::{
-    parse_jsonrpc_envelope, EvaluateBatchArgs, GuardToolArgs, SessionStatusArgs, ToolCallParams,
+    parse_jsonrpc_envelope, AccessShowArgs, EvaluateBatchArgs, GuardToolArgs, ToolCallParams,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -24,12 +24,12 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(call) = serde_json::from_value::<ToolCallParams>(envelope.params.clone()) {
         let _ = serde_json::from_value::<GuardToolArgs>(call.arguments.clone());
         let _ = serde_json::from_value::<EvaluateBatchArgs>(call.arguments.clone());
-        let _ = serde_json::from_value::<SessionStatusArgs>(call.arguments);
+        let _ = serde_json::from_value::<AccessShowArgs>(call.arguments);
     }
 
     // Clients also send malformed params directly; every typed shape must
     // reject them without panicking.
     let _ = serde_json::from_value::<GuardToolArgs>(envelope.params.clone());
     let _ = serde_json::from_value::<EvaluateBatchArgs>(envelope.params.clone());
-    let _ = serde_json::from_value::<SessionStatusArgs>(envelope.params);
+    let _ = serde_json::from_value::<AccessShowArgs>(envelope.params);
 });

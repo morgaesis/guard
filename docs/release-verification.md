@@ -26,7 +26,7 @@ workflow from a specific commit, not modified after upload:
 
 ```sh
 gh attestation verify guard-v1.2.3-x86_64-unknown-linux-gnu.tar.gz \
-  --repo morgaesis/ssh-guard
+  --repo morgaesis/guard
 ```
 
 The command exits non-zero if the artifact has no matching attestation or

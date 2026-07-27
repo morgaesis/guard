@@ -7,6 +7,7 @@ use crate::session::SessionGrant;
 use guard::evaluate::{EvalConfig, Evaluator};
 use guard::gating::verb::VerbCatalog;
 use guard::gating::GateMode;
+use guard::principal::PrincipalKey;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -144,9 +145,15 @@ verbs:
     assert_eq!(without_marker.verb_matches.len(), 2);
     assert!(without_marker.verb_guidance.is_some());
 
-    cfg.state.sessions.write().await.grant(
-        "typed".to_string(),
-        grant(vec!["operator:apply".to_string()]),
+    assert_eq!(
+        cfg.state.sessions.write().await.apply_delta(
+            "typed",
+            &crate::grant_profile::GrantRequestDelta {
+                override_markers: vec!["operator:apply".to_string()],
+                ..crate::grant_profile::GrantRequestDelta::default()
+            },
+        ),
+        Some(true)
     );
     let with_marker = execute_command(
         raw_request("true", &["apply"], Some("typed")),
@@ -551,4 +558,66 @@ async fn verb_list_reports_staleness_corrected_trust_and_provenance() {
     let hand = by_name("hand-authored");
     assert!(hand.trusted, "a hand-authored verb has no staleness expiry");
     assert!(!hand.auto_promoted);
+}
+
+#[tokio::test]
+async fn non_operator_verb_reads_expose_only_the_sanitized_menu() {
+    let (mut cfg, _buf) = make_test_config();
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: inspect-fixture
+    description: Inspect one fixture
+    binary: fixturectl
+    args: ["show", "{target}"]
+    params:
+      target: { pattern: "^[a-z0-9-]+$" }
+    consequence: reversible
+    trusted: true
+    evidence: operator-only provenance
+"#,
+        )
+        .unwrap(),
+    ));
+
+    let response = handle_admin_request(
+        &cfg,
+        &CallerIdentity::Unix { uid: 1001 },
+        AdminRequest::VerbList,
+    )
+    .await;
+    let AdminResponse::VerbMenu { items } = &response else {
+        panic!("non-operator must receive a sanitized verb menu: {response:?}");
+    };
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].name, "inspect-fixture");
+    assert_eq!(items[0].params, vec!["target"]);
+    let encoded = serde_json::to_string(&response).unwrap();
+    for private in [
+        "fixturectl",
+        "^[a-z0-9-]+$",
+        "operator-only provenance",
+        "trusted",
+        "coverage",
+        "credential_plan",
+    ] {
+        assert!(!encoded.contains(private), "leaked {private}: {encoded}");
+    }
+
+    assert!(AdminRequest::VerbShow {
+        name: "inspect-fixture".to_string()
+    }
+    .requires_daemon_uid());
+    assert!(matches!(
+        handle_admin_request(
+            &cfg,
+            &CallerIdentity::Unix { uid: 777 },
+            AdminRequest::VerbList,
+        )
+        .await,
+        AdminResponse::Verbs { .. }
+    ));
 }

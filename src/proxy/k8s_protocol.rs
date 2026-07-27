@@ -104,6 +104,13 @@ impl ProtocolConfig for KubernetesProtocol {
         k8s::redact_secret_response(value)
     }
 
+    fn reject_misleading_redaction(&self, value: &Value) -> Option<String> {
+        k8s::contains_helm_release_secret(value).then(|| {
+            "guard api-proxy: Helm release storage is unavailable through filtered Secret reads; use an operator-approved typed Helm verb with the daemon-owned kubeconfig"
+                .to_string()
+        })
+    }
+
     fn error_body(&self, code: u16, message: &str, reason: &str) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
             "kind": "Status",

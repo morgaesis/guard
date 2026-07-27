@@ -1642,7 +1642,7 @@ async fn spawn_truncated_cleanup_mock() -> String {
 async fn start_provenance_proxy(
     mock_base: String,
     session_sink: Option<Arc<dyn ApiSessionSink>>,
-) -> (String, reqwest::Client, RecordingSink) {
+) -> (SingleConnectionClient, RecordingSink) {
     let upstream =
         Upstream::from_kubeconfig_str(&kubeconfig_for(&mock_base), None).expect("upstream");
     let tls = ProxyTls::generate().expect("tls");
@@ -1656,11 +1656,72 @@ async fn start_provenance_proxy(
         proxy.attach_session_sink(session_sink);
     }
     tokio::spawn(proxy.serve_on(listener));
-    let client = reqwest::Client::builder()
-        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
-        .build()
-        .unwrap();
-    (format!("https://{listen}"), client, sink)
+    let client = SingleConnectionClient::connect(listen, &ca_pem).await;
+    (client, sink)
+}
+
+struct SingleConnectionClient {
+    sender: hyper::client::conn::http2::SendRequest<Full<Bytes>>,
+    authority: String,
+}
+
+impl SingleConnectionClient {
+    async fn connect(listen: std::net::SocketAddr, ca_pem: &str) -> Self {
+        let ca_der = base64::engine::general_purpose::STANDARD
+            .decode(
+                ca_pem
+                    .lines()
+                    .filter(|line| !line.starts_with("-----"))
+                    .collect::<String>(),
+            )
+            .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(pki_types::CertificateDer::from(ca_der)).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut tls_config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        tls_config.alpn_protocols = vec![b"h2".to_vec()];
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+        let tcp = tokio::net::TcpStream::connect(listen).await.unwrap();
+        let server_name = pki_types::ServerName::try_from("127.0.0.1")
+            .unwrap()
+            .to_owned();
+        let tls_stream = connector.connect(server_name, tcp).await.unwrap();
+        let (sender, connection) =
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls_stream))
+                .await
+                .unwrap();
+        tokio::spawn(async move { connection.await.unwrap() });
+        Self {
+            sender,
+            authority: listen.to_string(),
+        }
+    }
+
+    async fn request(
+        &mut self,
+        method: hyper::Method,
+        path: &str,
+        bearer: Option<&str>,
+        body: Option<&str>,
+    ) -> hyper::StatusCode {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(format!("https://{}{}", self.authority, path));
+        if let Some(bearer) = bearer {
+            builder = builder.header("authorization", format!("Bearer {bearer}"));
+        }
+        let request = builder
+            .body(Full::new(Bytes::from(body.unwrap_or_default().to_string())))
+            .unwrap();
+        let response = self.sender.send_request(request).await.unwrap();
+        let status = response.status();
+        response.into_body().collect().await.unwrap();
+        status
+    }
 }
 
 /// A delete of a resource guard itself created earlier in the session is
@@ -1670,56 +1731,32 @@ async fn start_provenance_proxy(
 /// resource with no creation record keeps the strict policy handling (hold).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proxy_allows_contained_delete_of_created_resource() {
-    let mock_base = spawn_create_delete_mock().await;
-    let kubeconfig = format!(
-        "apiVersion: v1\nkind: Config\ncurrent-context: ctx\nclusters:\n  - name: c\n    cluster: {{server: \"{mock_base}\"}}\ncontexts:\n  - name: ctx\n    context: {{cluster: c, user: u}}\nusers:\n  - name: u\n    user: {{}}\n"
-    );
-    let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
-    let tls = ProxyTls::generate().expect("tls");
-    let ca_pem = tls.ca_pem().to_string();
-    let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).expect("policy");
-    let (listener, listen) = reserve_listener().await;
-    let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
-
-    let sink = RecordingSink::default();
-    proxy.attach_gate(Arc::new(sink.clone()));
-
-    tokio::spawn(proxy.clone().serve_on(listener));
-
-    let base = format!("https://{listen}");
-    let client = reqwest::Client::builder()
-        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
-        .build()
-        .unwrap();
+    let (mut client, sink) = start_provenance_proxy(spawn_create_delete_mock().await, None).await;
 
     // This test's assertions depend on all four requests landing on the same
-    // proxy connection (provenance is connection-scoped by design). reqwest is
-    // built without the http2 feature, so these negotiate HTTP/1.1, and hyper
-    // only returns a connection to the client's pool once its response body has
-    // been fully read; leaving a body unread lets the next request race a
-    // background drain and, under a loaded scheduler, open a fresh connection
-    // instead of reusing the idle one. Reading each body with `.bytes()` before
-    // issuing the next request forces that handoff to complete synchronously.
+    // proxy connection because provenance is connection-scoped. The dedicated
+    // HTTP/2 client owns one TLS connection and drains every response body.
 
     // A delete with no creation record is held for operator approval (strict).
-    let resp = client
-        .delete(format!("{base}/api/v1/namespaces/dev/pods/other-pod"))
-        .send()
-        .await
-        .unwrap();
-    let status = resp.status();
-    resp.bytes().await.unwrap();
+    let status = client
+        .request(
+            hyper::Method::DELETE,
+            "/api/v1/namespaces/dev/pods/other-pod",
+            None,
+            None,
+        )
+        .await;
     assert_eq!(status, 403, "delete of an unrecorded resource stays held");
 
     // Create a resource through the proxy; guard records its provenance.
-    let resp = client
-        .post(format!("{base}/api/v1/namespaces/dev/pods"))
-        .body("{}")
-        .send()
-        .await
-        .unwrap();
-    let status = resp.status();
-    resp.bytes().await.unwrap();
+    let status = client
+        .request(
+            hyper::Method::POST,
+            "/api/v1/namespaces/dev/pods",
+            None,
+            Some("{}"),
+        )
+        .await;
     assert_eq!(status, 201, "create forwarded");
     wait_until("the create to arm exactly one revert", || {
         sink.calls.lock().unwrap().len() == 1
@@ -1727,13 +1764,14 @@ async fn proxy_allows_contained_delete_of_created_resource() {
     .await;
 
     // Deleting that same resource is now contained cleanup: allowed and forwarded.
-    let resp = client
-        .delete(format!("{base}/api/v1/namespaces/dev/pods/check-pod"))
-        .send()
-        .await
-        .unwrap();
-    let status = resp.status();
-    resp.bytes().await.unwrap();
+    let status = client
+        .request(
+            hyper::Method::DELETE,
+            "/api/v1/namespaces/dev/pods/check-pod",
+            None,
+            None,
+        )
+        .await;
     assert_eq!(
         status, 200,
         "delete of a guard-created resource is contained and allowed"
@@ -1752,14 +1790,16 @@ async fn proxy_allows_contained_delete_of_created_resource() {
 
     // Provenance is single-use: a second delete of the same name has no record
     // and falls back to the strict hold.
-    let resp = client
-        .delete(format!("{base}/api/v1/namespaces/dev/pods/check-pod"))
-        .send()
-        .await
-        .unwrap();
+    let status = client
+        .request(
+            hyper::Method::DELETE,
+            "/api/v1/namespaces/dev/pods/check-pod",
+            None,
+            None,
+        )
+        .await;
     assert_eq!(
-        resp.status(),
-        403,
+        status, 403,
         "provenance is consumed; a repeat delete is held again"
     );
 }
@@ -1768,37 +1808,46 @@ async fn proxy_allows_contained_delete_of_created_resource() {
 async fn contained_delete_retains_revert_on_transport_4xx_and_5xx_failures() {
     for (first, expected) in [(Some(404), 404), (Some(503), 503), (None, 502)] {
         let mock = spawn_failing_create_delete_mock(VecDeque::from([first, Some(200)])).await;
-        let (base, client, sink) = start_provenance_proxy(mock, None).await;
+        let (mut client, sink) = start_provenance_proxy(mock, None).await;
 
-        let response = client
-            .post(format!("{base}/api/v1/namespaces/dev/pods"))
-            .body("{}")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), 201);
-        response.bytes().await.unwrap();
+        assert_eq!(
+            client
+                .request(
+                    hyper::Method::POST,
+                    "/api/v1/namespaces/dev/pods",
+                    None,
+                    Some("{}"),
+                )
+                .await,
+            201
+        );
 
-        let response = client
-            .delete(format!("{base}/api/v1/namespaces/dev/pods/check-pod"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status().as_u16(), expected);
-        response.bytes().await.unwrap();
+        let status = client
+            .request(
+                hyper::Method::DELETE,
+                "/api/v1/namespaces/dev/pods/check-pod",
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(status.as_u16(), expected);
         assert!(
             sink.resolved.lock().unwrap().is_empty(),
             "failed cleanup must retain its armed revert"
         );
 
         if first.is_some() {
-            let response = client
-                .delete(format!("{base}/api/v1/namespaces/dev/pods/check-pod"))
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(response.status(), 200);
-            response.bytes().await.unwrap();
+            assert_eq!(
+                client
+                    .request(
+                        hyper::Method::DELETE,
+                        "/api/v1/namespaces/dev/pods/check-pod",
+                        None,
+                        None,
+                    )
+                    .await,
+                200
+            );
             assert_eq!(
                 sink.resolved.lock().unwrap().len(),
                 1,
@@ -1814,66 +1863,81 @@ async fn contained_delete_retains_revert_when_session_expires_before_forward() {
     let session_sink = BudgetSessionSink {
         remaining_resolutions: remaining.clone(),
     };
-    let (base, client, sink) = start_provenance_proxy(
+    let (mut client, sink) = start_provenance_proxy(
         spawn_create_delete_mock().await,
         Some(Arc::new(session_sink)),
     )
     .await;
 
-    let response = client
-        .post(format!("{base}/api/v1/namespaces/dev/pods"))
-        .bearer_auth("budget-session")
-        .body("{}")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 201);
-    response.bytes().await.unwrap();
+    assert_eq!(
+        client
+            .request(
+                hyper::Method::POST,
+                "/api/v1/namespaces/dev/pods",
+                Some("budget-session"),
+                Some("{}"),
+            )
+            .await,
+        201
+    );
 
     remaining.store(1, Ordering::SeqCst);
-    let response = client
-        .delete(format!("{base}/api/v1/namespaces/dev/pods/check-pod"))
-        .bearer_auth("budget-session")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 403);
-    response.bytes().await.unwrap();
+    assert_eq!(
+        client
+            .request(
+                hyper::Method::DELETE,
+                "/api/v1/namespaces/dev/pods/check-pod",
+                Some("budget-session"),
+                None,
+            )
+            .await,
+        403
+    );
     assert!(sink.resolved.lock().unwrap().is_empty());
 
     remaining.store(2, Ordering::SeqCst);
-    let response = client
-        .delete(format!("{base}/api/v1/namespaces/dev/pods/check-pod"))
-        .bearer_auth("budget-session")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 200);
-    response.bytes().await.unwrap();
+    assert_eq!(
+        client
+            .request(
+                hyper::Method::DELETE,
+                "/api/v1/namespaces/dev/pods/check-pod",
+                Some("budget-session"),
+                None,
+            )
+            .await,
+        200
+    );
     assert_eq!(sink.resolved.lock().unwrap().len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn contained_delete_retains_revert_when_a_2xx_body_disconnects() {
-    let (base, client, sink) =
+    let (mut client, sink) =
         start_provenance_proxy(spawn_truncated_cleanup_mock().await, None).await;
 
-    let response = client
-        .post(format!("{base}/api/v1/namespaces/dev/pods"))
-        .body("{}")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 201);
-    response.bytes().await.unwrap();
+    assert_eq!(
+        client
+            .request(
+                hyper::Method::POST,
+                "/api/v1/namespaces/dev/pods",
+                None,
+                Some("{}"),
+            )
+            .await,
+        201
+    );
 
-    let response = client
-        .delete(format!("{base}/api/v1/namespaces/dev/pods/check-pod"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 502);
-    response.bytes().await.unwrap();
+    assert_eq!(
+        client
+            .request(
+                hyper::Method::DELETE,
+                "/api/v1/namespaces/dev/pods/check-pod",
+                None,
+                None,
+            )
+            .await,
+        502
+    );
     assert!(
         sink.resolved.lock().unwrap().is_empty(),
         "a truncated 2xx cleanup response must retain its revert"
@@ -2163,13 +2227,12 @@ async fn spawn_helm_release_mock() -> String {
     format!("http://{addr}")
 }
 
-/// Regression test: reading Helm's release-storage Secret must return a
-/// redacted-but-successful response. The opaque `data.release` blob is not a
-/// type the proxy can parse, so redaction masks it by default rather than
-/// hard-erroring the whole response -- otherwise `helm list`/`status`/`upgrade`,
-/// which read this Secret, would all fail.
+/// Regression test: a filtered Helm release-storage Secret must fail explicitly.
+/// Helm skips release records whose `data.release` payload cannot be decoded,
+/// so a successful response with that field removed can look like an
+/// authoritative empty release inventory.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn proxy_redacts_helm_release_secret_without_erroring() {
+async fn proxy_rejects_helm_release_secret_instead_of_returning_false_empty_state() {
     let mock_base = spawn_helm_release_mock().await;
     let kubeconfig = format!(
         "apiVersion: v1\nkind: Config\ncurrent-context: ctx\nclusters:\n  - name: c\n    cluster: {{server: \"{mock_base}\"}}\ncontexts:\n  - name: ctx\n    context: {{cluster: c, user: u}}\nusers:\n  - name: u\n    user: {{}}\n"
@@ -2196,21 +2259,12 @@ async fn proxy_redacts_helm_release_secret_without_erroring() {
         .send()
         .await
         .expect("helm release secret read");
-    assert_eq!(
-        resp.status(),
-        200,
-        "reading the Helm release Secret must succeed, not error on the opaque blob"
-    );
+    assert_eq!(resp.status(), 403);
     let v: Value = resp.json().await.unwrap();
-    assert!(
-        v.get("data").is_none(),
-        "the opaque release blob is redacted"
-    );
-    assert_eq!(
-        v["type"], "helm.sh/release.v1",
-        "the release Secret type survives so helm can identify it"
-    );
-    assert_eq!(v["metadata"]["labels"]["owner"], "helm");
+    assert_eq!(v["status"], "Failure");
+    assert_eq!(v["reason"], "Forbidden");
+    assert!(v["message"].as_str().unwrap().contains("typed Helm verb"));
+    assert!(!v.to_string().contains("SDRzSUFB"));
 }
 
 /// Gate sink standing in for the daemon's approval queue with an operator who

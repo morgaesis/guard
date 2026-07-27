@@ -2,6 +2,7 @@
 name: Release
 
 "on":
+  workflow_call:
   push:
     tags:
       - "v*.*.*"
@@ -15,6 +16,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  RELEASE_LABEL: ${{ github.event_name == 'pull_request' && 'ci' || github.ref_name }}
 
 jobs:
   test:
@@ -24,12 +26,14 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           persist-credentials: false
+          fetch-depth: 0
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659  # v1.17.0
         with:
           cache: false
           rustflags: ""
       - name: Verify signed annotated tag and Cargo version
+        if: startsWith(github.ref, 'refs/tags/')
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -50,6 +54,22 @@ jobs:
             echo "release tag signature is not verified"
             exit 1
           }
+          git fetch --no-tags origin main
+          tag_commit=$(git rev-list -n 1 "$RELEASE_TAG")
+          git merge-base --is-ancestor "$tag_commit" origin/main || {
+            echo "release tag commit is not reachable from origin/main"
+            exit 1
+          }
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/commits/${tag_commit}" --jq '.commit.verification.verified')" = true || {
+            echo "release commit signature is not verified"
+            exit 1
+          }
+          check_runs=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${tag_commit}/check-runs?per_page=100")
+          jq -e '[.check_runs[] | select(.name == "Test & Lint" and .conclusion == "success")] | length > 0' \
+            <<< "$check_runs" >/dev/null || {
+            echo "required Test & Lint check did not pass for the release commit"
+            exit 1
+          }
       - name: Run tests
         run: cargo test
 
@@ -63,16 +83,13 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             artifact_name: guard
-            asset_name: guard-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             artifact_name: guard
-            asset_name: guard-${{ github.ref_name }}-aarch64-unknown-linux-gnu.tar.gz
             use_cross: true
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             artifact_name: guard.exe
-            asset_name: guard-${{ github.ref_name }}-x86_64-pc-windows-msvc.tar.gz
           # - target: x86_64-apple-darwin
           #   os: macos-latest
           #   artifact_name: guard
@@ -122,31 +139,375 @@ jobs:
           }
           cross build --release --target "$BUILD_TARGET"
 
-      - name: Strip binary
-        if: endsWith(matrix.target, '-linux-gnu')
+      - name: Strip native Linux binary
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
         shell: bash
         env:
           BUILD_TARGET: ${{ matrix.target }}
           ARTIFACT_NAME: ${{ matrix.artifact_name }}
         run: strip "target/${BUILD_TARGET}/release/${ARTIFACT_NAME}"
 
-      - name: Create archive
+      - name: Verify cross-built Linux architecture
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        env:
+          BINARY: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+        run: |
+          file "$BINARY"
+          file "$BINARY" | grep -q aarch64
+
+      - name: Create platform deployment archive
         shell: bash
         env:
           BUILD_TARGET: ${{ matrix.target }}
           ARTIFACT_NAME: ${{ matrix.artifact_name }}
-          ASSET_NAME: ${{ matrix.asset_name }}
         run: |
-          mkdir -p dist
-          cp "target/${BUILD_TARGET}/release/${ARTIFACT_NAME}" dist/
-          cd dist
-          tar -czf "$ASSET_NAME" "$ARTIFACT_NAME"
+          bundle="guard-${RELEASE_LABEL}-${BUILD_TARGET}"
+          archive="${bundle}.tar.gz"
+          root="dist/${bundle}"
+          mkdir -p "$root/deployment/systemd" "$root/deployment/hardening" \
+            "$root/deployment/windows" "$root/examples" "$root/docs"
+          cp "target/${BUILD_TARGET}/release/${ARTIFACT_NAME}" "$root/${ARTIFACT_NAME}"
+          binary_hash=$(sha256sum "$root/${ARTIFACT_NAME}" | cut -d ' ' -f 1)
+          printf '%s  %s\n' "$binary_hash" "$ARTIFACT_NAME" > "$root/BINARY-SHA256"
+          cp README.md INSTALL.md DEPLOYMENT.md LICENSE .env.example "$root/"
+          cp docs/*.md "$root/docs/"
+          cp examples/*.yaml examples/README.md "$root/examples/"
+          cp deployment/systemd/guard.service \
+            deployment/systemd/guard-exec-as-caller.service \
+            deployment/systemd/guard.env.example \
+            deployment/systemd/guard-operator \
+            deployment/systemd/test-guard-service-expansion.sh \
+            "$root/deployment/systemd/"
+          cp deployment/hardening/guard.apparmor.example \
+            deployment/hardening/seccomp-deny-escape.json \
+            "$root/deployment/hardening/"
+          cp deployment/windows/install-guard.ps1 \
+            deployment/windows/install-guard.Tests.ps1 \
+            "$root/deployment/windows/"
+          case "$BUILD_TARGET" in
+            x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu)
+              chmod 0755 "$root/${ARTIFACT_NAME}" \
+                "$root/deployment/systemd/guard-operator" \
+                "$root/deployment/systemd/test-guard-service-expansion.sh"
+              ;;
+            x86_64-pc-windows-msvc)
+              ;;
+            *)
+              echo "unsupported release target: $BUILD_TARGET"
+              exit 1
+              ;;
+          esac
+          find "$root" -type f -printf '%P\n' | LC_ALL=C sort > "$root/ARCHIVE-MANIFEST"
+          printf '%s\n' ARCHIVE-MANIFEST >> "$root/ARCHIVE-MANIFEST"
+          LC_ALL=C sort -o "$root/ARCHIVE-MANIFEST" "$root/ARCHIVE-MANIFEST"
+          tar -C dist -czf "dist/${archive}" "$bundle"
+
+      - name: Smoke test deployment archive
+        shell: bash
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+          ARTIFACT_NAME: ${{ matrix.artifact_name }}
+        run: |
+          bundle="guard-${RELEASE_LABEL}-${BUILD_TARGET}"
+          archive="dist/${bundle}.tar.gz"
+          smoke="dist/smoke"
+          mkdir -p "$smoke"
+          tar -C "$smoke" -xzf "$archive"
+          root="$smoke/$bundle"
+          test -f "$root/INSTALL.md"
+          test -f "$root/DEPLOYMENT.md"
+          test -f "$root/LICENSE"
+          test -f "$root/.env.example"
+          test -f "$root/docs/release-verification.md"
+          test -f "$root/docs/configuration.md"
+          test -f "$root/docs/api-proxy.md"
+          test -f "$root/examples/verbs.yaml"
+          test -f "$root/examples/verbs-readonly.yaml"
+          test -f "$root/examples/verbs-kubectl.yaml"
+          test -f "$root/examples/api-policy.yaml"
+          test -f "$root/deployment/windows/install-guard.ps1"
+          actual_manifest="dist/${bundle}.manifest.actual"
+          find "$root" -type f -printf '%P\n' | LC_ALL=C sort > "$actual_manifest"
+          diff -u "$root/ARCHIVE-MANIFEST" "$actual_manifest"
+          rm "$actual_manifest"
+          (cd "$root" && sha256sum --check BINARY-SHA256)
+          python3 - "$root" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          missing = []
+          for document in root.rglob("*.md"):
+              text = document.read_text(encoding="utf-8")
+              for link in re.findall(r"\[[^\]]*\]\(([^)]+)\)", text):
+                  target = link.split("#", 1)[0]
+                  if not target or "://" in target or target.startswith("mailto:"):
+                      continue
+                  if not (document.parent / target).resolve().exists():
+                      missing.append(f"{document.relative_to(root)} -> {target}")
+          if missing:
+              raise SystemExit("missing relative Markdown targets:\n" + "\n".join(missing))
+          PY
+          case "$BUILD_TARGET" in
+            aarch64-unknown-linux-gnu)
+              file "$root/${ARTIFACT_NAME}" | grep -q aarch64
+              ;;
+            *)
+              "$root/${ARTIFACT_NAME}" --version
+              ;;
+          esac
+          case "$BUILD_TARGET" in
+            *-linux-gnu)
+              test -x "$root/deployment/systemd/guard-operator"
+              test -x "$root/deployment/systemd/test-guard-service-expansion.sh"
+              test -f "$root/deployment/systemd/guard.service"
+              test -f "$root/deployment/systemd/guard-exec-as-caller.service"
+              test -f "$root/deployment/systemd/guard.env.example"
+              test -f "$root/deployment/hardening/guard.apparmor.example"
+              test -f "$root/deployment/hardening/seccomp-deny-escape.json"
+              ;;
+            x86_64-pc-windows-msvc)
+              test -f "$root/deployment/windows/install-guard.ps1"
+              test -f "$root/deployment/windows/install-guard.Tests.ps1"
+              ;;
+          esac
+
+      - name: Exercise packaged systemd argument expansion
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: sudo dist/smoke/guard-${RELEASE_LABEL}-${{ matrix.target }}/deployment/systemd/test-guard-service-expansion.sh
+
+      - name: Test packaged Windows installer contract
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          BUNDLE_ROOT: dist/smoke/guard-${{ env.RELEASE_LABEL }}-${{ matrix.target }}
+        run: Invoke-Pester -Path "$env:BUNDLE_ROOT/deployment/windows/install-guard.Tests.ps1" -CI
+
+      - name: Fault-inject packaged Windows install and rollback
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          BUNDLE_ROOT: dist/smoke/guard-${{ env.RELEASE_LABEL }}-${{ matrix.target }}
+        run: |
+          $installer = Resolve-Path "$env:BUNDLE_ROOT/deployment/windows/install-guard.ps1"
+          $candidate = Resolve-Path "$env:BUNDLE_ROOT/guard.exe"
+          $candidateHash = ((Get-Content -LiteralPath "$env:BUNDLE_ROOT/BINARY-SHA256" -Raw).Trim() -split '\s+')[0]
+          if ($candidateHash -notmatch '^[0-9a-f]{64}$') { throw 'Packaged binary manifest is invalid.' }
+          $faultCandidate = Join-Path $env:RUNNER_TEMP 'guard-fault-candidate.exe'
+          $faultEnvironment = Join-Path $env:RUNNER_TEMP 'guard-fault-environment.txt'
+          Copy-Item -LiteralPath $candidate -Destination $faultCandidate
+          $stream = [IO.File]::Open($faultCandidate, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::None)
+          try { $stream.WriteByte(0) } finally { $stream.Dispose() }
+          $faultCandidateHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $faultCandidate).Hash
+          Set-Content -LiteralPath $faultEnvironment -Value 'GUARD_LLM_MODEL=fixture/fault-injection' -NoNewline
+          $candidateInstall = @{ Action = 'install'; CandidateExe = [string]$candidate; ExpectedSha256 = $candidateHash }
+          $faultInstall = @{ Action = 'install'; CandidateExe = $faultCandidate; ExpectedSha256 = $faultCandidateHash; EnvFile = $faultEnvironment }
+
+          $env:GUARD_INSTALLER_TEST_MODE = '1'
+          . $installer -Action status
+          Remove-Item Env:GUARD_INSTALLER_TEST_MODE
+
+          function Get-DatabaseHashes {
+            $hashes = @{}
+            foreach ($path in Get-DatabasePaths -Database $StateDb) {
+              if (Test-Path -LiteralPath $path -PathType Leaf) {
+                $hashes[[IO.Path]::GetFileName($path)] = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash
+              }
+            }
+            return $hashes
+          }
+          function Assert-HashMapsEqual([hashtable]$Expected, [hashtable]$Actual, [string]$Label) {
+            if ($Expected.Count -ne $Actual.Count) { throw "$Label file count changed." }
+            foreach ($name in $Expected.Keys) {
+              if (-not $Actual.ContainsKey($name) -or $Actual[$name] -ne $Expected[$name]) {
+                throw "$Label content changed for $name."
+              }
+            }
+          }
+          function Get-ServiceEnvironmentLines {
+            return @((Get-ItemProperty -LiteralPath (Get-ServiceRegistryPath) -Name Environment).Environment | Sort-Object)
+          }
+          function Get-ServicePathName {
+            return [string](Get-CimInstance Win32_Service -Filter "Name='$ServiceName'").PathName
+          }
+          function Get-ApiRevertHashes([string]$GuardSid) {
+            $root = Get-ApiRevertRoot
+            $hashes = @{}
+            if (-not (Test-Path -LiteralPath $root)) { return $hashes }
+            Reset-TreeForAdministrativeMaintenance -Path $root
+            try {
+              foreach ($item in Get-PrunedTreeItems -Path $root) {
+                if (-not $item.PSIsContainer) {
+                  $hashes[$item.FullName.Substring($root.Length).TrimStart('\')] = (Get-FileHash -Algorithm SHA256 -LiteralPath $item.FullName).Hash
+                }
+              }
+              return $hashes
+            }
+            finally {
+              Protect-PrivateServiceTree -Path $root -GuardSid $GuardSid
+            }
+          }
+
+          try {
+            & $installer @candidateInstall
+            & $installer -Action access-list -Json | Out-Null
+            $guardSid = Get-GuardSid
+            Assert-DeploymentAcls -GuardSid $guardSid
+            Set-ServiceRegistryAcl -GuardSid $guardSid
+
+            $stockPathName = Get-ServicePathName
+            $customPathName = "$stockPathName `"--audit-log`" `"$DataDir\audit.log`""
+            & sc.exe config $ServiceName binPath= $customPathName | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Could not install the custom service command fixture.' }
+
+            $taskCount = @(Get-ScheduledTask -TaskName 'guard-op-*' -ErrorAction SilentlyContinue).Count
+            $operatorFailed = $false
+            try {
+              & $installer -Action access-show -Reference 'gr-00000000000000000000000000000000' -Json | Out-Null
+            }
+            catch {
+              $operatorFailed = $true
+              if ($_.Exception.Message -notmatch 'native_status=' -or $_.Exception.Message -notmatch 'output=') {
+                throw 'Operator failure omitted the native status or Guard output.'
+              }
+            }
+            if (-not $operatorFailed) { throw 'Unknown access reference unexpectedly succeeded.' }
+            if (@(Get-ScheduledTask -TaskName 'guard-op-*' -ErrorAction SilentlyContinue).Count -ne $taskCount) {
+              throw 'Operator failure left a scheduled task behind.'
+            }
+            if (@(Get-ChildItem -LiteralPath $TaskOutDir -Filter 'guard-op-*.out' -Force -ErrorAction SilentlyContinue).Count -ne 0) {
+              throw 'Operator failure left task output behind.'
+            }
+
+            $serviceKey = Get-ServiceRegistryPath
+            $current = @((Get-ItemProperty -LiteralPath $serviceKey -Name Environment).Environment)
+            New-ItemProperty -LiteralPath $serviceKey -Name Environment -PropertyType MultiString -Value ($current + 'GUARD_INSTALLER_CI_MARKER=retained') -Force | Out-Null
+            & $installer @candidateInstall | Out-Null
+            if ((Get-ServicePathName) -ne $customPathName) {
+              throw 'Installer rerun did not preserve the exact service command line.'
+            }
+            $names = @((Get-ItemProperty -LiteralPath $serviceKey -Name Environment).Environment | ForEach-Object { $_.Split('=', 2)[0] })
+            if ($names -notcontains 'GUARD_INSTALLER_CI_MARKER') {
+              throw 'Installer rerun did not preserve an unrelated service environment entry.'
+            }
+
+            Wait-ServiceStopped -Name $ServiceName
+            $baselineDatabase = Get-DatabaseHashes
+            $baselineEnvironment = Get-ServiceEnvironmentLines
+            $baselineBinary = (Get-FileHash -Algorithm SHA256 -LiteralPath $DeployedExe).Hash
+            $baselineCatalog = (Get-FileHash -Algorithm SHA256 -LiteralPath $VerbsPath).Hash
+            $baselinePathName = Get-ServicePathName
+            $apiRoot = Get-ApiRevertRoot
+            if (Test-Path -LiteralPath $apiRoot) {
+              Reset-TreeForAdministrativeMaintenance -Path $apiRoot
+              Remove-Item -LiteralPath $apiRoot -Recurse -Force
+            }
+            New-Item -ItemType Directory -Path $apiRoot -Force | Out-Null
+            $apiBody = Join-Path $apiRoot 'api-revert-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.body'
+            [IO.File]::WriteAllBytes($apiBody, [byte[]](1, 2, 3, 4, 5))
+            Protect-PrivateServiceTree -Path $apiRoot -GuardSid $guardSid
+            $baselineApiReverts = Get-ApiRevertHashes -GuardSid $guardSid
+            Start-Service -Name $ServiceName
+
+            $env:GUARD_INSTALLER_TEST_FAULT = 'after-environment'
+            $faultObserved = $false
+            try {
+              & $installer @faultInstall | Out-Null
+            }
+            catch {
+              $faultObserved = $_.Exception.Message -match 'Injected installer fault at after-environment'
+              if (-not $faultObserved) { throw }
+            }
+            finally {
+              Remove-Item Env:GUARD_INSTALLER_TEST_FAULT -ErrorAction SilentlyContinue
+            }
+            if (-not $faultObserved) { throw 'Installer fault injection did not fail the upgrade.' }
+            Wait-ServiceStopped -Name $ServiceName
+            Assert-HashMapsEqual -Expected $baselineDatabase -Actual (Get-DatabaseHashes) -Label 'Automatic rollback database'
+            if ((Get-FileHash -Algorithm SHA256 -LiteralPath $DeployedExe).Hash -ne $baselineBinary) {
+              throw 'Automatic rollback did not restore the binary.'
+            }
+            if ((Get-FileHash -Algorithm SHA256 -LiteralPath $VerbsPath).Hash -ne $baselineCatalog) {
+              throw 'Automatic rollback did not restore the catalog.'
+            }
+            if (Compare-Object $baselineEnvironment (Get-ServiceEnvironmentLines)) {
+              throw 'Automatic rollback did not restore the service environment.'
+            }
+            if ((Get-ServicePathName) -ne $baselinePathName) {
+              throw 'Automatic rollback did not restore the exact service command line.'
+            }
+            Start-Service -Name $ServiceName
+
+            $upgradeOutput = @(& $installer @faultInstall)
+            $backupLine = $upgradeOutput | Where-Object { $_ -match '^Rollback backup: (.+)$' } | Select-Object -Last 1
+            if (-not $backupLine) { throw 'Successful upgrade did not report a rollback backup.' }
+            [void]($backupLine -match '^Rollback backup: (.+)$')
+            $backupName = $Matches[1]
+            if ((Get-FileHash -Algorithm SHA256 -LiteralPath $DeployedExe).Hash -eq $baselineBinary) {
+              throw 'Successful test upgrade did not replace the binary.'
+            }
+            if ((Get-ServicePathName) -ne $baselinePathName) {
+              throw 'Successful upgrade discarded the exact service command line.'
+            }
+
+            Wait-ServiceStopped -Name $ServiceName
+            Reset-TreeForAdministrativeMaintenance -Path $apiRoot
+            [IO.File]::WriteAllBytes($apiBody, [byte[]](9, 9, 9))
+            Protect-PrivateServiceTree -Path $apiRoot -GuardSid $guardSid
+            [IO.File]::WriteAllBytes($StateDb, [Text.Encoding]::UTF8.GetBytes('invalid upgraded database fixture'))
+            [IO.File]::WriteAllBytes("$StateDb-journal", [Text.Encoding]::UTF8.GetBytes('invalid rollback journal fixture'))
+            & $installer -Action rollback -Backup $backupName | Out-Null
+            Wait-ServiceStopped -Name $ServiceName
+            Assert-HashMapsEqual -Expected $baselineDatabase -Actual (Get-DatabaseHashes) -Label 'Post-success rollback database'
+            if ((Get-FileHash -Algorithm SHA256 -LiteralPath $DeployedExe).Hash -ne $baselineBinary) {
+              throw 'Post-success rollback did not restore the binary.'
+            }
+            if ((Get-FileHash -Algorithm SHA256 -LiteralPath $VerbsPath).Hash -ne $baselineCatalog) {
+              throw 'Post-success rollback did not restore the catalog.'
+            }
+            if (Compare-Object $baselineEnvironment (Get-ServiceEnvironmentLines)) {
+              throw 'Post-success rollback did not restore the service environment.'
+            }
+            if ((Get-ServicePathName) -ne $baselinePathName) {
+              throw 'Post-success rollback did not restore the exact service command line.'
+            }
+            Assert-HashMapsEqual -Expected $baselineApiReverts -Actual (Get-ApiRevertHashes -GuardSid $guardSid) -Label 'Post-success rollback API revert snapshot'
+            Start-Service -Name $ServiceName
+            Verify-GuardService -ExpectedHash $baselineBinary -ExpectedVersion (Get-GuardVersion -GuardExe $DeployedExe)
+            Assert-DeploymentAcls -GuardSid $guardSid
+            Set-ServiceRegistryAcl -GuardSid $guardSid
+
+            Wait-ServiceStopped -Name $ServiceName
+            Set-GuardServiceConfiguration -PathName $baselinePathName -StartMode 'Disabled'
+            $disabledUpgradeOutput = @(& $installer @candidateInstall)
+            $disabledBackupLine = $disabledUpgradeOutput | Where-Object { $_ -match '^Rollback backup: (.+)$' } | Select-Object -Last 1
+            if (-not $disabledBackupLine) { throw 'Disabled service upgrade did not report a rollback backup.' }
+            [void]($disabledBackupLine -match '^Rollback backup: (.+)$')
+            $disabledBackupName = $Matches[1]
+            $disabledConfig = Get-CimInstance Win32_Service -Filter "Name='$ServiceName'"
+            if ($disabledConfig.StartMode -ne 'Disabled' -or (Get-Service -Name $ServiceName).Status -ne 'Stopped') {
+              throw 'Upgrade did not restore disabled stopped service state.'
+            }
+            & $installer -Action rollback -Backup $disabledBackupName | Out-Null
+            $disabledConfig = Get-CimInstance Win32_Service -Filter "Name='$ServiceName'"
+            if ($disabledConfig.StartMode -ne 'Disabled' -or (Get-Service -Name $ServiceName).Status -ne 'Stopped') {
+              throw 'Rollback did not verify and restore disabled stopped service state.'
+            }
+          }
+          finally {
+            Remove-Item Env:GUARD_INSTALLER_TEST_FAULT -ErrorAction SilentlyContinue
+            & $installer -Action uninstall -Purge
+            Remove-Item -LiteralPath $faultCandidate, $faultEnvironment -Force -ErrorAction SilentlyContinue
+          }
 
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: ${{ matrix.target }}
-          path: dist/${{ matrix.asset_name }}
+          path: dist/guard-${{ env.RELEASE_LABEL }}-${{ matrix.target }}.tar.gz
 
   sbom:
     name: Generate SBOM
@@ -171,8 +532,6 @@ jobs:
       # keeps each inventory exact; the target list mirrors the build matrix.
       - name: Generate CycloneDX SBOMs
         shell: bash
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           mkdir -p dist
           for target in \
@@ -181,8 +540,8 @@ jobs:
             x86_64-pc-windows-msvc; do
             cargo cyclonedx --format json --spec-version 1.5 \
               --target "$target" \
-              --override-filename "guard-${RELEASE_TAG}-${target}.cdx"
-            sbom="guard-${RELEASE_TAG}-${target}.cdx.json"
+              --override-filename "guard-${RELEASE_LABEL}-${target}.cdx"
+            sbom="guard-${RELEASE_LABEL}-${target}.cdx.json"
             jq -e '.components | map(.name) | contains(["rusqlite", "ring"])' \
               "$sbom" > /dev/null || {
               echo "SBOM ${sbom} is missing expected components"
@@ -200,6 +559,7 @@ jobs:
   release:
     name: Create GitHub Release
     needs: [build, sbom]
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
       contents: write  # Publishes release assets and release notes.
@@ -242,7 +602,16 @@ jobs:
               echo "published release already exists for ${RELEASE_TAG}"
               exit 1
             fi
+            mapfile -t expected_assets < <(printf '%s\n' "${archives[@]}" SHA256SUMS | xargs -n1 basename | LC_ALL=C sort -u)
+            mapfile -t existing_assets < <(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | LC_ALL=C sort -u)
+            for asset in "${existing_assets[@]}"; do
+              if ! printf '%s\n' "${expected_assets[@]}" | grep -Fxq -- "$asset"; then
+                gh release delete-asset "$RELEASE_TAG" "$asset" --yes
+              fi
+            done
             gh release upload "$RELEASE_TAG" --clobber "${archives[@]}" SHA256SUMS
+            mapfile -t actual_assets < <(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | LC_ALL=C sort -u)
+            diff -u <(printf '%s\n' "${expected_assets[@]}") <(printf '%s\n' "${actual_assets[@]}")
             gh release edit "$RELEASE_TAG" --draft=false
           else
             gh release create "$RELEASE_TAG" \

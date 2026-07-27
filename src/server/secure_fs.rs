@@ -145,7 +145,7 @@ pub(super) fn private_path_is_safe(path: &Path, directory: bool) -> bool {
 }
 
 #[cfg(windows)]
-pub(super) fn harden_existing_private_path(path: &Path, directory: bool) -> bool {
+pub(crate) fn harden_existing_private_path(path: &Path, directory: bool) -> bool {
     use std::os::windows::fs::MetadataExt;
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
     let Ok(meta) = fs::symlink_metadata(path) else {
