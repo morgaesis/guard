@@ -27,7 +27,7 @@ fn execute_wire_shape_parses_to_execute_variant() {
 }
 
 #[test]
-fn remaining_session_scoped_read_rpcs_carry_distinct_owner_bearers() {
+fn remaining_session_scoped_batch_read_carries_distinct_owner_bearers() {
     let batch = crate::server::wire::AdminRequest::EvaluateBatch {
         session_token: Some("target".to_string()),
         caller_token: Some("owner".to_string()),
@@ -44,23 +44,16 @@ fn remaining_session_scoped_read_rpcs_carry_distinct_owner_bearers() {
     let json = serde_json::to_value(&batch).unwrap();
     assert_eq!(json["session_token"], "target");
     assert_eq!(json["caller_token"], "owner");
-
-    let list = crate::server::wire::AdminRequest::GrantRequestList {
-        session_token: Some("target".to_string()),
-        caller_token: Some("owner".to_string()),
-    };
-    assert!(!list.requires_daemon_uid());
-    let json = serde_json::to_value(&list).unwrap();
-    assert_eq!(json["session_token"], "target");
-    assert_eq!(json["caller_token"], "owner");
 }
 
 #[test]
-fn legacy_authority_mutations_are_not_wire_protocol_variants() {
+fn legacy_authority_operations_are_not_wire_protocol_variants() {
     for json in [
         r#"{"op":"session_grant","token":"chosen"}"#,
         r#"{"op":"session_extend","token":"chosen","ttl_secs":3600}"#,
         r#"{"op":"grant_request_submit","session_token":"chosen","prompt":"hidden","delta":{"secret_names":["credential"]}}"#,
+        r#"{"op":"grant_request_list","session_token":"chosen","caller_token":"owner"}"#,
+        r#"{"op":"grant_request_show","handle":"gr-example","session_token":"chosen"}"#,
         r#"{"op":"saved_grant_edit","name":"hidden"}"#,
     ] {
         assert!(

@@ -172,9 +172,10 @@ function Stage-VerifiedGuardCandidate {
         [Parameter(Mandatory)][string]$SourceExe,
         [Parameter(Mandatory)][string]$ExpectedHash
     )
-    Set-MaintenanceAcl
+    $maintenanceRootExisted = Test-Path -LiteralPath $MaintenanceRoot
     $stagedExe = Join-Path $StagingDir "guard-$([guid]::NewGuid().ToString('N')).exe"
     try {
+        Set-MaintenanceAcl
         Copy-Item -LiteralPath $SourceExe -Destination $stagedExe
         if ((Get-FileHash -Algorithm SHA256 -LiteralPath $stagedExe).Hash.ToLowerInvariant() -ne $ExpectedHash.ToLowerInvariant()) {
             throw 'Staged Guard binary hash differs from the verified release manifest.'
@@ -184,6 +185,9 @@ function Stage-VerifiedGuardCandidate {
     }
     catch {
         if (Test-Path -LiteralPath $stagedExe) { Remove-Item -LiteralPath $stagedExe -Force }
+        if (-not $maintenanceRootExisted -and (Test-Path -LiteralPath $MaintenanceRoot)) {
+            Remove-GuardOwnedTree -Path $MaintenanceRoot
+        }
         throw
     }
 }

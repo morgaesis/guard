@@ -203,10 +203,24 @@ On Unix, the packaged paths use this upgrade sequence:
 release_version=0.6.0
 backup_dir="/var/backups/guard-before-v${release_version}"
 test ! -e "$backup_dir"
+sha256sum --check BINARY-SHA256
+expected_binary_hash="$(awk '$2 == "guard" {print $1}' BINARY-SHA256)"
+test "${#expected_binary_hash}" -eq 64
 install -d -o root -g root -m 0700 "$backup_dir"
 systemctl stop guard.service
 test "$(systemctl is-active guard.service || true)" = inactive
 install -o root -g root -m 0755 /usr/local/bin/guard "$backup_dir/guard"
+for deployed_file in \
+  /usr/local/sbin/guard-operator \
+  /etc/systemd/system/guard.service \
+  /etc/systemd/system/guard-exec-as-caller.service; do
+  backup_name="$(basename "$deployed_file")"
+  if test -f "$deployed_file"; then
+    cp -a "$deployed_file" "$backup_dir/$backup_name"
+  else
+    : > "$backup_dir/$backup_name.absent"
+  fi
+done
 sqlite3 /var/lib/guard/state.db ".backup '$backup_dir/state.db'"
 test -s "$backup_dir/state.db"
 cp -a /etc/guard "$backup_dir/config"
@@ -216,8 +230,16 @@ fi
 (cd "$backup_dir" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
 (cd "$backup_dir" && sha256sum --check SHA256SUMS)
 install -m 0755 guard /usr/local/bin/guard
+install -o root -g root -m 0755 deployment/systemd/guard-operator /usr/local/sbin/guard-operator
+install -o root -g root -m 0644 deployment/systemd/guard.service /etc/systemd/system/guard.service
+install -o root -g root -m 0644 deployment/systemd/guard-exec-as-caller.service /etc/systemd/system/guard-exec-as-caller.service
+systemctl daemon-reload
 systemctl start guard.service
-guard status
+daemon_pid="$(systemctl show guard.service --property MainPID --value)"
+test "$daemon_pid" -gt 0
+test "$(readlink -f "/proc/$daemon_pid/exe")" = /usr/local/bin/guard
+test "$(sha256sum "/proc/$daemon_pid/exe" | cut -d ' ' -f 1)" = "$expected_binary_hash"
+guard status --json
 ```
 
 Rollback stops the service again, verifies the backup manifest, and restores
@@ -235,6 +257,19 @@ for database_file in /var/lib/guard/state.db /var/lib/guard/state.db-wal /var/li
   test ! -e "$database_file" || rm -- "$database_file"
 done
 install -o root -g root -m 0755 "$backup_dir/guard" /usr/local/bin/guard
+restore_packaged_file() {
+  backup_name="$1"
+  destination="$2"
+  mode="$3"
+  if test -f "$backup_dir/$backup_name.absent"; then
+    rm -f -- "$destination"
+  else
+    install -o root -g root -m "$mode" "$backup_dir/$backup_name" "$destination"
+  fi
+}
+restore_packaged_file guard-operator /usr/local/sbin/guard-operator 0755
+restore_packaged_file guard.service /etc/systemd/system/guard.service 0644
+restore_packaged_file guard-exec-as-caller.service /etc/systemd/system/guard-exec-as-caller.service 0644
 install -o guard -g guard -m 0600 "$backup_dir/state.db" /var/lib/guard/state.db
 rm -rf /etc/guard /var/lib/guard/api-proxy-reverts
 cp -a "$backup_dir/config" /etc/guard
@@ -242,8 +277,13 @@ if test -d "$backup_dir/api-proxy-reverts"; then
   cp -a "$backup_dir/api-proxy-reverts" /var/lib/guard/api-proxy-reverts
   chown -R guard:guard /var/lib/guard/api-proxy-reverts
 fi
+systemctl daemon-reload
 systemctl start guard.service
-guard status
+daemon_pid="$(systemctl show guard.service --property MainPID --value)"
+test "$daemon_pid" -gt 0
+test "$(readlink -f "/proc/$daemon_pid/exe")" = /usr/local/bin/guard
+test "$(sha256sum "/proc/$daemon_pid/exe" | cut -d ' ' -f 1)" = "$(sha256sum "$backup_dir/guard" | cut -d ' ' -f 1)"
+guard status --json
 ```
 
 On Windows, verify the release archive checksum, extract it into an

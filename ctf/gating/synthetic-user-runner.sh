@@ -158,7 +158,6 @@ if [ "$(podman info --format '{{.Host.Security.Rootless}}')" != "true" ]; then
   echo "synthetic-user scenarios require rootless Podman" >&2
   exit 2
 fi
-
 mkdir -p "$EVIDENCE_ROOT"
 exec 9>"$EVIDENCE_ROOT/runner.lock"
 if ! flock -n 9; then
@@ -182,12 +181,24 @@ RUN_DIR="$EVIDENCE_ROOT/runs/$RUN_ID"
 RESULTS_DIR="$RUN_DIR/scenarios"
 MANIFEST="$RUN_DIR/manifest.md"
 mkdir -p "$RESULTS_DIR"
+SOURCE_MANIFEST="$RUN_DIR/source-files.sha256"
+(
+  cd "$REPO_ROOT"
+  find Cargo.toml Cargo.lock build.rs deny.toml src config tests examples \
+    ctf/gating/verbs.yaml ctf/gating/attack.sh ctf/gating/synthetic-user.sh \
+    ctf/gating/fake-llm.rs -type f -print0 |
+    LC_ALL=C sort -z |
+    xargs -0 sha256sum
+) > "$SOURCE_MANIFEST"
+SOURCE_DIGEST="$(sha256sum "$SOURCE_MANIFEST" | cut -d ' ' -f 1)"
 printf '%s\n' "runs/$RUN_ID" > "$EVIDENCE_ROOT/latest-run"
 {
   echo "# Synthetic-user run manifest"
   echo
   echo "- Run: \`$RUN_ID\`"
   echo "- Commit: \`$(git -C "$REPO_ROOT" rev-parse HEAD)\`"
+  echo "- Source manifest: \`source-files.sha256\`"
+  echo "- Source digest: \`$SOURCE_DIGEST\`"
   echo "- Image: \`$(podman image inspect "$IMAGE" --format '{{.Id}}')\`"
   echo "- Complete catalog: \`$FULL_CATALOG\`"
   echo "- Selected scenarios: \`${SELECTED[*]}\`"

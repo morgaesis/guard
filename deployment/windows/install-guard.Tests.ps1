@@ -186,6 +186,36 @@ Describe 'Guard Windows installer state and ACL contract' {
         }
     }
 
+    It 'removes maintenance roots created by a failed first staging attempt' {
+        $saved = @($script:MaintenanceRoot, $script:StagingDir, $script:BackupRoot, $script:TaskOutDir)
+        $script:MaintenanceRoot = Join-Path $TestDrive 'new-maintenance'
+        $script:StagingDir = Join-Path $script:MaintenanceRoot 'staging'
+        $script:BackupRoot = Join-Path $script:MaintenanceRoot 'backups'
+        $script:TaskOutDir = Join-Path $script:MaintenanceRoot 'task-output'
+        $source = Join-Path $TestDrive 'invalid-candidate.exe'
+        Set-Content -LiteralPath $source -Value 'fixture' -NoNewline
+        $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $source).Hash
+        Mock Set-MaintenanceAcl {
+            New-Item -ItemType Directory -Force -Path $script:MaintenanceRoot, $script:StagingDir, $script:BackupRoot, $script:TaskOutDir | Out-Null
+        }
+        Mock Get-GuardVersion { throw 'invalid candidate version' }
+        Mock Remove-GuardOwnedTree {
+            param($Path)
+            Remove-Item -LiteralPath $Path -Recurse -Force
+        }
+        try {
+            { Stage-VerifiedGuardCandidate -SourceExe $source -ExpectedHash $hash } | Should -Throw '*invalid candidate version*'
+            Test-Path -LiteralPath $script:MaintenanceRoot | Should -BeFalse
+            Should -Invoke Remove-GuardOwnedTree -Times 1 -Exactly
+        }
+        finally {
+            $script:MaintenanceRoot = $saved[0]
+            $script:StagingDir = $saved[1]
+            $script:BackupRoot = $saved[2]
+            $script:TaskOutDir = $saved[3]
+        }
+    }
+
     It 'preserves existing environment entries and merges managed values' {
         $existing = @{
             GUARD_LLM_API_KEY = 'existing-placeholder'

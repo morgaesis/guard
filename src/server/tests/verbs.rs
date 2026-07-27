@@ -519,6 +519,8 @@ async fn stale_auto_promoted_verb_is_not_trusted() {
 #[tokio::test]
 async fn verb_list_reports_staleness_corrected_trust_and_provenance() {
     let (mut cfg, _buf) = make_test_config();
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
     let current_stamp = cfg.state.evaluator.verb_promotion_stamp().to_string();
     let catalog = VerbCatalog::from_yaml(&format!(
         "verbs:\n\
@@ -533,7 +535,7 @@ async fn verb_list_reports_staleness_corrected_trust_and_provenance() {
 
     let response = handle_admin_request(
         &cfg,
-        &CallerIdentity::Unix { uid: 1000 },
+        &CallerIdentity::Unix { uid: 777 },
         AdminRequest::VerbList,
     )
     .await;

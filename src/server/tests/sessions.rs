@@ -1454,17 +1454,20 @@ async fn hard_typed_denial_is_labeled_non_overridable_without_request() {
     let (mut cfg, _) = make_test_config();
     cfg.config.daemon_uid = 777;
     cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.config.gate = GateMode::Consequence;
     cfg.state.verbs = Arc::new(RwLock::new(
         VerbCatalog::from_yaml(
             r#"
 verbs:
   - name: block-fixture
     binary: fixture-denied
+    baseline: true
     consequence: reversible
     coverage:
       - name: protected
         action: deny
         required_args: ["status"]
+        sticky: true
 "#,
         )
         .unwrap(),
@@ -1483,10 +1486,61 @@ verbs:
     assert!(!response.allowed);
     assert!(response.handle.is_none());
     assert!(response.access_requests.is_empty());
-    assert!(response
-        .verb_guidance
-        .as_deref()
-        .is_some_and(|guidance| guidance.contains("non-overridable operator policy")));
+    assert!(
+        response
+            .verb_guidance
+            .as_deref()
+            .is_some_and(|guidance| guidance.contains("non-overridable operator policy")),
+        "{response:?}"
+    );
+}
+
+#[tokio::test]
+async fn explicit_static_deny_text_cannot_become_an_access_request() {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = tmp.path().join("policy.yaml");
+    std::fs::write(
+        &policy,
+        r#"
+policy:
+  groups:
+    - name: protected
+      priority: 10
+      rules:
+        - patterns: ["fixture-denied*"]
+          action: deny
+          description: "explicit default-deny fixture"
+"#,
+    )
+    .unwrap();
+    cfg.state.evaluator = Arc::new(
+        Evaluator::new(EvalConfig::default().llm_enabled(false).policy_path(policy)).unwrap(),
+    );
+    let worker = CallerIdentity::Unix { uid: 1001 };
+    let mut request = request_with_session(
+        "fixture-denied",
+        vec!["status".to_string()],
+        "unused".to_string(),
+    );
+    request.session_token = None;
+
+    let response = execute_command(request, &cfg, &worker)
+        .await
+        .into_response();
+    assert!(!response.allowed);
+    assert!(response.reason.contains("explicit default-deny fixture"));
+    assert!(response.handle.is_none());
+    assert!(response.access_requests.is_empty());
+    assert!(
+        response
+            .verb_guidance
+            .as_deref()
+            .is_some_and(|guidance| guidance.contains("non-overridable operator policy")),
+        "{response:?}"
+    );
 }
 
 #[tokio::test]

@@ -170,9 +170,9 @@ jobs:
           cp "target/${BUILD_TARGET}/release/${ARTIFACT_NAME}" "$root/${ARTIFACT_NAME}"
           binary_hash=$(sha256sum "$root/${ARTIFACT_NAME}" | cut -d ' ' -f 1)
           printf '%s  %s\n' "$binary_hash" "$ARTIFACT_NAME" > "$root/BINARY-SHA256"
-          cp README.md INSTALL.md DEPLOYMENT.md LICENSE .env.example "$root/"
+          cp README.md INSTALL.md DEPLOYMENT.md ARCHITECTURE.md ROADMAP.md LICENSE .env.example "$root/"
           cp docs/*.md "$root/docs/"
-          cp examples/*.yaml examples/README.md "$root/examples/"
+          cp examples/*.yaml examples/README.md examples/fallback-models.env "$root/examples/"
           cp deployment/systemd/guard.service \
             deployment/systemd/guard-exec-as-caller.service \
             deployment/systemd/guard.env.example \
@@ -217,6 +217,8 @@ jobs:
           root="$smoke/$bundle"
           test -f "$root/INSTALL.md"
           test -f "$root/DEPLOYMENT.md"
+          test -f "$root/ARCHITECTURE.md"
+          test -f "$root/ROADMAP.md"
           test -f "$root/LICENSE"
           test -f "$root/.env.example"
           test -f "$root/docs/release-verification.md"
@@ -226,6 +228,7 @@ jobs:
           test -f "$root/examples/verbs-readonly.yaml"
           test -f "$root/examples/verbs-kubectl.yaml"
           test -f "$root/examples/api-policy.yaml"
+          test -f "$root/examples/fallback-models.env"
           test -f "$root/deployment/windows/install-guard.ps1"
           actual_manifest="dist/${bundle}.manifest.actual"
           find "$root" -type f -printf '%P\n' | LC_ALL=C sort > "$actual_manifest"
