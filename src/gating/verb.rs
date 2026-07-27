@@ -3091,10 +3091,15 @@ verbs:
         .unwrap();
         let mut catalog = VerbCatalog::load(&path).unwrap();
 
-        let mut saved = synth_verb("cmk", Some("^zones$"), false, "grant-live");
+        let mut saved = synth_verb("fixturectl", Some("^zones$"), false, "grant-live");
         saved.name = "grant-live".to_string();
         catalog.upsert_saved_grant_verb(saved).unwrap();
-        let mut access = synth_verb("cmk", Some("^networks$"), false, "access-generated-live");
+        let mut access = synth_verb(
+            "fixturectl",
+            Some("^networks$"),
+            false,
+            "access-generated-live",
+        );
         access.name = "access-generated-live".to_string();
         access.baseline = false;
         catalog.upsert_access_verb(access).unwrap();
