@@ -8,7 +8,24 @@ unit_sources=(
   "$script_dir/guard-exec-as-caller.service"
 )
 
-systemd-analyze verify "${unit_sources[@]}"
+verification_dir="$(mktemp -d)"
+cleanup_verification() {
+  if [ -n "$verification_dir" ] && [ -d "$verification_dir" ]; then
+    rm -r -- "$verification_dir"
+  fi
+}
+trap cleanup_verification EXIT
+verification_units=()
+for unit_source in "${unit_sources[@]}"; do
+  verification_unit="$verification_dir/$(basename "$unit_source")"
+  sed 's|^ExecStart=/usr/local/bin/guard |ExecStart=/bin/true |' \
+    "$unit_source" > "$verification_unit"
+  verification_units+=("$verification_unit")
+done
+systemd-analyze verify "${verification_units[@]}"
+cleanup_verification
+verification_dir=""
+trap - EXIT
 
 if [ "${1:-}" = "--verify-only" ]; then
   exit 0

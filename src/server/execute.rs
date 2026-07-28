@@ -47,6 +47,7 @@ use super::learning::{
 use super::path_with_shim_dir;
 use super::runtime::NotifyEvent;
 use super::transport::{write_policy_decision, write_stream_message};
+#[cfg(unix)]
 use super::wire::ExecOutcome;
 use super::wire::{
     authorize_session_use, decision_verb_match, verb_trust_is_current, CallerIdentity,
