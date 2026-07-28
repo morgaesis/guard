@@ -1,5 +1,17 @@
-$env:GUARD_INSTALLER_TEST_MODE = '1'
-. (Join-Path $PSScriptRoot 'install-guard.ps1') -Action status
+BeforeAll {
+    $script:InstallerTestModeBeforeTests = $env:GUARD_INSTALLER_TEST_MODE
+    $env:GUARD_INSTALLER_TEST_MODE = '1'
+    . (Join-Path $PSScriptRoot 'install-guard.ps1') -Action status
+}
+
+AfterAll {
+    if ($null -eq $script:InstallerTestModeBeforeTests) {
+        Remove-Item Env:GUARD_INSTALLER_TEST_MODE -ErrorAction SilentlyContinue
+    }
+    else {
+        $env:GUARD_INSTALLER_TEST_MODE = $script:InstallerTestModeBeforeTests
+    }
+}
 
 Describe 'Guard Windows operator command contract' {
     BeforeEach {
