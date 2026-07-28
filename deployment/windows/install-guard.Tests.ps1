@@ -185,6 +185,29 @@ Describe 'Guard Windows installer state and ACL contract' {
         { ConvertFrom-GuardVersionOutput -Text @('guard v0.6.0') -NativeStatus 1 } | Should -Throw
     }
 
+    It 'retries transient service registry provider failures' {
+        $script:registryReadAttempts = 0
+        Mock Test-Path { return $true }
+        Mock Get-Acl {
+            $script:registryReadAttempts++
+            if ($script:registryReadAttempts -lt 2) { throw 'fixture registry read race' }
+            return [pscustomobject]@{ Marker = 'expected' }
+        }
+        Mock Start-Sleep { return }
+        (Get-ServiceRegistryAclObject -Path 'HKLM:\fixture').Marker | Should -Be 'expected'
+        Should -Invoke Get-Acl -Times 2 -Exactly
+        Should -Invoke Start-Sleep -Times 1 -Exactly
+
+        $script:registryWriteAttempts = 0
+        Mock Set-Acl {
+            $script:registryWriteAttempts++
+            if ($script:registryWriteAttempts -lt 2) { throw 'fixture registry write race' }
+        }
+        Set-ServiceRegistryAclObject -Path 'HKLM:\fixture' -AclObject ([pscustomobject]@{})
+        Should -Invoke Set-Acl -Times 2 -Exactly
+        Should -Invoke Start-Sleep -Times 2 -Exactly
+    }
+
     It 'executes only the protected, digest-verified staged candidate' {
         $oldStagingDir = $StagingDir
         $StagingDir = Join-Path $TestDrive 'staging'

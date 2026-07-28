@@ -485,11 +485,40 @@ function Get-ServiceRegistryPath {
     return "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
 }
 
+function Get-ServiceRegistryAclObject {
+    param([Parameter(Mandatory)][string]$Path)
+    $lastError = 'service registry key is not visible'
+    for ($attempt = 1; $attempt -le 20; $attempt++) {
+        try {
+            if (Test-Path -LiteralPath $Path) { return Get-Acl -LiteralPath $Path }
+        }
+        catch { $lastError = $_.Exception.Message }
+        if ($attempt -lt 20) { Start-Sleep -Milliseconds 100 }
+    }
+    throw "Service registry ACL could not be read after 20 attempts: $lastError"
+}
+
+function Set-ServiceRegistryAclObject {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][object]$AclObject
+    )
+    $lastError = 'service registry ACL was not written'
+    for ($attempt = 1; $attempt -le 20; $attempt++) {
+        try {
+            Set-Acl -LiteralPath $Path -AclObject $AclObject
+            return
+        }
+        catch { $lastError = $_.Exception.Message }
+        if ($attempt -lt 20) { Start-Sleep -Milliseconds 100 }
+    }
+    throw "Service registry ACL could not be written after 20 attempts: $lastError"
+}
+
 function Set-ServiceRegistryAcl {
     param([Parameter(Mandatory)][string]$GuardSid)
     $path = Get-ServiceRegistryPath
-    if (-not (Test-Path -LiteralPath $path)) { throw "Service registry key does not exist: $path" }
-    $acl = Get-Acl -LiteralPath $path
+    $acl = Get-ServiceRegistryAclObject -Path $path
     $acl.SetAccessRuleProtection($true, $false)
     foreach ($rule in @($acl.Access)) { [void]$acl.RemoveAccessRuleSpecific($rule) }
     $acl.SetOwner([Security.Principal.SecurityIdentifier]::new($SidAdmins))
@@ -507,9 +536,9 @@ function Set-ServiceRegistryAcl {
         )
         [void]$acl.AddAccessRule($rule)
     }
-    Set-Acl -LiteralPath $path -AclObject $acl
+    Set-ServiceRegistryAclObject -Path $path -AclObject $acl
 
-    $verified = Get-Acl -LiteralPath $path
+    $verified = Get-ServiceRegistryAclObject -Path $path
     $ownerSid = try {
         ([Security.Principal.NTAccount]$verified.Owner).Translate([Security.Principal.SecurityIdentifier]).Value
     }
