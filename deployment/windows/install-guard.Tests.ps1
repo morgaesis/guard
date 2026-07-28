@@ -179,6 +179,12 @@ Describe 'Guard Windows installer state and ACL contract' {
         Assert-ExpectedCandidateHash | Should -Be ('ab' * 32)
     }
 
+    It 'parses the version format emitted by shipped binaries' {
+        ConvertFrom-GuardVersionOutput -Text @('guard v0.6.0 (abcdef0)') -NativeStatus 0 | Should -Be '0.6.0'
+        { ConvertFrom-GuardVersionOutput -Text @('guard 0.6.0') -NativeStatus 0 } | Should -Throw
+        { ConvertFrom-GuardVersionOutput -Text @('guard v0.6.0') -NativeStatus 1 } | Should -Throw
+    }
+
     It 'executes only the protected, digest-verified staged candidate' {
         $oldStagingDir = $StagingDir
         $StagingDir = Join-Path $TestDrive 'staging'

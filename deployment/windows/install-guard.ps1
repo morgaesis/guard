@@ -158,13 +158,26 @@ function Assert-ExpectedCandidateHash {
     return $ExpectedSha256.ToLowerInvariant()
 }
 
+function ConvertFrom-GuardVersionOutput {
+    param(
+        [Parameter(Mandatory)][string[]]$Text,
+        [Parameter(Mandatory)][int]$NativeStatus
+    )
+    if ($NativeStatus -ne 0 -or ($Text -join ' ') -notmatch '^guard\s+v([0-9]+\.[0-9]+\.[0-9]+)(?:\s|$)') {
+        throw 'Guard binary did not report a valid version.'
+    }
+    return $Matches[1]
+}
+
 function Get-GuardVersion {
     param([Parameter(Mandatory)][string]$GuardExe)
     $text = & $GuardExe --version 2>&1
-    if ($LASTEXITCODE -ne 0 -or ($text -join ' ') -notmatch '^guard\s+([0-9]+\.[0-9]+\.[0-9]+)') {
+    try {
+        return ConvertFrom-GuardVersionOutput -Text $text -NativeStatus $LASTEXITCODE
+    }
+    catch {
         throw "Guard binary '$GuardExe' did not report a valid version."
     }
-    return $Matches[1]
 }
 
 function Stage-VerifiedGuardCandidate {
