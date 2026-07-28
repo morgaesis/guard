@@ -411,7 +411,7 @@ Describe 'Guard Windows installer state and ACL contract' {
         $script:cleanupAttempts = 0
         Mock Get-ScheduledTask {
             if ($script:cleanupAttempts -ge 3) { return $null }
-            return [pscustomobject]@{ State = 'Ready' }
+            return [pscustomobject]@{ TaskName = 'guard-op-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; State = 'Ready' }
         }
         Mock Unregister-ScheduledTask {
             $script:cleanupAttempts++
@@ -424,7 +424,7 @@ Describe 'Guard Windows installer state and ACL contract' {
     }
 
     It 'surfaces operator artifact cleanup that remains incomplete' {
-        Mock Get-ScheduledTask { [pscustomobject]@{ State = 'Ready' } }
+        Mock Get-ScheduledTask { [pscustomobject]@{ TaskName = 'guard-op-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'; State = 'Ready' } }
         Mock Unregister-ScheduledTask { throw 'fixture cleanup failure' }
         Mock Start-Sleep { return }
         $output = Join-Path $TaskOutDir 'guard-op-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.out'
