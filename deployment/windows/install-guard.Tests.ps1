@@ -216,7 +216,7 @@ Describe 'Guard Windows installer state and ACL contract' {
             if ($script:registryWriteAttempts -lt 2) { throw 'fixture registry write race' }
         }
         Set-ServiceRegistryAclObject -Path 'HKLM:\fixture' -AclObject ([pscustomobject]@{})
-        Should -Invoke Set-Acl -Times 2 -Exactly -ParameterFilter { $Path -eq 'HKLM:\fixture' }
+        Should -Invoke Set-Acl -Times 2 -Exactly -ParameterFilter { $LiteralPath -eq 'HKLM:\fixture' }
         Should -Invoke Start-Sleep -Times 2 -Exactly
     }
 
