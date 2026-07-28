@@ -3,10 +3,6 @@ BeforeAll {
     $env:GUARD_INSTALLER_TEST_MODE = '1'
 }
 
-BeforeEach {
-    . (Join-Path $PSScriptRoot 'install-guard.ps1') -Action status
-}
-
 AfterAll {
     if ($null -eq $InstallerTestModeBeforeTests) {
         Remove-Item Env:GUARD_INSTALLER_TEST_MODE -ErrorAction SilentlyContinue
@@ -18,6 +14,7 @@ AfterAll {
 
 Describe 'Guard Windows operator command contract' {
     BeforeEach {
+        . (Join-Path $PSScriptRoot 'install-guard.ps1') -Action status
         $Reference = @()
         $ApprovalMode = 'ordinary'
         $Uses = 0
@@ -149,6 +146,10 @@ Describe 'Guard Windows operator command contract' {
 }
 
 Describe 'Guard Windows installer state and ACL contract' {
+    BeforeEach {
+        . (Join-Path $PSScriptRoot 'install-guard.ps1') -Action status
+    }
+
     It 'rejects every orphaned deployment root when the service is absent' {
         $saved = @($InstallRoot, $ConfigRoot, $DataDir, $MaintenanceRoot)
         try {
