@@ -362,22 +362,22 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'Could not install the custom service command fixture.' }
 
             $taskCount = @(Get-ScheduledTask -TaskName 'guard-op-*' -ErrorAction SilentlyContinue).Count
-            $operatorFailed = $false
-            try {
-              & $installer -Action access-show -Reference 'gr-00000000000000000000000000000000' -Json | Out-Null
+            $operatorOutput = @(& pwsh -NoLogo -NoProfile -NonInteractive -File $installer -Action access-show -Reference 'gr-00000000000000000000000000000000' -Json 2>&1)
+            $operatorStatus = $LASTEXITCODE
+            if ($operatorStatus -ne 125) { throw "Unknown access reference returned native status $operatorStatus instead of 125." }
+            try { $operatorDocument = ($operatorOutput -join "`n") | ConvertFrom-Json -ErrorAction Stop }
+            catch { throw 'Unknown access reference did not return structured JSON.' }
+            if ($operatorDocument.type -ne 'access_error' -or $operatorDocument.error -notmatch 'unknown or unauthorized access reference') {
+              throw 'Unknown access reference returned the wrong structured error.'
             }
-            catch {
-              $operatorFailed = $true
-              if ($_.Exception.Message -notmatch 'native_status=' -or $_.Exception.Message -notmatch 'output=') {
-                throw 'Operator failure omitted the native status or Guard output.'
-              }
-            }
-            if (-not $operatorFailed) { throw 'Unknown access reference unexpectedly succeeded.' }
             if (@(Get-ScheduledTask -TaskName 'guard-op-*' -ErrorAction SilentlyContinue).Count -ne $taskCount) {
               throw 'Operator failure left a scheduled task behind.'
             }
             if (@(Get-ChildItem -LiteralPath $TaskOutDir -Filter 'guard-op-*.out' -Force -ErrorAction SilentlyContinue).Count -ne 0) {
               throw 'Operator failure left task output behind.'
+            }
+            if (@(Get-ChildItem -LiteralPath $TaskOutDir -Filter 'guard-op-*.status' -Force -ErrorAction SilentlyContinue).Count -ne 0) {
+              throw 'Operator failure left task status behind.'
             }
 
             $serviceKey = Get-ServiceRegistryPath

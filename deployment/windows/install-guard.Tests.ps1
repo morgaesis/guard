@@ -115,6 +115,10 @@ Describe 'Guard Windows operator command contract' {
         $decodedPayload | Should -Not -Match ([regex]::Escape($Reason))
         $decodedPayload | Should -Not -Match 'cmd\.exe'
         $decodedPayload | Should -Match ([regex]::Escape((ConvertTo-Base64Utf8 $Reason)))
+        $decodedPayload | Should -Match ([regex]::Escape((ConvertTo-Base64Utf8 "$output.status")))
+        $decodedPayload | Should -Match '\$nativeStatus = 1'
+        $decodedPayload | Should -Match 'finally'
+        $decodedPayload | Should -Match 'WriteAllText'
     }
 
     It 'rejects task executable and output paths outside installer-owned roots' {
@@ -130,6 +134,14 @@ Describe 'Guard Windows operator command contract' {
         $result.Output | Should -Be $body
         $result.ExitCode | Should -Be 1
         ($result.Output | ConvertFrom-Json).items.Count | Should -Be 2
+    }
+
+    It 'reads the task-authored native status and rejects malformed status' {
+        $status = Join-Path $TestDrive 'operator.status'
+        Set-Content -LiteralPath $status -Value '125' -NoNewline
+        Read-GuardOperatorStatus -StatusFile $status | Should -Be 125
+        Set-Content -LiteralPath $status -Value 'not-a-status' -NoNewline
+        { Read-GuardOperatorStatus -StatusFile $status } | Should -Throw '*invalid native status*'
     }
 
     It 'does not truncate large structured output' {
@@ -464,7 +476,11 @@ Describe 'Guard Windows installer state and ACL contract' {
         $script:outputPresent = $true
         $script:outputDeleteAttempts = 0
         Mock Get-ScheduledTask { return $null }
-        Mock Test-Path { return $script:outputPresent }
+        Mock Test-Path {
+            param($LiteralPath)
+            if ($LiteralPath -like '*.status') { return $false }
+            return $script:outputPresent
+        }
         Mock Remove-Item {
             $script:outputDeleteAttempts++
             if ($script:outputDeleteAttempts -lt 3) { throw 'fixture output deletion failure' }
@@ -482,6 +498,7 @@ Describe 'Guard Windows installer state and ACL contract' {
         New-Item -ItemType Directory -Path $TaskOutDir | Out-Null
         $output = Join-Path $TaskOutDir 'guard-op-dddddddddddddddddddddddddddddddd.out'
         Set-Content -LiteralPath $output -Value 'diagnostic'
+        Set-Content -LiteralPath "$output.status" -Value '125' -NoNewline
         $script:taskPresent = $true
         Mock Get-ScheduledTask { if ($script:taskPresent) { return [pscustomobject]@{ TaskName = 'guard-op-dddddddddddddddddddddddddddddddd'; State = 'Ready' } } }
         Mock Unregister-ScheduledTask { $script:taskPresent = $false }
@@ -489,6 +506,7 @@ Describe 'Guard Windows installer state and ACL contract' {
             Remove-GuardOperatorArtifacts -TaskName 'guard-op-dddddddddddddddddddddddddddddddd' -OutputFile $output
             $script:taskPresent | Should -BeFalse
             Test-Path -LiteralPath $output | Should -BeFalse
+            Test-Path -LiteralPath "$output.status" | Should -BeFalse
             Should -Invoke Unregister-ScheduledTask -Times 1 -Exactly
         }
         finally { $TaskOutDir = $oldTaskOutDir }
@@ -500,6 +518,7 @@ Describe 'Guard Windows installer state and ACL contract' {
         New-Item -ItemType Directory -Path $TaskOutDir | Out-Null
         $output = Join-Path $TaskOutDir 'guard-op-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.out'
         Set-Content -LiteralPath $output -Value 'raw unsanitized output'
+        Set-Content -LiteralPath "$output.status" -Value '1' -NoNewline
         $script:taskPresent = $true
         Mock Get-ScheduledTask { if ($script:taskPresent) { return [pscustomobject]@{ TaskName = 'guard-op-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'; State = 'Ready' } } }
         Mock Unregister-ScheduledTask { $script:taskPresent = $false }
@@ -507,6 +526,7 @@ Describe 'Guard Windows installer state and ACL contract' {
             Remove-GuardOperatorArtifacts -TaskName 'guard-op-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' -OutputFile $output -PreserveOutput -DiagnosticOutput "token=visible`ncontrol`0value"
             $preserved = Get-Content -LiteralPath $output -Raw
             $script:taskPresent | Should -BeFalse
+            Test-Path -LiteralPath "$output.status" | Should -BeFalse
             $preserved | Should -Match 'token=\[redacted\]'
             $preserved | Should -Match 'control\?value'
             $preserved | Should -Not -Match 'visible'

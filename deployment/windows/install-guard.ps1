@@ -807,17 +807,37 @@ function New-GuardOperatorPayload {
     Assert-GuardOperatorInvocation -GuardExe $GuardExe -Arguments $Arguments -OutputFile $OutputFile
     $encodedExe = ConvertTo-Base64Utf8 $GuardExe
     $encodedOutput = ConvertTo-Base64Utf8 $OutputFile
+    $encodedStatus = ConvertTo-Base64Utf8 "$OutputFile.status"
     $encodedArguments = @($Arguments | ForEach-Object { "'$(ConvertTo-Base64Utf8 $_)'" }) -join ','
     $script = @"
 `$ErrorActionPreference = 'Stop'
 function Decode([string]`$value) { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(`$value)) }
 `$guardExe = Decode '$encodedExe'
 `$outputFile = Decode '$encodedOutput'
+`$statusFile = Decode '$encodedStatus'
 `$guardArguments = @($encodedArguments) | ForEach-Object { Decode `$_ }
-& `$guardExe @guardArguments *> `$outputFile
-exit `$LASTEXITCODE
+`$nativeStatus = 1
+try {
+    & `$guardExe @guardArguments *> `$outputFile
+    `$nativeStatus = `$LASTEXITCODE
+}
+finally {
+    [IO.File]::WriteAllText(`$statusFile, [string]`$nativeStatus, [Text.UTF8Encoding]::new(`$false))
+}
+exit `$nativeStatus
 "@
     return [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
+}
+
+function Read-GuardOperatorStatus {
+    param([Parameter(Mandatory)][string]$StatusFile)
+    if (-not (Test-Path -LiteralPath $StatusFile -PathType Leaf)) { return $null }
+    $raw = (Get-Content -LiteralPath $StatusFile -Raw).Trim()
+    $status = 0
+    if ($raw -notmatch '^[0-9]{1,10}$' -or -not [int]::TryParse($raw, [ref]$status) -or $status -lt 0) {
+        throw 'Guard operator task produced an invalid native status.'
+    }
+    return [int64]$status
 }
 
 function Invoke-GuardAsOperator {
@@ -829,6 +849,7 @@ function Invoke-GuardAsOperator {
     if (-not (Test-Path -LiteralPath $GuardExe -PathType Leaf)) { throw "Installed Guard binary not found at '$GuardExe'." }
     $taskName = "guard-op-$([guid]::NewGuid().ToString('N'))"
     $outputFile = Join-Path $TaskOutDir "$taskName.out"
+    $statusFile = "$outputFile.status"
     $payload = New-GuardOperatorPayload -GuardExe $GuardExe -Arguments $Arguments -OutputFile $outputFile
     $powerShellExe = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
     $taskAction = New-ScheduledTaskAction -Execute $powerShellExe -Argument "-NoLogo -NoProfile -NonInteractive -EncodedCommand $payload"
@@ -849,12 +870,16 @@ function Invoke-GuardAsOperator {
             $taskInfo = Get-ScheduledTaskInfo -TaskName $taskName -TaskPath '\'
             $triggered = $taskInfo.LastRunTime -gt $before.LastRunTime
             $active = $task.State -in @('Running', 'Queued')
-        } while ((-not $triggered -or $active) -and (Get-Date) -lt $deadline)
-        $nativeStatus = $taskInfo.LastTaskResult
+            $statusReady = Test-Path -LiteralPath $statusFile -PathType Leaf
+        } while ((-not $triggered -or $active -or -not $statusReady) -and (Get-Date) -lt $deadline)
+        $nativeStatus = if ($statusReady) {
+            Read-GuardOperatorStatus -StatusFile $statusFile
+        }
+        else { [int64]$taskInfo.LastTaskResult }
         if (Test-Path -LiteralPath $outputFile) {
             $output = Get-Content -LiteralPath $outputFile -Raw
         }
-        if (-not $triggered -or $active) {
+        if (-not $triggered -or $active -or -not $statusReady) {
             $diagnostic = if ($null -eq $output) { '' } else { ConvertTo-SanitizedDiagnosticOutput -Value $output }
             throw "Guard operator task timed out; native_status=$nativeStatus; output=$diagnostic"
         }
@@ -912,6 +937,7 @@ function Remove-GuardOperatorArtifacts {
         -not (Test-PathWithin -Path $OutputFile -Parent $TaskOutDir)) {
         throw 'Refusing to clean operator artifacts outside the validated maintenance paths.'
     }
+    $statusFile = "$OutputFile.status"
     $lastError = $null
     for ($attempt = 1; $attempt -le 3; $attempt++) {
         try {
@@ -921,6 +947,9 @@ function Remove-GuardOperatorArtifacts {
                     Stop-ScheduledTask -TaskName $TaskName -TaskPath '\' -ErrorAction Stop
                 }
                 Unregister-ScheduledTask -TaskName $TaskName -TaskPath '\' -Confirm:$false -ErrorAction Stop
+            }
+            if (Test-Path -LiteralPath $statusFile) {
+                Remove-Item -LiteralPath $statusFile -Force -ErrorAction Stop
             }
             if ($PreserveOutput -and $null -ne $DiagnosticOutput) {
                 $sanitized = ConvertTo-SanitizedDiagnosticOutput -Value $DiagnosticOutput
@@ -934,7 +963,8 @@ function Remove-GuardOperatorArtifacts {
                 Test-Path -LiteralPath $OutputFile -PathType Leaf
             }
             else { -not (Test-Path -LiteralPath $OutputFile) }
-            if (-not $taskRemaining -and $outputComplete) { return }
+            $statusComplete = -not (Test-Path -LiteralPath $statusFile)
+            if (-not $taskRemaining -and $outputComplete -and $statusComplete) { return }
             $lastError = 'task or output still exists after cleanup'
         }
         catch { $lastError = $_.Exception.Message }
