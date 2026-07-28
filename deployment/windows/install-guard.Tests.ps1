@@ -1,124 +1,127 @@
 BeforeAll {
-    $script:InstallerTestModeBeforeTests = $env:GUARD_INSTALLER_TEST_MODE
+    $InstallerTestModeBeforeTests = $env:GUARD_INSTALLER_TEST_MODE
     $env:GUARD_INSTALLER_TEST_MODE = '1'
+}
+
+BeforeEach {
     . (Join-Path $PSScriptRoot 'install-guard.ps1') -Action status
 }
 
 AfterAll {
-    if ($null -eq $script:InstallerTestModeBeforeTests) {
+    if ($null -eq $InstallerTestModeBeforeTests) {
         Remove-Item Env:GUARD_INSTALLER_TEST_MODE -ErrorAction SilentlyContinue
     }
     else {
-        $env:GUARD_INSTALLER_TEST_MODE = $script:InstallerTestModeBeforeTests
+        $env:GUARD_INSTALLER_TEST_MODE = $InstallerTestModeBeforeTests
     }
 }
 
 Describe 'Guard Windows operator command contract' {
     BeforeEach {
-        $script:Reference = @()
-        $script:ApprovalMode = 'ordinary'
-        $script:Uses = 0
-        $script:Intent = $null
-        $script:Reason = $null
-        $script:Json = $false
+        $Reference = @()
+        $ApprovalMode = 'ordinary'
+        $Uses = 0
+        $Intent = $null
+        $Reason = $null
+        $Json = $false
     }
 
     It 'maps ordinary, once, N-use, and batch approvals' {
-        $script:Action = 'access-approve'
-        $script:Reference = @('gr-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'gr-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')
+        $Action = 'access-approve'
+        $Reference = @('gr-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'gr-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')
         (Get-GuardActionArguments) -join ' ' | Should -Be 'access approve gr-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa gr-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --socket guard'
 
-        $script:ApprovalMode = 'once'
+        $ApprovalMode = 'once'
         (Get-GuardActionArguments) -join ' ' | Should -Be 'access approve gr-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa gr-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --once --socket guard'
 
-        $script:ApprovalMode = 'uses'
-        $script:Uses = 3
+        $ApprovalMode = 'uses'
+        $Uses = 3
         (Get-GuardActionArguments) -join ' ' | Should -Be 'access approve gr-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa gr-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --uses 3 --socket guard'
     }
 
     It 'maps deny, extend, revoke, list, show, confirm, and revert' {
-        $script:Action = 'access-deny'
-        $script:Reference = @('gr-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
-        $script:Reason = 'outside the approved task'
+        $Action = 'access-deny'
+        $Reference = @('gr-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
+        $Reason = 'outside the approved task'
         (Get-GuardActionArguments) -join ' ' | Should -Be 'access deny gr-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --reason outside the approved task --socket guard'
 
-        $script:Action = 'access-extend'
-        $script:Reference = @('session:0123456789abcdef')
-        $script:Intent = 'Inspect service health.'
-        $script:ApprovalMode = 'once'
+        $Action = 'access-extend'
+        $Reference = @('session:0123456789abcdef')
+        $Intent = 'Inspect service health.'
+        $ApprovalMode = 'once'
         (Get-GuardActionArguments) -join ' ' | Should -Be 'access extend session:0123456789abcdef Inspect service health. --once --socket guard'
 
-        $script:Action = 'access-revoke'
-        $script:Reference = @('agent:S-1-5-21-1000')
-        $script:ApprovalMode = 'ordinary'
+        $Action = 'access-revoke'
+        $Reference = @('agent:S-1-5-21-1000')
+        $ApprovalMode = 'ordinary'
         (Get-GuardActionArguments) -join ' ' | Should -Be 'access revoke agent:S-1-5-21-1000 --socket guard'
 
-        $script:Action = 'access-list'
-        $script:Reference = @()
+        $Action = 'access-list'
+        $Reference = @()
         (Get-GuardActionArguments) -join ' ' | Should -Be 'access list --socket guard'
 
-        $script:Action = 'access-show'
+        $Action = 'access-show'
         foreach ($inspectable in @('gr-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'session:0123456789abcdef')) {
-            $script:Reference = @($inspectable)
+            $Reference = @($inspectable)
             (Get-GuardActionArguments) -join ' ' | Should -Be "access show $inspectable --socket guard"
         }
 
         foreach ($operatorAction in @('confirm', 'revert')) {
-            $script:Action = $operatorAction
-            $script:Reference = @('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
+            $Action = $operatorAction
+            $Reference = @('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
             (Get-GuardActionArguments) -join ' ' | Should -Be "$operatorAction aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --socket guard"
         }
     }
 
     It 'maps held execution references through access approve and deny' {
         foreach ($operatorAction in @('access-approve', 'access-deny')) {
-            $script:Action = $operatorAction
-            $script:Reference = @('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
+            $Action = $operatorAction
+            $Reference = @('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
             (Get-GuardActionArguments) -join ' ' | Should -Be (($operatorAction -replace '-', ' ') + ' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --socket guard')
         }
     }
 
     It 'rejects malformed references, control characters, and invalid use counts' {
-        $script:Action = 'access-approve'
-        $script:Reference = @('request & whoami')
+        $Action = 'access-approve'
+        $Reference = @('request & whoami')
         { Get-GuardActionArguments } | Should -Throw
 
-        $script:Action = 'access-extend'
-        $script:Reference = @('session:0123456789abcdef')
-        $script:Intent = "inspect`nwhoami"
+        $Action = 'access-extend'
+        $Reference = @('session:0123456789abcdef')
+        $Intent = "inspect`nwhoami"
         { Get-GuardActionArguments } | Should -Throw
 
-        $script:Action = 'access-approve'
-        $script:Reference = @('gr-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
-        $script:ApprovalMode = 'uses'
-        $script:Uses = 0
+        $Action = 'access-approve'
+        $Reference = @('gr-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
+        $ApprovalMode = 'uses'
+        $Uses = 0
         { Get-GuardActionArguments } | Should -Throw
 
-        $script:Action = 'confirm'
-        $script:Reference = @('gr-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
+        $Action = 'confirm'
+        $Reference = @('gr-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
         { Get-GuardActionArguments } | Should -Throw
 
-        $script:Action = 'access-revoke'
-        $script:Reference = @('session:0123456789abcdef', 'agent:S-1-5-21-1000')
+        $Action = 'access-revoke'
+        $Reference = @('session:0123456789abcdef', 'agent:S-1-5-21-1000')
         { Get-GuardActionArguments } | Should -Throw
     }
 
     It 'keeps untrusted prose out of executable task syntax' {
-        $script:Action = 'access-deny'
-        $script:Reference = @('gr-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
-        $script:Reason = 'maintenance & whoami | calc.exe > output'
+        $Action = 'access-deny'
+        $Reference = @('gr-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
+        $Reason = 'maintenance & whoami | calc.exe > output'
         $arguments = Get-GuardActionArguments
         $output = Join-Path $TaskOutDir 'guard-op-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.out'
         $payload = New-GuardOperatorPayload -GuardExe $DeployedExe -Arguments $arguments -OutputFile $output
         $decodedPayload = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($payload))
 
-        $decodedPayload | Should -Not -Match ([regex]::Escape($script:Reason))
+        $decodedPayload | Should -Not -Match ([regex]::Escape($Reason))
         $decodedPayload | Should -Not -Match 'cmd\.exe'
-        $decodedPayload | Should -Match ([regex]::Escape((ConvertTo-Base64Utf8 $script:Reason)))
+        $decodedPayload | Should -Match ([regex]::Escape((ConvertTo-Base64Utf8 $Reason)))
     }
 
     It 'rejects task executable and output paths outside installer-owned roots' {
-        $script:Action = 'access-list'
+        $Action = 'access-list'
         $arguments = Get-GuardActionArguments
         { New-GuardOperatorPayload -GuardExe 'C:\Windows\System32\whoami.exe' -Arguments $arguments -OutputFile (Join-Path $TaskOutDir 'guard-op-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.out') } | Should -Throw
         { New-GuardOperatorPayload -GuardExe $DeployedExe -Arguments $arguments -OutputFile 'C:\Temp\guard-op-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.out' } | Should -Throw
@@ -147,13 +150,13 @@ Describe 'Guard Windows operator command contract' {
 
 Describe 'Guard Windows installer state and ACL contract' {
     It 'rejects every orphaned deployment root when the service is absent' {
-        $saved = @($script:InstallRoot, $script:ConfigRoot, $script:DataDir, $script:MaintenanceRoot)
+        $saved = @($InstallRoot, $ConfigRoot, $DataDir, $MaintenanceRoot)
         try {
-            $script:InstallRoot = Join-Path $TestDrive 'program'
-            $script:ConfigRoot = Join-Path $TestDrive 'config'
-            $script:DataDir = Join-Path $TestDrive 'data'
-            $script:MaintenanceRoot = Join-Path $TestDrive 'maintenance'
-            foreach ($path in @($script:InstallRoot, $script:ConfigRoot, $script:DataDir, $script:MaintenanceRoot)) {
+            $InstallRoot = Join-Path $TestDrive 'program'
+            $ConfigRoot = Join-Path $TestDrive 'config'
+            $DataDir = Join-Path $TestDrive 'data'
+            $MaintenanceRoot = Join-Path $TestDrive 'maintenance'
+            foreach ($path in @($InstallRoot, $ConfigRoot, $DataDir, $MaintenanceRoot)) {
                 New-Item -ItemType Directory -Path $path | Out-Null
                 { Assert-NewInstallationRootsAbsent } | Should -Throw '*deployment state exists*'
                 Remove-Item -LiteralPath $path -Recurse -Force
@@ -161,24 +164,24 @@ Describe 'Guard Windows installer state and ACL contract' {
             { Assert-NewInstallationRootsAbsent } | Should -Not -Throw
         }
         finally {
-            $script:InstallRoot = $saved[0]
-            $script:ConfigRoot = $saved[1]
-            $script:DataDir = $saved[2]
-            $script:MaintenanceRoot = $saved[3]
+            $InstallRoot = $saved[0]
+            $ConfigRoot = $saved[1]
+            $DataDir = $saved[2]
+            $MaintenanceRoot = $saved[3]
         }
     }
 
     It 'requires a verified release digest before staging' {
-        $script:ExpectedSha256 = $null
+        $ExpectedSha256 = $null
         { Assert-ExpectedCandidateHash } | Should -Throw
-        $script:ExpectedSha256 = 'ab' * 32
+        $ExpectedSha256 = 'ab' * 32
         Assert-ExpectedCandidateHash | Should -Be ('ab' * 32)
     }
 
     It 'executes only the protected, digest-verified staged candidate' {
-        $oldStagingDir = $script:StagingDir
-        $script:StagingDir = Join-Path $TestDrive 'staging'
-        New-Item -ItemType Directory -Path $script:StagingDir | Out-Null
+        $oldStagingDir = $StagingDir
+        $StagingDir = Join-Path $TestDrive 'staging'
+        New-Item -ItemType Directory -Path $StagingDir | Out-Null
         $source = Join-Path $TestDrive 'untrusted.exe'
         Set-Content -LiteralPath $source -Value 'fixture' -NoNewline
         $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $source).Hash
@@ -189,26 +192,26 @@ Describe 'Guard Windows installer state and ACL contract' {
             $candidate = Stage-VerifiedGuardCandidate -SourceExe $source -ExpectedHash $hash
             $candidate.Version | Should -Be '1.2.3'
             $script:executedCandidate | Should -Not -Be $source
-            (Test-PathWithin -Path $script:executedCandidate -Parent $script:StagingDir) | Should -BeTrue
+            (Test-PathWithin -Path $script:executedCandidate -Parent $StagingDir) | Should -BeTrue
             { Stage-VerifiedGuardCandidate -SourceExe $source -ExpectedHash ('00' * 32) } | Should -Throw
             Should -Invoke Get-GuardVersion -Times 1 -Exactly
         }
         finally {
-            $script:StagingDir = $oldStagingDir
+            $StagingDir = $oldStagingDir
         }
     }
 
     It 'removes maintenance roots created by a failed first staging attempt' {
-        $saved = @($script:MaintenanceRoot, $script:StagingDir, $script:BackupRoot, $script:TaskOutDir)
-        $script:MaintenanceRoot = Join-Path $TestDrive 'new-maintenance'
-        $script:StagingDir = Join-Path $script:MaintenanceRoot 'staging'
-        $script:BackupRoot = Join-Path $script:MaintenanceRoot 'backups'
-        $script:TaskOutDir = Join-Path $script:MaintenanceRoot 'task-output'
+        $saved = @($MaintenanceRoot, $StagingDir, $BackupRoot, $TaskOutDir)
+        $MaintenanceRoot = Join-Path $TestDrive 'new-maintenance'
+        $StagingDir = Join-Path $MaintenanceRoot 'staging'
+        $BackupRoot = Join-Path $MaintenanceRoot 'backups'
+        $TaskOutDir = Join-Path $MaintenanceRoot 'task-output'
         $source = Join-Path $TestDrive 'invalid-candidate.exe'
         Set-Content -LiteralPath $source -Value 'fixture' -NoNewline
         $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $source).Hash
         Mock Set-MaintenanceAcl {
-            New-Item -ItemType Directory -Force -Path $script:MaintenanceRoot, $script:StagingDir, $script:BackupRoot, $script:TaskOutDir | Out-Null
+            New-Item -ItemType Directory -Force -Path $MaintenanceRoot, $StagingDir, $BackupRoot, $TaskOutDir | Out-Null
         }
         Mock Get-GuardVersion { throw 'invalid candidate version' }
         Mock Remove-GuardOwnedTree {
@@ -217,14 +220,14 @@ Describe 'Guard Windows installer state and ACL contract' {
         }
         try {
             { Stage-VerifiedGuardCandidate -SourceExe $source -ExpectedHash $hash } | Should -Throw '*invalid candidate version*'
-            Test-Path -LiteralPath $script:MaintenanceRoot | Should -BeFalse
+            Test-Path -LiteralPath $MaintenanceRoot | Should -BeFalse
             Should -Invoke Remove-GuardOwnedTree -Times 1 -Exactly
         }
         finally {
-            $script:MaintenanceRoot = $saved[0]
-            $script:StagingDir = $saved[1]
-            $script:BackupRoot = $saved[2]
-            $script:TaskOutDir = $saved[3]
+            $MaintenanceRoot = $saved[0]
+            $StagingDir = $saved[1]
+            $BackupRoot = $saved[2]
+            $TaskOutDir = $saved[3]
         }
     }
 
@@ -274,7 +277,7 @@ Describe 'Guard Windows installer state and ACL contract' {
                 [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
                 [Security.AccessControl.InheritanceFlags]::ObjectInherit
             )
-            $rule.PropagationFlags | Should -Be [Security.AccessControl.PropagationFlags]::None
+            $rule.PropagationFlags | Should -Be ([Security.AccessControl.PropagationFlags]::None)
             (([int64]$rule.FileSystemRights) -band ([int64][Security.AccessControl.FileSystemRights]::Synchronize) ) | Should -Be ([int64][Security.AccessControl.FileSystemRights]::Synchronize)
         }
     }
@@ -323,9 +326,9 @@ Describe 'Guard Windows installer state and ACL contract' {
     }
 
     It 'rejects a nested junction without following or changing its target' {
-        $oldDataDir = $script:DataDir
-        $script:DataDir = Join-Path $TestDrive 'maintenance-data'
-        $root = Join-Path $script:DataDir 'private'
+        $oldDataDir = $DataDir
+        $DataDir = Join-Path $TestDrive 'maintenance-data'
+        $root = Join-Path $DataDir 'private'
         $outside = Join-Path $TestDrive 'junction-target'
         New-Item -ItemType Directory -Path $root, $outside -Force | Out-Null
         Set-Content -LiteralPath (Join-Path $outside 'sentinel.txt') -Value 'unchanged'
@@ -339,7 +342,7 @@ Describe 'Guard Windows installer state and ACL contract' {
         }
         finally {
             Remove-Item -LiteralPath $junction -Force -ErrorAction SilentlyContinue
-            $script:DataDir = $oldDataDir
+            $DataDir = $oldDataDir
         }
     }
 
@@ -372,11 +375,11 @@ Describe 'Guard Windows installer state and ACL contract' {
     }
 
     It 'round-trips API revert bodies and reapplies the daemon-only ACL' {
-        $oldDataDir = $script:DataDir
-        $oldStagingDir = $script:StagingDir
-        $script:DataDir = Join-Path $TestDrive 'data'
-        $script:StagingDir = Join-Path $TestDrive 'staging-api'
-        New-Item -ItemType Directory -Path $script:StagingDir | Out-Null
+        $oldDataDir = $DataDir
+        $oldStagingDir = $StagingDir
+        $DataDir = Join-Path $TestDrive 'data'
+        $StagingDir = Join-Path $TestDrive 'staging-api'
+        New-Item -ItemType Directory -Path $StagingDir | Out-Null
         $apiRoot = Get-ApiRevertRoot
         New-Item -ItemType Directory -Path (Join-Path $apiRoot 'nested') -Force | Out-Null
         $body = Join-Path $apiRoot 'nested\body.bin'
@@ -398,8 +401,8 @@ Describe 'Guard Windows installer state and ACL contract' {
             Should -Invoke Protect-PrivateServiceTree -Times 2 -Exactly
         }
         finally {
-            $script:DataDir = $oldDataDir
-            $script:StagingDir = $oldStagingDir
+            $DataDir = $oldDataDir
+            $StagingDir = $oldStagingDir
         }
     }
 
@@ -444,10 +447,10 @@ Describe 'Guard Windows installer state and ACL contract' {
     }
 
     It 'removes the SYSTEM task and output in normal mode' {
-        $oldTaskOutDir = $script:TaskOutDir
-        $script:TaskOutDir = Join-Path $TestDrive 'normal-output'
-        New-Item -ItemType Directory -Path $script:TaskOutDir | Out-Null
-        $output = Join-Path $script:TaskOutDir 'guard-op-dddddddddddddddddddddddddddddddd.out'
+        $oldTaskOutDir = $TaskOutDir
+        $TaskOutDir = Join-Path $TestDrive 'normal-output'
+        New-Item -ItemType Directory -Path $TaskOutDir | Out-Null
+        $output = Join-Path $TaskOutDir 'guard-op-dddddddddddddddddddddddddddddddd.out'
         Set-Content -LiteralPath $output -Value 'diagnostic'
         $script:taskPresent = $true
         Mock Get-ScheduledTask { if ($script:taskPresent) { return [pscustomobject]@{ TaskName = 'guard-op-dddddddddddddddddddddddddddddddd'; State = 'Ready' } } }
@@ -458,14 +461,14 @@ Describe 'Guard Windows installer state and ACL contract' {
             Test-Path -LiteralPath $output | Should -BeFalse
             Should -Invoke Unregister-ScheduledTask -Times 1 -Exactly
         }
-        finally { $script:TaskOutDir = $oldTaskOutDir }
+        finally { $TaskOutDir = $oldTaskOutDir }
     }
 
     It 'removes the SYSTEM task and retains only sanitized output in diagnostic mode' {
-        $oldTaskOutDir = $script:TaskOutDir
-        $script:TaskOutDir = Join-Path $TestDrive 'preserved-output'
-        New-Item -ItemType Directory -Path $script:TaskOutDir | Out-Null
-        $output = Join-Path $script:TaskOutDir 'guard-op-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.out'
+        $oldTaskOutDir = $TaskOutDir
+        $TaskOutDir = Join-Path $TestDrive 'preserved-output'
+        New-Item -ItemType Directory -Path $TaskOutDir | Out-Null
+        $output = Join-Path $TaskOutDir 'guard-op-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.out'
         Set-Content -LiteralPath $output -Value 'raw unsanitized output'
         $script:taskPresent = $true
         Mock Get-ScheduledTask { if ($script:taskPresent) { return [pscustomobject]@{ TaskName = 'guard-op-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'; State = 'Ready' } } }
@@ -479,7 +482,7 @@ Describe 'Guard Windows installer state and ACL contract' {
             $preserved | Should -Not -Match 'visible'
             Should -Invoke Unregister-ScheduledTask -Times 1 -Exactly
         }
-        finally { $script:TaskOutDir = $oldTaskOutDir }
+        finally { $TaskOutDir = $oldTaskOutDir }
     }
 
     It 'bounds preserved diagnostic output including its truncation marker' {
