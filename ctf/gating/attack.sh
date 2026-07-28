@@ -128,14 +128,12 @@ runuser -u guarddaemon -- env PATH="/fakebin:/usr/local/bin:/usr/bin:/bin" GUARD
 DAEMON_PID=$!
 
 for _ in $(seq 1 50); do [ -S "$SOCK" ] && break; sleep 0.2; done
+chmod 711 "$(dirname "$SOCK")" 2>/dev/null || true
 chmod 666 "$SOCK" 2>/dev/null || true
 [ -S "$SOCK" ] && ok "daemon listening on $SOCK" || { bad "daemon did not start"; cat /var/log/guard.log; exit 1; }
 
 echo
 echo "=== 1. transparent shims broker through Guard ==="
-SESSION_TOKEN=0123456789abcdef0123456789abcdef
-operator guard session grant "$SESSION_TOKEN" --ttl 60 --socket "$SOCK" >/tmp/session-grant.out 2>&1 \
-  || { bad "operator could not install live-equivalent session"; cat /tmp/session-grant.out; }
 OUT=$(cd /work && agent_shim env SSH_AUTH_SOCK=/tmp/agent.sock ssh safe-host 2>/tmp/ssh-shim.err)
 case "$OUT" in
   guarded-ssh:safe-host:/work:broker-owned) ok "ssh shim reached guarded primary with cwd and broker-owned SSH_AUTH_SOCK" ;;
@@ -156,7 +154,7 @@ case "$OUT" in
   guarded-ansible:web\ -m\ ping\ --check:/work) ok "ansible shim honored typed check-mode shape" ;;
   *) bad "ansible shim output mismatch: '$OUT'"; cat /tmp/ansible-shim.err ;;
 esac
-OUT=$(cd /work/ansible-project && agent_shim env GUARD_SESSION="$SESSION_TOKEN" ANSIBLE_CONFIG=/tmp/caller-ansible.cfg ansible -m ping all 2>/tmp/ansible-cwd.err)
+OUT=$(cd /work/ansible-project && agent_shim env ANSIBLE_CONFIG=/tmp/caller-ansible.cfg ansible -m ping all 2>/tmp/ansible-cwd.err)
 case "$OUT" in
   guarded-ansible-cwd:-m\ ping\ all:/work/ansible-project) ok "ansible shim discovered cwd inventory/config without caller ANSIBLE_CONFIG" ;;
   *) bad "ansible cwd discovery output mismatch: '$OUT'"; cat /tmp/ansible-cwd.err ;;
@@ -224,7 +222,7 @@ fi
 echo
 echo "=== 5. agent CANNOT self-approve its held command (bypass-resistance) ==="
 if [ -n "$HHANDLE" ]; then
-  if agent guard approve "$HHANDLE" --socket "$SOCK" >/tmp/selfapprove.out 2>&1; then
+  if agent guard access approve "$HHANDLE" --once --socket "$SOCK" >/tmp/selfapprove.out 2>&1; then
     bad "agent self-approved an irreversible hold (CRITICAL bypass)"
   else
     ok "agent self-approve refused (not daemon UID)"
@@ -235,7 +233,7 @@ fi
 echo
 echo "=== 6. operator approve executes from the bound snapshot ==="
 if [ -n "$HHANDLE" ]; then
-  operator guard approve "$HHANDLE" --socket "$SOCK" >/tmp/opapprove.out 2>&1
+  operator guard access approve "$HHANDLE" --once --socket "$SOCK" >/tmp/opapprove.out 2>&1
   sleep 1
   [ ! -d /work/secret ] && ok "operator approval executed the held action" || { bad "operator approval did not execute"; cat /tmp/opapprove.out; }
 fi
@@ -254,7 +252,7 @@ agent guard run rm -rf /work/marker.txt --socket "$SOCK" >/tmp/raw.out 2>&1 || t
 [ -f /work/marker.txt ] && ok "raw destructive command did not execute" || bad "raw rm executed despite gating"
 
 echo
-echo "=== 9. restart mid-window: no unattended revert at boot ==="
+echo "=== 9. restart mid-window: future deadline is re-armed ==="
 agent guard verb run stage-file --param path=/work/restart.txt --confirm-within 600 --socket "$SOCK" >/tmp/restart.out 2>&1
 RHANDLE=$(handle_of /tmp/restart.out)
 kill "$DAEMON_PID" 2>/dev/null; wait "$DAEMON_PID" 2>/dev/null
@@ -263,13 +261,17 @@ runuser -u guarddaemon -- env PATH="/fakebin:/usr/local/bin:/usr/bin:/bin" GUARD
   --state-db /var/lib/guard/state.db --shim-dir /shim --users 1001 >>/var/log/guard.log 2>&1 &
 DAEMON_PID=$!
 for _ in $(seq 1 50); do [ -S "$SOCK" ] && break; sleep 0.2; done
+chmod 711 "$(dirname "$SOCK")" 2>/dev/null || true
 chmod 666 "$SOCK" 2>/dev/null || true
 sleep 5
-if [ -f /work/restart.txt ] && operator guard provisionals --socket "$SOCK" 2>/dev/null | grep -q needs_operator_decision; then
-  ok "restart left the change in place as needs_operator_decision (no unattended revert)"
+PROVISIONALS=$(operator guard provisionals --socket "$SOCK" 2>/dev/null || true)
+if [ -f /work/restart.txt ] \
+  && printf '%s\n' "$PROVISIONALS" | grep -Fq "$RHANDLE" \
+  && printf '%s\n' "$PROVISIONALS" | grep -q '^\[armed\]'; then
+  ok "restart left the change in place and re-armed its future deadline"
 else
   bad "restart recovery did not behave (file present? $( [ -f /work/restart.txt ] && echo yes || echo no ))"
-  operator guard provisionals --socket "$SOCK" 2>/dev/null | head
+  printf '%s\n' "$PROVISIONALS" | head
 fi
 
 echo

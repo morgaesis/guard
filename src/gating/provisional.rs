@@ -325,20 +325,29 @@ impl ProvisionalRegistry {
         }
     }
 
-    /// Sweeper tick: claim every `Armed` provisional whose forward command has
-    /// run and whose deadline has passed, transitioning each to `Reverting`, and
-    /// return them so the daemon can run their reverts. The startup grace is the
-    /// daemon's responsibility (it delays starting the sweeper), so this only
-    /// considers the live deadline.
-    pub fn take_due(&mut self, now: u64) -> Vec<Provisional> {
-        let due: Vec<String> = self
+    /// Handles whose completed forward action is due for rollback. This does
+    /// not claim them; the daemon first persists an exact `Armed -> Reverting`
+    /// CAS and only then installs the claimed row in memory.
+    pub fn due_handles(&self, now: u64) -> Vec<String> {
+        let mut due = self
             .items
             .values()
             .filter(|p| {
                 p.status == ProvisionalStatus::Armed && p.forward_done && now >= p.deadline_unix
             })
             .map(|p| p.handle.clone())
-            .collect();
+            .collect::<Vec<_>>();
+        due.sort();
+        due
+    }
+
+    /// Sweeper tick: claim every `Armed` provisional whose forward command has
+    /// run and whose deadline has passed, transitioning each to `Reverting`, and
+    /// return them so the daemon can run their reverts. The startup grace is the
+    /// daemon's responsibility (it delays starting the sweeper), so this only
+    /// considers the live deadline.
+    pub fn take_due(&mut self, now: u64) -> Vec<Provisional> {
+        let due = self.due_handles(now);
         let mut taken = Vec::new();
         for h in due {
             if let Some(p) = self.items.get_mut(&h) {

@@ -1,11 +1,12 @@
 use super::{print_json, SecretCommands, JSON_SCHEMA_VERSION};
-use crate::cli_client::{admin_client, resolve_client_endpoint};
-use crate::{client_config, server};
+use crate::cli_client::{admin_client, load_client_config, resolve_client_endpoint};
+use crate::server;
 use anyhow::{Context, Result};
 use std::io::{IsTerminal, Read};
 
 pub(crate) async fn handle_secrets(subcommand: SecretCommands) -> Result<()> {
-    let config = client_config::ClientConfig::load().ok().unwrap_or_default();
+    let json = matches!(&subcommand, SecretCommands::List { json: true, .. });
+    let config = load_client_config(json)?;
     let (socket_path, tcp_port) = resolve_client_endpoint(None, &config);
     let client = admin_client(socket_path, tcp_port, &config);
 

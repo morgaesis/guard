@@ -48,8 +48,9 @@ regex per parameter, single-argv rendering, no shell), which is what makes
 
 - **[saved-grants.yaml](saved-grants.yaml)** -- Reusable saved grants that
   activate typed verbs, set a session evaluation mode and TTL, declare
-  secret-name entitlements, and bound automatic request approval. Issue one
-  with `guard grant issue <name>`. Load with `--grants`.
+  secret-name entitlements, and bound automatic request approval. Request,
+  inspect, approve, deny, or revoke access with `guard access request`,
+  `list`, `show`, `approve`, `deny`, and `revoke`. Load with `--grants`.
 
 - **[api-policy.yaml](api-policy.yaml)** -- Kubernetes API proxy policy.
   First-match-wins rules over typed API operations (verb, resource, namespace,

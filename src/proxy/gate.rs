@@ -90,7 +90,7 @@ pub trait GateSink: Send + Sync {
 
     /// Enqueue a policy-held API request for operator approval and wait for the
     /// decision. The request stays buffered in the proxy while the operator
-    /// reviews it (`guard approvals` / `guard approve` / `guard deny`); only an
+    /// reviews it with `guard access show`, `approve`, or `deny`; only an
     /// explicit approval releases it, and an unattended hold expires to a
     /// denial. Default: fail closed, for sinks with no approval queue.
     async fn hold_request(

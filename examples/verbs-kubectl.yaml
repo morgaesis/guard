@@ -5,8 +5,8 @@
 #   guard server start --gate consequence --socket /run/guard/guard.sock \
 #       --verbs /etc/guard/verbs-kubectl.yaml        # Linux (unix socket)
 #
-# Agents call these via `guard verb <name> <param>=<value>` instead of raw
-# kubectl. Each verb pins a fixed argv; `{param}` values are substituted as
+# Agents call these via `guard verb run <name> --param <name>=<value>` instead
+# of raw kubectl. Each verb pins a fixed argv; `{param}` values are substituted as
 # exactly one argv element (no shell), and every param has an anchored (^...$)
 # validation pattern, so flag/command injection is structurally impossible.
 #

@@ -1,4 +1,6 @@
-use crate::grant_profile::{EvaluationMode, GrantRequest, GrantRequestDelta, SavedGrant};
+#[cfg(test)]
+use crate::grant_profile::{EvaluationMode, GrantRequestDelta};
+use crate::grant_profile::{GrantRequest, SavedGrant};
 use crate::session::{
     HistoricalGrant, SessionDecisionSource, SessionExecStatus, SessionGrantSummary, SessionOwner,
     SessionReport,
@@ -45,6 +47,20 @@ pub(super) enum CallerIdentity {
 }
 
 impl CallerIdentity {
+    /// True only for the kernel-authenticated local SYSTEM identity carried by
+    /// a Windows named-pipe connection. Unix and TCP callers can never satisfy
+    /// this check, even when their principal text resembles the SYSTEM SID.
+    pub fn is_windows_system_operator(&self) -> bool {
+        #[cfg(windows)]
+        {
+            matches!(self, Self::Windows { sid } if sid.eq_ignore_ascii_case("S-1-5-18"))
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
     /// Returns the key used to look up per-user config in tools.yaml.
     pub fn user_key(&self) -> Option<String> {
         match self {
@@ -141,7 +157,9 @@ pub(super) fn authorize_session_use(
     daemon_principal: &PrincipalKey,
 ) -> SessionAuthz {
     let caller_principal = caller.principal();
-    let is_operator = matches!(&caller_principal, Some(p) if daemon_principal.eq_ci(p))
+    let is_operator = (caller.is_local_peer()
+        && matches!(&caller_principal, Some(p) if daemon_principal.eq_ci(p)))
+        || caller.is_windows_system_operator()
         || matches!(caller, CallerIdentity::TcpAdmin { .. });
     match owner {
         SessionOwner::Unowned => {
@@ -216,14 +234,12 @@ pub(super) fn verb_effective_trust(verb: &guard::gating::verb::Verb, current_sta
     )
 }
 
-fn default_api_endpoint() -> String {
-    "default".to_string()
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 #[allow(clippy::enum_variant_names)]
 pub enum AdminRequest {
+    #[cfg(test)]
+    #[serde(skip)]
     SessionGrant {
         token: String,
         #[serde(default)]
@@ -261,29 +277,21 @@ pub enum AdminRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         owner: Option<String>,
     },
+    #[cfg(test)]
+    #[serde(skip)]
     SessionAppeal {
         token: String,
         binary: String,
         #[serde(default)]
         args: Vec<String>,
     },
+    #[cfg(test)]
+    #[serde(skip)]
     SessionRevoke {
         token: String,
     },
-    SessionExtend {
-        token: String,
-        ttl_secs: u64,
-    },
-    SessionLabel {
-        token: String,
-        label: String,
-    },
-    SessionRevokeFiltered {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        label: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        saved_grant: Option<String>,
-    },
+    #[cfg(test)]
+    #[serde(skip)]
     SessionList {
         /// Include past (revoked/expired) grants alongside the active set.
         #[serde(default)]
@@ -298,6 +306,8 @@ pub enum AdminRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         visible_token: Option<String>,
     },
+    #[cfg(test)]
+    #[serde(skip)]
     SessionShow {
         token: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -309,6 +319,8 @@ pub enum AdminRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller_token: Option<String>,
     },
+    #[cfg(test)]
+    #[serde(skip)]
     SessionStatus {
         token: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -316,8 +328,9 @@ pub enum AdminRequest {
     },
     /// Issue an agent kubeconfig for one live, expiring Guard session. The
     /// upstream credential remains daemon-only.
+    #[cfg(test)]
+    #[serde(skip)]
     KubeconfigIssue {
-        #[serde(default = "default_api_endpoint")]
         endpoint: String,
         session_token: String,
     },
@@ -397,13 +410,13 @@ pub enum AdminRequest {
     VerbCoverageList,
     /// Clear evaluator-generated API verb coverage and evidence.
     VerbCoverageClear,
-    SavedGrantList,
-    SavedGrantShow {
-        name: String,
-    },
+    #[cfg(test)]
+    #[serde(skip)]
     SavedGrantSave {
         grant: SavedGrant,
     },
+    #[cfg(test)]
+    #[serde(skip)]
     SavedGrantEdit {
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -449,9 +462,8 @@ pub enum AdminRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auto_approve_requests: Option<bool>,
     },
-    SavedGrantDelete {
-        name: String,
-    },
+    #[cfg(test)]
+    #[serde(skip)]
     SavedGrantRegenerate {
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -459,6 +471,8 @@ pub enum AdminRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         proposal_id: Option<String>,
     },
+    #[cfg(test)]
+    #[serde(skip)]
     GrantRequestSubmit {
         session_token: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -471,28 +485,68 @@ pub enum AdminRequest {
         prompt: String,
         delta: GrantRequestDelta,
     },
+    #[cfg(test)]
+    #[serde(skip)]
     GrantRequestList {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_token: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller_token: Option<String>,
     },
+    #[cfg(test)]
+    #[serde(skip)]
     GrantRequestShow {
         handle: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_token: Option<String>,
     },
+    #[cfg(test)]
+    #[serde(skip)]
     GrantRequestApprove {
         handle: String,
     },
+    #[cfg(test)]
+    #[serde(skip)]
     GrantRequestDeny {
         handle: String,
         reason: String,
     },
+    #[cfg(test)]
+    #[serde(skip)]
     GrantRequestWithdraw {
         handle: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_token: Option<String>,
+    },
+    /// Submit prose for the daemon-authenticated local principal. The caller
+    /// supplies no owner and needs no existing bearer session.
+    AccessRequest {
+        intent: String,
+    },
+    /// Decide each durable request independently. `uses: None` is ordinary
+    /// approval; `Some(1)` is the exact representation of `--once`.
+    AccessApprove {
+        handles: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        uses: Option<u64>,
+    },
+    AccessDeny {
+        handles: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    AccessRevoke {
+        target: String,
+    },
+    AccessExtend {
+        target: String,
+        intent: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        uses: Option<u64>,
+    },
+    AccessList,
+    AccessShow {
+        reference: String,
     },
     EvaluateBatch {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -514,9 +568,23 @@ pub enum AdminRequest {
 impl AdminRequest {
     /// Admin RPCs that require the caller to be the daemon UID.
     /// Ping is a public liveness probe. Secret RPCs and session
-    /// listing are open to any connected user; they self-scope or
-    /// redact sensitive fields so a caller cannot elevate from them.
+    /// scoped reads are open to connected users and enforce ownership in the
+    /// handler.
     pub(super) fn requires_daemon_uid(&self) -> bool {
+        #[cfg(test)]
+        if matches!(
+            self,
+            Self::GrantRequestSubmit { .. }
+                | Self::GrantRequestWithdraw { .. }
+                | Self::SessionList { .. }
+                | Self::SessionShow { .. }
+                | Self::SessionStatus { .. }
+                | Self::KubeconfigIssue { .. }
+                | Self::GrantRequestList { .. }
+                | Self::GrantRequestShow { .. }
+        ) {
+            return false;
+        }
         // Gate-control writes (confirm/revert/approve/deny) are daemon-UID-only:
         // a corrupted agent must never be able to confirm or approve its own
         // action. Reads (provisionals/approval list/show) self-scope inside the
@@ -525,10 +593,6 @@ impl AdminRequest {
         !matches!(
             self,
             Self::Ping
-                | Self::SessionList { .. }
-                | Self::SessionShow { .. }
-                | Self::SessionStatus { .. }
-                | Self::KubeconfigIssue { .. }
                 | Self::SecretSet { .. }
                 | Self::SecretDelete { .. }
                 | Self::SecretExists { .. }
@@ -540,11 +604,9 @@ impl AdminRequest {
                 // the handler, so it is not gated to the daemon UID here.
                 | Self::ApprovalNote { .. }
                 | Self::VerbList
-                | Self::VerbShow { .. }
-                | Self::GrantRequestList { .. }
-                | Self::GrantRequestShow { .. }
-                | Self::GrantRequestSubmit { .. }
-                | Self::GrantRequestWithdraw { .. }
+                | Self::AccessRequest { .. }
+                | Self::AccessList
+                | Self::AccessShow { .. }
                 | Self::EvaluateBatch { .. }
         )
     }
@@ -632,6 +694,9 @@ pub enum AdminResponse {
     Verbs {
         items: Vec<VerbSummary>,
     },
+    VerbMenu {
+        items: Vec<VerbMenuItem>,
+    },
     VerbCreated {
         verb: guard::gating::verb::Verb,
         /// True when the verb was written to the catalog; false for a preview.
@@ -671,6 +736,15 @@ pub enum AdminResponse {
     GrantRequest {
         request: GrantRequest,
     },
+    AccessItems {
+        items: Vec<AccessItem>,
+    },
+    AccessItem {
+        item: AccessItem,
+    },
+    AccessDecisions {
+        items: Vec<AccessDecisionResult>,
+    },
     SessionBulkRevoked {
         count: usize,
     },
@@ -685,6 +759,67 @@ pub enum AdminResponse {
         path: String,
         items: Vec<serde_json::Value>,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccessCapability {
+    pub verb: String,
+    pub description: String,
+    /// Exact immutable command matcher and consequence inputs reviewed for
+    /// this capability.
+    #[serde(default)]
+    pub matcher: serde_json::Value,
+    /// SHA-256 digest of the canonical matcher representation.
+    #[serde(default)]
+    pub matcher_digest: String,
+    pub consequence: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_plan: Option<String>,
+    pub baseline: bool,
+    pub trusted: bool,
+    pub has_revert: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccessItem {
+    pub reference: String,
+    pub kind: String,
+    pub requester: String,
+    pub target: String,
+    #[serde(default)]
+    pub effective_scope: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_uses: Option<u64>,
+    /// `unselected`, `unlimited`, `bounded`, or `unavailable`.
+    pub use_policy: String,
+    pub state: String,
+    pub next_action: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approval_options: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<AccessCapability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccessDecisionResult {
+    pub request: String,
+    pub success: bool,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_uses: Option<u64>,
+    /// `unlimited`, `bounded`, or `unavailable`.
+    pub use_policy: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -732,6 +867,17 @@ pub struct VerbSummary {
     /// for an auto-promotion).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<String>,
+}
+
+/// Non-operator verb menu. It contains invocation planning data but no policy
+/// matcher, credential, provenance, or trust topology.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerbMenuItem {
+    pub name: String,
+    pub description: String,
+    pub params: Vec<String>,
+    pub consequence: String,
+    pub has_revert: bool,
 }
 
 fn verb_summary_default_baseline() -> bool {
@@ -978,8 +1124,16 @@ pub(crate) enum IncomingMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         admin_token: Option<String>,
     },
-    Execute(Box<ExecuteRequest>),
+    Execute {
+        protocol_version: u16,
+        features: Vec<String>,
+        execute: Box<ExecuteRequest>,
+    },
 }
+
+pub(crate) const EXECUTE_PROTOCOL_VERSION: u16 = 1;
+pub(crate) const EXECUTE_FEATURE_LOCAL_CWD: &str = "local-cwd-v1";
+pub(crate) const EXECUTE_FEATURE_TCP_NO_CWD: &str = "tcp-no-cwd-v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecuteResponse {
@@ -997,10 +1151,20 @@ pub struct ExecuteResponse {
     /// envelope, not denied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<GateStatus>,
-    /// Handle for a held or provisional command, used by `guard approve` /
-    /// `guard confirm` / `guard approvals show`.
+    /// Durable request identifier for a held command, or containment handle for
+    /// a provisional command. Held requests use `guard access`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handle: Option<String>,
+    /// Exact operator commands valid for this response. Denials may offer
+    /// ordinary, one-time, and bounded approval. Holds offer one-shot approval
+    /// because they replay one immutable snapshot.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approval_options: Vec<String>,
+    /// Every durable access request created by this decision. Multi-verb
+    /// denials populate this collection even though the legacy singular
+    /// handle is intentionally absent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub access_requests: Vec<AccessRequestGuidance>,
     /// Honest statement of what the gate checked and did not check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coverage: Option<Coverage>,
@@ -1019,8 +1183,57 @@ pub struct ExecuteResponse {
     pub decision_trace: Option<DecisionTrace>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccessRequestGuidance {
+    pub reference: String,
+    pub approval_options: Vec<String>,
+}
+
+impl AccessRequestGuidance {
+    fn new(reference: String) -> Self {
+        let approval_options = vec![
+            format!("guard access approve {reference}"),
+            format!("guard access approve {reference} --once"),
+            format!("guard access approve {reference} --uses 3"),
+        ];
+        Self {
+            reference,
+            approval_options,
+        }
+    }
+}
+
 fn default_decision_source() -> String {
     "validation".to_string()
+}
+
+/// Remove legacy value-bearing match diagnostics before they reach durable or
+/// serialized state. Current matchers emit structural features only, but this
+/// boundary also protects records produced by an older daemon or a fixture.
+pub(super) fn redacted_verb_match_features(features: &[String]) -> Vec<String> {
+    features
+        .iter()
+        .filter(|feature| !feature.contains(":allowed=") && !feature.contains(":observed="))
+        .cloned()
+        .collect()
+}
+
+pub(super) fn decision_verb_match(matched: &VerbMatchInfo) -> DecisionVerbMatch {
+    DecisionVerbMatch {
+        verb: matched.verb.clone(),
+        cell: matched.cell.clone(),
+        scope: format!("{:?}", matched.scope).to_ascii_lowercase(),
+        action: format!("{:?}", matched.action).to_ascii_lowercase(),
+        features: redacted_verb_match_features(&matched.features),
+        selected: matched.selected,
+        overridden: matched.overridden,
+    }
+}
+
+fn redact_verb_matches(matches: &mut [VerbMatchInfo]) {
+    for matched in matches {
+        matched.features = redacted_verb_match_features(&matched.features);
+    }
 }
 
 /// Wire-level consequence-gate outcome.
@@ -1104,6 +1317,8 @@ pub(super) enum ExecOutcome {
 pub(super) struct ExecuteResult {
     policy: PolicyOutcome,
     pub(super) exec: ExecOutcome,
+    request_handle: Option<String>,
+    access_requests: Vec<AccessRequestGuidance>,
     /// Secret-store key names whose values entered the environment of a
     /// successfully spawned child. This does not prove the child consumed them.
     exposed_secret_refs: Vec<String>,
@@ -1119,6 +1334,8 @@ impl ExecuteResult {
                 reason: reason.into(),
             },
             exec: ExecOutcome::NotAttempted,
+            request_handle: None,
+            access_requests: Vec::new(),
             exposed_secret_refs: Vec::new(),
             verb_matches: Vec::new(),
             verb_guidance: None,
@@ -1142,6 +1359,8 @@ impl ExecuteResult {
                 stdout,
                 stderr,
             },
+            request_handle: None,
+            access_requests: Vec::new(),
             exposed_secret_refs: Vec::new(),
             verb_matches: Vec::new(),
             verb_guidance: None,
@@ -1163,6 +1382,8 @@ impl ExecuteResult {
                 reason: exec_reason.into(),
                 started: false,
             },
+            request_handle: None,
+            access_requests: Vec::new(),
             exposed_secret_refs: Vec::new(),
             verb_matches: Vec::new(),
             verb_guidance: None,
@@ -1185,6 +1406,8 @@ impl ExecuteResult {
                 reason: exec_reason.into(),
                 started: true,
             },
+            request_handle: None,
+            access_requests: Vec::new(),
             exposed_secret_refs: Vec::new(),
             verb_matches: Vec::new(),
             verb_guidance: None,
@@ -1199,6 +1422,8 @@ impl ExecuteResult {
             },
             exposed_secret_refs: Vec::new(),
             exec: ExecOutcome::DryRun { coverage: None },
+            request_handle: None,
+            access_requests: Vec::new(),
             verb_matches: Vec::new(),
             verb_guidance: None,
             decision_source: SessionDecisionSource::Validation,
@@ -1215,6 +1440,8 @@ impl ExecuteResult {
             exec: ExecOutcome::DryRun {
                 coverage: Some(coverage),
             },
+            request_handle: None,
+            access_requests: Vec::new(),
             exposed_secret_refs: Vec::new(),
             verb_matches: Vec::new(),
             verb_guidance: None,
@@ -1230,6 +1457,8 @@ impl ExecuteResult {
                 reason: reason.into(),
             },
             exec: ExecOutcome::Held { handle, coverage },
+            request_handle: None,
+            access_requests: Vec::new(),
             exposed_secret_refs: Vec::new(),
             verb_matches: Vec::new(),
             verb_guidance: None,
@@ -1257,6 +1486,8 @@ impl ExecuteResult {
                 stdout,
                 stderr,
             },
+            request_handle: None,
+            access_requests: Vec::new(),
             exposed_secret_refs: Vec::new(),
             verb_matches: Vec::new(),
             verb_guidance: None,
@@ -1268,6 +1499,37 @@ impl ExecuteResult {
         exposed_secret_refs.sort();
         exposed_secret_refs.dedup();
         self.exposed_secret_refs = exposed_secret_refs;
+        self
+    }
+
+    pub(super) fn with_access_request(mut self, request_handle: Option<String>) -> Self {
+        self.request_handle = request_handle.clone();
+        self.access_requests = request_handle
+            .into_iter()
+            .map(AccessRequestGuidance::new)
+            .collect();
+        self
+    }
+
+    pub(super) fn with_access_requests(mut self, mut references: Vec<String>) -> Self {
+        references.sort();
+        references.dedup();
+        self.request_handle = (references.len() == 1).then(|| references[0].clone());
+        self.access_requests = references
+            .into_iter()
+            .map(AccessRequestGuidance::new)
+            .collect();
+        if !self.access_requests.is_empty() {
+            let joined = self
+                .access_requests
+                .iter()
+                .map(|request| request.reference.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            self.verb_guidance = Some(format!(
+                "approve: guard access approve {joined}\nonce: guard access approve {joined} --once\nbounded: guard access approve {joined} --uses 3"
+            ));
+        }
         self
     }
 
@@ -1288,8 +1550,16 @@ impl ExecuteResult {
         matches: Vec<VerbMatchInfo>,
         guidance: Option<String>,
     ) -> Self {
-        self.verb_matches = matches;
-        self.verb_guidance = guidance;
+        if !matches.is_empty() {
+            self.verb_matches = matches;
+        }
+        if let Some(guidance) = guidance {
+            self.verb_guidance = match self.verb_guidance.take() {
+                Some(existing) if existing == guidance => Some(existing),
+                Some(existing) => Some(format!("{existing}\n{guidance}")),
+                None => Some(guidance),
+            };
+        }
         self
     }
 
@@ -1318,24 +1588,21 @@ impl ExecuteResult {
     /// audit events first should do so before consuming the result.
     pub(super) fn into_response(self) -> ExecuteResponse {
         let allowed = self.policy_allowed();
-        let verb_matches = self.verb_matches;
+        let request_handle = self.request_handle;
+        let access_requests = self.access_requests;
+        let request_approval_options = access_requests
+            .first()
+            .filter(|_| access_requests.len() == 1)
+            .map(|request| request.approval_options.clone())
+            .unwrap_or_default();
+        let mut verb_matches = self.verb_matches;
+        redact_verb_matches(&mut verb_matches);
         let verb_guidance = self.verb_guidance;
         let decision_source = self.decision_source.as_str().to_string();
         let decision_trace = Some(DecisionTrace {
             version: DecisionTrace::VERSION,
             decision_source: decision_source.clone(),
-            verb_matches: verb_matches
-                .iter()
-                .map(|matched| DecisionVerbMatch {
-                    verb: matched.verb.clone(),
-                    cell: matched.cell.clone(),
-                    scope: format!("{:?}", matched.scope).to_ascii_lowercase(),
-                    action: format!("{:?}", matched.action).to_ascii_lowercase(),
-                    features: matched.features.clone(),
-                    selected: matched.selected,
-                    overridden: matched.overridden,
-                })
-                .collect(),
+            verb_matches: verb_matches.iter().map(decision_verb_match).collect(),
             failed_dimensions: if allowed {
                 Vec::new()
             } else {
@@ -1369,6 +1636,8 @@ impl ExecuteResult {
                 stderr,
                 status: None,
                 handle: None,
+                approval_options: Vec::new(),
+                access_requests: Vec::new(),
                 coverage: None,
                 verb_matches,
                 verb_guidance,
@@ -1390,6 +1659,8 @@ impl ExecuteResult {
                 stderr: None,
                 status: None,
                 handle: None,
+                approval_options: Vec::new(),
+                access_requests: Vec::new(),
                 coverage: None,
                 verb_matches,
                 verb_guidance,
@@ -1406,6 +1677,8 @@ impl ExecuteResult {
                 // plain dry-run stays byte-identical to the pre-gating wire.
                 status: coverage.as_ref().map(|_| GateStatus::DryRun),
                 handle: None,
+                approval_options: Vec::new(),
+                access_requests: Vec::new(),
                 coverage,
                 verb_matches,
                 verb_guidance,
@@ -1419,28 +1692,39 @@ impl ExecuteResult {
                 stdout: None,
                 stderr: None,
                 status: None,
-                handle: None,
+                handle: request_handle,
+                approval_options: request_approval_options,
+                access_requests,
                 coverage: None,
                 verb_matches,
                 verb_guidance,
                 decision_source,
                 decision_trace,
             },
-            ExecOutcome::Held { handle, coverage } => ExecuteResponse {
-                // Approved but held: allowed=true (not a denial), no exit code.
-                allowed: true,
-                reason: policy_reason,
-                exit_code: None,
-                stdout: None,
-                stderr: None,
-                status: Some(GateStatus::Held),
-                handle: Some(handle),
-                coverage: Some(coverage),
-                verb_matches,
-                verb_guidance,
-                decision_source,
-                decision_trace,
-            },
+            ExecOutcome::Held { handle, coverage } => {
+                let approval_options = vec![format!("guard access approve {handle} --once")];
+                let access_requests = vec![AccessRequestGuidance {
+                    reference: handle.clone(),
+                    approval_options: approval_options.clone(),
+                }];
+                ExecuteResponse {
+                    // Approved but held: allowed=true (not a denial), no exit code.
+                    allowed: true,
+                    reason: policy_reason,
+                    exit_code: None,
+                    stdout: None,
+                    stderr: None,
+                    status: Some(GateStatus::Held),
+                    handle: Some(handle),
+                    approval_options,
+                    access_requests,
+                    coverage: Some(coverage),
+                    verb_matches,
+                    verb_guidance,
+                    decision_source,
+                    decision_trace,
+                }
+            }
             ExecOutcome::Provisional {
                 handle,
                 coverage,
@@ -1455,6 +1739,8 @@ impl ExecuteResult {
                 stderr,
                 status: Some(GateStatus::Provisional),
                 handle: Some(handle),
+                approval_options: Vec::new(),
+                access_requests: Vec::new(),
                 coverage: Some(coverage),
                 verb_matches,
                 verb_guidance,
@@ -1473,5 +1759,80 @@ impl ExecuteResult {
             ExecOutcome::Held { .. } => SessionExecStatus::Held,
             ExecOutcome::Provisional { .. } => SessionExecStatus::Provisional,
         }
+    }
+}
+
+#[cfg(test)]
+mod decision_trace_feature_tests {
+    use super::*;
+    use guard::gating::verb::CoverageAction;
+
+    #[test]
+    fn authority_requests_reject_unknown_use_fields() {
+        for raw in [
+            r#"{"op":"access_approve","handles":["gr-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"use":1}"#,
+            r#"{"op":"access_extend","target":"agent:1001","intent":"inspect","use":1}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<AdminRequest>(raw).is_err(),
+                "misspelled bounded-use field was accepted: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn response_and_trace_drop_legacy_observed_argument_values() {
+        let fixture_value = "fixture-credential-value";
+        let matched = VerbMatchInfo {
+            verb: "api-read".to_string(),
+            cell: "target".to_string(),
+            scope: VerbMatchScope::Session,
+            action: CoverageAction::Preauthorized,
+            features: vec![
+                "target:position:2".to_string(),
+                format!("target:position:2:allowed={fixture_value}"),
+                format!("target:position:2:observed={fixture_value}"),
+            ],
+            selected: true,
+            overridden: false,
+        };
+
+        let response = ExecuteResult::denied("fixture denial")
+            .with_verb_resolution(vec![matched], None)
+            .into_response();
+        assert_eq!(response.verb_matches[0].features, vec!["target:position:2"]);
+        assert_eq!(
+            response.decision_trace.as_ref().unwrap().verb_matches[0].features,
+            vec!["target:position:2"]
+        );
+        assert!(!serde_json::to_string(&response)
+            .unwrap()
+            .contains(fixture_value));
+    }
+
+    #[test]
+    fn multi_request_denial_is_structured_without_singular_or_prose_parsing() {
+        let response = ExecuteResult::denied("two scopes require approval")
+            .with_access_requests(vec!["access-b".to_string(), "access-a".to_string()])
+            .into_response();
+
+        assert_eq!(response.handle, None);
+        assert!(response.approval_options.is_empty());
+        assert_eq!(
+            response
+                .access_requests
+                .iter()
+                .map(|request| request.reference.as_str())
+                .collect::<Vec<_>>(),
+            vec!["access-a", "access-b"]
+        );
+        assert_eq!(
+            response.access_requests[0].approval_options,
+            vec![
+                "guard access approve access-a",
+                "guard access approve access-a --once",
+                "guard access approve access-a --uses 3",
+            ]
+        );
     }
 }

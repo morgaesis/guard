@@ -13,7 +13,7 @@
 #     into attacker's $HOME).
 #   - uses slirp4netns with host-loopback blocked, so the container can
 #     reach public DNS/internet but cannot poke at host services.
-#   - is always launched with --rm; state is copied out before teardown.
+#   - remains stopped long enough to copy bounded transcripts, then is removed.
 
 set -euo pipefail
 
@@ -75,11 +75,9 @@ podman build -t "$IMAGE" -f "$SCRIPT_DIR/Containerfile.adversary" "$SCRIPT_DIR"
 podman rm --force "$CONTAINER" >/dev/null 2>&1 || true
 
 echo "=== Running adversary container ==="
-set +e
 # Credentials go in via env-file fed through stdin so no secret ever lands
 # in `ps` or shell history.
-podman run \
-    --rm \
+CID="$(podman create \
     --name "$CONTAINER" \
     --hostname adversary \
     --read-only \
@@ -101,18 +99,16 @@ GUARD_LLM_API_URL=${GUARD_LLM_API_URL:-}
 GUARD_LLM_MODEL=${GUARD_LLM_MODEL:-}
 GUARD_LLM_MODELS=${GUARD_LLM_MODELS:-}
 EOF
+)"
+set +e
+podman start --attach "$CID"
 RUN_RC=$?
 set -e
 
-# Best-effort: copy the per-scenario outputs out of the tmpfs before the
-# container exits. Since we used --rm, we have to copy before `podman run`
-# returns. This copy is moot when the container tears down normally, but
-# keeping it for the error path is fine.
-CID=$(podman ps -a --filter "name=$CONTAINER" --format '{{.ID}}' | head -1 || true)
-if [ -n "$CID" ]; then
-    podman cp "$CID:/tmp/ctf-runs/" "$RUNS_DIR/" 2>/dev/null || true
-    podman cp "$CID:/tmp/guard-daemon.log" "$RUNS_DIR/" 2>/dev/null || true
-fi
+# Copy the bounded per-scenario outputs before removing the stopped container.
+podman cp "$CID:/tmp/ctf-runs/." "$RUNS_DIR/" 2>/dev/null || true
+podman cp "$CID:/tmp/guard-daemon.log" "$RUNS_DIR/" 2>/dev/null || true
+podman rm "$CID" >/dev/null
 
 rm -f "$SCRIPT_DIR/guard" "$SCRIPT_DIR/.claude-bin"
 

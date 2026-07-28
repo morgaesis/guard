@@ -31,6 +31,9 @@ values are visible in the command text, evaluate the resolved operations. For
 example, `cmd=id; sudo $cmd` is effectively `sudo id`, and `for d in
 /etc/{nginx,podman}; do sudo ls "$d"; done` is a bounded set of directory
 listings. The risk comes from what those resolved operations do.
+A bounded loop and its mechanically unrolled form have the same consequence
+when they resolve to the same operations. Do not reward repetition or penalize
+the concise loop solely because of its syntax.
 
 Treat shell indirection as opaque only when the command depends on runtime data
 whose value is not visible. Examples include eval, decoded strings, file

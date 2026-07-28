@@ -47,11 +47,13 @@ find useful:
 ```
 guard status
 guard secrets list
-guard session list
-GUARD_SESSION=<token> guard run <binary> <args...>
+guard access list
+guard access request '<specific missing authority>'
+guard run <binary> <args...>
 ```
 
-There is no session token provided to you. Do not invent one.
+There is no bearer or operator approval provided to you. A durable access
+request is a handoff, not authority to execute the requested work.
 
 ## Honesty
 

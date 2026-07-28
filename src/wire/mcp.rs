@@ -22,24 +22,54 @@ pub struct JsonRpcEnvelope {
 #[derive(Debug, Clone)]
 pub enum JsonRpcEnvelopeError {
     NotAnObject,
-    MissingMethod { id: Option<Value> },
+    Invalid {
+        id: Option<Value>,
+        message: &'static str,
+    },
 }
 
-/// Extract id/method/params from a JSON-RPC message. Matches the daemon's
-/// tolerance exactly: any JSON object with a string `method` is accepted;
-/// `params` defaults to null.
+/// Validate and extract one MCP JSON-RPC 2.0 request or notification.
 pub fn parse_jsonrpc_envelope(message: &Value) -> Result<JsonRpcEnvelope, JsonRpcEnvelopeError> {
     let Some(object) = message.as_object() else {
         return Err(JsonRpcEnvelopeError::NotAnObject);
     };
     let id = object.get("id").cloned();
+    if object.get("jsonrpc") != Some(&Value::String("2.0".to_string())) {
+        return Err(JsonRpcEnvelopeError::Invalid {
+            id,
+            message: "jsonrpc must equal \"2.0\"",
+        });
+    }
+    if let Some(value) = id.as_ref() {
+        let valid = match value {
+            Value::String(_) => true,
+            Value::Number(number) => number.is_i64() || number.is_u64(),
+            _ => false,
+        };
+        if !valid {
+            return Err(JsonRpcEnvelopeError::Invalid {
+                id: None,
+                message: "id must be a string or integer",
+            });
+        }
+    }
     let Some(method) = object.get("method").and_then(Value::as_str) else {
-        return Err(JsonRpcEnvelopeError::MissingMethod { id });
+        return Err(JsonRpcEnvelopeError::Invalid {
+            id,
+            message: "missing method",
+        });
     };
+    let params = object.get("params").cloned().unwrap_or(Value::Null);
+    if !params.is_null() && !params.is_object() {
+        return Err(JsonRpcEnvelopeError::Invalid {
+            id,
+            message: "params must be an object when present",
+        });
+    }
     Ok(JsonRpcEnvelope {
         id,
         method: method.to_string(),
-        params: object.get("params").cloned().unwrap_or(Value::Null),
+        params,
     })
 }
 
@@ -150,6 +180,33 @@ pub struct EvaluateBatchArgs {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct SessionStatusArgs {
-    pub session: String,
+pub struct AccessShowArgs {
+    pub reference: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn jsonrpc_envelope_requires_mcp_jsonrpc_shapes() {
+        for invalid in [
+            json!({"jsonrpc": "1.0", "id": 1, "method": "initialize"}),
+            json!({"jsonrpc": "2.0", "id": null, "method": "initialize"}),
+            json!({"jsonrpc": "2.0", "id": 1.5, "method": "initialize"}),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": []}),
+            json!({"jsonrpc": "2.0", "id": 1}),
+        ] {
+            assert!(parse_jsonrpc_envelope(&invalid).is_err(), "{invalid}");
+        }
+
+        let notification = parse_jsonrpc_envelope(&json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {}
+        }))
+        .expect("valid notification");
+        assert!(notification.id.is_none());
+    }
 }

@@ -1,164 +1,112 @@
-# Saved grants and sessions
+# Access, saved grants, and sessions
 
-A saved grant is reusable operator-authored authority. It activates typed verbs,
-selects an evaluation mode, carries evaluator context and secret-name
-entitlements, declares a default TTL, and defines the ceiling for automatic
-request approval. Issuing it creates a live bearer-token session bound to that
-saved-grant revision.
+`guard access` is the public authority workflow. An authenticated local agent can
+request work in prose without already owning a session:
 
 ```bash
-guard grant save host-a-maintenance \
-  --description 'Bounded maintenance on host-a' \
-  --verb host-a-read \
-  --verb host-a-apply \
-  --override-marker operator:host-a-apply \
-  --ttl 1800 \
-  --prompt 'Inspect and maintain host-a only.'
-
-eval "$(guard grant issue host-a-maintenance --label incident-42)"
-guard session status
+guard access request 'Inspect host-a and report drift.'
+guard access show <request>
 ```
 
-`GUARD_SESSION` is bearer authority. Keep the token out of logs and command
-output. Audit and history use a stable fingerprint instead of the token bytes.
+The daemon records the kernel-authenticated uid or SID as requester. The wire
+request has no owner field, and a request cannot select or transfer authority to
+another principal. Equivalent retries for one principal and target return the
+same durable request. Requests from different principals remain separate.
 
-Each issued session is bound to an owner principal. It defaults to the principal
-that issues the grant; when the operator and the consuming agent run under
-different local identities, name the agent with `--owner <uid|sid>` on `guard
-grant issue`, `guard session new`, or `guard session grant`. Only the owning
-principal (or the daemon/operator principal) may execute under the session,
-appeal it, issue its brokered kubeconfig, batch-evaluate against it, or inspect
-it; a different local peer that learns the token is refused with a `session
-principal mismatch` audit reason. A session token is not transferable between
-principals: reissue for a new owner rather than sharing a handle.
-
-## Authority and precedence
-
-An issued session may expand a global readonly or evaluator posture inside the
-verb regions the grant activates. This is the intended path for a short-lived
-agent to perform bounded mutations while the daemon baseline remains readonly.
-
-The overlay cannot bypass hard invariants, including the server binary floor,
-protocol hard-denies, credential-plan binding, secret-value checks, consequence
-routing, audit, and behavioral suspension. Operator verb cells may be sticky. A
-baseline `evaluate` or `deny` cell changes only when it declares an
-`override_marker` and the issued grant carries that exact marker. Generated
-coverage cannot mint or silently replace an operator marker.
-
-A coverage cell says nothing outside its bounds. A grant that activates an
-Ansible check-mode cell does not deny another command or another verb. Missing
-regions continue through their ordinary evaluator or policy path. Guard does not
-generate complement denies from phrases such as "only --check mode."
-
-See [Typed verbs and coverage](verbs.md) for the complete resolver order.
-
-## Lifecycle
-
-`guard grant save` creates a reusable grant. Use these commands for maintenance:
+An operator decides requests individually or in a batch:
 
 ```bash
-guard grant list
-guard grant show host-a-maintenance
-
-guard grant edit host-a-maintenance \
-  --clear-verbs \
-  --verb host-a-read \
-  --ttl 900
-
-guard grant regenerate host-a-maintenance \
-  --prompt 'Inspect host-a and apply only the bounded service verb.'
-# Inspect the candidate and deterministic delta, then apply its exact proposal:
-guard grant regenerate host-a-maintenance --apply <proposal-id>
-
-guard grant issue host-a-maintenance --ttl 600 --label interactive-debug
-guard grant delete host-a-maintenance
+guard access approve <request>...
+guard access approve <request> --once
+guard access approve <request> --uses 3
+guard access deny <request>... --reason 'outside the approved task'
+guard access revoke <session-or-agent>
 ```
 
-An edit increments the saved-grant revision. Regeneration previews a validated
-candidate and deterministic delta without changing authority. Applying its
-integrity-bound proposal commits that exact candidate only when the saved-grant
-revision and evaluator regime remain unchanged. Issued sessions retain their
-immutable authority snapshot; they do not silently acquire a later saved-grant
-revision.
+`--once` is exactly `--uses 1`. Batch results are per request. One invalid or
+stale item does not widen or roll back another item that succeeds.
 
-Saved grants can also live in the YAML catalog selected by `--grants` or
-`GUARD_GRANTS`. [`examples/saved-grants.yaml`](../examples/saved-grants.yaml)
-shows TTLs, evaluation modes, activated verbs, markers, secret names, and
-auto-approval ceilings.
+## Resolution and precedence
 
-## Evaluation modes
+The daemon reduces intent against typed verbs, daemon baseline authority,
+active requester authority, evaluator gates, credential plans, and verified
+revert envelopes. A request stores only the missing non-baseline delta.
+Generated proposals are inert, untrusted, and non-baseline. Approval promotes
+the exact reviewed matcher to trusted access-session coverage stored with the
+durable request. Guard derives consequence independently of the model:
+recognized read-only shapes may execute, while unknown or mutating generated
+shapes remain irreversible holds. Daemon-wide baseline promotion requires an
+operator-authored catalog change.
 
-Saved grants and live sessions use three miss behaviors:
+Access cannot bypass the binary floor, protocol hard-denies, sticky operator
+cells, credential-plan binding, secret-value checks, consequence routing,
+audit, or behavioral suspension. A model-authored revert is not treated as a
+verified rollback envelope.
 
-| Mode | A request outside activated verb coverage |
-|---|---|
-| `evaluator` | Reaches the evaluator with the session prompt. |
-| `policy-only` | Requires deterministic policy or verb authorization. |
-| `read-only` | Uses readonly evaluator behavior for uncovered work. |
+## Sessions and bounded uses
 
-The mode controls misses. It does not weaken a matched deny, hard invariant, or
-consequence classification.
+Approval creates or reuses one access-managed session bound to the requester.
+The bearer remains internal. CLI, JSON, audit, and history use stable session
+references such as `session:0123456789abcdef` and never expose raw tokens.
 
-## Agent requests
+A bounded use is consumed atomically when Guard admits the bound execution
+snapshot. The durable count is decremented before process spawn, so a later
+spawn failure consumes the use. Concurrent requests cannot admit more snapshots
+than the remaining count. SQLite persistence, restart recovery, expiry,
+revocation, history, status, and audit retain the limit and remaining count.
 
-An agent can ask for a bounded amendment without gaining admin authority:
+Every approved request has its own typed scope and counter. An ordinary approval
+for one system does not make a one-time or exhausted grant for another system
+unlimited.
+
+Access-managed sessions authorize brokered command verbs. They cannot issue a
+reusable brokered kubeconfig or authenticate directly to the API proxy because
+that would bypass command admission and bounded-use accounting.
+
+An operator extends a specific active target by stable session reference or
+agent label:
 
 ```bash
-guard grant request submit \
-  --justification 'Need the host-a service restart verb for this incident.' \
-  --verb host-a-restart \
-  --ttl 600
+guard access extend session:0123456789abcdef 'Inspect host-a logs.'
+guard access extend agent:1001 'Restart the bounded fixture service.' --once
 ```
 
-The response contains a durable handle. The requester can inspect or withdraw
-its request; the daemon principal or TCP admin principal can decide it:
+There is no implicit latest-session target. Repeating an equivalent extension
+reuses its durable request and does not refill a partially consumed budget. An
+expired or revoked target does not reuse its terminal approval; a new request
+creates new review state.
+
+## Inspection
+
+`guard access list` prints one compact line per request, hold, and session with
+requester, target, effective scope, expiry, remaining uses, state, and next
+action. `guard access show` includes typed capability coverage and evidence.
+Both commands support `--json` with `schema_version: 1`.
 
 ```bash
-guard grant request show <handle>
-guard grant request withdraw <handle>
-
-guard grant request approve <handle>
-guard grant request deny <handle> --reason 'outside the saved-grant ceiling'
+guard access list
+guard access list --json
+guard access show <request-or-session>
+guard access show <request-or-session> --json
 ```
 
-When a saved grant enables automatic approval, only requests inside its declared
-ceiling apply automatically. The ceiling can limit verbs, secret names, TTL,
-prompt expansion, and evaluation modes. Requests outside the ceiling retain the
-same escalation handle for operator action.
+Denied operations that can be represented as missing typed authority return one
+durable request identifier. Consequence-gated holds use the immutable hold
+identifier as that request, preserving the exact argv, principal, catalog
+revision, credential hashes, and revert evidence reviewed by the operator. A
+hold accepts only `guard access approve <request> --once`; ordinary and N-use
+approval apply to authority requests.
 
-## Session operations
+## Internal authority objects
 
-`guard session show` and `guard session status` let an agent inspect its own
-effective scope without exposing the raw bearer. Operators can list, extend,
-label, revoke, and bulk-revoke sessions:
+Saved grants define reusable ceilings, evaluation modes, secret-name selectors,
+and default lifetimes. Sessions hold immutable issued authority snapshots. Grant
+requests and holds record review transitions. These objects persist in SQLite
+and are managed through the principal-bound access resolver. Removed grant,
+session, and appeal commands return a direct `guard access` migration error and
+cannot author or expose authority.
 
-```bash
-guard session show
-guard session list --history --since 2h
-guard session extend <token> --ttl 900
-guard session label <token> incident-42
-guard session revoke <token>
-guard session revoke-matching --label incident-42
-guard session revoke-matching --saved-grant host-a-maintenance
-```
-
-The SQLite state database stores saved grants, revisions, sessions, requests,
-transitions, and bounded interaction history. Each interaction carries a
-versioned decision trace with its stable decision source, matched typed cells,
-failed dimensions or conflicts, and actionable guidance. Holds and provisionals
-persist the same trace with their immutable snapshots. History includes names of
-delivered secrets but never secret values. A later grant edit does not rewrite
-an already reviewed action.
-
-Optional rolling denial-count, hold-count, and denial-ratio thresholds suspend a
-session into deny-all while the triggering behavior remains in the configured
-window. `guard session status` reports suspension and the operator action rather
-than hiding it behind an ordinary evaluator denial.
-
-## Migration aliases
-
-Legacy profile flags, environment variables, YAML keys, and exact command
-patterns are accepted only as migration inputs. Exact argv and an exact prefix
-ending in a separate `*` token migrate deterministically to saved grants and
-typed coverage. Ambiguous patterns fail loading and never become a parallel
-authorization language. New configuration uses saved grants and verbs.
+The state database stores saved grants, revisions, sessions, requests,
+transitions, bounded-use counts, and bounded interaction history. History names
+delivered secrets but never stores secret values. A later catalog or saved-grant
+edit does not rewrite an already reviewed execution snapshot.

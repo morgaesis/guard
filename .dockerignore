@@ -25,4 +25,7 @@ ctf/gating/*
 !ctf/gating/README.md
 !ctf/gating/run.sh
 !ctf/gating/attack.sh
+!ctf/gating/synthetic-user-runner.sh
+!ctf/gating/synthetic-user.sh
+!ctf/gating/fake-llm.rs
 !ctf/gating/verbs.yaml

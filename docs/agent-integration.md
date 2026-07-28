@@ -19,6 +19,12 @@ A shim preserves argv and the caller's working directory, then invokes
 not first-class authorization types. Guard avoids re-entering the top-level shim
 while leaving nested shims available to child processes.
 
+Local execution uses a versioned wire envelope. The client declares the local
+working-directory feature and must include `cwd`; the daemon rejects legacy,
+missing, or unsupported contracts with an upgrade error before evaluation.
+TCP clients declare that caller filesystem context is unavailable instead of
+silently inheriting the daemon's working directory.
+
 Add the shim directory ahead of the real tools in the agent's `PATH`. The agent
 cannot bypass Guard if it also lacks remote credentials and direct upstream
 reachability.
@@ -79,9 +85,16 @@ Human `guard run` streams the child process. `guard run --json` returns one
 machine-readable result containing child stdout, stderr, exit status, decision
 source, matched verb cells, and escalation guidance. `--explain` renders those
 details on stderr for a successful human run; default success remains quiet.
-Denied and held results render guidance without requiring the flag. Read commands such as
-`guard status --json`, `guard session status --json`, and `guard verb list
---json` support automation without parsing prose.
+Authority-missing denials that reduce to typed coverage render one durable
+request identifier and exact `guard access approve` guidance without requiring
+the flag. A novel operation that cannot yet be reduced gives the exact
+`guard access request` retry and states that no durable request exists. An
+operator hard-deny is labeled non-overridable and creates no request. Holds
+render one durable identifier and only one-time approval guidance. Typed denial
+requests offer ordinary, one-time, and bounded access.
+`guard access list
+--json` and `guard access show --json` support automation without parsing prose
+or handling bearer tokens.
 
 A successful human command does not print verb matching noise. Denied and held
 commands print the matching coverage and the next bounded action on stderr.
@@ -116,28 +129,36 @@ guard config set-server ~/.guard/guard.sock
 guard mcp serve
 ```
 
-The MCP server executes commands and provides requester-scoped verb, approval,
-and session operations through the normal daemon protocol. Structured and human
-tool results carry the stable decision source, matched cells, and guidance. It
-does not create a parallel policy path.
+The MCP server executes commands through the normal daemon protocol. Structured
+results include `schema_version` and `type`. Structured and human results carry
+the stable decision source, matched cells, durable request identifier, and
+exact access approval commands. It does not create a parallel policy path.
+Normal client configuration supplies the execution token for a TCP daemon. MCP does
+not receive or forward the configured admin bearer.
 
-The server exposes five tools:
+Local-socket MCP exposes six tools:
 
 | Tool | Purpose | Key arguments | CLI equivalent |
 | ---- | ------- | ------------- | -------------- |
 | `guard_run` | Execute one command through the daemon | `binary` (string) plus `args` (string array), or `verb` (`{name, params}`) for a catalog verb; one of the two is required. Optional: `env`, `secretEnv`, `secretFiles` (string maps), `secrets` (string array), `hostkey` (enum), containment gating (`revert`, `confirmCheck`, `revertControlPath` strings; `confirmWithin` integer; `requireApproval` boolean; `waitApproval` integer seconds or boolean), `reevaluate` (boolean) | `guard run`, `guard verb run` |
 | `guard_verbs` | Read the operator-defined verb catalog | none | `guard verb list` |
-| `guard_approvals` | List the caller's held approvals and provisional executions | none | `guard approvals`, `guard provisionals` |
+| `guard_access_request` | Request access for an intended operation | `intent` (string, required) | `guard access request` |
+| `guard_access_list` | List the caller's requests, holds, and access sessions | none | `guard access list` |
 | `guard_evaluate_batch` | Dry-evaluate up to 64 command shapes without executing anything | `commands` (array of `{binary, args}`, 1-64 items, required); `session` (string, optional target session) | MCP-only; no CLI equivalent |
-| `guard_session_status` | Show one session's grant, escalations, holds, and provisionals | `session` (string, required) | `guard session status` |
+| `guard_access_show` | Show one durable request, hold, or access session | `reference` (string, required) | `guard access show` |
 
 `guard_run` is the default name for the execution tool; `guard mcp serve
---tool-name` renames it. `guard_run`'s `waitApproval` mirrors the CLI's
+--tool-name` renames it to a name that is not reserved by another built-in
+tool. `guard_run`'s `waitApproval` mirrors the CLI's
 `--wait-approval`: an integer bounds the wait in seconds, `true` waits without
 bound, and `false` or omission returns the held handle immediately.
 `guard_evaluate_batch` evaluates every shape against the active saved-grant
 revision cache context and returns per-command verdicts without running,
 holding, or reverting anything.
+
+TCP MCP exposes only `guard_run`. Administrative MCP tools require the
+kernel-authenticated principal available on a local socket and are not
+advertised over bearer-authenticated TCP.
 
 HTTP MCP is available for a local single-tenant runtime and requires a bearer:
 
@@ -146,14 +167,20 @@ export GUARD_MCP_TOKEN="..."
 guard mcp serve --http 127.0.0.1:7333
 ```
 
-Every HTTP MCP caller appears to the daemon as the MCP process principal. Keep
-the listener inside the same trusted boundary and use the stdio transport when
-per-process network identity is unnecessary.
+The HTTP listener accepts loopback addresses only. Requests require the bearer,
+an absent or loopback `Origin`, and an `Accept` header listing both
+`application/json` and `text/event-stream`. Unsupported
+`MCP-Protocol-Version` values are rejected. The transport returns 405 for GET
+because it does not provide an SSE listening stream. A successful initialize
+response supplies an `Mcp-Session-Id`; subsequent requests present that ID and
+can reconnect without losing MCP lifecycle state. Unknown, missing, duplicate,
+or terminated sessions fail closed. Every HTTP MCP caller appears to the daemon
+as the MCP process principal. Use stdio when a network transport is unnecessary.
 
 ## In-process API clients
 
 Helm, Terraform providers, k9s, and SDKs can perform API operations without
-spawning a command for each request. Point these clients at Guard's brokered
-endpoint so policy applies at the request boundary. The API client carries a
-Guard session bearer while the daemon retains the upstream credential. See
-[API proxy](api-proxy.md).
+spawning a command for each request. Operator/bootstrap clients can point at
+Guard's brokered endpoint so policy applies at the request boundary. The public
+access workflow uses typed command verbs and exports no API bearer. See [API
+proxy](api-proxy.md).

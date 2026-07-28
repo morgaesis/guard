@@ -11,6 +11,7 @@ use guard::gating::verb::{
     CoverageAction, CoverageProbe, CoverageProvenance, ValueConstraint, Verb, VerbCoverageCell,
 };
 use guard::gating::Reversibility;
+use guard::principal::PrincipalKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -134,6 +135,7 @@ impl SavedGrant {
         Ok(self)
     }
 
+    #[cfg(test)]
     pub fn generated_verb_names(&self) -> Vec<String> {
         self.generated_verbs
             .iter()
@@ -141,6 +143,7 @@ impl SavedGrant {
             .collect()
     }
 
+    #[cfg(test)]
     pub fn all_activated_verbs(&self) -> Vec<String> {
         let mut names = self.activated_verbs.clone();
         names.extend(self.generated_verb_names());
@@ -148,6 +151,7 @@ impl SavedGrant {
         names
     }
 
+    #[cfg(test)]
     pub fn contains_delta(&self, delta: &GrantRequestDelta) -> bool {
         delta.override_markers.is_empty()
             && delta
@@ -225,7 +229,33 @@ impl GrantRequestStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GrantRequest {
     pub handle: String,
+    /// Internal bearer target for compatibility session amendments. Access
+    /// projections always replace this value with a stable fingerprint.
+    #[serde(default)]
     pub session_token: String,
+    /// Daemon-authenticated requester. Access requests always populate this
+    /// from the local peer and never accept it from the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester: Option<PrincipalKey>,
+    /// Stable session fingerprint or agent label used by the public access
+    /// workflow. This is safe to display and is never accepted as authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Canonical digest used to converge equivalent retries.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub request_key: String,
+    /// Declarative bounded-use policy carried by proactive extension. Ordinary
+    /// agent requests leave this unset and the operator chooses at approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_uses: Option<u64>,
+    /// Complete typed scope covered by this access request. `delta` contains
+    /// only authority missing from the target session.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authority_verbs: Vec<String>,
+    /// Exact synthesized coverage proposed by this request. It remains inert
+    /// until operator approval commits it to the catalog.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proposed_verbs: Vec<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub saved_grant: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -269,9 +299,15 @@ impl GrantRequest {
         let handle = format!("gr-{:032x}", rand::random::<u128>());
         let created_unix = now_unix();
         Ok(Self {
-            next_action: format!("guard grant request show {handle}"),
+            next_action: format!("guard access show {handle}"),
             handle,
             session_token,
+            requester: None,
+            target: None,
+            request_key: String::new(),
+            requested_uses: None,
+            authority_verbs: Vec::new(),
+            proposed_verbs: Vec::new(),
             saved_grant,
             issued_saved_revision: None,
             issued_session_revision: None,
@@ -284,6 +320,92 @@ impl GrantRequest {
             decided_reason: None,
         })
     }
+
+    pub fn new_access(
+        requester: PrincipalKey,
+        session_token: Option<String>,
+        target: String,
+        delta: GrantRequestDelta,
+        intent: String,
+    ) -> Result<Self> {
+        Self::new_access_with_uses(requester, session_token, target, delta, intent, None)
+    }
+
+    pub fn new_access_with_uses(
+        requester: PrincipalKey,
+        session_token: Option<String>,
+        target: String,
+        mut delta: GrantRequestDelta,
+        intent: String,
+        requested_uses: Option<u64>,
+    ) -> Result<Self> {
+        normalize_strings(&mut delta.activated_verbs);
+        normalize_strings(&mut delta.override_markers);
+        normalize_strings(&mut delta.secret_names);
+        if intent.trim().is_empty() {
+            bail!("access request requires an intent");
+        }
+        if delta.is_empty() && requested_uses.is_none() {
+            bail!("access request has no requested change");
+        }
+        let handle = format!("gr-{:032x}", rand::random::<u128>());
+        let created_unix = now_unix();
+        let mut request = Self {
+            next_action: format!("guard access show {handle}"),
+            handle,
+            session_token: session_token.unwrap_or_default(),
+            requester: Some(requester),
+            target: Some(target),
+            request_key: String::new(),
+            requested_uses,
+            authority_verbs: Vec::new(),
+            proposed_verbs: Vec::new(),
+            saved_grant: None,
+            issued_saved_revision: None,
+            issued_session_revision: None,
+            delta,
+            justification: intent,
+            status: GrantRequestStatus::Pending,
+            created_unix,
+            expires_unix: created_unix.saturating_add(86_400),
+            decided_unix: None,
+            decided_reason: None,
+        };
+        request.request_key = request.canonical_access_key()?;
+        Ok(request)
+    }
+
+    pub fn canonical_access_key(&self) -> Result<String> {
+        let requester = self
+            .requester
+            .as_ref()
+            .context("access request requires an authenticated requester")?;
+        let encoded = serde_json::to_vec(&(
+            requester,
+            &self.session_token,
+            &self.delta,
+            self.requested_uses,
+            &self.authority_verbs,
+            &self.proposed_verbs,
+            &self.issued_session_revision,
+        ))?;
+        let digest = Sha256::digest(encoded);
+        Ok(format!(
+            "ar-{}",
+            digest[..16]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        ))
+    }
+}
+
+pub fn normalize_access_intent(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -331,7 +453,7 @@ impl SavedGrantCatalog {
         let grant = grant.normalize()?;
         if self.grants.contains_key(&grant.name) {
             bail!(
-                "saved grant '{}' already exists; use `guard grant edit`",
+                "saved grant '{}' already exists; use `guard access request <intent>` for missing authority",
                 grant.name
             );
         }
@@ -339,6 +461,7 @@ impl SavedGrantCatalog {
         Ok(grant)
     }
 
+    #[cfg(test)]
     pub fn replace(&mut self, grant: SavedGrant) -> Result<SavedGrant> {
         let previous = self
             .grants
@@ -350,10 +473,6 @@ impl SavedGrantCatalog {
         let grant = grant.normalize()?;
         self.grants.insert(grant.name.clone(), grant.clone());
         Ok(grant)
-    }
-
-    pub fn remove(&mut self, name: &str) -> Option<SavedGrant> {
-        self.grants.remove(name)
     }
 
     /// Parse saved grants and migrate the legacy top-level `profiles` key.
@@ -632,6 +751,7 @@ fn normalize_strings(values: &mut Vec<String>) {
     values.dedup();
 }
 
+#[cfg(test)]
 fn selector_matches(selector: &str, value: &str) -> bool {
     if let Some(prefix) = selector.strip_suffix('*') {
         value.starts_with(prefix)
@@ -845,5 +965,76 @@ mod tests {
             catalog.get("shared").unwrap().prompt_append.as_deref(),
             Some("durable revision")
         );
+    }
+
+    #[test]
+    fn access_request_keys_coalesce_equivalent_authority_but_isolate_principals() {
+        let delta = GrantRequestDelta {
+            activated_verbs: vec!["inspect".to_string()],
+            ..GrantRequestDelta::default()
+        };
+        let one = GrantRequest::new_access(
+            PrincipalKey::from_uid(1001),
+            None,
+            "agent:1001".to_string(),
+            delta.clone(),
+            "Inspect   the fixture".to_string(),
+        )
+        .unwrap();
+        let retry = GrantRequest::new_access(
+            PrincipalKey::from_uid(1001),
+            None,
+            "agent:1001".to_string(),
+            delta.clone(),
+            " inspect the fixture ".to_string(),
+        )
+        .unwrap();
+        let other = GrantRequest::new_access(
+            PrincipalKey::from_uid(1002),
+            None,
+            "agent:1002".to_string(),
+            delta,
+            "inspect the fixture".to_string(),
+        )
+        .unwrap();
+        assert_eq!(one.request_key, retry.request_key);
+        assert_ne!(one.request_key, other.request_key);
+        assert_eq!(one.requester, Some(PrincipalKey::from_uid(1001)));
+        assert!(one.session_token.is_empty());
+    }
+
+    #[test]
+    fn access_request_keys_ignore_prose_and_display_target_for_one_session_revision() {
+        let delta = GrantRequestDelta {
+            activated_verbs: vec!["access-command-run".to_string()],
+            ..GrantRequestDelta::default()
+        };
+        let mut execution = GrantRequest::new_access(
+            PrincipalKey::from_uid(1001),
+            Some("session-token".to_string()),
+            "session:fixture".to_string(),
+            delta.clone(),
+            "access-command-run".to_string(),
+        )
+        .unwrap();
+        execution.authority_verbs = vec!["access-command-run".to_string()];
+        execution.issued_session_revision = Some("revision-4".to_string());
+        execution.request_key = execution.canonical_access_key().unwrap();
+
+        let mut prose = GrantRequest::new_access(
+            PrincipalKey::from_uid(1001),
+            Some("session-token".to_string()),
+            "agent:1001".to_string(),
+            delta,
+            "Run the bounded command".to_string(),
+        )
+        .unwrap();
+        prose.authority_verbs = vec!["access-command-run".to_string()];
+        prose.issued_session_revision = Some("revision-4".to_string());
+        prose.request_key = prose.canonical_access_key().unwrap();
+
+        assert_eq!(execution.request_key, prose.request_key);
+        prose.session_token = "another-session".to_string();
+        assert_ne!(execution.request_key, prose.canonical_access_key().unwrap());
     }
 }

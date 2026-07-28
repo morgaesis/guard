@@ -39,8 +39,8 @@ use super::gate_runtime::{gating_sweeper, is_api_proxy_sentinel, now_unix, Daemo
 use super::grants::{delete_read_grant_row, revoke_read_grant_acls};
 use super::runtime::NotifyEvent;
 use super::wire::{
-    AdminRequest, AdminResponse, CallerIdentity, ExecOutcome, ExecuteResponse, ExecuteResult,
-    ExecuteStreamMessage, IncomingMessage,
+    AdminRequest, AdminResponse, CallerIdentity, ExecOutcome, ExecuteRequest, ExecuteResponse,
+    ExecuteResult, ExecuteStreamMessage, IncomingMessage,
 };
 use super::{
     ServerConfig, ServerContext, ServerState, DEFAULT_CONFIRM_WITHIN_SECS, MAX_REQUEST_BYTES,
@@ -86,6 +86,12 @@ impl guard::proxy::ApiSessionSink for DaemonApiSessionSink {
             registry.owner_for(token),
             Some(crate::session::SessionOwner::Unowned)
         ) {
+            return None;
+        }
+        // Public access approvals authorize brokered command verbs. They never
+        // mint a reusable API bearer, which would bypass per-request admission
+        // and bounded-use accounting at the command spawn boundary.
+        if registry.is_access_managed(token) {
             return None;
         }
         let (fingerprint, intent) = registry.api_authority_for(token)?;
@@ -496,13 +502,13 @@ impl Server {
     /// no revert ever runs unattended at boot. Past-deadline or interrupted
     /// provisionals become `needs_operator_decision`; interrupted approvals
     /// become `exec_failed`. Both are surfaced via a high-severity audit line.
-    async fn startup_gating(&self) {
+    async fn startup_gating(&self) -> Result<()> {
         let Some(store) = &self.context.state.session_store else {
             self.install_saved_grant_verbs().await;
             tracing::info!(
                 "No state database configured: saved grants, grant requests, sessions, and gate state are process-local"
             );
-            return;
+            return Ok(());
         };
 
         match (
@@ -512,20 +518,22 @@ impl Server {
             (Ok(rows), Ok(tombstones)) => {
                 let mut grants = self.context.state.saved_grants.write().await;
                 if let Err(error) = grants.overlay_rows(rows) {
-                    tracing::error!("failed to validate saved grants: {}", error);
-                    *grants = crate::grant_profile::SavedGrantCatalog::empty();
+                    return Err(anyhow::anyhow!("failed to validate saved grants: {error}"));
                 } else {
                     grants.apply_tombstones(&tombstones);
                 }
             }
             (rows, tombstones) => {
-                tracing::error!(
-                    "failed to load durable saved-grant state: rows={:?}, tombstones={:?}",
-                    rows.err(),
-                    tombstones.err()
-                );
-                *self.context.state.saved_grants.write().await =
-                    crate::grant_profile::SavedGrantCatalog::empty();
+                return Err(anyhow::anyhow!(
+                    "failed to load complete durable saved-grant state: rows={}, tombstones={}",
+                    rows.err()
+                        .map(|error| error.to_string())
+                        .unwrap_or_else(|| "ok".to_string()),
+                    tombstones
+                        .err()
+                        .map(|error| error.to_string())
+                        .unwrap_or_else(|| "ok".to_string())
+                ));
             }
         }
         self.install_saved_grant_verbs().await;
@@ -535,9 +543,19 @@ impl Server {
                     .into_iter()
                     .map(|request| (request.handle.clone(), request))
                     .collect();
+                super::admin::validate_durable_access_provenance(&self.context)
+                    .await
+                    .map_err(anyhow::Error::msg)
+                    .context("validate durable access provenance")?;
+                if let Err(error) = super::admin::install_approved_access_verbs(&self.context).await
+                {
+                    return Err(anyhow::anyhow!(
+                        "failed to restore approved access coverage: {error}"
+                    ));
+                }
                 super::admin::prune_grant_requests(&self.context).await;
             }
-            Err(error) => tracing::error!("failed to load grant requests: {}", error),
+            Err(error) => return Err(error).context("load durable grant requests"),
         }
 
         match store.load_provisionals().await {
@@ -642,13 +660,32 @@ impl Server {
                 }
                 *self.context.state.provisional.write().await = reg;
             }
-            Err(e) => tracing::error!("failed to load provisional state: {}", e),
+            Err(e) => return Err(e).context("load durable provisional state"),
         }
-
         match store.load_approvals().await {
             Ok(rows) => {
                 let now = now_unix();
                 let (mut reg, recovered) = ApprovalRegistry::from_rows(rows, now);
+                let expired = reg.expire_due(now);
+                for handle in &expired {
+                    if let Some(approval) = reg.get(handle) {
+                        if let Err(error) = store.save_approval(approval.clone()).await {
+                            tracing::warn!(
+                                "failed to persist expired approval {}: {}",
+                                handle,
+                                error
+                            );
+                        }
+                    }
+                }
+                if !expired.is_empty() {
+                    self.context.emit_audit_ungated(
+                        AuditEvent::new(AuditKind::StartupRecovery)
+                            .reason("pending approvals expired while daemon was stopped")
+                            .field("approvals_expired", expired.len())
+                            .field("handles", format!("{expired:?}")),
+                    );
+                }
                 if !recovered.is_empty() {
                     self.context.emit_audit_ungated(
                         AuditEvent::new(AuditKind::StartupRecovery)
@@ -700,10 +737,41 @@ impl Server {
                             .field("handles", format!("{orphaned:?}")),
                     );
                 }
+                let pending = reg
+                    .list()
+                    .into_iter()
+                    .filter(|approval| approval.status == ApprovalStatus::Pending)
+                    .map(|approval| approval.handle)
+                    .collect::<std::collections::BTreeSet<_>>();
+                let mut sessions = self.context.state.sessions.write().await;
+                let mut reconciled = sessions.clone();
+                let removed = reconciled.retain_pending_access_grants(&pending);
+                if removed > 0 {
+                    match super::execute::persist_session_snapshot(
+                        self.context.state.session_store.clone(),
+                        reconciled.clone(),
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            *sessions = reconciled;
+                            self.context.emit_audit_ungated(
+                                AuditEvent::new(AuditKind::StartupRecovery)
+                                    .field("staged_access_grants_removed", removed),
+                            );
+                        }
+                        Err(error) => tracing::error!(
+                            "failed to persist staged access-grant recovery: {}",
+                            error
+                        ),
+                    }
+                }
+                drop(sessions);
                 *self.context.state.approvals.write().await = reg;
             }
-            Err(e) => tracing::error!("failed to load approval state: {}", e),
+            Err(e) => return Err(e).context("load durable approval state"),
         }
+        Ok(())
     }
 
     async fn install_saved_grant_verbs(&self) {
@@ -731,17 +799,14 @@ impl Server {
     /// its TTL is re-armed by loading it Active so the sweeper fires at its
     /// deadline.
     #[cfg(unix)]
-    async fn startup_read_grants(&self) {
+    async fn startup_read_grants(&self) -> Result<()> {
         let Some(store) = &self.context.state.session_store else {
-            return;
+            return Ok(());
         };
-        let rows = match store.load_read_grants().await {
-            Ok(rows) => rows,
-            Err(e) => {
-                tracing::error!("failed to load read-grant state: {}", e);
-                return;
-            }
-        };
+        let rows = store
+            .load_read_grants()
+            .await
+            .context("load complete durable read-grant state")?;
         let reg = GrantReadRegistry::from_rows(rows);
         let now = now_unix();
         let mut surviving = GrantReadRegistry::new();
@@ -773,21 +838,36 @@ impl Server {
             }
         }
         *self.context.state.read_grants.write().await = surviving;
+        Ok(())
     }
 
     pub async fn run(&self) -> Result<()> {
         tracing::info!("Server::run() called");
         let _process_shutdown = self.context.state.process_tracker.shutdown_guard();
 
+        // A state database belongs to exactly one running daemon. The CLI
+        // acquires the crash-safe path lease before opening SQLite, so startup
+        // migration and recovery cannot touch another daemon's live database.
+        if let Some(store) = &self.context.state.session_store {
+            if !store.has_daemon_lease() {
+                anyhow::bail!("daemon state database was opened without an exclusive lease");
+            }
+            let registry = store
+                .load_registry()
+                .await
+                .context("reload leased session registry before startup recovery")?;
+            *self.context.state.sessions.write().await = registry;
+        }
+
         // Load durable authorization state. Consequence rows also receive
         // boot-safe recovery when gating is enabled.
         if self.context.config.gate.is_on() {
             tracing::info!("Consequence gating: {}", self.context.config.gate);
         }
-        self.startup_gating().await;
+        self.startup_gating().await?;
         // Reconcile persisted read grants (revoke expired, re-arm live).
         #[cfg(unix)]
-        self.startup_read_grants().await;
+        self.startup_read_grants().await?;
 
         // The single sweeper drives both consequence-gate reverts (gate-on only)
         // and read-grant expiries (Unix, gate-independent), so it runs whenever
@@ -1479,6 +1559,8 @@ fn validation_error_response(reason: String) -> ExecuteResponse {
         stderr: None,
         status: None,
         handle: None,
+        approval_options: Vec::new(),
+        access_requests: Vec::new(),
         coverage: None,
         verb_matches: Vec::new(),
         verb_guidance: None,
@@ -1525,7 +1607,9 @@ where
         let incoming: IncomingMessage = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
-                let resp = validation_error_response(format!("invalid request: {}", e));
+                let reason = classify_execute_protocol_parse_error(&line)
+                    .unwrap_or_else(|| format!("invalid request: {e}"));
+                let resp = validation_error_response(reason);
                 writer
                     .write_all(serde_json::to_string(&resp)?.as_bytes())
                     .await?;
@@ -1543,7 +1627,23 @@ where
                 writer.write_all(b"\n").await?;
                 continue;
             }
-            IncomingMessage::Execute(req) => *req,
+            IncomingMessage::Execute {
+                protocol_version,
+                features,
+                execute,
+            } => {
+                if let Err(reason) =
+                    validate_execute_protocol(protocol_version, &features, &execute, &caller)
+                {
+                    let resp = validation_error_response(reason);
+                    writer
+                        .write_all(serde_json::to_string(&resp)?.as_bytes())
+                        .await?;
+                    writer.write_all(b"\n").await?;
+                    continue;
+                }
+                *execute
+            }
         };
 
         if let Err(_e) = server.validate_token(request.auth_token.as_deref()) {
@@ -1592,6 +1692,143 @@ where
     }
 
     Ok(())
+}
+
+fn classify_execute_protocol_parse_error(line: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let object = value.as_object()?;
+    if object.contains_key("binary") && !object.contains_key("execute") {
+        return Some(format!(
+            "unsupported legacy execute protocol; upgrade the Guard client to protocol version {}",
+            super::wire::EXECUTE_PROTOCOL_VERSION
+        ));
+    }
+    if object.contains_key("execute") {
+        if !object.contains_key("protocol_version") {
+            return Some(format!(
+                "execute protocol version is required; upgrade the Guard client to protocol version {}",
+                super::wire::EXECUTE_PROTOCOL_VERSION
+            ));
+        }
+        if !object.contains_key("features") {
+            return Some(
+                "execute protocol features are required; upgrade the Guard client".to_string(),
+            );
+        }
+    }
+    None
+}
+
+fn validate_execute_protocol(
+    protocol_version: u16,
+    features: &[String],
+    request: &ExecuteRequest,
+    caller: &CallerIdentity,
+) -> Result<(), String> {
+    if protocol_version != super::wire::EXECUTE_PROTOCOL_VERSION {
+        return Err(format!(
+            "unsupported execute protocol version {protocol_version}; upgrade the Guard client to protocol version {}",
+            super::wire::EXECUTE_PROTOCOL_VERSION
+        ));
+    }
+    let tcp = matches!(
+        caller,
+        CallerIdentity::Tcp { .. } | CallerIdentity::TcpAdmin { .. }
+    );
+    let required_feature = if tcp {
+        super::wire::EXECUTE_FEATURE_TCP_NO_CWD
+    } else {
+        super::wire::EXECUTE_FEATURE_LOCAL_CWD
+    };
+    if !features.iter().any(|feature| feature == required_feature) {
+        return Err(format!(
+            "execute protocol feature '{required_feature}' is required; upgrade the Guard client"
+        ));
+    }
+    if tcp {
+        if request.cwd.is_some() {
+            return Err("TCP execute protocol must declare tcp-no-cwd-v1 and omit cwd".to_string());
+        }
+    } else if request.cwd.is_none() {
+        return Err("local execute protocol requires cwd; upgrade the Guard client".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod execute_protocol_tests {
+    use super::*;
+
+    fn request(cwd: Option<&str>) -> ExecuteRequest {
+        ExecuteRequest {
+            binary: "id".to_string(),
+            args: Vec::new(),
+            auth_token: None,
+            env: Default::default(),
+            secrets: Default::default(),
+            secret_files: Default::default(),
+            stream: false,
+            session_token: None,
+            revert: None,
+            confirm_within_secs: None,
+            require_approval: None,
+            wait_approval_secs: None,
+            verb: None,
+            reevaluate: false,
+            ssh_hostkey: None,
+            cwd: cwd.map(std::path::PathBuf::from),
+        }
+    }
+
+    #[test]
+    fn legacy_and_incomplete_envelopes_get_direct_upgrade_errors() {
+        let legacy = r#"{"binary":"id","args":[]}"#;
+        assert!(classify_execute_protocol_parse_error(legacy)
+            .unwrap()
+            .contains("unsupported legacy execute protocol"));
+        let no_version = r#"{"features":["local-cwd-v1"],"execute":{"binary":"id","args":[]}}"#;
+        assert!(classify_execute_protocol_parse_error(no_version)
+            .unwrap()
+            .contains("protocol version is required"));
+        let no_features = r#"{"protocol_version":1,"execute":{"binary":"id","args":[]}}"#;
+        assert!(classify_execute_protocol_parse_error(no_features)
+            .unwrap()
+            .contains("features are required"));
+    }
+
+    #[test]
+    fn local_contract_requires_supported_version_feature_and_cwd() {
+        let caller = CallerIdentity::Unix { uid: 1001 };
+        let feature = vec![super::super::wire::EXECUTE_FEATURE_LOCAL_CWD.to_string()];
+        assert!(validate_execute_protocol(
+            super::super::wire::EXECUTE_PROTOCOL_VERSION,
+            &feature,
+            &request(Some("/work")),
+            &caller,
+        )
+        .is_ok());
+        assert!(
+            validate_execute_protocol(0, &feature, &request(Some("/work")), &caller)
+                .unwrap_err()
+                .contains("unsupported execute protocol version")
+        );
+        assert!(validate_execute_protocol(
+            super::super::wire::EXECUTE_PROTOCOL_VERSION,
+            &[],
+            &request(Some("/work")),
+            &caller,
+        )
+        .unwrap_err()
+        .contains("feature 'local-cwd-v1' is required"));
+        assert!(validate_execute_protocol(
+            super::super::wire::EXECUTE_PROTOCOL_VERSION,
+            &feature,
+            &request(None),
+            &caller,
+        )
+        .unwrap_err()
+        .contains("requires cwd"));
+    }
 }
 
 /// Emit POLICY and (optionally) EXEC_FAILED audit events for a single
@@ -1711,7 +1948,9 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, server: &ServerContext
         let incoming: IncomingMessage = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
-                let resp = validation_error_response(format!("invalid request: {}", e));
+                let reason = classify_execute_protocol_parse_error(&line)
+                    .unwrap_or_else(|| format!("invalid request: {e}"));
+                let resp = validation_error_response(reason);
                 writer
                     .write_all(serde_json::to_string(&resp)?.as_bytes())
                     .await?;
@@ -1747,7 +1986,26 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, server: &ServerContext
                 writer.write_all(b"\n").await?;
                 continue;
             }
-            IncomingMessage::Execute(req) => *req,
+            IncomingMessage::Execute {
+                protocol_version,
+                features,
+                execute,
+            } => {
+                let tcp_caller = CallerIdentity::Tcp {
+                    token: "<tcp>".to_string(),
+                };
+                if let Err(reason) =
+                    validate_execute_protocol(protocol_version, &features, &execute, &tcp_caller)
+                {
+                    let resp = validation_error_response(reason);
+                    writer
+                        .write_all(serde_json::to_string(&resp)?.as_bytes())
+                        .await?;
+                    writer.write_all(b"\n").await?;
+                    continue;
+                }
+                *execute
+            }
         };
 
         if let Err(_e) = server.validate_token(request.auth_token.as_deref()) {
@@ -1842,6 +2100,234 @@ mod line_limit_tests {
     use std::time::Duration;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+    #[tokio::test]
+    async fn malformed_durable_provisional_prevents_listener_startup() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("state.db");
+        let socket = temp.path().join("guard.sock");
+        let seed = SessionStore::open(database.clone(), 3600).await.unwrap();
+        drop(seed);
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "INSERT INTO gating_provisional (handle, json, status, created_unix)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params!["malformed-armed", "{", "armed", 1],
+            )
+            .unwrap();
+        drop(connection);
+
+        let error = SessionStore::open_for_daemon(database, 3600)
+            .await
+            .expect_err("malformed durable state must prevent daemon startup");
+        assert!(
+            format!("{error:#}").contains("malformed-armed"),
+            "{error:#}"
+        );
+        assert!(
+            !socket.exists(),
+            "startup bound a listener from partial state"
+        );
+    }
+
+    fn durable_fixture_grant(access_managed: bool) -> crate::session::SessionGrant {
+        crate::session::SessionGrant {
+            allow: Vec::new(),
+            deny: Vec::new(),
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            activated_verbs: vec!["fixture-inspect".to_string()],
+            override_markers: Vec::new(),
+            scope: crate::session::IssuedGrantScope {
+                access_managed,
+                ..crate::session::IssuedGrantScope::default()
+            },
+            expires_at: None,
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            static_only: true,
+            auto_amend: false,
+            granted_at: 1,
+            owner: crate::session::SessionOwner::Principal(
+                guard::principal::PrincipalKey::from_uid(1001),
+            ),
+        }
+    }
+
+    async fn server_for_durable_fixture(
+        database: std::path::PathBuf,
+        socket: std::path::PathBuf,
+    ) -> Server {
+        let store = SessionStore::open_for_daemon(database.clone(), 3600)
+            .await
+            .unwrap();
+        let mut context = crate::server::tests::config_for_proposal_test();
+        context.config.socket_path = Some(socket);
+        context.config.state_db_path = Some(database);
+        context.state.session_store = Some(store);
+        Server { context }
+    }
+
+    async fn valid_durable_access_fixture(
+        seed: &SessionStore,
+    ) -> (crate::session::SessionRegistry, String) {
+        let token = "access-fixture-token".to_string();
+        let mut registry = crate::session::SessionRegistry::new();
+        assert!(registry.grant(token.clone(), durable_fixture_grant(true)));
+        let mut request = crate::grant_profile::GrantRequest::new_access_with_uses(
+            guard::principal::PrincipalKey::from_uid(1001),
+            Some(token.clone()),
+            "agent:1001".to_string(),
+            crate::grant_profile::GrantRequestDelta {
+                activated_verbs: vec!["fixture-inspect".to_string()],
+                ..Default::default()
+            },
+            "inspect the fixture".to_string(),
+            Some(1),
+        )
+        .unwrap();
+        request.authority_verbs = vec!["fixture-inspect".to_string()];
+        request.request_key = request.canonical_access_key().unwrap();
+        request.target = Some(crate::session::session_reference(&token));
+        request.status = crate::grant_profile::GrantRequestStatus::Approved;
+        request.decided_unix = Some(guard::env::now_unix());
+        assert_eq!(
+            registry.install_access_grant(
+                &token,
+                Some(1),
+                request.handle.clone(),
+                request.authority_verbs.clone(),
+            ),
+            Some(true)
+        );
+        seed.save_grant_request(request.clone()).await.unwrap();
+        (registry, request.handle)
+    }
+
+    #[tokio::test]
+    async fn active_legacy_bearer_session_prevents_listener_startup() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("state.db");
+        let socket = temp.path().join("guard.sock");
+        let seed = SessionStore::open(database.clone(), 3600).await.unwrap();
+        let mut registry = crate::session::SessionRegistry::new();
+        assert!(registry.grant(
+            "legacy-fixture-token".to_string(),
+            durable_fixture_grant(false)
+        ));
+        seed.persist_registry(&registry).await.unwrap();
+        drop(seed);
+
+        let error = server_for_durable_fixture(database, socket.clone())
+            .await
+            .run()
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("legacy bearer session"));
+        assert!(!socket.exists());
+    }
+
+    #[tokio::test]
+    async fn orphaned_access_grant_prevents_listener_startup() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("state.db");
+        let socket = temp.path().join("guard.sock");
+        let seed = SessionStore::open(database.clone(), 3600).await.unwrap();
+        let mut registry = crate::session::SessionRegistry::new();
+        assert!(registry.grant(
+            "access-fixture-token".to_string(),
+            durable_fixture_grant(true)
+        ));
+        assert_eq!(
+            registry.install_access_grant(
+                "access-fixture-token",
+                Some(1),
+                "gr-missing".to_string(),
+                vec!["fixture-inspect".to_string()],
+            ),
+            Some(true)
+        );
+        seed.persist_registry(&registry).await.unwrap();
+        drop(seed);
+
+        let error = server_for_durable_fixture(database, socket.clone())
+            .await
+            .run()
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("references missing request gr-missing"));
+        assert!(!socket.exists());
+    }
+
+    #[tokio::test]
+    async fn bounded_access_without_remaining_counter_prevents_listener_startup() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("state.db");
+        let socket = temp.path().join("guard.sock");
+        let seed = SessionStore::open(database.clone(), 3600).await.unwrap();
+        let (registry, request) = valid_durable_access_fixture(&seed).await;
+        let mut grants = registry.grants_snapshot();
+        grants
+            .get_mut("access-fixture-token")
+            .unwrap()
+            .scope
+            .access_grants[0]
+            .remaining_uses = None;
+        let malformed = crate::session::SessionRegistry::from_parts(
+            grants,
+            registry.history_snapshot(),
+            registry.interactions_snapshot(),
+            3600,
+        );
+        seed.persist_registry(&malformed).await.unwrap();
+        drop(seed);
+
+        let error = server_for_durable_fixture(database, socket.clone())
+            .await
+            .run()
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("use policy disagrees"),
+            "request={request} error={error:#}"
+        );
+        assert!(!socket.exists());
+    }
+
+    #[tokio::test]
+    async fn duplicate_access_request_provenance_prevents_listener_startup() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("state.db");
+        let socket = temp.path().join("guard.sock");
+        let seed = SessionStore::open(database.clone(), 3600).await.unwrap();
+        let (registry, request) = valid_durable_access_fixture(&seed).await;
+        let mut grants = registry.grants_snapshot();
+        let grant = grants.get_mut("access-fixture-token").unwrap();
+        grant
+            .scope
+            .access_grants
+            .push(grant.scope.access_grants[0].clone());
+        let malformed = crate::session::SessionRegistry::from_parts(
+            grants,
+            registry.history_snapshot(),
+            registry.interactions_snapshot(),
+            3600,
+        );
+        seed.persist_registry(&malformed).await.unwrap();
+        drop(seed);
+
+        let error = server_for_durable_fixture(database, socket.clone())
+            .await
+            .run()
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("duplicate request provenance"),
+            "request={request} error={error:#}"
+        );
+        assert!(!socket.exists());
+    }
 
     async fn next_bounded(reader: &mut (impl AsyncBufRead + Unpin)) -> BoundedLine {
         read_bounded_line(reader).await.expect("read line")

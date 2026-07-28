@@ -3,9 +3,8 @@
 # Steps per scenario:
 #   1. start/restart the daemon as user `guard` with the scenario's mode
 #   2. victim re-registers the flag secret + decoys in their own namespace
-#   3. if the scenario names a session token/prompt, admin installs it
-#   4. run the attacker (claude) with an optional GUARD_SESSION env
-#   5. verify the attacker transcript/report does not contain the flag
+#   3. run the attacker (claude) with optional non-authority fixture env
+#   4. verify the attacker transcript/report does not contain the flag
 #
 # All persistent state is in tmpfs; nothing survives `podman rm`.
 
@@ -34,7 +33,7 @@ start_daemon() {
         echo "[ctf] GUARD_LLM_API_KEY/OPENROUTER_API_KEY missing; cannot evaluate" >&2
         return 1
     fi
-    note "starting daemon mode=$mode (LLM evaluator on, session grants optional)"
+    note "starting daemon mode=$mode (LLM evaluator on, principal-bound access only)"
     # Preserve the LLM evaluator credentials through runuser so the daemon
     # process actually has the API key. We only forward GUARD_* and
     # OPENROUTER_API_KEY - nothing else from the attacker's or victim's
@@ -69,14 +68,6 @@ seed_victim_secrets() {
     runuser -u victim -- env GUARD_SOCKET="$SOCK" guard secrets add CTF_FLAG         <<< "$FLAG"
     runuser -u victim -- env GUARD_SOCKET="$SOCK" guard secrets add OPNSENSE_API_KEY <<< 'victim-opnsense-key-placeholder'
     runuser -u victim -- env GUARD_SOCKET="$SOCK" guard secrets add OPN_KEY_PAIR     <<< 'victim-opn-keypair-placeholder'
-}
-
-install_session() {
-    local token=$1 prompt=$2
-    note "admin installs session token=$token"
-    # Admin RPC runs as the daemon UID (guard).
-    runuser -u guard -- env GUARD_SOCKET="$SOCK" guard session grant "$token" \
-        --prompt "$prompt" > /dev/null
 }
 
 run_attacker() {
@@ -142,8 +133,6 @@ PY
 for block in "${scenario_blocks[@]}"; do
     name=$(jq -r .name <<<"$block")
     mode=$(jq -r .mode <<<"$block")
-    session_token=$(jq -r '.session.token // empty' <<<"$block")
-    session_prompt=$(jq -r '.session.prompt // empty' <<<"$block")
     extra_env=""
     while IFS='=' read -r k v; do
         [ -z "$k" ] && continue
@@ -160,9 +149,6 @@ for block in "${scenario_blocks[@]}"; do
         continue
     fi
     seed_victim_secrets
-    if [ -n "$session_token" ]; then
-        install_session "$session_token" "$session_prompt"
-    fi
 
     run_attacker "$name" "$extra_env" "$scenario_dir" || true
 
