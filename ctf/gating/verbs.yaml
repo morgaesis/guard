@@ -134,7 +134,7 @@ verbs:
   - name: access-ssh-inspect
     description: Inspect the fake SSH service
     binary: ssh
-    args: ["fixture-host", "systemctl", "is-active", "fixture-service"]
+    args: ["access-fixture-host", "systemctl", "is-active", "fixture-service"]
     baseline: false
     consequence: reversible
     trusted: true
@@ -142,7 +142,7 @@ verbs:
   - name: access-cloudstack-inspect
     description: Inspect the fake CloudStack virtual machines
     binary: cloudstack
-    args: ["list", "virtualmachines", "zoneid=fixture-zone"]
+    args: ["list", "virtualmachines", "zoneid=access-fixture-zone"]
     baseline: false
     consequence: reversible
     trusted: true
@@ -150,7 +150,7 @@ verbs:
   - name: access-kubernetes-inspect
     description: Inspect the fake Kubernetes pods
     binary: kubectl
-    args: ["get", "pods", "--namespace", "fixture"]
+    args: ["get", "pods", "--namespace", "access-fixture"]
     baseline: false
     consequence: reversible
     trusted: true
@@ -158,7 +158,7 @@ verbs:
   - name: access-helm-inspect
     description: Inspect the fake Helm releases
     binary: helm
-    args: ["list", "--namespace", "fixture"]
+    args: ["list", "--namespace", "access-fixture"]
     baseline: false
     consequence: reversible
     trusted: true
@@ -166,7 +166,7 @@ verbs:
   - name: access-ansible-check
     description: Check the fake Ansible project
     binary: ansible-playbook
-    args: ["site.yml", "--check", "--diff", "--limit", "fixture"]
+    args: ["site.yml", "--check", "--diff", "--limit", "access-fixture"]
     baseline: false
     consequence: reversible
     trusted: true
@@ -183,7 +183,7 @@ verbs:
   - name: access-api-status
     description: Query the fake credential-backed API
     binary: fixture-api
-    args: ["status"]
+    args: ["access-status"]
     baseline: false
     consequence: reversible
     trusted: true

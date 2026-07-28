@@ -202,13 +202,21 @@ On Unix, the packaged paths use this upgrade sequence:
 ```bash
 release_version=0.6.0
 backup_dir="/var/backups/guard-before-v${release_version}"
+standard_state="$(systemctl is-active guard.service || true)"
+caller_state="$(systemctl is-active guard-exec-as-caller.service || true)"
+case "$standard_state:$caller_state" in
+  active:active) echo 'both packaged Guard services are active' >&2; exit 1 ;;
+  active:*) guard_unit=guard.service ;;
+  *:active) guard_unit=guard-exec-as-caller.service ;;
+  *) echo 'no packaged Guard service is active' >&2; exit 1 ;;
+esac
 test ! -e "$backup_dir"
 sha256sum --check BINARY-SHA256
 expected_binary_hash="$(awk '$2 == "guard" {print $1}' BINARY-SHA256)"
 test "${#expected_binary_hash}" -eq 64
 install -d -o root -g root -m 0700 "$backup_dir"
-systemctl stop guard.service
-test "$(systemctl is-active guard.service || true)" = inactive
+systemctl stop "$guard_unit"
+test "$(systemctl is-active "$guard_unit" || true)" = inactive
 install -o root -g root -m 0755 /usr/local/bin/guard "$backup_dir/guard"
 for deployed_file in \
   /usr/local/sbin/guard-operator \
@@ -223,7 +231,11 @@ for deployed_file in \
 done
 sqlite3 /var/lib/guard/state.db ".backup '$backup_dir/state.db'"
 test -s "$backup_dir/state.db"
-cp -a /etc/guard "$backup_dir/config"
+if test -d /etc/guard; then
+  cp -a /etc/guard "$backup_dir/config"
+else
+  : > "$backup_dir/config.absent"
+fi
 if test -d /var/lib/guard/api-proxy-reverts; then
   cp -a /var/lib/guard/api-proxy-reverts "$backup_dir/api-proxy-reverts"
 fi
@@ -234,8 +246,8 @@ install -o root -g root -m 0755 deployment/systemd/guard-operator /usr/local/sbi
 install -o root -g root -m 0644 deployment/systemd/guard.service /etc/systemd/system/guard.service
 install -o root -g root -m 0644 deployment/systemd/guard-exec-as-caller.service /etc/systemd/system/guard-exec-as-caller.service
 systemctl daemon-reload
-systemctl start guard.service
-daemon_pid="$(systemctl show guard.service --property MainPID --value)"
+systemctl start "$guard_unit"
+daemon_pid="$(systemctl show "$guard_unit" --property MainPID --value)"
 test "$daemon_pid" -gt 0
 test "$(readlink -f "/proc/$daemon_pid/exe")" = /usr/local/bin/guard
 test "$(sha256sum "/proc/$daemon_pid/exe" | cut -d ' ' -f 1)" = "$expected_binary_hash"
@@ -250,8 +262,16 @@ backup so SQLite cannot combine files from different snapshots:
 ```bash
 release_version=0.6.0
 backup_dir="/var/backups/guard-before-v${release_version}"
-systemctl stop guard.service
-test "$(systemctl is-active guard.service || true)" = inactive
+standard_state="$(systemctl is-active guard.service || true)"
+caller_state="$(systemctl is-active guard-exec-as-caller.service || true)"
+case "$standard_state:$caller_state" in
+  active:active) echo 'both packaged Guard services are active' >&2; exit 1 ;;
+  active:*) guard_unit=guard.service; state_owner=guard; state_group=guard ;;
+  *:active) guard_unit=guard-exec-as-caller.service; state_owner=root; state_group=root ;;
+  *) echo 'no packaged Guard service is active' >&2; exit 1 ;;
+esac
+systemctl stop "$guard_unit"
+test "$(systemctl is-active "$guard_unit" || true)" = inactive
 (cd "$backup_dir" && sha256sum --check SHA256SUMS)
 for database_file in /var/lib/guard/state.db /var/lib/guard/state.db-wal /var/lib/guard/state.db-shm /var/lib/guard/state.db-journal; do
   test ! -e "$database_file" || rm -- "$database_file"
@@ -270,16 +290,18 @@ restore_packaged_file() {
 restore_packaged_file guard-operator /usr/local/sbin/guard-operator 0755
 restore_packaged_file guard.service /etc/systemd/system/guard.service 0644
 restore_packaged_file guard-exec-as-caller.service /etc/systemd/system/guard-exec-as-caller.service 0644
-install -o guard -g guard -m 0600 "$backup_dir/state.db" /var/lib/guard/state.db
+install -o "$state_owner" -g "$state_group" -m 0600 "$backup_dir/state.db" /var/lib/guard/state.db
 rm -rf /etc/guard /var/lib/guard/api-proxy-reverts
-cp -a "$backup_dir/config" /etc/guard
+if test ! -f "$backup_dir/config.absent"; then
+  cp -a "$backup_dir/config" /etc/guard
+fi
 if test -d "$backup_dir/api-proxy-reverts"; then
   cp -a "$backup_dir/api-proxy-reverts" /var/lib/guard/api-proxy-reverts
-  chown -R guard:guard /var/lib/guard/api-proxy-reverts
+  chown -R "$state_owner:$state_group" /var/lib/guard/api-proxy-reverts
 fi
 systemctl daemon-reload
-systemctl start guard.service
-daemon_pid="$(systemctl show guard.service --property MainPID --value)"
+systemctl start "$guard_unit"
+daemon_pid="$(systemctl show "$guard_unit" --property MainPID --value)"
 test "$daemon_pid" -gt 0
 test "$(readlink -f "/proc/$daemon_pid/exe")" = /usr/local/bin/guard
 test "$(sha256sum "/proc/$daemon_pid/exe" | cut -d ' ' -f 1)" = "$(sha256sum "$backup_dir/guard" | cut -d ' ' -f 1)"

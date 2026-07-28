@@ -58,7 +58,7 @@ printf 'maintenance applied\n'
 EOF
   cat > /scenario/bin/fixture-api <<'EOF'
 #!/bin/sh
-[ "$1" = status ] || exit 48
+[ "$1" = status ] || [ "$1" = access-status ] || exit 48
 [ "${FIXTURE_API_TOKEN:-}" = synthetic-fixture-token ] || exit 49
 printf 'fixture-api:healthy\n'
 EOF
@@ -298,6 +298,136 @@ expect_failure() {
   fi
 }
 
+request_concurrently() {
+  local name="$1" intent="$2" alternate="$3" index pid status reference references
+  local -a pids=()
+  for index in 1 2 3 4; do
+    if [ "$((index % 2))" -eq 0 ]; then
+      reference="$alternate"
+    else
+      reference="$intent"
+    fi
+    guard access request "$reference" --json \
+      > "/scenario/journey/$name-$index.out" \
+      2> "/scenario/journey/$name-$index.stderr" &
+    pids+=("$!")
+  done
+  for pid in "${pids[@]}"; do
+    set +e
+    wait "$pid"
+    status=$?
+    set -e
+    [ "$status" -eq 0 ]
+  done
+  references="$(
+    for index in 1 2 3 4; do
+      request_reference "/scenario/journey/$name-$index.out"
+    done
+  )"
+  [ "$(printf '%s\n' "$references" | sed '/^$/d' | wc -l)" -eq 4 ]
+  [ "$(printf '%s\n' "$references" | sed '/^$/d' | sort -u | wc -l)" -eq 1 ]
+  printf '%s\n' "$(printf '%s\n' "$references" | sed -n '1p')" \
+    > "/scenario/journey/$name.handle"
+  printf 'phase=%s uid=%s concurrent_requests=4 unique_references=1\n' \
+    "$name" "$(id -u)" >> "$RAW"
+}
+
+assert_access_decisions() {
+  local file="$1"
+  shift
+  python3 - "$file" "$@" <<'PY'
+import json
+import sys
+
+path, *expected = sys.argv[1:]
+with open(path, encoding="utf-8") as stream:
+    document = json.load(stream)
+items = document["response"]["items"]
+actual = [f"{item['request']}:{str(item['success']).lower()}" for item in items]
+if actual != expected:
+    raise SystemExit(f"unexpected access decisions: {actual!r}")
+PY
+}
+
+assert_denied_without_execution() {
+  python3 - "$@" <<'PY'
+import json
+import sys
+
+for path in sys.argv[1:]:
+    with open(path, encoding="utf-8") as stream:
+        document = json.load(stream)
+    response = document["response"]
+    assert document["type"] == "run_result", path
+    assert response["allowed"] is False, path
+    assert response.get("exit_code") is None, path
+    assert response.get("stdout") is None, path
+    assert response.get("stderr") is None, path
+PY
+}
+
+PRIVATE_ROOT=/scenario/private-install
+PRIVATE_SOCKET="$PRIVATE_ROOT/run/guard.sock"
+
+private_daemon_start() {
+  local binary="$1" log_name="$2" pid ready=false
+  mkdir -p "$PRIVATE_ROOT/home" "$PRIVATE_ROOT/config" "$PRIVATE_ROOT/data" \
+    "$PRIVATE_ROOT/run" "$PRIVATE_ROOT/log"
+  rm -f "$PRIVATE_SOCKET"
+  HOME="$PRIVATE_ROOT/home" \
+    XDG_CONFIG_HOME="$PRIVATE_ROOT/config" \
+    XDG_DATA_HOME="$PRIVATE_ROOT/data" \
+    PATH="/scenario/bin:/usr/local/bin:/usr/bin:/bin" \
+    KUBECONFIG=/scenario/fixtures/daemon.kubeconfig \
+    nohup "$binary" server start \
+      --no-llm \
+      --gate consequence \
+      --socket "$PRIVATE_SOCKET" \
+      --verbs /etc/guard/verbs.yaml \
+      --state-db "$PRIVATE_ROOT/data/state.db" \
+      --audit-log "$PRIVATE_ROOT/data/audit.jsonl" \
+      --history-retention 3600 \
+      --child-env KUBECONFIG \
+      --users 1001,1002 \
+      > "$PRIVATE_ROOT/log/$log_name.log" 2>&1 < /dev/null &
+  pid=$!
+  printf '%s\n' "$pid" > "$PRIVATE_ROOT/run/daemon.pid"
+  for _ in $(seq 1 100); do
+    if [ -S "$PRIVATE_SOCKET" ] && kill -0 "$pid" 2>/dev/null; then
+      ready=true
+      break
+    fi
+    sleep 0.1
+  done
+  [ "$ready" = true ]
+  chmod 0711 "$PRIVATE_ROOT/run"
+  chmod 0666 "$PRIVATE_SOCKET"
+}
+
+private_daemon_stop() {
+  local pid state stopped=false
+  pid="$(sed -n '1p' "$PRIVATE_ROOT/run/daemon.pid")"
+  kill "$pid"
+  for _ in $(seq 1 100); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      stopped=true
+      break
+    fi
+    state="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || true)"
+    if [ "$state" = Z ]; then
+      stopped=true
+      break
+    fi
+    sleep 0.1
+  done
+  [ "$stopped" = true ]
+  rm -f "$PRIVATE_ROOT/run/daemon.pid" "$PRIVATE_SOCKET"
+}
+
+private_guard() {
+  GUARD_SOCKET="$PRIVATE_SOCKET" guard "$@"
+}
+
 phase_su13() {
   local phase="$1" handle session
   case "$phase" in
@@ -426,7 +556,7 @@ PY
       expect_failure replay-session guard access show "$session" --json
       bearer="$(sed -n '1p' /scenario/journey/exposed-owner.bearer)"
       export GUARD_SESSION="$bearer"
-      expect_failure replay-bearer guard run --json helm list --namespace fixture
+      expect_failure replay-bearer guard run --json helm list --namespace access-fixture
       grep -q 'session principal mismatch' /scenario/journey/replay-bearer.out
       ! grep -q 'fixture-release' /scenario/journey/replay-bearer.out
       unset GUARD_SESSION
@@ -436,14 +566,14 @@ PY
       ;;
     consume)
       [ "$(id -u)" -eq 1001 ]
-      capture_phase owner-consume guard run --json ssh fixture-host systemctl is-active fixture-service
+      capture_phase owner-consume guard run --json ssh access-fixture-host systemctl is-active fixture-service
       grep -q 'fixture-service:active' /scenario/journey/owner-consume.out
-      expect_failure owner-exhausted guard run --json ssh fixture-host systemctl is-active fixture-service
+      expect_failure owner-exhausted guard run --json ssh access-fixture-host systemctl is-active fixture-service
       grep -q 'use limit is exhausted' /scenario/journey/owner-exhausted.out
       ;;
     after-restart)
       [ "$(id -u)" -eq 1001 ]
-      expect_failure owner-restart-exhausted guard run --json ssh fixture-host systemctl is-active fixture-service
+      expect_failure owner-restart-exhausted guard run --json ssh access-fixture-host systemctl is-active fixture-service
       grep -q 'use limit is exhausted' /scenario/journey/owner-restart-exhausted.out
       ;;
     verify)
@@ -569,28 +699,27 @@ phase_su16() {
       ;;
     reject-primary-cross-scope)
       [ "$(id -u)" -eq 1001 ]
-      capture_phase ssh-before-other-approvals guard run --json ssh fixture-host systemctl is-active fixture-service
+      capture_phase ssh-before-other-approvals guard run --json ssh access-fixture-host systemctl is-active fixture-service
       grep -q 'fixture-service:active' /scenario/journey/ssh-before-other-approvals.out
-      expect_failure cross-kube guard run --json kubectl get pods --namespace fixture
+      expect_failure cross-kube guard run --json kubectl get pods --namespace access-fixture
       [ "$(response_handle /scenario/journey/cross-kube.out)" = "$(read_handle kube)" ]
       expect_failure cross-command guard run --json printf 'bounded-command-complete\n'
       [ "$(response_handle /scenario/journey/cross-command.out)" = "$(read_handle command)" ]
-      expect_failure cross-cloud guard run --json cloudstack list virtualmachines zoneid=fixture-zone
+      expect_failure cross-cloud guard run --json cloudstack list virtualmachines zoneid=access-fixture-zone
       [ "$(response_handle /scenario/journey/cross-cloud.out)" = "$(read_handle cloud)" ]
       expect_failure cross-file guard run --json cat /scenario/fixtures/operator-note
       [ "$(response_handle /scenario/journey/cross-file.out)" = "$(read_handle file)" ]
-      (cd /scenario/ansible && expect_failure cross-ansible guard run --json ansible-playbook site.yml --check --diff --limit fixture)
+      (cd /scenario/ansible && expect_failure cross-ansible guard run --json ansible-playbook site.yml --check --diff --limit access-fixture)
       [ "$(response_handle /scenario/journey/cross-ansible.out)" = "$(read_handle ansible)" ]
-      expect_failure cross-api guard run --json fixture-api status
+      expect_failure cross-api guard run --json fixture-api access-status
       [ "$(response_handle /scenario/journey/cross-api.out)" = "$(read_handle api)" ]
-      ! grep -Eq 'fixture-pod|bounded-command-complete|fixture-vm|operator-only fixture|changed=0|fixture-api:healthy' \
-        /scenario/journey/cross-*.out
+      assert_denied_without_execution /scenario/journey/cross-*.out
       ;;
     reject-secondary-cross-scope)
       [ "$(id -u)" -eq 1002 ]
-      expect_failure secondary-cross-ssh guard run --json ssh fixture-host systemctl is-active fixture-service
+      expect_failure secondary-cross-ssh guard run --json ssh access-fixture-host systemctl is-active fixture-service
       ! grep -q 'fixture-service:active' /scenario/journey/secondary-cross-ssh.out
-      expect_failure secondary-helm-before-approval guard run --json helm list --namespace fixture
+      expect_failure secondary-helm-before-approval guard run --json helm list --namespace access-fixture
       [ "$(response_handle /scenario/journey/secondary-helm-before-approval.out)" = "$(read_handle helm)" ]
       ;;
     approve-batch)
@@ -615,15 +744,15 @@ phase_su16() {
       ;;
     consume-secondary)
       [ "$(id -u)" -eq 1002 ]
-      capture_phase helm-first guard run --json helm list --namespace fixture
-      capture_phase helm-second guard run --json helm list --namespace fixture
+      capture_phase helm-first guard run --json helm list --namespace access-fixture
+      capture_phase helm-second guard run --json helm list --namespace access-fixture
       ;;
     race-and-fail)
       [ "$(id -u)" -eq 1001 ]
       set +e
-      guard run --json kubectl get pods --namespace fixture > /scenario/journey/race-a.out 2>&1 &
+      guard run --json kubectl get pods --namespace access-fixture > /scenario/journey/race-a.out 2>&1 &
       local first_pid=$!
-      guard run --json kubectl get pods --namespace fixture > /scenario/journey/race-b.out 2>&1 &
+      guard run --json kubectl get pods --namespace access-fixture > /scenario/journey/race-b.out 2>&1 &
       local second_pid=$!
       wait "$first_pid"; local first_status=$?
       wait "$second_pid"; local second_status=$?
@@ -636,18 +765,19 @@ phase_su16() {
       grep -q 'use limit is exhausted' /scenario/journey/missing-second.out
       capture_phase command-first guard run --json printf 'bounded-command-complete\n'
       grep -q 'bounded-command-complete' /scenario/journey/command-first.out
-      capture_phase ssh-first guard run --json ssh fixture-host systemctl is-active fixture-service
-      capture_phase ssh-second guard run --json ssh fixture-host systemctl is-active fixture-service
+      capture_phase ssh-first guard run --json ssh access-fixture-host systemctl is-active fixture-service
+      capture_phase ssh-second guard run --json ssh access-fixture-host systemctl is-active fixture-service
       ;;
     after-restart)
       [ "$(id -u)" -eq 1001 ]
       capture_phase command-second guard run --json printf 'bounded-command-complete\n'
       expect_failure command-third guard run --json printf 'bounded-command-complete\n'
       grep -q 'use limit is exhausted' /scenario/journey/command-third.out
-      capture_phase cloud-use guard run --json cloudstack list virtualmachines zoneid=fixture-zone
+      capture_phase cloud-use guard run --json cloudstack list virtualmachines zoneid=access-fixture-zone
       capture_phase file-use guard run --json cat /scenario/fixtures/operator-note
-      (cd /scenario/ansible && capture_phase ansible-use guard run --json ansible-playbook site.yml --check --diff --limit fixture)
-      capture_phase api-use guard run --json fixture-api status
+      (cd /scenario/ansible && capture_phase ansible-use guard run --json ansible-playbook site.yml --check --diff --limit access-fixture)
+      printf '%s' synthetic-fixture-token | guard secrets add fixture/api-token >> "$RAW" 2>&1
+      capture_phase api-use guard run --json fixture-api access-status
       grep -q 'fixture-api:healthy' /scenario/journey/api-use.out
       ! grep -q 'synthetic-fixture-token' /scenario/journey/api-use.out
       ;;
@@ -686,10 +816,10 @@ phase_su17() {
       ;;
     consume-extension)
       [ "$(id -u)" -eq 1001 ]
-      capture_phase extension-consume guard run --json kubectl get pods --namespace fixture
-      expect_failure extension-exhausted guard run --json kubectl get pods --namespace fixture
+      capture_phase extension-consume guard run --json kubectl get pods --namespace access-fixture
+      expect_failure extension-exhausted guard run --json kubectl get pods --namespace access-fixture
       grep -q 'use limit is exhausted' /scenario/journey/extension-exhausted.out
-      capture_phase original-still-active guard run --json ssh fixture-host systemctl is-active fixture-service
+      capture_phase original-still-active guard run --json ssh access-fixture-host systemctl is-active fixture-service
       ;;
     retry-extension)
       [ "$(id -u)" -eq 1000 ]
@@ -800,6 +930,389 @@ phase_su18() {
   esac
 }
 
+phase_su19() {
+  local phase="$1" stale='gr-00000000000000000000000000000000'
+  local primary_command primary_file secondary_file fresh
+  case "$phase" in
+    request-primary)
+      [ "$(id -u)" -eq 1001 ]
+      request_concurrently primary-command \
+        'Run the fake bounded command' '  Run   the fake bounded command  '
+      request_concurrently primary-file \
+        'Read the fake operator file' ' Read  the fake operator file '
+      [ "$(read_handle primary-command)" != "$(read_handle primary-file)" ]
+      ;;
+    request-secondary)
+      [ "$(id -u)" -eq 1002 ]
+      request_concurrently secondary-command \
+        'Run the fake bounded command' ' Run   the fake bounded command '
+      request_concurrently secondary-file \
+        'Read the fake operator file' '  Read the fake operator file  '
+      [ "$(read_handle secondary-command)" != "$(read_handle secondary-file)" ]
+      [ "$(read_handle primary-command)" != "$(read_handle secondary-command)" ]
+      [ "$(read_handle primary-file)" != "$(read_handle secondary-file)" ]
+      ;;
+    decide)
+      [ "$(id -u)" -eq 1000 ]
+      primary_command="$(read_handle primary-command)"
+      primary_file="$(read_handle primary-file)"
+      secondary_file="$(read_handle secondary-file)"
+      capture_phase deny-primary-file guard access deny "$primary_file" \
+        --reason 'this principal does not need file inspection' --json
+      grep -q '"state": "denied"' /scenario/journey/deny-primary-file.out
+      if capture_stdout_phase mixed-partial guard access approve \
+        "$stale" "$primary_command" "$secondary_file" --uses 3 --json; then
+        return 1
+      fi
+      [ "$(cat /scenario/journey/mixed-partial.status)" -eq 1 ]
+      [ ! -s /scenario/journey/mixed-partial.stderr ]
+      assert_access_decisions /scenario/journey/mixed-partial.out \
+        "$stale:false" "$primary_command:true" "$secondary_file:true"
+      ;;
+    use-primary)
+      [ "$(id -u)" -eq 1001 ]
+      capture_phase primary-command-use guard run --json printf 'bounded-command-complete\n'
+      grep -q 'bounded-command-complete' /scenario/journey/primary-command-use.out
+      expect_failure primary-file-denied guard run --json cat /scenario/fixtures/operator-note
+      fresh="$(response_handle /scenario/journey/primary-file-denied.out)"
+      [ -n "$fresh" ]
+      [ "$fresh" != "$(read_handle primary-file)" ]
+      printf '%s\n' "$fresh" > /scenario/journey/primary-file-fresh.handle
+      ;;
+    use-secondary)
+      [ "$(id -u)" -eq 1002 ]
+      capture_phase secondary-file-use guard run --json cat /scenario/fixtures/operator-note
+      grep -q 'synthetic operator note' /scenario/journey/secondary-file-use.out
+      expect_failure secondary-command-pending guard run --json printf 'bounded-command-complete\n'
+      fresh="$(response_handle /scenario/journey/secondary-command-pending.out)"
+      [ -n "$fresh" ]
+      [ "$fresh" = "$(read_handle secondary-command)" ]
+      ;;
+    verify)
+      [ "$(id -u)" -eq 1000 ]
+      primary_command="$(read_handle primary-command)"
+      secondary_file="$(read_handle secondary-file)"
+      capture_phase primary-command-show guard access show "$primary_command" --json
+      capture_phase secondary-file-show guard access show "$secondary_file" --json
+      grep -q '"remaining_uses": 2' /scenario/journey/primary-command-show.out
+      grep -q '"remaining_uses": 2' /scenario/journey/secondary-file-show.out
+      capture_phase pending-secondary-command guard access show \
+        "$(read_handle secondary-command)" --json
+      grep -q '"state": "pending"' /scenario/journey/pending-secondary-command.out
+      capture_phase concurrent-final-list guard access list --json
+      [ "$(grep -c '"kind": "session"' /scenario/journey/concurrent-final-list.out)" -eq 2 ]
+      record_result passed 'intended policy' \
+        'concurrent retries converged within each principal and system, references stayed independent across principals, and a stale-first partial batch preserved ordered successful decisions'
+      ;;
+    *) return 2 ;;
+  esac
+}
+
+phase_su20() {
+  local phase="$1" primary secondary primary_session fresh retry
+  case "$phase" in
+    request)
+      [ "$(id -u)" -eq 1001 ]
+      save_request durable-command 'Run the fake bounded command'
+      ;;
+    request-secondary)
+      [ "$(id -u)" -eq 1002 ]
+      save_request durable-file 'Read the fake operator file'
+      ;;
+    approve)
+      [ "$(id -u)" -eq 1000 ]
+      primary="$(read_handle durable-command)"
+      secondary="$(read_handle durable-file)"
+      capture_phase durable-approve guard access approve "$primary" "$secondary" --uses 3 --json
+      [ "$(grep -c '"success": true' /scenario/journey/durable-approve.out)" -eq 2 ]
+      primary_session="$(python3 - "$primary" <<'PY'
+import json
+import sys
+
+request = sys.argv[1]
+with open("/scenario/journey/durable-approve.out", encoding="utf-8") as stream:
+    document = json.load(stream)
+print(next(item["target"] for item in document["response"]["items"] if item["request"] == request))
+PY
+)"
+      printf '%s\n' "$primary_session" > /scenario/journey/durable-command.session
+      ;;
+    consume-first)
+      [ "$(id -u)" -eq 1001 ]
+      capture_phase durable-command-first guard run --json printf 'bounded-command-complete\n'
+      ;;
+    consume-secondary-first)
+      [ "$(id -u)" -eq 1002 ]
+      capture_phase durable-file-first guard run --json cat /scenario/fixtures/operator-note
+      ;;
+    revoke-after-restart)
+      [ "$(id -u)" -eq 1000 ]
+      primary="$(read_handle durable-command)"
+      secondary="$(read_handle durable-file)"
+      capture_phase durable-command-before-revoke guard access show "$primary" --json
+      capture_phase durable-file-before-revoke guard access show "$secondary" --json
+      grep -q '"remaining_uses": 2' /scenario/journey/durable-command-before-revoke.out
+      grep -q '"remaining_uses": 2' /scenario/journey/durable-file-before-revoke.out
+      primary_session="$(sed -n '1p' /scenario/journey/durable-command.session)"
+      capture_phase durable-revoke guard access revoke "$primary_session" --json
+      expect_failure durable-repeat-revoke guard access revoke "$primary_session" --json
+      capture_phase historical-approve guard access approve "$primary" --uses 9 --json
+      grep -q 'already approved; authority unchanged' /scenario/journey/historical-approve.out
+      ;;
+    post-revoke-primary)
+      [ "$(id -u)" -eq 1001 ]
+      expect_failure durable-command-revoked guard run --json printf 'bounded-command-complete\n'
+      fresh="$(response_handle /scenario/journey/durable-command-revoked.out)"
+      [ -n "$fresh" ]
+      [ "$fresh" != "$(read_handle durable-command)" ]
+      printf '%s\n' "$fresh" > /scenario/journey/durable-command-fresh.handle
+      ;;
+    post-revoke-secondary)
+      [ "$(id -u)" -eq 1002 ]
+      capture_phase durable-file-second guard run --json cat /scenario/fixtures/operator-note
+      ;;
+    after-second-restart-primary)
+      [ "$(id -u)" -eq 1001 ]
+      expect_failure durable-command-retry guard run --json printf 'bounded-command-complete\n'
+      retry="$(response_handle /scenario/journey/durable-command-retry.out)"
+      [ "$retry" = "$(read_handle durable-command-fresh)" ]
+      ;;
+    after-second-restart-secondary)
+      [ "$(id -u)" -eq 1002 ]
+      capture_phase durable-file-third guard run --json cat /scenario/fixtures/operator-note
+      expect_failure durable-file-exhausted guard run --json cat /scenario/fixtures/operator-note
+      grep -q 'use limit is exhausted' /scenario/journey/durable-file-exhausted.out
+      ;;
+    verify)
+      [ "$(id -u)" -eq 1000 ]
+      primary_session="$(sed -n '1p' /scenario/journey/durable-command.session)"
+      expect_failure durable-revoked-show guard access show "$primary_session" --json
+      capture_phase durable-file-final guard access show "$(read_handle durable-file)" --json
+      grep -q '"remaining_uses": 0' /scenario/journey/durable-file-final.out
+      record_result passed 'intended policy' \
+        'revocation before exhaustion survived two restarts without historical reapproval restoring authority, while another principal retained and exhausted its independent bounded budget'
+      ;;
+    *) return 2 ;;
+  esac
+}
+
+phase_su21() {
+  local phase="$1" stale='gr-00000000000000000000000000000000'
+  local before after ssh cloud file retry
+  case "$phase" in
+    discover-and-request)
+      [ "$(id -u)" -eq 1001 ]
+      capture_phase terminal-before guard access list --json
+      before="$(sha256sum /scenario/journey/terminal-before.out | cut -d' ' -f1)"
+      capture_stdout_phase approve-help guard access approve --help
+      capture_stdout_phase deny-help guard access deny --help
+      [ ! -s /scenario/journey/approve-help.stderr ]
+      [ ! -s /scenario/journey/deny-help.stderr ]
+      grep -q -- '--once' /scenario/journey/approve-help.out
+      grep -q -- '--uses <N>' /scenario/journey/approve-help.out
+      grep -q -- '--reason <REASON>' /scenario/journey/deny-help.out
+      capture_phase terminal-after guard access list --json
+      after="$(sha256sum /scenario/journey/terminal-after.out | cut -d' ' -f1)"
+      [ "$before" = "$after" ]
+      save_request terminal-command 'Run the fake bounded command'
+      save_request terminal-cloud 'Inspect the fake CloudStack virtual machines'
+      save_request terminal-file 'Read the fake operator file'
+      ;;
+    decide)
+      [ "$(id -u)" -eq 1000 ]
+      ssh="$(read_handle terminal-command)"
+      cloud="$(read_handle terminal-cloud)"
+      file="$(read_handle terminal-file)"
+      capture_phase terminal-file-deny guard access deny "$file" --json
+      if capture_stdout_phase terminal-approve-partial guard access approve \
+        "$stale" "$ssh" "$file" --once --json; then
+        return 1
+      fi
+      [ ! -s /scenario/journey/terminal-approve-partial.stderr ]
+      assert_access_decisions /scenario/journey/terminal-approve-partial.out \
+        "$stale:false" "$ssh:true" "$file:false"
+      if capture_stdout_phase terminal-deny-partial guard access deny \
+        "$cloud" "$ssh" "$stale" --reason 'the remaining systems are out of scope' --json; then
+        return 1
+      fi
+      [ ! -s /scenario/journey/terminal-deny-partial.stderr ]
+      assert_access_decisions /scenario/journey/terminal-deny-partial.out \
+        "$cloud:true" "$ssh:false" "$stale:false"
+      ;;
+    retry-and-use)
+      [ "$(id -u)" -eq 1001 ]
+      capture_phase terminal-command-use guard run --json printf 'bounded-command-complete\n'
+      expect_failure terminal-command-exhausted guard run --json printf 'bounded-command-complete\n'
+      grep -q 'use limit is exhausted' /scenario/journey/terminal-command-exhausted.out
+      retry="$(response_handle /scenario/journey/terminal-command-exhausted.out)"
+      [ -n "$retry" ]
+      printf '%s\n' "$retry" > /scenario/journey/terminal-command-fresh.handle
+      capture_phase terminal-command-retry guard access request ' Run the fake bounded command ' --json
+      retry="$(request_reference /scenario/journey/terminal-command-retry.out)"
+      [ "$retry" = "$(read_handle terminal-command-fresh)" ]
+      [ "$retry" != "$(read_handle terminal-command)" ]
+      capture_phase terminal-cloud-retry guard access request \
+        'Inspect the fake CloudStack virtual machines' --json
+      retry="$(request_reference /scenario/journey/terminal-cloud-retry.out)"
+      [ "$retry" != "$(read_handle terminal-cloud)" ]
+      expect_failure terminal-file-run guard run --json cat /scenario/fixtures/operator-note
+      [ "$(response_handle /scenario/journey/terminal-file-run.out)" != "$(read_handle terminal-file)" ]
+      ;;
+    stale-and-verify)
+      [ "$(id -u)" -eq 1000 ]
+      if capture_stdout_phase terminal-stale-show guard access show "$stale" --json; then
+        return 1
+      fi
+      [ "$(cat /scenario/journey/terminal-stale-show.status)" -eq 125 ]
+      [ ! -s /scenario/journey/terminal-stale-show.stderr ]
+      python3 - <<'PY'
+import json
+
+with open("/scenario/journey/terminal-stale-show.out", encoding="utf-8") as stream:
+    document = json.load(stream)
+assert document["schema_version"] == 1
+assert document["type"] == "access_error"
+assert "unknown or unauthorized access reference" in document["error"]
+PY
+      capture_phase terminal-exhausted-show guard access show \
+        "$(read_handle terminal-command)" --json
+      grep -q '"remaining_uses": 0' /scenario/journey/terminal-exhausted-show.out
+      record_result passed 'intended policy' \
+        'approve and deny help remained non-mutating; ordered partial decisions committed valid items, exhausted approvals did not refill on retry, denied intent produced fresh requests, and stale JSON stayed machine-readable'
+      ;;
+    *) return 2 ;;
+  esac
+}
+
+phase_su22() {
+  local phase="$1" stale='gr-00000000000000000000000000000000'
+  local command_request kube_request candidate_status pid executable
+  case "$phase" in
+    install)
+      [ "$(id -u)" -eq 1000 ]
+      mkdir -p "$PRIVATE_ROOT/stage" "$PRIVATE_ROOT/releases/v1" "$PRIVATE_ROOT/releases/v2"
+      printf 'invalid candidate\n' > "$PRIVATE_ROOT/stage/guard.bad"
+      chmod 0755 "$PRIVATE_ROOT/stage/guard.bad"
+      set +e
+      "$PRIVATE_ROOT/stage/guard.bad" --version \
+        > "$PRIVATE_ROOT/log-invalid-candidate.out" 2>&1
+      candidate_status=$?
+      set -e
+      [ "$candidate_status" -ne 0 ]
+      rm -f "$PRIVATE_ROOT/stage/guard.bad"
+      [ ! -e "$PRIVATE_ROOT/stage/guard.bad" ]
+      cp /usr/local/bin/guard "$PRIVATE_ROOT/stage/guard"
+      chmod 0755 "$PRIVATE_ROOT/stage/guard"
+      cmp /usr/local/bin/guard "$PRIVATE_ROOT/stage/guard"
+      "$PRIVATE_ROOT/stage/guard" --version > "$PRIVATE_ROOT/stage/version.out"
+      mv "$PRIVATE_ROOT/stage/guard" "$PRIVATE_ROOT/releases/v1/guard"
+      cp "$PRIVATE_ROOT/releases/v1/guard" "$PRIVATE_ROOT/releases/v2/guard"
+      chmod 0755 "$PRIVATE_ROOT/releases/v2/guard"
+      ln -s releases/v1/guard "$PRIVATE_ROOT/current"
+      private_daemon_start "$PRIVATE_ROOT/current" install
+      ;;
+    request)
+      [ "$(id -u)" -eq 1001 ]
+      capture_phase private-command-request guard access request \
+        'Run the fake bounded command' --socket "$PRIVATE_SOCKET" --json
+      command_request="$(request_reference /scenario/journey/private-command-request.out)"
+      [ -n "$command_request" ]
+      printf '%s\n' "$command_request" > /scenario/journey/private-command.handle
+      capture_phase private-kube-request guard access request \
+        'Inspect the fake Kubernetes pods' --socket "$PRIVATE_SOCKET" --json
+      kube_request="$(request_reference /scenario/journey/private-kube-request.out)"
+      [ -n "$kube_request" ]
+      printf '%s\n' "$kube_request" > /scenario/journey/private-kube.handle
+      ;;
+    approve-and-use)
+      [ "$(id -u)" -eq 1000 ]
+      capture_phase private-command-approve guard access approve \
+        "$(read_handle private-command)" --uses 2 --socket "$PRIVATE_SOCKET" --json
+      ;;
+    consume-before-upgrade)
+      [ "$(id -u)" -eq 1001 ]
+      capture_phase private-command-first private_guard run --json \
+        printf 'bounded-command-complete\n'
+      ;;
+    fail-and-rollback)
+      [ "$(id -u)" -eq 1000 ]
+      private_daemon_stop
+      ln -s releases/v2/guard "$PRIVATE_ROOT/current.next"
+      mv -T "$PRIVATE_ROOT/current.next" "$PRIVATE_ROOT/current"
+      touch "$PRIVATE_ROOT/not-a-directory"
+      set +e
+      HOME="$PRIVATE_ROOT/home" XDG_CONFIG_HOME="$PRIVATE_ROOT/config" \
+        XDG_DATA_HOME="$PRIVATE_ROOT/data" \
+        timeout 5 "$PRIVATE_ROOT/current" server start --no-llm \
+          --gate consequence \
+          --socket "$PRIVATE_ROOT/not-a-directory/guard.sock" \
+          --verbs /etc/guard/verbs.yaml \
+          --state-db "$PRIVATE_ROOT/data/state.db" \
+          --audit-log "$PRIVATE_ROOT/data/audit.jsonl" \
+          --users 1001,1002 \
+          > "$PRIVATE_ROOT/log/failed-upgrade.log" 2>&1
+      candidate_status=$?
+      set -e
+      [ "$candidate_status" -ne 0 ]
+      [ ! -S "$PRIVATE_ROOT/not-a-directory/guard.sock" ]
+      expect_failure private-outage guard access list --socket "$PRIVATE_SOCKET" --json
+      ln -s releases/v1/guard "$PRIVATE_ROOT/current.next"
+      mv -T "$PRIVATE_ROOT/current.next" "$PRIVATE_ROOT/current"
+      private_daemon_start "$PRIVATE_ROOT/current" rollback
+      capture_phase private-command-after-rollback guard access show \
+        "$(read_handle private-command)" --socket "$PRIVATE_SOCKET" --json
+      grep -q '"remaining_uses": 1' /scenario/journey/private-command-after-rollback.out
+      ;;
+    retry-after-rollback)
+      [ "$(id -u)" -eq 1001 ]
+      capture_phase private-kube-retry guard access request \
+        ' Inspect the fake Kubernetes pods ' --socket "$PRIVATE_SOCKET" --json
+      [ "$(request_reference /scenario/journey/private-kube-retry.out)" = "$(read_handle private-kube)" ]
+      ;;
+    promote-upgrade)
+      [ "$(id -u)" -eq 1000 ]
+      kube_request="$(read_handle private-kube)"
+      if capture_stdout_phase private-kube-partial guard access approve \
+        "$stale" "$kube_request" --once --socket "$PRIVATE_SOCKET" --json; then
+        return 1
+      fi
+      assert_access_decisions /scenario/journey/private-kube-partial.out \
+        "$stale:false" "$kube_request:true"
+      private_daemon_stop
+      ln -s releases/v2/guard "$PRIVATE_ROOT/current.next"
+      mv -T "$PRIVATE_ROOT/current.next" "$PRIVATE_ROOT/current"
+      private_daemon_start "$PRIVATE_ROOT/current" upgraded
+      pid="$(sed -n '1p' "$PRIVATE_ROOT/run/daemon.pid")"
+      executable="$(readlink "/proc/$pid/exe")"
+      [ "$executable" = "$PRIVATE_ROOT/releases/v2/guard" ]
+      ;;
+    verify-client)
+      [ "$(id -u)" -eq 1001 ]
+      capture_phase private-command-second private_guard run --json \
+        printf 'bounded-command-complete\n'
+      expect_failure private-command-exhausted private_guard run --json \
+        printf 'bounded-command-complete\n'
+      grep -q 'use limit is exhausted' /scenario/journey/private-command-exhausted.out
+      capture_phase private-kube-use private_guard run --json \
+        kubectl get pods --namespace access-fixture
+      expect_failure private-kube-exhausted private_guard run --json \
+        kubectl get pods --namespace access-fixture
+      grep -q 'use limit is exhausted' /scenario/journey/private-kube-exhausted.out
+      ;;
+    cleanup)
+      [ "$(id -u)" -eq 1000 ]
+      private_daemon_stop
+      [ ! -S "$PRIVATE_SOCKET" ]
+      [ ! -e "$PRIVATE_ROOT/current.next" ]
+      [ ! -e "$PRIVATE_ROOT/stage/guard" ]
+      [ ! -e "$PRIVATE_ROOT/stage/guard.bad" ]
+      record_result passed 'intended policy' \
+        'a private staged install rejected an invalid candidate, a failed upgrade left no daemon or socket, rollback preserved pending requests and remaining uses, and the verified replacement binary completed the bounded workflows before deterministic cleanup'
+      ;;
+    *) return 2 ;;
+  esac
+}
+
 run_phase() {
   export GUARD_SOCKET="$SOCKET"
   RAW="/scenario/raw/$SCENARIO-$(id -u).log"
@@ -812,6 +1325,10 @@ run_phase() {
     SU-16) phase_su16 "$3" ;;
     SU-17) phase_su17 "$3" ;;
     SU-18) phase_su18 "$3" ;;
+    SU-19) phase_su19 "$3" ;;
+    SU-20) phase_su20 "$3" ;;
+    SU-21) phase_su21 "$3" ;;
+    SU-22) phase_su22 "$3" ;;
     *)
       [ "$3" = contract ]
       run

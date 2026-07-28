@@ -20,7 +20,7 @@ host needs different limits.
 ## Synthetic-user mode
 
 `synthetic-user` runs SU-01 through SU-11, seven SU-12 workload journeys, and
-SU-13 through SU-18.
+SU-13 through SU-22.
 Each scenario receives a separate rootless Podman container, named volume,
 Guard daemon, socket, database, fake fixtures, uid-separated principal, and
 network namespace. Runtime networking is disabled. The container has a
@@ -80,6 +80,10 @@ to the scenario volume.
 | SU-16 | Ordinary, one-time, and N-use access approvals remain request-scoped across cross-system attempts, batch partial failure, last-use races, spawn failure, restart, two principals, SSH, CloudStack, Kubernetes, Helm, Ansible, credential-backed API, file, and command workflows. |
 | SU-17 | Proactive extension targets a stable session reference, stores only missing coverage, and converges across retries. |
 | SU-18 | Bare help and inspection are non-mutating; bounded expiry and explicit revoke remain fail-closed across restart. |
+| SU-19 | Concurrent prose retries converge within each principal and system, while stale-first partial decisions preserve independent sessions and bounded budgets. |
+| SU-20 | Revocation before exhaustion survives repeated restart without restoring historical authority or changing another principal's remaining uses. |
+| SU-21 | Approve and deny help is non-mutating; ordered partial decisions, terminal retries, exhausted grants, fresh denied requests, and stale JSON references remain predictable. |
+| SU-22 | A private staged install, failed upgrade, rollback, replacement-binary proof, persisted bounded authority, and cleanup complete without host mounts or external services. |
 
 ## Deployment under test
 

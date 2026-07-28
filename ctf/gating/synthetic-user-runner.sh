@@ -17,6 +17,7 @@ ACTIVE_VOLUME=""
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 RUN_DIR=""
 MANIFEST=""
+OUTCOMES_FILE=""
 PRESERVED_FIXTURES=0
 HOST_FAILURE_PHASE=""
 HOST_FAILURE_CATEGORY=""
@@ -45,6 +46,13 @@ write_status() {
       echo "- Host-side failure evidence: \`$HOST_FAILURE_EVIDENCE\`"
     fi
   } >"$STATUS_FILE"
+}
+
+finalize_manifest_status() {
+  local status="$1" outcomes="$2" temporary="${MANIFEST}.tmp"
+  sed "s/^- Status: running$/- Status: $status/" "$MANIFEST" > "$temporary"
+  cat "$outcomes" >> "$temporary"
+  mv "$temporary" "$MANIFEST"
 }
 
 redact_host_field() {
@@ -137,6 +145,16 @@ self_test() {
     return 1
   fi
   unset GUARD_SU_TEST_COPY_FAILURE
+  MANIFEST="$test_dir/manifest.md"
+  local outcomes="$test_dir/outcomes.md"
+  printf '%s\n' '# Synthetic-user run manifest' '- Status: running' > "$MANIFEST"
+  printf '%s\n' '' '## Outcomes' '- Status: complete catalog passed' > "$outcomes"
+  finalize_manifest_status complete "$outcomes"
+  grep -Fq -- '- Status: complete' "$MANIFEST"
+  grep -Fq -- '- Status: complete catalog passed' "$MANIFEST"
+  if grep -Fq -- '- Status: running' "$MANIFEST"; then
+    return 1
+  fi
   rm -r "$test_dir"
 }
 
@@ -167,7 +185,8 @@ fi
 
 CATALOG=(SU-01 SU-02 SU-03 SU-04 SU-05 SU-06 SU-07 SU-08 SU-09 SU-10 SU-11
   SU-12-ssh SU-12-cloudstack SU-12-kubernetes SU-12-helm SU-12-ansible
-  SU-12-host-maintenance SU-12-api SU-13 SU-14 SU-15 SU-16 SU-17 SU-18)
+  SU-12-host-maintenance SU-12-api SU-13 SU-14 SU-15 SU-16 SU-17 SU-18
+  SU-19 SU-20 SU-21 SU-22)
 if [ "$#" -eq 0 ]; then
   set -- "${CATALOG[@]}"
 fi
@@ -185,7 +204,9 @@ SOURCE_MANIFEST="$RUN_DIR/source-files.sha256"
 (
   cd "$REPO_ROOT"
   find Cargo.toml Cargo.lock build.rs deny.toml src config tests examples \
-    ctf/gating/verbs.yaml ctf/gating/attack.sh ctf/gating/synthetic-user.sh \
+    ctf/gating/README.md ctf/gating/Containerfile ctf/gating/run.sh \
+    ctf/gating/verbs.yaml ctf/gating/attack.sh \
+    ctf/gating/synthetic-user-runner.sh ctf/gating/synthetic-user.sh \
     ctf/gating/fake-llm.rs -type f -print0 |
     LC_ALL=C sort -z |
     xargs -0 sha256sum
@@ -216,6 +237,9 @@ cleanup_active() {
   if [ -n "$ACTIVE_CONTAINER" ] && [ -n "$ACTIVE_VOLUME" ]; then
     cleanup_one "$ACTIVE_CONTAINER" "$ACTIVE_VOLUME"
   fi
+  if [ -n "$OUTCOMES_FILE" ] && [ -f "$OUTCOMES_FILE" ]; then
+    rm -- "$OUTCOMES_FILE"
+  fi
 }
 
 trap cleanup_active EXIT
@@ -224,6 +248,7 @@ trap 'exit 130' INT TERM
 run_one() {
   local scenario="$1"
   local slug container volume result exec_status
+  local -a scenario_environment=(--env GUARD_SWEEPER_GRACE_SECS=1)
   HOST_FAILURE_PHASE=""
   HOST_FAILURE_CATEGORY=""
   HOST_FAILURE_EXEC_STATUS=""
@@ -242,12 +267,9 @@ run_one() {
   write_status "$scenario" "$container" "$volume" "starting" "none established" "create the isolated fixture"
   podman volume create "$volume" >/dev/null
 
-  {
-    printf '%s\n' 'GUARD_SWEEPER_GRACE_SECS=1'
-    if [ "$scenario" = SU-18 ]; then
-      printf '%s\n' 'GUARD_ACCESS_TTL_SECS=3'
-    fi
-  } |
+  if [ "$scenario" = SU-18 ]; then
+    scenario_environment+=(--env GUARD_ACCESS_TTL_SECS=3)
+  fi
   if podman create \
     --name "$container" \
     --user 1000:1000 \
@@ -262,7 +284,7 @@ run_one() {
     --tmpfs /tmp:rw,nosuid,nodev,size=256m,mode=1777 \
     --tmpfs /var/log:rw,nosuid,nodev,size=32m,mode=0700 \
     --volume "$volume:/scenario:rw,U" \
-    --env-file /dev/stdin \
+    "${scenario_environment[@]}" \
     --entrypoint /synthetic-user.sh \
     "$IMAGE" daemon "$scenario" >/dev/null; then
     :
@@ -447,6 +469,46 @@ run_scenario() {
       run_phase "$container" "$scenario" 1001 after-revoke || return
       run_phase "$container" "$scenario" 1000 verify || return
       ;;
+    SU-19)
+      run_phase "$container" "$scenario" 1001 request-primary || return
+      run_phase "$container" "$scenario" 1002 request-secondary || return
+      run_phase "$container" "$scenario" 1000 decide || return
+      run_phase "$container" "$scenario" 1001 use-primary || return
+      run_phase "$container" "$scenario" 1002 use-secondary || return
+      run_phase "$container" "$scenario" 1000 verify || return
+      ;;
+    SU-20)
+      run_phase "$container" "$scenario" 1001 request || return
+      run_phase "$container" "$scenario" 1002 request-secondary || return
+      run_phase "$container" "$scenario" 1000 approve || return
+      run_phase "$container" "$scenario" 1001 consume-first || return
+      run_phase "$container" "$scenario" 1002 consume-secondary-first || return
+      restart_daemon "$container" "$scenario" || return
+      run_phase "$container" "$scenario" 1000 revoke-after-restart || return
+      run_phase "$container" "$scenario" 1001 post-revoke-primary || return
+      run_phase "$container" "$scenario" 1002 post-revoke-secondary || return
+      restart_daemon "$container" "$scenario" || return
+      run_phase "$container" "$scenario" 1001 after-second-restart-primary || return
+      run_phase "$container" "$scenario" 1002 after-second-restart-secondary || return
+      run_phase "$container" "$scenario" 1000 verify || return
+      ;;
+    SU-21)
+      run_phase "$container" "$scenario" 1001 discover-and-request || return
+      run_phase "$container" "$scenario" 1000 decide || return
+      run_phase "$container" "$scenario" 1001 retry-and-use || return
+      run_phase "$container" "$scenario" 1000 stale-and-verify || return
+      ;;
+    SU-22)
+      run_phase "$container" "$scenario" 1000 install || return
+      run_phase "$container" "$scenario" 1001 request || return
+      run_phase "$container" "$scenario" 1000 approve-and-use || return
+      run_phase "$container" "$scenario" 1001 consume-before-upgrade || return
+      run_phase "$container" "$scenario" 1000 fail-and-rollback || return
+      run_phase "$container" "$scenario" 1001 retry-after-rollback || return
+      run_phase "$container" "$scenario" 1000 promote-upgrade || return
+      run_phase "$container" "$scenario" 1001 verify-client || return
+      run_phase "$container" "$scenario" 1000 cleanup || return
+      ;;
     *)
       run_phase "$container" "$scenario" 1001 contract || return
       ;;
@@ -475,8 +537,12 @@ if [ "$leftovers" -ne "$PRESERVED_FIXTURES" ] \
   exit 1
 fi
 
-write_status "complete" "none" "none" "$((TOTAL - failures)) passed, $failures failed" \
-  "see per-scenario evidence" "review the report and integrated diff"
+if [ "$failures" -eq 0 ]; then
+  manifest_status=complete
+else
+  manifest_status=failed
+fi
+OUTCOMES_FILE="${MANIFEST}.outcomes"
 {
   echo
   echo "## Outcomes"
@@ -491,5 +557,10 @@ write_status "complete" "none" "none" "$((TOTAL - failures)) passed, $failures f
   else
     echo "- Status: incomplete or failed catalog"
   fi
-} >> "$MANIFEST"
+} > "$OUTCOMES_FILE"
+finalize_manifest_status "$manifest_status" "$OUTCOMES_FILE"
+rm -- "$OUTCOMES_FILE"
+OUTCOMES_FILE=""
+write_status "complete" "none" "none" "$((TOTAL - failures)) passed, $failures failed" \
+  "see per-scenario evidence" "review the report and integrated diff"
 exit "$failures"

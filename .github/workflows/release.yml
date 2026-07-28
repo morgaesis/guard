@@ -199,8 +199,6 @@ jobs:
               ;;
           esac
           find "$root" -type f -printf '%P\n' | LC_ALL=C sort > "$root/ARCHIVE-MANIFEST"
-          printf '%s\n' ARCHIVE-MANIFEST >> "$root/ARCHIVE-MANIFEST"
-          LC_ALL=C sort -o "$root/ARCHIVE-MANIFEST" "$root/ARCHIVE-MANIFEST"
           tar -C dist -czf "dist/${archive}" "$bundle"
 
       - name: Smoke test deployment archive
