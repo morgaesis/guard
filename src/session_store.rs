@@ -158,9 +158,9 @@ impl SessionStore {
             Self::ensure_windows_path_has_no_reparse_points(&absolute)?;
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create state database parent {}", parent.display()))?;
-            if !crate::server::secure_fs::harden_existing_private_path(parent, true) {
+            if !crate::server::secure_fs::harden_existing_state_path(parent, true) {
                 anyhow::bail!(
-                    "state database parent {} is not daemon-only",
+                    "state database parent {} is not protected from ordinary local users",
                     parent.display()
                 );
             }
@@ -2854,9 +2854,9 @@ fn enforce_private_state_files(path: &Path) -> Result<()> {
         sidecar("-journal"),
     ] {
         match std::fs::symlink_metadata(&candidate) {
-            Ok(_) if crate::server::secure_fs::harden_existing_private_path(&candidate, false) => {}
+            Ok(_) if crate::server::secure_fs::harden_existing_state_path(&candidate, false) => {}
             Ok(_) => anyhow::bail!(
-                "state database file {} is not daemon-only",
+                "state database file {} is not protected from ordinary local users",
                 candidate.display()
             ),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
