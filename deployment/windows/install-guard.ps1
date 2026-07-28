@@ -498,16 +498,32 @@ function Get-ServiceRegistryAclObject {
     throw "Service registry ACL could not be read after 20 attempts: $lastError"
 }
 
-function Set-ServiceRegistryAclObject {
-    param(
-        [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][object]$AclObject
+function Write-ServiceRegistryAclObject {
+    param([Parameter(Mandatory)][object]$AclObject)
+    $subKey = "SYSTEM\CurrentControlSet\Services\$ServiceName"
+    $rights = [Security.AccessControl.RegistryRights]::ReadPermissions `
+        -bor [Security.AccessControl.RegistryRights]::ChangePermissions `
+        -bor [Security.AccessControl.RegistryRights]::TakeOwnership
+    $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
+        $subKey,
+        [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
+        $rights
     )
+    if ($null -eq $key) { throw 'service registry key is not visible' }
+    try {
+        [Microsoft.Win32.RegistryAclExtensions]::SetAccessControl($key, $AclObject)
+    }
+    finally {
+        $key.Dispose()
+    }
+}
+
+function Set-ServiceRegistryAclObject {
+    param([Parameter(Mandatory)][object]$AclObject)
     $lastError = 'service registry ACL was not written'
     for ($attempt = 1; $attempt -le 20; $attempt++) {
         try {
-            $item = Get-Item -LiteralPath $Path -ErrorAction Stop
-            Set-Acl -InputObject $item -AclObject $AclObject -ErrorAction Stop
+            Write-ServiceRegistryAclObject -AclObject $AclObject
             return
         }
         catch { $lastError = $_.Exception.Message }
@@ -537,7 +553,7 @@ function Set-ServiceRegistryAcl {
         )
         [void]$acl.AddAccessRule($rule)
     }
-    Set-ServiceRegistryAclObject -Path $path -AclObject $acl
+    Set-ServiceRegistryAclObject -AclObject $acl
 
     $verified = Get-ServiceRegistryAclObject -Path $path
     $ownerSid = try {
