@@ -4,6 +4,7 @@ use crate::grant_profile::{
 use crate::secrets::legacy_sentinel;
 use crate::session::{
     session_reference, IssuedGrantScope, SessionGrant, SessionGrantSummary, SessionOwner,
+    SessionRegistry,
 };
 #[cfg(test)]
 use crate::session::{
@@ -47,6 +48,60 @@ use guard::gating::approval::{Approval, ApprovalStatus};
 pub(super) const MAX_GRANT_REQUESTS: usize = 1024;
 pub(super) const MAX_PENDING_GRANT_REQUESTS_PER_SESSION: usize = 32;
 pub(super) const MAX_GRANT_REQUEST_PAYLOAD_BYTES: usize = 64 * 1024;
+
+struct AccessTargetSnapshot {
+    requester: PrincipalKey,
+    target: String,
+    active_verbs: Vec<String>,
+    usable_access_verbs: Vec<String>,
+    revision: Option<String>,
+    expires_at: Option<u64>,
+}
+
+fn access_target_snapshot(
+    sessions: &SessionRegistry,
+    token: &str,
+) -> Result<AccessTargetSnapshot, String> {
+    let owner = sessions
+        .owner_for(token)
+        .ok_or_else(|| "access target expired while resolving".to_string())?;
+    let SessionOwner::Principal(requester) = owner else {
+        return Err("legacy unowned sessions cannot be extended".to_string());
+    };
+    let summary = sessions
+        .list()
+        .into_iter()
+        .find(|summary| summary.token == token)
+        .ok_or_else(|| "access target expired while resolving".to_string())?;
+    let usable_access_verbs = summary
+        .scope
+        .access_grants
+        .iter()
+        .filter(|grant| {
+            !grant.pending && grant.remaining_uses.is_none_or(|remaining| remaining > 0)
+        })
+        .flat_map(|grant| grant.verbs.iter().cloned())
+        .collect();
+    Ok(AccessTargetSnapshot {
+        requester,
+        target: summary
+            .scope
+            .label
+            .clone()
+            .unwrap_or_else(|| session_reference(token)),
+        active_verbs: summary.activated_verbs,
+        usable_access_verbs,
+        revision: sessions.effective_revision_key(token),
+        expires_at: summary.expires_at,
+    })
+}
+
+fn proposed_verbs_for_missing_authority(proposed: Vec<Verb>, missing: &[String]) -> Vec<Verb> {
+    proposed
+        .into_iter()
+        .filter(|verb| missing.iter().any(|name| name == &verb.name))
+        .collect()
+}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[cfg(test)]
@@ -242,6 +297,39 @@ mod regeneration_proposal_tests {
 
         assert_ne!(first.request_key, second.request_key);
         assert!(access_request_key_eq_ci(&first, &second));
+    }
+
+    #[test]
+    fn access_target_snapshot_rebases_to_the_current_revision() {
+        let owner = PrincipalKey::from_uid(1001);
+        let mut registry = crate::session::SessionRegistry::new();
+        registry.grant("session".to_string(), access_grant(owner, 10));
+        let before = access_target_snapshot(&registry, "session").unwrap();
+
+        registry
+            .apply_delta(
+                "session",
+                &GrantRequestDelta {
+                    activated_verbs: vec!["host-maintain".to_string()],
+                    ..GrantRequestDelta::default()
+                },
+            )
+            .unwrap();
+        let after = access_target_snapshot(&registry, "session").unwrap();
+
+        assert_ne!(before.revision, after.revision);
+        assert!(after.active_verbs.contains(&"host-maintain".to_string()));
+    }
+
+    #[test]
+    fn active_generated_authority_does_not_restage_unreferenced_coverage() {
+        let generated = candidate();
+        assert!(proposed_verbs_for_missing_authority(vec![generated.clone()], &[]).is_empty());
+        assert_eq!(
+            proposed_verbs_for_missing_authority(vec![generated], &["generated:test".to_string()])
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -1228,11 +1316,11 @@ pub(super) async fn submit_access_request(
     let (
         session_token,
         requester,
-        target,
-        active_verbs,
-        usable_access_verbs,
-        session_revision,
-        session_expiry,
+        mut target,
+        mut active_verbs,
+        mut usable_access_verbs,
+        mut session_revision,
+        mut session_expiry,
     ) = {
         let sessions = server.state.sessions.read().await;
         let token = match explicit_target {
@@ -1267,38 +1355,15 @@ pub(super) async fn submit_access_request(
                         .to_string(),
                 );
             }
-            let owner = sessions
-                .owner_for(&token)
-                .ok_or_else(|| "access target expired while resolving".to_string())?;
-            let SessionOwner::Principal(requester) = owner else {
-                return Err("legacy unowned sessions cannot be extended".to_string());
-            };
-            let summary = sessions
-                .list()
-                .into_iter()
-                .find(|summary| summary.token == token)
-                .ok_or_else(|| "access target expired while resolving".to_string())?;
-            let usable_access_verbs = summary
-                .scope
-                .access_grants
-                .iter()
-                .filter(|grant| {
-                    !grant.pending && grant.remaining_uses.is_none_or(|remaining| remaining > 0)
-                })
-                .flat_map(|grant| grant.verbs.iter().cloned())
-                .collect::<Vec<_>>();
+            let snapshot = access_target_snapshot(&sessions, &token)?;
             (
                 Some(token.clone()),
-                requester,
-                summary
-                    .scope
-                    .label
-                    .clone()
-                    .unwrap_or_else(|| session_reference(&token)),
-                summary.activated_verbs,
-                usable_access_verbs,
-                sessions.effective_revision_key(&token),
-                summary.expires_at,
+                snapshot.requester,
+                snapshot.target,
+                snapshot.active_verbs,
+                snapshot.usable_access_verbs,
+                snapshot.revision,
+                snapshot.expires_at,
             )
         }
     };
@@ -1334,6 +1399,18 @@ pub(super) async fn submit_access_request(
     prune_grant_requests(server).await;
     {
         let _transition = server.state.grant_request_transition_gate.lock().await;
+        if let Some(token) = session_token.as_deref() {
+            let sessions = server.state.sessions.read().await;
+            let snapshot = access_target_snapshot(&sessions, token)?;
+            if !snapshot.requester.eq_ci(&requester) {
+                return Err("access target belongs to a different principal".to_string());
+            }
+            target = snapshot.target;
+            active_verbs = snapshot.active_verbs;
+            usable_access_verbs = snapshot.usable_access_verbs;
+            session_revision = snapshot.revision;
+            session_expiry = snapshot.expires_at;
+        }
         let requests = server.state.grant_requests.read().await;
         if let Some(existing) = requests
             .values()
@@ -1373,6 +1450,19 @@ pub(super) async fn submit_access_request(
     }
 
     let (reduced, proposed_verbs) = reduce_access_intent(server, &intent).await?;
+    let _transition = server.state.grant_request_transition_gate.lock().await;
+    if let Some(token) = session_token.as_deref() {
+        let sessions = server.state.sessions.read().await;
+        let snapshot = access_target_snapshot(&sessions, token)?;
+        if !snapshot.requester.eq_ci(&requester) {
+            return Err("access target belongs to a different principal".to_string());
+        }
+        target = snapshot.target;
+        active_verbs = snapshot.active_verbs;
+        usable_access_verbs = snapshot.usable_access_verbs;
+        session_revision = snapshot.revision;
+        session_expiry = snapshot.expires_at;
+    }
     let mut missing = reduced
         .iter()
         .filter(|verb| {
@@ -1383,6 +1473,7 @@ pub(super) async fn submit_access_request(
         .collect::<Vec<_>>();
     missing.sort();
     missing.dedup();
+    let proposed_verbs = proposed_verbs_for_missing_authority(proposed_verbs, &missing);
     if missing.is_empty() && requested_uses.is_none() {
         if let Some(existing) = server
             .state
@@ -1469,7 +1560,6 @@ pub(super) async fn submit_access_request(
         return Err("access request exceeds the request size limit".to_string());
     }
 
-    let _transition = server.state.grant_request_transition_gate.lock().await;
     if let Some(existing) = server
         .state
         .grant_requests

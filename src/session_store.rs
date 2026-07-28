@@ -3517,6 +3517,9 @@ mod tests {
             revert_detail: None,
         };
         store.save_provisional(armed.clone()).await.unwrap();
+        let mut armed = armed;
+        armed.decision_trace = Some(guard::gating::DecisionTrace::source("static_policy"));
+        store.save_provisional(armed.clone()).await.unwrap();
         let mut reverting = armed.clone();
         reverting.status = ProvisionalStatus::Reverting;
         store.fail_next_write_for_test();
@@ -4654,6 +4657,9 @@ mod tests {
             result_stderr: None,
             notes: Vec::new(),
         };
+        first.save_approval(pending.clone()).await.unwrap();
+        let mut pending = pending;
+        pending.decision_trace = Some(guard::gating::DecisionTrace::source("static_policy"));
         first.save_approval(pending.clone()).await.unwrap();
         let mut approving = pending.clone();
         approving.status = ApprovalStatus::Approving;

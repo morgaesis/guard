@@ -808,6 +808,7 @@ async fn route_allow_and_record<W: AsyncWrite + Unpin>(
 ) -> ExecuteResult {
     let reason = inputs.reason.clone();
     let risk = inputs.risk;
+    let trace = decision_trace_for_phase(phase, source, true);
     let mut context = RequestContext {
         server: phase.server,
         caller: phase.caller,
@@ -815,39 +816,7 @@ async fn route_allow_and_record<W: AsyncWrite + Unpin>(
         stream_output: phase.stream_output,
         stream_writer: &mut *phase.stream_writer,
     };
-    let result = route_gated_allow(&mut context, request, inputs).await;
-    let trace = decision_trace_for_phase(phase, source, true);
-    match &result.exec {
-        ExecOutcome::Held { handle, .. } => {
-            let updated = phase
-                .server
-                .state
-                .approvals
-                .write()
-                .await
-                .set_decision_trace(handle, trace.clone());
-            if let (Some(store), Some(approval)) = (&phase.server.state.session_store, updated) {
-                if let Err(error) = store.save_approval(approval).await {
-                    tracing::error!("failed to persist held decision trace: {error}");
-                }
-            }
-        }
-        ExecOutcome::Provisional { handle, .. } => {
-            let updated = phase
-                .server
-                .state
-                .provisional
-                .write()
-                .await
-                .set_decision_trace(handle, trace.clone());
-            if let (Some(store), Some(provisional)) = (&phase.server.state.session_store, updated) {
-                if let Err(error) = store.save_provisional(provisional).await {
-                    tracing::error!("failed to persist provisional decision trace: {error}");
-                }
-            }
-        }
-        _ => {}
-    }
+    let result = route_gated_allow(&mut context, request, inputs, Some(trace.clone())).await;
     record_live_session_interaction(
         phase.server,
         phase.session_token.as_deref(),

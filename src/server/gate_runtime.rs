@@ -940,6 +940,7 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
     context: &mut RequestContext<'_, W>,
     request: ExecuteRequest,
     mut inputs: GateInputs,
+    decision_trace: Option<guard::gating::DecisionTrace>,
 ) -> ExecuteResult {
     let server = context.server;
     if request.session_token.is_some() {
@@ -1033,11 +1034,12 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
                             "{} [held for operator review: containment envelope not validated: {}]",
                             inputs.reason, why
                         );
-                        return hold_for_approval_with_authority(
+                        return hold_for_approval_with_trace(
                             context,
                             request,
                             caller_principal,
                             inputs,
+                            decision_trace,
                         )
                         .await;
                     }
@@ -1050,11 +1052,13 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
                 inputs.reason,
                 inputs.authority,
                 inputs.consume_access_verbs,
+                decision_trace,
             )
             .await
         }
         GateOutcome::Hold => {
-            hold_for_approval_with_authority(context, request, caller_principal, inputs).await
+            hold_for_approval_with_trace(context, request, caller_principal, inputs, decision_trace)
+                .await
         }
     }
 }
@@ -1076,6 +1080,7 @@ pub(super) async fn arm_containment_with_authority<W: AsyncWrite + Unpin>(
         reason,
         authority,
         Vec::new(),
+        None,
     )
     .await
 }
@@ -1087,6 +1092,7 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
     reason: String,
     authority: Option<SessionAuthoritySnapshot>,
     consume_access_verbs: Vec<String>,
+    decision_trace: Option<guard::gating::DecisionTrace>,
 ) -> ExecuteResult {
     let server = context.server;
     let caller = context.caller;
@@ -1226,7 +1232,7 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
         secret_entitlements,
         api_revert: None,
         reason: reason.clone(),
-        decision_trace: Some(guard::gating::DecisionTrace::source("evaluator")),
+        decision_trace,
         created_unix: now,
         deadline_unix: now.saturating_add(window),
         forward_done: false,
@@ -1385,11 +1391,22 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
 /// Hold an irreversible/uncertain/high-risk command for operator approval.
 /// Consumes the routed [`GateInputs`]; `revert_preauthorized` and `bypass`
 /// have already been acted on by the router and are ignored here.
+#[cfg(test)]
 pub(super) async fn hold_for_approval_with_authority<W: AsyncWrite + Unpin>(
     context: &mut RequestContext<'_, W>,
     request: ExecuteRequest,
     caller_principal: Option<PrincipalKey>,
     inputs: GateInputs,
+) -> ExecuteResult {
+    hold_for_approval_with_trace(context, request, caller_principal, inputs, None).await
+}
+
+pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
+    context: &mut RequestContext<'_, W>,
+    request: ExecuteRequest,
+    caller_principal: Option<PrincipalKey>,
+    inputs: GateInputs,
+    decision_trace: Option<guard::gating::DecisionTrace>,
 ) -> ExecuteResult {
     let server = context.server;
     let caller = context.caller;
@@ -1557,7 +1574,7 @@ pub(super) async fn hold_for_approval_with_authority<W: AsyncWrite + Unpin>(
         reason: reason.clone(),
         risk,
         reversibility,
-        decision_trace: Some(guard::gating::DecisionTrace::source("evaluator")),
+        decision_trace,
         created_unix: now,
         ttl_secs: server.config.approval_ttl_secs,
         status: ApprovalStatus::Pending,

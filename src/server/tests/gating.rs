@@ -4,7 +4,8 @@ use crate::server::execute::audit_session_fingerprint;
 use crate::server::gate_runtime::run_provisional_check;
 use crate::server::gate_runtime::{
     approval_to_result, execute_snapshot, hash_secret_value, hold_for_approval_with_authority,
-    new_handle, now_unix, route_gated_allow, GateInputs, SessionAuthoritySnapshot,
+    hold_for_approval_with_trace, new_handle, now_unix, route_gated_allow, GateInputs,
+    SessionAuthoritySnapshot,
 };
 #[cfg(unix)]
 use crate::server::gate_runtime::{
@@ -1296,6 +1297,7 @@ async fn recoverable_with_unaffirmable_revert_is_held_for_review() {
         },
         request,
         inputs,
+        None,
     )
     .await;
 
@@ -1370,6 +1372,7 @@ async fn post_evaluator_session_revoke_or_expiry_fails_before_arm_or_hold() {
             authority: Some(revoked_authority),
             consume_access_verbs: Vec::new(),
         },
+        None,
     )
     .await;
     assert!(!denied.policy_allowed());
@@ -1423,6 +1426,7 @@ async fn post_evaluator_session_revoke_or_expiry_fails_before_arm_or_hold() {
             authority: Some(expired_authority),
             consume_access_verbs: Vec::new(),
         },
+        None,
     )
     .await;
     assert!(!denied.policy_allowed());
@@ -2912,7 +2916,12 @@ async fn kube_proxy_hold_routes_through_approval_queue() {
 /// still completes the park immediately.
 #[tokio::test]
 async fn nonstreaming_wait_approval_returns_promptly_on_decision() {
-    let (cfg, _operator, agent) = gating_config(7014, 1000);
+    let (mut cfg, _operator, agent) = gating_config(7014, 1000);
+    let state = tempfile::tempdir().unwrap();
+    let store = crate::session_store::SessionStore::open(state.path().join("state.db"), 3_600)
+        .await
+        .unwrap();
+    cfg.state.session_store = Some(store.clone());
     let agent_principal = agent.principal();
 
     let request = ExecuteRequest {
@@ -2936,7 +2945,7 @@ async fn nonstreaming_wait_approval_returns_promptly_on_decision() {
     let cfg2 = cfg.clone();
     let waiter = tokio::spawn(async move {
         let mut sink = tokio::io::sink();
-        hold_for_approval_with_authority(
+        hold_for_approval_with_trace(
             &mut RequestContext {
                 server: &cfg2,
                 caller: &agent,
@@ -2956,16 +2965,19 @@ async fn nonstreaming_wait_approval_returns_promptly_on_decision() {
                 authority: None,
                 consume_access_verbs: Vec::new(),
             },
+            Some(guard::gating::DecisionTrace::source("static_policy")),
         )
         .await
     });
 
     let handle = wait_for_pending_hold(&cfg).await;
-    {
+    let denied = {
         let mut reg = cfg.state.approvals.write().await;
         reg.deny(&handle, now_unix(), "operator rejected".to_string())
             .unwrap();
-    }
+        reg.get(&handle).cloned().unwrap()
+    };
+    store.save_approval(denied).await.unwrap();
 
     // Well under the 30s wait: the deny must wake the waiter.
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
@@ -2977,6 +2989,15 @@ async fn nonstreaming_wait_approval_returns_promptly_on_decision() {
         result.policy_reason().contains("operator rejected"),
         "got: {}",
         result.policy_reason()
+    );
+    let durable = store.load_approvals().await.unwrap();
+    assert_eq!(durable[0].status, ApprovalStatus::Denied);
+    assert_eq!(
+        durable[0]
+            .decision_trace
+            .as_ref()
+            .map(|trace| trace.decision_source.as_str()),
+        Some("static_policy")
     );
 }
 

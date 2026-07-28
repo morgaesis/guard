@@ -382,13 +382,12 @@ impl GrantRequest {
             .context("access request requires an authenticated requester")?;
         let encoded = serde_json::to_vec(&(
             requester,
-            self.target.as_deref().unwrap_or("new"),
+            &self.session_token,
             &self.delta,
             self.requested_uses,
             &self.authority_verbs,
             &self.proposed_verbs,
             &self.issued_session_revision,
-            normalize_access_intent(&self.justification),
         ))?;
         let digest = Sha256::digest(encoded);
         Ok(format!(
@@ -969,7 +968,7 @@ mod tests {
     }
 
     #[test]
-    fn access_request_keys_coalesce_normalized_intent_but_isolate_principals() {
+    fn access_request_keys_coalesce_equivalent_authority_but_isolate_principals() {
         let delta = GrantRequestDelta {
             activated_verbs: vec!["inspect".to_string()],
             ..GrantRequestDelta::default()
@@ -1002,5 +1001,40 @@ mod tests {
         assert_ne!(one.request_key, other.request_key);
         assert_eq!(one.requester, Some(PrincipalKey::from_uid(1001)));
         assert!(one.session_token.is_empty());
+    }
+
+    #[test]
+    fn access_request_keys_ignore_prose_and_display_target_for_one_session_revision() {
+        let delta = GrantRequestDelta {
+            activated_verbs: vec!["access-command-run".to_string()],
+            ..GrantRequestDelta::default()
+        };
+        let mut execution = GrantRequest::new_access(
+            PrincipalKey::from_uid(1001),
+            Some("session-token".to_string()),
+            "session:fixture".to_string(),
+            delta.clone(),
+            "access-command-run".to_string(),
+        )
+        .unwrap();
+        execution.authority_verbs = vec!["access-command-run".to_string()];
+        execution.issued_session_revision = Some("revision-4".to_string());
+        execution.request_key = execution.canonical_access_key().unwrap();
+
+        let mut prose = GrantRequest::new_access(
+            PrincipalKey::from_uid(1001),
+            Some("session-token".to_string()),
+            "agent:1001".to_string(),
+            delta,
+            "Run the bounded command".to_string(),
+        )
+        .unwrap();
+        prose.authority_verbs = vec!["access-command-run".to_string()];
+        prose.issued_session_revision = Some("revision-4".to_string());
+        prose.request_key = prose.canonical_access_key().unwrap();
+
+        assert_eq!(execution.request_key, prose.request_key);
+        prose.session_token = "another-session".to_string();
+        assert_ne!(execution.request_key, prose.canonical_access_key().unwrap());
     }
 }
