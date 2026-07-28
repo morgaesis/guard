@@ -57,6 +57,14 @@ jobs:
             echo "checksum manifest included an unexpected file type"
             exit 1
           fi
+          release_job=$(sed -n '/^  release:/,$p' .github/workflows/publish-release.yml)
+          checkout_line=$(printf '%s\n' "$release_job" | grep -n -m1 'uses: actions/checkout@' | cut -d: -f1)
+          create_line=$(printf '%s\n' "$release_job" | grep -n -m1 'name: Create Release' | cut -d: -f1)
+          test -n "$checkout_line"
+          test -n "$create_line"
+          test "$checkout_line" -lt "$create_line"
+          printf '%s\n' "$release_job" | grep -A3 -m1 'uses: actions/checkout@' | grep -q 'persist-credentials: false'
+          printf '%s\n' "$release_job" | grep -A4 -m1 'uses: actions/checkout@' | grep -q 'fetch-depth: 0'
           mkdir /tmp/guard-release-test/verify
           cp /tmp/guard-release-test/a/*.tar.gz /tmp/guard-release-test/b/*.tar.gz /tmp/guard-release-test/verify/
           cp /tmp/guard-release-test/c/*.cdx.json /tmp/guard-release-test/verify/
