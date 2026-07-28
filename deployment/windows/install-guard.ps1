@@ -506,7 +506,8 @@ function Set-ServiceRegistryAclObject {
     $lastError = 'service registry ACL was not written'
     for ($attempt = 1; $attempt -le 20; $attempt++) {
         try {
-            Set-Acl -LiteralPath $Path -AclObject $AclObject
+            $item = Get-Item -LiteralPath $Path -ErrorAction Stop
+            Set-Acl -InputObject $item -AclObject $AclObject -ErrorAction Stop
             return
         }
         catch { $lastError = $_.Exception.Message }

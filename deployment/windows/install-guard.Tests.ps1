@@ -211,12 +211,16 @@ Describe 'Guard Windows installer state and ACL contract' {
         Should -Invoke Start-Sleep -Times 1 -Exactly
 
         $script:registryWriteAttempts = 0
+        Mock Get-Item { return [pscustomobject]@{ Marker = 'registry-key' } }
         Mock Set-Acl {
             $script:registryWriteAttempts++
             if ($script:registryWriteAttempts -lt 2) { throw 'fixture registry write race' }
         }
-        Set-ServiceRegistryAclObject -Path 'HKLM:\fixture' -AclObject ([pscustomobject]@{})
-        Should -Invoke Set-Acl -Times 2 -Exactly -ParameterFilter { $LiteralPath -eq 'HKLM:\fixture' }
+        Set-ServiceRegistryAclObject -Path 'HKLM:\fixture[1]' -AclObject ([pscustomobject]@{ Marker = 'acl' })
+        Should -Invoke Get-Item -Times 2 -Exactly -ParameterFilter { $LiteralPath -eq 'HKLM:\fixture[1]' }
+        Should -Invoke Set-Acl -Times 2 -Exactly -ParameterFilter {
+            $InputObject.Marker -eq 'registry-key' -and $AclObject.Marker -eq 'acl'
+        }
         Should -Invoke Start-Sleep -Times 2 -Exactly
     }
 
