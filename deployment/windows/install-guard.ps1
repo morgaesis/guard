@@ -1258,13 +1258,25 @@ function Install-FileAtomically {
         [Parameter(Mandatory)][string]$ExpectedHash
     )
     $staged = Join-Path $StagingDir "restore-$([guid]::NewGuid().ToString('N')).tmp"
-    Copy-Item -LiteralPath $Source -Destination $staged
-    if ((Get-FileHash -Algorithm SHA256 -LiteralPath $staged).Hash.ToLowerInvariant() -ne $ExpectedHash.ToLowerInvariant()) {
-        Remove-Item -LiteralPath $staged -Force
-        throw "Staged file for '$Destination' failed integrity validation."
+    $replaced = Join-Path $StagingDir "replaced-$([guid]::NewGuid().ToString('N')).tmp"
+    try {
+        Copy-Item -LiteralPath $Source -Destination $staged
+        if ((Get-FileHash -Algorithm SHA256 -LiteralPath $staged).Hash.ToLowerInvariant() -ne $ExpectedHash.ToLowerInvariant()) {
+            throw "Staged file for '$Destination' failed integrity validation."
+        }
+        if (Test-Path -LiteralPath $Destination) {
+            [IO.File]::Replace($staged, $Destination, $replaced)
+            Remove-Item -LiteralPath $replaced -Force -ErrorAction Stop
+        }
+        else { Move-Item -LiteralPath $staged -Destination $Destination }
     }
-    if (Test-Path -LiteralPath $Destination) { [IO.File]::Replace($staged, $Destination, $null) }
-    else { Move-Item -LiteralPath $staged -Destination $Destination }
+    finally {
+        foreach ($temporaryPath in @($staged, $replaced)) {
+            if (Test-Path -LiteralPath $temporaryPath) {
+                Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
 }
 
 function Get-ServiceBinPath {

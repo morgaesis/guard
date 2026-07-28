@@ -416,6 +416,23 @@ Describe 'Guard Windows installer state and ACL contract' {
         Resolve-InstallServicePath -ExistingPath $custom -DesiredPath $withKey | Should -Be $custom
     }
 
+    It 'atomically replaces an existing file without retaining replacement artifacts' {
+        $oldStagingDir = $StagingDir
+        $StagingDir = Join-Path $TestDrive 'atomic-staging'
+        New-Item -ItemType Directory -Path $StagingDir | Out-Null
+        $source = Join-Path $TestDrive 'candidate.bin'
+        $destination = Join-Path $TestDrive 'installed.bin'
+        [IO.File]::WriteAllText($source, 'candidate', [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText($destination, 'installed', [Text.UTF8Encoding]::new($false))
+        try {
+            $expectedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $source).Hash
+            Install-FileAtomically -Source $source -Destination $destination -ExpectedHash $expectedHash
+            [IO.File]::ReadAllText($destination) | Should -Be 'candidate'
+            @(Get-ChildItem -LiteralPath $StagingDir -Force).Count | Should -Be 0
+        }
+        finally { $StagingDir = $oldStagingDir }
+    }
+
     It 'round-trips API revert bodies and reapplies the daemon-only ACL' {
         $oldDataDir = $DataDir
         $oldStagingDir = $StagingDir
