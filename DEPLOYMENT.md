@@ -90,8 +90,19 @@ gives the daemon deliberately broad reach: the guard account carries
 passwordless sudo for brokered children, holds the fleet SSH identity and tool
 credentials, and exposes the socket to the agent group. Passwordless sudo
 requires a host-local sudoers entry for the guard account and, because the
-packaged unit sets `NoNewPrivileges=true`, a service drop-in that relaxes it to
-`false` so setuid `sudo` can elevate. This is the intended shape of a sudo-like
+packaged unit mounts the host filesystem read-only and sets
+`NoNewPrivileges=true`, a service drop-in that removes those restrictions:
+
+```ini
+[Service]
+NoNewPrivileges=false
+ProtectSystem=false
+ProtectHome=false
+```
+
+Run `systemctl daemon-reload` and restart `guard.service` after installing the
+drop-in. These settings let setuid `sudo` elevate and let approved children
+write normal host and home paths. This is the intended shape of a sudo-like
 broker, not a hardening gap. The enforcement surface is the evaluator envelope,
 operator policy and catalogs, and the audit stream - not a minimized daemon.
 Guard alone holding the credentials is what keeps a direct tool invocation

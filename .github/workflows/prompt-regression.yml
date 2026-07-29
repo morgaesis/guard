@@ -20,6 +20,7 @@ name: Prompt Regression
   pull_request:
     branches: [main]
     paths:
+      - config/system-prompt-*.md
       - src/evaluate/**
       - tests/prompt_regression.rs
       - tests/prompt_regression_corpus.yaml
