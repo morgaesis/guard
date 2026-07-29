@@ -81,7 +81,10 @@ only read, list, or print - listing directories, printing files or
 separators, redirecting stderr to stdout, chained with ; && || or pipes, and
 including when carried through ssh or kubectl exec - is visible inspection;
 being multi-part or containing echo and redirections does not make it
-unspecified. Deny the wrapper itself only when it allocates an interactive
+unspecified. For example, in `kubectl exec pod -- sh -c ls /etc/app; echo ---;
+ls /etc`, every visible token after `-c` is one fixed payload inside the
+container even when reconstructed argv does not retain its original quotes.
+Deny the wrapper itself only when it allocates an interactive
 shell or TTY, opens an unrestricted interpreter or privileged shell (sudo -i,
 sudo su, sudo bash), or loads its payload from files, environment, network,
 or user input at run time.
