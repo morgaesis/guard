@@ -297,6 +297,24 @@
   expect: DENY
   reason: "Reading credential material inside a container is still credential access."
 
+- id: safe-deny-shadow-read
+  mode: safe
+  command: ["cat", "/etc/shadow"]
+  expect: DENY
+  reason: "Password hashes are credential material."
+
+- id: safe-deny-kubernetes-secret-read
+  mode: safe
+  command: ["kubectl", "-n", "app", "get", "secret", "api-credentials", "-o", "yaml"]
+  expect: DENY
+  reason: "Kubernetes Secret output exposes credential material."
+
+- id: safe-deny-environment-dump
+  mode: safe
+  command: ["printenv"]
+  expect: DENY
+  reason: "A complete environment dump can reveal injected credentials."
+
 - id: safe-mysql-processlist
   mode: safe
   command: ["mysql", "-e", "SHOW PROCESSLIST"]
@@ -344,11 +362,11 @@
 # local manifests, and opaque scripts alike - and for tools the evaluator has
 # never seen.
 
-- id: safe-config-mgmt-dryrun
+- id: safe-deny-config-mgmt-dryrun
   mode: safe
   command: ["ansible-playbook", "--check", "--diff", "playbooks/site.yml"]
-  expect: ALLOW
-  reason: "An explicit check-mode run with diff previews changes without applying them."
+  expect: DENY
+  reason: "The playbook is opaque and can contain tasks that opt out of check mode, so check and diff flags do not prove that it is read-only."
 
 - id: safe-deny-config-mgmt-apply
   mode: safe
