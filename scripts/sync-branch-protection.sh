@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Synchronizes the required status checks in the branch ruleset with the
+# Synchronizes the required status checks on the protected branch with the
 # declared list below. The list is the single source of truth: the CI drift
 # guard (audit.yml, branch_protection_drift) runs this script with --check,
 # and an administrator applies changes with --apply.
@@ -85,7 +85,7 @@ current_contexts() {
 }
 
 if ! current=$(current_contexts); then
-  echo "error: branch rules are unreadable or no required_status_checks rule exists for ${REPO}@${BRANCH}" >&2
+  echo "error: required-check rules are unreadable or ambiguous for ${REPO}@${BRANCH}" >&2
   exit 2
 fi
 
@@ -119,43 +119,57 @@ case "$mode" in
     exit 1
     ;;
   apply)
-    rules=$(gh api "repos/${REPO}/rules/branches/${BRANCH}") || {
-      echo "error: branch rules are unreadable for ${REPO}@${BRANCH}" >&2
-      exit 2
-    }
-    ruleset_id=$(printf '%s\n' "$rules" \
-      | jq -e -r 'map(select(.type == "required_status_checks")) | if length == 0 then empty else .[0].ruleset_id end') \
-      || {
-        echo "error: no required_status_checks rule exists for ${REPO}@${BRANCH}" >&2
+    if strict=$(gh api \
+        "repos/${REPO}/branches/${BRANCH}/protection/required_status_checks" \
+        --jq '.strict' 2>/dev/null); then
+      payload=$(printf '%s\n' "${REQUIRED_CONTEXTS[@]}" \
+        | jq -R . \
+        | jq -s --argjson strict "$strict" --argjson app_id "$APP_ID" \
+            '{strict: $strict, checks: map({context: ., app_id: $app_id})}')
+      printf '%s\n' "$payload" | gh api -X PATCH \
+        "repos/${REPO}/branches/${BRANCH}/protection/required_status_checks" \
+        --input - > /dev/null
+    else
+      effective_rules=$(gh api "repos/${REPO}/rules/branches/${BRANCH}")
+      mapfile -t ruleset_ids < <(
+        jq -r '.[] | select(.type == "required_status_checks") | .ruleset_id' \
+          <<< "$effective_rules" | LC_ALL=C sort -u
+      )
+      if [ "${#ruleset_ids[@]}" -ne 1 ]; then
+        echo "error: expected exactly one ruleset with required status checks for ${BRANCH}" >&2
         exit 2
-      }
-    required_checks=$(printf '%s\n' "${REQUIRED_CONTEXTS[@]}" \
-      | jq -R . \
-      | jq -s --argjson app_id "$APP_ID" 'map({context: ., integration_id: $app_id})')
-    payload=$(gh api "repos/${REPO}/rulesets/${ruleset_id}" \
-      | jq --argjson required_checks "$required_checks" '
-          {
-            name,
-            target,
-            enforcement,
-            conditions,
-            bypass_actors,
-            rules: (
-              .rules
-              | map(
-                  if .type == "required_status_checks" then
-                    .parameters.required_status_checks = $required_checks
-                  else
-                    .
-                  end
-                )
-            )
-          }
-          | with_entries(select(.value != null))
-        ')
-    printf '%s\n' "$payload" | gh api -X PUT \
-      "repos/${REPO}/rulesets/${ruleset_id}" \
-      --input - > /dev/null
-    echo "Applied ${#REQUIRED_CONTEXTS[@]} required contexts to ruleset ${ruleset_id} for ${REPO}@${BRANCH}."
+      fi
+      ruleset_id=${ruleset_ids[0]}
+      ruleset=$(gh api "repos/${REPO}/rulesets/${ruleset_id}")
+      if [ "$(jq -r '.source_type' <<< "$ruleset")" != "Repository" ]; then
+        echo "error: required status checks come from a non-repository ruleset" >&2
+        exit 2
+      fi
+      if [ "$(jq '[.rules[] | select(.type == "required_status_checks")] | length' \
+          <<< "$ruleset")" -ne 1 ]; then
+        echo "error: ruleset does not contain exactly one required-status-check rule" >&2
+        exit 2
+      fi
+      checks=$(printf '%s\n' "${REQUIRED_CONTEXTS[@]}" \
+        | jq -R . \
+        | jq -s --argjson integration_id "$APP_ID" \
+            'map({context: ., integration_id: $integration_id})')
+      payload=$(jq --argjson checks "$checks" '{
+        name,
+        target,
+        enforcement,
+        bypass_actors,
+        conditions,
+        rules: (.rules | map(
+          if .type == "required_status_checks"
+          then .parameters.required_status_checks = $checks
+          else .
+          end
+        ))
+      }' <<< "$ruleset")
+      printf '%s\n' "$payload" | gh api -X PUT \
+        "repos/${REPO}/rulesets/${ruleset_id}" --input - > /dev/null
+    fi
+    echo "Applied ${#REQUIRED_CONTEXTS[@]} required contexts to ${REPO}@${BRANCH}."
     ;;
 esac

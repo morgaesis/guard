@@ -9,12 +9,13 @@ use hyper::service::service_fn;
 use hyper::{header, HeaderMap, Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -22,15 +23,28 @@ use tokio::sync::Mutex;
 const JSONRPC_VERSION: &str = "2.0";
 const DEFAULT_TOOL_NAME: &str = "guard_run";
 const VERB_LIST_TOOL_NAME: &str = "guard_verbs";
-const APPROVAL_LIST_TOOL_NAME: &str = "guard_approvals";
+const ACCESS_REQUEST_TOOL_NAME: &str = "guard_access_request";
+const APPROVAL_LIST_TOOL_NAME: &str = "guard_access_list";
 const EVALUATE_BATCH_TOOL_NAME: &str = "guard_evaluate_batch";
-const SESSION_STATUS_TOOL_NAME: &str = "guard_session_status";
+const SESSION_STATUS_TOOL_NAME: &str = "guard_access_show";
+const BUILT_IN_TOOL_NAMES: &[&str] = &[
+    DEFAULT_TOOL_NAME,
+    VERB_LIST_TOOL_NAME,
+    ACCESS_REQUEST_TOOL_NAME,
+    APPROVAL_LIST_TOOL_NAME,
+    EVALUATE_BATCH_TOOL_NAME,
+    SESSION_STATUS_TOOL_NAME,
+];
+const TOOL_SCHEMA_VERSION: u64 = 1;
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-03-26", "2024-11-05"];
 
 /// Cap the HTTP request body we will buffer. The MCP request payloads are
 /// small JSON-RPC envelopes; this bounds the memory a single connection can
 /// force us to allocate from an unauthenticated peer before the bearer check.
 const MAX_HTTP_BODY: usize = 1024 * 1024;
+const MAX_HTTP_SESSIONS: usize = 1024;
+const MAX_MCP_REQUEST_IDS: usize = 16 * 1024;
+const HTTP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Clone, Debug)]
 pub struct McpConfig {
@@ -57,6 +71,15 @@ impl McpConfig {
             bail!("MCP tool name cannot be empty");
         }
 
+        if self.tool_name != DEFAULT_TOOL_NAME
+            && BUILT_IN_TOOL_NAMES.contains(&self.tool_name.as_str())
+        {
+            bail!(
+                "MCP tool name '{}' is reserved by a built-in tool",
+                self.tool_name
+            );
+        }
+
         if self.http_addr.is_some()
             && self
                 .http_token
@@ -66,9 +89,16 @@ impl McpConfig {
                 .unwrap_or(true)
         {
             bail!(
-                "--http requires a bearer token (set --http-token or GUARD_MCP_TOKEN); \
+                "--http requires a bearer token from GUARD_MCP_TOKEN; \
                  refusing to start an unauthenticated network MCP server"
             );
+        }
+
+        if self
+            .http_addr
+            .is_some_and(|address| !address.ip().is_loopback())
+        {
+            bail!("--http must bind to a loopback address");
         }
 
         Ok(())
@@ -93,8 +123,8 @@ impl Default for McpConfig {
 // arguments) live in the library crate (`guard::wire::mcp`) so their parsing
 // surface can be fuzzed.
 use guard::wire::mcp::{
-    parse_jsonrpc_envelope, EvaluateBatchArgs, GuardToolArgs, JsonRpcEnvelopeError,
-    SessionStatusArgs, ToolCallParams, WaitApproval,
+    parse_jsonrpc_envelope, AccessShowArgs, EvaluateBatchArgs, GuardToolArgs, JsonRpcEnvelopeError,
+    ToolCallParams, WaitApproval,
 };
 
 #[derive(Debug, Clone)]
@@ -106,13 +136,20 @@ struct GuardToolResponse {
     stderr: Option<String>,
     /// Consequence-gate outcome: "executed", "held", "provisional", etc.
     status: Option<String>,
-    /// Handle for a held/provisional command (use with guard approve/confirm).
+    /// Handle for a held/provisional command.
     handle: Option<String>,
+    approval_options: Vec<String>,
+    access_requests: Vec<server::AccessRequestGuidance>,
     /// Honest statement of what the gate checked and did not check.
     coverage: Option<guard::gating::Coverage>,
     verb_matches: Vec<server::VerbMatchInfo>,
     guidance: Option<String>,
     decision_source: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AccessRequestArgs {
+    intent: String,
 }
 
 impl From<server::ExecuteResponse> for GuardToolResponse {
@@ -135,6 +172,8 @@ impl From<server::ExecuteResponse> for GuardToolResponse {
                 .to_string()
             }),
             handle: response.handle,
+            approval_options: response.approval_options,
+            access_requests: response.access_requests,
             verb_matches: response.verb_matches,
             guidance: response.verb_guidance,
             decision_source: response.decision_source,
@@ -161,12 +200,14 @@ struct ClientExecutor {
     socket_path: Option<PathBuf>,
     tcp_port: Option<u16>,
     auth_token: Option<String>,
+    session_token: Option<String>,
 }
 
 impl ClientExecutor {
-    /// Build a bare daemon client carrying only the connection details and the
-    /// optional TCP auth token. Used for read-only admin RPCs that the catalog
-    /// and approval tools proxy.
+    /// Build a daemon client without operator authority. On a local socket the
+    /// kernel-authenticated MCP process principal scopes self-service reads. A
+    /// TCP endpoint refuses these RPCs instead of silently upgrading every MCP
+    /// bearer holder to the configured daemon administrator.
     fn admin_client(&self) -> daemon_client::Client {
         let mut client = daemon_client::Client::new(self.socket_path.clone(), self.tcp_port);
         if let Some(token) = &self.auth_token {
@@ -244,6 +285,9 @@ impl GuardExecutor for ClientExecutor {
         if let Some(token) = &self.auth_token {
             client = client.with_auth(token.clone());
         }
+        if let Some(token) = &self.session_token {
+            client = client.with_session(token.clone());
+        }
         if let Some(verb) = args.verb {
             client = client.with_verb(server::VerbInvocation {
                 name: verb.name,
@@ -294,13 +338,16 @@ struct JsonRpcError {
 pub async fn serve(config: McpConfig) -> Result<()> {
     config.validate()?;
 
+    let expose_admin_tools = config.socket_path.is_some() && config.tcp_port.is_none();
     let executor = Arc::new(ClientExecutor {
         socket_path: config.socket_path.clone(),
         tcp_port: config.tcp_port,
         auth_token: config.auth_token.clone(),
+        session_token: config.session_token.clone(),
     });
     let server = McpServer::new(executor.clone(), executor, config.tool_name)
-        .with_caller_token(config.session_token);
+        .with_caller_token(config.session_token)
+        .with_admin_tools(expose_admin_tools);
 
     match config.http_addr {
         Some(addr) => {
@@ -358,12 +405,11 @@ const MAX_HTTP_HEADER_SECTION: usize = 64 * 1024;
 /// before the bearer check.
 const HTTP_REQUEST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// Minimal MCP Streamable-HTTP transport: a single POST endpoint that pipes the
+/// Minimal MCP Streamable HTTP transport: a single endpoint that pipes the
 /// JSON-RPC body through the same request handler the stdio path uses. Every
 /// request must carry `Authorization: Bearer <token>`; there is no server-side
-/// SSE streaming. The handler is shared behind a Mutex because MCP keeps a
-/// little session state (the initialize handshake) and clients are expected to
-/// drive one logical session.
+/// SSE streaming. Initialize creates an opaque MCP session so lifecycle state
+/// survives connection reuse, reconnects, and HTTP/2 connection sharing.
 async fn serve_http<E: GuardExecutor + 'static, A: GuardAdmin + 'static>(
     server: McpServer<E, A>,
     addr: SocketAddr,
@@ -375,15 +421,25 @@ async fn serve_http<E: GuardExecutor + 'static, A: GuardAdmin + 'static>(
     let bound = listener.local_addr().unwrap_or(addr);
 
     if !bound.ip().is_loopback() {
-        tracing::warn!(
-            address = %bound,
-            "MCP HTTP transport bound to a non-loopback address; it is intended for \
-             localhost or trusted networks only and authenticates with a single bearer token"
-        );
+        bail!("MCP HTTP transport must bind to a loopback address, got {bound}");
     }
     tracing::info!(address = %bound, "MCP HTTP transport listening");
 
     serve_http_on(listener, server, token).await
+}
+
+struct HttpSession<E: GuardExecutor, A: GuardAdmin> {
+    connection: Arc<Mutex<McpServer<E, A>>>,
+    expires_at: Instant,
+}
+
+type HttpSessionTable<E, A> = HashMap<String, HttpSession<E, A>>;
+
+fn prune_expired_http_sessions<E: GuardExecutor, A: GuardAdmin>(
+    sessions: &mut HttpSessionTable<E, A>,
+    now: Instant,
+) {
+    sessions.retain(|_, session| session.expires_at > now);
 }
 
 /// Accept loop over an already-bound listener: each connection is served by
@@ -395,8 +451,9 @@ async fn serve_http_on<E: GuardExecutor + 'static, A: GuardAdmin + 'static>(
     server: McpServer<E, A>,
     token: String,
 ) -> Result<()> {
-    let server = Arc::new(Mutex::new(server));
+    let server = Arc::new(server);
     let token = Arc::new(token);
+    let sessions: Arc<Mutex<HttpSessionTable<E, A>>> = Arc::new(Mutex::new(HashMap::new()));
 
     loop {
         let (stream, _peer) = match listener.accept().await {
@@ -408,13 +465,15 @@ async fn serve_http_on<E: GuardExecutor + 'static, A: GuardAdmin + 'static>(
         };
         let server = server.clone();
         let token = token.clone();
+        let sessions = sessions.clone();
         tokio::spawn(async move {
             let service = service_fn(move |request| {
                 let server = server.clone();
                 let token = token.clone();
+                let sessions = sessions.clone();
                 async move {
                     Ok::<_, std::convert::Infallible>(
-                        handle_http_request(request, &server, &token).await,
+                        handle_http_request(request, &server, &sessions, &token).await,
                     )
                 }
             });
@@ -439,9 +498,14 @@ async fn serve_http_on<E: GuardExecutor + 'static, A: GuardAdmin + 'static>(
 /// with no Content-Length) and time.
 async fn handle_http_request<E: GuardExecutor, A: GuardAdmin>(
     request: Request<Incoming>,
-    server: &Mutex<McpServer<E, A>>,
+    server: &McpServer<E, A>,
+    sessions: &Mutex<HttpSessionTable<E, A>>,
     token: &str,
 ) -> Response<Full<Bytes>> {
+    if !origin_is_loopback(request.headers()) {
+        return http_error_response(StatusCode::FORBIDDEN, "invalid Origin header");
+    }
+
     // Reject a declared oversized body up front, before any other check, so
     // the bound applies even to unauthenticated peers.
     let declared_length = request
@@ -453,13 +517,6 @@ async fn handle_http_request<E: GuardExecutor, A: GuardAdmin>(
         return http_error_response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
     }
 
-    if request.method() != Method::POST {
-        return http_error_response(
-            StatusCode::METHOD_NOT_ALLOWED,
-            "method not allowed; POST a JSON-RPC request",
-        );
-    }
-
     if !path_is_mcp_endpoint(request.uri().path()) {
         return http_error_response(StatusCode::NOT_FOUND, "not found");
     }
@@ -467,6 +524,50 @@ async fn handle_http_request<E: GuardExecutor, A: GuardAdmin>(
     if !bearer_matches(request.headers(), token) {
         return http_error_response(StatusCode::UNAUTHORIZED, "missing or invalid bearer token");
     }
+
+    if request.method() == Method::DELETE {
+        let Some(session_id) = request
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| valid_mcp_session_id(value))
+        else {
+            return http_error_response(
+                StatusCode::BAD_REQUEST,
+                "missing or invalid Mcp-Session-Id",
+            );
+        };
+        let mut session_table = sessions.lock().await;
+        prune_expired_http_sessions(&mut session_table, Instant::now());
+        if session_table.remove(session_id).is_none() {
+            return http_error_response(StatusCode::NOT_FOUND, "unknown MCP session");
+        }
+        return empty_response(StatusCode::NO_CONTENT);
+    }
+
+    if request.method() != Method::POST {
+        return http_error_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method not allowed; POST a JSON-RPC request",
+        );
+    }
+
+    if !accepts_mcp_response_types(request.headers()) {
+        return http_error_response(
+            StatusCode::NOT_ACCEPTABLE,
+            "Accept must list application/json and text/event-stream",
+        );
+    }
+
+    if !mcp_protocol_version_is_supported(request.headers()) {
+        return http_error_response(StatusCode::BAD_REQUEST, "unsupported MCP-Protocol-Version");
+    }
+
+    let presented_session = request
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
 
     let body = match tokio::time::timeout(
         HTTP_REQUEST_READ_TIMEOUT,
@@ -495,21 +596,172 @@ async fn handle_http_request<E: GuardExecutor, A: GuardAdmin>(
         }
     };
 
-    let response = {
-        let mut guard = server.lock().await;
-        guard.handle_message(message).await
+    let parsed_envelope = match parse_jsonrpc_envelope(&message) {
+        Ok(envelope) => envelope,
+        Err(_) => {
+            let mut connection = server.fresh_connection();
+            let response = connection.handle_message(message).await;
+            return response
+                .map(|response| json_response(StatusCode::OK, &response))
+                .unwrap_or_else(|| empty_response(StatusCode::ACCEPTED));
+        }
+    };
+    let is_initialize = parsed_envelope.method == "initialize";
+
+    let (response, response_session) = if is_initialize {
+        if presented_session.is_some() {
+            return http_error_response(
+                StatusCode::BAD_REQUEST,
+                "initialize must not carry Mcp-Session-Id",
+            );
+        }
+        if parsed_envelope.id.is_none() {
+            return http_error_response(
+                StatusCode::BAD_REQUEST,
+                "initialize must be a JSON-RPC request with a non-null id",
+            );
+        }
+
+        let mut connection = server.fresh_connection();
+        let response = connection.handle_message(message).await;
+        let initialized = connection.initialize_seen
+            && response
+                .as_ref()
+                .is_some_and(|response| response["result"].is_object());
+        if !initialized {
+            return response
+                .map(|response| json_response(StatusCode::OK, &response))
+                .unwrap_or_else(|| empty_response(StatusCode::ACCEPTED));
+        }
+
+        let mut session_table = sessions.lock().await;
+        let now = Instant::now();
+        prune_expired_http_sessions(&mut session_table, now);
+        if session_table.len() >= MAX_HTTP_SESSIONS {
+            return http_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "MCP session capacity reached",
+            );
+        }
+        let session_id = loop {
+            let candidate = new_mcp_session_id();
+            if !session_table.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+        session_table.insert(
+            session_id.clone(),
+            HttpSession {
+                connection: Arc::new(Mutex::new(connection)),
+                expires_at: now + HTTP_SESSION_IDLE_TIMEOUT,
+            },
+        );
+        (response, Some(session_id))
+    } else {
+        let Some(session_id) = presented_session.filter(|value| valid_mcp_session_id(value)) else {
+            return http_error_response(
+                StatusCode::BAD_REQUEST,
+                "missing or invalid Mcp-Session-Id",
+            );
+        };
+        let connection = {
+            let mut session_table = sessions.lock().await;
+            let now = Instant::now();
+            prune_expired_http_sessions(&mut session_table, now);
+            let Some(session) = session_table.get_mut(&session_id) else {
+                return http_error_response(StatusCode::NOT_FOUND, "unknown MCP session");
+            };
+            session.expires_at = now + HTTP_SESSION_IDLE_TIMEOUT;
+            session.connection.clone()
+        };
+        let response = connection.lock().await.handle_message(message).await;
+        (response, Some(session_id))
     };
 
     // A JSON-RPC notification (no id) produces no response value. The MCP
     // Streamable-HTTP shape answers such a POST with 202 Accepted and no body.
     match response {
-        Some(response) => json_response(StatusCode::OK, &response),
+        Some(response) => {
+            json_response_with_session(StatusCode::OK, &response, response_session.as_deref())
+        }
         None => empty_response(StatusCode::ACCEPTED),
     }
 }
 
+fn new_mcp_session_id() -> String {
+    use rand::Rng;
+    let mut bytes = [0u8; 16];
+    rand::rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn valid_mcp_session_id(value: &str) -> bool {
+    value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn path_is_mcp_endpoint(path: &str) -> bool {
     path == "/" || path == "/mcp"
+}
+
+fn origin_is_loopback(headers: &HeaderMap) -> bool {
+    let mut origins = headers.get_all(header::ORIGIN).iter();
+    let Some(origin) = origins.next() else {
+        return true;
+    };
+    if origins.next().is_some() {
+        return false;
+    }
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    let Ok(uri) = origin.parse::<hyper::Uri>() else {
+        return false;
+    };
+    if !matches!(uri.scheme_str(), Some("http" | "https"))
+        || uri.path() != "/"
+        || uri.query().is_some()
+    {
+        return false;
+    }
+    let Some(authority) = uri.authority() else {
+        return false;
+    };
+    if authority.as_str().contains('@') {
+        return false;
+    }
+    let host = authority.host();
+    host.eq_ignore_ascii_case("localhost")
+        || host == "[::1]"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+fn accepts_mcp_response_types(headers: &HeaderMap) -> bool {
+    let accepted = headers
+        .get_all(header::ACCEPT)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|value| value.split(';').next())
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    accepted.contains(&"application/json") && accepted.contains(&"text/event-stream")
+}
+
+fn mcp_protocol_version_is_supported(headers: &HeaderMap) -> bool {
+    let mut versions = headers.get_all("mcp-protocol-version").iter();
+    let Some(version) = versions.next() else {
+        // MCP defines 2025-03-26 as the compatibility default when no header
+        // or other negotiated-version signal is available.
+        return true;
+    };
+    if versions.next().is_some() {
+        return false;
+    }
+    version
+        .to_str()
+        .is_ok_and(|version| SUPPORTED_PROTOCOL_VERSIONS.contains(&version))
 }
 
 /// Bearer comparison via the shared constant-time helper: reject on length
@@ -536,10 +788,22 @@ fn error_body(message: &str) -> Value {
 }
 
 fn json_response(status: StatusCode, body: &Value) -> Response<Full<Bytes>> {
+    json_response_with_session(status, body, None)
+}
+
+fn json_response_with_session(
+    status: StatusCode,
+    body: &Value,
+    session_id: Option<&str>,
+) -> Response<Full<Bytes>> {
     let payload = serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec());
-    Response::builder()
+    let mut builder = Response::builder()
         .status(status)
-        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(session_id) = session_id {
+        builder = builder.header("mcp-session-id", session_id);
+    }
+    builder
         .body(Full::new(Bytes::from(payload)))
         .expect("static response parts are valid")
 }
@@ -560,7 +824,9 @@ struct McpServer<E: GuardExecutor, A: GuardAdmin> {
     executor: Arc<E>,
     admin: Arc<A>,
     tool_name: String,
+    admin_tools: bool,
     initialize_seen: bool,
+    seen_request_ids: HashSet<String>,
     caller_token: Option<String>,
 }
 
@@ -570,7 +836,9 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
             executor,
             admin,
             tool_name,
+            admin_tools: true,
             initialize_seen: false,
+            seen_request_ids: HashSet::new(),
             caller_token: None,
         }
     }
@@ -578,6 +846,23 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
     fn with_caller_token(mut self, caller_token: Option<String>) -> Self {
         self.caller_token = caller_token.filter(|token| !token.is_empty());
         self
+    }
+
+    fn with_admin_tools(mut self, admin_tools: bool) -> Self {
+        self.admin_tools = admin_tools;
+        self
+    }
+
+    fn fresh_connection(&self) -> Self {
+        Self {
+            executor: self.executor.clone(),
+            admin: self.admin.clone(),
+            tool_name: self.tool_name.clone(),
+            admin_tools: self.admin_tools,
+            initialize_seen: false,
+            seen_request_ids: HashSet::new(),
+            caller_token: self.caller_token.clone(),
+        }
     }
 
     async fn handle_message(&mut self, message: Value) -> Option<Value> {
@@ -591,17 +876,34 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                     None,
                 ));
             }
-            Err(JsonRpcEnvelopeError::MissingMethod { id }) => {
+            Err(JsonRpcEnvelopeError::Invalid { id, message }) => {
                 return Some(jsonrpc_error_response(
                     id.unwrap_or(Value::Null),
                     -32600,
-                    "invalid request: missing method".to_string(),
+                    format!("invalid request: {message}"),
                     None,
                 ));
             }
         };
 
         if let Some(id) = envelope.id {
+            if self.seen_request_ids.len() >= MAX_MCP_REQUEST_IDS {
+                return Some(jsonrpc_error_response(
+                    id,
+                    -32600,
+                    "invalid request: MCP session request limit reached".to_string(),
+                    None,
+                ));
+            }
+            let request_id_key = serde_json::to_string(&id).expect("validated JSON-RPC id");
+            if !self.seen_request_ids.insert(request_id_key) {
+                return Some(jsonrpc_error_response(
+                    id,
+                    -32600,
+                    "invalid request: id was already used in this session".to_string(),
+                    None,
+                ));
+            }
             return self
                 .handle_request(id, &envelope.method, envelope.params)
                 .await;
@@ -614,6 +916,17 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
     async fn handle_request(&mut self, id: Value, method: &str, params: Value) -> Option<Value> {
         let response = match method {
             "initialize" => {
+                if self.initialize_seen {
+                    return Some(jsonrpc_error_response(
+                        id,
+                        -32600,
+                        "invalid request: initialize was already completed".to_string(),
+                        None,
+                    ));
+                }
+                if let Err(error) = validate_initialize_params(&params) {
+                    return Some(jsonrpc_error_response(id, -32602, error.to_string(), None));
+                }
                 self.initialize_seen = true;
                 jsonrpc_result_response(id, self.initialize_result(&params))
             }
@@ -642,16 +955,19 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                 if tool_call.name == self.tool_name {
                     let result = self.call_tool(tool_call.arguments).await;
                     jsonrpc_result_response(id, result)
-                } else if tool_call.name == VERB_LIST_TOOL_NAME {
+                } else if self.admin_tools && tool_call.name == VERB_LIST_TOOL_NAME {
                     let result = self.call_verb_list().await;
                     jsonrpc_result_response(id, result)
-                } else if tool_call.name == APPROVAL_LIST_TOOL_NAME {
+                } else if self.admin_tools && tool_call.name == ACCESS_REQUEST_TOOL_NAME {
+                    let result = self.call_access_request(tool_call.arguments).await;
+                    jsonrpc_result_response(id, result)
+                } else if self.admin_tools && tool_call.name == APPROVAL_LIST_TOOL_NAME {
                     let result = self.call_approval_list().await;
                     jsonrpc_result_response(id, result)
-                } else if tool_call.name == EVALUATE_BATCH_TOOL_NAME {
+                } else if self.admin_tools && tool_call.name == EVALUATE_BATCH_TOOL_NAME {
                     let result = self.call_evaluate_batch(tool_call.arguments).await;
                     jsonrpc_result_response(id, result)
-                } else if tool_call.name == SESSION_STATUS_TOOL_NAME {
+                } else if self.admin_tools && tool_call.name == SESSION_STATUS_TOOL_NAME {
                     let result = self.call_session_status(tool_call.arguments).await;
                     jsonrpc_result_response(id, result)
                 } else {
@@ -703,7 +1019,7 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
     }
 
     fn list_tools_result(&self) -> Value {
-        json!({
+        let mut result = json!({
             "tools": [
                 {
                     "name": self.tool_name,
@@ -788,16 +1104,57 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                     "outputSchema": {
                         "type": "object",
                         "properties": {
+                            "schema_version": { "type": "integer", "const": TOOL_SCHEMA_VERSION },
+                            "type": { "type": "string", "enum": ["execution_result", "error"] },
                             "allowed": { "type": "boolean" },
                             "reason": { "type": "string" },
                             "exit_code": { "type": ["integer", "null"] },
                             "stdout": { "type": ["string", "null"] },
                             "stderr": { "type": ["string", "null"] },
-                            "status": { "type": ["string", "null"], "description": "Consequence-gate outcome: executed, provisional, held, reverted, dry_run." },
-                            "handle": { "type": ["string", "null"], "description": "Handle for a held/provisional command (use with guard approve/confirm)." },
-                            "coverage": { "type": ["object", "null"], "description": "What the gate checked and deliberately did NOT check (checked / not_checked arrays). Surfaced for held/provisional/dry-run outcomes." }
+                            "status": { "type": ["string", "null"], "description": "Consequence-gate outcome: executed, provisional, held, reverted, or dry_run. Null means the legacy gate-off path returned a normal allow/deny result." },
+                            "handle": { "type": ["string", "null"], "description": "Null for an ordinary executed or dry-run result. A denied or held result may carry a durable access-request reference; a provisional result carries its containment handle." },
+                            "approval_options": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Exact operator commands for a denied or held request. A held command exposes the one-shot approval command; a denied request may expose ordinary, one-time, and bounded-use approval commands."
+                            },
+                            "access_requests": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "reference": { "type": "string" },
+                                        "approval_options": {
+                                            "type": "array",
+                                            "items": { "type": "string" }
+                                        }
+                                    },
+                                    "required": ["reference", "approval_options"]
+                                },
+                                "description": "Every durable access request created by the decision, with exact operator commands for each independently scoped request."
+                            },
+                            "coverage": { "type": ["object", "null"], "description": "What the gate checked and deliberately did NOT check (checked / not_checked arrays). Surfaced for held/provisional/dry-run outcomes." },
+                            "verb_matches": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "verb": { "type": "string" },
+                                        "cell": { "type": "string" },
+                                        "scope": { "type": "string", "enum": ["baseline", "session"] },
+                                        "action": { "type": "string" },
+                                        "features": { "type": "array", "items": { "type": "string" } },
+                                        "selected": { "type": "boolean" },
+                                        "overridden": { "type": "boolean" }
+                                    },
+                                    "required": ["verb", "cell", "scope", "action", "selected", "overridden"]
+                                },
+                                "description": "Every applicable typed-verb coverage cell, including the selected and overridden cells."
+                            },
+                            "guidance": { "type": ["string", "null"], "description": "Actionable typed-verb or access guidance for a denied or held decision." },
+                            "decision_source": { "type": "string", "description": "Stable source label for the admission decision, such as static_policy, typed_verb, evaluator, or validation." }
                         },
-                        "required": ["allowed", "reason", "exit_code", "stdout", "stderr"]
+                        "required": ["schema_version", "type", "allowed", "reason", "exit_code", "stdout", "stderr", "status", "handle", "approval_options", "access_requests", "coverage", "verb_matches", "guidance", "decision_source"]
                     },
                     "annotations": {
                         "readOnlyHint": false,
@@ -815,6 +1172,11 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                         "properties": {},
                         "additionalProperties": false
                     },
+                    "outputSchema": admin_output_schema(
+                        "verb_list",
+                        "verbs",
+                        json!({ "type": "array", "items": { "type": "object" } })
+                    ),
                     "annotations": {
                         "readOnlyHint": true,
                         "destructiveHint": false,
@@ -823,14 +1185,43 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                     }
                 },
                 {
+                    "name": ACCESS_REQUEST_TOOL_NAME,
+                    "title": "Request Access",
+                    "description": "Submit an access request for the daemon-authenticated caller. The intent describes the operation the caller needs to perform.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "intent": { "type": "string" }
+                        },
+                        "required": ["intent"],
+                        "additionalProperties": false
+                    },
+                    "outputSchema": admin_output_schema(
+                        "access_request",
+                        "item",
+                        json!({ "type": "object" })
+                    ),
+                    "annotations": {
+                        "readOnlyHint": false,
+                        "destructiveHint": false,
+                        "idempotentHint": false,
+                        "openWorldHint": true
+                    }
+                },
+                {
                     "name": APPROVAL_LIST_TOOL_NAME,
-                    "title": "List Held and Provisional Approvals",
-                    "description": "List the caller's held approvals and provisional (auto-revert) executions, scoped to the caller by the daemon. Use to poll whether an operator has approved a held command or to see provisionals still inside their revert window. Read-only; it does not approve, confirm, or run anything.",
+                    "title": "List Access State",
+                    "description": "List the caller's access requests, held operations, and active access sessions. The daemon scopes the result to the authenticated caller. Read-only; it does not approve, confirm, execute, or prune anything.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {},
                         "additionalProperties": false
                     },
+                    "outputSchema": admin_output_schema(
+                        "access_list",
+                        "items",
+                        json!({ "type": "array", "items": { "type": "object" } })
+                    ),
                     "annotations": {
                         "readOnlyHint": true,
                         "destructiveHint": false,
@@ -862,6 +1253,11 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                         },
                         "required": ["commands"]
                     },
+                    "outputSchema": admin_output_schema(
+                        "evaluation_batch",
+                        "items",
+                        json!({ "type": "array", "items": { "type": "object" } })
+                    ),
                     "annotations": {
                         "readOnlyHint": true,
                         "destructiveHint": false,
@@ -871,13 +1267,18 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                 },
                 {
                     "name": SESSION_STATUS_TOOL_NAME,
-                    "title": "Show Session Status",
-                    "description": "Show the caller's live grant, escalations, holds, and provisionals for one session token.",
+                    "title": "Show Access State",
+                    "description": "Show one caller-visible access request, hold, or session by its stable reference.",
                     "inputSchema": {
                         "type": "object",
-                        "properties": { "session": { "type": "string" } },
-                        "required": ["session"]
+                        "properties": { "reference": { "type": "string" } },
+                        "required": ["reference"]
                     },
+                    "outputSchema": admin_output_schema(
+                        "access_show",
+                        "item",
+                        json!({ "type": "object" })
+                    ),
                     "annotations": {
                         "readOnlyHint": true,
                         "destructiveHint": false,
@@ -886,7 +1287,14 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                     }
                 }
             ]
-        })
+        });
+        if !self.admin_tools {
+            result["tools"]
+                .as_array_mut()
+                .expect("tools result is an array")
+                .truncate(1);
+        }
+        result
     }
 
     async fn call_tool(&self, arguments: Value) -> Value {
@@ -909,7 +1317,30 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
         match self.admin.send_admin(server::AdminRequest::VerbList).await {
             Ok(server::AdminResponse::Verbs { items }) => {
                 let structured = json!({ "verbs": items });
-                admin_tool_result(render_verbs_text(&items), structured)
+                admin_tool_result("verb_list", render_verbs_text(&items), structured)
+            }
+            Ok(server::AdminResponse::VerbMenu { items }) => {
+                let text = items
+                    .iter()
+                    .map(|verb| {
+                        let params = if verb.params.is_empty() {
+                            String::new()
+                        } else {
+                            format!("\n    params: {}", verb.params.join(", "))
+                        };
+                        format!(
+                            "{} [{}]{} - {}{}",
+                            verb.name,
+                            verb.consequence,
+                            if verb.has_revert { " revertable" } else { "" },
+                            verb.description,
+                            params
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let structured = json!({ "verbs": items, "projection": "agent_menu" });
+                admin_tool_result("verb_list", text, structured)
             }
             Ok(server::AdminResponse::Error { message }) => tool_error_result(message),
             Ok(_) => tool_error_result("unexpected response from guard daemon".to_string()),
@@ -917,18 +1348,39 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
         }
     }
 
-    /// Proxy AdminRequest::ApprovalList: surface the caller's held approvals.
-    /// The daemon scopes the list to the caller; this path never approves,
-    /// confirms, or executes anything.
+    async fn call_access_request(&self, arguments: Value) -> Value {
+        let args: AccessRequestArgs = match serde_json::from_value(arguments) {
+            Ok(args) => args,
+            Err(error) => return tool_error_result(format!("invalid tool arguments: {error}")),
+        };
+        match self
+            .admin
+            .send_admin(server::AdminRequest::AccessRequest {
+                intent: args.intent,
+            })
+            .await
+        {
+            Ok(server::AdminResponse::AccessItem { item }) => admin_tool_result(
+                "access_request",
+                render_access_text(std::slice::from_ref(&item)),
+                json!({ "item": item }),
+            ),
+            Ok(server::AdminResponse::Error { message }) => tool_error_result(message),
+            Ok(_) => tool_error_result("unexpected response from guard daemon".to_string()),
+            Err(error) => tool_error_result(format!("{error:#}")),
+        }
+    }
+
+    /// Surface the caller's complete access state without mutating it.
     async fn call_approval_list(&self) -> Value {
         match self
             .admin
-            .send_admin(server::AdminRequest::ApprovalList)
+            .send_admin(server::AdminRequest::AccessList)
             .await
         {
-            Ok(server::AdminResponse::Approvals { items }) => {
-                let structured = json!({ "approvals": items });
-                admin_tool_result(render_approvals_text(&items), structured)
+            Ok(server::AdminResponse::AccessItems { items }) => {
+                let structured = json!({ "items": items });
+                admin_tool_result("access_list", render_access_text(&items), structured)
             }
             Ok(server::AdminResponse::Error { message }) => tool_error_result(message),
             Ok(_) => tool_error_result("unexpected response from guard daemon".to_string()),
@@ -961,7 +1413,7 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
-                admin_tool_result(text, json!({ "items": items }))
+                admin_tool_result("evaluation_batch", text, json!({ "items": items }))
             }
             Ok(server::AdminResponse::Error { message }) => tool_error_result(message),
             Ok(_) => tool_error_result("unexpected response from guard daemon".to_string()),
@@ -970,37 +1422,21 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
     }
 
     async fn call_session_status(&self, arguments: Value) -> Value {
-        let args: SessionStatusArgs = match serde_json::from_value(arguments) {
+        let args: AccessShowArgs = match serde_json::from_value(arguments) {
             Ok(args) => args,
             Err(error) => return tool_error_result(format!("invalid tool arguments: {error}")),
         };
         match self
             .admin
-            .send_admin(server::AdminRequest::SessionStatus {
-                token: args.session,
-                caller_token: self.caller_token.clone(),
+            .send_admin(server::AdminRequest::AccessShow {
+                reference: args.reference,
             })
             .await
         {
-            Ok(server::AdminResponse::SessionStatus {
-                report,
-                approvals,
-                provisionals,
-                requests,
-            }) => admin_tool_result(
-                format!(
-                    "active={} approvals={} provisionals={} grant_requests={}",
-                    report.active.is_some(),
-                    approvals.len(),
-                    provisionals.len(),
-                    requests.len()
-                ),
-                json!({
-                    "report": report,
-                    "approvals": approvals,
-                    "provisionals": provisionals,
-                    "requests": requests,
-                }),
+            Ok(server::AdminResponse::AccessItem { item }) => admin_tool_result(
+                "access_show",
+                render_access_text(std::slice::from_ref(&item)),
+                json!({ "item": item }),
             ),
             Ok(server::AdminResponse::Error { message }) => tool_error_result(message),
             Ok(_) => tool_error_result("unexpected response from guard daemon".to_string()),
@@ -1031,17 +1467,43 @@ fn render_verbs_text(items: &[server::VerbSummary]) -> String {
     lines.join("\n")
 }
 
-fn render_approvals_text(items: &[server::ApprovalSummary]) -> String {
+fn render_access_text(items: &[server::AccessItem]) -> String {
     if items.is_empty() {
-        return "(no held or provisional approvals)".to_string();
+        return "(no access requests or sessions)".to_string();
     }
     items
         .iter()
-        .map(|a| {
-            format!(
-                "[{}] handle={} cmd={:?} risk={:?} class={:?} reason={:?}",
-                a.status, a.handle, a.command, a.risk, a.reversibility, a.reason
-            )
+        .map(|item| {
+            let mut line = format!(
+                "{} requester={} target={} scope={} expiry={} uses={} state={} next={}",
+                item.reference,
+                item.requester,
+                item.target,
+                if item.effective_scope.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    item.effective_scope.join(",")
+                },
+                item.expires_unix
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                match item.use_policy.as_str() {
+                    "bounded" => item
+                        .remaining_uses
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "0".to_string()),
+                    other => other.to_string(),
+                },
+                item.state,
+                item.next_action
+            );
+            for (label, command) in ["approve", "once", "bounded"]
+                .into_iter()
+                .zip(item.approval_options.iter())
+            {
+                line.push_str(&format!("\n{label}: {command}"));
+            }
+            line
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -1050,7 +1512,36 @@ fn render_approvals_text(items: &[server::ApprovalSummary]) -> String {
 /// Wrap a read-only admin proxy result in the MCP tool-result envelope. These
 /// are never daemon errors (those go through `tool_error_result`), so
 /// `isError` is false.
-fn admin_tool_result(text: String, structured: Value) -> Value {
+fn admin_output_schema(result_type: &str, payload_name: &str, payload_schema: Value) -> Value {
+    let mut schema = json!({
+        "type": "object",
+        "properties": {
+            "schema_version": { "type": "integer", "const": TOOL_SCHEMA_VERSION },
+            "type": { "type": "string", "enum": [result_type, "error"] },
+            "reason": { "type": "string" }
+        },
+        "required": ["schema_version", "type"],
+        "allOf": [
+            {
+                "if": { "properties": { "type": { "const": result_type } } },
+                "then": { "required": [payload_name] }
+            },
+            {
+                "if": { "properties": { "type": { "const": "error" } } },
+                "then": { "required": ["reason"] }
+            }
+        ]
+    });
+    schema["properties"][payload_name] = payload_schema;
+    schema
+}
+
+fn admin_tool_result(result_type: &str, text: String, mut structured: Value) -> Value {
+    let fields = structured
+        .as_object_mut()
+        .expect("admin structured content is an object");
+    fields.insert("schema_version".to_string(), json!(TOOL_SCHEMA_VERSION));
+    fields.insert("type".to_string(), json!(result_type));
     json!({
         "content": [
             {
@@ -1083,6 +1574,35 @@ fn ensure_initialized(initialize_seen: bool, method: &str) -> Result<()> {
     }
 }
 
+fn validate_initialize_params(params: &Value) -> Result<()> {
+    let Some(params) = params.as_object() else {
+        bail!("initialize params must be an object");
+    };
+    if params
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        bail!("initialize requires a nonempty protocolVersion");
+    }
+    if !params.get("capabilities").is_some_and(Value::is_object) {
+        bail!("initialize requires a capabilities object");
+    }
+    let Some(client) = params.get("clientInfo").and_then(Value::as_object) else {
+        bail!("initialize requires a clientInfo object");
+    };
+    for field in ["name", "version"] {
+        if client
+            .get(field)
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            bail!("initialize clientInfo requires a nonempty {field}");
+        }
+    }
+    Ok(())
+}
+
 fn jsonrpc_result_response(id: Value, result: Value) -> Value {
     serde_json::to_value(JsonRpcResponse {
         jsonrpc: JSONRPC_VERSION,
@@ -1109,6 +1629,8 @@ fn jsonrpc_error_response(id: Value, code: i64, message: String, data: Option<Va
 
 fn tool_result(result: GuardToolResponse) -> Value {
     let structured = json!({
+        "schema_version": TOOL_SCHEMA_VERSION,
+        "type": "execution_result",
         "allowed": result.allowed,
         "reason": result.reason,
         "exit_code": result.exit_code,
@@ -1116,10 +1638,12 @@ fn tool_result(result: GuardToolResponse) -> Value {
         "stderr": result.stderr,
         "status": result.status,
         "handle": result.handle,
-        "coverage": result.coverage
-        ,"verb_matches": result.verb_matches
-        ,"guidance": result.guidance
-        ,"decision_source": result.decision_source
+        "approval_options": result.approval_options,
+        "access_requests": result.access_requests,
+        "coverage": result.coverage,
+        "verb_matches": result.verb_matches,
+        "guidance": result.guidance,
+        "decision_source": result.decision_source
     });
 
     json!({
@@ -1136,11 +1660,21 @@ fn tool_result(result: GuardToolResponse) -> Value {
 
 fn tool_error_result(message: String) -> Value {
     let structured = json!({
+        "schema_version": TOOL_SCHEMA_VERSION,
+        "type": "error",
         "allowed": false,
         "reason": message,
         "exit_code": Value::Null,
         "stdout": Value::Null,
-        "stderr": Value::Null
+        "stderr": Value::Null,
+        "status": Value::Null,
+        "handle": Value::Null,
+        "approval_options": [],
+        "access_requests": [],
+        "coverage": Value::Null,
+        "verb_matches": [],
+        "guidance": Value::Null,
+        "decision_source": "validation"
     });
 
     json!({
@@ -1196,6 +1730,14 @@ fn render_tool_text(result: &Value) -> String {
     let stderr = result.get("stderr").and_then(Value::as_str).unwrap_or("");
     let status = result.get("status").and_then(Value::as_str);
     let handle = result.get("handle").and_then(Value::as_str).unwrap_or("");
+    let approval_options = result
+        .get("approval_options")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    let access_next_steps = render_access_next_steps(result, handle, &approval_options);
     let guidance = result
         .get("guidance")
         .and_then(Value::as_str)
@@ -1209,7 +1751,7 @@ fn render_tool_text(result: &Value) -> String {
     match status {
         Some("held") => {
             return format!(
-                "HELD for operator approval (handle {handle}): {reason}\nThe operator must run `guard approve {handle}` for this to execute. Do not retry; wait or proceed with other work.{}",
+                "HELD for operator approval (request {handle}): {reason}{access_next_steps}\nDo not retry; wait or proceed with other work.{}",
                 coverage_text(result),
             ) + &decision + &guidance;
         }
@@ -1232,7 +1774,12 @@ fn render_tool_text(result: &Value) -> String {
     }
 
     if !allowed {
-        return format!("DENIED: {reason}{decision}{guidance}");
+        let request = if handle.is_empty() {
+            String::new()
+        } else {
+            format!(" (request {handle})")
+        };
+        return format!("DENIED{request}: {reason}{access_next_steps}{decision}{guidance}");
     }
 
     // Approved path: the policy reason is operational noise for the
@@ -1261,6 +1808,63 @@ fn render_tool_text(result: &Value) -> String {
         return "(no output)".to_string();
     }
     sections.join("\n")
+}
+
+fn render_access_next_steps(result: &Value, handle: &str, approval_options: &[&str]) -> String {
+    let access_requests = result
+        .get("access_requests")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let reference = item.get("reference")?.as_str()?;
+            let commands = item
+                .get("approval_options")?
+                .as_array()?
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>();
+            Some((reference, commands))
+        })
+        .collect::<Vec<_>>();
+
+    if access_requests.len() == 1 {
+        let (reference, commands) = &access_requests[0];
+        return render_single_access_next_steps(reference, commands);
+    }
+    if !access_requests.is_empty() {
+        let mut output = String::from("\nAccess requests:");
+        for (reference, commands) in access_requests {
+            output.push_str(&format!("\n- `{reference}`"));
+            for command in commands {
+                output.push_str(&format!("\n  `{command}`"));
+            }
+            output.push_str(&format!(
+                "\n  Inspect with `guard access show {reference}`."
+            ));
+        }
+        return output;
+    }
+
+    render_single_access_next_steps(handle, approval_options)
+}
+
+fn render_single_access_next_steps(handle: &str, approval_options: &[&str]) -> String {
+    let mut output = String::new();
+    if !approval_options.is_empty() {
+        output.push_str(if approval_options.len() == 1 {
+            "\nOperator command:"
+        } else {
+            "\nOperator commands:"
+        });
+        for command in approval_options {
+            output.push_str(&format!("\n`{command}`"));
+        }
+    }
+    if !handle.is_empty() {
+        output.push_str(&format!("\nInspect with `guard access show {handle}`."));
+    }
+    output
 }
 
 fn decision_text(result: &Value) -> String {
@@ -1297,7 +1901,7 @@ mod tests {
     use super::*;
     use anyhow::anyhow;
     use guard::wire::mcp::McpSshHostKeyMode;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncRead, AsyncReadExt};
     use tokio::net::TcpStream;
 
     #[derive(Clone)]
@@ -1337,6 +1941,95 @@ mod tests {
         })
     }
 
+    #[test]
+    fn held_tool_text_returns_exact_access_commands() {
+        let text = render_tool_text(&serde_json::json!({
+            "allowed": true,
+            "reason": "needs review",
+            "status": "held",
+            "handle": "hold-example",
+            "approval_options": ["guard access approve hold-example --once"],
+            "exit_code": null,
+            "stdout": null,
+            "stderr": null
+        }));
+        for command in [
+            "`guard access approve hold-example --once`",
+            "`guard access show hold-example`",
+        ] {
+            assert!(text.contains(command), "missing {command}: {text}");
+        }
+        assert!(!text.contains("--uses"));
+    }
+
+    #[test]
+    fn denied_tool_text_returns_exact_access_commands() {
+        let text = render_tool_text(&serde_json::json!({
+            "allowed": false,
+            "reason": "outside current access",
+            "status": null,
+            "handle": "request-example",
+            "approval_options": [
+                "guard access approve request-example",
+                "guard access approve request-example --once",
+                "guard access approve request-example --uses 3"
+            ],
+            "exit_code": null,
+            "stdout": null,
+            "stderr": null
+        }));
+        for command in [
+            "`guard access approve request-example`",
+            "`guard access approve request-example --once`",
+            "`guard access approve request-example --uses 3`",
+            "`guard access show request-example`",
+        ] {
+            assert!(text.contains(command), "missing {command}: {text}");
+        }
+    }
+
+    #[test]
+    fn multi_request_denial_returns_each_exact_operator_handoff() {
+        let text = render_tool_text(&serde_json::json!({
+            "allowed": false,
+            "reason": "two independent systems need access",
+            "status": null,
+            "handle": null,
+            "approval_options": [],
+            "access_requests": [
+                {
+                    "reference": "access-cloud",
+                    "approval_options": [
+                        "guard access approve access-cloud",
+                        "guard access approve access-cloud --once",
+                        "guard access approve access-cloud --uses 3"
+                    ]
+                },
+                {
+                    "reference": "access-host",
+                    "approval_options": [
+                        "guard access approve access-host",
+                        "guard access approve access-host --once",
+                        "guard access approve access-host --uses 3"
+                    ]
+                }
+            ],
+            "exit_code": null,
+            "stdout": null,
+            "stderr": null,
+            "decision_source": "typed_verb"
+        }));
+
+        for reference in ["access-cloud", "access-host"] {
+            for suffix in ["", " --once", " --uses 3"] {
+                let command = format!("`guard access approve {reference}{suffix}`");
+                assert!(text.contains(&command), "missing {command}: {text}");
+            }
+            let show = format!("`guard access show {reference}`");
+            assert!(text.contains(&show), "missing {show}: {text}");
+        }
+    }
+
     #[derive(Clone)]
     struct RecordingAdmin {
         request: Arc<std::sync::Mutex<Option<server::AdminRequest>>>,
@@ -1361,6 +2054,8 @@ mod tests {
                 stderr: None,
                 status: None,
                 handle: None,
+                approval_options: Vec::new(),
+                access_requests: Vec::new(),
                 coverage: None,
                 verb_matches: Vec::new(),
                 guidance: None,
@@ -1385,6 +2080,54 @@ mod tests {
 
         assert_eq!(response["result"]["protocolVersion"], "2025-03-26");
         assert!(response["result"]["capabilities"]["tools"].is_object());
+    }
+
+    #[tokio::test]
+    async fn request_ids_cannot_be_reused_within_one_mcp_session() {
+        let mut server = http_test_server();
+        let initialize = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": "duplicate",
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": { "name": "fixture", "version": "1" }
+                }
+            }))
+            .await
+            .expect("initialize response");
+        assert!(initialize["result"].is_object());
+
+        let duplicate = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": "duplicate",
+                "method": "ping"
+            }))
+            .await
+            .expect("duplicate response");
+        assert_eq!(duplicate["error"]["code"], -32600);
+        assert!(duplicate["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("already used")));
+    }
+
+    #[tokio::test]
+    async fn initialize_rejects_incomplete_client_parameters() {
+        let mut server = http_test_server();
+        let response = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {}
+            }))
+            .await
+            .expect("initialization error response");
+        assert_eq!(response["error"]["code"], -32602);
+        assert!(!server.initialize_seen);
     }
 
     #[tokio::test]
@@ -1426,7 +2169,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_status_sends_mcp_owned_session_separately_from_target() {
+    async fn access_show_sends_the_requested_durable_reference() {
         let executor = Arc::new(FakeExecutor {
             response: Err("unused".to_string()),
         });
@@ -1444,17 +2187,45 @@ mod tests {
                 "method": "tools/call",
                 "params": {
                     "name": SESSION_STATUS_TOOL_NAME,
-                    "arguments": { "session": "requested-target" }
+                    "arguments": { "reference": "requested-target" }
                 }
             }))
             .await
             .unwrap();
         assert!(matches!(
             recorded.lock().unwrap().as_ref(),
-            Some(server::AdminRequest::SessionStatus {
-                token: target,
-                caller_token: Some(owner),
-            }) if target == "requested-target" && owner == "mcp-owner"
+            Some(server::AdminRequest::AccessShow { reference })
+                if reference == "requested-target"
+        ));
+    }
+
+    #[tokio::test]
+    async fn access_request_sends_exact_intent() {
+        let executor = Arc::new(FakeExecutor {
+            response: Err("unused".to_string()),
+        });
+        let recorded = Arc::new(std::sync::Mutex::new(None));
+        let admin = Arc::new(RecordingAdmin {
+            request: recorded.clone(),
+        });
+        let mut server = McpServer::new(executor, admin, DEFAULT_TOOL_NAME.to_string());
+        server.initialize_seen = true;
+        let _ = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 44,
+                "method": "tools/call",
+                "params": {
+                    "name": ACCESS_REQUEST_TOOL_NAME,
+                    "arguments": { "intent": "Inspect the deployment target" }
+                }
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            recorded.lock().unwrap().as_ref(),
+            Some(server::AdminRequest::AccessRequest { intent })
+                if intent == "Inspect the deployment target"
         ));
     }
 
@@ -1469,6 +2240,8 @@ mod tests {
                 stderr: None,
                 status: None,
                 handle: None,
+                approval_options: Vec::new(),
+                access_requests: Vec::new(),
                 coverage: None,
                 verb_matches: Vec::new(),
                 guidance: None,
@@ -1515,6 +2288,43 @@ mod tests {
                 ["type"],
             "string"
         );
+    }
+
+    #[tokio::test]
+    async fn tcp_scoped_mcp_advertises_and_accepts_only_guard_run() {
+        let executor = Arc::new(FakeExecutor {
+            response: Err("unused".to_string()),
+        });
+        let mut server = McpServer::new(executor, empty_admin(), DEFAULT_TOOL_NAME.to_string())
+            .with_admin_tools(false);
+        server.initialize_seen = true;
+
+        let listed = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list"
+            }))
+            .await
+            .expect("tools/list response");
+        let names: Vec<&str> = listed["result"]["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert_eq!(names, [DEFAULT_TOOL_NAME]);
+
+        let hidden_call = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": { "name": VERB_LIST_TOOL_NAME, "arguments": {} }
+            }))
+            .await
+            .expect("tools/call response");
+        assert_eq!(hidden_call["error"]["code"], -32601);
     }
 
     #[test]
@@ -1588,6 +2398,7 @@ mod tests {
             socket_path: Some(PathBuf::from("/nonexistent/guard.sock")),
             tcp_port: None,
             auth_token: None,
+            session_token: None,
         };
         let args: GuardToolArgs = serde_json::from_value(json!({})).unwrap();
         let error = executor.execute(args).await.unwrap_err();
@@ -1595,6 +2406,77 @@ mod tests {
             error.to_string().contains("`binary` or `verb`"),
             "unexpected error: {error:#}"
         );
+    }
+
+    #[tokio::test]
+    async fn executor_threads_session_and_exec_auth_tokens() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let captured = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = tokio::io::split(stream);
+            let mut lines = BufReader::new(reader).lines();
+            let request: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().expect("execute request"))
+                    .unwrap();
+            writer
+                .write_all(
+                    br#"{"allowed":true,"reason":"fixture","exit_code":0,"stdout":null,"stderr":null}"#,
+                )
+                .await
+                .unwrap();
+            writer.write_all(b"\n").await.unwrap();
+            request
+        });
+
+        let executor = ClientExecutor {
+            socket_path: None,
+            tcp_port: Some(port),
+            auth_token: Some("exec-auth-fixture".to_string()),
+            session_token: Some("session-fixture".to_string()),
+        };
+        let args: GuardToolArgs = serde_json::from_value(json!({ "binary": "true" })).unwrap();
+        executor.execute(args).await.unwrap();
+
+        let request = captured.await.unwrap();
+        assert_eq!(request["execute"]["auth_token"], "exec-auth-fixture");
+        assert_eq!(request["execute"]["session_token"], "session-fixture");
+    }
+
+    #[tokio::test]
+    async fn admin_client_never_forwards_operator_authority() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let captured = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = tokio::io::split(stream);
+            let mut lines = BufReader::new(reader).lines();
+            let request: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().expect("admin request"))
+                    .unwrap();
+            writer
+                .write_all(br#"{"result":"verbs","items":[]}"#)
+                .await
+                .unwrap();
+            writer.write_all(b"\n").await.unwrap();
+            request
+        });
+
+        let executor = ClientExecutor {
+            socket_path: None,
+            tcp_port: Some(port),
+            auth_token: Some("exec-auth-fixture".to_string()),
+            session_token: None,
+        };
+        let response = executor
+            .send_admin(server::AdminRequest::VerbList)
+            .await
+            .unwrap();
+        assert!(matches!(response, server::AdminResponse::Verbs { .. }));
+
+        let request = captured.await.unwrap();
+        assert!(request.get("admin_token").is_none());
+        assert!(request.get("auth_token").is_none());
     }
 
     #[test]
@@ -1650,6 +2532,8 @@ mod tests {
                 stderr: None,
                 status: None,
                 handle: None,
+                approval_options: Vec::new(),
+                access_requests: Vec::new(),
                 coverage: None,
                 verb_matches: Vec::new(),
                 guidance: None,
@@ -1763,6 +2647,8 @@ mod tests {
             stderr: None,
             status: None,
             handle: None,
+            approval_options: Vec::new(),
+            access_requests: Vec::new(),
             coverage: None,
             verb_matches: Vec::new(),
             guidance: None,
@@ -1777,6 +2663,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn structured_results_preserve_decision_fields_for_gate_statuses() {
+        for (allowed, status, handle) in [
+            (false, None, None),
+            (true, Some("held"), Some("request-1")),
+            (true, Some("provisional"), Some("provisional-1")),
+            (true, Some("executed"), None),
+        ] {
+            let value = tool_result(GuardToolResponse {
+                allowed,
+                reason: "fixture result".to_string(),
+                exit_code: Some(0),
+                stdout: Some("fixture\n".to_string()),
+                stderr: None,
+                status: status.map(str::to_string),
+                handle: handle.map(str::to_string),
+                approval_options: if status == Some("held") {
+                    vec!["guard access approve request-1 --once".to_string()]
+                } else {
+                    Vec::new()
+                },
+                access_requests: Vec::new(),
+                coverage: None,
+                verb_matches: Vec::new(),
+                guidance: Some("inspect access state".to_string()),
+                decision_source: "fixture".to_string(),
+            });
+            let structured = &value["structuredContent"];
+            assert_eq!(structured["schema_version"], TOOL_SCHEMA_VERSION);
+            assert_eq!(structured["type"], "execution_result");
+            assert_eq!(structured["allowed"], allowed);
+            assert_eq!(structured["status"], json!(status));
+            assert_eq!(structured["handle"], json!(handle));
+            assert!(structured["approval_options"].is_array());
+            assert!(structured["verb_matches"].is_array());
+            assert_eq!(structured["guidance"], "inspect access state");
+            assert_eq!(structured["decision_source"], "fixture");
+            assert_eq!(value["isError"], false);
+        }
+    }
+
     #[tokio::test]
     async fn request_missing_method_gets_invalid_request_error() {
         let executor = Arc::new(FakeExecutor {
@@ -1788,6 +2715,8 @@ mod tests {
                 stderr: None,
                 status: None,
                 handle: None,
+                approval_options: Vec::new(),
+                access_requests: Vec::new(),
                 coverage: None,
                 verb_matches: Vec::new(),
                 guidance: None,
@@ -1810,7 +2739,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_includes_catalog_and_approval_tools() {
+    async fn tools_list_has_stable_order_and_access_request_schema() {
         let executor = Arc::new(FakeExecutor {
             response: Ok(GuardToolResponse {
                 allowed: true,
@@ -1820,6 +2749,8 @@ mod tests {
                 stderr: None,
                 status: None,
                 handle: None,
+                approval_options: Vec::new(),
+                access_requests: Vec::new(),
                 coverage: None,
                 verb_matches: Vec::new(),
                 guidance: None,
@@ -1845,9 +2776,58 @@ mod tests {
             .filter_map(|t| t["name"].as_str())
             .collect();
 
-        assert!(names.contains(&DEFAULT_TOOL_NAME));
-        assert!(names.contains(&VERB_LIST_TOOL_NAME));
-        assert!(names.contains(&APPROVAL_LIST_TOOL_NAME));
+        assert_eq!(
+            names,
+            vec![
+                DEFAULT_TOOL_NAME,
+                VERB_LIST_TOOL_NAME,
+                ACCESS_REQUEST_TOOL_NAME,
+                APPROVAL_LIST_TOOL_NAME,
+                EVALUATE_BATCH_TOOL_NAME,
+                SESSION_STATUS_TOOL_NAME,
+            ]
+        );
+        let access_request = &response["result"]["tools"][2];
+        assert_eq!(
+            access_request["inputSchema"]["properties"]["intent"]["type"],
+            "string"
+        );
+        assert_eq!(access_request["inputSchema"]["required"], json!(["intent"]));
+        assert_eq!(access_request["inputSchema"]["additionalProperties"], false);
+
+        for tool in response["result"]["tools"].as_array().expect("tools array") {
+            let output = &tool["outputSchema"];
+            assert!(output.is_object(), "{} needs outputSchema", tool["name"]);
+            assert_eq!(
+                output["properties"]["schema_version"]["const"],
+                TOOL_SCHEMA_VERSION
+            );
+            assert!(output["properties"]["type"].is_object());
+        }
+
+        let output = &response["result"]["tools"][0]["outputSchema"];
+        for field in [
+            "approval_options",
+            "access_requests",
+            "verb_matches",
+            "guidance",
+            "decision_source",
+        ] {
+            assert!(output["properties"].get(field).is_some(), "missing {field}");
+            assert!(
+                output["required"]
+                    .as_array()
+                    .expect("output required array")
+                    .iter()
+                    .any(|required| required == field),
+                "{field} must be required"
+            );
+        }
+        let handle_description = output["properties"]["handle"]["description"]
+            .as_str()
+            .expect("handle description");
+        assert!(handle_description.contains("held"));
+        assert!(handle_description.contains("provisional"));
     }
 
     #[tokio::test]
@@ -1861,6 +2841,8 @@ mod tests {
                 stderr: None,
                 status: None,
                 handle: None,
+                approval_options: Vec::new(),
+                access_requests: Vec::new(),
                 coverage: None,
                 verb_matches: Vec::new(),
                 guidance: None,
@@ -1903,13 +2885,18 @@ mod tests {
 
         assert_eq!(response["result"]["isError"], false);
         assert_eq!(
+            response["result"]["structuredContent"]["schema_version"],
+            TOOL_SCHEMA_VERSION
+        );
+        assert_eq!(response["result"]["structuredContent"]["type"], "verb_list");
+        assert_eq!(
             response["result"]["structuredContent"]["verbs"][0]["name"],
             "drain-node"
         );
     }
 
     #[tokio::test]
-    async fn approval_list_tool_proxies_daemon_approvals() {
+    async fn access_list_tool_proxies_non_mutating_access_state() {
         let executor = Arc::new(FakeExecutor {
             response: Ok(GuardToolResponse {
                 allowed: true,
@@ -1919,6 +2906,8 @@ mod tests {
                 stderr: None,
                 status: None,
                 handle: None,
+                approval_options: Vec::new(),
+                access_requests: Vec::new(),
                 coverage: None,
                 verb_matches: Vec::new(),
                 guidance: None,
@@ -1926,7 +2915,7 @@ mod tests {
             }),
         });
         let admin = Arc::new(FakeAdmin {
-            response: server::AdminResponse::Approvals { items: vec![] },
+            response: server::AdminResponse::AccessItems { items: vec![] },
         });
         let mut server = McpServer::new(executor, admin, DEFAULT_TOOL_NAME.to_string());
         server.initialize_seen = true;
@@ -1945,7 +2934,15 @@ mod tests {
             .expect("tools/call should respond");
 
         assert_eq!(response["result"]["isError"], false);
-        assert!(response["result"]["structuredContent"]["approvals"]
+        assert_eq!(
+            response["result"]["structuredContent"]["schema_version"],
+            TOOL_SCHEMA_VERSION
+        );
+        assert_eq!(
+            response["result"]["structuredContent"]["type"],
+            "access_list"
+        );
+        assert!(response["result"]["structuredContent"]["items"]
             .as_array()
             .expect("approvals array")
             .is_empty());
@@ -1972,6 +2969,45 @@ mod tests {
         config
             .validate()
             .expect("token present makes http config valid");
+
+        config.http_addr = Some("0.0.0.0:7333".parse().unwrap());
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("loopback"));
+    }
+
+    #[test]
+    fn custom_execution_tool_cannot_shadow_a_built_in_tool() {
+        for reserved in BUILT_IN_TOOL_NAMES
+            .iter()
+            .copied()
+            .filter(|name| *name != DEFAULT_TOOL_NAME)
+        {
+            let config = McpConfig {
+                socket_path: Some(PathBuf::from("/run/guard/guard.sock")),
+                tool_name: reserved.to_string(),
+                ..McpConfig::default()
+            };
+            let error = config.validate().expect_err("reserved name must fail");
+            assert!(error.to_string().contains("reserved"));
+            assert!(error.to_string().contains(reserved));
+        }
+
+        let default = McpConfig {
+            socket_path: Some(PathBuf::from("/run/guard/guard.sock")),
+            ..McpConfig::default()
+        };
+        default
+            .validate()
+            .expect("the default execution name is valid");
+
+        let custom = McpConfig {
+            socket_path: Some(PathBuf::from("/run/guard/guard.sock")),
+            tool_name: "fixture_run".to_string(),
+            ..McpConfig::default()
+        };
+        custom
+            .validate()
+            .expect("an independent custom name is valid");
     }
 
     #[test]
@@ -1994,17 +3030,40 @@ mod tests {
                 stderr: None,
                 status: None,
                 handle: None,
+                approval_options: Vec::new(),
+                access_requests: Vec::new(),
                 coverage: None,
                 verb_matches: Vec::new(),
                 guidance: None,
                 decision_source: "static_policy".to_string(),
             }),
         });
-        let mut server = McpServer::new(executor, empty_admin(), DEFAULT_TOOL_NAME.to_string());
-        // The HTTP server shares the same initialize gate; pre-seed it so a raw
-        // POST of tools/list does not need the full handshake for this test.
-        server.initialize_seen = true;
-        server
+        McpServer::new(executor, empty_admin(), DEFAULT_TOOL_NAME.to_string())
+    }
+
+    #[test]
+    fn expired_http_sessions_are_pruned_deterministically() {
+        let now = Instant::now();
+        let mut sessions = HttpSessionTable::new();
+        sessions.insert(
+            "expired".to_string(),
+            HttpSession {
+                connection: Arc::new(Mutex::new(http_test_server())),
+                expires_at: now,
+            },
+        );
+        sessions.insert(
+            "active".to_string(),
+            HttpSession {
+                connection: Arc::new(Mutex::new(http_test_server())),
+                expires_at: now + HTTP_SESSION_IDLE_TIMEOUT,
+            },
+        );
+
+        prune_expired_http_sessions(&mut sessions, now);
+
+        assert!(!sessions.contains_key("expired"));
+        assert!(sessions.contains_key("active"));
     }
 
     /// Bind an ephemeral port and serve the real hyper-backed HTTP transport
@@ -2023,7 +3082,9 @@ mod tests {
     /// Read exactly one HTTP response (status line, headers, Content-Length
     /// body) off a connection without consuming bytes of a following response,
     /// so keep-alive tests can issue sequential requests on one stream.
-    async fn read_one_response(stream: &mut TcpStream) -> (u16, String) {
+    async fn read_one_response_parts<R: AsyncRead + Unpin>(
+        stream: &mut R,
+    ) -> (u16, HashMap<String, String>, String) {
         let mut head = Vec::new();
         let mut byte = [0u8; 1];
         while !head.ends_with(b"\r\n\r\n") {
@@ -2038,6 +3099,12 @@ mod tests {
             .and_then(|line| line.split_whitespace().nth(1))
             .and_then(|code| code.parse().ok())
             .expect("status code");
+        let headers = head_text
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
+            .collect::<HashMap<_, _>>();
         let content_length: usize = head_text
             .lines()
             .find_map(|line| {
@@ -2051,7 +3118,12 @@ mod tests {
             .unwrap_or(0);
         let mut body = vec![0u8; content_length];
         stream.read_exact(&mut body).await.expect("read body");
-        (status, String::from_utf8_lossy(&body).into_owned())
+        (status, headers, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    async fn read_one_response<R: AsyncRead + Unpin>(stream: &mut R) -> (u16, String) {
+        let (status, _, body) = read_one_response_parts(stream).await;
+        (status, body)
     }
 
     /// Drive one raw HTTP request against an ephemeral-port HTTP MCP server and
@@ -2059,15 +3131,19 @@ mod tests {
     async fn http_roundtrip(
         addr: SocketAddr,
         authorization: Option<&str>,
+        additional_headers: &[(&str, &str)],
         json_body: &str,
     ) -> (u16, String) {
         let mut stream = TcpStream::connect(addr).await.expect("connect");
         let mut request = format!(
-            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
             json_body.len()
         );
         if let Some(auth) = authorization {
             request.push_str(&format!("Authorization: {auth}\r\n"));
+        }
+        for (name, value) in additional_headers {
+            request.push_str(&format!("{name}: {value}\r\n"));
         }
         request.push_str("Connection: close\r\n\r\n");
         request.push_str(json_body);
@@ -2092,15 +3168,29 @@ mod tests {
         (status, body)
     }
 
+    fn authenticated_http_post(token: &str, body: &str) -> String {
+        format!(
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn authenticated_http_post_with_session(token: &str, session_id: &str, body: &str) -> String {
+        format!(
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nMcp-Session-Id: {session_id}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
     #[tokio::test(flavor = "multi_thread")]
-    async fn http_transport_enforces_bearer_and_serves_tools_list() {
+    async fn http_transport_enforces_bearer() {
         let token = "test-bearer-token".to_string();
         let (addr, handle) = spawn_http_server(&token).await;
 
-        let list_body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        let ping_body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}}"#;
 
         // No Authorization header -> 401, no JSON-RPC result.
-        let (status, body) = http_roundtrip(addr, None, list_body).await;
+        let (status, body) = http_roundtrip(addr, None, &[], ping_body).await;
         assert_eq!(status, 401, "missing token must be rejected");
         assert!(
             !body.contains("\"result\""),
@@ -2108,25 +3198,17 @@ mod tests {
         );
 
         // Wrong token -> 401.
-        let (status, _) = http_roundtrip(addr, Some("Bearer wrong-token"), list_body).await;
+        let (status, _) = http_roundtrip(addr, Some("Bearer wrong-token"), &[], ping_body).await;
         assert_eq!(status, 401, "wrong token must be rejected");
 
         // Correct token -> 200 + a valid JSON-RPC result listing tools.
         let auth = format!("Bearer {token}");
-        let (status, body) = http_roundtrip(addr, Some(&auth), list_body).await;
+        let (status, body) = http_roundtrip(addr, Some(&auth), &[], ping_body).await;
         assert_eq!(status, 200, "valid token must be accepted");
         let parsed: Value = serde_json::from_str(&body).expect("body is JSON");
         assert_eq!(parsed["jsonrpc"], "2.0");
         assert_eq!(parsed["id"], 1);
-        let names: Vec<&str> = parsed["result"]["tools"]
-            .as_array()
-            .expect("tools array")
-            .iter()
-            .filter_map(|t| t["name"].as_str())
-            .collect();
-        assert!(names.contains(&DEFAULT_TOOL_NAME));
-        assert!(names.contains(&VERB_LIST_TOOL_NAME));
-        assert!(names.contains(&APPROVAL_LIST_TOOL_NAME));
+        assert!(parsed["result"].is_object());
 
         // A non-POST method is rejected with 405.
         let mut stream = TcpStream::connect(addr).await.expect("connect");
@@ -2151,15 +3233,236 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn http_transport_rejects_non_loopback_origins_and_invalid_versions() {
+        let token = "origin-token";
+        let auth = format!("Bearer {token}");
+        let (addr, handle) = spawn_http_server(token).await;
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}}"#;
+
+        let (status, _) = http_roundtrip(
+            addr,
+            Some(&auth),
+            &[("Origin", "https://attacker.example")],
+            body,
+        )
+        .await;
+        assert_eq!(status, 403);
+
+        let (status, _) = http_roundtrip(
+            addr,
+            Some(&auth),
+            &[("Origin", "http://localhost:4180")],
+            body,
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        let (status, _) = http_roundtrip(
+            addr,
+            Some(&auth),
+            &[("MCP-Protocol-Version", "2099-01-01")],
+            body,
+        )
+        .await;
+        assert_eq!(status, 400);
+
+        let (status, _) = http_roundtrip(
+            addr,
+            Some(&auth),
+            &[("MCP-Protocol-Version", "2025-11-25")],
+            body,
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_transport_requires_streamable_http_accept_types() {
+        let token = "accept-token";
+        let (addr, handle) = spawn_http_server(token).await;
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let (status, _) = read_one_response(&mut stream).await;
+        assert_eq!(status, 406);
+        handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn invalid_and_notification_initializes_cannot_exhaust_session_capacity() {
+        let token = "initialize-capacity-token";
+        let (addr, handle) = spawn_http_server(token).await;
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+
+        for id in 0..MAX_HTTP_SESSIONS {
+            let notification = json!({
+                "jsonrpc": "2.0",
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": { "name": "fixture", "version": "1" }
+                }
+            })
+            .to_string();
+            stream
+                .write_all(authenticated_http_post(token, &notification).as_bytes())
+                .await
+                .expect("write initialize notification");
+            let (status, headers, _) = read_one_response_parts(&mut stream).await;
+            assert_eq!(status, 400, "notification initialize {id}");
+            assert!(!headers.contains_key("mcp-session-id"));
+
+            let invalid = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "initialize",
+                "params": {}
+            })
+            .to_string();
+            stream
+                .write_all(authenticated_http_post(token, &invalid).as_bytes())
+                .await
+                .expect("write invalid initialize");
+            let (status, headers, body) = read_one_response_parts(&mut stream).await;
+            assert_eq!(status, 200, "invalid initialize {id}");
+            assert!(!headers.contains_key("mcp-session-id"));
+            let response: Value = serde_json::from_str(&body).expect("JSON-RPC error");
+            assert_eq!(response["error"]["code"], -32602);
+        }
+
+        let valid = json!({
+            "jsonrpc": "2.0",
+            "id": "valid-after-invalid",
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": { "name": "fixture", "version": "1" }
+            }
+        })
+        .to_string();
+        stream
+            .write_all(authenticated_http_post(token, &valid).as_bytes())
+            .await
+            .expect("write valid initialize");
+        let (status, headers, body) = read_one_response_parts(&mut stream).await;
+        assert_eq!(status, 200);
+        assert!(headers.contains_key("mcp-session-id"));
+        let response: Value = serde_json::from_str(&body).expect("InitializeResult");
+        assert!(response["result"].is_object());
+
+        handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_session_state_survives_reconnect_and_isolated_sessions_do_not_mix() {
+        let token = "lifecycle-token";
+        let (addr, handle) = spawn_http_server(token).await;
+        let init = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": { "name": "fixture", "version": "1" }
+            }
+        })
+        .to_string();
+        let list = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
+
+        let mut initialized = TcpStream::connect(addr).await.expect("connect");
+        initialized
+            .write_all(authenticated_http_post(token, &init).as_bytes())
+            .await
+            .expect("initialize");
+        let (status, headers, _) = read_one_response_parts(&mut initialized).await;
+        assert_eq!(status, 200);
+        let session_id = headers
+            .get("mcp-session-id")
+            .expect("initialize response session id")
+            .clone();
+        drop(initialized);
+
+        let mut reconnected = TcpStream::connect(addr).await.expect("reconnect");
+        reconnected
+            .write_all(authenticated_http_post_with_session(token, &session_id, list).as_bytes())
+            .await
+            .expect("list");
+        let (_, body) = read_one_response(&mut reconnected).await;
+        let response: Value = serde_json::from_str(&body).unwrap();
+        assert!(response["result"]["tools"].is_array());
+
+        let mut second = TcpStream::connect(addr).await.expect("second connect");
+        second
+            .write_all(authenticated_http_post(token, &init).as_bytes())
+            .await
+            .expect("second initialize");
+        let (status, headers, _) = read_one_response_parts(&mut second).await;
+        assert_eq!(status, 200);
+        let second_session_id = headers
+            .get("mcp-session-id")
+            .expect("second initialize response session id")
+            .clone();
+        assert_ne!(session_id, second_session_id);
+
+        let auth = format!("Bearer {token}");
+        let first_headers = [("Mcp-Session-Id", session_id.as_str())];
+        let second_headers = [("Mcp-Session-Id", second_session_id.as_str())];
+        let (first_result, second_result) = tokio::join!(
+            http_roundtrip(addr, Some(&auth), &first_headers, list),
+            http_roundtrip(addr, Some(&auth), &second_headers, list)
+        );
+        assert_eq!(first_result.0, 200);
+        assert_eq!(second_result.0, 200);
+
+        let mut terminating = TcpStream::connect(addr).await.expect("terminate connect");
+        terminating
+            .write_all(
+                format!(
+                    "DELETE /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nMcp-Session-Id: {second_session_id}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("terminate session");
+        assert_eq!(read_one_response(&mut terminating).await.0, 204);
+        assert_eq!(
+            http_roundtrip(addr, Some(&auth), &second_headers, list)
+                .await
+                .0,
+            404
+        );
+
+        let mut missing = TcpStream::connect(addr).await.expect("connect");
+        missing
+            .write_all(authenticated_http_post(token, list).as_bytes())
+            .await
+            .expect("list without session");
+        assert_eq!(read_one_response(&mut missing).await.0, 400);
+
+        handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn http_transport_serves_sequential_requests_on_one_connection() {
         let token = "keepalive-token";
         let (addr, handle) = spawn_http_server(token).await;
 
         let mut stream = TcpStream::connect(addr).await.expect("connect");
         for id in 1..=2 {
-            let body = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"ping"}}"#);
+            let body = format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"initialize","params":{{"protocolVersion":"2025-11-25","capabilities":{{}},"clientInfo":{{"name":"fixture","version":"1"}}}}}}"#
+            );
             let request = format!(
-                "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
                 body.len()
             );
             stream
@@ -2181,10 +3484,10 @@ mod tests {
         let token = "chunked-token";
         let (addr, handle) = spawn_http_server(token).await;
 
-        let body = r#"{"jsonrpc":"2.0","id":11,"method":"ping"}"#;
+        let body = r#"{"jsonrpc":"2.0","id":11,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}}"#;
         let (first, second) = body.split_at(10);
         let request = format!(
-            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{first}\r\n{:x}\r\n{second}\r\n0\r\n\r\n",
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{first}\r\n{:x}\r\n{second}\r\n0\r\n\r\n",
             first.len(),
             second.len()
         );
@@ -2225,36 +3528,54 @@ mod tests {
         // the streaming cap on the body read must reject it. The body is one
         // byte over the cap and fully framed, so the server drains the input
         // and can deliver the 413 over a clean close.
-        let mut stream = TcpStream::connect(addr).await.expect("connect");
-        stream
-            .write_all(
-                format!(
-                    "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n"
-                )
-                .as_bytes(),
-            )
-            .await
-            .expect("write head");
+        let stream = TcpStream::connect(addr).await.expect("connect");
+        let (mut reader, mut writer) = stream.into_split();
+        let token = token.to_string();
         let chunk = vec![b'x'; 64 * 1024];
-        let mut remaining = MAX_HTTP_BODY + 1;
-        while remaining > 0 {
-            let take = remaining.min(chunk.len());
-            stream
-                .write_all(format!("{take:x}\r\n").as_bytes())
+        let writer_task = tokio::spawn(async move {
+            writer
+                .write_all(
+                    format!(
+                        "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
                 .await
-                .expect("write chunk size");
-            stream
-                .write_all(&chunk[..take])
-                .await
-                .expect("write chunk data");
-            stream.write_all(b"\r\n").await.expect("write chunk end");
-            remaining -= take;
-        }
-        stream
-            .write_all(b"0\r\n\r\n")
-            .await
-            .expect("write terminal chunk");
-        let (status, _) = read_one_response(&mut stream).await;
+                .expect("write head");
+            let mut remaining = MAX_HTTP_BODY + 1;
+            while remaining > 0 {
+                let take = remaining.min(chunk.len());
+                let mut frame = format!("{take:x}\r\n").into_bytes();
+                frame.extend_from_slice(&chunk[..take]);
+                frame.extend_from_slice(b"\r\n");
+                if let Err(error) = writer.write_all(&frame).await {
+                    assert!(
+                        matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        ),
+                        "unexpected chunk write failure: {error}"
+                    );
+                    return;
+                }
+                remaining -= take;
+            }
+            if let Err(error) = writer.write_all(b"0\r\n\r\n").await {
+                assert!(
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                    ),
+                    "unexpected terminal chunk write failure: {error}"
+                );
+            }
+        });
+        let (status, _) = read_one_response(&mut reader).await;
+        writer_task.await.expect("chunk writer task");
         assert_eq!(status, 413, "chunked oversized body must be rejected");
 
         handle.abort();

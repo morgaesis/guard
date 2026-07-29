@@ -80,6 +80,15 @@ pub trait ProtocolConfig: Send + Sync {
     /// number of objects redacted.
     fn redact_response(&self, value: &mut serde_json::Value) -> usize;
 
+    /// Reject a successful response whose redacted form would be materially
+    /// misleading to the calling tool. The safe default accepts every
+    /// redactable response. Protocols may return a client-facing reason before
+    /// redaction when removing protected fields would turn existing state into
+    /// a plausible empty or absent result.
+    fn reject_misleading_redaction(&self, _value: &serde_json::Value) -> Option<String> {
+        None
+    }
+
     /// Client-facing error body for proxy-generated denials and upstream
     /// failures. Kubernetes overrides this with a `Status`; other protocols use
     /// plain JSON.

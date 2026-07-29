@@ -16,10 +16,10 @@ guard server start \
   --gate consequence \
   --kube-proxy 127.0.0.1:8443 \
   --kubeconfig /etc/guard/kubeconfig \
-  --api-policy /etc/guard/api-policy.yaml
+  --api-policy /etc/guard/api-policy.yaml \
+  --brokered-kubeconfig-out /run/guard/kubeconfig
 
-guard api kubeconfig --output "$HOME/.kube/guard-config"
-KUBECONFIG="$HOME/.kube/guard-config" kubectl get pods -n dev
+KUBECONFIG=/run/guard/kubeconfig kubectl get pods -n dev
 ```
 
 The input kubeconfig belongs to the daemon and may contain a bearer token or
@@ -27,31 +27,21 @@ client certificate. Exec and auth-provider plugins are rejected. The brokered
 kubeconfig points only to Guard, trusts its local CA, and contains no upstream
 credential.
 
-`guard api kubeconfig` authenticates the local caller and embeds its live,
-finite-expiry `GUARD_SESSION` bearer. The caller process writes a mode 0600,
-caller-owned output file. Expired, revoked, or suspended sessions stop working
-at the proxy and cannot issue another config. Reissue the config after session
-or daemon TLS rotation. `--brokered-kubeconfig-out` remains an explicit
-operator/bootstrap compatibility path and does not replace caller-scoped
-issuance.
+`--brokered-kubeconfig-out` is an operator/bootstrap output for a trusted local
+or single-tenant API client. Guard does not export caller-scoped session
+credentials. Access-managed sessions are command-only and cannot authenticate
+to this listener. Kubernetes, Helm, and credential-backed API access grants run
+through approved typed command verbs, preserving request-scoped admission
+counts.
 
-## Session attribution
+## Client boundary and attribution
 
-A client attributes requests with a standard Guard bearer:
-
-```http
-Authorization: Bearer <Guard session>
-```
-
-`X-Guard-Session` is a compatibility alias. Guard rejects duplicate or
-conflicting forms, validates the live unsuspended session, strips the client
-header, and records only the session fingerprint and safe operation context.
-The upstream never receives the Guard session bearer. Guard injects the named
-endpoint's upstream credential only after authorization.
-
-The session is revalidated immediately before forwarding, including after a
-slow snapshot or held approval. Expiry, revocation, suspension, or a changed
-immutable authority snapshot fails closed.
+The operator-generated kubeconfig contains no Guard bearer. Its requests are
+unattributed and are safe only within the listener's trusted local or
+single-tenant boundary. Incoming client authorization is never forwarded to the
+upstream. A Guard-session authorization header that does not resolve to live
+internally integrated state fails closed; the public CLI does not create that
+state.
 
 Each request also binds the complete API policy and evaluator-intent generation
 before classification. A hot reload that changes any policy field or evaluator
@@ -73,9 +63,8 @@ and subresource. Actions are:
 | `evaluate` | Ask the evaluator under policy and live-session intent. |
 
 Explicit policy denies and protocol hard-denies are absolute. A readonly
-listener baseline rejects unattributed writes. A live prompt-bearing session may
-send writes to the evaluator under its own bounded intent, but cannot override
-those absolute boundaries.
+listener baseline rejects unattributed writes. Evaluated traffic cannot
+override those absolute boundaries.
 
 Kubernetes interactive subresources (`exec`, `attach`, `portforward`, and
 `proxy`), `pods/ephemeralcontainers`, and Secret watches are hard-denied. Writes
@@ -99,7 +88,6 @@ endpoints:
     kubeconfig: /etc/guard/cluster.kubeconfig
     policy: /etc/guard/cluster-policy.yaml
     brokered_kubeconfig_out: /run/guard/cluster.kubeconfig
-    session_env: GUARD_SESSION
 
   - name: github-automation
     listen: 127.0.0.1:9443
@@ -114,8 +102,8 @@ Endpoint identity binds policy, generated coverage, history, upstream credential
 selection, and persisted rollback. A plan created on one listener cannot run
 through another listener, even when both use the same protocol.
 
-Listeners bind loopback only. A Guard session bearer conveys scope but is not a
-network client identity, so expose the proxy only inside a trusted local or
+Listeners bind loopback only and the operator-generated client has no network
+identity credential. Expose the proxy only inside a trusted local or
 single-tenant boundary. API proxy mode is incompatible with `--exec-as-caller`.
 
 ## Consequence and rollback
@@ -129,20 +117,21 @@ revert plan:
 - faithfully recreatable delete restores a sanitized snapshot;
 - side-effect-only operations without a faithful inverse hold.
 
-The persisted plan binds endpoint, protocol, canonical target, session, and
+The persisted plan binds endpoint, protocol, canonical target, attribution, and
 upstream credential identity. A create and its cleanup are correlated only
-inside the same connection and session, and explicit policy deny still wins.
+inside the same connection and attribution context, and explicit policy deny
+still wins.
 `guard provisionals`, `guard confirm`, and `guard revert` manage API and command
 envelopes through the same interface.
 
 ## Generated coverage and evaluator limits
 
 Evaluate-routed traffic can produce exact verb coverage cells. Each cell binds
-endpoint, session fingerprint, typed operation fields, namespace, value-free
-body shape, evaluator regime, and expiry. Value-bearing mutations remain
-evaluator-routed. A session can evaluate past a global generated deny under its
-own intent; operator policy cannot be displaced. Use `guard verb coverage list`
-and `guard verb coverage clear` for inspection and reset.
+endpoint, attribution when present, typed operation fields, namespace,
+value-free body shape, evaluator regime, and expiry. Value-bearing mutations
+remain evaluator-routed. Generated coverage cannot displace operator policy.
+Use `guard verb coverage list` and `guard verb coverage clear` for inspection
+and reset.
 
 The API judge has configurable global concurrency, endpoint/session token
 buckets, error circuits, and a reserved session slot. Limits bound spend and

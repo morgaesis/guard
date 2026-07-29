@@ -72,3 +72,150 @@ verbs:
     args: ["site.yml", "--check", "--diff", "--limit", "web"]
     consequence: reversible
     trusted: true
+
+  - name: failing-revert
+    description: Create a fixture whose deterministic rollback fails
+    binary: touch
+    args: ["/scenario/fixtures/revert-target"]
+    consequence: recoverable
+    revert: { binary: "false", args: [] }
+    trusted: true
+
+  - name: ssh-diagnose
+    description: Inspect one fake SSH service through the broker
+    binary: ssh
+    args: ["fixture-host", "systemctl", "is-active", "fixture-service"]
+    consequence: reversible
+    trusted: true
+
+  - name: cloudstack-inventory
+    description: List fake CloudStack virtual machines
+    binary: cloudstack
+    args: ["list", "virtualmachines", "zoneid=fixture-zone"]
+    consequence: reversible
+    trusted: true
+
+  - name: kubernetes-list
+    description: List pods through a daemon-owned fake kubeconfig
+    binary: kubectl
+    args: ["get", "pods", "--namespace", "fixture"]
+    consequence: reversible
+    trusted: true
+
+  - name: helm-list-direct
+    description: List fake Helm releases through a typed direct path
+    binary: helm
+    args: ["list", "--namespace", "fixture"]
+    consequence: reversible
+    trusted: true
+
+  - name: ansible-check
+    description: Run one fake playbook in check mode with a bounded target
+    binary: ansible-playbook
+    args: ["site.yml", "--check", "--diff", "--limit", "fixture"]
+    consequence: reversible
+    trusted: true
+
+  - name: host-maintenance
+    description: Apply a recoverable fake host maintenance operation
+    binary: hostctl
+    args: ["apply", "/scenario/fixtures/maintenance-applied"]
+    consequence: recoverable
+    revert: { binary: rm, args: ["-f", "/scenario/fixtures/maintenance-applied"] }
+    trusted: true
+
+  - name: fixture-api-status
+    description: Query a fake credential-bearing API
+    binary: fixture-api
+    args: ["status"]
+    consequence: reversible
+    trusted: true
+
+  - name: access-ssh-inspect
+    description: Inspect the fake SSH service
+    binary: ssh
+    args: ["access-fixture-host", "systemctl", "is-active", "fixture-service"]
+    baseline: false
+    consequence: reversible
+    trusted: true
+
+  - name: access-cloudstack-inspect
+    description: Inspect the fake CloudStack virtual machines
+    binary: cloudstack
+    args: ["list", "virtualmachines", "zoneid=access-fixture-zone"]
+    baseline: false
+    consequence: reversible
+    trusted: true
+
+  - name: access-kubernetes-inspect
+    description: Inspect the fake Kubernetes pods
+    binary: kubectl
+    args: ["get", "pods", "--namespace", "access-fixture"]
+    baseline: false
+    consequence: reversible
+    trusted: true
+
+  - name: access-helm-inspect
+    description: Inspect the fake Helm releases
+    binary: helm
+    args: ["list", "--namespace", "access-fixture"]
+    baseline: false
+    consequence: reversible
+    trusted: true
+
+  - name: access-ansible-check
+    description: Check the fake Ansible project
+    binary: ansible-playbook
+    args: ["site.yml", "--check", "--diff", "--limit", "access-fixture"]
+    baseline: false
+    consequence: reversible
+    trusted: true
+
+  - name: access-host-maintenance
+    description: Apply the fake host maintenance operation
+    binary: hostctl
+    args: ["apply", "/scenario/fixtures/access-maintenance-applied"]
+    baseline: false
+    consequence: recoverable
+    revert: { binary: rm, args: ["-f", "/scenario/fixtures/access-maintenance-applied"] }
+    trusted: true
+
+  - name: access-api-status
+    description: Query the fake credential-backed API
+    binary: fixture-api
+    args: ["access-status"]
+    baseline: false
+    consequence: reversible
+    trusted: true
+
+  - name: access-file-read
+    description: Read the fake operator file
+    binary: cat
+    args: ["/scenario/fixtures/operator-note"]
+    baseline: false
+    consequence: reversible
+    trusted: true
+
+  - name: access-command-run
+    description: Run the fake bounded command
+    binary: printf
+    args: ["bounded-command-complete\\n"]
+    baseline: false
+    consequence: reversible
+    trusted: true
+
+  - name: access-missing-command
+    description: Run the missing fake command
+    binary: guard-missing-fixture-binary
+    args: []
+    baseline: false
+    consequence: reversible
+    trusted: true
+
+  - name: access-held-delete
+    description: Delete the fake staging tree
+    binary: rm
+    args: ["-rf", "/scenario/fixtures/staging"]
+    baseline: false
+    consequence: irreversible
+    trusted: true

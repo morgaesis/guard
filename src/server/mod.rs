@@ -28,7 +28,6 @@ use guard::principal::PrincipalKey;
 
 // Re-export so main.rs can pattern-match on history status without a
 // direct dependency on the `session` module path.
-pub use crate::session::HistoricalStatus;
 use crate::tool_config::ToolRegistry;
 use anyhow::Result;
 #[cfg(unix)]
@@ -86,7 +85,7 @@ mod grants;
 mod learning;
 mod metrics;
 mod runtime;
-mod secure_fs;
+pub(crate) mod secure_fs;
 #[cfg(test)]
 mod tests;
 mod transport;
@@ -100,12 +99,17 @@ pub(crate) use runtime::CommandAdmissionConfig;
 #[cfg(windows)]
 pub(crate) use transport::winplat;
 pub use transport::Server;
+#[cfg(test)]
+pub(crate) use wire::AccessDecisionResult;
 pub use wire::{
-    AdminRequest, AdminResponse, ApprovalSummary, CommandSpec, ExecuteRequest, ExecuteResponse,
-    GateStatus, OutputStream, RevertSpec, SshHostKeyMode, VerbInvocation, VerbMatchInfo,
-    VerbSummary,
+    AccessItem, AccessRequestGuidance, AdminRequest, AdminResponse, CommandSpec, ExecuteRequest,
+    ExecuteResponse, GateStatus, OutputStream, RevertSpec, SshHostKeyMode, VerbInvocation,
+    VerbMatchInfo, VerbSummary,
 };
-pub(crate) use wire::{ExecuteStreamMessage, IncomingMessage};
+pub(crate) use wire::{
+    ExecuteStreamMessage, IncomingMessage, EXECUTE_FEATURE_LOCAL_CWD, EXECUTE_FEATURE_TCP_NO_CWD,
+    EXECUTE_PROTOCOL_VERSION,
+};
 
 use execute::{audit_command_line, audit_session_fingerprint};
 use guard::audit::{AuditEvent, AuditKind};
@@ -167,9 +171,7 @@ pub(crate) struct ServerConfig {
     pub(crate) gate: GateMode,
     /// Held-command lifetime. `u64::MAX` represents an unbounded operator hold.
     pub(crate) approval_ttl_secs: u64,
-    /// Daemon-lifetime authentication key for stateless regeneration
-    /// proposals. Cloned configurations share the same key so internal preview
-    /// configurations can verify proposals without exposing authority.
+    #[cfg(test)]
     pub(crate) regeneration_proposal_key: Arc<[u8; 32]>,
     /// Optional server-wide binary allow-list. `None` (the default) imposes no
     /// restriction. When `Some`, only binaries permitted by [`binary_allowed`]
@@ -203,8 +205,11 @@ impl Default for ServerConfig {
     /// behavior off, and this process's own identity. The entrypoint
     /// overrides the operator-facing fields via struct update syntax.
     fn default() -> Self {
+        #[cfg(test)]
         use rand::Rng;
+        #[cfg(test)]
         let mut regeneration_proposal_key = [0u8; 32];
+        #[cfg(test)]
         rand::rng().fill_bytes(&mut regeneration_proposal_key);
         Self {
             socket_path: None,
@@ -228,6 +233,7 @@ impl Default for ServerConfig {
             // populates the registries from persisted state before serving.
             gate: GateMode::Off,
             approval_ttl_secs: APPROVAL_TTL_SECS,
+            #[cfg(test)]
             regeneration_proposal_key: Arc::new(regeneration_proposal_key),
             // No binary restriction by default; the entrypoint sets this from
             // --allow-bin / GUARD_ALLOW_BIN, like the gate field above.
@@ -379,22 +385,27 @@ impl ServerContext {
         Ok(())
     }
 
-    /// Authorize an admin RPC. Admin = caller is the daemon's own UID.
-    /// There is no token-based elevation.
+    /// Authorize an admin RPC. A local operator is the daemon identity, plus
+    /// the kernel-authenticated SYSTEM principal on Windows so an elevated
+    /// installer task can perform operator actions through the named pipe.
+    /// Unix peers receive no equivalent root exception. TCP administration
+    /// remains restricted to the separately authenticated TcpAdmin transport.
     /// Without this rule, an exec-allowed agent process could mint
     /// sessions whose `--prompt` overrides the LLM policy from itself.
     fn validate_admin(&self, caller: &CallerIdentity) -> Result<()> {
-        // The operator is whoever runs as the daemon's own principal: its uid on
-        // Unix, its SID on Windows. One comparison, both platforms. A Unix
-        // caller's principal is the uid string, equal to daemon_principal
-        // exactly when uid == daemon_uid, so Unix behavior is unchanged.
-        if matches!(caller.principal(), Some(ref p) if self.config.daemon_principal.eq_ci(p)) {
+        if self.caller_is_admin(caller) {
             return Ok(());
         }
-        if matches!(caller, CallerIdentity::TcpAdmin { .. }) {
-            return Ok(());
-        }
-        anyhow::bail!("admin RPC refused: caller is not the daemon principal");
+        anyhow::bail!(
+            "admin RPC refused: caller is not the daemon principal or Windows SYSTEM operator"
+        );
+    }
+
+    fn caller_is_admin(&self, caller: &CallerIdentity) -> bool {
+        (caller.is_local_peer()
+            && matches!(caller.principal(), Some(ref p) if self.config.daemon_principal.eq_ci(p)))
+            || caller.is_windows_system_operator()
+            || matches!(caller, CallerIdentity::TcpAdmin { .. })
     }
 
     fn validate_token(&self, token: Option<&str>) -> Result<()> {

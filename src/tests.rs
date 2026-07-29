@@ -590,285 +590,192 @@ fn test_server_start_state_db_flag() {
 }
 
 #[test]
-fn test_server_start_admin_token_flag() {
-    let ServerCommands::Start { admin_token, .. } =
-        parse_start(&["guard", "server", "start", "--admin-token", "adm"])
-    else {
-        panic!("expected start");
-    };
-    assert_eq!(admin_token.as_deref(), Some("adm"));
-}
-
-#[test]
-fn saved_grant_issue_parses_canonical_command() {
-    match MainArgs::try_parse_from(["guard", "grant", "issue", "readonly-kube"]) {
-        Ok(MainArgs::Grant(GrantCommands::Issue { name, .. })) => {
-            assert_eq!(name, "readonly-kube");
-        }
-        Ok(_) => panic!("expected saved grant issue"),
-        Err(error) => panic!("expected grant parse, got {error}"),
+fn server_secret_values_are_rejected_in_argv() {
+    for flag in ["--auth-token", "--admin-token", "--llm-api-key"] {
+        assert!(
+            MainArgs::try_parse_from(["guard", "server", "start", flag, "secret-value"]).is_err(),
+            "{flag} must not accept a secret through argv"
+        );
     }
 }
 
 #[test]
-fn legacy_grant_prompt_routes_to_session_issue() {
-    let args = preprocess_legacy_grant_args(vec![
-        "guard".to_string(),
-        "grant".to_string(),
-        "allow only --check mode".to_string(),
-    ]);
-    match MainArgs::try_parse_from(args) {
-        Ok(MainArgs::Session(SessionCommands::New { prose, .. })) => {
-            assert_eq!(prose.as_deref(), Some("allow only --check mode"));
-        }
-        Ok(_) => panic!("expected legacy grant prompt to issue a session"),
-        Err(error) => panic!("expected legacy grant prompt to parse, got {error}"),
-    }
-}
-
-#[test]
-fn legacy_grant_token_prompt_routes_to_session_amendment() {
-    let token = "0123456789abcdef0123456789abcdef";
-    let args = preprocess_legacy_grant_args(vec![
-        "guard".to_string(),
-        "grant".to_string(),
-        token.to_string(),
-        "allow only --check mode".to_string(),
-    ]);
-    match MainArgs::try_parse_from(args) {
-        Ok(MainArgs::Session(SessionCommands::Grant {
-            token: parsed_token,
-            prose,
-            ..
-        })) => {
-            assert_eq!(parsed_token, token);
-            assert_eq!(prose.as_deref(), Some("allow only --check mode"));
-        }
-        Ok(_) => panic!("expected legacy token grant to amend a session"),
-        Err(error) => panic!("expected legacy token grant to parse, got {error}"),
-    }
-}
-
-#[test]
-fn legacy_grant_prompt_preserves_value_options() {
-    let args = preprocess_legacy_grant_args(
-        ["guard", "grant", "--ttl", "3600", "bounded work"]
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
+fn secret_setters_reject_values_in_argv() {
+    assert!(MainArgs::try_parse_from(["guard", "config", "set-token", "secret-value"]).is_err());
+    assert!(
+        MainArgs::try_parse_from(["guard", "config", "set-admin-token", "secret-value"]).is_err()
     );
-    match MainArgs::try_parse_from(args) {
-        Ok(MainArgs::Session(SessionCommands::New { ttl, prose, .. })) => {
-            assert_eq!(ttl, Some(3600));
-            assert_eq!(prose.as_deref(), Some("bounded work"));
-        }
-        Ok(_) => panic!("expected option-bearing legacy grant to issue a session"),
-        Err(error) => panic!("expected option-bearing legacy grant to parse, got {error}"),
-    }
-}
-
-#[test]
-fn legacy_grant_token_preserves_prompt_option() {
-    let token = "0123456789abcdef0123456789abcdef";
-    let args = preprocess_legacy_grant_args(
-        ["guard", "grant", token, "--prompt", "bounded work"]
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
+    assert!(
+        MainArgs::try_parse_from(["guard", "secrets", "add", "fixture-key", "secret-value"])
+            .is_err()
     );
-    match MainArgs::try_parse_from(args) {
-        Ok(MainArgs::Session(SessionCommands::Grant {
-            token: parsed_token,
-            prompt,
-            ..
-        })) => {
-            assert_eq!(parsed_token, token);
-            assert_eq!(prompt.as_deref(), Some("bounded work"));
-        }
-        Ok(_) => panic!("expected token grant to amend a session"),
-        Err(error) => panic!("expected token grant to parse, got {error}"),
-    }
+
+    assert!(matches!(
+        MainArgs::try_parse_from(["guard", "config", "set-token"]),
+        Ok(MainArgs::Config(ConfigCommands::SetToken))
+    ));
+    assert!(matches!(
+        MainArgs::try_parse_from(["guard", "secrets", "add", "fixture-key"]),
+        Ok(MainArgs::Secrets(SecretCommands::Add { value: None, .. }))
+    ));
 }
 
 #[test]
-fn legacy_grant_finds_token_after_value_options() {
-    let token = "0123456789abcdef0123456789abcdef";
-    let args = preprocess_legacy_grant_args(
-        [
-            "guard",
-            "grant",
-            "--ttl",
-            "3600",
-            token,
-            "--prompt=bounded work",
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect(),
-    );
-    match MainArgs::try_parse_from(args) {
-        Ok(MainArgs::Session(SessionCommands::Grant {
-            token: parsed_token,
-            ttl,
-            prompt,
-            ..
-        })) => {
-            assert_eq!(parsed_token, token);
-            assert_eq!(ttl, Some(3600));
-            assert_eq!(prompt.as_deref(), Some("bounded work"));
-        }
-        Ok(_) => panic!("expected flags-before-token grant to amend a session"),
-        Err(error) => panic!("expected flags-before-token grant to parse, got {error}"),
-    }
-}
-
-#[test]
-fn legacy_grant_options_only_issue_a_session() {
-    let args = preprocess_legacy_grant_args(
-        ["guard", "grant", "--ttl=3600", "--auto-amend"]
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
-    );
-    match MainArgs::try_parse_from(args) {
-        Ok(MainArgs::Session(SessionCommands::New {
-            ttl, auto_amend, ..
-        })) => {
-            assert_eq!(ttl, Some(3600));
-            assert!(auto_amend);
-        }
-        Ok(_) => panic!("expected options-only grant to issue a session"),
-        Err(error) => panic!("expected options-only grant to parse, got {error}"),
-    }
-}
-
-#[test]
-fn bare_grant_uses_canonical_saved_grant_tree() {
-    let args =
-        preprocess_legacy_grant_args(["guard", "grant"].into_iter().map(str::to_string).collect());
-    let error = match MainArgs::try_parse_from(args) {
+fn bare_guard_is_non_mutating_access_help() {
+    let error = match MainArgs::try_parse_from(["guard"]) {
         Err(error) => error,
-        Ok(_) => panic!("bare grant unexpectedly parsed"),
+        Ok(_) => panic!("bare guard unexpectedly parsed"),
     };
     assert_eq!(
         error.kind(),
         clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
     );
+    let rendered = error.to_string();
+    assert!(rendered.contains("guard access request \"<intent>\""));
+    assert!(rendered.contains("guard access approve <request>..."));
+    assert!(rendered.contains("guard access list"));
 }
 
 #[test]
-fn grant_help_uses_canonical_saved_grant_tree() {
-    for flag in ["-h", "--help"] {
-        let args = ["guard", "grant", flag]
-            .into_iter()
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        assert_eq!(preprocess_legacy_grant_args(args.clone()), args);
-        let error = match MainArgs::try_parse_from(args) {
-            Err(error) => error,
-            Ok(_) => panic!("grant help unexpectedly parsed"),
-        };
-        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
-        let rendered = error.to_string();
-        assert!(rendered.contains("save"));
-        assert!(rendered.contains("regenerate"));
-        assert!(!rendered.contains("GUARD_SESSION="));
+fn bare_access_is_non_mutating_help() {
+    let error = match MainArgs::try_parse_from(["guard", "access"]) {
+        Err(error) => error,
+        Ok(_) => panic!("bare access unexpectedly parsed"),
+    };
+    assert_eq!(
+        error.kind(),
+        clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+    );
+    let rendered = error.to_string();
+    for command in [
+        "request", "approve", "deny", "revoke", "extend", "list", "show",
+    ] {
+        assert!(rendered.contains(command), "missing {command}: {rendered}");
+    }
+    assert!(rendered.contains("guard access approve <request> --once"));
+    assert!(rendered.contains("one or more decisions in the access batch failed"));
+}
+
+#[test]
+fn access_command_family_parses_bounded_and_batch_forms() {
+    assert!(matches!(
+        MainArgs::try_parse_from(["guard", "access", "request", "restart one service"]),
+        Ok(MainArgs::Access(AccessCommands::Request { .. }))
+    ));
+    match MainArgs::try_parse_from([
+        "guard", "access", "approve", "gr-one", "gr-two", "--uses", "3", "--json",
+    ]) {
+        Ok(MainArgs::Access(AccessCommands::Approve {
+            requests,
+            once,
+            uses,
+            json,
+            ..
+        })) => {
+            assert_eq!(requests, ["gr-one", "gr-two"]);
+            assert!(!once);
+            assert_eq!(uses, Some(3));
+            assert!(json);
+        }
+        Ok(_) => panic!("unexpected access command"),
+        Err(error) => panic!("access approve did not parse: {error}"),
+    }
+    assert!(MainArgs::try_parse_from([
+        "guard", "access", "approve", "gr-one", "--once", "--uses", "2"
+    ])
+    .is_err());
+    assert!(matches!(
+        MainArgs::try_parse_from([
+            "guard",
+            "access",
+            "extend",
+            "session:0011",
+            "inspect fixture",
+            "--once"
+        ]),
+        Ok(MainArgs::Access(AccessCommands::Extend { once: true, .. }))
+    ));
+    assert!(matches!(
+        MainArgs::try_parse_from(["guard", "access", "revoke", "session:0011", "--json"]),
+        Ok(MainArgs::Access(AccessCommands::Revoke { json: true, .. }))
+    ));
+}
+
+#[test]
+fn access_extend_help_explains_target_and_bounded_use_defaults() {
+    let error = match MainArgs::try_parse_from(["guard", "access", "extend", "--help"]) {
+        Err(error) => error,
+        Ok(_) => panic!("access extend help unexpectedly parsed"),
+    };
+    let rendered = error.to_string();
+    assert!(rendered.contains("session reference or agent label"));
+    assert!(rendered.contains("Unlimited by default"));
+    assert!(rendered.contains("Equivalent to --uses 1"));
+    assert!(rendered.contains("Omit both use flags for unlimited authority"));
+}
+
+#[test]
+fn historical_authority_aliases_and_argv_http_bearer_are_rejected() {
+    for args in [
+        vec!["guard", "approve", "0123456789abcdef0123456789abcdef"],
+        vec!["guard", "deny", "0123456789abcdef0123456789abcdef"],
+        vec!["guard", "approvals"],
+        vec![
+            "guard",
+            "mcp",
+            "serve",
+            "--http",
+            "127.0.0.1:7333",
+            "--http-token",
+            "fixture",
+        ],
+        vec![
+            "guard",
+            "mcp",
+            "serve",
+            "--tcp-port",
+            "7332",
+            "--token",
+            "fixture",
+        ],
+    ] {
+        assert!(MainArgs::try_parse_from(args).is_err());
+    }
+
+    assert!(matches!(
+        MainArgs::try_parse_from(["guard", "session", "new", "--profile", "fixture"]),
+        Ok(MainArgs::Session { .. })
+    ));
+    assert!(matches!(
+        MainArgs::try_parse_from(["guard", "grant", "issue", "fixture"]),
+        Ok(MainArgs::Grant { .. })
+    ));
+    assert!(matches!(
+        MainArgs::try_parse_from(["guard", "appeal", "fixture", "status"]),
+        Ok(MainArgs::Appeal { .. })
+    ));
+    for (command, replacement) in [
+        ("session", "guard access"),
+        ("grant", "guard access"),
+        ("appeal", "guard access request <intent>"),
+    ] {
+        let error = legacy_authority_error(command, replacement).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("has been removed"));
+        assert!(message.contains(replacement));
     }
 }
 
 #[test]
-fn legacy_grant_unknown_option_remains_a_parse_error() {
-    let args = preprocess_legacy_grant_args(
-        ["guard", "grant", "--unknown-option", "bounded work"]
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
-    );
-    assert!(MainArgs::try_parse_from(args).is_err());
-}
-
-#[test]
-fn canonical_grant_commands_bypass_legacy_preprocessing() {
-    let args = vec![
-        "guard".to_string(),
-        "grant".to_string(),
-        "issue".to_string(),
-        "readonly-kube".to_string(),
-    ];
-    assert_eq!(preprocess_legacy_grant_args(args.clone()), args);
-}
-
-#[test]
-fn saved_grant_authority_commands_parse_as_one_canonical_tree() {
-    assert!(matches!(
-        MainArgs::try_parse_from([
-            "guard",
-            "grant",
-            "save",
-            "bounded",
-            "--verb",
-            "inspect",
-            "--override-marker",
-            "operator:apply",
-            "--secret",
-            "service/readonly/*",
-            "--ceiling-verb",
-            "restart-one",
-            "--ceiling-secret",
-            "service/readonly/*",
-            "--ceiling-ttl",
-            "300",
-            "--ceiling-mode",
-            "policy-only",
-            "--allow-prompt-append",
-            "--prompt",
-            "bounded work",
-        ]),
-        Ok(MainArgs::Grant(GrantCommands::Save { .. }))
-    ));
-    assert!(matches!(
-        MainArgs::try_parse_from([
-            "guard",
-            "grant",
-            "edit",
-            "bounded",
-            "--clear-override-markers",
-            "--clear-ceiling-verbs",
-            "--allow-prompt-append=false",
-            "--auto-approve=false",
-        ]),
-        Ok(MainArgs::Grant(GrantCommands::Edit { .. }))
-    ));
-    assert!(matches!(
-        MainArgs::try_parse_from([
-            "guard",
-            "grant",
-            "regenerate",
-            "bounded",
-            "--apply",
-            "rg1-proposal",
-        ]),
-        Ok(MainArgs::Grant(GrantCommands::Regenerate { .. }))
-    ));
-    assert!(matches!(
-        MainArgs::try_parse_from([
-            "guard",
-            "grant",
-            "request",
-            "submit",
-            "--session",
-            "session-token",
-            "--justification",
-            "pager alert",
-            "--prompt-append",
-            "evaluate one service",
-            "--override-marker",
-            "operator:apply",
-        ]),
-        Ok(MainArgs::Grant(GrantCommands::Request(
-            GrantRequestCommands::Submit { .. }
-        )))
-    ));
+fn ordinary_verb_help_hides_operator_only_show() {
+    let error = match MainArgs::try_parse_from(["guard", "verb", "--help"]) {
+        Err(error) => error,
+        Ok(_) => panic!("verb help unexpectedly parsed"),
+    };
+    let rendered = error.to_string();
+    assert!(rendered.contains("list"));
+    assert!(rendered.contains("run"));
+    assert!(!rendered.contains("show"));
 }
 
 #[test]
@@ -894,144 +801,6 @@ fn guard_mode_env_resolution() {
     assert!(message.contains("readonly"), "message: {message}");
     assert!(message.contains("paranoid"), "message: {message}");
     assert!(message.contains("safe"), "message: {message}");
-}
-
-#[test]
-fn session_grant_parses_prose_and_static_only_alias() {
-    match MainArgs::try_parse_from([
-        "guard",
-        "session",
-        "grant",
-        "tok",
-        "--no-llm-fallback",
-        "readonly grafana kube access",
-    ]) {
-        Ok(MainArgs::Session(SessionCommands::Grant {
-            token,
-            prose,
-            static_only,
-            ..
-        })) => {
-            assert_eq!(token, "tok");
-            assert_eq!(prose.as_deref(), Some("readonly grafana kube access"));
-            assert!(static_only);
-        }
-        Ok(_) => panic!("expected session grant"),
-        Err(err) => panic!("expected session grant parse, got {err}"),
-    }
-}
-
-#[test]
-fn session_grant_parses_auto_amend_flags() {
-    match MainArgs::try_parse_from([
-        "guard",
-        "session",
-        "grant",
-        "tok",
-        "--auto-amend",
-        "--no-auto-amend",
-        "readonly grafana kube access",
-    ]) {
-        Ok(MainArgs::Session(SessionCommands::Grant {
-            auto_amend,
-            no_auto_amend,
-            ..
-        })) => {
-            assert!(auto_amend);
-            assert!(no_auto_amend);
-        }
-        Ok(_) => panic!("expected session grant"),
-        Err(err) => panic!("expected session grant parse, got {err}"),
-    }
-}
-
-#[test]
-fn session_authority_input_treats_mode_and_behavior_flags_as_live_authority() {
-    let none = None;
-    let strings = Vec::<String>::new();
-    let mode = Some("read-only".to_string());
-    let empty = cli_client::SessionAuthorityInput {
-        prose: &none,
-        saved_grant: &none,
-        allow: &strings,
-        deny: &strings,
-        activated_verbs: &strings,
-        override_markers: &strings,
-        ttl: &None,
-        prompt: &none,
-        evaluation_mode: &none,
-        prompt_file: &None,
-        static_only: false,
-        auto_amend: false,
-        no_auto_amend: false,
-    };
-    assert!(empty.is_empty());
-
-    let mode_only = cli_client::SessionAuthorityInput {
-        evaluation_mode: &mode,
-        ..empty
-    };
-    assert!(!mode_only.is_empty());
-
-    let auto_only = cli_client::SessionAuthorityInput {
-        auto_amend: true,
-        evaluation_mode: &none,
-        ..mode_only
-    };
-    assert!(!auto_only.is_empty());
-
-    let no_auto_only = cli_client::SessionAuthorityInput {
-        no_auto_amend: true,
-        auto_amend: false,
-        ..auto_only
-    };
-    assert!(!no_auto_only.is_empty());
-}
-
-#[test]
-fn session_appeal_forwards_hyphen_args() {
-    match MainArgs::try_parse_from(["guard", "session", "appeal", "tok", "df", "-h", "--output"]) {
-        Ok(MainArgs::Session(SessionCommands::Appeal {
-            token,
-            binary,
-            args,
-            ..
-        })) => {
-            assert_eq!(token, "tok");
-            assert_eq!(binary, "df");
-            assert_eq!(args, vec!["-h", "--output"]);
-        }
-        Ok(_) => panic!("expected session appeal"),
-        Err(err) => panic!("expected session appeal parse, got {err}"),
-    }
-}
-
-#[test]
-fn top_level_appeal_parses_session_and_command() {
-    match MainArgs::try_parse_from([
-        "guard",
-        "appeal",
-        "--session",
-        "tok",
-        "kubectl",
-        "get",
-        "pods",
-        "-n",
-        "grafana",
-    ]) {
-        Ok(MainArgs::Appeal {
-            session,
-            binary,
-            args,
-            ..
-        }) => {
-            assert_eq!(session.as_deref(), Some("tok"));
-            assert_eq!(binary, "kubectl");
-            assert_eq!(args, vec!["get", "pods", "-n", "grafana"]);
-        }
-        Ok(_) => panic!("expected top-level appeal"),
-        Err(err) => panic!("expected top-level appeal parse, got {err}"),
-    }
 }
 
 /// Shared guard for tests that mutate `GUARD_LLM_MODEL*` environment
@@ -1333,61 +1102,10 @@ fn passthrough_help_requested_only_for_bare_command_help() {
         Some((vec!["run"], "guard run"))
     );
     assert_eq!(
-        passthrough_command_help_requested(&["appeal".to_string(), "--help".to_string()]),
-        Some((vec!["appeal"], "guard appeal"))
-    );
-    // Help after guard's own options (but before the binary) is still guard's.
-    assert_eq!(
-        passthrough_command_help_requested(&[
-            "appeal".to_string(),
-            "--session".to_string(),
-            "tok".to_string(),
-            "--help".to_string()
-        ]),
-        Some((vec!["appeal"], "guard appeal"))
-    );
-    assert_eq!(
-        passthrough_command_help_requested(&[
-            "session".to_string(),
-            "appeal".to_string(),
-            "-h".to_string()
-        ]),
-        Some((vec!["session", "appeal"], "guard session appeal"))
-    );
-    // Token given, binary not yet: help is still for guard.
-    assert_eq!(
-        passthrough_command_help_requested(&[
-            "session".to_string(),
-            "appeal".to_string(),
-            "tok".to_string(),
-            "--help".to_string()
-        ]),
-        Some((vec!["session", "appeal"], "guard session appeal"))
-    );
-    assert_eq!(
         passthrough_command_help_requested(&[
             "run".to_string(),
             "df".to_string(),
             "--help".to_string()
-        ]),
-        None
-    );
-    // Once the binary is named, `--help`/`-h` belong to the appealed command.
-    assert_eq!(
-        passthrough_command_help_requested(&[
-            "appeal".to_string(),
-            "kubectl".to_string(),
-            "--help".to_string()
-        ]),
-        None
-    );
-    assert_eq!(
-        passthrough_command_help_requested(&[
-            "session".to_string(),
-            "appeal".to_string(),
-            "tok".to_string(),
-            "df".to_string(),
-            "-h".to_string()
         ]),
         None
     );
@@ -1493,7 +1211,7 @@ fn cli_command_path_avoids_unknown_positional_values() {
             "show".to_string(),
             "token".to_string()
         ]),
-        "session show"
+        "session"
     );
     assert_eq!(
         cli_command_path(&[
@@ -1613,8 +1331,8 @@ fn machine_readable_flags_cover_read_and_execution_commands() {
         Ok(MainArgs::Provisionals { json: true, .. })
     ));
     assert!(matches!(
-        MainArgs::try_parse_from(["guard", "approvals", "--json"]),
-        Ok(MainArgs::Approvals { json: true, .. })
+        MainArgs::try_parse_from(["guard", "access", "list", "--json"]),
+        Ok(MainArgs::Access(AccessCommands::List { json: true, .. }))
     ));
     assert!(matches!(
         MainArgs::try_parse_from(["guard", "verb", "list", "--json"]),
@@ -1629,14 +1347,6 @@ fn machine_readable_flags_cover_read_and_execution_commands() {
         Ok(MainArgs::Verb(VerbCommands::Coverage {
             command: VerbCoverageCommands::List { json: true, .. }
         }))
-    ));
-    assert!(matches!(
-        MainArgs::try_parse_from(["guard", "session", "list", "--json"]),
-        Ok(MainArgs::Session(SessionCommands::List { json: true, .. }))
-    ));
-    assert!(matches!(
-        MainArgs::try_parse_from(["guard", "session", "show", "--json", "token"]),
-        Ok(MainArgs::Session(SessionCommands::Show { json: true, .. }))
     ));
     assert!(matches!(
         MainArgs::try_parse_from(["guard", "secret", "list", "--json"]),

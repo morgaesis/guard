@@ -39,6 +39,9 @@ use tracing_subscriber::{fmt as tracing_fmt, EnvFilter, Layer};
 const EXIT_GUARD_ERROR: i32 = 125;
 const EXIT_GUARD_DENIED: i32 = 126;
 const EXIT_GUARD_HELD: i32 = 127;
+/// One or more decisions in a completed access batch failed. This is a result
+/// status, not a guard operational failure.
+const EXIT_GUARD_ACCESS_DECISION_FAILED: i32 = 1;
 const JSON_SCHEMA_VERSION: u32 = 1;
 
 fn parse_unbounded_secs(value: &str) -> Result<u64, String> {
@@ -54,94 +57,6 @@ fn parse_unbounded_secs(value: &str) -> Result<u64, String> {
     Ok(seconds)
 }
 
-/// Preserve the original top-level grant shorthand without adding it back to
-/// the public command tree. Canonical saved-grant subcommands pass through.
-fn preprocess_legacy_grant_args(mut args: Vec<String>) -> Vec<String> {
-    if args.get(1).map(String::as_str) != Some("grant") {
-        return args;
-    }
-    // Bare `guard grant` and its help flags belong to the canonical saved-grant
-    // tree. They must never be reinterpreted as the legacy session-minting
-    // shorthand.
-    if args.len() == 2 || matches!(args.get(2).map(String::as_str), Some("-h" | "--help")) {
-        return args;
-    }
-    const CANONICAL: &[&str] = &[
-        "save",
-        "edit",
-        "regenerate",
-        "issue",
-        "list",
-        "show",
-        "delete",
-        "request",
-        "help",
-    ];
-    if args
-        .get(2)
-        .is_some_and(|arg| CANONICAL.contains(&arg.as_str()))
-    {
-        return args;
-    }
-    const VALUE_FLAGS: &[&str] = &[
-        "--allow",
-        "--deny",
-        "--verb",
-        "--override-marker",
-        "--ttl",
-        "--prompt",
-        "--prompt-file",
-        "--socket",
-    ];
-    const BOOLEAN_FLAGS: &[&str] = &[
-        "--static-only",
-        "--no-llm-fallback",
-        "--auto-amend",
-        "--no-auto-amend",
-    ];
-    let mut first_positional = None;
-    let mut index = 2;
-    while index < args.len() {
-        let arg = &args[index];
-        if arg == "--" {
-            first_positional = args.get(index + 1).map(String::as_str);
-            break;
-        }
-        if VALUE_FLAGS.contains(&arg.as_str()) {
-            index += 2;
-            continue;
-        }
-        if VALUE_FLAGS.iter().any(|flag| {
-            arg.strip_prefix(flag)
-                .is_some_and(|rest| rest.starts_with('='))
-        }) || BOOLEAN_FLAGS.contains(&arg.as_str())
-        {
-            index += 1;
-            continue;
-        }
-        if arg.starts_with('-') {
-            index += 1;
-            continue;
-        }
-        first_positional = Some(arg.as_str());
-        break;
-    }
-    let command = if first_positional.is_some_and(is_legacy_session_token) {
-        "grant"
-    } else {
-        "new"
-    };
-    args.splice(1..2, ["session".to_string(), command.to_string()]);
-    args
-}
-
-fn is_legacy_session_token(value: &str) -> bool {
-    value.len() == 32
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
 fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
@@ -151,9 +66,9 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
 }
 
 use cli_client::{
-    handle_api, handle_approval_note_cmd, handle_approvals, handle_audit_tail, handle_audit_verify,
-    handle_config, handle_gate_action, handle_grant, handle_provisionals, handle_session,
-    handle_status, handle_verb, run_exec, run_mcp, GatingOptions, RunInjections, SshHostKeyCliMode,
+    handle_access, handle_api, handle_audit_tail, handle_audit_verify, handle_config,
+    handle_gate_action, handle_provisionals, handle_status, handle_verb, run_exec, run_mcp,
+    GatingOptions, RunInjections, SshHostKeyCliMode,
 };
 use cli_secrets::handle_secrets;
 use cli_server::run_server;
@@ -163,7 +78,7 @@ use cli_shim::{handle_shim, ShimOptions};
 #[command(
     name = "guard",
     about = "Evaluator-gated command execution for AI agents",
-    after_help = "Access model:\n  Non-admin local callers can run commands, manage their own secret namespace, read liveness status, list sessions with redaction, show a known session token, list/run verbs, inspect their own held approvals/provisionals, and manage local client setup.\n  Daemon-principal callers or TCP admin-token callers can grant/revoke/appeal sessions, approve/deny/confirm/revert gates, create verbs, read full daemon status, and inspect detailed secret ownership.\n\nUse `guard help-tree` for a categorized access summary."
+    after_help = "Access workflow:\n  Agents run ordinary commands and use `guard access request \"<intent>\"` when authority is missing.\n  Operators use `guard access approve <request>...`, optionally with `--once` or `--uses N`.\n  `guard access list` and `show` inspect principal-bound requests, holds, and sessions without bearer tokens.\n  Operators use `guard access revoke <session-or-agent>` to remove active access authority.\n\nUse `guard access --help` for representative examples or `guard help-tree` for the full command map."
 )]
 #[allow(clippy::large_enum_variant)]
 enum MainArgs {
@@ -289,41 +204,35 @@ enum MainArgs {
     /// Manage client configuration
     #[clap(subcommand)]
     Config(ConfigCommands),
-    /// Obtain client material for brokered API endpoints.
-    #[clap(subcommand)]
+    /// Removed caller-scoped API credential export.
+    #[clap(subcommand, hide = true)]
     Api(ApiCommands),
     /// Expose guard as an MCP server over stdio
     #[clap(subcommand)]
     Mcp(McpCommands),
-    /// Manage scoped session permissions
-    #[clap(subcommand)]
-    Session(SessionCommands),
-    /// Save, issue, amend, and request reusable grants.
-    #[clap(subcommand)]
-    Grant(GrantCommands),
-    /// Ask the evaluator to amend or deny a session grant without executing the command.
-    /// Daemon-principal or TCP admin-token only.
-    //
-    // `disable_help_flag` so `guard appeal <binary> -h` forwards `-h` to the
-    // appealed command rather than printing this subcommand's help. Bare help
-    // (before a binary is named) is recovered by `passthrough_command_help_requested`.
+    /// Request, approve, inspect, and extend principal-bound access.
     #[clap(
-        hide = true,
-        disable_help_flag = true,
-        after_help = "Use `guard appeal --session <token> <binary> --help` to pass --help to the appealed command."
+        subcommand,
+        after_help = "Common workflow:\n  guard access request \"restart the fixture service\"\n  guard access approve <request>\n  guard access approve <request> --once\n  guard access approve <request> --uses 3\n  guard access list\n  guard access show <request-or-session>\n  guard access revoke <session-or-agent>\n\nExit status:\n  1      one or more decisions in the access batch failed"
     )]
-    Appeal {
-        /// Session token. Defaults to GUARD_SESSION.
-        #[arg(long, value_name = "TOKEN")]
-        session: Option<String>,
-        /// Server socket path (defaults to configured)
-        #[arg(long, value_name = "PATH")]
-        socket: Option<String>,
-        /// Binary to evaluate for session amendment
-        binary: String,
-        /// Arguments to pass to the binary
+    Access(AccessCommands),
+    /// Removed legacy authority command. Use `guard access`.
+    #[clap(hide = true, disable_help_flag = true)]
+    Session {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
+        legacy_args: Vec<String>,
+    },
+    /// Removed legacy authority command. Use `guard access`.
+    #[clap(hide = true, disable_help_flag = true)]
+    Grant {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        legacy_args: Vec<String>,
+    },
+    /// Removed legacy authority command. Use `guard access request`.
+    #[clap(hide = true, disable_help_flag = true)]
+    Appeal {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        legacy_args: Vec<String>,
     },
     /// Show daemon status. Always prints client + server version,
     /// uptime, evaluation mode, and dry-run state. The full config
@@ -368,39 +277,6 @@ enum MainArgs {
         #[arg(long)]
         socket: Option<String>,
     },
-    /// List held / decided operator approvals, or show one with a handle.
-    Approvals {
-        /// Optional handle to show a single approval's status and result.
-        handle: Option<String>,
-        #[arg(long)]
-        socket: Option<String>,
-        /// Emit machine-readable approval records.
-        #[arg(long, action = ArgAction::SetTrue)]
-        json: bool,
-    },
-    /// Approve a held command: execute it from its bound snapshot. Daemon-UID only.
-    Approve {
-        handle: String,
-        #[arg(long)]
-        socket: Option<String>,
-    },
-    /// Deny a held command. Daemon-UID only.
-    Deny {
-        handle: String,
-        #[arg(long)]
-        socket: Option<String>,
-    },
-    /// Post a note to a held command's approval thread, then show the thread.
-    /// The operator may note any hold; the requester may note its own.
-    #[clap(name = "approval-note")]
-    ApprovalNote {
-        /// Held-command handle.
-        handle: String,
-        /// Note text.
-        text: String,
-        #[arg(long)]
-        socket: Option<String>,
-    },
     /// Run or list operator-defined verbs (the typed, least-expressive interface).
     #[clap(subcommand)]
     Verb(VerbCommands),
@@ -434,6 +310,84 @@ enum AuditCommands {
 }
 
 #[derive(Subcommand)]
+enum AccessCommands {
+    /// Submit prose for the authenticated local principal.
+    Request {
+        intent: String,
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
+    /// Approve each request independently with unlimited authority by default.
+    Approve {
+        #[arg(required = true)]
+        requests: Vec<String>,
+        /// Grant one use. Equivalent to --uses 1.
+        #[arg(long, conflicts_with = "uses", action = ArgAction::SetTrue)]
+        once: bool,
+        /// Grant exactly N uses. A batch exits 1 if any request fails.
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+        uses: Option<u64>,
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
+    /// Deny one or more requests independently.
+    Deny {
+        #[arg(required = true)]
+        requests: Vec<String>,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
+    /// Revoke one active access-managed session.
+    Revoke {
+        target: String,
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
+    /// Add prose-derived authority to one session reference or agent label. Unlimited by default.
+    Extend {
+        /// Stable session reference or agent label that receives the authority.
+        target: String,
+        /// Plain-language description of the authority to add.
+        intent: String,
+        /// Grant one use. Equivalent to --uses 1.
+        #[arg(long, conflicts_with = "uses", action = ArgAction::SetTrue)]
+        once: bool,
+        /// Grant exactly N uses. Omit both use flags for unlimited authority.
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+        uses: Option<u64>,
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
+    /// List compact request and session state.
+    List {
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
+    /// Show detailed request or session coverage and evidence.
+    Show {
+        reference: String,
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum VerbCommands {
     /// List available verbs with their parameters and consequence class.
     List {
@@ -444,6 +398,7 @@ enum VerbCommands {
         json: bool,
     },
     /// Show one verb, including typed coverage and generation evidence.
+    #[clap(hide = true)]
     Show {
         name: String,
         #[arg(long)]
@@ -452,6 +407,7 @@ enum VerbCommands {
         json: bool,
     },
     /// Delete one operator-authored verb.
+    #[clap(hide = true)]
     Delete {
         name: String,
         #[arg(long)]
@@ -482,6 +438,7 @@ enum VerbCommands {
     },
     /// Create a verb from plain-language prose (LLM-synthesized, validated, and
     /// stored with the prose + evidence). Operator-only.
+    #[clap(hide = true)]
     Create {
         /// Plain-language description of the operation to expose as a verb.
         #[arg(long)]
@@ -518,431 +475,6 @@ enum VerbCoverageCommands {
     Clear {
         #[arg(long)]
         socket: Option<String>,
-        #[arg(long, action = ArgAction::SetTrue)]
-        json: bool,
-    },
-}
-
-#[derive(Subcommand)]
-enum GrantCommands {
-    /// Save a new reusable grant. Use `edit` for an existing name.
-    Save {
-        name: String,
-        #[arg(long)]
-        description: Option<String>,
-        #[arg(long = "verb")]
-        verbs: Vec<String>,
-        #[arg(long = "override-marker")]
-        override_markers: Vec<String>,
-        #[arg(long = "secret")]
-        secret_names: Vec<String>,
-        /// Maximum verbs an automatic amendment may request.
-        #[arg(long = "ceiling-verb")]
-        ceiling_verbs: Vec<String>,
-        /// Maximum secret selectors an automatic amendment may request.
-        #[arg(long = "ceiling-secret")]
-        ceiling_secrets: Vec<String>,
-        #[arg(long = "ceiling-ttl")]
-        ceiling_ttl: Option<u64>,
-        #[arg(long = "ceiling-mode")]
-        ceiling_modes: Vec<String>,
-        #[arg(long = "allow-prompt-append", action = ArgAction::SetTrue)]
-        allow_prompt_append: bool,
-        #[arg(long)]
-        ttl: Option<u64>,
-        #[arg(long)]
-        prompt: Option<String>,
-        #[arg(long, default_value = "evaluator")]
-        evaluation_mode: String,
-        #[arg(long, action = ArgAction::SetTrue)]
-        auto_approve: bool,
-        #[arg(long)]
-        socket: Option<String>,
-        #[arg(long, action = ArgAction::SetTrue)]
-        json: bool,
-    },
-    /// Update a reusable grant and increment its revision.
-    Edit {
-        name: String,
-        #[arg(long)]
-        description: Option<String>,
-        #[arg(long = "verb")]
-        verbs: Vec<String>,
-        /// Remove every activated verb.
-        #[arg(long, conflicts_with = "verbs")]
-        clear_verbs: bool,
-        #[arg(long = "override-marker")]
-        override_markers: Vec<String>,
-        /// Remove every baseline override marker.
-        #[arg(long, conflicts_with = "override_markers")]
-        clear_override_markers: bool,
-        #[arg(long = "secret")]
-        secret_names: Vec<String>,
-        /// Remove every secret-name entitlement.
-        #[arg(long, conflicts_with = "secret_names")]
-        clear_secrets: bool,
-        #[arg(long = "ceiling-verb")]
-        ceiling_verbs: Vec<String>,
-        #[arg(long, conflicts_with = "ceiling_verbs")]
-        clear_ceiling_verbs: bool,
-        #[arg(long = "ceiling-secret")]
-        ceiling_secrets: Vec<String>,
-        #[arg(long, conflicts_with = "ceiling_secrets")]
-        clear_ceiling_secrets: bool,
-        #[arg(long = "ceiling-ttl")]
-        ceiling_ttl: Option<u64>,
-        #[arg(long, conflicts_with = "ceiling_ttl")]
-        clear_ceiling_ttl: bool,
-        #[arg(long = "ceiling-mode")]
-        ceiling_modes: Vec<String>,
-        #[arg(long, conflicts_with = "ceiling_modes")]
-        clear_ceiling_modes: bool,
-        #[arg(long = "allow-prompt-append", action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
-        allow_prompt_append: Option<bool>,
-        #[arg(long)]
-        ttl: Option<u64>,
-        /// Remove the default TTL.
-        #[arg(long, conflicts_with = "ttl")]
-        clear_ttl: bool,
-        #[arg(long)]
-        prompt: Option<String>,
-        #[arg(long)]
-        evaluation_mode: Option<String>,
-        #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
-        auto_approve: Option<bool>,
-        #[arg(long)]
-        socket: Option<String>,
-        #[arg(long, action = ArgAction::SetTrue)]
-        json: bool,
-    },
-    /// Regenerate typed verbs from the saved prompt or replacement prose.
-    Regenerate {
-        name: String,
-        #[arg(long)]
-        prompt: Option<String>,
-        /// Apply an exact proposal returned by a previous preview.
-        #[arg(long, value_name = "PROPOSAL_ID", conflicts_with = "prompt")]
-        apply: Option<String>,
-        #[arg(long)]
-        socket: Option<String>,
-        #[arg(long, action = ArgAction::SetTrue)]
-        json: bool,
-    },
-    /// Issue a reusable grant into a fresh session.
-    Issue {
-        name: String,
-        #[arg(long)]
-        ttl: Option<u64>,
-        #[arg(long)]
-        label: Option<String>,
-        #[arg(long)]
-        evaluation_mode: Option<String>,
-        /// Principal (Unix uid or Windows SID) that owns the issued session. Set
-        /// this when minting a session for an agent that runs under a different
-        /// local identity than the operator. Defaults to the issuing principal.
-        #[arg(long)]
-        owner: Option<String>,
-        #[arg(long)]
-        socket: Option<String>,
-    },
-    /// List reusable grants.
-    List {
-        #[arg(long)]
-        socket: Option<String>,
-        #[arg(long, action = ArgAction::SetTrue)]
-        json: bool,
-    },
-    /// Show one reusable grant.
-    Show {
-        name: String,
-        #[arg(long)]
-        socket: Option<String>,
-        #[arg(long, action = ArgAction::SetTrue)]
-        json: bool,
-    },
-    /// Delete one reusable grant and its generated verbs.
-    Delete {
-        name: String,
-        #[arg(long)]
-        socket: Option<String>,
-    },
-    /// Create and resolve durable grant amendment requests.
-    #[clap(subcommand)]
-    Request(GrantRequestCommands),
-}
-
-#[derive(Subcommand)]
-enum GrantRequestCommands {
-    /// Request a bounded amendment to the active session.
-    Submit {
-        #[arg(long)]
-        session: Option<String>,
-        #[arg(long)]
-        saved_grant: Option<String>,
-        #[arg(long)]
-        justification: String,
-        #[arg(long = "prompt-append")]
-        prompt_append: Option<String>,
-        #[arg(long = "verb")]
-        verbs: Vec<String>,
-        #[arg(long = "secret")]
-        secret_names: Vec<String>,
-        #[arg(long = "override-marker")]
-        override_markers: Vec<String>,
-        #[arg(long)]
-        ttl: Option<u64>,
-        #[arg(long)]
-        evaluation_mode: Option<String>,
-        #[arg(long)]
-        socket: Option<String>,
-        #[arg(long, action = ArgAction::SetTrue)]
-        json: bool,
-    },
-    List {
-        #[arg(long)]
-        socket: Option<String>,
-        #[arg(long, action = ArgAction::SetTrue)]
-        json: bool,
-    },
-    Show {
-        handle: String,
-        #[arg(long)]
-        socket: Option<String>,
-        #[arg(long, action = ArgAction::SetTrue)]
-        json: bool,
-    },
-    Approve {
-        handle: String,
-        #[arg(long)]
-        socket: Option<String>,
-    },
-    Deny {
-        handle: String,
-        #[arg(long)]
-        reason: String,
-        #[arg(long)]
-        socket: Option<String>,
-    },
-    Withdraw {
-        handle: String,
-        #[arg(long)]
-        socket: Option<String>,
-    },
-}
-
-#[derive(Subcommand)]
-enum SessionCommands {
-    /// Mint a fresh session token. Grant flags install scoped typed verbs and
-    /// require the daemon principal or TCP admin token. Prints `export
-    /// GUARD_SESSION=<token>` on stdout so you can `eval $(guard session
-    /// new ...)` to set it for the current shell.
-    New {
-        /// Compatibility prose appended to evaluator context.
-        #[arg(value_name = "PROSE", hide = true)]
-        prose: Option<String>,
-        /// Issue this session from a reusable saved grant.
-        #[arg(long, alias = "profile", value_name = "NAME")]
-        saved_grant: Option<String>,
-        /// Glob pattern to allow in this session (repeatable)
-        #[arg(long = "allow", value_name = "GLOB", hide = true)]
-        allow: Vec<String>,
-        /// Glob pattern to deny in this session (repeatable, beats allow)
-        #[arg(long = "deny", value_name = "GLOB", hide = true)]
-        deny: Vec<String>,
-        /// Activate a non-baseline catalog verb for this session (repeatable).
-        #[arg(long = "verb", value_name = "NAME")]
-        activated_verbs: Vec<String>,
-        /// Carry an exact marker that lets matching session permission replace
-        /// a baseline evaluate/deny cell (repeatable).
-        #[arg(long = "override-marker", value_name = "MARKER", hide = true)]
-        override_markers: Vec<String>,
-        /// Time-to-live in seconds; omit for no expiry (grants persist in the
-        /// state DB and are reloaded on daemon restart)
-        #[arg(long, value_name = "SECONDS")]
-        ttl: Option<u64>,
-        /// Free-form context appended to the LLM system prompt for this session.
-        #[arg(long, value_name = "TEXT")]
-        prompt: Option<String>,
-        /// Evaluator behavior for misses: evaluator, policy-only, or read-only.
-        #[arg(long, value_name = "MODE")]
-        evaluation_mode: Option<String>,
-        /// Read session context from a file.
-        #[arg(long, value_name = "PATH")]
-        prompt_file: Option<PathBuf>,
-        /// Deny session-rule misses instead of falling through to the LLM.
-        #[arg(long = "static-only", alias = "no-llm-fallback", hide = true, action = ArgAction::SetTrue)]
-        static_only: bool,
-        /// Let fresh low-risk LLM fallback decisions add exact session rules.
-        #[arg(long = "auto-amend", hide = true, action = ArgAction::SetTrue)]
-        auto_amend: bool,
-        /// Disable automatic exact-rule amendment for this grant.
-        #[arg(long = "no-auto-amend", hide = true, action = ArgAction::SetTrue)]
-        no_auto_amend: bool,
-        /// Principal (Unix uid or Windows SID) that owns the session. Set when
-        /// minting a session for an agent that runs under a different local
-        /// identity. Defaults to the issuing principal.
-        #[arg(long, value_name = "PRINCIPAL")]
-        owner: Option<String>,
-        /// Server socket path (defaults to configured)
-        #[arg(long, value_name = "PATH")]
-        socket: Option<String>,
-    },
-    /// Install scoped permissions for a session token.
-    /// Daemon-principal or TCP admin-token only.
-    #[command(hide = true)]
-    Grant {
-        /// Opaque session token; the agent passes this as GUARD_SESSION or --session
-        token: String,
-        /// Compatibility prose appended to evaluator context.
-        #[arg(value_name = "PROSE")]
-        prose: Option<String>,
-        /// Glob pattern to allow in this session (repeatable)
-        #[arg(long = "allow", value_name = "GLOB", hide = true)]
-        allow: Vec<String>,
-        /// Glob pattern to deny in this session (repeatable, beats allow)
-        #[arg(long = "deny", value_name = "GLOB", hide = true)]
-        deny: Vec<String>,
-        /// Activate a non-baseline catalog verb for this session (repeatable).
-        #[arg(long = "verb", value_name = "NAME")]
-        activated_verbs: Vec<String>,
-        /// Carry an exact marker that lets matching session permission replace
-        /// a baseline evaluate/deny cell (repeatable).
-        #[arg(long = "override-marker", value_name = "MARKER", hide = true)]
-        override_markers: Vec<String>,
-        /// Time-to-live in seconds; omit for no expiry (grants persist in the
-        /// state DB and are reloaded on daemon restart)
-        #[arg(long, value_name = "SECONDS")]
-        ttl: Option<u64>,
-        /// Free-form context appended to the LLM system prompt for evaluator
-        /// calls made under this session token.
-        #[arg(long, value_name = "TEXT")]
-        prompt: Option<String>,
-        /// Issue from a reusable saved grant.
-        #[arg(long, alias = "profile", value_name = "NAME")]
-        saved_grant: Option<String>,
-        /// Evaluator behavior for misses: evaluator, policy-only, or read-only.
-        #[arg(long, value_name = "MODE")]
-        evaluation_mode: Option<String>,
-        /// Read prompt from a file (alternative to --prompt). Mutually
-        /// exclusive with --prompt; --prompt-file wins if both are given.
-        #[arg(long, value_name = "PATH")]
-        prompt_file: Option<PathBuf>,
-        /// Deny session-rule misses instead of falling through to the LLM.
-        #[arg(long = "static-only", alias = "no-llm-fallback", hide = true, action = ArgAction::SetTrue)]
-        static_only: bool,
-        /// Let fresh low-risk LLM fallback decisions add exact session rules.
-        #[arg(long = "auto-amend", hide = true, action = ArgAction::SetTrue)]
-        auto_amend: bool,
-        /// Disable automatic exact-rule amendment for this grant.
-        #[arg(long = "no-auto-amend", hide = true, action = ArgAction::SetTrue)]
-        no_auto_amend: bool,
-        /// Principal (Unix uid or Windows SID) that owns the session. Set when
-        /// installing a session for an agent that runs under a different local
-        /// identity. Defaults to the issuing principal.
-        #[arg(long, value_name = "PRINCIPAL")]
-        owner: Option<String>,
-        /// Server socket path (defaults to configured)
-        #[arg(long, value_name = "PATH")]
-        socket: Option<String>,
-    },
-    /// Ask the evaluator to amend or deny a session grant without executing the command.
-    /// Daemon-principal or TCP admin-token only.
-    //
-    // `disable_help_flag`: same rationale as the top-level `Appeal` variant --
-    // `-h`/`--help` after the binary must reach the appealed command. Bare help is
-    // recovered by `passthrough_command_help_requested`.
-    #[clap(
-        hide = true,
-        disable_help_flag = true,
-        after_help = "Use `guard session appeal <token> <binary> --help` to pass --help to the appealed command."
-    )]
-    Appeal {
-        /// Session token to appeal against.
-        token: String,
-        /// Server socket path (defaults to configured)
-        #[arg(long, value_name = "PATH")]
-        socket: Option<String>,
-        /// Binary to evaluate for session amendment.
-        binary: String,
-        /// Arguments to pass to the binary.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-    /// Revoke a session grant. Daemon-principal or TCP admin-token only.
-    Revoke {
-        /// Session token to revoke.
-        token: String,
-        /// Server socket path (defaults to configured)
-        #[arg(long, value_name = "PATH")]
-        socket: Option<String>,
-    },
-    /// Extend an active session from now.
-    Extend {
-        token: String,
-        #[arg(long, value_name = "SECONDS")]
-        ttl: u64,
-        #[arg(long)]
-        socket: Option<String>,
-    },
-    /// Set or replace the label on an active session.
-    Label {
-        token: String,
-        label: String,
-        #[arg(long)]
-        socket: Option<String>,
-    },
-    /// Revoke every active session matching a label or saved grant.
-    RevokeMatching {
-        #[arg(long)]
-        label: Option<String>,
-        #[arg(long)]
-        saved_grant: Option<String>,
-        #[arg(long)]
-        socket: Option<String>,
-    },
-    /// Show one session in detail, including prompt, aggregate stats, and recent
-    /// interactions. With no token, defaults to the caller's own `$GUARD_SESSION`.
-    /// A non-daemon caller may only inspect the grant on its own token.
-    Show {
-        /// Session token to inspect. Defaults to $GUARD_SESSION when omitted.
-        token: Option<String>,
-        /// Number of recent interactions to print.
-        #[arg(long, value_name = "N", default_value_t = 20)]
-        limit: usize,
-        /// Server socket path (defaults to configured)
-        #[arg(long, value_name = "PATH")]
-        socket: Option<String>,
-        /// Emit machine-readable session detail.
-        #[arg(long, action = ArgAction::SetTrue)]
-        json: bool,
-    },
-    /// Show requester-scoped grant, escalation, hold, and provisional status.
-    Status {
-        token: Option<String>,
-        #[arg(long)]
-        socket: Option<String>,
-        #[arg(long, action = ArgAction::SetTrue)]
-        json: bool,
-    },
-    /// List active session grants
-    List {
-        /// Include past (revoked/expired) grants. Daemon retains
-        /// history for a bounded window (default 24h).
-        #[arg(long = "history", action = ArgAction::SetTrue)]
-        history: bool,
-        /// Filter history to entries that ended within the last duration.
-        /// Accepts plain seconds (e.g. `3600`) or simple suffixes:
-        /// `30m`, `2h`, `1d`. Implies --history when set.
-        #[arg(long, value_name = "DURATION")]
-        since: Option<String>,
-        /// Print untruncated session prompts (daemon UID only; other users
-        /// still see "(hidden)").
-        #[arg(long = "full", action = ArgAction::SetTrue)]
-        full: bool,
-        /// Server socket path (defaults to configured)
-        #[arg(long, value_name = "PATH")]
-        socket: Option<String>,
-        /// Emit machine-readable session records.
         #[arg(long, action = ArgAction::SetTrue)]
         json: bool,
     },
@@ -1000,6 +532,12 @@ fn parse_env_bool(value: &str) -> bool {
     )
 }
 
+fn legacy_authority_error(command: &str, replacement: &str) -> Result<()> {
+    anyhow::bail!(
+        "`guard {command}` has been removed because it bypasses the principal-bound access workflow; use `{replacement}`"
+    )
+}
+
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum ServerCommands {
@@ -1013,14 +551,13 @@ enum ServerCommands {
         #[arg(long, value_name = "PORT")]
         tcp_port: Option<u16>,
 
-        /// Shared token required for TCP clients.
-        /// Env: GUARD_AUTH_TOKEN.
-        #[arg(long, value_name = "TOKEN")]
+        /// Shared token required for TCP clients. Read from GUARD_AUTH_TOKEN.
+        #[arg(skip)]
         auth_token: Option<String>,
 
-        /// Separate token required for non-Ping TCP admin RPCs.
-        /// Env: GUARD_ADMIN_TOKEN.
-        #[arg(long, value_name = "TOKEN")]
+        /// Separate token required for non-Ping TCP admin RPCs. Read from
+        /// GUARD_ADMIN_TOKEN.
+        #[arg(skip)]
         admin_token: Option<String>,
 
         /// Group owning the UNIX socket.
@@ -1042,8 +579,9 @@ enum ServerCommands {
         #[arg(long, value_name = "PATH")]
         shim_dir: Option<PathBuf>,
 
-        /// LLM provider API key. Prefer the GUARD_LLM_API_KEY env var.
-        #[arg(long, value_name = "KEY")]
+        /// LLM provider API key. Read from GUARD_LLM_API_KEY or
+        /// OPENROUTER_API_KEY.
+        #[arg(skip)]
         llm_api_key: Option<String>,
 
         /// OpenAI-compatible chat completions endpoint.
@@ -1521,10 +1059,6 @@ enum ServerCommands {
         #[arg(long, value_name = "PORT")]
         tcp_port: Option<u16>,
 
-        /// Shared token for TCP connections.
-        #[arg(long, value_name = "TOKEN")]
-        token: Option<String>,
-
         /// Inject an environment variable (KEY=VALUE, repeatable)
         #[arg(long = "env", value_name = "KEY=VALUE", value_parser = parse_env_assignment)]
         env_vars: Vec<(String, String)>,
@@ -1573,16 +1107,10 @@ enum ConfigCommands {
         /// TCP port on 127.0.0.1 for guard clients.
         port: u16,
     },
-    /// Set auth token
-    SetToken {
-        /// Shared token for TCP connections.
-        token: String,
-    },
-    /// Set admin token
-    SetAdminToken {
-        /// Separate token for TCP admin RPCs.
-        token: String,
-    },
+    /// Set the TCP execution token from piped stdin or a hidden prompt.
+    SetToken,
+    /// Set the TCP admin token from piped stdin or a hidden prompt.
+    SetAdminToken,
     /// Set default user
     SetUser {
         /// Default user label for client configuration.
@@ -1594,7 +1122,8 @@ enum ConfigCommands {
 
 #[derive(Subcommand)]
 enum ApiCommands {
-    /// Issue a kubeconfig carrying the live GUARD_SESSION bearer.
+    /// Removed because access-managed authority is command-only.
+    #[clap(hide = true)]
     Kubeconfig {
         /// Named Kubernetes endpoint configured on the daemon.
         #[arg(long, default_value = "default")]
@@ -1621,24 +1150,14 @@ enum McpCommands {
         #[arg(long, value_name = "PORT")]
         tcp_port: Option<u16>,
 
-        /// Shared token for TCP connections.
-        #[arg(long, value_name = "TOKEN")]
-        token: Option<String>,
-
         /// MCP tool name exposed to clients.
         #[arg(long, default_value = "guard_run")]
         tool_name: String,
 
-        /// Serve MCP over Streamable-HTTP on this address (e.g. 127.0.0.1:7333)
-        /// instead of stdio. Requires a bearer token (--http-token or
-        /// GUARD_MCP_TOKEN). Intended for localhost / trusted networks.
+        /// Serve MCP over Streamable HTTP on a loopback address (for example,
+        /// 127.0.0.1:7333) instead of stdio. Requires GUARD_MCP_TOKEN.
         #[arg(long, value_name = "ADDR")]
         http: Option<String>,
-
-        /// Bearer token required on every HTTP request (overrides
-        /// GUARD_MCP_TOKEN). Only used with --http; never logged.
-        #[arg(long, value_name = "TOKEN")]
-        http_token: Option<String>,
     },
 }
 
@@ -1648,7 +1167,8 @@ enum SecretCommands {
     Add {
         /// Secret key used by --secret and tool configs.
         key: String,
-        /// Secret value. Omit to read piped stdin or prompt interactively.
+        /// Secret value, read from piped stdin or a hidden prompt.
+        #[arg(skip)]
         value: Option<String>,
     },
     /// List stored secret keys.
@@ -1745,11 +1265,17 @@ async fn run_main() -> Result<()> {
         );
         return Ok(());
     }
+    if args.is_empty() {
+        return print_nested_help(&[], "guard");
+    }
+    if args.len() == 1 && args[0] == "access" {
+        return print_nested_help(&["access"], "guard access");
+    }
     if let Some((path, bin_name)) = passthrough_command_help_requested(&args) {
         return print_nested_help(&path, bin_name);
     }
 
-    let result = MainArgs::try_parse_from(preprocess_legacy_grant_args(std::env::args().collect()));
+    let result = MainArgs::try_parse();
 
     match result {
         Ok(MainArgs::Run {
@@ -1806,20 +1332,6 @@ async fn run_main() -> Result<()> {
         Ok(MainArgs::Revert { handle, socket }) => {
             handle_gate_action(socket, "revert", handle).await
         }
-        Ok(MainArgs::Approve { handle, socket }) => {
-            handle_gate_action(socket, "approve", handle).await
-        }
-        Ok(MainArgs::Deny { handle, socket }) => handle_gate_action(socket, "deny", handle).await,
-        Ok(MainArgs::Approvals {
-            handle,
-            socket,
-            json,
-        }) => handle_approvals(socket, handle, json).await,
-        Ok(MainArgs::ApprovalNote {
-            handle,
-            text,
-            socket,
-        }) => handle_approval_note_cmd(socket, handle, text).await,
         Ok(MainArgs::Verb(subcommand)) => handle_verb(subcommand).await,
         Ok(MainArgs::Audit(subcommand)) => match subcommand {
             AuditCommands::Verify { socket, json } => handle_audit_verify(socket, json).await,
@@ -1851,27 +1363,11 @@ async fn run_main() -> Result<()> {
         Ok(MainArgs::Config(subcommand)) => handle_config(subcommand).await,
         Ok(MainArgs::Api(subcommand)) => handle_api(subcommand).await,
         Ok(MainArgs::Mcp(subcommand)) => run_mcp(subcommand).await,
-        Ok(MainArgs::Session(subcommand)) => handle_session(subcommand).await,
-        Ok(MainArgs::Grant(subcommand)) => handle_grant(subcommand).await,
-        Ok(MainArgs::Appeal {
-            session,
-            socket,
-            binary,
-            args,
-        }) => {
-            let token = session
-                .or_else(|| std::env::var("GUARD_SESSION").ok())
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    anyhow::anyhow!("guard appeal requires --session or GUARD_SESSION")
-                })?;
-            handle_session(SessionCommands::Appeal {
-                token,
-                socket,
-                binary,
-                args,
-            })
-            .await
+        Ok(MainArgs::Access(subcommand)) => handle_access(subcommand).await,
+        Ok(MainArgs::Session { .. }) => legacy_authority_error("session", "guard access"),
+        Ok(MainArgs::Grant { .. }) => legacy_authority_error("grant", "guard access"),
+        Ok(MainArgs::Appeal { .. }) => {
+            legacy_authority_error("appeal", "guard access request <intent>")
         }
         Ok(MainArgs::Status { socket, json }) => handle_status(socket, json).await,
         Ok(MainArgs::HelpTree { admin }) => {
@@ -1909,7 +1405,7 @@ fn top_level_version_requested(args: &[String]) -> bool {
     }
 }
 
-// The `run`/`exec` and `appeal` commands disable clap's help flag so that
+// The `run`/`exec` commands disable clap's help flag so that
 // `-h`/`--help` after the target binary forward to that binary instead of
 // printing guard's own help. The cost is that a help flag meant for guard
 // (before any binary is named) would otherwise error, so it is recovered here
@@ -1920,59 +1416,8 @@ fn passthrough_command_help_requested(
     let is_help = |idx| matches!(args.get(idx).map(String::as_str), Some("--help" | "-h"));
     match args.first().map(String::as_str) {
         Some("run" | "exec") if is_help(1) && args.len() == 2 => Some((vec!["run"], "guard run")),
-        // `guard appeal [--session T] [--socket P] <binary> ...`: the binary is
-        // the first positional. Help before it is guard's; after it forwards.
-        Some("appeal") if appeal_self_help_requested(&args[1..], &["--session", "--socket"], 0) => {
-            Some((vec!["appeal"], "guard appeal"))
-        }
-        // `guard session appeal [--socket P] <token> <binary> ...`: the binary is
-        // the second positional (token is the first).
-        Some("session")
-            if matches!(args.get(1).map(String::as_str), Some("appeal"))
-                && appeal_self_help_requested(&args[2..], &["--socket"], 1) =>
-        {
-            Some((vec!["session", "appeal"], "guard session appeal"))
-        }
         _ => None,
     }
-}
-
-/// True if `-h`/`--help` in an appeal invocation is meant for guard rather than
-/// the appealed command: it appears before the `<binary>` positional has been
-/// consumed. `value_flags` are the guard options that take a separate value (so
-/// their value is not miscounted as a positional); `leading_positionals` is how
-/// many positionals precede `<binary>` (0 for top-level appeal, 1 for `session
-/// appeal`, whose first positional is the token).
-fn appeal_self_help_requested(
-    args: &[String],
-    value_flags: &[&str],
-    leading_positionals: usize,
-) -> bool {
-    let mut positionals = 0usize;
-    let mut i = 0;
-    while i < args.len() {
-        let arg = args[i].as_str();
-        if arg == "--help" || arg == "-h" {
-            // `<binary>` is the positional at index `leading_positionals`; it is
-            // consumed once `positionals` exceeds that count.
-            return positionals <= leading_positionals;
-        }
-        if arg.starts_with('-') && arg != "-" {
-            if value_flags.contains(&arg) && !arg.contains('=') {
-                i += 2;
-            } else {
-                i += 1;
-            }
-        } else {
-            positionals += 1;
-            if positionals > leading_positionals {
-                // The binary has been named; everything after belongs to it.
-                return false;
-            }
-            i += 1;
-        }
-    }
-    false
 }
 
 fn print_nested_help(path: &[&str], bin_name: &str) -> Result<()> {
@@ -2066,11 +1511,6 @@ fn format_timestamp(ts: u64) -> String {
     format!("{} ({ts})", unix_seconds_to_utc(ts))
 }
 
-fn format_optional_timestamp(ts: Option<u64>) -> String {
-    ts.map(format_timestamp)
-        .unwrap_or_else(|| "(never)".to_string())
-}
-
 fn log_cli_usage_error(args: &[String], error: &clap::Error) {
     let command_path = cli_command_path(args);
     // Client-side event: no durable sink is installed in the CLI process, so
@@ -2130,15 +1570,11 @@ fn print_help_tree(admin: bool) {
     println!("    server status");
     println!("    secrets|secret add|remove|list");
     println!("    verb list");
-    println!("    verb show <name>");
     println!("    verb run <name> --param key=value");
-    println!("    session list [--history] [--since duration] [--full]");
-    println!("    session show [token]  (defaults to $GUARD_SESSION)");
-    println!("    session status [token]");
-    println!("    session new");
+    println!("    access request \"<intent>\"");
+    println!("    access list");
+    println!("    access show <request-or-session>");
     println!("    provisionals");
-    println!("    approvals [handle]");
-    println!("    approval-note <handle> <text>");
     println!("    mcp serve");
     println!();
     println!("  local setup");
@@ -2148,17 +1584,13 @@ fn print_help_tree(admin: bool) {
         println!();
         println!("{}", paint("  admin", AnsiColor::Yellow, color));
         println!("    server start");
-        println!("    grant save|edit|regenerate|issue|list|show|delete");
-        println!("    grant request submit|list|show|approve|deny|withdraw");
-        println!("    session new [prose] [--saved-grant name]");
-        println!("    session grant <token> [prose] [--saved-grant name]");
-        println!("    session appeal <token> <binary> [args...]");
-        println!("    session revoke|extend|label|revoke-matching");
+        println!("    verb show <name>");
+        println!("    access approve <request>... [--once|--uses N]");
+        println!("    access revoke <session-or-agent>");
+        println!("    access deny <request>... [--reason text]");
+        println!("    access extend <session-or-agent> \"<intent>\" [--once|--uses N]");
         println!("    secrets list --detailed");
-        println!("    approve|deny <handle>");
         println!("    confirm|revert <handle>");
-        println!("    verb create --prompt <text>");
-        println!("    verb delete <name>");
         println!("    audit verify|tail [-n N]");
     } else {
         println!();
@@ -2175,7 +1607,7 @@ fn print_help_tree(admin: bool) {
     println!("Access markers:");
     println!("  user commands are available to allowed local callers.");
     println!("  local setup commands edit client-side files for the invoking account.");
-    println!("  session show reveals a full grant only to the daemon or the token's own holder; list hides raw tokens for non-admin callers.");
+    println!("  access list and show expose stable references and scoped authority, never raw session tokens.");
     println!("  admin commands require the daemon principal or the TCP admin token.");
 }
 #[cfg(test)]

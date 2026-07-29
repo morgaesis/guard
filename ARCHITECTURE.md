@@ -29,15 +29,15 @@ Operator behavior is documented in [README.md](README.md),
 
 ## Authorization vocabulary
 
-The public model has three nouns:
+The public authority workflow has two inputs:
 
 - **Policy** defines global evaluator behavior and hard boundaries.
-- **Verb** defines typed operation coverage and an execution plan.
-- **Grant** activates or expands verbs for a reusable scope or live session.
+- **Access intent** describes work in prose. The resolver reduces it to typed
+  coverage and requests only missing authority for the authenticated principal.
 
-Legacy profiles and unambiguous command patterns are migration inputs. They
-compile into saved grants and typed coverage. Ambiguous patterns fail loading.
-They do not remain an independent authority system.
+Verbs, saved grants, sessions, requests, and holds are internal authority
+objects. Operator-authored policy and verb catalogs remain the source of hard
+invariants, sticky boundaries, credential plans, and verified revert envelopes.
 
 A coverage cell has an explicit action and axes. It is silent outside those
 axes. This prevents an instruction such as "allow Ansible check mode" from
@@ -51,15 +51,19 @@ agent -> client or shim -> authenticated daemon -> resolver -> evaluator/gate
 ```
 
 The daemon authenticates a Unix uid, Windows SID, or TCP bearer before reading
-request authority. It validates argv, working directory, session, injections,
-and binary floor before semantic evaluation. Raw commands reverse-match all
-verb cells. The resolver combines applicable global and session coverage, then
-routes a miss or conflict to the evaluator when policy permits.
+request authority. Execute requests use a versioned envelope with an explicit
+feature set. Local requests require the caller's working directory; TCP requests
+declare that they have no caller filesystem context. The daemon validates the
+wire contract, argv, working directory, session, injections, and binary floor
+before semantic evaluation. Raw commands reverse-match all verb cells. The
+resolver combines applicable global and session coverage, then routes a miss or
+conflict to the evaluator when policy permits.
 
 The execution snapshot contains canonical argv, working directory, principal,
 session revision, matched coverage, credential and execution plan, consequence,
-and secret-name/value bindings. A hold freezes that snapshot. Approval cannot
-adopt later grant, catalog, policy, environment, or secret changes.
+and secret-name bindings with salted value hashes. A hold freezes that snapshot.
+Approval cannot adopt later grant, catalog, policy, environment, or secret
+changes.
 
 Approved children receive the caller's canonical working directory but the
 daemon's clean environment, identity, SSH context, and secret bindings. Guard
@@ -88,6 +92,30 @@ The evaluator cache keys immutable policy, saved-grant and session revisions,
 current session state, coverage, markers, conflict packet, and request. Grant
 edit, regeneration, amendment, suspension, expiry, revocation, or coverage
 change invalidates affected cache authority.
+
+## Access negotiation
+
+An authenticated local principal submits prose without presenting a session.
+The daemon reuses matching typed verbs, subtracts baseline and already active
+authority, and persists one principal-bound request for the missing delta.
+Proposed generated coverage is inert, untrusted, and non-baseline. Approval
+promotes the exact reviewed matcher to trusted session coverage, stores it in
+the durable request, and leaves the operator-authored catalog unchanged. The
+daemon derives consequence locally: recognized read-only shapes may execute,
+while unknown or mutating generated shapes remain irreversible holds.
+Approval creates or reuses one access-managed session for that principal. A bounded use is committed to SQLite
+under the session write lock before the admitted snapshot can spawn, so retries,
+concurrency, spawn failure, restart, expiry, revocation, history, and audit see
+one durable remaining-use count for the exact approved request. Independent
+requests retain separate scope and accounting inside the principal's session.
+
+Consequence holds use their immutable hold identifier as the access request and
+accept only one-time approval because the reviewed snapshot executes once.
+This keeps approval bound to the reviewed argv, principal, catalog revision,
+credential hashes, and revert evidence. `guard access list` and `show` project
+requests, holds, and sessions without exposing bearer tokens.
+Access-managed sessions authorize brokered command verbs and cannot mint or use
+reusable API-proxy credentials.
 
 ## Consequence gate
 
@@ -124,12 +152,11 @@ protocol, policy, mode, upstream, credential reference, local client output,
 generated coverage, history, and rollback registration. Concurrent listeners
 using one protocol cannot cross credentials or reverts.
 
-The client sends `Authorization: Bearer <Guard session>` or the compatibility
-header `X-Guard-Session`. The proxy validates one live session, strips the
-client credential, and binds only its fingerprint and intent to the request.
-Immediately before forwarding, it revalidates expiry, revocation, suspension,
-and immutable authority. The endpoint credential is injected only after these
-checks and is never returned to the client.
+The operator-generated client configuration contains the loopback endpoint and
+local CA, but no Guard or upstream credential. Requests from this client are
+unattributed and rely on the listener's trusted local or single-tenant boundary.
+The endpoint credential is injected only after protocol, policy, evaluator, and
+consequence checks and is never returned to the client.
 
 Protocol hard-denies reject uninspectable or credential-minting surfaces before
 policy. Explicit policy actions are `allow`, `deny`, `hold`, and `evaluate`.
@@ -137,10 +164,10 @@ Allowed secret-bearing reads are redacted according to protocol classification,
 regardless of policy wording. Unsafe redirects, encodings, response headers,
 compression, and uninspectable secret bodies fail closed.
 
-Generated API coverage binds endpoint, session fingerprint, operation,
+Generated API coverage binds endpoint, attribution when present, operation,
 namespace, value-free body shape, evaluator regime, and expiry. Value-bearing
-mutations remain evaluator-routed. Global concurrency, endpoint/session token
-buckets, error circuits, and a session reserve bound evaluator amplification.
+mutations remain evaluator-routed. Global concurrency, endpoint and attribution
+token buckets, error circuits, and a reserved evaluator slot bound amplification.
 
 ## Principal and credential model
 
@@ -149,14 +176,13 @@ SID is the operator principal. Agents run under another principal and cannot
 approve holds, confirm provisionals, change grants, edit verbs, or inspect daemon
 secret ownership.
 
-Each session is bound to an owner principal at creation. Every local path that
-consumes a session's authority requires the requesting peer's kernel-read
-principal to equal that owner, so a leaked or replayed handle is unusable by a
-different local peer; the operator principal is exempt and administers all
-sessions. The operator declares the owner when issuing a session for an agent
-that runs under a different uid. A session with no bound owner (carried across
-the principal-binding migration) is refused for execution and API use until
-reissued.
+Each command-access session is bound automatically to the authenticated
+requester. Every local path that consumes its authority requires the requesting
+peer's kernel-read principal to equal that owner, so a leaked or replayed
+request reference or internal bearer is unusable by a different local peer. The
+operator principal is exempt and administers all sessions. Startup rejects any
+active session without an authenticated owner and matching approved-request
+provenance.
 
 TCP has no peer principal. It uses separate execution and admin bearers and
 refuses consequence gating and per-principal secret injection.

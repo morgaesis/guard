@@ -138,6 +138,21 @@ pub fn redact_secret_response(value: &mut Value) -> usize {
     }
 }
 
+/// Whether a Secret response contains Helm release storage. Helm decodes the
+/// `data.release` payload to build its release inventory and skips entries that
+/// cannot be decoded. Returning the object after removing `data` can therefore
+/// make an existing release look absent instead of access-restricted.
+pub fn contains_helm_release_secret(value: &Value) -> bool {
+    fn is_helm_release(item: &Value) -> bool {
+        item.get("type").and_then(Value::as_str) == Some("helm.sh/release.v1")
+    }
+
+    value.get("items").and_then(Value::as_array).map_or_else(
+        || is_helm_release(value),
+        |items| items.iter().any(is_helm_release),
+    )
+}
+
 /// Remove `data` and `stringData` from a single object. Returns true if either
 /// was present.
 fn strip_secret_fields(obj: &mut Value) -> bool {
@@ -332,14 +347,8 @@ mod tests {
     }
 
     #[test]
-    fn redact_helm_release_secret_is_opaque_by_default() {
-        // Helm stores release state as a Secret of type `helm.sh/release.v1`
-        // whose `data.release` is an opaque, doubly-base64-and-gzip-encoded blob
-        // rather than any structured type the proxy models. Redaction must not
-        // require that value to be parseable: it strips `data` wholesale (masking
-        // by default) and succeeds, leaving metadata/type/labels intact so
-        // `helm list`/`status`/`upgrade` can read the release inventory.
-        let mut v: Value = serde_json::json!({
+    fn helm_release_secret_detection_covers_single_objects_and_lists() {
+        let release: Value = serde_json::json!({
             "kind": "Secret",
             "apiVersion": "v1",
             "metadata": {
@@ -350,14 +359,19 @@ mod tests {
             "type": "helm.sh/release.v1",
             "data": {"release": "SDRzSUFBQUFBQUFDLzZvR0FBWU5BUUFBQUE9PQ=="}
         });
-        let n = redact_secret_response(&mut v);
-        assert_eq!(
-            n, 1,
-            "the opaque Helm release Secret is redacted, not rejected"
-        );
-        assert!(v.get("data").is_none(), "opaque release blob is stripped");
-        assert_eq!(v["type"], "helm.sh/release.v1");
-        assert_eq!(v["metadata"]["labels"]["owner"], "helm");
+        assert!(contains_helm_release_secret(&release));
+        assert!(contains_helm_release_secret(&serde_json::json!({
+            "kind": "SecretList",
+            "items": [
+                {"type": "Opaque", "data": {"key": "dmFsdWU="}},
+                release
+            ]
+        })));
+        assert!(!contains_helm_release_secret(&serde_json::json!({
+            "kind": "Secret",
+            "type": "Opaque",
+            "data": {"key": "dmFsdWU="}
+        })));
     }
 
     #[test]

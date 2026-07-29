@@ -1,8 +1,9 @@
 # guard
 
-Guard is an evaluator-gated command and API broker for AI agents. Agents submit
-ordinary commands or API requests, while the Guard daemon applies policy,
-evaluates intent and risk, and executes approved work with credentials the agent
+Guard is a policy-gated command and API broker for AI agents. Agents submit
+ordinary commands or API requests and describe missing access in prose. The
+Guard daemon applies policy, reduces approved intent to bounded enforcement
+coverage, evaluates risk, and executes approved work with credentials the agent
 cannot read.
 
 ```console
@@ -13,10 +14,12 @@ $ guard run rm -rf /etc/nginx
 DENIED: Recursive deletion of system configuration.
 ```
 
-Guard combines an LLM evaluator with deterministic binary limits, typed verbs,
-saved grants, consequence routing, credential brokering, output redaction, and
-protocol-aware API mediation. It is a policy gate, not a sandbox. The agent must
-run as a principal that cannot bypass the daemon or read its credentials.
+Guard combines operator policy and prose-first access requests with an LLM
+evaluator, deterministic binary limits, consequence routing, credential
+brokering, output redaction, and protocol-aware API mediation. Typed verbs and
+saved grants implement enforcement behind that workflow. Guard is a policy
+gate, not a sandbox. The agent must run as a principal that cannot bypass the
+daemon or read its credentials.
 
 ## Install
 
@@ -61,19 +64,26 @@ guard server start --dry-run --socket .cache/guard-dry-run.sock
 guard server connect --socket .cache/guard-dry-run.sock bash -- -c 'sudo id'
 ```
 
-## Core model
+## Access model
 
-Guard has three public authorization nouns:
+Guard's supported public authority model is policy plus prose-first access
+intent. Policy supplies global evaluator behavior and hard boundaries. Agents
+continue to use ordinary commands and API requests, and submit a prose access
+request when authority is missing. Operators approve, deny, extend, inspect, or
+revoke those principal-bound requests through `guard access`.
 
-- **Policy** supplies global evaluator behavior and hard boundaries.
-- **Verbs** describe typed operation coverage, credential plans, and consequence.
-- **Grants** activate or expand verb coverage for a saved scope or live session.
+Typed verbs, coverage cells, saved grants, and sessions are operator and
+enforcement internals. The daemon maps approved intent into those bounded
+objects so policy, credentials, consequence, expiry, and use counts remain
+deterministic. Operator verb commands inspect and exercise the typed catalog.
+Legacy grant, session, and appeal commands return a direct error pointing to
+`guard access`; they cannot mint, modify, or print authority.
 
-A verb coverage cell is silent outside its declared bounds. Allowing Ansible
-`--check` mode does not generate denies for unrelated commands, so ordinary
-read-only work such as `guard run ssh host uptime` remains independently
-evaluable. Raw commands reverse-match every applicable verb cell, which lets
-agents benefit from verbs without changing their normal tool syntax.
+Internally, a verb coverage cell is silent outside its declared bounds.
+Allowing Ansible `--check` mode does not generate denies for unrelated commands,
+so ordinary read-only work such as `guard run ssh host uptime` remains
+independently evaluable. Raw commands reverse-match every applicable verb cell,
+which lets agents benefit from verbs without changing their normal tool syntax.
 
 Session coverage may expand a baseline readonly or evaluator posture inside its
 activated regions. It does not override hard invariants, sticky operator cells,
@@ -81,28 +91,27 @@ binary limits, credential binding, or the consequence gate. A baseline cell
 that declares an override marker changes only when the issued session carries
 the exact operator-authored marker.
 
-Create and issue a reusable grant:
+Request access in prose and let the daemon reduce it to typed coverage:
 
 ```bash
-guard grant save host-a-checks \
-  --verb ansible-host-a-check \
-  --ttl 1800 \
-  --prompt 'Inspect host-a and report drift.'
-
-eval "$(guard grant issue host-a-checks)"
-guard session status
+guard access request 'Inspect host-a and report drift.'
+guard access list
 ```
 
-Agents request bounded expansion through `guard grant request submit`; a denial
-returns a durable handle and the exact operator action needed to resolve it.
+An operator approves one or more durable requests with `guard access approve`.
+`--once` is exactly `--uses 1`; `--uses 3` grants that request three admissions.
+Each approval retains its own scope and count. Denied results offer ordinary,
+one-time, and bounded approval. A held result offers only `--once` because it
+executes one immutable reviewed snapshot. Operators remove an active access
+session with `guard access revoke <session-or-agent>`.
 
 Structured execution results include a versioned decision trace with a stable
 source, every applicable typed cell, conflicts, and bounded next-step guidance.
 Use `--explain` to render it on successful human runs; denials and holds always
 show actionable guidance.
 
-See [Saved grants and sessions](docs/saved-grants.md) and
-[Typed verbs and coverage](docs/verbs.md).
+See [Access and authority internals](docs/saved-grants.md) and
+[Operator verb catalogs](docs/verbs.md).
 
 ## Consequence routing
 
@@ -116,7 +125,9 @@ guard server start --gate consequence \
   --socket /run/guard/guard.sock \
   --verbs /etc/guard/verbs.yaml
 
-guard verb run restart-service --param unit=nginx
+guard access request 'Restart nginx and verify that it is healthy.'
+guard access approve <request> --once
+guard run systemctl restart nginx
 guard provisionals
 guard confirm <handle>
 ```
@@ -143,9 +154,9 @@ request and re-originates allowed traffic with daemon-held upstream credentials.
 Kubernetes is the reference protocol; GitHub and Vercel adapters demonstrate
 the generic protocol surface. One daemon can serve multiple named listeners.
 
-Clients send `Authorization: Bearer <Guard session>`. Guard consumes that
-session bearer, never forwards it, and injects the endpoint's upstream
-credential only after authorization. See [API proxy](docs/api-proxy.md).
+Guard strips client authentication before forwarding and injects the endpoint's
+upstream credential only after authorization. Public access sessions remain
+command-only and export no API bearer. See [API proxy](docs/api-proxy.md).
 
 ## Security boundary
 
@@ -168,8 +179,8 @@ tool-native access control, backups, and network segmentation. See
 | [Release verification](docs/release-verification.md) | Checksums, SBOMs, and signed build provenance |
 | [DEPLOYMENT.md](DEPLOYMENT.md) | Service accounts, hardening, and unattended operation |
 | [Configuration](docs/configuration.md) | Environment, endpoints, evaluator, and state |
-| [Saved grants and sessions](docs/saved-grants.md) | Reusable authority, live sessions, and requests |
-| [Typed verbs and coverage](docs/verbs.md) | Templates, reverse matching, precedence, and promotion |
+| [Access and authority internals](docs/saved-grants.md) | Prose requests, approvals, bounded uses, and internal authority state |
+| [Operator verb catalogs](docs/verbs.md) | Typed enforcement, reverse matching, precedence, and promotion |
 | [Consequence gating](docs/consequence-gating.md) | Holds, auto-revert, confirmation, and recovery |
 | [API proxy](docs/api-proxy.md) | Protocol policy, brokered credentials, listeners, and API reverts |
 | [Agent integration](docs/agent-integration.md) | Shims, working directory, structured output, and MCP |

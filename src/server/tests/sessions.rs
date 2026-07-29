@@ -1,6 +1,8 @@
 use crate::grant_profile::{EvaluationMode, SavedGrantCatalog};
 use crate::server::admin::handle_admin_request;
-use crate::server::execute::{evaluation_cache_scope, execute_command, session_source_from_eval};
+use crate::server::execute::{
+    admit_access_use, evaluation_cache_scope, execute_command, session_source_from_eval,
+};
 use crate::server::gate_runtime::SessionAuthoritySnapshot;
 use crate::server::learning::{
     allow_session_auto_amend_candidate, deny_session_auto_amend_candidate,
@@ -9,7 +11,8 @@ use crate::server::transport::{claim_session_maintenance, session_maintenance_on
 use crate::server::wire::ExecOutcome;
 use crate::server::wire::{AdminRequest, AdminResponse, CallerIdentity, ExecuteRequest};
 use crate::session::{
-    SessionDecisionSource, SessionExactRule, SessionExecStatus, SessionGrant, SessionInteraction,
+    AccessUseGrant, IssuedGrantScope, SessionDecisionSource, SessionExactRule, SessionExecStatus,
+    SessionGrant, SessionInteraction,
 };
 use crate::session_store::SessionStore;
 use guard::evaluate::{EvalConfig, Evaluator};
@@ -44,6 +47,16 @@ fn granted_session(allow: Vec<String>, allow_exact: Vec<SessionExactRule>) -> Se
     }
 }
 
+fn granted_session_owned(
+    owner_uid: u32,
+    allow: Vec<String>,
+    allow_exact: Vec<SessionExactRule>,
+) -> SessionGrant {
+    let mut grant = granted_session(allow, allow_exact);
+    grant.owner = crate::session::SessionOwner::Principal(PrincipalKey::from_uid(owner_uid));
+    grant
+}
+
 async fn run_verb_synthesis_llm(listener: tokio::net::TcpListener) {
     loop {
         let (mut stream, _) = match listener.accept().await {
@@ -74,14 +87,14 @@ async fn run_verb_synthesis_llm(listener: tokio::net::TcpListener) {
                 }
             }
             let arguments = serde_json::json!({
-                "name": "check-host",
-                "description": "Inspect one host",
-                "binary": "uptime",
-                "args": [],
+                "name": "check-compiler",
+                "description": "Inspect compiler version",
+                "binary": "rustc",
+                "args": ["--version"],
                 "params": {},
                 "consequence": "reversible",
                 "trusted": false,
-                "evidence": "The exact uptime command is read only."
+                "evidence": "The exact compiler version command is read only."
             })
             .to_string();
             let body = serde_json::json!({
@@ -109,6 +122,1425 @@ async fn run_verb_synthesis_llm(listener: tokio::net::TcpListener) {
             let _ = stream.shutdown().await;
         });
     }
+}
+
+#[tokio::test]
+async fn synthesized_verbs_default_to_session_scope() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(run_verb_synthesis_llm(listener));
+
+    let (mut cfg, _) = make_test_config();
+    cfg.state.evaluator = Arc::new(
+        Evaluator::new(
+            EvalConfig::default()
+                .llm_api_key("test-key".to_string())
+                .llm_api_url(url)
+                .llm_retries(0),
+        )
+        .unwrap(),
+    );
+    cfg.config.daemon_principal = PrincipalKey::from_uid(cfg.config.daemon_uid);
+    let daemon = CallerIdentity::Unix {
+        uid: cfg.config.daemon_uid,
+    };
+
+    let response = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::VerbCreate {
+            prose: "Inspect compiler version.".to_string(),
+            binary_hint: Some("rustc".to_string()),
+            preview: true,
+        },
+    )
+    .await;
+    let AdminResponse::VerbCreated { verb, .. } = response else {
+        panic!("expected synthesized verb, got {response:?}");
+    };
+    assert!(
+        !verb.baseline,
+        "prose synthesis must not create daemon-wide authority"
+    );
+}
+
+#[tokio::test]
+async fn approved_synthesized_access_executes_deterministically_without_catalog_file() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(run_verb_synthesis_llm(listener));
+
+    let (mut cfg, _) = make_test_config();
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.config.gate = GateMode::Consequence;
+    cfg.state.evaluator = Arc::new(
+        Evaluator::new(
+            EvalConfig::default()
+                .llm_api_key("test-key".to_string())
+                .llm_api_url(url)
+                .llm_retries(0),
+        )
+        .unwrap(),
+    );
+    let initial_catalog_version = cfg.state.verbs.read().await.version();
+    let worker = CallerIdentity::Unix { uid: 1001 };
+    let daemon = CallerIdentity::Unix { uid: 777 };
+    let AdminResponse::AccessItem { item } = handle_admin_request(
+        &cfg,
+        &worker,
+        AdminRequest::AccessRequest {
+            intent: "Inspect compiler version with a synthesized diagnostic".to_string(),
+        },
+    )
+    .await
+    else {
+        panic!("expected synthesized access request")
+    };
+    assert_eq!(
+        cfg.state.verbs.read().await.version(),
+        initial_catalog_version
+    );
+    assert!(
+        cfg.state.grant_requests.read().await[&item.reference]
+            .proposed_verbs
+            .len()
+            == 1
+    );
+
+    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::AccessApprove {
+            handles: vec![item.reference],
+            uses: Some(1),
+        },
+    )
+    .await
+    else {
+        panic!("expected synthesized approval")
+    };
+    assert!(items[0].success, "approval failed: {:?}", items[0]);
+    let generated = cfg
+        .state
+        .verbs
+        .read()
+        .await
+        .list()
+        .into_iter()
+        .find(|verb| verb.name.starts_with("access-generated-"))
+        .expect("approved generated coverage is installed");
+    assert!(generated.trusted);
+    assert!(!generated.baseline);
+    let access_token = cfg
+        .state
+        .sessions
+        .read()
+        .await
+        .access_token_for_principal(&PrincipalKey::from_uid(1001))
+        .expect("approval creates a principal-bound access session");
+    assert!(
+        cfg.state
+            .sessions
+            .read()
+            .await
+            .verb_scope_for(&access_token)
+            .expect("access session remains live")
+            .0
+            .contains(&generated.name),
+        "approved generated coverage must be active in the access session"
+    );
+    assert_eq!(
+        cfg.state
+            .verbs
+            .read()
+            .await
+            .match_command_all("rustc", &["--version".to_string()])
+            .len(),
+        1,
+        "approved generated coverage must match its synthesized command"
+    );
+
+    let mut request =
+        request_with_session("rustc", vec!["--version".to_string()], "unused".to_string());
+    request.session_token = None;
+    let first = execute_command(request.clone(), &cfg, &worker)
+        .await
+        .into_response();
+    assert!(first.allowed, "first approved execution denied: {first:?}");
+    assert_eq!(
+        cfg.state
+            .sessions
+            .read()
+            .await
+            .aggregate_access_uses(&access_token),
+        Some(Some(0)),
+        "the once approval must be consumed at the first admission: {first:?}"
+    );
+    let denied = execute_command(request, &cfg, &worker)
+        .await
+        .into_response();
+    assert!(!denied.allowed);
+    assert!(denied.reason.contains("use limit is exhausted"));
+    assert!(denied.handle.is_some());
+}
+
+#[tokio::test]
+async fn equivalent_synthesized_access_converges_across_principals() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(run_verb_synthesis_llm(listener));
+
+    let (mut cfg, _) = make_test_config();
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.config.gate = GateMode::Consequence;
+    cfg.state.evaluator = Arc::new(
+        Evaluator::new(
+            EvalConfig::default()
+                .llm_api_key("test-key".to_string())
+                .llm_api_url(url)
+                .llm_retries(0),
+        )
+        .unwrap(),
+    );
+    let daemon = CallerIdentity::Unix { uid: 777 };
+    let first_principal = CallerIdentity::Unix { uid: 1001 };
+    let second_principal = CallerIdentity::Unix { uid: 1002 };
+
+    let AdminResponse::AccessItem { item: first } = handle_admin_request(
+        &cfg,
+        &first_principal,
+        AdminRequest::AccessRequest {
+            intent: "Inspect the first compiler version".to_string(),
+        },
+    )
+    .await
+    else {
+        panic!("expected first generated request")
+    };
+    let AdminResponse::AccessItem { item: second } = handle_admin_request(
+        &cfg,
+        &second_principal,
+        AdminRequest::AccessRequest {
+            intent: "Check the compiler version on another independent host".to_string(),
+        },
+    )
+    .await
+    else {
+        panic!("expected second generated request")
+    };
+    assert_eq!(first.capabilities.len(), 1);
+    assert_eq!(second.capabilities.len(), 1);
+    assert_eq!(first.capabilities[0].verb, second.capabilities[0].verb);
+    assert_eq!(
+        first.capabilities[0].matcher,
+        second.capabilities[0].matcher
+    );
+    assert_eq!(first.capabilities[0].matcher_digest.len(), 64);
+    assert_eq!(
+        first.capabilities[0].matcher_digest,
+        second.capabilities[0].matcher_digest
+    );
+    assert_eq!(
+        cfg.state.grant_requests.read().await[&first.reference].proposed_verbs,
+        cfg.state.grant_requests.read().await[&second.reference].proposed_verbs,
+        "request-specific prose must not alter canonical generated authority"
+    );
+
+    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::AccessApprove {
+            handles: vec![first.reference, second.reference],
+            uses: Some(1),
+        },
+    )
+    .await
+    else {
+        panic!("expected generated batch approval")
+    };
+    assert!(
+        items.iter().all(|item| item.success),
+        "equivalent approvals must converge: {items:?}"
+    );
+}
+
+#[tokio::test]
+async fn pending_reused_generated_access_survives_revoke_and_restart() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(run_verb_synthesis_llm(listener));
+
+    let (mut cfg, _) = make_test_config();
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.config.gate = GateMode::Consequence;
+    cfg.state.evaluator = Arc::new(
+        Evaluator::new(
+            EvalConfig::default()
+                .llm_api_key("test-key".to_string())
+                .llm_api_url(url)
+                .llm_retries(0),
+        )
+        .unwrap(),
+    );
+    let temporary = tempfile::tempdir().unwrap();
+    let state_db = temporary.path().join("state.db");
+    let store = SessionStore::open(state_db.clone(), 3_600).await.unwrap();
+    cfg.state.session_store = Some(store.clone());
+    let daemon = CallerIdentity::Unix { uid: 777 };
+    let worker = CallerIdentity::Unix { uid: 1001 };
+
+    let AdminResponse::AccessItem { item: initial } = handle_admin_request(
+        &cfg,
+        &worker,
+        AdminRequest::AccessRequest {
+            intent: "Inspect the compiler version before maintenance".to_string(),
+        },
+    )
+    .await
+    else {
+        panic!("expected initial generated request")
+    };
+    let generated_name = initial.capabilities[0].verb.clone();
+    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::AccessApprove {
+            handles: vec![initial.reference],
+            uses: None,
+        },
+    )
+    .await
+    else {
+        panic!("expected initial generated approval")
+    };
+    assert!(items[0].success, "initial approval failed: {items:?}");
+    let target = items[0].target.clone().unwrap();
+    let AdminResponse::AccessDecisions { items } =
+        handle_admin_request(&cfg, &daemon, AdminRequest::AccessRevoke { target }).await
+    else {
+        panic!("expected generated access revoke")
+    };
+    assert!(items[0].success);
+
+    let response = handle_admin_request(
+        &cfg,
+        &worker,
+        AdminRequest::AccessRequest {
+            intent: "Check the maintenance compiler version".to_string(),
+        },
+    )
+    .await;
+    let AdminResponse::AccessItem { item: pending } = response else {
+        panic!("expected reused generated request, got {response:?}")
+    };
+    assert_eq!(pending.capabilities[0].verb, generated_name);
+    let durable_pending = store
+        .load_grant_request(pending.reference.clone())
+        .await
+        .unwrap()
+        .expect("pending generated request is durable");
+    assert_eq!(
+        durable_pending.status,
+        crate::grant_profile::GrantRequestStatus::Pending
+    );
+    assert_eq!(durable_pending.proposed_verbs.len(), 1);
+
+    let (mut restarted, _) = make_test_config();
+    restarted.config.daemon_uid = 777;
+    restarted.config.daemon_principal = PrincipalKey::from_uid(777);
+    restarted.config.gate = GateMode::Consequence;
+    let restarted_store = SessionStore::open(state_db, 3_600).await.unwrap();
+    restarted.state.session_store = Some(restarted_store.clone());
+    *restarted.state.sessions.write().await = restarted_store.load_registry().await.unwrap();
+    *restarted.state.grant_requests.write().await = restarted_store
+        .load_grant_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|request| (request.handle.clone(), request))
+        .collect();
+    assert!(restarted
+        .state
+        .verbs
+        .read()
+        .await
+        .get(&generated_name)
+        .is_none());
+
+    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+        &restarted,
+        &daemon,
+        AdminRequest::AccessApprove {
+            handles: vec![pending.reference],
+            uses: Some(1),
+        },
+    )
+    .await
+    else {
+        panic!("expected restarted generated approval")
+    };
+    assert!(items[0].success, "restart approval failed: {items:?}");
+    assert!(restarted
+        .state
+        .verbs
+        .read()
+        .await
+        .get(&generated_name)
+        .is_some());
+}
+
+#[tokio::test]
+async fn full_access_queue_rejects_before_synthesis_or_catalog_change() {
+    let (mut cfg, _) = make_test_config();
+    cfg.state.evaluator = Arc::new(
+        Evaluator::new(
+            EvalConfig::default()
+                .llm_api_key("test-key".to_string())
+                .llm_api_url("http://127.0.0.1:9".to_string())
+                .llm_retries(0),
+        )
+        .unwrap(),
+    );
+    for index in 0..crate::server::admin::MAX_GRANT_REQUESTS {
+        let request = crate::grant_profile::GrantRequest::new(
+            format!("fixture-{index}"),
+            None,
+            crate::grant_profile::GrantRequestDelta {
+                prompt_append: Some(format!("fixture-{index}")),
+                ..Default::default()
+            },
+            format!("fixture-{index}"),
+        )
+        .unwrap();
+        cfg.state
+            .grant_requests
+            .write()
+            .await
+            .insert(request.handle.clone(), request);
+    }
+    let before = cfg.state.verbs.read().await.version();
+    let response = handle_admin_request(
+        &cfg,
+        &CallerIdentity::Unix { uid: 1001 },
+        AdminRequest::AccessRequest {
+            intent: "Run a novel diagnostic that has no catalog match".to_string(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        response,
+        AdminResponse::Error { message } if message.contains("queue is full")
+    ));
+    assert_eq!(cfg.state.verbs.read().await.version(), before);
+}
+
+#[tokio::test]
+async fn access_request_is_principal_bound_coalesced_batched_and_bounded() {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.config.gate = GateMode::Consequence;
+    cfg.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            "verbs:\n  - name: inspect-fixture\n    description: Inspect fixture\n    binary: rustc\n    args: [--version]\n    baseline: false\n    consequence: reversible\n    trusted: true\n  - name: operate-fixture\n    description: Operate fixture\n    binary: rustc\n    args: [--print, sysroot]\n    baseline: false\n    consequence: reversible\n    trusted: true\n  - name: baseline-fixture\n    description: Run baseline fixture\n    binary: rustc\n    args: [--print, target-libdir]\n    baseline: true\n    consequence: reversible\n    trusted: true\n  - name: missing-fixture\n    description: Run missing fixture binary\n    binary: guard-missing-fixture-binary\n    args: []\n    baseline: false\n    consequence: reversible\n    trusted: true\n",
+        )
+        .unwrap(),
+    ));
+    let tmp = tempfile::tempdir().unwrap();
+    cfg.state.session_store = Some(
+        SessionStore::open(tmp.path().join("state.db"), 3600)
+            .await
+            .unwrap(),
+    );
+    let daemon = CallerIdentity::Unix { uid: 777 };
+    let worker = CallerIdentity::Unix { uid: 1001 };
+    let other = CallerIdentity::Unix { uid: 1002 };
+
+    let request = || AdminRequest::AccessRequest {
+        intent: "Inspect fixture".to_string(),
+    };
+    let AdminResponse::AccessItem { item: first } =
+        handle_admin_request(&cfg, &worker, request()).await
+    else {
+        panic!("expected access request")
+    };
+    let AdminResponse::AccessItem { item: retry } =
+        handle_admin_request(&cfg, &worker, request()).await
+    else {
+        panic!("expected coalesced access request")
+    };
+    let AdminResponse::AccessItem { item: isolated } =
+        handle_admin_request(&cfg, &other, request()).await
+    else {
+        panic!("expected isolated access request")
+    };
+    assert_eq!(first.reference, retry.reference);
+    assert_ne!(first.reference, isolated.reference);
+    assert_eq!(first.requester, "1001");
+    assert_eq!(
+        first.next_action,
+        format!("guard access show {}", first.reference)
+    );
+    assert!(first
+        .approval_options
+        .contains(&format!("guard access approve {} --once", first.reference)));
+
+    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::AccessApprove {
+            handles: vec![first.reference.clone(), "missing-request".to_string()],
+            uses: Some(1),
+        },
+    )
+    .await
+    else {
+        panic!("expected per-item access decisions")
+    };
+    assert!(items[0].success);
+    assert!(!items[1].success);
+    assert_eq!(items[0].remaining_uses, Some(1));
+    let AdminResponse::AccessItem {
+        item: approved_retry,
+    } = handle_admin_request(&cfg, &worker, request()).await
+    else {
+        panic!("expected approved request retry")
+    };
+    assert_eq!(approved_retry.reference, first.reference);
+    assert_eq!(approved_retry.state, "approved");
+
+    let worker_items = handle_admin_request(&cfg, &worker, AdminRequest::AccessList).await;
+    let AdminResponse::AccessItems {
+        items: worker_items,
+    } = worker_items
+    else {
+        panic!("expected access list")
+    };
+    assert!(worker_items.iter().all(|item| item.requester == "1001"));
+    assert!(!worker_items
+        .iter()
+        .any(|item| item.reference == isolated.reference));
+
+    let mut baseline = request_with_session(
+        "rustc",
+        vec!["--print".to_string(), "target-libdir".to_string()],
+        "unused".to_string(),
+    );
+    baseline.session_token = None;
+    assert!(execute_command(baseline, &cfg, &worker)
+        .await
+        .policy_allowed());
+    let remaining_before_access = {
+        let sessions = cfg.state.sessions.read().await;
+        let token = sessions
+            .access_token_for_principal(&PrincipalKey::from_uid(1001))
+            .unwrap();
+        sessions.aggregate_access_uses(&token).flatten()
+    };
+    assert_eq!(remaining_before_access, Some(1));
+
+    let mut reevaluate_escape = request_with_session(
+        "rustc",
+        vec!["--print".to_string(), "cfg".to_string()],
+        "unused".to_string(),
+    );
+    reevaluate_escape.session_token = None;
+    reevaluate_escape.reevaluate = true;
+    let reevaluate_denied = execute_command(reevaluate_escape, &cfg, &worker).await;
+    assert!(!reevaluate_denied.policy_allowed());
+    assert!(
+        reevaluate_denied
+            .policy_reason()
+            .contains("session policy-only mode"),
+        "unexpected denial: {}",
+        reevaluate_denied.policy_reason()
+    );
+
+    let mut execution =
+        request_with_session("rustc", vec!["--version".to_string()], "unused".to_string());
+    execution.session_token = None;
+    let (first_run, second_run) = tokio::join!(
+        execute_command(execution.clone(), &cfg, &worker),
+        execute_command(execution, &cfg, &worker)
+    );
+    let admitted = [&first_run, &second_run]
+        .into_iter()
+        .filter(|result| result.policy_allowed())
+        .count();
+    assert_eq!(admitted, 1);
+    let denied = [&first_run, &second_run]
+        .into_iter()
+        .find(|result| !result.policy_allowed())
+        .unwrap();
+    assert!(denied.policy_reason().contains("use limit is exhausted"));
+
+    let AdminResponse::AccessItem {
+        item: ordinary_request,
+    } = handle_admin_request(
+        &cfg,
+        &worker,
+        AdminRequest::AccessRequest {
+            intent: "Operate fixture".to_string(),
+        },
+    )
+    .await
+    else {
+        panic!("expected independent ordinary access request")
+    };
+    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::AccessApprove {
+            handles: vec![ordinary_request.reference],
+            uses: None,
+        },
+    )
+    .await
+    else {
+        panic!("expected ordinary access approval")
+    };
+    assert!(items[0].success);
+    for _ in 0..2 {
+        let mut operate = request_with_session(
+            "rustc",
+            vec!["--print".to_string(), "sysroot".to_string()],
+            "unused".to_string(),
+        );
+        operate.session_token = None;
+        assert!(execute_command(operate, &cfg, &worker)
+            .await
+            .policy_allowed());
+    }
+    let mut exhausted_inspect =
+        request_with_session("rustc", vec!["--version".to_string()], "unused".to_string());
+    exhausted_inspect.session_token = None;
+    let denied = execute_command(exhausted_inspect.clone(), &cfg, &worker)
+        .await
+        .into_response();
+    assert!(!denied.allowed);
+    assert!(denied.reason.contains("use limit is exhausted"));
+    let followup = denied
+        .handle
+        .expect("an exhausted access session receives a new durable request");
+    let pending_revision = cfg.state.grant_requests.read().await[&followup]
+        .issued_session_revision
+        .clone();
+    let live_token = cfg
+        .state
+        .sessions
+        .read()
+        .await
+        .access_token_for_principal(&PrincipalKey::from_uid(1001))
+        .unwrap();
+    assert_eq!(
+        pending_revision,
+        cfg.state
+            .sessions
+            .read()
+            .await
+            .effective_revision_key(&live_token),
+        "the denial request must bind the post-admission authority revision"
+    );
+    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::AccessApprove {
+            handles: vec![followup],
+            uses: Some(1),
+        },
+    )
+    .await
+    else {
+        panic!("expected follow-up access decision")
+    };
+    assert!(
+        items[0].success,
+        "follow-up approval failed: {:?}",
+        items[0]
+    );
+    assert!(execute_command(exhausted_inspect, &cfg, &worker)
+        .await
+        .policy_allowed());
+
+    let restored = cfg
+        .state
+        .session_store
+        .as_ref()
+        .unwrap()
+        .load_registry()
+        .await
+        .unwrap();
+    let restored_access = restored
+        .list()
+        .into_iter()
+        .find(|summary| summary.owner.label() == "1001")
+        .unwrap();
+    assert!(restored.static_only_for(&restored_access.token));
+    assert_eq!(
+        restored
+            .access_grant_uses(&restored_access.token, &first.reference)
+            .and_then(|(_, remaining)| remaining),
+        Some(0)
+    );
+
+    let AdminResponse::AccessItem {
+        item: spawn_request,
+    } = handle_admin_request(
+        &cfg,
+        &other,
+        AdminRequest::AccessRequest {
+            intent: "Run missing fixture binary".to_string(),
+        },
+    )
+    .await
+    else {
+        panic!("expected spawn-failure access request")
+    };
+    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::AccessApprove {
+            handles: vec![spawn_request.reference.clone()],
+            uses: Some(1),
+        },
+    )
+    .await
+    else {
+        panic!("expected spawn-failure approval")
+    };
+    assert!(items[0].success);
+    let mut missing = request_with_session(
+        "guard-missing-fixture-binary",
+        Vec::new(),
+        "unused".to_string(),
+    );
+    missing.session_token = None;
+    let failed_spawn = execute_command(missing, &cfg, &other).await;
+    assert!(failed_spawn.policy_allowed());
+    assert!(matches!(
+        failed_spawn.exec,
+        ExecOutcome::Failed { started: false, .. }
+    ));
+    let restored = cfg
+        .state
+        .session_store
+        .as_ref()
+        .unwrap()
+        .load_registry()
+        .await
+        .unwrap();
+    let other_access = restored
+        .list()
+        .into_iter()
+        .find(|summary| summary.owner.label() == "1002")
+        .unwrap();
+    assert_eq!(
+        restored
+            .access_grant_uses(&other_access.token, &spawn_request.reference)
+            .and_then(|(_, remaining)| remaining),
+        Some(0)
+    );
+
+    let target = crate::session::session_reference(&restored_access.token);
+    let extension = AdminRequest::AccessExtend {
+        target: target.clone(),
+        intent: "Inspect fixture".to_string(),
+        uses: Some(2),
+    };
+    let AdminResponse::AccessDecisions { items: extended } =
+        handle_admin_request(&cfg, &daemon, extension.clone()).await
+    else {
+        panic!("expected access extension")
+    };
+    assert!(extended[0].success);
+    assert_eq!(extended[0].remaining_uses, Some(2));
+    let AdminResponse::AccessDecisions { items: retried } =
+        handle_admin_request(&cfg, &daemon, extension.clone()).await
+    else {
+        panic!("expected idempotent access extension")
+    };
+    assert_eq!(retried[0].request, extended[0].request);
+    assert_eq!(retried[0].remaining_uses, Some(2));
+
+    let mut one_use =
+        request_with_session("rustc", vec!["--version".to_string()], "unused".to_string());
+    one_use.session_token = None;
+    assert!(execute_command(one_use, &cfg, &worker)
+        .await
+        .policy_allowed());
+    let AdminResponse::AccessDecisions {
+        items: retry_after_use,
+    } = handle_admin_request(&cfg, &daemon, extension).await
+    else {
+        panic!("expected converged access extension")
+    };
+    assert_eq!(retry_after_use[0].remaining_uses, Some(1));
+
+    assert!(matches!(
+        handle_admin_request(
+            &cfg,
+            &worker,
+            AdminRequest::AccessRevoke {
+                target: target.clone()
+            }
+        )
+        .await,
+        AdminResponse::Error { .. }
+    ));
+    let AdminResponse::AccessDecisions { items } =
+        handle_admin_request(&cfg, &daemon, AdminRequest::AccessRevoke { target }).await
+    else {
+        panic!("expected access revoke result")
+    };
+    assert!(items[0].success);
+    assert_eq!(items[0].state, "revoked");
+    let restored = cfg
+        .state
+        .session_store
+        .as_ref()
+        .unwrap()
+        .load_registry()
+        .await
+        .unwrap();
+    assert!(restored
+        .access_token_for_principal(&PrincipalKey::from_uid(1001))
+        .is_none());
+}
+
+#[tokio::test]
+async fn sequential_approval_keeps_fresh_sibling_extensions_valid() {
+    let (mut cfg, _) = make_test_config();
+    let state = tempfile::tempdir().unwrap();
+    cfg.state.session_store = Some(
+        SessionStore::open(state.path().join("state.db"), 3600)
+            .await
+            .unwrap(),
+    );
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            "verbs:\n  - name: inspect-a\n    description: Inspect system A\n    binary: true\n    args: []\n    baseline: false\n    consequence: reversible\n    trusted: true\n  - name: inspect-b\n    description: Inspect system B\n    binary: printf\n    args: [b]\n    baseline: false\n    consequence: reversible\n    trusted: true\n  - name: inspect-c\n    description: Inspect system C\n    binary: printf\n    args: [c]\n    baseline: false\n    consequence: reversible\n    trusted: true\n",
+        )
+        .unwrap(),
+    ));
+    let worker = CallerIdentity::Unix { uid: 1001 };
+    let daemon = CallerIdentity::Unix { uid: 777 };
+    let AdminResponse::AccessItem { item: initial } = handle_admin_request(
+        &cfg,
+        &worker,
+        AdminRequest::AccessRequest {
+            intent: "Inspect system A".to_string(),
+        },
+    )
+    .await
+    else {
+        panic!("expected initial access request")
+    };
+    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::AccessApprove {
+            handles: vec![initial.reference],
+            uses: None,
+        },
+    )
+    .await
+    else {
+        panic!("expected initial approval")
+    };
+    assert!(items[0].success);
+
+    let mut pending = Vec::new();
+    for intent in ["Inspect system B", "Inspect system C"] {
+        let AdminResponse::AccessItem { item } = handle_admin_request(
+            &cfg,
+            &worker,
+            AdminRequest::AccessRequest {
+                intent: intent.to_string(),
+            },
+        )
+        .await
+        else {
+            panic!("expected sibling extension request")
+        };
+        pending.push(item.reference);
+    }
+    let issued_revisions = {
+        let requests = cfg.state.grant_requests.read().await;
+        pending
+            .iter()
+            .map(|handle| requests[handle].issued_session_revision.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(issued_revisions[0], issued_revisions[1]);
+
+    for handle in pending.clone() {
+        let AdminResponse::AccessDecisions { items } = handle_admin_request(
+            &cfg,
+            &daemon,
+            AdminRequest::AccessApprove {
+                handles: vec![handle],
+                uses: Some(2),
+            },
+        )
+        .await
+        else {
+            panic!("expected sibling decision")
+        };
+        assert!(
+            items[0].success,
+            "sequential sibling approval must rebase pending requests: {items:?}"
+        );
+    }
+    let durable = cfg
+        .state
+        .session_store
+        .as_ref()
+        .unwrap()
+        .load_grant_requests()
+        .await
+        .unwrap();
+    assert!(durable.iter().all(|request| {
+        !pending.contains(&request.handle)
+            || request.status == crate::grant_profile::GrantRequestStatus::Approved
+    }));
+}
+
+#[tokio::test]
+async fn access_approval_and_revoke_retry_one_registry_generation_conflict() {
+    let (mut cfg, _) = make_test_config();
+    let state = tempfile::tempdir().unwrap();
+    let database = state.path().join("state.db");
+    cfg.state.session_store = Some(SessionStore::open(database.clone(), 3600).await.unwrap());
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            "verbs:\n  - name: inspect-a\n    description: Inspect system A\n    binary: true\n    args: []\n    baseline: false\n    consequence: reversible\n    trusted: true\n",
+        )
+        .unwrap(),
+    ));
+    let worker = CallerIdentity::Unix { uid: 1001 };
+    let daemon = CallerIdentity::Unix { uid: 777 };
+    let AdminResponse::AccessItem { item: pending } = handle_admin_request(
+        &cfg,
+        &worker,
+        AdminRequest::AccessRequest {
+            intent: "Inspect system A".to_string(),
+        },
+    )
+    .await
+    else {
+        panic!("expected access request")
+    };
+
+    let competing = SessionStore::open(database.clone(), 3600).await.unwrap();
+    let mut advanced = competing.load_registry().await.unwrap();
+    advanced.grant(
+        "unrelated-before-approval".to_string(),
+        granted_session_owned(2001, Vec::new(), Vec::new()),
+    );
+    competing.persist_registry(&advanced).await.unwrap();
+
+    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::AccessApprove {
+            handles: vec![pending.reference],
+            uses: None,
+        },
+    )
+    .await
+    else {
+        panic!("expected access approval")
+    };
+    assert!(items[0].success, "approval did not retry: {items:?}");
+    let target = items[0].target.clone().unwrap();
+    assert!(cfg
+        .state
+        .sessions
+        .read()
+        .await
+        .has("unrelated-before-approval"));
+
+    let competing = SessionStore::open(database, 3600).await.unwrap();
+    let mut advanced = competing.load_registry().await.unwrap();
+    advanced.grant(
+        "unrelated-before-revoke".to_string(),
+        granted_session_owned(2002, Vec::new(), Vec::new()),
+    );
+    competing.persist_registry(&advanced).await.unwrap();
+
+    let AdminResponse::AccessDecisions { items } =
+        handle_admin_request(&cfg, &daemon, AdminRequest::AccessRevoke { target }).await
+    else {
+        panic!("expected access revoke")
+    };
+    assert!(items[0].success, "revoke did not retry: {items:?}");
+    assert!(cfg
+        .state
+        .sessions
+        .read()
+        .await
+        .has("unrelated-before-revoke"));
+}
+
+#[tokio::test]
+async fn multi_request_admission_audits_every_consumed_budget() {
+    let (mut cfg, _) = make_test_config();
+    let (audit_directory, _audit) = super::attach_test_audit_log(&mut cfg);
+    cfg.state.sessions.write().await.grant(
+        "multi-budget".to_string(),
+        SessionGrant {
+            allow: Vec::new(),
+            deny: Vec::new(),
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            activated_verbs: vec!["verb-a".to_string(), "verb-b".to_string()],
+            override_markers: Vec::new(),
+            scope: IssuedGrantScope {
+                access_managed: true,
+                access_grants: vec![
+                    AccessUseGrant {
+                        request: "gr-budget-a".to_string(),
+                        verbs: vec!["verb-a".to_string()],
+                        use_limit: Some(1),
+                        remaining_uses: Some(1),
+                        pending: false,
+                    },
+                    AccessUseGrant {
+                        request: "gr-budget-b".to_string(),
+                        verbs: vec!["verb-b".to_string()],
+                        use_limit: Some(2),
+                        remaining_uses: Some(2),
+                        pending: false,
+                    },
+                ],
+                ..IssuedGrantScope::default()
+            },
+            expires_at: Some(crate::server::gate_runtime::now_unix().saturating_add(60)),
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            static_only: true,
+            auto_amend: false,
+            granted_at: 0,
+            owner: crate::session::SessionOwner::Principal(PrincipalKey::from_uid(1001)),
+        },
+    );
+    let request = request_with_session("true", Vec::new(), "multi-budget".to_string());
+    let admission = admit_access_use(
+        &cfg,
+        &request,
+        &["verb-a".to_string(), "verb-b".to_string()],
+        None,
+    )
+    .await
+    .expect("admission succeeds")
+    .expect("access-managed admission is recorded");
+    assert_eq!(admission.consumptions.len(), 2);
+
+    let audit = std::fs::read_to_string(audit_directory.path().join("audit.jsonl")).unwrap();
+    for request in ["gr-budget-a", "gr-budget-b"] {
+        assert_eq!(
+            audit
+                .matches(&format!("[\"access_request\",\"{request}\"]"))
+                .count(),
+            1,
+            "each decremented request receives an audit event: {audit}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn access_list_and_show_project_expiry_without_mutating_durable_requests() {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            "verbs:\n  - name: inspect-fixture\n    description: Inspect fixture\n    binary: true\n    args: []\n    baseline: false\n    consequence: reversible\n    trusted: true\n",
+        )
+        .unwrap(),
+    ));
+    let tmp = tempfile::tempdir().unwrap();
+    cfg.state.session_store = Some(
+        SessionStore::open(tmp.path().join("state.db"), 3600)
+            .await
+            .unwrap(),
+    );
+    let worker = CallerIdentity::Unix { uid: 1001 };
+    let AdminResponse::AccessItem { item } = handle_admin_request(
+        &cfg,
+        &worker,
+        AdminRequest::AccessRequest {
+            intent: "Inspect fixture".to_string(),
+        },
+    )
+    .await
+    else {
+        panic!("expected access request")
+    };
+    let mut expired = cfg.state.grant_requests.read().await[&item.reference].clone();
+    expired.expires_unix = 1;
+    cfg.state
+        .grant_requests
+        .write()
+        .await
+        .insert(item.reference.clone(), expired.clone());
+    cfg.state
+        .session_store
+        .as_ref()
+        .unwrap()
+        .save_grant_request(expired)
+        .await
+        .unwrap();
+
+    let AdminResponse::AccessItems { items } =
+        handle_admin_request(&cfg, &worker, AdminRequest::AccessList).await
+    else {
+        panic!("expected access list")
+    };
+    let listed = items
+        .iter()
+        .find(|listed| listed.reference == item.reference)
+        .expect("expired request remains visible");
+    assert_eq!(listed.state, "expired");
+    assert!(listed.approval_options.is_empty());
+
+    let AdminResponse::AccessItem { item: shown } = handle_admin_request(
+        &cfg,
+        &worker,
+        AdminRequest::AccessShow {
+            reference: item.reference.clone(),
+        },
+    )
+    .await
+    else {
+        panic!("expected access show")
+    };
+    assert_eq!(shown.state, "expired");
+    assert!(cfg
+        .state
+        .grant_requests
+        .read()
+        .await
+        .contains_key(&item.reference));
+    assert!(cfg
+        .state
+        .session_store
+        .as_ref()
+        .unwrap()
+        .load_grant_requests()
+        .await
+        .unwrap()
+        .iter()
+        .any(|stored| stored.handle == item.reference));
+}
+
+#[tokio::test]
+async fn access_extend_rejects_legacy_session_authority() {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.state.sessions.write().await.grant(
+        "legacy-session".to_string(),
+        granted_session_owned(1001, Vec::new(), Vec::new()),
+    );
+    let response = handle_admin_request(
+        &cfg,
+        &CallerIdentity::Unix { uid: 777 },
+        AdminRequest::AccessExtend {
+            target: crate::session::session_reference("legacy-session"),
+            intent: "Inspect fixture".to_string(),
+            uses: Some(1),
+        },
+    )
+    .await;
+    assert!(matches!(
+        response,
+        AdminResponse::Error { message } if message.contains("access-managed targets only")
+    ));
+}
+
+#[tokio::test]
+async fn revoked_access_session_cannot_be_resurrected_by_pending_extension() {
+    let (mut cfg, _) = make_test_config();
+    let state = tempfile::tempdir().unwrap();
+    cfg.state.session_store = Some(
+        SessionStore::open(state.path().join("state.db"), 3_600)
+            .await
+            .unwrap(),
+    );
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            "verbs:\n  - name: inspect-fixture\n    description: Inspect fixture\n    binary: true\n    args: []\n    baseline: false\n    consequence: reversible\n    trusted: true\n  - name: operate-fixture\n    description: Operate fixture\n    binary: printf\n    args: [operate]\n    baseline: false\n    consequence: reversible\n    trusted: true\n",
+        )
+        .unwrap(),
+    ));
+    let worker = CallerIdentity::Unix { uid: 1001 };
+    let daemon = CallerIdentity::Unix { uid: 777 };
+    let AdminResponse::AccessItem { item: initial } = handle_admin_request(
+        &cfg,
+        &worker,
+        AdminRequest::AccessRequest {
+            intent: "Inspect fixture".to_string(),
+        },
+    )
+    .await
+    else {
+        panic!("expected initial access request")
+    };
+    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::AccessApprove {
+            handles: vec![initial.reference],
+            uses: None,
+        },
+    )
+    .await
+    else {
+        panic!("expected initial approval")
+    };
+    assert!(items[0].success);
+    let target = items[0].target.clone().unwrap();
+
+    let AdminResponse::AccessItem { item: extension } = handle_admin_request(
+        &cfg,
+        &worker,
+        AdminRequest::AccessRequest {
+            intent: "Operate fixture".to_string(),
+        },
+    )
+    .await
+    else {
+        panic!("expected pending extension")
+    };
+    assert_eq!(extension.state, "pending");
+    assert!(matches!(
+        handle_admin_request(&cfg, &daemon, AdminRequest::AccessRevoke { target },).await,
+        AdminResponse::AccessDecisions { .. }
+    ));
+    assert_eq!(
+        cfg.state.grant_requests.read().await[&extension.reference].status,
+        crate::grant_profile::GrantRequestStatus::Withdrawn
+    );
+    let durable_extension = cfg
+        .state
+        .session_store
+        .as_ref()
+        .unwrap()
+        .load_grant_request(extension.reference.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        durable_extension.status,
+        crate::grant_profile::GrantRequestStatus::Withdrawn
+    );
+    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::AccessApprove {
+            handles: vec![extension.reference],
+            uses: Some(1),
+        },
+    )
+    .await
+    else {
+        panic!("expected extension decision")
+    };
+    assert!(!items[0].success);
+    assert_eq!(items[0].state, "withdrawn");
+    assert!(cfg
+        .state
+        .sessions
+        .read()
+        .await
+        .access_token_for_principal(&PrincipalKey::from_uid(1001))
+        .is_none());
+}
+
+#[tokio::test]
+async fn sessionless_denied_typed_command_returns_access_request_guidance() {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.config.gate = GateMode::Consequence;
+    cfg.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            "verbs:\n  - name: inspect-fixture\n    description: Inspect fixture\n    binary: fixture-inspect\n    args: [status]\n    baseline: false\n    consequence: reversible\n    trusted: true\n",
+        )
+        .unwrap(),
+    ));
+    let tmp = tempfile::tempdir().unwrap();
+    cfg.state.session_store = Some(
+        SessionStore::open(tmp.path().join("state.db"), 3600)
+            .await
+            .unwrap(),
+    );
+    let worker = CallerIdentity::Unix { uid: 1001 };
+    let mut request = request_with_session(
+        "fixture-inspect",
+        vec!["status".to_string()],
+        "unused".to_string(),
+    );
+    request.session_token = None;
+
+    let response = execute_command(request.clone(), &cfg, &worker)
+        .await
+        .into_response();
+    assert!(!response.allowed);
+    let handle = response
+        .handle
+        .as_deref()
+        .expect("denied typed command returns an access request");
+    let guidance = response
+        .verb_guidance
+        .as_deref()
+        .expect("denied typed command returns operator guidance");
+    for command in [
+        format!("guard access approve {handle}"),
+        format!("guard access approve {handle} --once"),
+        format!("guard access approve {handle} --uses 3"),
+    ] {
+        assert!(guidance.contains(&command), "missing {command}: {guidance}");
+    }
+
+    let retry = execute_command(request, &cfg, &worker)
+        .await
+        .into_response();
+    assert_eq!(retry.handle.as_deref(), Some(handle));
+}
+
+#[tokio::test]
+async fn sessionless_novel_denial_returns_exact_typed_request_guidance() {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.state.verbs = Arc::new(RwLock::new(VerbCatalog::empty()));
+    let worker = CallerIdentity::Unix { uid: 1001 };
+    let mut request = request_with_session(
+        "novel-fixture",
+        vec!["inspect".to_string()],
+        "unused".to_string(),
+    );
+    request.session_token = None;
+
+    let response = execute_command(request, &cfg, &worker)
+        .await
+        .into_response();
+    assert!(!response.allowed);
+    assert!(response.handle.is_none());
+    let guidance = response
+        .verb_guidance
+        .as_deref()
+        .expect("novel denial explains how to request typed access");
+    assert!(
+        guidance.contains("guard access request 'novel-fixture inspect'"),
+        "{guidance}"
+    );
+    assert!(guidance.contains("no durable access request was created"));
+}
+
+#[tokio::test]
+async fn hard_typed_denial_is_labeled_non_overridable_without_request() {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.config.gate = GateMode::Consequence;
+    cfg.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: block-fixture
+    binary: fixture-denied
+    baseline: true
+    consequence: reversible
+    coverage:
+      - name: protected
+        action: deny
+        required_args: ["status"]
+        sticky: true
+"#,
+        )
+        .unwrap(),
+    ));
+    let worker = CallerIdentity::Unix { uid: 1001 };
+    let mut request = request_with_session(
+        "fixture-denied",
+        vec!["status".to_string()],
+        "unused".to_string(),
+    );
+    request.session_token = None;
+
+    let response = execute_command(request, &cfg, &worker)
+        .await
+        .into_response();
+    assert!(!response.allowed);
+    assert!(response.handle.is_none());
+    assert!(response.access_requests.is_empty());
+    assert!(
+        response
+            .verb_guidance
+            .as_deref()
+            .is_some_and(|guidance| guidance.contains("non-overridable operator policy")),
+        "{response:?}"
+    );
+}
+
+#[tokio::test]
+async fn explicit_static_deny_text_cannot_become_an_access_request() {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = tmp.path().join("policy.yaml");
+    std::fs::write(
+        &policy,
+        r#"
+policy:
+  groups:
+    - name: protected
+      priority: 10
+      rules:
+        - patterns: ["fixture-denied*"]
+          action: deny
+          description: "explicit default-deny fixture"
+"#,
+    )
+    .unwrap();
+    cfg.state.evaluator = Arc::new(
+        Evaluator::new(EvalConfig::default().llm_enabled(false).policy_path(policy)).unwrap(),
+    );
+    let worker = CallerIdentity::Unix { uid: 1001 };
+    let mut request = request_with_session(
+        "fixture-denied",
+        vec!["status".to_string()],
+        "unused".to_string(),
+    );
+    request.session_token = None;
+
+    let response = execute_command(request, &cfg, &worker)
+        .await
+        .into_response();
+    assert!(!response.allowed);
+    assert!(response.reason.contains("explicit default-deny fixture"));
+    assert!(response.handle.is_none());
+    assert!(response.access_requests.is_empty());
+    assert!(
+        response
+            .verb_guidance
+            .as_deref()
+            .is_some_and(|guidance| guidance.contains("non-overridable operator policy")),
+        "{response:?}"
+    );
 }
 
 #[tokio::test]
@@ -184,6 +1616,26 @@ async fn kubeconfig_issuance_is_local_live_session_scoped_and_secret_free() {
         handle_admin_request(&cfg, &CallerIdentity::Unix { uid: 777 }, request()).await,
         AdminResponse::KubeconfigIssued { .. }
     ));
+
+    {
+        let mut sessions = cfg.state.sessions.write().await;
+        let mut access_managed = sessions.grants_snapshot().remove(token).unwrap();
+        access_managed.scope.access_managed = true;
+        sessions.grant("access-managed-kube".to_string(), access_managed);
+    }
+    match handle_admin_request(
+        &cfg,
+        &CallerIdentity::Unix { uid: 1_001 },
+        AdminRequest::KubeconfigIssue {
+            endpoint: "cluster-a".to_string(),
+            session_token: "access-managed-kube".to_string(),
+        },
+    )
+    .await
+    {
+        AdminResponse::Error { message } => assert!(message.contains("not reusable API")),
+        other => panic!("access-managed session minted a kubeconfig: {other:?}"),
+    }
     assert!(matches!(
         handle_admin_request(
             &cfg,
@@ -794,10 +2246,45 @@ fn tcp_admin_token_validation_is_separate_from_exec_token() {
             token: "exec-token".into(),
         })
         .is_err());
+
+    cfg.config.daemon_principal = PrincipalKey::from_raw("exec-token");
+    assert!(
+        cfg.validate_admin(&CallerIdentity::Tcp {
+            token: "exec-token".into(),
+        })
+        .is_err(),
+        "an ordinary TCP bearer must not become operator authority by colliding with the daemon principal"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn authenticated_windows_system_is_an_operator_without_broadening_other_callers() {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.daemon_principal = PrincipalKey::from_sid("S-1-5-80-12345");
+
+    assert!(cfg
+        .validate_admin(&CallerIdentity::Windows {
+            sid: "S-1-5-18".into(),
+        })
+        .is_ok());
+    assert!(cfg
+        .validate_admin(&CallerIdentity::Windows {
+            sid: "S-1-5-19".into(),
+        })
+        .is_err());
+    assert!(cfg
+        .validate_admin(&CallerIdentity::Unix { uid: 0 })
+        .is_err());
+    assert!(cfg
+        .validate_admin(&CallerIdentity::Tcp {
+            token: "S-1-5-18".into(),
+        })
+        .is_err());
 }
 
 #[tokio::test]
-async fn session_list_is_user_visible_but_prompt_is_hidden() {
+async fn session_list_omits_foreign_sessions() {
     let (mut cfg, _) = make_test_config();
     cfg.config.daemon_uid = 777;
     cfg.config.daemon_principal = PrincipalKey::from_uid(777);
@@ -840,19 +2327,9 @@ async fn session_list_is_user_visible_but_prompt_is_hidden() {
     )
     .await;
     match listed {
-        AdminResponse::SessionList { grants, .. } => {
-            let grant = grants.iter().find(|grant| grant.token == token).is_none();
-            assert!(grant, "non-daemon callers must not receive bearer tokens");
-            let hidden = grants
-                .iter()
-                .find(|grant| grant.token == "(hidden)")
-                .expect("redacted session grant visible to user");
-            assert!(hidden.allow.is_empty());
-            assert!(hidden.deny.is_empty());
-            assert!(hidden.allow_exact.is_empty());
-            assert!(hidden.deny_exact.is_empty());
-            assert_eq!(hidden.prompt_append.as_deref(), Some("(hidden)"));
-            assert!(hidden.generated_notes.is_empty());
+        AdminResponse::SessionList { grants, history } => {
+            assert!(grants.is_empty());
+            assert!(history.is_empty());
         }
         other => panic!("unexpected {:?}", other),
     }
@@ -923,6 +2400,134 @@ async fn session_list_shows_current_session_details_without_raw_token_for_user()
         }
         other => panic!("unexpected {:?}", other),
     }
+}
+
+#[tokio::test]
+async fn non_owner_session_list_omits_active_and_historical_rows() {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    let private_scope = IssuedGrantScope {
+        label: Some("private-label".to_string()),
+        saved_grant: Some("private-saved-grant".to_string()),
+        saved_revision: 9,
+        secret_names: vec!["private/credential".to_string()],
+        access_managed: true,
+        access_grants: vec![AccessUseGrant {
+            request: "gr-private-request".to_string(),
+            verbs: vec!["private-verb".to_string()],
+            use_limit: Some(3),
+            remaining_uses: Some(2),
+            pending: false,
+        }],
+        ..IssuedGrantScope::default()
+    };
+    let make_grant = || SessionGrant {
+        allow: Vec::new(),
+        deny: Vec::new(),
+        allow_exact: Vec::new(),
+        deny_exact: Vec::new(),
+        activated_verbs: vec!["private-verb".to_string()],
+        override_markers: Vec::new(),
+        scope: private_scope.clone(),
+        expires_at: None,
+        prompt_append: Some("private prompt".to_string()),
+        generated_notes: Vec::new(),
+        static_only: true,
+        auto_amend: false,
+        granted_at: 0,
+        owner: crate::session::SessionOwner::Principal(PrincipalKey::from_uid(1001)),
+    };
+    {
+        let mut sessions = cfg.state.sessions.write().await;
+        assert!(sessions.grant("private-active".to_string(), make_grant()));
+        assert!(sessions.grant("private-history".to_string(), make_grant()));
+        assert!(sessions.revoke("private-history"));
+    }
+
+    let AdminResponse::SessionList { grants, history } = handle_admin_request(
+        &cfg,
+        &CallerIdentity::Unix { uid: 2002 },
+        AdminRequest::SessionList {
+            include_history: true,
+            since_unix: None,
+            visible_token: None,
+        },
+    )
+    .await
+    else {
+        panic!("expected session list")
+    };
+    assert!(grants.is_empty());
+    assert!(history.is_empty());
+    let rendered = serde_json::to_string(&(grants, history)).unwrap();
+    for private in [
+        "private-label",
+        "private-saved-grant",
+        "private/credential",
+        "private-verb",
+        "gr-private-request",
+    ] {
+        assert!(!rendered.contains(private), "leaked {private}: {rendered}");
+    }
+}
+
+#[tokio::test]
+async fn archived_session_token_cannot_be_reissued_to_another_principal() {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    let daemon = CallerIdentity::Unix { uid: 777 };
+    let token = "archived-bearer".to_string();
+    let grant_for = |owner: &str| AdminRequest::SessionGrant {
+        token: token.clone(),
+        allow: vec!["fixture-command".to_string()],
+        deny: Vec::new(),
+        activated_verbs: Vec::new(),
+        override_markers: Vec::new(),
+        ttl_secs: None,
+        prompt_append: Some(format!("private owner {owner}")),
+        prose: None,
+        saved_grant: None,
+        profile: None,
+        evaluation_mode: None,
+        static_only: true,
+        auto_amend: false,
+        owner: Some(owner.to_string()),
+    };
+    assert!(matches!(
+        handle_admin_request(&cfg, &daemon, grant_for("1001")).await,
+        AdminResponse::Ok
+    ));
+    assert!(matches!(
+        handle_admin_request(
+            &cfg,
+            &daemon,
+            AdminRequest::SessionRevoke {
+                token: token.clone()
+            }
+        )
+        .await,
+        AdminResponse::Ok
+    ));
+    assert!(matches!(
+        handle_admin_request(&cfg, &daemon, grant_for("2002")).await,
+        AdminResponse::Error { message }
+            if message.contains("already issued")
+    ));
+    assert!(matches!(
+        handle_admin_request(
+            &cfg,
+            &CallerIdentity::Unix { uid: 2002 },
+            AdminRequest::SessionShow {
+                token,
+                limit: Some(1),
+                caller_token: None,
+            }
+        )
+        .await,
+        AdminResponse::Error { .. }
+    ));
 }
 
 #[tokio::test]
@@ -1167,7 +2772,7 @@ async fn session_show_other_token_denied_for_non_admin() {
                 evaluation_mode: None,
                 static_only: false,
                 auto_amend: false,
-                owner: None,
+                owner: Some("778".to_string()),
             },
         )
         .await;
@@ -1388,7 +2993,7 @@ async fn grant_requests_use_the_issued_ceiling_and_redact_session_tokens() {
                 evaluation_mode: None,
                 static_only: false,
                 auto_amend: false,
-                owner: None,
+                owner: Some("778".to_string()),
             },
         )
         .await,
@@ -1466,7 +3071,7 @@ async fn grant_requests_use_the_issued_ceiling_and_redact_session_tokens() {
             if items.len() == 1 && items[0].session_token.starts_with("sha256:")
     ));
 
-    let cross_session = handle_admin_request(
+    let replayed_caller_bearer = handle_admin_request(
         &cfg,
         &worker,
         AdminRequest::GrantRequestList {
@@ -1476,8 +3081,8 @@ async fn grant_requests_use_the_issued_ceiling_and_redact_session_tokens() {
     )
     .await;
     assert!(matches!(
-        cross_session,
-        AdminResponse::Error { message } if message.contains("only list its own")
+        replayed_caller_bearer,
+        AdminResponse::GrantRequests { items } if items.len() == 1
     ));
 
     let admin = handle_admin_request(
@@ -1503,11 +3108,10 @@ async fn grant_request_submit_enforces_suspension_quota_and_aggregate_size() {
     cfg.config.behavior_limits.max_denials = Some(1);
     let worker = CallerIdentity::Unix { uid: 778 };
     for token in ["suspended-request", "quota-request", "large-request"] {
-        cfg.state
-            .sessions
-            .write()
-            .await
-            .grant(token.to_string(), granted_session(Vec::new(), Vec::new()));
+        cfg.state.sessions.write().await.grant(
+            token.to_string(),
+            granted_session_owned(778, Vec::new(), Vec::new()),
+        );
     }
     cfg.state.sessions.write().await.record_interaction(
         "suspended-request",
@@ -1625,7 +3229,7 @@ async fn auto_and_operator_approval_fail_without_partial_session_authority() {
                     evaluation_mode: None,
                     static_only: false,
                     auto_amend: false,
-                    owner: None,
+                    owner: Some("778".to_string()),
                 },
             )
             .await,
@@ -1749,7 +3353,7 @@ async fn terminal_grant_request_races_have_one_durable_authority_outcome() {
                     evaluation_mode: None,
                     static_only: false,
                     auto_amend: false,
-                    owner: None,
+                    owner: Some("778".to_string()),
                 },
             )
             .await,
@@ -2105,11 +3709,11 @@ async fn grant_request_show_and_withdraw_require_the_issuing_session() {
     let worker = CallerIdentity::Unix { uid: 778 };
     cfg.state.sessions.write().await.grant(
         "owner-session".to_string(),
-        granted_session(Vec::new(), Vec::new()),
+        granted_session_owned(778, Vec::new(), Vec::new()),
     );
     cfg.state.sessions.write().await.grant(
         "victim-session".to_string(),
-        granted_session(Vec::new(), Vec::new()),
+        granted_session_owned(779, Vec::new(), Vec::new()),
     );
     let cross_session = handle_admin_request(
         &cfg,
@@ -2128,7 +3732,7 @@ async fn grant_request_show_and_withdraw_require_the_issuing_session() {
     .await;
     assert!(matches!(
         cross_session,
-        AdminResponse::Error { message } if message.contains("only request changes to itself")
+        AdminResponse::Error { message } if message.contains("session principal mismatch")
     ));
     assert!(matches!(
         handle_admin_request(
@@ -2231,11 +3835,10 @@ async fn withdraw_and_prune_keep_memory_when_persistence_fails() {
             .unwrap(),
     );
     let token = "persisted-request-owner".to_string();
-    cfg.state
-        .sessions
-        .write()
-        .await
-        .grant(token.clone(), granted_session(Vec::new(), Vec::new()));
+    cfg.state.sessions.write().await.grant(
+        token.clone(),
+        granted_session_owned(778, Vec::new(), Vec::new()),
+    );
     let mut request = crate::grant_profile::GrantRequest::new(
         token.clone(),
         None,
@@ -2550,7 +4153,7 @@ async fn grant_request_approval_rejects_expiry_and_stale_saved_revision() {
                 evaluation_mode: None,
                 static_only: false,
                 auto_amend: false,
-                owner: None,
+                owner: Some("778".to_string()),
             },
         )
         .await,
@@ -2638,11 +4241,10 @@ async fn grant_request_binds_unsaved_session_revision_and_prunes_expired_rows() 
     let daemon = CallerIdentity::Unix { uid: 777 };
     let worker = CallerIdentity::Unix { uid: 778 };
     let token = "unsaved-revision".to_string();
-    cfg.state
-        .sessions
-        .write()
-        .await
-        .grant(token.clone(), granted_session(Vec::new(), Vec::new()));
+    cfg.state.sessions.write().await.grant(
+        token.clone(),
+        granted_session_owned(778, Vec::new(), Vec::new()),
+    );
     let submit = |prompt: &str| AdminRequest::GrantRequestSubmit {
         session_token: token.clone(),
         caller_token: Some(token.clone()),
@@ -2732,11 +4334,10 @@ async fn grant_request_queue_is_bounded_and_recovers_capacity_from_expiry() {
     cfg.config.daemon_principal = PrincipalKey::from_uid(777);
     let worker = CallerIdentity::Unix { uid: 778 };
     let token = "bounded-queue-0".to_string();
-    cfg.state
-        .sessions
-        .write()
-        .await
-        .grant(token.clone(), granted_session(Vec::new(), Vec::new()));
+    cfg.state.sessions.write().await.grant(
+        token.clone(),
+        granted_session_owned(778, Vec::new(), Vec::new()),
+    );
     for index in 0..1024 {
         let request = crate::grant_profile::GrantRequest::new(
             format!("bounded-queue-{}", index / 32),

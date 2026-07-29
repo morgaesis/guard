@@ -60,6 +60,10 @@ Those examples are acceptable because the target and effect are visible. Do not
 deny them merely because they write files, refresh package indexes, or change
 service state.
 
+A bounded loop and its mechanically unrolled form have the same consequence
+when they resolve to the same operations. Do not reward repetition or penalize
+the concise loop solely because of its syntax.
+
 Authenticated API requests are a first-class pattern. `curl -u "$USER:$PASS"`,
 `curl -H "Authorization: Bearer $TOKEN"`, `wget --http-user=$USER
 --http-password=$PASS`, `http --auth=$USER:$PASS`, and equivalent

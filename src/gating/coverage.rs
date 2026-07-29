@@ -277,7 +277,7 @@ pub fn resolve_scoped_matches(
 
     let guidance = match decision {
         VerbDecision::Evaluate => Some(
-            "Matched verb coverage requires evaluator review. A denial should be escalated by asking the operator to expand the session grant or verb coverage."
+            "Matched verb coverage requires evaluator review. A denial should be escalated with `guard access request <intent>` so the operator can review the missing typed coverage."
                 .to_string(),
         ),
         VerbDecision::Conflict if plan_conflict => Some(
