@@ -85,9 +85,15 @@ jobs:
 
       - name: Report outdated dependencies
         run: |
-          if ! cargo outdated --exit-code 1; then
-            echo "::warning::Available dependency updates are listed above."
-          fi
+          set +e
+          cargo outdated --exit-code 3
+          status=$?
+          set -e
+          case "$status" in
+            0) ;;
+            3) echo "::warning::Available dependency updates are listed above." ;;
+            *) exit "$status" ;;
+          esac
 
   cargo_machete:
     name: Unused Dependencies
