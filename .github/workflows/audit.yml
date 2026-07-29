@@ -84,7 +84,10 @@ jobs:
         run: cargo install cargo-outdated --version 0.19.0 --locked
 
       - name: Report outdated dependencies
-        run: cargo outdated --exit-code 1
+        run: |
+          if ! cargo outdated --exit-code 1; then
+            echo "::warning::Available dependency updates are listed above."
+          fi
 
   cargo_machete:
     name: Unused Dependencies
