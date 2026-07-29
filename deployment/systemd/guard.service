@@ -14,14 +14,17 @@ EnvironmentFile=-/etc/default/guard
 # writable HOME/.ssh for ssh to record newly accepted host keys. Pin HOME to the
 # state directory and have systemd pre-create .ssh (owned by the guard user).
 Environment=HOME=/var/lib/guard
+# A numeric fail-closed default keeps the service startable before an operator
+# configures the authenticated agent UID list in /etc/default/guard.
+Environment=GUARD_ALLOWED_UIDS=0
 RuntimeDirectory=guard
 RuntimeDirectoryMode=0755
 StateDirectory=guard guard/.ssh
 StateDirectoryMode=0700
 UMask=0077
-# Set GUARD_ALLOWED_USERS to `--users UID[,UID...]` for a second authorization
-# boundary inside the guard-clients socket group.
-ExecStart=/usr/local/bin/guard server start --socket /run/guard/guard.sock --socket-group guard-clients --state-db /var/lib/guard/state.db ${GUARD_ALLOWED_USERS}
+# GUARD_ALLOWED_UIDS contains only UID[,UID...]. Keeping --users outside the
+# expansion makes systemd pass the option and its value as separate arguments.
+ExecStart=/usr/local/bin/guard server start --socket /run/guard/guard.sock --socket-group guard-clients --state-db /var/lib/guard/state.db --users ${GUARD_ALLOWED_UIDS}
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true

@@ -16,9 +16,11 @@
 #   allow  -> forward to the apiserver
 #   deny   -> reject at the proxy; the apiserver is never contacted
 #   hold   -> park the request for operator approval before it reaches the
-#             apiserver: the client blocks while `guard approvals` lists it,
-#             `guard approve` releases it, `guard deny` or TTL expiry fails it
-#             closed. Requires `--gate consequence`; without it, holds deny.
+#             apiserver: `guard access list` lists it, `guard access show
+#             <request>` inspects it, `guard access approve <request> --once`
+#             releases its immutable snapshot, and `guard access deny <request>`
+#             or TTL expiry fails it closed. Requires `--gate consequence`;
+#             without it, holds deny.
 #   evaluate -> ask the daemon's LLM evaluator. It judges the operation against
 #             the `intent` prose below using a redacted operation summary and
 #             whether an auto-revert is constructible for it; the verdict still

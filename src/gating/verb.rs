@@ -392,6 +392,12 @@ impl VerbCatalog {
                     verb.name
                 );
             }
+            if verb.name.starts_with("access-generated-") {
+                bail!(
+                    "verb name '{}' uses the reserved generated-access namespace",
+                    verb.name
+                );
+            }
             normalize_operator_boundaries(&mut verb);
             validate_verb(&verb)?;
             if verbs.insert(verb.name.clone(), verb.clone()).is_some() {
@@ -431,7 +437,25 @@ impl VerbCatalog {
         if current == self.mtime {
             return Ok(false);
         }
-        let reloaded = Self::load(&path)?;
+        let runtime_verbs = self
+            .verbs
+            .values()
+            .filter(|verb| {
+                verb.name.starts_with("grant-") || verb.name.starts_with("access-generated-")
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut reloaded = Self::load(&path)?;
+        for mut verb in runtime_verbs {
+            if verb.name.starts_with("grant-") {
+                reloaded.upsert_saved_grant_verb(verb)?;
+            } else {
+                // Approved generated coverage is trusted only in memory. Demote
+                // it back to its validated proposal form before reinstalling it.
+                verb.trusted = false;
+                reloaded.upsert_access_verb(verb)?;
+            }
+        }
         *self = reloaded;
         Ok(true)
     }
@@ -684,6 +708,44 @@ impl VerbCatalog {
         Ok(())
     }
 
+    /// Install approved prose-generated access coverage without writing the
+    /// operator-authored catalog. The exact candidate remains durable in its
+    /// approved access request and is restored from SQLite at startup.
+    pub fn upsert_access_verb(&mut self, mut verb: Verb) -> Result<()> {
+        validate_synthesized_safety(&verb)?;
+        if verb.baseline {
+            bail!("generated access coverage must not be baseline");
+        }
+        if !verb.name.starts_with("access-generated-") {
+            bail!(
+                "generated access verb '{}' must use the reserved 'access-generated-' prefix",
+                verb.name
+            );
+        }
+        // Synthesis proposes the matcher, not its safety class. Promotion may
+        // make the exact matcher deterministic, but consequence routing is
+        // derived locally so a model cannot label a mutation reversible.
+        verb.consequence = if synthesized_access_is_statically_read_only(&verb) {
+            Reversibility::Reversible
+        } else {
+            Reversibility::Irreversible
+        };
+        verb.revert = None;
+        verb.trusted = true;
+        if let Some(existing) = self.verbs.get(&verb.name) {
+            if serde_json::to_value(existing)? == serde_json::to_value(&verb)? {
+                return Ok(());
+            }
+            bail!(
+                "generated access verb '{}' conflicts with catalog state",
+                verb.name
+            );
+        }
+        self.verbs.insert(verb.name.clone(), verb);
+        self.refresh_version()?;
+        Ok(())
+    }
+
     pub fn remove_saved_grant_verbs(&mut self, grant_name: &str) -> Result<usize> {
         let prefix = format!("grant-{grant_name}-");
         let before = self.verbs.len();
@@ -704,7 +766,9 @@ impl VerbCatalog {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("unknown verb: '{}'", name))?;
         if name.starts_with("grant-") {
-            bail!("delete saved-grant coverage through `guard grant delete`");
+            bail!(
+                "saved-grant coverage cannot be deleted directly; use `guard access revoke <session-or-agent>`"
+            );
         }
         let path = self.path.clone().ok_or_else(|| {
             anyhow::anyhow!("verb catalog is not backed by a file; cannot delete a verb")
@@ -967,8 +1031,8 @@ fn coverage_cell_matches(
                 .map(|constraint| ("namespace", constraint)),
         )
     {
-        let values = matched_values(constraint, args)?;
-        add_constraint_features(&mut features, &mut specificity, kind, constraint, &values);
+        matched_values(constraint, args)?;
+        add_constraint_features(&mut features, &mut specificity, kind, constraint);
     }
 
     if let Some(fanout) = &cell.fanout {
@@ -982,13 +1046,7 @@ fn coverage_cell_matches(
         {
             return None;
         }
-        add_constraint_features(
-            &mut features,
-            &mut specificity,
-            "fanout",
-            &fanout.selector,
-            &values,
-        );
+        add_constraint_features(&mut features, &mut specificity, "fanout", &fanout.selector);
         features.insert(format!("fanout:max={}", fanout.max));
         let selector = constraint_selector(&fanout.selector);
         specificity.fanout.insert(selector, fanout.max);
@@ -1071,7 +1129,6 @@ fn add_constraint_features(
     specificity: &mut CoverageSpecificity,
     kind: &str,
     constraint: &ValueConstraint,
-    observed: &[String],
 ) {
     let selector = constraint_selector(constraint);
     let key = format!("{kind}:{selector}");
@@ -1085,13 +1142,116 @@ fn add_constraint_features(
             values: constraint.values.iter().cloned().collect(),
         },
     );
-    if !constraint.values.is_empty() {
-        let mut values = constraint.values.clone();
-        values.sort();
-        features.insert(format!("{kind}:{selector}:allowed={}", values.join("|")));
+}
+
+/// A generated access matcher can execute immediately only when its exact
+/// command shape proves a read operation. Everything else is held as
+/// irreversible. The model's consequence and rollback fields are never part
+/// of this decision.
+fn synthesized_access_is_statically_read_only(verb: &Verb) -> bool {
+    if !verb.coverage.is_empty() {
+        return false;
     }
-    if !observed.is_empty() {
-        features.insert(format!("{kind}:{selector}:observed={}", observed.join("|")));
+
+    let binary = binary_match_key(&verb.binary);
+    if matches!(
+        binary.as_str(),
+        "false" | "id" | "pwd" | "true" | "uname" | "uptime" | "whoami"
+    ) {
+        return verb
+            .args
+            .iter()
+            .all(|argument| !argument.contains(['{', '}']));
+    }
+    if binary == "hostname" {
+        return verb.args.is_empty();
+    }
+    if matches!(binary.as_str(), "cargo" | "rustc") {
+        return verb.args == ["--version"];
+    }
+
+    let literal_tokens = verb
+        .args
+        .iter()
+        .filter(|argument| !argument.contains(['{', '}']))
+        .map(|argument| argument.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    if literal_tokens.iter().any(|argument| {
+        matches!(
+            argument.as_str(),
+            "annotate"
+                | "apply"
+                | "attach"
+                | "cordon"
+                | "create"
+                | "delete"
+                | "disable"
+                | "drain"
+                | "edit"
+                | "enable"
+                | "exec"
+                | "expose"
+                | "install"
+                | "label"
+                | "patch"
+                | "remove"
+                | "replace"
+                | "restart"
+                | "rollout"
+                | "run"
+                | "scale"
+                | "set"
+                | "start"
+                | "stop"
+                | "taint"
+                | "uninstall"
+                | "update"
+                | "upgrade"
+        )
+    }) {
+        return false;
+    }
+
+    let Some(operation) = verb
+        .args
+        .iter()
+        .find(|argument| !argument.starts_with('-'))
+        .filter(|argument| !argument.contains(['{', '}']))
+        .map(|operation| operation.to_ascii_lowercase())
+    else {
+        return false;
+    };
+
+    match binary.as_str() {
+        "kubectl" => matches!(
+            operation.as_str(),
+            "api-resources"
+                | "api-versions"
+                | "cluster-info"
+                | "describe"
+                | "explain"
+                | "get"
+                | "logs"
+                | "version"
+        ),
+        "systemctl" => matches!(
+            operation.as_str(),
+            "is-active"
+                | "is-enabled"
+                | "is-failed"
+                | "list-dependencies"
+                | "list-unit-files"
+                | "list-units"
+                | "show"
+                | "status"
+        ),
+        "helm" => {
+            matches!(
+                operation.as_str(),
+                "env" | "get" | "history" | "list" | "search" | "show" | "status" | "version"
+            )
+        }
+        _ => false,
     }
 }
 
@@ -1158,6 +1318,24 @@ pub fn validate_synthesized_safety(verb: &Verb) -> Result<()> {
         );
     }
     validate_binary_not_shell(&verb.binary, "synthesized verb")?;
+    let binary_name = std::path::Path::new(&verb.binary)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&verb.binary)
+        .trim_end_matches(".exe")
+        .to_ascii_lowercase();
+    if verb.consequence == Reversibility::Reversible
+        && matches!(
+            binary_name.as_str(),
+            "rm" | "rmdir" | "shred" | "unlink" | "del" | "erase" | "format" | "mkfs" | "dd"
+        )
+    {
+        bail!(
+            "synthesized verb '{}' classifies destructive binary '{}' as reversible",
+            verb.name,
+            verb.binary
+        );
+    }
     for (pname, spec) in &verb.params {
         validate_param_not_overbroad(pname, spec, "synthesized verb")?;
     }
@@ -2108,6 +2286,9 @@ verbs:
             "x"
         ))
         .is_err());
+        assert!(
+            validate_synthesized_safety(&synth_verb("rm", None, false, "delete-fixture")).is_err()
+        );
         // over-broad / whitespace-admitting patterns
         assert!(validate_synthesized_safety(&synth_verb("cmk", Some("^.+$"), false, "x")).is_err());
         assert!(
@@ -2167,6 +2348,105 @@ verbs:
             provenance: None,
         });
         assert!(validate_synthesized_safety(&generated_marker).is_err());
+    }
+
+    #[test]
+    fn generated_access_promotion_derives_consequence_from_command_shape() {
+        let mut catalog = VerbCatalog::default();
+        let candidate = |name: &str, binary: &str, args: &[&str], consequence| {
+            let mut verb = synth_verb(binary, None, false, name);
+            verb.name = format!("access-generated-{name}");
+            verb.args = args
+                .iter()
+                .map(|argument| (*argument).to_string())
+                .collect();
+            verb.baseline = false;
+            verb.consequence = consequence;
+            verb
+        };
+
+        catalog
+            .upsert_access_verb(candidate(
+                "kubectl-delete",
+                "kubectl",
+                &["delete", "pod", "fixture"],
+                Reversibility::Reversible,
+            ))
+            .unwrap();
+        catalog
+            .upsert_access_verb(candidate(
+                "systemctl-stop",
+                "systemctl",
+                &["stop", "fixture.service"],
+                Reversibility::Reversible,
+            ))
+            .unwrap();
+        catalog
+            .upsert_access_verb(candidate(
+                "kubectl-get",
+                "kubectl",
+                &["get", "pods"],
+                Reversibility::Irreversible,
+            ))
+            .unwrap();
+        catalog
+            .upsert_access_verb(candidate(
+                "rustc-version",
+                "rustc",
+                &["--version"],
+                Reversibility::Irreversible,
+            ))
+            .unwrap();
+
+        for name in [
+            "access-generated-kubectl-delete",
+            "access-generated-systemctl-stop",
+        ] {
+            let installed = catalog.get(name).unwrap();
+            assert!(installed.trusted);
+            assert_eq!(installed.consequence, Reversibility::Irreversible);
+        }
+        for name in [
+            "access-generated-kubectl-get",
+            "access-generated-rustc-version",
+        ] {
+            let diagnostic = catalog.get(name).unwrap();
+            assert!(diagnostic.trusted);
+            assert_eq!(diagnostic.consequence, Reversibility::Reversible);
+        }
+    }
+
+    #[test]
+    fn typed_match_features_exclude_observed_argument_values() {
+        let catalog = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: api-read
+    binary: apictl
+    consequence: reversible
+    coverage:
+      - name: target
+        action: evaluate
+        required_args: ["get"]
+        min_args: 3
+        max_args: 3
+        target:
+          position: 2
+          values: ["fixture-bearer-value"]
+"#,
+        )
+        .unwrap();
+        let fixture_value = "fixture-bearer-value";
+        let matches =
+            catalog.match_command_all("apictl", &args_vec(&["get", "resource", fixture_value]));
+
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].features.contains("target:position:2"));
+        assert!(!matches[0].features.iter().any(|feature| {
+            feature.contains("allowed=")
+                || feature.contains("observed=")
+                || feature.contains(fixture_value)
+        }));
     }
 
     #[test]
@@ -2782,6 +3062,61 @@ verbs:
         )
         .expect_err("reserved namespace must fail");
         assert!(error.to_string().contains("reserved saved-grant namespace"));
+    }
+
+    #[test]
+    fn operator_catalog_cannot_occupy_generated_access_namespace() {
+        let error = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: access-generated-collision
+    binary: "true"
+    consequence: reversible
+"#,
+        )
+        .expect_err("reserved namespace must fail");
+        assert!(error
+            .to_string()
+            .contains("reserved generated-access namespace"));
+    }
+
+    #[test]
+    fn hot_reload_preserves_daemon_owned_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("verbs.yaml");
+        std::fs::write(
+            &path,
+            "verbs:\n  - name: operator-one\n    binary: uptime\n    consequence: reversible\n",
+        )
+        .unwrap();
+        let mut catalog = VerbCatalog::load(&path).unwrap();
+
+        let mut saved = synth_verb("fixturectl", Some("^zones$"), false, "grant-live");
+        saved.name = "grant-live".to_string();
+        catalog.upsert_saved_grant_verb(saved).unwrap();
+        let mut access = synth_verb(
+            "fixturectl",
+            Some("^networks$"),
+            false,
+            "access-generated-live",
+        );
+        access.name = "access-generated-live".to_string();
+        access.baseline = false;
+        catalog.upsert_access_verb(access).unwrap();
+
+        std::fs::write(
+            &path,
+            "verbs:\n  - name: operator-two\n    binary: hostname\n    consequence: reversible\n",
+        )
+        .unwrap();
+        catalog.mtime = None;
+        assert!(catalog.reload_if_stale().unwrap());
+        assert!(catalog.get("operator-one").is_none());
+        assert!(catalog.get("operator-two").is_some());
+        assert!(catalog.get("grant-live").is_some());
+        assert!(catalog
+            .get("access-generated-live")
+            .is_some_and(|verb| verb.trusted && !verb.baseline));
     }
 
     fn args_vec(v: &[&str]) -> Vec<String> {

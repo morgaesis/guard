@@ -28,6 +28,7 @@ not in command-line arguments.
 | `GUARD_ALLOW_BIN` | unset | Comma-separated hard binary floor. |
 | `GUARD_GATE` | `off` | `off` or `consequence`; requires a local authenticated listener. |
 | `GUARD_APPROVAL_TTL` | `3600` | Held-command lifetime in seconds, or `unbounded`. |
+| `GUARD_ACCESS_TTL_SECS` | `3600` | Lifetime in seconds for access-managed sessions. |
 | `GUARD_NOTIFY_CMD` | unset | Operator command receiving one JSON gate-lifecycle event on stdin. |
 | `GUARD_NOTIFY_TIMEOUT_SECS` | `10` | Notify command timeout in seconds, from 1 to 60. |
 | `GUARD_VERBS` | state directory when promotion needs it | Typed verb catalog. |
@@ -48,10 +49,11 @@ evaluator judgment at all.
 
 `--policy <yaml>` is an optional pre-evaluator deny path. With the evaluator
 enabled, policy allow patterns do not skip evaluation. `--no-evaluator` makes
-static policy the decision source. Typed verbs are the deterministic allow
-interface. Legacy profile and unambiguous command-pattern inputs migrate to
-saved grants and verb coverage; new authorization should use policy, verbs, and
-grants.
+static policy the decision source. Agents request missing authority in prose
+with `guard access request`; operators inspect and decide it with `guard access`.
+Typed verbs, saved grants, and sessions are internal enforcement objects.
+Operator-authored policy and verb catalogs define deterministic hard boundaries,
+credential plans, and rollback behavior.
 
 ## Endpoints and authentication
 
@@ -160,7 +162,7 @@ the daemon.
 | `GUARD_KUBE_PROXY_KUBECONFIG` | none | Daemon-owned upstream kubeconfig. |
 | `GUARD_KUBE_CONTEXT` | kubeconfig current context | Upstream Kubernetes context. |
 | `GUARD_API_POLICY` | none | Hot-reloaded API policy; absence is default deny. |
-| `GUARD_BROKERED_KUBECONFIG_OUT` | none | Operator/bootstrap kubeconfig output; agents use `guard api kubeconfig`. |
+| `GUARD_BROKERED_KUBECONFIG_OUT` | none | Operator/bootstrap kubeconfig output for a trusted local API client. |
 | `GUARD_API_RARITY_ESCALATION` | `0` | Observation threshold for evaluator or hold escalation. |
 
 API evaluator concurrency, rate, burst, error circuit, and cooldown controls use

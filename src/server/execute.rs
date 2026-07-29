@@ -12,7 +12,7 @@ use guard::gating::coverage::{
     VerbResolution,
 };
 use guard::gating::verb::CoverageAction;
-use guard::gating::{Coverage, DecisionTrace, DecisionVerbMatch};
+use guard::gating::{Coverage, DecisionTrace};
 use guard::redact::{
     command_line, redact_exact_secrets, redact_output, redact_output_text,
     redact_output_with_state, RedactionState,
@@ -47,11 +47,13 @@ use super::learning::{
 use super::path_with_shim_dir;
 use super::runtime::NotifyEvent;
 use super::transport::{write_policy_decision, write_stream_message};
+#[cfg(unix)]
 use super::wire::ExecOutcome;
 use super::wire::{
-    authorize_session_use, verb_trust_is_current, CallerIdentity, ExecuteRequest, ExecuteResult,
-    ExecuteStreamMessage, OutputStream, RevertSpec, SessionAuthz, SshHostKeyMode, VerbContext,
-    VerbMatchInfo, VerbMatchScope, SESSION_PRINCIPAL_MISMATCH, SESSION_UNOWNED_REFUSED,
+    authorize_session_use, decision_verb_match, verb_trust_is_current, CallerIdentity,
+    ExecuteRequest, ExecuteResult, ExecuteStreamMessage, OutputStream, RevertSpec, SessionAuthz,
+    SshHostKeyMode, VerbContext, VerbMatchInfo, VerbMatchScope, SESSION_PRINCIPAL_MISMATCH,
+    SESSION_UNOWNED_REFUSED,
 };
 use super::{
     binary_exists_on_path, child_env_allowlist, dangerous_env_name,
@@ -137,6 +139,13 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
     stream_output: bool,
     stream_writer: &mut W,
 ) -> ExecuteResult {
+    if request.session_token.is_none() && caller.is_local_peer() {
+        if let Some(principal) = caller.principal() {
+            let sessions = server.state.sessions.read().await;
+            request.session_token =
+                super::admin::access_token_for_principal_ci(&sessions, &principal);
+        }
+    }
     let admission_scope = caller.to_string();
     let _handler_permit = match server
         .state
@@ -158,6 +167,42 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         verb_matches: Vec::new(),
         verb_guidance: None,
     };
+
+    // Session authority is owner-bound before any catalog lookup. A replayed
+    // bearer therefore cannot reveal foreign session verbs, match precedence,
+    // or approval guidance through the pre-validation resolution path.
+    if let Some(token) = request.session_token.as_deref() {
+        let refusal = {
+            let sessions = server.state.sessions.read().await;
+            match sessions.owner_for(token) {
+                None => Some(format!(
+                    "unknown session token: '{token}' is revoked, expired, or never existed"
+                )),
+                Some(SessionOwner::Unowned) => {
+                    Some(format!("session '{token}' {SESSION_UNOWNED_REFUSED}"))
+                }
+                Some(owner) => match authorize_session_use(
+                    &owner,
+                    caller,
+                    &server.config.daemon_principal,
+                ) {
+                    SessionAuthz::Allowed => None,
+                    SessionAuthz::Mismatch => Some(format!(
+                        "{SESSION_PRINCIPAL_MISMATCH}: caller {caller} is not the owner of session '{token}'"
+                    )),
+                    SessionAuthz::Unowned => {
+                        Some(format!("session '{token}' {SESSION_UNOWNED_REFUSED}"))
+                    }
+                },
+            }
+        };
+        if let Some(reason) = refusal {
+            server.audit_deny(caller, None, &request.binary, &request.args, &reason);
+            let _ = write_policy_decision(stream_output, &mut *phase.stream_writer, false, &reason)
+                .await;
+            return ExecuteResult::denied(reason);
+        }
+    }
 
     let verb_resolution = match resolve_verb_context(&mut phase, &mut request).await {
         Ok(resolution) => resolution,
@@ -191,7 +236,7 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         depth,
     )
     .await;
-    result.with_verb_resolution(verb_resolution.matches, verb_resolution.guidance)
+    result.with_verb_resolution(phase.verb_matches.clone(), phase.verb_guidance.clone())
 }
 
 async fn execute_after_verb_resolution<W: AsyncWrite + Unpin>(
@@ -427,19 +472,7 @@ fn decision_trace_for_phase<W: AsyncWrite + Unpin>(
     DecisionTrace {
         version: DecisionTrace::VERSION,
         decision_source: decision_source.clone(),
-        verb_matches: phase
-            .verb_matches
-            .iter()
-            .map(|matched| DecisionVerbMatch {
-                verb: matched.verb.clone(),
-                cell: matched.cell.clone(),
-                scope: format!("{:?}", matched.scope).to_ascii_lowercase(),
-                action: format!("{:?}", matched.action).to_ascii_lowercase(),
-                features: matched.features.clone(),
-                selected: matched.selected,
-                overridden: matched.overridden,
-            })
-            .collect(),
+        verb_matches: decision_trace_verb_matches(&phase.verb_matches),
         failed_dimensions: if allowed {
             Vec::new()
         } else {
@@ -459,6 +492,26 @@ fn decision_trace_for_phase<W: AsyncWrite + Unpin>(
     }
 }
 
+fn decision_trace_verb_matches(matches: &[VerbMatchInfo]) -> Vec<guard::gating::DecisionVerbMatch> {
+    matches.iter().map(decision_verb_match).collect()
+}
+
+fn selected_session_verbs<W: AsyncWrite + Unpin>(phase: &ExecPhase<'_, W>) -> Vec<String> {
+    let mut verbs = phase
+        .verb_matches
+        .iter()
+        .filter(|matched| {
+            matched.selected
+                && matched.scope == guard::gating::coverage::VerbMatchScope::Session
+                && !matched.overridden
+        })
+        .map(|matched| matched.verb.clone())
+        .collect::<Vec<_>>();
+    verbs.sort();
+    verbs.dedup();
+    verbs
+}
+
 /// Deny bookkeeping shared by the policy phases: audit the decision, notify a
 /// streaming client, record the interaction on the live session (when one is
 /// attached), and produce the denied result.
@@ -470,40 +523,100 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
     risk: Option<i32>,
     mut reason: String,
 ) -> ExecuteResult {
-    if !phase.server.config.admission_preview {
+    let mut access_request_handle = None;
+    let durable_command = redact_output_text(&command);
+    let hard_verb_deny = phase.verb_matches.iter().any(|matched| {
+        matched.selected
+            && !matched.overridden
+            && matched.action == guard::gating::verb::CoverageAction::Deny
+    });
+    let static_default_deny = matches!(
+        reason.as_str(),
+        "default-deny: no matching allow rule" | "no policy and LLM disabled: default-deny"
+    );
+    let hard_static_deny = source == SessionDecisionSource::StaticPolicy && !static_default_deny;
+    let escalation_allowed = !matches!(
+        source,
+        SessionDecisionSource::Validation | SessionDecisionSource::EvaluatorError
+    ) && !hard_verb_deny
+        && !hard_static_deny;
+    if !phase.server.config.admission_preview && escalation_allowed {
         if let Some(token) = phase.session_token.as_deref() {
             super::admin::prune_grant_requests(phase.server).await;
             let now = guard::env::now_unix();
-            let (saved_grant, session_revision, session_expires_at) = {
+            let (saved_grant, session_revision, session_expires_at, requester, access_managed) = {
                 let sessions = phase.server.state.sessions.read().await;
                 (
                     sessions.saved_grant_for(token),
                     sessions.effective_revision_key(token),
                     sessions.expires_at_for(token).flatten(),
+                    sessions.owner_for(token),
+                    sessions.is_access_managed(token),
                 )
             };
-            let delta = crate::grant_profile::GrantRequestDelta {
-                prompt_append: Some(format!(
-                "Evaluate this denied operation within the operator-approved task scope: {command}"
-            )),
-                ..crate::grant_profile::GrantRequestDelta::default()
-            };
+            let mut denied_verbs = selected_session_verbs(phase);
+            if access_managed && denied_verbs.is_empty() {
+                denied_verbs = phase
+                    .server
+                    .state
+                    .verbs
+                    .read()
+                    .await
+                    .match_command_all(&request.binary, &request.args)
+                    .into_iter()
+                    .filter(|matched| !matched.rendered.baseline)
+                    .map(|matched| matched.rendered.name)
+                    .collect();
+                denied_verbs.sort();
+                denied_verbs.dedup();
+            }
             let candidate = session_revision.as_ref().and_then(|session_revision| {
-                crate::grant_profile::GrantRequest::new(
-                    token.to_string(),
-                    saved_grant.as_ref().map(|(name, _)| name.clone()),
-                    delta,
-                    command.clone(),
-                )
-                .ok()
-                .map(|mut request| {
+                let crate::session::SessionOwner::Principal(requester) = requester.clone()? else {
+                    return None;
+                };
+                let mut request = if access_managed {
+                    if denied_verbs.is_empty() {
+                        return None;
+                    }
+                    let mut request = crate::grant_profile::GrantRequest::new_access(
+                        requester,
+                        Some(token.to_string()),
+                        crate::session::session_reference(token),
+                        crate::grant_profile::GrantRequestDelta {
+                            activated_verbs: denied_verbs.clone(),
+                            ..crate::grant_profile::GrantRequestDelta::default()
+                        },
+                        durable_command.clone(),
+                    )
+                    .ok()?;
+                    request.authority_verbs = denied_verbs.clone();
+                    request
+                } else {
+                    crate::grant_profile::GrantRequest::new(
+                        token.to_string(),
+                        saved_grant.as_ref().map(|(name, _)| name.clone()),
+                        crate::grant_profile::GrantRequestDelta {
+                            prompt_append: Some(format!(
+                                "Evaluate this denied operation within the operator-approved task scope: {durable_command}"
+                            )),
+                            ..crate::grant_profile::GrantRequestDelta::default()
+                        },
+                        durable_command.clone(),
+                    )
+                    .ok()?
+                };
+                Some(crate::session_store::sanitize_grant_request({
+                    request.saved_grant = saved_grant.as_ref().map(|(name, _)| name.clone());
                     request.issued_saved_revision = saved_grant.map(|(_, revision)| revision);
                     request.issued_session_revision = Some(session_revision.clone());
+                    if access_managed {
+                        request.request_key = request.canonical_access_key().ok()?;
+                    }
                     if let Some(session_expires_at) = session_expires_at {
                         request.expires_unix = request.expires_unix.min(session_expires_at);
                     }
                     request
-                })
+                }))
             });
             let (request, created) = {
                 let mut requests = phase.server.state.grant_requests.write().await;
@@ -523,8 +636,15 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
                         request.session_token == token
                             && request.status == crate::grant_profile::GrantRequestStatus::Pending
                             && request.expires_unix > now
-                            && request.justification == command
-                            && request.issued_session_revision == session_revision
+                            && request.issued_session_revision
+                                == candidate
+                                    .as_ref()
+                                    .and_then(|candidate| candidate.issued_session_revision.clone())
+                            && request.request_key
+                                == candidate
+                                    .as_ref()
+                                    .map(|candidate| candidate.request_key.as_str())
+                                    .unwrap_or_default()
                     })
                     .cloned()
                 {
@@ -563,10 +683,20 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
                 }
             };
             if let Some(request) = request {
-                reason.push_str(&format!(
-                "; escalation={} next=`guard grant request show {}` operator=`guard grant request approve {}`",
-                request.handle, request.handle, request.handle
-            ));
+                if request.requester.is_some() {
+                    access_request_handle = Some(request.handle.clone());
+                    let guidance = format!(
+                        "approve: guard access approve {}\nonce: guard access approve {} --once\nbounded: guard access approve {} --uses 3",
+                        request.handle, request.handle, request.handle
+                    );
+                    phase.verb_guidance = Some(guidance);
+                    reason.push_str(&format!("; access_request={}", request.handle));
+                } else {
+                    reason.push_str(&format!(
+                        "; internal authority request {} is pending operator review",
+                        request.handle
+                    ));
+                }
                 if created {
                     phase.server.emit_audit_ungated(
                         guard::audit::AuditEvent::new(
@@ -589,7 +719,52 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
                     });
                 }
             }
+        } else {
+            let matching_intent = {
+                let mut catalog = phase.server.state.verbs.write().await;
+                if let Err(error) = catalog.reload_if_stale() {
+                    tracing::warn!("verb catalog reload failed, using previous: {error}");
+                }
+                catalog
+                    .match_command_all(&request.binary, &request.args)
+                    .into_iter()
+                    .find(|matched| !matched.rendered.baseline)
+                    .map(|matched| matched.rendered.name)
+            };
+            let intent = matching_intent.unwrap_or_else(|| durable_command.clone());
+            match super::admin::submit_access_request(
+                phase.server,
+                phase.caller,
+                None,
+                &intent,
+                None,
+            )
+            .await
+            {
+                Ok(item) if item.kind == "request" => {
+                    access_request_handle = Some(item.reference.clone());
+                    phase.verb_guidance = Some(format!(
+                        "approve: guard access approve {}\nonce: guard access approve {} --once\nbounded: guard access approve {} --uses 3",
+                        item.reference, item.reference, item.reference
+                    ));
+                    reason.push_str(&format!("; access_request={}", item.reference));
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    phase.verb_guidance = Some(format!(
+                        "no durable access request was created: {}; request typed access with: guard access request {}",
+                        redact_output_text(&error),
+                        shell_words::join([intent.as_str()])
+                    ));
+                    reason.push_str("; typed access request required");
+                }
+            }
         }
+    } else if !phase.server.config.admission_preview && (hard_verb_deny || hard_static_deny) {
+        phase.verb_guidance = Some(
+            "non-overridable operator policy denied this command; no access request was created"
+                .to_string(),
+        );
     }
     let _ = log_audit_policy_for_request(phase.server, phase.caller, request, false, &reason);
     let _ = write_policy_decision(
@@ -616,7 +791,9 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
         },
     )
     .await;
-    ExecuteResult::denied(reason).with_decision_source(source)
+    ExecuteResult::denied(reason)
+        .with_access_request(access_request_handle)
+        .with_decision_source(source)
 }
 
 /// Allow bookkeeping shared by the gate-routed allow paths: route the
@@ -632,6 +809,7 @@ async fn route_allow_and_record<W: AsyncWrite + Unpin>(
 ) -> ExecuteResult {
     let reason = inputs.reason.clone();
     let risk = inputs.risk;
+    let trace = decision_trace_for_phase(phase, source, true);
     let mut context = RequestContext {
         server: phase.server,
         caller: phase.caller,
@@ -639,39 +817,7 @@ async fn route_allow_and_record<W: AsyncWrite + Unpin>(
         stream_output: phase.stream_output,
         stream_writer: &mut *phase.stream_writer,
     };
-    let result = route_gated_allow(&mut context, request, inputs).await;
-    let trace = decision_trace_for_phase(phase, source, true);
-    match &result.exec {
-        ExecOutcome::Held { handle, .. } => {
-            let updated = phase
-                .server
-                .state
-                .approvals
-                .write()
-                .await
-                .set_decision_trace(handle, trace.clone());
-            if let (Some(store), Some(approval)) = (&phase.server.state.session_store, updated) {
-                if let Err(error) = store.save_approval(approval).await {
-                    tracing::error!("failed to persist held decision trace: {error}");
-                }
-            }
-        }
-        ExecOutcome::Provisional { handle, .. } => {
-            let updated = phase
-                .server
-                .state
-                .provisional
-                .write()
-                .await
-                .set_decision_trace(handle, trace.clone());
-            if let (Some(store), Some(provisional)) = (&phase.server.state.session_store, updated) {
-                if let Err(error) = store.save_provisional(provisional).await {
-                    tracing::error!("failed to persist provisional decision trace: {error}");
-                }
-            }
-        }
-        _ => {}
-    }
+    let result = route_gated_allow(&mut context, request, inputs, Some(trace.clone())).await;
     record_live_session_interaction(
         phase.server,
         phase.session_token.as_deref(),
@@ -1167,6 +1313,7 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
                         verb: verb_ctx.clone(),
                         bypass: false,
                         authority,
+                        consume_access_verbs: selected_session_verbs(phase),
                     };
                     let result = route_allow_and_record(
                         phase,
@@ -1181,7 +1328,11 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
                 }
             }
         }
-        if static_only && !force_evaluate {
+        let selected_typed_coverage = phase
+            .verb_matches
+            .iter()
+            .any(|matched| matched.selected && !matched.overridden);
+        if static_only && !force_evaluate && !selected_typed_coverage {
             let reason =
                 "session policy-only mode: command is outside active verb coverage".to_string();
             return Err(deny_and_record(
@@ -1318,6 +1469,7 @@ async fn try_static_fast_allow<W: AsyncWrite + Unpin>(
                 verb: None,
                 bypass: true,
                 authority,
+                consume_access_verbs: Vec::new(),
             };
             return Err(route_allow_and_record(
                 phase,
@@ -1425,6 +1577,7 @@ async fn try_trusted_verb_allow<W: AsyncWrite + Unpin>(
                 verb: Some(vc),
                 bypass: false,
                 authority,
+                consume_access_verbs: selected_session_verbs(phase),
             };
             return Err(route_allow_and_record(
                 phase,
@@ -1681,6 +1834,7 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
                 verb: verb_ctx,
                 bypass,
                 authority: evaluated_authority,
+                consume_access_verbs: selected_session_verbs(phase),
             };
             route_allow_and_record(
                 phase,
@@ -1791,6 +1945,76 @@ pub(super) async fn persist_session_snapshot(
     Ok(())
 }
 
+/// Validate access authority at the execution-admission boundary and consume
+/// bounded uses. The durable registry snapshot is written before spawn, so a
+/// later spawn failure burns the admitted use, unlimited grants observe remote
+/// revocation, and concurrent attempts cannot oversubscribe a budget.
+pub(super) async fn admit_access_use(
+    server: &ServerContext,
+    request: &ExecuteRequest,
+    selected_verbs: &[String],
+    preferred_requests: Option<&[String]>,
+) -> Result<Option<crate::session::AccessAdmission>, String> {
+    if selected_verbs.is_empty() {
+        return Ok(None);
+    }
+    let Some(token) = request.session_token.as_deref() else {
+        return Ok(None);
+    };
+    let mut sessions = server.state.sessions.write().await;
+    if !sessions.is_access_managed(token) {
+        return Ok(None);
+    }
+    let mut reloaded_after_conflict = false;
+    loop {
+        if !sessions.is_access_managed(token) {
+            return Err(
+                "access session expired or was revoked during durable admission".to_string(),
+            );
+        }
+        let mut staged = sessions.clone();
+        let admission = staged.consume_access_use(token, selected_verbs, preferred_requests)?;
+        let persist_result =
+            persist_session_snapshot(server.state.session_store.clone(), staged.clone()).await;
+        match persist_result {
+            Ok(()) => {
+                *sessions = staged;
+            }
+            Err(error)
+                if !reloaded_after_conflict
+                    && SessionStore::is_registry_generation_conflict(&error) =>
+            {
+                let Some(store) = &server.state.session_store else {
+                    return Err(format!("failed to persist access admission: {error}"));
+                };
+                *sessions = store.load_registry().await.map_err(|reload_error| {
+                    format!(
+                        "failed to reload sessions after a concurrent access admission: {reload_error}"
+                    )
+                })?;
+                reloaded_after_conflict = true;
+                continue;
+            }
+            Err(error) => {
+                return Err(format!("failed to persist access admission: {error}"));
+            }
+        }
+        for consumption in &admission.consumptions {
+            if let Some(remaining_uses) = consumption.remaining_uses {
+                server.emit_audit_ungated(
+                    guard::audit::AuditEvent::new(guard::audit::AuditKind::SessionGrant)
+                        .session_fingerprint(audit_session_fingerprint(Some(token)))
+                        .field("event", "access_use_consumed")
+                        .field("access_request", &consumption.request)
+                        .field("remaining_uses", format!("{remaining_uses}")),
+                );
+            }
+        }
+        return Ok(Some(admission));
+    }
+}
+
+#[cfg(test)]
 pub(super) async fn persist_current_sessions(server: &ServerContext) -> Result<()> {
     let snapshot = { server.state.sessions.read().await.clone() };
     persist_session_snapshot(server.state.session_store.clone(), snapshot).await
@@ -2278,7 +2502,7 @@ pub(super) async fn exec_after_approval_with_secret_authority<W: AsyncWrite + Un
             return ExecuteResult::exec_failed(
                     allow_reason,
                     format!(
-                        "saved grant does not entitle secret '{secret_name}'; next: guard grant request submit --prompt 'allow secret {secret_name}' --secret {secret_name}"
+                        "saved authority does not entitle secret '{secret_name}'; next: guard access request 'Use credential selector {secret_name} for this task'"
                     ),
                 );
         }
@@ -2936,5 +3160,200 @@ pub(super) fn merge_envelope_context(
     match session_prompt {
         Some(prompt) if !prompt.trim().is_empty() => Some(format!("{envelope}\n\n{prompt}")),
         _ => Some(envelope),
+    }
+}
+
+#[cfg(test)]
+mod decision_trace_feature_tests {
+    use super::*;
+    use guard::gating::verb::CoverageAction;
+
+    #[test]
+    fn persisted_trace_drops_legacy_observed_argument_values() {
+        let fixture_value = "fixture-bearer-value";
+        let matches = vec![VerbMatchInfo {
+            verb: "api-read".to_string(),
+            cell: "target".to_string(),
+            scope: VerbMatchScope::Session,
+            action: CoverageAction::Preauthorized,
+            features: vec![
+                "target:position:2".to_string(),
+                format!("target:position:2:allowed={fixture_value}"),
+                format!("target:position:2:observed={fixture_value}"),
+            ],
+            selected: true,
+            overridden: false,
+        }];
+
+        let persisted = decision_trace_verb_matches(&matches);
+        assert_eq!(persisted[0].features, vec!["target:position:2"]);
+        assert!(!serde_json::to_string(&persisted)
+            .unwrap()
+            .contains(fixture_value));
+    }
+}
+
+#[cfg(test)]
+mod transactional_access_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bounded_admission_reloads_once_after_unrelated_daemon_write() {
+        let mut server = crate::server::tests::config_for_proposal_test();
+        let state = tempfile::tempdir().unwrap();
+        let database = state.path().join("state.db");
+        let store = SessionStore::open(database.clone(), 3600).await.unwrap();
+        let token = "bounded-reload".to_string();
+        let mut registry = SessionRegistry::new();
+        registry.grant(
+            token.clone(),
+            crate::session::SessionGrant {
+                allow: Vec::new(),
+                deny: Vec::new(),
+                allow_exact: Vec::new(),
+                deny_exact: Vec::new(),
+                activated_verbs: vec!["host-inspect".to_string()],
+                override_markers: Vec::new(),
+                scope: crate::session::IssuedGrantScope {
+                    access_managed: true,
+                    ..crate::session::IssuedGrantScope::default()
+                },
+                expires_at: None,
+                prompt_append: None,
+                generated_notes: Vec::new(),
+                granted_at: 1,
+                static_only: true,
+                auto_amend: false,
+                owner: SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(1001)),
+            },
+        );
+        registry.install_access_grant(
+            &token,
+            Some(1),
+            "access-use".to_string(),
+            vec!["host-inspect".to_string()],
+        );
+        store.persist_registry(&registry).await.unwrap();
+        *server.state.sessions.write().await = registry;
+        server.state.session_store = Some(store.clone());
+
+        let competing = SessionStore::open(database, 3600).await.unwrap();
+        let mut advanced = competing.load_registry().await.unwrap();
+        advanced.record_interaction(
+            &token,
+            SessionInteraction {
+                at_unix: guard::env::now_unix(),
+                command: "fixture interaction".to_string(),
+                allowed: true,
+                source: SessionDecisionSource::StaticPolicy,
+                reason: "fixture".to_string(),
+                risk: Some(0),
+                exec_status: SessionExecStatus::Completed,
+                exit_code: Some(0),
+                exposed_secret_refs: Vec::new(),
+                decision_trace: None,
+            },
+        );
+        competing.persist_registry(&advanced).await.unwrap();
+
+        let request = ExecuteRequest {
+            binary: "host-inspect".to_string(),
+            args: Vec::new(),
+            auth_token: None,
+            env: HashMap::new(),
+            secrets: HashMap::new(),
+            secret_files: HashMap::new(),
+            stream: false,
+            session_token: Some(token.clone()),
+            revert: None,
+            confirm_within_secs: None,
+            reevaluate: false,
+            ssh_hostkey: None,
+            cwd: None,
+            require_approval: None,
+            wait_approval_secs: None,
+            verb: None,
+        };
+        admit_access_use(&server, &request, &["host-inspect".to_string()], None)
+            .await
+            .unwrap();
+
+        let durable = store.load_registry().await.unwrap();
+        assert_eq!(
+            durable.access_grant_uses(&token, "access-use"),
+            Some((Some(1), Some(0)))
+        );
+        assert_eq!(durable.show(&token, 10).unwrap().stats.total, 1);
+    }
+
+    #[tokio::test]
+    async fn unlimited_admission_reloads_and_refuses_a_concurrent_revoke() {
+        let mut server = crate::server::tests::config_for_proposal_test();
+        let state = tempfile::tempdir().unwrap();
+        let database = state.path().join("state.db");
+        let store = SessionStore::open(database.clone(), 3600).await.unwrap();
+        let token = "unlimited-revoked".to_string();
+        let mut registry = SessionRegistry::new();
+        registry.grant(
+            token.clone(),
+            crate::session::SessionGrant {
+                allow: Vec::new(),
+                deny: Vec::new(),
+                allow_exact: Vec::new(),
+                deny_exact: Vec::new(),
+                activated_verbs: vec!["host-inspect".to_string()],
+                override_markers: Vec::new(),
+                scope: crate::session::IssuedGrantScope {
+                    access_managed: true,
+                    ..crate::session::IssuedGrantScope::default()
+                },
+                expires_at: None,
+                prompt_append: None,
+                generated_notes: Vec::new(),
+                granted_at: 1,
+                static_only: true,
+                auto_amend: false,
+                owner: SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(1001)),
+            },
+        );
+        registry.install_access_grant(
+            &token,
+            None,
+            "access-unlimited".to_string(),
+            vec!["host-inspect".to_string()],
+        );
+        store.persist_registry(&registry).await.unwrap();
+        *server.state.sessions.write().await = registry;
+        server.state.session_store = Some(store.clone());
+
+        let competing = SessionStore::open(database, 3600).await.unwrap();
+        let mut revoked = competing.load_registry().await.unwrap();
+        assert!(revoked.revoke(&token));
+        competing.persist_registry(&revoked).await.unwrap();
+
+        let request = ExecuteRequest {
+            binary: "host-inspect".to_string(),
+            args: Vec::new(),
+            auth_token: None,
+            env: HashMap::new(),
+            secrets: HashMap::new(),
+            secret_files: HashMap::new(),
+            stream: false,
+            session_token: Some(token.clone()),
+            revert: None,
+            confirm_within_secs: None,
+            reevaluate: false,
+            ssh_hostkey: None,
+            cwd: None,
+            require_approval: None,
+            wait_approval_secs: None,
+            verb: None,
+        };
+        let error = admit_access_use(&server, &request, &["host-inspect".to_string()], None)
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("expired or was revoked"));
+        assert!(!server.state.sessions.read().await.has(&token));
     }
 }

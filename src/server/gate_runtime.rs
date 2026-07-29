@@ -12,8 +12,8 @@ use std::path::PathBuf;
 use tokio::io::AsyncWrite;
 
 use super::execute::{
-    audit_command_line, audit_session_fingerprint, exec_after_approval_with_secret_authority,
-    exec_with_read_grant_retry_with_secret_authority,
+    admit_access_use, audit_command_line, audit_session_fingerprint,
+    exec_after_approval_with_secret_authority, exec_with_read_grant_retry_with_secret_authority,
 };
 use super::grants::{delete_read_grant_row, finish_read_grant_revert, persist_read_grant};
 use super::runtime::NotifyEvent;
@@ -157,11 +157,19 @@ async fn gate_capacity_reason(
     None
 }
 
-pub(super) async fn persist_provisional(server: &ServerContext, p: &Provisional) {
+async fn try_persist_provisional(server: &ServerContext, p: &Provisional) -> Result<(), String> {
     if let Some(store) = &server.state.session_store {
-        if let Err(e) = store.save_provisional(p.clone()).await {
-            tracing::warn!("failed to persist provisional {}: {}", p.handle, e);
-        }
+        store
+            .save_provisional(p.clone())
+            .await
+            .map_err(|error| format!("failed to persist provisional {}: {error}", p.handle))?;
+    }
+    Ok(())
+}
+
+pub(super) async fn persist_provisional(server: &ServerContext, p: &Provisional) {
+    if let Err(error) = try_persist_provisional(server, p).await {
+        tracing::warn!("{error}");
     }
 }
 
@@ -280,7 +288,7 @@ impl Drop for ProxyHoldOrphanGuard {
             let session_fingerprint =
                 if let Some(a) = server.state.approvals.read().await.get(&handle).cloned() {
                     let session_fingerprint = a.snapshot.session_fingerprint.clone();
-                    persist_approval(&server, &a).await;
+                    let _ = persist_approval(&server, &a).await;
                     session_fingerprint
                 } else {
                     None
@@ -421,7 +429,11 @@ impl guard::proxy::GateSink for DaemonGateSink {
             revert_detail: None,
             api_revert: Some(api_revert),
         };
-        persist_provisional(&self.server, &provisional).await;
+        if let Err(error) = try_persist_provisional(&self.server, &provisional).await {
+            tracing::error!("api-proxy auto-revert was not armed: {error}");
+            remove_revert_body(&provisional);
+            return None;
+        }
         self.server
             .state
             .provisional
@@ -497,6 +509,8 @@ impl guard::proxy::GateSink for DaemonGateSink {
             verb_name: None,
             verb_params: std::collections::BTreeMap::new(),
             catalog_version: None,
+            access_verbs: Vec::new(),
+            access_requests: Vec::new(),
             principal,
             secret_binding: None,
         };
@@ -517,6 +531,9 @@ impl guard::proxy::GateSink for DaemonGateSink {
             result_stderr: None,
             notes: Vec::new(),
         };
+        if let Err(reason) = persist_approval(&self.server, &approval).await {
+            return HoldDecision::Denied { reason };
+        }
         let notify = self
             .server
             .state
@@ -524,7 +541,6 @@ impl guard::proxy::GateSink for DaemonGateSink {
             .write()
             .await
             .enqueue(approval.clone());
-        persist_approval(&self.server, &approval).await;
         self.server.emit_audit_ungated(
             AuditEvent::new(AuditKind::Held)
                 .handle(&handle)
@@ -625,13 +641,29 @@ impl guard::proxy::GateSink for DaemonGateSink {
         // pending create-revert is moot. Confirm it to cancel
         // the timer; the sweeper then never tries to delete an absent object. A
         // handle that is already terminal is a no-op.
-        let updated = {
-            let mut reg = self.server.state.provisional.write().await;
-            reg.confirm(handle)
+        let mut registry = self.server.state.provisional.write().await;
+        let Some(expected) = registry.get(handle).cloned() else {
+            return;
         };
-        match updated {
+        let mut staged = guard::gating::provisional::ProvisionalRegistry::new();
+        staged.insert(expected.clone());
+        match staged.confirm(handle) {
             Ok(p) => {
-                persist_provisional(&self.server, &p).await;
+                if let Some(store) = &self.server.state.session_store {
+                    if let Err(error) = store
+                        .compare_and_swap_provisional(expected, p.clone())
+                        .await
+                    {
+                        tracing::warn!(
+                            "api-proxy: could not durably resolve auto-revert {}: {}",
+                            handle,
+                            error
+                        );
+                        return;
+                    }
+                }
+                registry.insert(p.clone());
+                drop(registry);
                 tracing::info!(
                     "api-proxy: resolved auto-revert {} (created object deleted by workload)",
                     handle
@@ -646,25 +678,39 @@ impl guard::proxy::GateSink for DaemonGateSink {
                     behavior: None,
                 });
             }
-            Err(e) => tracing::debug!("api-proxy: resolve {} was a no-op: {}", handle, e),
+            Err(e) => {
+                drop(registry);
+                tracing::debug!("api-proxy: resolve {} was a no-op: {}", handle, e);
+            }
         }
     }
+}
+
+async fn try_delete_provisional_row(server: &ServerContext, handle: &str) -> Result<(), String> {
+    if let Some(store) = &server.state.session_store {
+        store
+            .delete_provisional(handle.to_string())
+            .await
+            .map_err(|error| format!("failed to delete provisional {handle}: {error}"))?;
+    }
+    Ok(())
 }
 
 async fn delete_provisional_row(server: &ServerContext, handle: &str) {
-    if let Some(store) = &server.state.session_store {
-        if let Err(e) = store.delete_provisional(handle.to_string()).await {
-            tracing::warn!("failed to delete provisional {}: {}", handle, e);
-        }
+    if let Err(error) = try_delete_provisional_row(server, handle).await {
+        tracing::warn!("{error}");
     }
 }
 
-pub(super) async fn persist_approval(server: &ServerContext, a: &Approval) {
+pub(super) async fn persist_approval(server: &ServerContext, a: &Approval) -> Result<(), String> {
     if let Some(store) = &server.state.session_store {
-        if let Err(e) = store.save_approval(a.clone()).await {
-            tracing::warn!("failed to persist approval {}: {}", a.handle, e);
+        if let Err(error) = store.save_approval(a.clone()).await {
+            let message = format!("failed to persist approval {}: {error}", a.handle);
+            tracing::warn!("{message}");
+            return Err(message);
         }
     }
+    Ok(())
 }
 
 /// Outcome of assessing a free-form `--revert` before arming a containment
@@ -819,6 +865,9 @@ pub(super) struct GateInputs {
     /// Its revision is rechecked before routing and its immutable entitlements
     /// govern the forward command, confirmation check, and rollback.
     pub(super) authority: Option<SessionAuthoritySnapshot>,
+    /// Selected requester-session verbs supplying this execution's authority.
+    /// Baseline or unrelated work leaves this empty.
+    pub(super) consume_access_verbs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -854,11 +903,44 @@ async fn session_authority_is_current(
     current.as_ref() == expected
 }
 
+async fn access_admission_denial(
+    server: &ServerContext,
+    caller: &CallerIdentity,
+    selected_verbs: &[String],
+    reason: String,
+) -> ExecuteResult {
+    let mut intents = selected_verbs.to_vec();
+    intents.sort();
+    intents.dedup();
+    if intents.is_empty() {
+        return ExecuteResult::denied(reason);
+    }
+    let required = intents.len();
+    let mut handles = Vec::new();
+    for intent in intents {
+        if let Ok(item) =
+            super::admin::submit_access_request(server, caller, None, &intent, None).await
+        {
+            if item.kind == "request" {
+                handles.push(item.reference);
+            }
+        }
+    }
+    handles.sort();
+    handles.dedup();
+    if handles.len() != required {
+        ExecuteResult::denied(reason)
+    } else {
+        ExecuteResult::denied(reason).with_access_requests(handles)
+    }
+}
+
 /// Route an approved command through the consequence gate.
 pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
     context: &mut RequestContext<'_, W>,
     request: ExecuteRequest,
     mut inputs: GateInputs,
+    decision_trace: Option<guard::gating::DecisionTrace>,
 ) -> ExecuteResult {
     let server = context.server;
     if request.session_token.is_some() {
@@ -880,6 +962,17 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
 
     // Gating off, or an operator-authored static-policy allow: execute directly.
     if !server.config.gate.is_on() || inputs.bypass {
+        if let Err(reason) =
+            admit_access_use(server, &request, &inputs.consume_access_verbs, None).await
+        {
+            return access_admission_denial(
+                server,
+                context.caller,
+                &inputs.consume_access_verbs,
+                reason,
+            )
+            .await;
+        }
         return exec_with_read_grant_retry_with_secret_authority(
             context,
             request,
@@ -903,6 +996,17 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
 
     match outcome {
         GateOutcome::ExecuteNow => {
+            if let Err(reason) =
+                admit_access_use(server, &request, &inputs.consume_access_verbs, None).await
+            {
+                return access_admission_denial(
+                    server,
+                    context.caller,
+                    &inputs.consume_access_verbs,
+                    reason,
+                )
+                .await;
+            }
             exec_with_read_grant_retry_with_secret_authority(
                 context,
                 request,
@@ -930,39 +1034,65 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
                             "{} [held for operator review: containment envelope not validated: {}]",
                             inputs.reason, why
                         );
-                        return hold_for_approval_with_authority(
+                        return hold_for_approval_with_trace(
                             context,
                             request,
                             caller_principal,
                             inputs,
+                            decision_trace,
                         )
                         .await;
                     }
                 }
             }
-            arm_containment_with_authority(
+            arm_containment_with_access_use(
                 context,
                 request,
                 caller_principal,
                 inputs.reason,
                 inputs.authority,
+                inputs.consume_access_verbs,
+                decision_trace,
             )
             .await
         }
         GateOutcome::Hold => {
-            hold_for_approval_with_authority(context, request, caller_principal, inputs).await
+            hold_for_approval_with_trace(context, request, caller_principal, inputs, decision_trace)
+                .await
         }
     }
 }
 
 /// Arm a containment envelope: persist the provisional, run the forward command,
 /// then mark it armed with an auto-revert deadline.
+#[cfg(all(test, unix))]
 pub(super) async fn arm_containment_with_authority<W: AsyncWrite + Unpin>(
     context: &mut RequestContext<'_, W>,
     request: ExecuteRequest,
     caller_principal: Option<PrincipalKey>,
     reason: String,
     authority: Option<SessionAuthoritySnapshot>,
+) -> ExecuteResult {
+    arm_containment_with_access_use(
+        context,
+        request,
+        caller_principal,
+        reason,
+        authority,
+        Vec::new(),
+        None,
+    )
+    .await
+}
+
+async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
+    context: &mut RequestContext<'_, W>,
+    request: ExecuteRequest,
+    caller_principal: Option<PrincipalKey>,
+    reason: String,
+    authority: Option<SessionAuthoritySnapshot>,
+    consume_access_verbs: Vec<String>,
+    decision_trace: Option<guard::gating::DecisionTrace>,
 ) -> ExecuteResult {
     let server = context.server;
     let caller = context.caller;
@@ -1013,7 +1143,6 @@ pub(super) async fn arm_containment_with_authority<W: AsyncWrite + Unpin>(
             Coverage::contain(),
         );
     }
-
     // A provisional persists across restarts, but plain `--env` values have no
     // stable store reference to re-resolve. Any such value could be a secret
     // regardless of its name or shape, so fail closed before persistence or
@@ -1047,6 +1176,9 @@ pub(super) async fn arm_containment_with_authority<W: AsyncWrite + Unpin>(
         return ExecuteResult::denied(
             "session expired, was revoked, or changed before containment could be armed",
         );
+    }
+    if let Err(reason) = admit_access_use(server, &request, &consume_access_verbs, None).await {
+        return access_admission_denial(server, caller, &consume_access_verbs, reason).await;
     }
     let (session_revision, secret_entitlements) = match request.session_token.as_deref() {
         Some(_) => match authority {
@@ -1100,7 +1232,7 @@ pub(super) async fn arm_containment_with_authority<W: AsyncWrite + Unpin>(
         secret_entitlements,
         api_revert: None,
         reason: reason.clone(),
-        decision_trace: Some(guard::gating::DecisionTrace::source("evaluator")),
+        decision_trace,
         created_unix: now,
         deadline_unix: now.saturating_add(window),
         forward_done: false,
@@ -1111,7 +1243,12 @@ pub(super) async fn arm_containment_with_authority<W: AsyncWrite + Unpin>(
 
     // Commit BEFORE exec so a crash between exec and arm still leaves a
     // recoverable revert (startup recovery routes it to needs_operator_decision).
-    persist_provisional(server, &provisional).await;
+    if let Err(detail) = try_persist_provisional(server, &provisional).await {
+        return ExecuteResult::exec_failed(
+            reason,
+            format!("command was not run because its rollback state was not durable: {detail}"),
+        );
+    }
     server
         .state
         .provisional
@@ -1195,24 +1332,81 @@ pub(super) async fn arm_containment_with_authority<W: AsyncWrite + Unpin>(
             );
             result
         }
-        _ => {
-            // The child never ran (spawn/setup failure) - nothing to revert.
-            // Drop the provisional and return the failure as-is.
-            server.state.provisional.write().await.remove(&handle);
-            delete_provisional_row(server, &handle).await;
+        ExecOutcome::Failed {
+            started: false,
+            reason: ref spawn_detail,
+        } => {
+            // The child never ran, so persist a terminal tombstone before
+            // deleting the staging row. If deletion fails, restart recovery
+            // sees a non-rollbackable terminal record rather than interpreting
+            // an armed, unstarted row as an ambiguous mutation.
+            let terminal = {
+                let mut terminal = provisional.clone();
+                terminal.status = ProvisionalStatus::Reverted;
+                terminal.revert_detail = Some(format!(
+                    "forward command did not start; no rollback is required: {spawn_detail}"
+                ));
+                server
+                    .state
+                    .provisional
+                    .write()
+                    .await
+                    .insert(terminal.clone());
+                terminal
+            };
+            match try_persist_provisional(server, &terminal).await {
+                Ok(()) => match try_delete_provisional_row(server, &handle).await {
+                    Ok(()) => {
+                        server.state.provisional.write().await.remove(&handle);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "{error}; retained terminal non-executed provisional {handle}"
+                        );
+                    }
+                },
+                Err(save_error) => match try_delete_provisional_row(server, &handle).await {
+                    Ok(()) => {
+                        server.state.provisional.write().await.remove(&handle);
+                    }
+                    Err(delete_error) => {
+                        tracing::error!(
+                            "failed to retire non-executed provisional {handle}: {save_error}; {delete_error}"
+                        );
+                        return ExecuteResult::exec_failed(
+                            reason,
+                            format!(
+                                "{spawn_detail}; rollback state could not be retired safely: {save_error}; {delete_error}"
+                            ),
+                        );
+                    }
+                },
+            }
             result
         }
+        _ => result,
     }
 }
 
 /// Hold an irreversible/uncertain/high-risk command for operator approval.
 /// Consumes the routed [`GateInputs`]; `revert_preauthorized` and `bypass`
 /// have already been acted on by the router and are ignored here.
+#[cfg(test)]
 pub(super) async fn hold_for_approval_with_authority<W: AsyncWrite + Unpin>(
     context: &mut RequestContext<'_, W>,
     request: ExecuteRequest,
     caller_principal: Option<PrincipalKey>,
     inputs: GateInputs,
+) -> ExecuteResult {
+    hold_for_approval_with_trace(context, request, caller_principal, inputs, None).await
+}
+
+pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
+    context: &mut RequestContext<'_, W>,
+    request: ExecuteRequest,
+    caller_principal: Option<PrincipalKey>,
+    inputs: GateInputs,
+    decision_trace: Option<guard::gating::DecisionTrace>,
 ) -> ExecuteResult {
     let server = context.server;
     let caller = context.caller;
@@ -1222,6 +1416,7 @@ pub(super) async fn hold_for_approval_with_authority<W: AsyncWrite + Unpin>(
         reversibility,
         verb,
         authority,
+        consume_access_verbs,
         ..
     } = inputs;
     if server.config.dry_run {
@@ -1231,6 +1426,11 @@ pub(super) async fn hold_for_approval_with_authority<W: AsyncWrite + Unpin>(
                 reason
             ),
             Coverage::hold(),
+        );
+    }
+    if !request.env.is_empty() {
+        return ExecuteResult::denied(
+            "approval holds reject plain environment values; use named secret references",
         );
     }
     if let Some(why) = gate_capacity_reason(server, caller_principal.as_ref()).await {
@@ -1321,15 +1521,29 @@ pub(super) async fn hold_for_approval_with_authority<W: AsyncWrite + Unpin>(
         },
         None => (String::new(), None),
     };
+    let access_requests = match request.session_token.as_deref() {
+        Some(token) if !consume_access_verbs.is_empty() => {
+            match server
+                .state
+                .sessions
+                .read()
+                .await
+                .select_access_requests(token, &consume_access_verbs)
+            {
+                Ok(requests) => requests,
+                Err(reason) => {
+                    return access_admission_denial(server, caller, &consume_access_verbs, reason)
+                        .await
+                }
+            }
+        }
+        _ => Vec::new(),
+    };
     let snapshot = ApprovalSnapshot {
         binary: request.binary.clone(),
         args: request.args.clone(),
         cwd: request.cwd.clone(),
-        env: request
-            .env
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
+        env: std::collections::BTreeMap::new(),
         secret_keys: request
             .secrets
             .iter()
@@ -1349,6 +1563,8 @@ pub(super) async fn hold_for_approval_with_authority<W: AsyncWrite + Unpin>(
         verb_name: verb.as_ref().map(|v| v.name.clone()),
         verb_params: verb.as_ref().map(|v| v.params.clone()).unwrap_or_default(),
         catalog_version: verb.as_ref().map(|v| v.catalog_version),
+        access_verbs: consume_access_verbs,
+        access_requests,
         principal: caller_principal,
         secret_binding,
     };
@@ -1358,7 +1574,7 @@ pub(super) async fn hold_for_approval_with_authority<W: AsyncWrite + Unpin>(
         reason: reason.clone(),
         risk,
         reversibility,
-        decision_trace: Some(guard::gating::DecisionTrace::source("evaluator")),
+        decision_trace,
         created_unix: now,
         ttl_secs: server.config.approval_ttl_secs,
         status: ApprovalStatus::Pending,
@@ -1370,13 +1586,15 @@ pub(super) async fn hold_for_approval_with_authority<W: AsyncWrite + Unpin>(
         notes: Vec::new(),
     };
 
+    if let Err(message) = persist_approval(server, &approval).await {
+        return ExecuteResult::exec_failed(reason, message);
+    }
     let notify = server
         .state
         .approvals
         .write()
         .await
         .enqueue(approval.clone());
-    persist_approval(server, &approval).await;
     server.emit_audit_ungated(
         AuditEvent::new(AuditKind::Held)
             .handle(&handle)
@@ -1412,7 +1630,10 @@ pub(super) async fn hold_for_approval_with_authority<W: AsyncWrite + Unpin>(
             )
             .await
         }
-        None => ExecuteResult::held(reason, handle, Coverage::hold()),
+        None => ExecuteResult::held(reason, handle.clone(), Coverage::hold()).with_verb_resolution(
+            Vec::new(),
+            Some(format!("approve: guard access approve {handle} --once")),
+        ),
     }
 }
 
@@ -1459,6 +1680,10 @@ async fn wait_for_decision<W: AsyncWrite + Unpin>(
                 "still awaiting operator approval".to_string(),
                 handle.to_string(),
                 Coverage::hold(),
+            )
+            .with_verb_resolution(
+                Vec::new(),
+                Some(format!("approve: guard access approve {handle} --once")),
             );
         }
 
@@ -1538,11 +1763,22 @@ pub(super) fn hash_secret_value(salt_hex: &str, value: &str) -> String {
 }
 
 /// Execute an approved snapshot verbatim under the original caller's identity,
-/// with no client stream. Used by `guard approve`.
+/// with no client stream. Used by `guard access approve`.
 pub(super) async fn execute_snapshot(
     server: &ServerContext,
     snapshot: &ApprovalSnapshot,
     reason: &str,
+) -> ExecuteResult {
+    let access_requests =
+        (!snapshot.access_requests.is_empty()).then_some(snapshot.access_requests.as_slice());
+    execute_snapshot_with_access_request(server, snapshot, reason, access_requests).await
+}
+
+pub(super) async fn execute_snapshot_with_access_request(
+    server: &ServerContext,
+    snapshot: &ApprovalSnapshot,
+    reason: &str,
+    preferred_access_requests: Option<&[String]>,
 ) -> ExecuteResult {
     if !binary_allowed(&server.config.allowed_binaries, &snapshot.binary) {
         return ExecuteResult::exec_failed(
@@ -1552,6 +1788,33 @@ pub(super) async fn execute_snapshot(
                 snapshot.binary
             ),
         );
+    }
+    if snapshot.session_fingerprint.is_some() != snapshot.session_revision.is_some() {
+        return ExecuteResult::exec_failed(
+            reason.to_string(),
+            "approval rejected: originating session identity is incomplete".to_string(),
+        );
+    }
+    let preferred_access_requests =
+        preferred_access_requests.filter(|requests| !requests.is_empty());
+    if let Some(preferred) = preferred_access_requests {
+        let mut expected = snapshot.access_requests.clone();
+        expected.sort();
+        expected.dedup();
+        let mut supplied = preferred.to_vec();
+        supplied.sort();
+        supplied.dedup();
+        if snapshot.session_fingerprint.is_none()
+            || snapshot.access_verbs.is_empty()
+            || expected.is_empty()
+            || expected != supplied
+        {
+            return ExecuteResult::exec_failed(
+                reason.to_string(),
+                "approval rejected: originating access session expired or was revoked, or the held access binding is incomplete"
+                    .to_string(),
+            );
+        }
     }
     if let (Some(fingerprint), Some(expected_revision)) = (
         snapshot.session_fingerprint.as_deref(),
@@ -1676,7 +1939,14 @@ pub(super) async fn execute_snapshot(
                         .to_string(),
                 );
             }
-            return execute_snapshot_request(server, snapshot, reason, &caller).await;
+            return execute_snapshot_request(
+                server,
+                snapshot,
+                reason,
+                &caller,
+                preferred_access_requests,
+            )
+            .await;
         };
         if current_tool_sources.len() != tool_hashes.len()
             || current_tool_sources.iter().any(|(env_var, secret_name)| {
@@ -1724,7 +1994,7 @@ pub(super) async fn execute_snapshot(
             }
         }
     }
-    execute_snapshot_request(server, snapshot, reason, &caller).await
+    execute_snapshot_request(server, snapshot, reason, &caller, preferred_access_requests).await
 }
 
 async fn execute_snapshot_request(
@@ -1732,8 +2002,9 @@ async fn execute_snapshot_request(
     snapshot: &ApprovalSnapshot,
     reason: &str,
     caller: &CallerIdentity,
+    preferred_access_requests: Option<&[String]>,
 ) -> ExecuteResult {
-    let request = ExecuteRequest {
+    let mut request = ExecuteRequest {
         binary: snapshot.binary.clone(),
         args: snapshot.args.clone(),
         cwd: snapshot.cwd.clone(),
@@ -1763,6 +2034,34 @@ async fn execute_snapshot_request(
         wait_approval_secs: None,
         verb: None,
     };
+    request.session_token = if snapshot.session_fingerprint.is_none() {
+        None
+    } else {
+        let sessions = server.state.sessions.read().await;
+        super::admin::session_token_for_approval_snapshot(&sessions, snapshot)
+    };
+    if snapshot.session_fingerprint.is_some() && request.session_token.is_none() {
+        return ExecuteResult::denied(
+            "originating session expired, changed, or was revoked before held-command admission",
+        );
+    }
+    let mut selected_verbs = snapshot.access_verbs.clone();
+    selected_verbs.sort();
+    selected_verbs.dedup();
+    match admit_access_use(server, &request, &selected_verbs, preferred_access_requests).await {
+        Ok(Some(_)) => {}
+        Ok(None) if preferred_access_requests.is_some() => {
+            return ExecuteResult::exec_failed(
+                reason.to_string(),
+                "approval rejected: originating access session expired or was revoked before held-command admission"
+                    .to_string(),
+            )
+        }
+        Ok(None) => {}
+        Err(admission_reason) => {
+            return ExecuteResult::exec_failed(reason.to_string(), admission_reason)
+        }
+    }
     let mut sink = tokio::io::sink();
     let mut context = RequestContext {
         server,
@@ -1806,7 +2105,7 @@ pub(super) async fn gating_sweeper(server: ServerContext) {
         for h in &expired {
             let row = server.state.approvals.read().await.get(h).cloned();
             if let Some(a) = row {
-                persist_approval(&server, &a).await;
+                let _ = persist_approval(&server, &a).await;
                 server.emit_audit_ungated(
                     AuditEvent::new(AuditKind::ApprovalExpired)
                         .handle(h)
@@ -1827,27 +2126,53 @@ pub(super) async fn gating_sweeper(server: ServerContext) {
             }
         }
 
-        // Due auto-reverts. take_due transitions each to Reverting; persist that
-        // before running so a crash mid-revert recovers to needs_operator_decision.
+        // Due auto-reverts. Each exact Armed -> Reverting transition becomes
+        // durable before the rollback task starts, so a write failure leaves
+        // the timer armed and retryable.
         // Each revert is bounded by a wall-clock timeout (a timeout is recorded as
         // RevertFailed and stays queryable), and reverts are dispatched as
         // independent tasks so a burst of slow rollbacks cannot serialize and push
         // out the next tick's fail-closed expiry sweep.
-        let due = { server.state.provisional.write().await.take_due(now) };
-        for p in due {
-            persist_provisional(&server, &p).await;
+        let due = { server.state.provisional.read().await.due_handles(now) };
+        for handle in due {
+            let claimed = {
+                let mut registry = server.state.provisional.write().await;
+                let Some(expected) = registry.get(&handle).cloned() else {
+                    continue;
+                };
+                let mut staged = guard::gating::provisional::ProvisionalRegistry::new();
+                staged.insert(expected.clone());
+                let Ok(next) = staged.begin_revert(&handle) else {
+                    continue;
+                };
+                if let Some(store) = &server.state.session_store {
+                    if let Err(error) = store
+                        .compare_and_swap_provisional(expected, next.clone())
+                        .await
+                    {
+                        tracing::warn!(
+                            "failed to persist due rollback claim {}: {}",
+                            handle,
+                            error
+                        );
+                        continue;
+                    }
+                }
+                registry.insert(next.clone());
+                next
+            };
             server.emit_event(NotifyEvent {
                 event: "provisional_due",
                 at_unix: now,
-                handle: Some(p.handle.clone()),
-                session_fingerprint: p.session_fingerprint.clone(),
-                reason: Some(p.reason.clone()),
+                handle: Some(claimed.handle.clone()),
+                session_fingerprint: claimed.session_fingerprint.clone(),
+                reason: Some(claimed.reason.clone()),
                 status: Some("reverting".to_string()),
                 behavior: None,
             });
             let cfg = server.clone();
             tokio::spawn(async move {
-                let _ = finish_due_provisional(&cfg, &p).await;
+                let _ = finish_due_provisional(&cfg, &claimed).await;
             });
         }
 
@@ -2048,46 +2373,85 @@ pub(super) async fn finish_due_provisional(
         _ => None,
     });
     if check_exit == Some(0) {
-        let confirmed = {
-            let mut registry = server.state.provisional.write().await;
-            registry.confirm_after_check(&p.handle)
-        };
-        match confirmed {
-            Ok(row) => {
-                persist_provisional(server, &row).await;
-                forget_proxy_provenance(server, &p.handle).await;
-                remove_revert_body(p);
-                server.emit_audit_ungated(
-                    AuditEvent::new(AuditKind::ProvisionalAutoConfirmed)
-                        .handle(&p.handle)
-                        .field(
-                            "check",
-                            audit_command_line(
-                                p.confirm_check_binary.as_deref().unwrap_or_default(),
-                                &p.confirm_check_args,
-                            ),
-                        )
-                        .field("control_path", format!("{:?}", p.control_path)),
-                );
-                server.emit_event(NotifyEvent {
-                    event: "decision_made",
-                    at_unix: now_unix(),
-                    handle: Some(p.handle.clone()),
-                    session_fingerprint: p.session_fingerprint.clone(),
-                    reason: Some("independent confirmation check succeeded".to_string()),
-                    status: Some("confirmed".to_string()),
-                    behavior: None,
-                });
-                return (
-                    format!("provisional {} confirmed by independent check", p.handle),
-                    Some(0),
-                );
+        let mut registry = server.state.provisional.write().await;
+        let expected = registry.get(&p.handle).cloned();
+        let confirmed = expected.as_ref().and_then(|expected| {
+            let mut staged = guard::gating::provisional::ProvisionalRegistry::new();
+            staged.insert(expected.clone());
+            staged.confirm_after_check(&p.handle).ok()
+        });
+        match (expected, confirmed) {
+            (Some(expected), Some(row)) => {
+                if let Some(store) = &server.state.session_store {
+                    if let Err(error) = store
+                        .compare_and_swap_provisional(expected, row.clone())
+                        .await
+                    {
+                        drop(registry);
+                        tracing::warn!(
+                            "confirmation check succeeded but provisional {} could not become durable: {}",
+                            p.handle,
+                            error
+                        );
+                    } else {
+                        registry.insert(row.clone());
+                        drop(registry);
+                        forget_proxy_provenance(server, &p.handle).await;
+                        remove_revert_body(p);
+                        server.emit_audit_ungated(
+                            AuditEvent::new(AuditKind::ProvisionalAutoConfirmed)
+                                .handle(&p.handle)
+                                .field(
+                                    "check",
+                                    audit_command_line(
+                                        p.confirm_check_binary.as_deref().unwrap_or_default(),
+                                        &p.confirm_check_args,
+                                    ),
+                                )
+                                .field("control_path", format!("{:?}", p.control_path)),
+                        );
+                        server.emit_event(NotifyEvent {
+                            event: "decision_made",
+                            at_unix: now_unix(),
+                            handle: Some(p.handle.clone()),
+                            session_fingerprint: p.session_fingerprint.clone(),
+                            reason: Some("independent confirmation check succeeded".to_string()),
+                            status: Some("confirmed".to_string()),
+                            behavior: None,
+                        });
+                        return (
+                            format!("provisional {} confirmed by independent check", p.handle),
+                            Some(0),
+                        );
+                    }
+                } else {
+                    registry.insert(row.clone());
+                    drop(registry);
+                    forget_proxy_provenance(server, &p.handle).await;
+                    remove_revert_body(p);
+                    server.emit_audit_ungated(
+                        AuditEvent::new(AuditKind::ProvisionalAutoConfirmed)
+                            .handle(&p.handle)
+                            .field(
+                                "check",
+                                audit_command_line(
+                                    p.confirm_check_binary.as_deref().unwrap_or_default(),
+                                    &p.confirm_check_args,
+                                ),
+                            )
+                            .field("control_path", format!("{:?}", p.control_path)),
+                    );
+                    return (
+                        format!("provisional {} confirmed by independent check", p.handle),
+                        Some(0),
+                    );
+                }
             }
-            Err(error) => {
+            _ => {
+                drop(registry);
                 tracing::warn!(
-                    "confirmation check succeeded but provisional {} could not confirm: {}",
-                    p.handle,
-                    error
+                    "confirmation check succeeded but provisional {} was no longer reverting",
+                    p.handle
                 );
             }
         }
@@ -2226,7 +2590,20 @@ async fn defer_revert(
         reg.get(&p.handle).cloned()
     };
     if let Some(u) = &updated {
-        persist_provisional(server, u).await;
+        if let Err(error) = try_persist_provisional(server, u).await {
+            tracing::error!(
+                "deferred rollback state for provisional {} was not durable: {}",
+                p.handle,
+                error
+            );
+            return (
+                format!(
+                    "provisional {} revert was deferred but persistence failed: {}",
+                    p.handle, error
+                ),
+                None,
+            );
+        }
     }
     server.emit_audit_ungated(
         AuditEvent::new(AuditKind::RevertDeferred)
@@ -2339,7 +2716,20 @@ pub(super) async fn finish_revert(
         reg.get(&p.handle).cloned()
     };
     if let Some(u) = &updated {
-        persist_provisional(server, u).await;
+        if let Err(error) = try_persist_provisional(server, u).await {
+            tracing::error!(
+                "rollback for provisional {} completed but its terminal state was not durable: {}",
+                p.handle,
+                error
+            );
+            return (
+                format!(
+                    "provisional {} rollback completed but terminal persistence failed: {}",
+                    p.handle, error
+                ),
+                exit,
+            );
+        }
     }
     // The revert is terminal (whether it succeeded or failed); drop any
     // api-proxy provenance tied to it so it cannot outlive its window, and
@@ -2395,5 +2785,51 @@ pub(super) async fn finish_revert(
             ),
             exit,
         )
+    }
+}
+
+#[cfg(test)]
+mod transactional_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn api_revert_creation_failure_does_not_arm_memory_only_authority() {
+        let mut server = crate::server::tests::config_for_proposal_test();
+        let state = tempfile::tempdir().unwrap();
+        let store = crate::session_store::SessionStore::open(state.path().join("state.db"), 3600)
+            .await
+            .unwrap();
+        store.fail_next_write_for_test();
+        server.state.session_store = Some(store.clone());
+        let sink = DaemonGateSink {
+            server: server.clone(),
+            endpoint: "fixture-endpoint".to_string(),
+            protocol: "fixture-protocol".to_string(),
+            snapshot_dir: state.path().to_path_buf(),
+            snapshot_dir_safe: true,
+            window_secs: 60,
+        };
+
+        let handle = guard::proxy::GateSink::arm_revert(
+            &sink,
+            guard::proxy::ApiMutation {
+                label: "fixture mutation".to_string(),
+                revert: guard::proxy::HttpRevert {
+                    method: "DELETE".to_string(),
+                    path: "/fixture".to_string(),
+                    body: None,
+                },
+                session_fingerprint: None,
+                session_revision: None,
+                secret_entitlements: None,
+                upstream_target: "https://fixture.invalid".to_string(),
+                upstream_identity: "fixture-identity".to_string(),
+            },
+        )
+        .await;
+
+        assert!(handle.is_none());
+        assert!(server.state.provisional.read().await.list().is_empty());
+        assert!(store.load_provisionals().await.unwrap().is_empty());
     }
 }

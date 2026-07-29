@@ -2,21 +2,32 @@
 use crate::server::gate_runtime::reconstruct_caller;
 #[cfg(windows)]
 use crate::server::transport::winplat;
-use crate::server::wire::{CallerIdentity, ExecOutcome, ExecuteResult, IncomingMessage};
+use crate::server::wire::{
+    CallerIdentity, ExecOutcome, ExecuteResult, IncomingMessage, EXECUTE_FEATURE_LOCAL_CWD,
+    EXECUTE_PROTOCOL_VERSION,
+};
 #[cfg(windows)]
 use guard::principal::PrincipalKey;
 
-/// `IncomingMessage` is untagged, and a bare execute request must resolve to
+/// `IncomingMessage` is untagged, and a versioned execute envelope resolves to
 /// the Execute variant.
 #[test]
 fn execute_wire_shape_parses_to_execute_variant() {
-    let msg: IncomingMessage =
-        serde_json::from_str(r#"{"binary":"ls","args":["-l"]}"#).expect("execute parses");
-    assert!(matches!(msg, IncomingMessage::Execute(_)));
+    let msg: IncomingMessage = serde_json::from_value(serde_json::json!({
+        "protocol_version": EXECUTE_PROTOCOL_VERSION,
+        "features": [EXECUTE_FEATURE_LOCAL_CWD],
+        "execute": {
+            "binary": "ls",
+            "args": ["-l"],
+            "cwd": "/fixture"
+        }
+    }))
+    .expect("execute parses");
+    assert!(matches!(msg, IncomingMessage::Execute { .. }));
 }
 
 #[test]
-fn session_scoped_public_rpcs_carry_distinct_owner_bearers() {
+fn remaining_session_scoped_batch_read_carries_distinct_owner_bearers() {
     let batch = crate::server::wire::AdminRequest::EvaluateBatch {
         session_token: Some("target".to_string()),
         caller_token: Some("owner".to_string()),
@@ -33,24 +44,57 @@ fn session_scoped_public_rpcs_carry_distinct_owner_bearers() {
     let json = serde_json::to_value(&batch).unwrap();
     assert_eq!(json["session_token"], "target");
     assert_eq!(json["caller_token"], "owner");
+}
 
-    let submit = crate::server::wire::AdminRequest::GrantRequestSubmit {
-        session_token: "target".to_string(),
-        caller_token: Some("owner".to_string()),
-        saved_grant: None,
-        prompt: "request".to_string(),
-        delta: Default::default(),
-    };
-    assert!(!submit.requires_daemon_uid());
+#[test]
+fn legacy_authority_operations_are_not_wire_protocol_variants() {
+    for json in [
+        r#"{"op":"session_grant","token":"chosen"}"#,
+        r#"{"op":"session_extend","token":"chosen","ttl_secs":3600}"#,
+        r#"{"op":"grant_request_submit","session_token":"chosen","prompt":"hidden","delta":{"secret_names":["credential"]}}"#,
+        r#"{"op":"grant_request_list","session_token":"chosen","caller_token":"owner"}"#,
+        r#"{"op":"grant_request_show","handle":"gr-example","session_token":"chosen"}"#,
+        r#"{"op":"saved_grant_edit","name":"hidden"}"#,
+    ] {
+        assert!(
+            serde_json::from_str::<crate::server::wire::AdminRequest>(json).is_err(),
+            "legacy authority mutation unexpectedly parsed: {json}"
+        );
+    }
+}
 
-    let list = crate::server::wire::AdminRequest::GrantRequestList {
-        session_token: Some("target".to_string()),
-        caller_token: Some("owner".to_string()),
+#[test]
+fn access_wire_shapes_are_stable_and_requester_is_not_caller_selected() {
+    let request = crate::server::wire::AdminRequest::AccessRequest {
+        intent: "Inspect fixture".to_string(),
     };
-    assert!(!list.requires_daemon_uid());
-    let json = serde_json::to_value(&list).unwrap();
-    assert_eq!(json["session_token"], "target");
-    assert_eq!(json["caller_token"], "owner");
+    assert!(!request.requires_daemon_uid());
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["intent"], "Inspect fixture");
+    assert!(json.get("requester").is_none());
+    assert!(json.get("owner").is_none());
+
+    let item = crate::server::wire::AccessItem {
+        reference: "gr-example".to_string(),
+        kind: "request".to_string(),
+        requester: "1001".to_string(),
+        target: "agent:1001".to_string(),
+        effective_scope: vec!["inspect".to_string()],
+        expires_unix: Some(123),
+        remaining_uses: Some(1),
+        use_policy: "unselected".to_string(),
+        state: "pending".to_string(),
+        next_action: "guard access approve gr-example".to_string(),
+        approval_options: Vec::new(),
+        intent: Some("Inspect fixture".to_string()),
+        capabilities: Vec::new(),
+        decided_reason: None,
+    };
+    let json = serde_json::to_value(item).unwrap();
+    assert_eq!(json["reference"], "gr-example");
+    assert_eq!(json["requester"], "1001");
+    assert_eq!(json["remaining_uses"], 1);
+    assert!(json.get("session_token").is_none());
 }
 
 // ---- Audit-line redaction helpers ---------------------------------------
@@ -75,6 +119,23 @@ fn execute_response_carries_stable_decision_source_and_trace() {
         response.decision_trace.as_ref().map(|trace| trace.version),
         Some(guard::gating::DecisionTrace::VERSION)
     );
+}
+
+#[test]
+fn structured_guidance_preserves_access_commands_and_coverage_detail() {
+    let response = ExecuteResult::denied("missing authority")
+        .with_verb_resolution(
+            Vec::new(),
+            Some("approve: guard access approve gr-example --once".to_string()),
+        )
+        .with_verb_resolution(Vec::new(), Some("coverage conflict".to_string()))
+        .with_access_request(Some("gr-example".to_string()))
+        .into_response();
+    assert_eq!(
+        response.verb_guidance.as_deref(),
+        Some("approve: guard access approve gr-example --once\ncoverage conflict")
+    );
+    assert_eq!(response.handle.as_deref(), Some("gr-example"));
 }
 
 #[test]
@@ -128,6 +189,32 @@ fn is_local_peer_excludes_tcp_and_unknown() {
         sid: "S-1-5-18".into()
     }
     .is_local_peer());
+}
+
+#[test]
+fn windows_system_operator_check_never_elevates_unix_or_tcp_callers() {
+    assert!(!CallerIdentity::Unix { uid: 0 }.is_windows_system_operator());
+    assert!(!CallerIdentity::Tcp {
+        token: "S-1-5-18".into()
+    }
+    .is_windows_system_operator());
+    assert!(!CallerIdentity::TcpAdmin {
+        token: "S-1-5-18".into()
+    }
+    .is_windows_system_operator());
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_system_sid_is_the_only_named_pipe_system_operator() {
+    assert!(CallerIdentity::Windows {
+        sid: "s-1-5-18".into()
+    }
+    .is_windows_system_operator());
+    assert!(!CallerIdentity::Windows {
+        sid: "S-1-5-19".into()
+    }
+    .is_windows_system_operator());
 }
 
 #[test]

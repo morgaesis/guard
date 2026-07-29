@@ -5,12 +5,13 @@ use crate::session::{
     SessionOwner, SessionRegistry,
 };
 use anyhow::{Context, Result};
-use guard::gating::approval::Approval;
-use guard::gating::provisional::Provisional;
+use guard::gating::approval::{Approval, ApprovalStatus};
+use guard::gating::provisional::{Provisional, ProvisionalStatus};
 use guard::gating::read_grant::ReadGrant;
 use guard::redact::redact_output_text;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use std::collections::HashMap;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -26,86 +27,435 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 /// `session_history`). Rows carried forward from v6 default to the `Unowned`
 /// sentinel, which is refused for any authority use until the session is
 /// reissued.
-const SCHEMA_VERSION: i64 = 7;
+///
+/// Version 8 adds access-managed session scope and per-request bounded-use
+/// accounting.
+///
+/// Version 9 adds a durable registry generation. Every full registry rewrite
+/// compares and advances that generation in the same SQLite transaction, so
+/// independently running daemons cannot consume the same bounded use or
+/// restore an older authority snapshot. Older binaries reject schema 9 instead
+/// of writing without that concurrency boundary.
+const SCHEMA_VERSION: i64 = 9;
 const VACUUM_MIN_PAGES: u64 = 512;
 const VACUUM_MIN_FREE_PAGES: u64 = 128;
+const REGISTRY_GENERATION_KEY: &str = "registry_generation";
+
+#[derive(Debug)]
+struct RegistryGenerationConflict {
+    expected: u64,
+    found: u64,
+}
+
+impl std::fmt::Display for RegistryGenerationConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "session registry changed in another daemon (expected generation {}, found {}); reload before retrying",
+            self.expected, self.found
+        )
+    }
+}
+
+impl std::error::Error for RegistryGenerationConflict {}
+
+#[derive(Debug, Default)]
+struct RegistryWriteState {
+    database_generation: u64,
+    last_written_revision: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RegistryCommitOptions {
+    fail_before_commit: bool,
+    expected_generation: u64,
+}
 
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     path: PathBuf,
     history_retention_secs: u64,
-    /// Serializes session-registry writes and records the revision of the last
-    /// snapshot written. The registry is persisted as a full-table rewrite, so
-    /// two concurrent persists completing out of order would let a stale
-    /// snapshot clobber a newer one on disk; the writer holds this lock across
-    /// the rewrite and drops any snapshot older than what already landed.
-    /// Shared across clones so every handle to the same store agrees.
-    registry_write_gate: std::sync::Arc<tokio::sync::Mutex<u64>>,
+    /// Held by daemon-opened stores from before SQLite initialization until
+    /// every clone of the running daemon's store has been dropped.
+    daemon_lease: Option<std::sync::Arc<StateDatabaseLease>>,
+    /// Serializes writes from this process and carries the durable generation
+    /// expected by its next full registry rewrite. SQLite compares that
+    /// generation inside the rewrite transaction, extending stale-snapshot
+    /// protection across independently opened stores and daemon processes.
+    registry_write_gate: std::sync::Arc<tokio::sync::Mutex<RegistryWriteState>>,
     #[cfg(test)]
     fail_next_write: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     fail_next_approval: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// Process-lifetime ownership of one state database. The operating system
+/// releases the advisory lock if the daemon exits or crashes. The lock file is
+/// intentionally retained so a new inode cannot bypass a live lock.
+#[derive(Debug)]
+pub struct StateDatabaseLease {
+    _file: File,
+}
+
 impl SessionStore {
+    pub(crate) fn is_registry_generation_conflict(error: &anyhow::Error) -> bool {
+        error.downcast_ref::<RegistryGenerationConflict>().is_some()
+    }
+
+    pub(crate) fn has_daemon_lease(&self) -> bool {
+        self.daemon_lease.is_some()
+    }
+
+    #[cfg(test)]
     pub async fn open(path: PathBuf, history_retention_secs: u64) -> Result<Self> {
         let path_for_open = path.clone();
-        tokio::task::spawn_blocking(move || Self::open_sync(path_for_open, history_retention_secs))
-            .await
-            .context("session store open task failed")?
+        tokio::task::spawn_blocking(move || {
+            Self::open_sync(path_for_open, history_retention_secs, None)
+        })
+        .await
+        .context("session store open task failed")?
+    }
+
+    /// Open the state database for a daemon. The path lease is acquired before
+    /// SQLite can initialize, migrate, sanitize, or repair any durable row.
+    pub async fn open_for_daemon(path: PathBuf, history_retention_secs: u64) -> Result<Self> {
+        tokio::task::spawn_blocking(move || {
+            let path = Self::normalize_daemon_database_path(&path)?;
+            Self::ensure_single_link_database(&path)?;
+            let lease = std::sync::Arc::new(Self::acquire_daemon_lease_sync(&path)?);
+            Self::ensure_single_link_database(&path)?;
+            let store = Self::open_sync(path.clone(), history_retention_secs, Some(lease))?;
+            Self::ensure_single_link_database(&path)?;
+            Ok(store)
+        })
+        .await
+        .context("daemon session store open task failed")?
+    }
+
+    fn normalize_daemon_database_path(path: &Path) -> Result<PathBuf> {
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .context("resolve current directory for state database")?
+                .join(path)
+        };
+        let file_name = absolute
+            .file_name()
+            .context("state database path must name a file")?
+            .to_os_string();
+        let parent = absolute
+            .parent()
+            .context("state database path must have a parent directory")?;
+
+        #[cfg(unix)]
+        {
+            create_parent_without_symlinks(parent)?;
+            secure_state_parent(parent)?;
+        }
+        #[cfg(windows)]
+        {
+            Self::ensure_windows_path_has_no_reparse_points(&absolute)?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create state database parent {}", parent.display()))?;
+            if !crate::server::secure_fs::harden_existing_state_path(parent, true) {
+                anyhow::bail!(
+                    "state database parent {} is not protected from ordinary local users",
+                    parent.display()
+                );
+            }
+            Self::ensure_windows_path_has_no_reparse_points(&absolute)?;
+        }
+        #[cfg(not(any(unix, windows)))]
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create state database parent {}", parent.display()))?;
+
+        let canonical_parent = std::fs::canonicalize(parent)
+            .with_context(|| format!("canonicalize state database parent {}", parent.display()))?;
+        let canonical = canonical_parent.join(file_name);
+        #[cfg(windows)]
+        Self::ensure_windows_path_has_no_reparse_points(&canonical)?;
+        Ok(canonical)
+    }
+
+    #[cfg(windows)]
+    fn ensure_windows_path_has_no_reparse_points(path: &Path) -> Result<()> {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        let mut ancestors = path.ancestors().collect::<Vec<_>>();
+        ancestors.reverse();
+        for ancestor in ancestors {
+            if ancestor.as_os_str().is_empty() {
+                continue;
+            }
+            match std::fs::symlink_metadata(ancestor) {
+                Ok(metadata) if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 => {
+                    anyhow::bail!(
+                        "state database path {} contains reparse point {}",
+                        path.display(),
+                        ancestor.display()
+                    );
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "inspect state database path component {}",
+                            ancestor.display()
+                        )
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     pub async fn load_registry(&self) -> Result<SessionRegistry> {
         let path = self.path.clone();
         let retention = self.history_retention_secs;
-        tokio::task::spawn_blocking(move || Self::load_registry_sync(&path, retention))
+        let mut write_state = self.registry_write_gate.lock().await;
+        let (registry, generation) =
+            tokio::task::spawn_blocking(move || Self::load_registry_sync(&path, retention))
+                .await
+                .context("session store load task failed")??;
+        write_state.database_generation = generation;
+        write_state.last_written_revision = registry.revision();
+        Ok(registry)
+    }
+
+    /// Acquire the single-daemon lease for this state database. Daemon startup
+    /// must hold this lease before loading or recovering consequence state, so
+    /// a live `Reverting` claim is never reclassified by a second process.
+    #[cfg(test)]
+    pub async fn acquire_daemon_lease(&self) -> Result<StateDatabaseLease> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || Self::acquire_daemon_lease_sync(&path))
             .await
-            .context("session store load task failed")?
+            .context("state database lease task failed")?
+    }
+
+    fn acquire_daemon_lease_sync(path: &Path) -> Result<StateDatabaseLease> {
+        let mut lock_name = path.as_os_str().to_os_string();
+        lock_name.push(".daemon.lock");
+        let lock_path = PathBuf::from(lock_name);
+        prepare_state_path(&lock_path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+            Self::ensure_windows_path_has_no_reparse_points(&lock_path)?;
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        let file = options
+            .open(&lock_path)
+            .with_context(|| format!("open daemon lease {}", lock_path.display()))?;
+        #[cfg(windows)]
+        Self::validate_windows_state_handle(&file, &lock_path)?;
+        file.try_lock().map_err(|error| {
+            anyhow::anyhow!(
+                "state database {} already has an active daemon: {}",
+                path.display(),
+                error
+            )
+        })?;
+        Ok(StateDatabaseLease { _file: file })
+    }
+
+    fn ensure_single_link_database(path: &Path) -> Result<()> {
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspect state db {}", path.display()))
+            }
+        };
+        #[cfg(unix)]
+        let links = metadata.nlink();
+        #[cfg(windows)]
+        let links = {
+            if metadata.file_type().is_symlink() {
+                anyhow::bail!(
+                    "state database {} is a symbolic link; daemon state requires an unaliased path",
+                    path.display()
+                );
+            }
+            Self::windows_link_count(path)?
+        };
+        #[cfg(not(any(unix, windows)))]
+        let links = 1;
+        if links != 1 {
+            anyhow::bail!(
+                "state database {} has {links} hard links; daemon state requires one unaliased path",
+                path.display()
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn windows_link_count(path: &Path) -> Result<u64> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .with_context(|| format!("open state db {} for identity check", path.display()))?;
+        Self::validate_windows_state_handle(&file, path)
+    }
+
+    #[cfg(windows)]
+    fn validate_windows_state_handle(file: &File, path: &Path) -> Result<u64> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, GetFinalPathNameByHandleW, BY_HANDLE_FILE_INFORMATION,
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_NAME_NORMALIZED, VOLUME_NAME_DOS,
+        };
+
+        let handle = file.as_raw_handle() as _;
+        let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        let result = unsafe { GetFileInformationByHandle(handle, &mut information) };
+        if result == 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("inspect state db identity {}", path.display()));
+        }
+        if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            anyhow::bail!("state database path {} is a reparse point", path.display());
+        }
+        if information.nNumberOfLinks != 1 {
+            anyhow::bail!(
+                "state database path {} has {} hard links",
+                path.display(),
+                information.nNumberOfLinks
+            );
+        }
+        let length = unsafe {
+            GetFinalPathNameByHandleW(
+                handle,
+                std::ptr::null_mut(),
+                0,
+                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+            )
+        };
+        if length == 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("resolve opened state path {}", path.display()));
+        }
+        let mut final_path = vec![0_u16; length as usize + 1];
+        let written = unsafe {
+            GetFinalPathNameByHandleW(
+                handle,
+                final_path.as_mut_ptr(),
+                final_path.len() as u32,
+                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+            )
+        };
+        if written == 0 || written as usize >= final_path.len() {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("resolve opened state path {}", path.display()));
+        }
+        final_path.truncate(written as usize);
+        let final_path = String::from_utf16(&final_path)
+            .context("opened state path is not valid UTF-16")?
+            .trim_start_matches(r"\\?\")
+            .to_ascii_lowercase();
+        let expected = std::fs::canonicalize(path)
+            .with_context(|| format!("canonicalize opened state path {}", path.display()))?
+            .to_string_lossy()
+            .trim_start_matches(r"\\?\")
+            .to_ascii_lowercase();
+        if final_path != expected {
+            anyhow::bail!(
+                "opened state path {} resolves to a different filesystem object",
+                path.display()
+            );
+        }
+        Ok(u64::from(information.nNumberOfLinks))
     }
 
     pub async fn persist_registry(&self, registry: &SessionRegistry) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("simulated session-store write failure");
+        }
         let path = self.path.clone();
         let retention = self.history_retention_secs;
         let mut snapshot = registry.clone().with_history_retention(retention);
         snapshot.purge_expired();
         let revision = snapshot.revision();
-        let mut last_written = self.registry_write_gate.lock().await;
-        if revision < *last_written {
+        let mut write_state = self.registry_write_gate.lock().await;
+        if revision < write_state.last_written_revision {
             // A newer snapshot already landed; a full-table rewrite from this
             // one would roll the on-disk state back.
             return Ok(());
         }
-        tokio::task::spawn_blocking(move || {
-            Self::persist_registry_sync(&path, retention, &snapshot)
+        let expected_generation = write_state.database_generation;
+        let generation = tokio::task::spawn_blocking(move || {
+            Self::persist_registry_sync(&path, retention, &snapshot, expected_generation)
         })
         .await
         .context("session store persist task failed")??;
-        *last_written = revision;
+        write_state.database_generation = generation;
+        write_state.last_written_revision = revision;
         Ok(())
     }
 
-    fn open_sync(path: PathBuf, history_retention_secs: u64) -> Result<Self> {
+    fn open_sync(
+        path: PathBuf,
+        history_retention_secs: u64,
+        daemon_lease: Option<std::sync::Arc<StateDatabaseLease>>,
+    ) -> Result<Self> {
+        let (registry, generation) = Self::load_registry_sync(&path, history_retention_secs)?;
         let store = Self {
             path,
             history_retention_secs,
-            registry_write_gate: std::sync::Arc::new(tokio::sync::Mutex::new(0)),
+            daemon_lease,
+            registry_write_gate: std::sync::Arc::new(tokio::sync::Mutex::new(RegistryWriteState {
+                database_generation: generation,
+                last_written_revision: registry.revision(),
+            })),
             #[cfg(test)]
             fail_next_write: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             fail_next_approval: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
-        let registry = Self::load_registry_sync(&store.path, history_retention_secs)?;
-        Self::persist_registry_sync(&store.path, history_retention_secs, &registry)?;
         Ok(store)
     }
 
-    fn load_registry_sync(path: &Path, history_retention_secs: u64) -> Result<SessionRegistry> {
-        let conn = Self::open_connection(path)?;
+    fn load_registry_sync(
+        path: &Path,
+        history_retention_secs: u64,
+    ) -> Result<(SessionRegistry, u64)> {
+        Self::load_registry_sync_with_hook(path, history_retention_secs, || {})
+    }
+
+    fn load_registry_sync_with_hook<F>(
+        path: &Path,
+        history_retention_secs: u64,
+        after_grants: F,
+    ) -> Result<(SessionRegistry, u64)>
+    where
+        F: FnOnce(),
+    {
+        let mut conn = Self::open_connection(path)?;
         Self::init_schema(&conn)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
 
         let mut grants = HashMap::new();
         {
-            let mut stmt = conn.prepare(
+            let mut stmt = tx.prepare(
                 "SELECT token, allow_json, deny_json, allow_exact_json, deny_exact_json, activated_verbs_json, override_markers_json, scope_json, expires_at, prompt_append, generated_notes_json, granted_at, static_only, auto_amend, owner_json
                  FROM session_grants",
             )?;
@@ -140,10 +490,11 @@ impl SessionStore {
                 grants.insert(token, grant);
             }
         }
+        after_grants();
 
         let mut history = Vec::new();
         {
-            let mut stmt = conn.prepare(
+            let mut stmt = tx.prepare(
                 "SELECT token, allow_json, deny_json, allow_exact_json, deny_exact_json, activated_verbs_json, override_markers_json, scope_json, granted_at, expires_at, ended_at, status, prompt_append, generated_notes_json, static_only, auto_amend, owner_json
                  FROM session_history
                  ORDER BY ended_at ASC, id ASC",
@@ -181,7 +532,7 @@ impl SessionStore {
 
         let mut interactions = Vec::new();
         {
-            let mut stmt = conn.prepare(
+            let mut stmt = tx.prepare(
                 "SELECT token, at_unix, command, allowed, source, reason, risk, exec_status, exit_code, secret_refs_json, decision_trace_json
                  FROM session_interactions
                  ORDER BY at_unix ASC, id ASC",
@@ -223,21 +574,70 @@ impl SessionStore {
         let mut registry =
             SessionRegistry::from_parts(grants, history, interactions, history_retention_secs);
         registry.purge_expired();
-        Ok(registry)
+        let generation = Self::read_registry_generation(&tx)?;
+        tx.commit()?;
+        Ok((registry, generation))
     }
 
     fn persist_registry_sync(
         path: &Path,
         history_retention_secs: u64,
         registry: &SessionRegistry,
-    ) -> Result<()> {
-        let conn = Self::open_connection(path)?;
+        expected_generation: u64,
+    ) -> Result<u64> {
+        let mut conn = Self::open_connection(path)?;
         Self::init_schema(&conn)?;
-        let tx = conn.unchecked_transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        Self::rewrite_registry_transaction(&tx, history_retention_secs, registry)?;
+        let generation = Self::rewrite_registry_cas_transaction(
+            &tx,
+            history_retention_secs,
+            registry,
+            expected_generation,
+        )?;
         tx.commit()?;
-        Ok(())
+        Ok(generation)
+    }
+
+    fn read_registry_generation(conn: &Connection) -> Result<u64> {
+        let encoded = conn.query_row(
+            "SELECT value FROM state_metadata WHERE key = ?1",
+            params![REGISTRY_GENERATION_KEY],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(decode_u64(encoded)?)
+    }
+
+    fn rewrite_registry_cas_transaction(
+        tx: &Transaction<'_>,
+        history_retention_secs: u64,
+        registry: &SessionRegistry,
+        expected_generation: u64,
+    ) -> Result<u64> {
+        let durable_generation = Self::read_registry_generation(tx)?;
+        if durable_generation != expected_generation {
+            return Err(RegistryGenerationConflict {
+                expected: expected_generation,
+                found: durable_generation,
+            }
+            .into());
+        }
+        Self::rewrite_registry_transaction(tx, history_retention_secs, registry)?;
+        let next_generation = expected_generation
+            .checked_add(1)
+            .context("session registry generation exhausted")?;
+        let changed = tx.execute(
+            "UPDATE state_metadata SET value = ?1 WHERE key = ?2 AND value = ?3",
+            params![
+                encode_u64(next_generation)?,
+                REGISTRY_GENERATION_KEY,
+                encode_u64(expected_generation)?
+            ],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("session registry generation compare-and-swap was lost");
+        }
+        Ok(next_generation)
     }
 
     fn rewrite_registry_transaction(
@@ -408,7 +808,8 @@ impl SessionStore {
             );
         }
         if version == SCHEMA_VERSION {
-            Self::repair_current_schema(conn)?;
+            Self::validate_current_schema_tables(conn)?;
+            Self::validate_authority_row_indexes(conn)?;
             return Ok(());
         }
 
@@ -501,7 +902,13 @@ impl SessionStore {
                 json TEXT NOT NULL,
                 status TEXT NOT NULL,
                 created_unix INTEGER NOT NULL
-            );",
+            );
+            CREATE TABLE IF NOT EXISTS state_metadata (
+                key TEXT PRIMARY KEY,
+                value INTEGER NOT NULL
+            );
+            INSERT OR IGNORE INTO state_metadata (key, value)
+            VALUES ('registry_generation', 0);",
         )?;
         ensure_column(
             &tx,
@@ -622,6 +1029,9 @@ impl SessionStore {
             "owner_json",
             &format!("TEXT NOT NULL DEFAULT {OWNER_JSON_DEFAULT}"),
         )?;
+        // Validate every authority-bearing index before migration sanitization
+        // can rewrite redundant columns from JSON and conceal corruption.
+        Self::validate_authority_row_indexes(&tx)?;
         // Databases written before schema v6 may hold credential material that
         // transited a command line (recorded argv, learned rules, prompts).
         // Sanitize once as part of the migration; the version bump below makes
@@ -632,85 +1042,175 @@ impl SessionStore {
         Ok(())
     }
 
-    /// Repair columns that belong to the current schema version. This keeps
-    /// startup safe after an interrupted or partially applied current migration.
-    fn repair_current_schema(conn: &Connection) -> Result<()> {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS saved_grants (
-                name TEXT PRIMARY KEY,
-                json TEXT NOT NULL,
-                updated_unix INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS saved_grant_tombstones (
-                name TEXT PRIMARY KEY,
-                deleted_unix INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS grant_requests (
-                handle TEXT PRIMARY KEY,
-                json TEXT NOT NULL,
-                status TEXT NOT NULL,
-                created_unix INTEGER NOT NULL
-            );",
-        )?;
-        ensure_column(
-            conn,
-            "session_grants",
-            "activated_verbs_json",
-            "TEXT NOT NULL DEFAULT '[]'",
-        )?;
-        ensure_column(
-            conn,
-            "session_grants",
-            "override_markers_json",
-            "TEXT NOT NULL DEFAULT '[]'",
-        )?;
-        ensure_column(
-            conn,
-            "session_grants",
-            "scope_json",
-            "TEXT NOT NULL DEFAULT '{}'",
-        )?;
-        ensure_column(
-            conn,
-            "session_history",
-            "activated_verbs_json",
-            "TEXT NOT NULL DEFAULT '[]'",
-        )?;
-        ensure_column(
-            conn,
-            "session_history",
-            "override_markers_json",
-            "TEXT NOT NULL DEFAULT '[]'",
-        )?;
-        ensure_column(
-            conn,
-            "session_history",
-            "scope_json",
-            "TEXT NOT NULL DEFAULT '{}'",
-        )?;
-        ensure_column(conn, "session_interactions", "exit_code", "INTEGER")?;
-        ensure_column(
-            conn,
-            "session_interactions",
-            "secret_refs_json",
-            "TEXT NOT NULL DEFAULT '[]'",
-        )?;
-        ensure_column(conn, "session_interactions", "decision_trace_json", "TEXT")?;
-        ensure_column(
-            conn,
-            "session_grants",
-            "owner_json",
-            &format!("TEXT NOT NULL DEFAULT {OWNER_JSON_DEFAULT}"),
-        )?;
-        ensure_column(
-            conn,
-            "session_history",
-            "owner_json",
-            &format!("TEXT NOT NULL DEFAULT {OWNER_JSON_DEFAULT}"),
-        )?;
+    fn validate_authority_row_indexes(conn: &Connection) -> Result<()> {
+        {
+            let mut stmt =
+                conn.prepare("SELECT name, updated_unix, json FROM saved_grants ORDER BY name")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (name, updated_unix, json) = row?;
+                let grant = serde_json::from_str::<SavedGrant>(&json)
+                    .with_context(|| format!("decode durable saved grant {name}"))?;
+                if grant.name != name || grant.updated_unix != decode_u64(updated_unix)? {
+                    anyhow::bail!(
+                        "durable saved-grant index disagrees with serialized row for {name}"
+                    );
+                }
+            }
+        }
+        {
+            let mut stmt = conn.prepare(
+                "SELECT handle, status, created_unix, json FROM grant_requests ORDER BY handle",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (handle, status, created_unix, json) = row?;
+                let request = serde_json::from_str::<GrantRequest>(&json).with_context(|| {
+                    format!("decode durable grant request {handle} with status {status}")
+                })?;
+                if request.handle != handle
+                    || request.status.as_str() != status
+                    || request.created_unix != decode_u64(created_unix)?
+                {
+                    anyhow::bail!(
+                        "durable grant-request index disagrees with serialized row for {handle}"
+                    );
+                }
+            }
+        }
+        {
+            let mut stmt = conn.prepare(
+                "SELECT handle, status, created_unix, json FROM gating_provisional ORDER BY handle",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (handle, status, created_unix, json) = row?;
+                let provisional =
+                    serde_json::from_str::<Provisional>(&json).with_context(|| {
+                        format!("decode durable provisional {handle} with status {status}")
+                    })?;
+                if provisional.handle != handle
+                    || provisional.status.as_str() != status
+                    || provisional.created_unix != decode_u64(created_unix)?
+                {
+                    anyhow::bail!(
+                        "durable provisional index disagrees with serialized row for {handle}"
+                    );
+                }
+            }
+        }
+        {
+            let mut stmt = conn.prepare(
+                "SELECT handle, status, created_unix, json FROM gating_approval ORDER BY handle",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (handle, status, created_unix, json) = row?;
+                let approval = serde_json::from_str::<Approval>(&json).with_context(|| {
+                    format!("decode durable approval {handle} with status {status}")
+                })?;
+                if approval.handle != handle
+                    || approval.status.as_str() != status
+                    || approval.created_unix != decode_u64(created_unix)?
+                {
+                    anyhow::bail!(
+                        "durable approval index disagrees with serialized row for {handle}"
+                    );
+                }
+            }
+        }
+        {
+            let mut stmt = conn.prepare(
+                "SELECT target_path, status, expires_unix, json FROM read_grants ORDER BY target_path",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (target_path, status, expires_unix, json) = row?;
+                let grant = serde_json::from_str::<ReadGrant>(&json).with_context(|| {
+                    format!("decode durable read grant {target_path} with status {status}")
+                })?;
+                if grant.target_path != target_path
+                    || grant.status.as_str() != status
+                    || grant.expires_unix != decode_u64(expires_unix)?
+                {
+                    anyhow::bail!(
+                        "durable read-grant index disagrees with serialized row for {target_path}"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
+    fn validate_current_schema_tables(conn: &Connection) -> Result<()> {
+        const REQUIRED_TABLES: &[&str] = &[
+            "session_grants",
+            "session_history",
+            "session_interactions",
+            "gating_provisional",
+            "gating_approval",
+            "read_grants",
+            "saved_grants",
+            "saved_grant_tombstones",
+            "grant_requests",
+            "state_metadata",
+        ];
+        for table in REQUIRED_TABLES {
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                params![table],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                anyhow::bail!("current state database is missing required table {table}");
+            }
+        }
+        let generation_exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM state_metadata WHERE key = ?1)",
+            params![REGISTRY_GENERATION_KEY],
+            |row| row.get(0),
+        )?;
+        if !generation_exists {
+            anyhow::bail!("current state database is missing registry generation metadata");
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub async fn save_saved_grant(&self, grant: SavedGrant) -> Result<()> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
@@ -733,6 +1233,7 @@ impl SessionStore {
         .context("save saved grant task failed")?
     }
 
+    #[cfg(test)]
     pub async fn delete_saved_grant(&self, name: String) -> Result<()> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
@@ -752,8 +1253,34 @@ impl SessionStore {
     }
 
     pub async fn load_saved_grants(&self) -> Result<Vec<SavedGrant>> {
-        self.load_json_rows("SELECT json FROM saved_grants", "saved grant")
-            .await
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = Self::open_connection(&path)?;
+            Self::init_schema(&conn)?;
+            let mut stmt = conn.prepare("SELECT name, updated_unix, json FROM saved_grants")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            let mut grants = Vec::new();
+            for row in rows {
+                let (name, updated_unix, json) = row?;
+                let grant = serde_json::from_str::<SavedGrant>(&json)
+                    .with_context(|| format!("decode durable saved grant {name}"))?;
+                if grant.name != name || grant.updated_unix != decode_u64(updated_unix)? {
+                    anyhow::bail!(
+                        "durable saved-grant index disagrees with serialized row for {name}"
+                    );
+                }
+                grants.push(grant);
+            }
+            Ok(grants)
+        })
+        .await
+        .context("load saved grants task failed")?
     }
 
     pub async fn load_saved_grant_tombstones(&self) -> Result<Vec<String>> {
@@ -779,6 +1306,7 @@ impl SessionStore {
             anyhow::bail!("simulated session-store write failure");
         }
         let path = self.path.clone();
+        let request = sanitize_grant_request(request);
         tokio::task::spawn_blocking(move || {
             let conn = Self::open_connection(&path)?;
             Self::init_schema(&conn)?;
@@ -808,6 +1336,8 @@ impl SessionStore {
             anyhow::bail!("simulated session-store write failure");
         }
         let path = self.path.clone();
+        let pending = sanitize_grant_request(pending);
+        let terminal = sanitize_grant_request(terminal);
         tokio::task::spawn_blocking(move || {
             Self::compare_and_swap_grant_request_sync(&path, &pending, &terminal)
         })
@@ -832,6 +1362,9 @@ impl SessionStore {
             || terminal.issued_saved_revision != pending.issued_saved_revision
             || terminal.issued_session_revision != pending.issued_session_revision
             || terminal.delta != pending.delta
+            || terminal.requested_uses != pending.requested_uses
+            || terminal.authority_verbs != pending.authority_verbs
+            || terminal.proposed_verbs != pending.proposed_verbs
         {
             anyhow::bail!("invalid grant request terminal transition");
         }
@@ -894,6 +1427,7 @@ impl SessionStore {
         pending: GrantRequest,
         approved: GrantRequest,
         registry: SessionRegistry,
+        rebased_pending: Vec<(GrantRequest, GrantRequest)>,
     ) -> Result<()> {
         #[cfg(test)]
         if self
@@ -909,21 +1443,43 @@ impl SessionStore {
         {
             anyhow::bail!("simulated session-store write failure");
         }
+        let pending = sanitize_grant_request(pending);
+        let approved = sanitize_grant_request(approved);
+        let rebased_pending = rebased_pending
+            .into_iter()
+            .map(|(previous, next)| {
+                (
+                    sanitize_grant_request(previous),
+                    sanitize_grant_request(next),
+                )
+            })
+            .collect::<Vec<_>>();
         let path = self.path.clone();
         let retention = self.history_retention_secs;
         let revision = registry.revision();
-        let mut last_written = self.registry_write_gate.lock().await;
-        if revision < *last_written {
+        let mut write_state = self.registry_write_gate.lock().await;
+        if revision < write_state.last_written_revision {
             anyhow::bail!("approved session snapshot is stale");
         }
-        tokio::task::spawn_blocking(move || {
+        let expected_generation = write_state.database_generation;
+        let generation = tokio::task::spawn_blocking(move || {
             Self::commit_grant_request_approval_sync(
-                &path, retention, &pending, &approved, &registry, false,
+                &path,
+                retention,
+                &pending,
+                &approved,
+                &registry,
+                &rebased_pending,
+                RegistryCommitOptions {
+                    fail_before_commit: false,
+                    expected_generation,
+                },
             )
         })
         .await
         .context("grant request approval transaction task failed")??;
-        *last_written = revision;
+        write_state.database_generation = generation;
+        write_state.last_written_revision = revision;
         Ok(())
     }
 
@@ -933,15 +1489,20 @@ impl SessionStore {
         pending: &GrantRequest,
         approved: &GrantRequest,
         registry: &SessionRegistry,
-        fail_before_commit: bool,
-    ) -> Result<()> {
+        rebased_pending: &[(GrantRequest, GrantRequest)],
+        options: RegistryCommitOptions,
+    ) -> Result<u64> {
         if pending.status != crate::grant_profile::GrantRequestStatus::Pending
             || approved.status != crate::grant_profile::GrantRequestStatus::Approved
             || approved.handle != pending.handle
-            || approved.session_token != pending.session_token
+            || (!pending.session_token.is_empty()
+                && approved.session_token != pending.session_token)
+            || approved.requester != pending.requester
             || approved.issued_saved_revision != pending.issued_saved_revision
             || approved.issued_session_revision != pending.issued_session_revision
             || approved.delta != pending.delta
+            || approved.authority_verbs != pending.authority_verbs
+            || approved.proposed_verbs != pending.proposed_verbs
         {
             anyhow::bail!("invalid grant request approval transition");
         }
@@ -962,15 +1523,22 @@ impl SessionStore {
         if durable != *pending {
             anyhow::bail!("durable grant request changed after approval began");
         }
-        let durable_grant = Self::load_session_grant(&tx, &pending.session_token)?
-            .context("durable session for grant request is missing")?;
-        if durable_grant.is_expired(guard::env::now_unix())
-            || session_grant_revision_key(&durable_grant) != pending.issued_session_revision
-        {
-            anyhow::bail!("durable session changed after grant request issuance");
+        if !pending.session_token.is_empty() {
+            let durable_grant = Self::load_session_grant(&tx, &pending.session_token)?
+                .context("durable session for grant request is missing")?;
+            if durable_grant.is_expired(guard::env::now_unix())
+                || session_grant_revision_key(&durable_grant) != pending.issued_session_revision
+            {
+                anyhow::bail!("durable session changed after grant request issuance");
+            }
         }
 
-        Self::rewrite_registry_transaction(&tx, history_retention_secs, registry)?;
+        let generation = Self::rewrite_registry_cas_transaction(
+            &tx,
+            history_retention_secs,
+            registry,
+            options.expected_generation,
+        )?;
         let approved_json =
             serde_json::to_string(approved).context("encode approved grant request")?;
         tx.execute(
@@ -982,16 +1550,192 @@ impl SessionStore {
                 approved.handle
             ],
         )?;
-        if fail_before_commit {
+        for (original, rebased) in rebased_pending {
+            let mut expected = original.clone();
+            expected.session_token = rebased.session_token.clone();
+            expected.issued_session_revision = rebased.issued_session_revision.clone();
+            expected.request_key = expected
+                .canonical_access_key()
+                .context("recompute sibling access request key after session rebase")?;
+            if original.status != crate::grant_profile::GrantRequestStatus::Pending
+                || rebased.status != crate::grant_profile::GrantRequestStatus::Pending
+                || expected != *rebased
+                || original.handle == pending.handle
+                || original.session_token != pending.session_token
+                || original.issued_session_revision != pending.issued_session_revision
+                || rebased.session_token != approved.session_token
+            {
+                anyhow::bail!("invalid sibling grant request rebase");
+            }
+            let durable_json = tx
+                .query_row(
+                    "SELECT json FROM grant_requests WHERE handle = ?1",
+                    params![original.handle],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .context("durable sibling grant request is missing")?;
+            let durable: GrantRequest = serde_json::from_str(&durable_json)
+                .context("decode durable sibling grant request")?;
+            if durable != *original {
+                anyhow::bail!("durable sibling grant request changed before rebase");
+            }
+            let rebased_json =
+                serde_json::to_string(rebased).context("encode rebased sibling grant request")?;
+            tx.execute(
+                "UPDATE grant_requests SET json = ?1, status = ?2, created_unix = ?3 WHERE handle = ?4",
+                params![
+                    rebased_json,
+                    rebased.status.as_str(),
+                    encode_u64(rebased.created_unix)?,
+                    rebased.handle
+                ],
+            )?;
+        }
+        if options.fail_before_commit {
             anyhow::bail!("simulated crash before approval transaction commit");
         }
         tx.commit()?;
+        Ok(generation)
+    }
+
+    /// Revoke one access session and withdraw every pending request targeting
+    /// it in the same transaction.
+    pub async fn commit_access_revoke(
+        &self,
+        token: String,
+        expected_revision: Option<String>,
+        registry: SessionRegistry,
+        withdrawals: Vec<(GrantRequest, GrantRequest)>,
+    ) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("simulated session-store write failure");
+        }
+        let withdrawals = withdrawals
+            .into_iter()
+            .map(|(previous, next)| {
+                (
+                    sanitize_grant_request(previous),
+                    sanitize_grant_request(next),
+                )
+            })
+            .collect::<Vec<_>>();
+        let path = self.path.clone();
+        let retention = self.history_retention_secs;
+        let revision = registry.revision();
+        let mut write_state = self.registry_write_gate.lock().await;
+        if revision < write_state.last_written_revision {
+            anyhow::bail!("access revoke session snapshot is stale");
+        }
+        let expected_generation = write_state.database_generation;
+        let generation = tokio::task::spawn_blocking(move || {
+            let mut conn = Self::open_connection(&path)?;
+            Self::init_schema(&conn)?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let durable_grant = Self::load_session_grant(&tx, &token)?
+                .context("durable access session is missing")?;
+            if session_grant_revision_key(&durable_grant) != expected_revision {
+                anyhow::bail!("durable access session changed before revoke");
+            }
+            for (pending, withdrawn) in &withdrawals {
+                if pending.status != crate::grant_profile::GrantRequestStatus::Pending
+                    || withdrawn.status != crate::grant_profile::GrantRequestStatus::Withdrawn
+                    || pending.handle != withdrawn.handle
+                    || pending.session_token != token
+                {
+                    anyhow::bail!("invalid access request withdrawal");
+                }
+                let mut expected = withdrawn.clone();
+                expected.status = pending.status;
+                expected.decided_unix = pending.decided_unix;
+                expected.decided_reason = pending.decided_reason.clone();
+                expected.next_action = pending.next_action.clone();
+                if expected != *pending {
+                    anyhow::bail!("access request withdrawal changed immutable fields");
+                }
+                let durable_json = tx
+                    .query_row(
+                        "SELECT json FROM grant_requests WHERE handle = ?1",
+                        params![pending.handle],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .context("durable pending access request is missing")?;
+                let durable: GrantRequest = serde_json::from_str(&durable_json)
+                    .context("decode durable pending access request")?;
+                if durable != *pending {
+                    anyhow::bail!("durable access request changed before revoke");
+                }
+            }
+            let generation = Self::rewrite_registry_cas_transaction(
+                &tx,
+                retention,
+                &registry,
+                expected_generation,
+            )?;
+            for (_, withdrawn) in &withdrawals {
+                let json = serde_json::to_string(withdrawn)
+                    .context("encode withdrawn access request")?;
+                tx.execute(
+                    "UPDATE grant_requests SET json = ?1, status = ?2, created_unix = ?3 WHERE handle = ?4",
+                    params![
+                        json,
+                        withdrawn.status.as_str(),
+                        encode_u64(withdrawn.created_unix)?,
+                        withdrawn.handle
+                    ],
+                )?;
+            }
+            tx.commit()?;
+            Ok(generation)
+        })
+        .await
+        .context("access revoke transaction task failed")??;
+        write_state.database_generation = generation;
+        write_state.last_written_revision = revision;
         Ok(())
     }
 
     pub async fn load_grant_requests(&self) -> Result<Vec<GrantRequest>> {
-        self.load_json_rows("SELECT json FROM grant_requests", "grant request")
-            .await
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = Self::open_connection(&path)?;
+            Self::init_schema(&conn)?;
+            let mut stmt =
+                conn.prepare("SELECT handle, status, created_unix, json FROM grant_requests")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            let mut requests = Vec::new();
+            for row in rows {
+                let (handle, status, created_unix, json) = row?;
+                let request = serde_json::from_str::<GrantRequest>(&json).with_context(|| {
+                    format!("decode durable grant request {handle} with status {status}")
+                })?;
+                let created_unix = decode_u64(created_unix)?;
+                if request.handle != handle
+                    || request.status.as_str() != status
+                    || request.created_unix != created_unix
+                {
+                    anyhow::bail!(
+                        "durable grant-request index disagrees with serialized row for {handle}"
+                    );
+                }
+                requests.push(request);
+            }
+            Ok(requests)
+        })
+        .await
+        .context("load grant requests task failed")?
     }
 
     pub async fn delete_grant_requests(&self, handles: Vec<String>) -> Result<()> {
@@ -1035,56 +1779,144 @@ impl SessionStore {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    async fn load_json_rows<T>(&self, query: &'static str, kind: &'static str) -> Result<Vec<T>>
-    where
-        T: serde::de::DeserializeOwned + Send + 'static,
-    {
-        let path = self.path.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = Self::open_connection(&path)?;
-            Self::init_schema(&conn)?;
-            let mut stmt = conn.prepare(query)?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-            let mut values = Vec::new();
-            for row in rows {
-                let json = row?;
-                match serde_json::from_str::<T>(&json) {
-                    Ok(value) => values.push(value),
-                    Err(error) => tracing::warn!("skipping unreadable {} row: {}", kind, error),
-                }
-            }
-            Ok(values)
-        })
-        .await
-        .with_context(|| format!("load {kind} task failed"))?
-    }
-
     // --- Consequence-gating runtime state (provisional executions and operator
     // approvals). These are high-churn, handle-keyed rows, so unlike the session
     // registry they persist incrementally (per-row upsert/delete) rather than by
     // full-table snapshot, and a provisional is committed before its forward
     // command runs so a crash still leaves a recoverable revert.
 
+    /// Insert a new provisional or advance an existing row through a legal,
+    /// monotonic transition. Creation uses a plain insert. Existing rows are
+    /// compared and replaced under one immediate transaction.
     pub async fn save_provisional(&self, p: Provisional) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("simulated session-store write failure");
+        }
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || Self::insert_or_advance_provisional_sync(&path, &p))
+            .await
+            .context("save_provisional task failed")?
+    }
+
+    pub async fn compare_and_swap_provisional(
+        &self,
+        expected: Provisional,
+        next: Provisional,
+    ) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("simulated session-store write failure");
+        }
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = Self::open_connection(&path)?;
-            Self::init_schema(&conn)?;
-            let json = serde_json::to_string(&p).context("encode provisional")?;
-            conn.execute(
-                "INSERT OR REPLACE INTO gating_provisional (handle, json, status, created_unix)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    p.handle,
-                    json,
-                    p.status.as_str(),
-                    encode_u64(p.created_unix)?
-                ],
-            )?;
-            Ok(())
+            Self::compare_and_swap_provisional_sync(&path, &expected, &next)
         })
         .await
-        .context("save_provisional task failed")?
+        .context("provisional transition task failed")?
+    }
+
+    fn insert_or_advance_provisional_sync(path: &Path, next: &Provisional) -> Result<()> {
+        let mut conn = Self::open_connection(path)?;
+        Self::init_schema(&conn)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let durable_json = tx
+            .query_row(
+                "SELECT json FROM gating_provisional WHERE handle = ?1",
+                params![next.handle],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match durable_json {
+            None => {
+                if next.status != ProvisionalStatus::Armed {
+                    anyhow::bail!("new provisional must begin armed");
+                }
+                let next_json = serde_json::to_string(next).context("encode new provisional")?;
+                let changed = tx.execute(
+                    "INSERT INTO gating_provisional (handle, json, status, created_unix)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        next.handle,
+                        next_json,
+                        next.status.as_str(),
+                        encode_u64(next.created_unix)?
+                    ],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!("provisional creation insert was lost");
+                }
+            }
+            Some(durable_json) => {
+                let expected: Provisional =
+                    serde_json::from_str(&durable_json).context("decode durable provisional")?;
+                Self::compare_and_swap_provisional_transaction(
+                    &tx,
+                    &expected,
+                    next,
+                    &durable_json,
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn compare_and_swap_provisional_sync(
+        path: &Path,
+        expected: &Provisional,
+        next: &Provisional,
+    ) -> Result<()> {
+        let mut conn = Self::open_connection(path)?;
+        Self::init_schema(&conn)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let expected_json =
+            serde_json::to_string(expected).context("encode expected provisional")?;
+        Self::compare_and_swap_provisional_transaction(&tx, expected, next, &expected_json)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn compare_and_swap_provisional_transaction(
+        tx: &Transaction<'_>,
+        expected: &Provisional,
+        next: &Provisional,
+        expected_json: &str,
+    ) -> Result<()> {
+        if !valid_provisional_transition(expected, next)? {
+            anyhow::bail!(
+                "invalid provisional transition from {} to {}",
+                expected.status.as_str(),
+                next.status.as_str()
+            );
+        }
+        let next_json = serde_json::to_string(next).context("encode next provisional")?;
+        if next_json == expected_json {
+            return Ok(());
+        }
+        let changed = tx.execute(
+            "UPDATE gating_provisional
+             SET json = ?1, status = ?2, created_unix = ?3
+             WHERE handle = ?4 AND status = ?5 AND json = ?6",
+            params![
+                next_json,
+                next.status.as_str(),
+                encode_u64(next.created_unix)?,
+                next.handle,
+                expected.status.as_str(),
+                expected_json
+            ],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("durable provisional changed before transition");
+        }
+        Ok(())
     }
 
     pub async fn delete_provisional(&self, handle: String) -> Result<()> {
@@ -1107,15 +1939,32 @@ impl SessionStore {
         tokio::task::spawn_blocking(move || {
             let conn = Self::open_connection(&path)?;
             Self::init_schema(&conn)?;
-            let mut stmt = conn.prepare("SELECT json FROM gating_provisional")?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            let mut stmt =
+                conn.prepare("SELECT handle, status, created_unix, json FROM gating_provisional")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
             let mut out = Vec::new();
             for row in rows {
-                let json = row?;
-                match serde_json::from_str::<Provisional>(&json) {
-                    Ok(p) => out.push(p),
-                    Err(e) => tracing::warn!("skipping unreadable provisional row: {}", e),
+                let (handle, status, created_unix, json) = row?;
+                let provisional =
+                    serde_json::from_str::<Provisional>(&json).with_context(|| {
+                        format!("decode durable provisional {handle} with status {status}")
+                    })?;
+                if provisional.handle != handle
+                    || provisional.status.as_str() != status
+                    || provisional.created_unix != decode_u64(created_unix)?
+                {
+                    anyhow::bail!(
+                        "durable provisional index disagrees with serialized row for {handle}"
+                    );
                 }
+                out.push(provisional);
             }
             Ok(out)
         })
@@ -1123,26 +1972,149 @@ impl SessionStore {
         .context("load_provisionals task failed")?
     }
 
+    /// Insert a new pending approval or advance an existing row through a
+    /// legal, monotonic transition. A stale caller can never replace a decided
+    /// row with Pending because the durable row is compared inside the write
+    /// transaction.
     pub async fn save_approval(&self, a: Approval) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("simulated session-store write failure");
+        }
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || Self::insert_or_advance_approval_sync(&path, &a))
+            .await
+            .context("save_approval task failed")?
+    }
+
+    pub async fn compare_and_swap_approval(
+        &self,
+        expected: Approval,
+        next: Approval,
+    ) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("simulated session-store write failure");
+        }
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = Self::open_connection(&path)?;
-            Self::init_schema(&conn)?;
-            let json = serde_json::to_string(&a).context("encode approval")?;
-            conn.execute(
-                "INSERT OR REPLACE INTO gating_approval (handle, json, status, created_unix)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    a.handle,
-                    json,
-                    a.status.as_str(),
-                    encode_u64(a.created_unix)?
-                ],
-            )?;
-            Ok(())
+            Self::compare_and_swap_approval_sync(&path, &expected, &next)
         })
         .await
-        .context("save_approval task failed")?
+        .context("approval transition task failed")?
+    }
+
+    fn insert_or_advance_approval_sync(path: &Path, next: &Approval) -> Result<()> {
+        if !next.snapshot.env.is_empty() {
+            anyhow::bail!("approval snapshots cannot persist plain environment values");
+        }
+        let mut conn = Self::open_connection(path)?;
+        Self::init_schema(&conn)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let durable_json = tx
+            .query_row(
+                "SELECT json FROM gating_approval WHERE handle = ?1",
+                params![next.handle],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match durable_json {
+            None => {
+                if next.status != ApprovalStatus::Pending {
+                    anyhow::bail!("new approval must begin pending");
+                }
+                let next_json = serde_json::to_string(next).context("encode new approval")?;
+                let changed = tx.execute(
+                    "INSERT INTO gating_approval (handle, json, status, created_unix)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        next.handle,
+                        next_json,
+                        next.status.as_str(),
+                        encode_u64(next.created_unix)?
+                    ],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!("approval creation insert was lost");
+                }
+            }
+            Some(durable_json) => {
+                let expected: Approval =
+                    serde_json::from_str(&durable_json).context("decode durable approval")?;
+                Self::compare_and_swap_approval_transaction(&tx, &expected, next, &durable_json)?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn compare_and_swap_approval_sync(
+        path: &Path,
+        expected: &Approval,
+        next: &Approval,
+    ) -> Result<()> {
+        let mut conn = Self::open_connection(path)?;
+        Self::init_schema(&conn)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let expected_json = serde_json::to_string(expected).context("encode expected approval")?;
+        Self::compare_and_swap_approval_transaction(&tx, expected, next, &expected_json)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn compare_and_swap_approval_transaction(
+        tx: &Transaction<'_>,
+        expected: &Approval,
+        next: &Approval,
+        expected_json: &str,
+    ) -> Result<()> {
+        if !next.snapshot.env.is_empty() {
+            anyhow::bail!("approval snapshots cannot persist plain environment values");
+        }
+        if !valid_approval_transition(expected, next)? {
+            anyhow::bail!(
+                "invalid approval transition from {} to {}",
+                expected.status.as_str(),
+                next.status.as_str()
+            );
+        }
+        let next_json = serde_json::to_string(next).context("encode next approval")?;
+        if next_json == expected_json {
+            return Ok(());
+        }
+        let changed = tx.execute(
+            "UPDATE gating_approval
+             SET json = ?1, status = ?2, created_unix = ?3
+             WHERE handle = ?4 AND status = ?5 AND json = ?6",
+            params![
+                next_json,
+                next.status.as_str(),
+                encode_u64(next.created_unix)?,
+                next.handle,
+                expected.status.as_str(),
+                expected_json
+            ],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("durable approval changed before transition");
+        }
+        Ok(())
+    }
+
+    /// Claim a pending approval with an exact durable compare-and-swap. This
+    /// is the execution ownership boundary for daemons sharing one database.
+    pub async fn compare_and_swap_approval_claim(
+        &self,
+        pending: Approval,
+        approving: Approval,
+    ) -> Result<()> {
+        self.compare_and_swap_approval(pending, approving).await
     }
 
     pub async fn delete_approval(&self, handle: String) -> Result<()> {
@@ -1165,15 +2137,36 @@ impl SessionStore {
         tokio::task::spawn_blocking(move || {
             let conn = Self::open_connection(&path)?;
             Self::init_schema(&conn)?;
-            let mut stmt = conn.prepare("SELECT json FROM gating_approval")?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            let mut stmt =
+                conn.prepare("SELECT handle, status, created_unix, json FROM gating_approval")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
             let mut out = Vec::new();
             for row in rows {
-                let json = row?;
-                match serde_json::from_str::<Approval>(&json) {
-                    Ok(a) => out.push(a),
-                    Err(e) => tracing::warn!("skipping unreadable approval row: {}", e),
+                let (handle, status, created_unix, json) = row?;
+                let approval = serde_json::from_str::<Approval>(&json).with_context(|| {
+                    format!("decode durable approval {handle} with status {status}")
+                })?;
+                if approval.handle != handle
+                    || approval.status.as_str() != status
+                    || approval.created_unix != decode_u64(created_unix)?
+                {
+                    anyhow::bail!(
+                        "durable approval index disagrees with serialized row for {handle}"
+                    );
                 }
+                if !approval.snapshot.env.is_empty() {
+                    anyhow::bail!(
+                        "durable approval {handle} contains prohibited plain environment values"
+                    );
+                }
+                out.push(approval);
             }
             Ok(out)
         })
@@ -1229,15 +2222,31 @@ impl SessionStore {
         tokio::task::spawn_blocking(move || {
             let conn = Self::open_connection(&path)?;
             Self::init_schema(&conn)?;
-            let mut stmt = conn.prepare("SELECT json FROM read_grants")?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            let mut stmt =
+                conn.prepare("SELECT target_path, status, expires_unix, json FROM read_grants")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
             let mut out = Vec::new();
             for row in rows {
-                let json = row?;
-                match serde_json::from_str::<ReadGrant>(&json) {
-                    Ok(g) => out.push(g),
-                    Err(e) => tracing::warn!("skipping unreadable read-grant row: {}", e),
+                let (target_path, status, expires_unix, json) = row?;
+                let grant = serde_json::from_str::<ReadGrant>(&json).with_context(|| {
+                    format!("decode durable read grant {target_path} with status {status}")
+                })?;
+                if grant.target_path != target_path
+                    || grant.status.as_str() != status
+                    || grant.expires_unix != decode_u64(expires_unix)?
+                {
+                    anyhow::bail!(
+                        "durable read-grant index disagrees with serialized row for {target_path}"
+                    );
                 }
+                out.push(grant);
             }
             Ok(out)
         })
@@ -1246,7 +2255,174 @@ impl SessionStore {
     }
 }
 
-/// One-time migration pass (schema v6): run credential redaction over
+fn serialized_eq<T: serde::Serialize>(left: &T, right: &T) -> Result<bool> {
+    Ok(serde_json::to_vec(left)? == serde_json::to_vec(right)?)
+}
+
+fn serialized_prefix<T: serde::Serialize>(prefix: &[T], values: &[T]) -> Result<bool> {
+    if prefix.len() > values.len() {
+        return Ok(false);
+    }
+    prefix
+        .iter()
+        .zip(values)
+        .try_fold(true, |equal, (left, right)| {
+            Ok(equal && serialized_eq(left, right)?)
+        })
+}
+
+fn option_only_adds_or_preserves<T: serde::Serialize>(
+    previous: &Option<T>,
+    next: &Option<T>,
+) -> Result<bool> {
+    match (previous, next) {
+        (None, _) => Ok(true),
+        (Some(left), Some(right)) => serialized_eq(left, right),
+        (Some(_), None) => Ok(false),
+    }
+}
+
+fn valid_approval_transition(previous: &Approval, next: &Approval) -> Result<bool> {
+    if previous.handle != next.handle
+        || !serialized_eq(&previous.snapshot, &next.snapshot)?
+        || previous.reason != next.reason
+        || previous.risk != next.risk
+        || !serialized_eq(&previous.reversibility, &next.reversibility)?
+        || previous.created_unix != next.created_unix
+        || previous.ttl_secs != next.ttl_secs
+        || !serialized_prefix(&previous.notes, &next.notes)?
+        || !option_only_adds_or_preserves(&previous.decision_trace, &next.decision_trace)?
+    {
+        return Ok(false);
+    }
+
+    let legal_status = matches!(
+        (previous.status, next.status),
+        (ApprovalStatus::Pending, ApprovalStatus::Pending)
+            | (ApprovalStatus::Pending, ApprovalStatus::Approving)
+            | (ApprovalStatus::Pending, ApprovalStatus::Denied)
+            | (ApprovalStatus::Pending, ApprovalStatus::Expired)
+            | (ApprovalStatus::Pending, ApprovalStatus::ExecFailed)
+            | (ApprovalStatus::Approving, ApprovalStatus::Approved)
+            | (ApprovalStatus::Approving, ApprovalStatus::ExecFailed)
+            | (ApprovalStatus::Approved, ApprovalStatus::Approved)
+            | (ApprovalStatus::Denied, ApprovalStatus::Denied)
+            | (ApprovalStatus::Expired, ApprovalStatus::Expired)
+            | (ApprovalStatus::ExecFailed, ApprovalStatus::ExecFailed)
+    );
+    if !legal_status {
+        return Ok(false);
+    }
+    if previous.status == next.status && previous.status != ApprovalStatus::Pending {
+        return serialized_eq(previous, next);
+    }
+    if matches!(
+        next.status,
+        ApprovalStatus::Denied | ApprovalStatus::Expired
+    ) && next.decided_unix.is_none()
+    {
+        return Ok(false);
+    }
+    if matches!(
+        next.status,
+        ApprovalStatus::Approved | ApprovalStatus::ExecFailed
+    ) && next.decided_unix.is_none()
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn provisional_identity(provisional: &Provisional) -> Provisional {
+    let mut identity = provisional.clone();
+    identity.decision_trace = None;
+    identity.forward_done = false;
+    identity.status = ProvisionalStatus::Armed;
+    identity.revert_exit = None;
+    identity.revert_detail = None;
+    identity
+}
+
+fn valid_provisional_transition(previous: &Provisional, next: &Provisional) -> Result<bool> {
+    if !serialized_eq(&provisional_identity(previous), &provisional_identity(next))?
+        || (previous.forward_done && !next.forward_done)
+        || !option_only_adds_or_preserves(&previous.decision_trace, &next.decision_trace)?
+    {
+        return Ok(false);
+    }
+    let legal_status = matches!(
+        (previous.status, next.status),
+        (ProvisionalStatus::Armed, ProvisionalStatus::Armed)
+            | (ProvisionalStatus::Armed, ProvisionalStatus::Reverting)
+            | (ProvisionalStatus::Armed, ProvisionalStatus::Confirmed)
+            | (ProvisionalStatus::Armed, ProvisionalStatus::Reverted)
+            | (
+                ProvisionalStatus::Armed,
+                ProvisionalStatus::NeedsOperatorDecision
+            )
+            | (
+                ProvisionalStatus::NeedsOperatorDecision,
+                ProvisionalStatus::NeedsOperatorDecision
+            )
+            | (
+                ProvisionalStatus::NeedsOperatorDecision,
+                ProvisionalStatus::Reverting
+            )
+            | (
+                ProvisionalStatus::NeedsOperatorDecision,
+                ProvisionalStatus::Confirmed
+            )
+            | (ProvisionalStatus::Reverting, ProvisionalStatus::Confirmed)
+            | (ProvisionalStatus::Reverting, ProvisionalStatus::Reverted)
+            | (
+                ProvisionalStatus::Reverting,
+                ProvisionalStatus::RevertFailed
+            )
+            | (
+                ProvisionalStatus::Reverting,
+                ProvisionalStatus::NeedsOperatorDecision
+            )
+            | (ProvisionalStatus::Confirmed, ProvisionalStatus::Confirmed)
+            | (ProvisionalStatus::Reverted, ProvisionalStatus::Reverted)
+            | (
+                ProvisionalStatus::RevertFailed,
+                ProvisionalStatus::RevertFailed
+            )
+    );
+    if !legal_status {
+        return Ok(false);
+    }
+    if previous.status == next.status
+        && !matches!(
+            previous.status,
+            ProvisionalStatus::Armed | ProvisionalStatus::NeedsOperatorDecision
+        )
+    {
+        return serialized_eq(previous, next);
+    }
+    Ok(true)
+}
+
+pub(crate) fn sanitize_grant_request(mut request: GrantRequest) -> GrantRequest {
+    request.justification = redact_output_text(&request.justification);
+    request.delta.prompt_append = request
+        .delta
+        .prompt_append
+        .take()
+        .map(|prompt| redact_output_text(&prompt));
+    request.decided_reason = request
+        .decided_reason
+        .take()
+        .map(|reason| redact_output_text(&reason));
+    if !request.request_key.is_empty() {
+        if let Ok(request_key) = request.canonical_access_key() {
+            request.request_key = request_key;
+        }
+    }
+    request
+}
+
+/// Migration pass for persisted command-derived text and durable gate state.
 /// persisted command-derived text so a secret that entered the state database
 /// under an older schema does not outlive the upgrade. Rows are sanitized in
 /// place -- diagnostic utility is kept, credential-shaped values become the
@@ -1334,6 +2510,74 @@ fn sanitize_persisted_credentials(conn: &Connection) -> Result<()> {
                     ],
                 )?;
             }
+        }
+    }
+    {
+        let mut stmt = conn.prepare("SELECT rowid, json FROM grant_requests")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (rowid, json) in rows {
+            let Ok(request) = serde_json::from_str::<GrantRequest>(&json) else {
+                continue;
+            };
+            let sanitized = sanitize_grant_request(request);
+            let sanitized_json = serde_json::to_string(&sanitized)?;
+            if sanitized_json != json {
+                conn.execute(
+                    "UPDATE grant_requests
+                     SET json = ?1, status = ?2, created_unix = ?3
+                     WHERE rowid = ?4",
+                    params![
+                        sanitized_json,
+                        sanitized.status.as_str(),
+                        encode_u64(sanitized.created_unix)?,
+                        rowid
+                    ],
+                )?;
+            }
+        }
+    }
+    {
+        let mut stmt = conn.prepare("SELECT rowid, json FROM gating_approval")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (rowid, json) in rows {
+            let Ok(mut approval) = serde_json::from_str::<Approval>(&json) else {
+                continue;
+            };
+            if approval.snapshot.env.is_empty() {
+                continue;
+            }
+            approval.snapshot.env.clear();
+            if matches!(
+                approval.status,
+                ApprovalStatus::Pending | ApprovalStatus::Approving
+            ) {
+                approval.status = ApprovalStatus::ExecFailed;
+                approval.decided_unix = Some(guard::env::now_unix());
+                approval.decided_reason = Some(
+                    "plain environment values were removed from persisted approval state"
+                        .to_string(),
+                );
+            }
+            let sanitized_json = serde_json::to_string(&approval)?;
+            conn.execute(
+                "UPDATE gating_approval
+                 SET json = ?1, status = ?2, created_unix = ?3
+                 WHERE rowid = ?4",
+                params![
+                    sanitized_json,
+                    approval.status.as_str(),
+                    encode_u64(approval.created_unix)?,
+                    rowid
+                ],
+            )?;
         }
     }
     Ok(())
@@ -1448,7 +2692,16 @@ fn open_state_connection(path: &Path) -> rusqlite::Result<Connection> {
     Connection::open(path)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn prepare_state_path(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    SessionStore::ensure_windows_path_has_no_reparse_points(path)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn prepare_state_path(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -1587,7 +2840,37 @@ fn enforce_private_state_files(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn enforce_private_state_files(path: &Path) -> Result<()> {
+    let sidecar = |suffix: &str| {
+        let mut value = path.as_os_str().to_os_string();
+        value.push(suffix);
+        PathBuf::from(value)
+    };
+    for candidate in [
+        path.to_path_buf(),
+        sidecar("-wal"),
+        sidecar("-shm"),
+        sidecar("-journal"),
+    ] {
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(_) if crate::server::secure_fs::harden_existing_state_path(&candidate, false) => {}
+            Ok(_) => anyhow::bail!(
+                "state database file {} is not protected from ordinary local users",
+                candidate.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("inspect state database file {}", candidate.display())
+                })
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 fn enforce_private_state_files(_path: &Path) -> Result<()> {
     Ok(())
 }
@@ -1772,6 +3055,43 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 
+    fn pending_approval(handle: &str) -> Approval {
+        Approval {
+            handle: handle.to_string(),
+            snapshot: guard::gating::approval::ApprovalSnapshot {
+                binary: "fixture-command".to_string(),
+                args: Vec::new(),
+                cwd: None,
+                env: std::collections::BTreeMap::new(),
+                secret_keys: std::collections::BTreeMap::new(),
+                session_fingerprint: None,
+                session_revision: None,
+                secret_entitlements: None,
+                secret_file_keys: std::collections::BTreeMap::new(),
+                verb_name: None,
+                verb_params: std::collections::BTreeMap::new(),
+                catalog_version: None,
+                access_verbs: Vec::new(),
+                access_requests: Vec::new(),
+                principal: Some(guard::principal::PrincipalKey::from_uid(1001)),
+                secret_binding: None,
+            },
+            reason: "fixture approval".to_string(),
+            risk: Some(7),
+            reversibility: Some(guard::gating::Reversibility::Irreversible),
+            decision_trace: None,
+            created_unix: 1,
+            ttl_secs: u64::MAX,
+            status: ApprovalStatus::Pending,
+            decided_unix: None,
+            decided_reason: None,
+            result_exit: None,
+            result_stdout: None,
+            result_stderr: None,
+            notes: Vec::new(),
+        }
+    }
+
     #[cfg(unix)]
     fn mode(path: &Path) -> u32 {
         std::fs::symlink_metadata(path).unwrap().mode() & 0o777
@@ -1948,6 +3268,281 @@ mod tests {
         assert_eq!(restored.decision_trace.as_ref(), Some(&trace));
     }
 
+    #[tokio::test]
+    async fn malformed_provisional_row_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let conn = Connection::open(path).unwrap();
+        conn.execute(
+            "INSERT INTO gating_provisional (handle, json, status, created_unix)
+             VALUES (?1, ?2, ?3, ?4)",
+            params!["malformed-armed", "{", "armed", 1],
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = store.load_provisionals().await.unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("malformed-armed"), "{rendered}");
+        assert!(rendered.contains("armed"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn grant_request_index_mismatch_fails_closed() {
+        let request = GrantRequest::new(
+            "fixture-session".to_string(),
+            None,
+            crate::grant_profile::GrantRequestDelta {
+                ttl_secs: Some(60),
+                ..Default::default()
+            },
+            "inspect the fixture".to_string(),
+        )
+        .unwrap();
+        let json = serde_json::to_string(&request).unwrap();
+        let cases = [
+            (
+                format!("{}-different", request.handle),
+                request.status.as_str().to_string(),
+                request.created_unix,
+            ),
+            (
+                request.handle.clone(),
+                "approved".to_string(),
+                request.created_unix,
+            ),
+            (
+                request.handle.clone(),
+                request.status.as_str().to_string(),
+                request.created_unix + 1,
+            ),
+        ];
+
+        for (handle, status, created_unix) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("state.db");
+            let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+            let conn = Connection::open(path).unwrap();
+            conn.execute(
+                "INSERT INTO grant_requests (handle, json, status, created_unix)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![handle, json, status, encode_u64(created_unix).unwrap()],
+            )
+            .unwrap();
+            drop(conn);
+
+            let error = format!("{:#}", store.load_grant_requests().await.unwrap_err());
+            assert!(error.contains("index disagrees"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_rejects_grant_request_index_corruption_before_sanitizing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let request = GrantRequest::new(
+            "fixture-session".to_string(),
+            None,
+            crate::grant_profile::GrantRequestDelta {
+                prompt_append: Some("Authorization: Bearer fixture-value".to_string()),
+                ..Default::default()
+            },
+            "inspect the fixture".to_string(),
+        )
+        .unwrap();
+        store.save_grant_request(request.clone()).await.unwrap();
+        drop(store);
+
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE grant_requests SET json = ?1, status = 'approved', created_unix = ?2 WHERE handle = ?3",
+            params![
+                serde_json::to_string(&request).unwrap(),
+                encode_u64(request.created_unix + 1).unwrap(),
+                request.handle
+            ],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
+            .unwrap();
+        drop(conn);
+
+        let error = SessionStore::open(path.clone(), 3600).await.unwrap_err();
+        assert!(format!("{error:#}").contains("grant-request index disagrees"));
+        let conn = Connection::open(path).unwrap();
+        let (status, created_unix, version): (String, i64, i64) = (
+            conn.query_row("SELECT status FROM grant_requests", [], |row| row.get(0))
+                .unwrap(),
+            conn.query_row("SELECT created_unix FROM grant_requests", [], |row| {
+                row.get(0)
+            })
+            .unwrap(),
+            conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap(),
+        );
+        assert_eq!(status, "approved");
+        assert_eq!(decode_u64(created_unix).unwrap(), request.created_unix + 1);
+        assert_eq!(version, SCHEMA_VERSION - 1);
+        let json: String = conn
+            .query_row("SELECT json FROM grant_requests", [], |row| row.get(0))
+            .unwrap();
+        assert!(json.contains("fixture-value"));
+    }
+
+    #[tokio::test]
+    async fn current_schema_missing_authority_table_fails_without_repair() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+        drop(store);
+
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("DROP TABLE grant_requests", []).unwrap();
+        drop(conn);
+
+        let error = SessionStore::open(path.clone(), 3600)
+            .await
+            .expect_err("current authority tables must never be recreated implicitly");
+        assert!(format!("{error:#}").contains("missing required table grant_requests"));
+        let conn = Connection::open(path).unwrap();
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'grant_requests')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!exists, "failed startup repaired missing authority state");
+    }
+
+    #[tokio::test]
+    async fn saved_grant_name_index_mismatch_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let grant = crate::grant_profile::SavedGrantCatalog::from_yaml(
+            "grants:\n  - name: expected-name\n    activated_verbs: [inspect]\n",
+        )
+        .unwrap()
+        .get("expected-name")
+        .unwrap()
+        .clone();
+        store.save_saved_grant(grant).await.unwrap();
+        drop(store);
+
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE saved_grants SET name = 'different-name' WHERE name = 'expected-name'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = SessionStore::open(path, 3600).await.unwrap_err();
+        assert!(format!("{error:#}").contains("saved-grant index disagrees"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn malformed_approval_and_read_grant_rows_fail_closed() {
+        let approval_tmp = tempfile::tempdir().unwrap();
+        let approval_path = approval_tmp.path().join("state.db");
+        let approval_store = SessionStore::open(approval_path.clone(), 3600)
+            .await
+            .unwrap();
+        let approval_conn = Connection::open(approval_path).unwrap();
+        approval_conn
+            .execute(
+                "INSERT INTO gating_approval (handle, json, status, created_unix)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params!["malformed-approval", "{", "pending", 1],
+            )
+            .unwrap();
+        drop(approval_conn);
+
+        let approval_error = format!("{:#}", approval_store.load_approvals().await.unwrap_err());
+        assert!(approval_error.contains("malformed-approval"));
+
+        let read_tmp = tempfile::tempdir().unwrap();
+        let read_path = read_tmp.path().join("state.db");
+        let read_store = SessionStore::open(read_path.clone(), 3600).await.unwrap();
+        let read_conn = Connection::open(read_path).unwrap();
+        read_conn
+            .execute(
+                "INSERT INTO read_grants (target_path, json, status, expires_unix)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params!["/fixture/path", "{", "active", 1],
+            )
+            .unwrap();
+        drop(read_conn);
+
+        let read_error = format!("{:#}", read_store.load_read_grants().await.unwrap_err());
+        assert!(read_error.contains("/fixture/path"));
+    }
+
+    #[tokio::test]
+    async fn provisional_claim_failure_leaves_durable_rollback_armed() {
+        use std::collections::BTreeMap;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(tmp.path().join("state.db"), 3600)
+            .await
+            .unwrap();
+        let armed = Provisional {
+            handle: "provisional-cas".to_string(),
+            principal: Some(guard::principal::PrincipalKey::from_uid(1001)),
+            binary: "fixture-forward".to_string(),
+            args: Vec::new(),
+            cwd: None,
+            secret_keys: BTreeMap::new(),
+            secret_file_keys: BTreeMap::new(),
+            revert_binary: "fixture-revert".to_string(),
+            revert_args: Vec::new(),
+            confirm_check_binary: None,
+            confirm_check_args: Vec::new(),
+            control_path: Some("fixture".to_string()),
+            session_fingerprint: None,
+            session_revision: None,
+            secret_entitlements: None,
+            api_revert: None,
+            reason: "fixture provisional".to_string(),
+            decision_trace: None,
+            created_unix: 1,
+            deadline_unix: 2,
+            forward_done: true,
+            status: ProvisionalStatus::Armed,
+            revert_exit: None,
+            revert_detail: None,
+        };
+        store.save_provisional(armed.clone()).await.unwrap();
+        let mut armed = armed;
+        armed.decision_trace = Some(guard::gating::DecisionTrace::source("static_policy"));
+        store.save_provisional(armed.clone()).await.unwrap();
+        let mut reverting = armed.clone();
+        reverting.status = ProvisionalStatus::Reverting;
+        store.fail_next_write_for_test();
+        assert!(store
+            .compare_and_swap_provisional(armed.clone(), reverting.clone())
+            .await
+            .is_err());
+        assert_eq!(
+            store.load_provisionals().await.unwrap()[0].status,
+            ProvisionalStatus::Armed
+        );
+
+        store
+            .compare_and_swap_provisional(armed.clone(), reverting)
+            .await
+            .unwrap();
+        assert!(store.save_provisional(armed).await.is_err());
+        assert_eq!(
+            store.load_provisionals().await.unwrap()[0].status,
+            ProvisionalStatus::Reverting
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn state_store_rejects_symlinks_and_non_regular_database_paths() {
@@ -2047,6 +3642,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grant_request_storage_and_migration_redact_command_credentials() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let mut request = GrantRequest::new(
+            "fixture-session".to_string(),
+            None,
+            crate::grant_profile::GrantRequestDelta {
+                prompt_append: Some(format!(
+                    "inspect with Authorization: Bearer {}",
+                    FIXTURE_BEARER_JWT
+                )),
+                ..Default::default()
+            },
+            format!(
+                "curl -H 'Authorization: Bearer {}' /status",
+                FIXTURE_BEARER_JWT
+            ),
+        )
+        .unwrap();
+        store.save_grant_request(request.clone()).await.unwrap();
+
+        let conn = Connection::open(&path).unwrap();
+        let stored: String = conn
+            .query_row(
+                "SELECT json FROM grant_requests WHERE handle = ?1",
+                params![request.handle],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!stored.contains(FIXTURE_BEARER_JWT));
+        assert!(stored.contains("[REDACTED]"));
+
+        request.justification = format!("tool {}", FIXTURE_PASSWORD_FLAG);
+        request.delta.prompt_append = Some(format!("legacy {}", FIXTURE_PASSWORD_FLAG));
+        let legacy_json = serde_json::to_string(&request).unwrap();
+        conn.execute(
+            "UPDATE grant_requests SET json = ?1 WHERE handle = ?2",
+            params![legacy_json, request.handle],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 8).unwrap();
+        drop(conn);
+
+        let migrated = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let migrated_json =
+            serde_json::to_string(&migrated.load_grant_requests().await.unwrap()).unwrap();
+        assert!(!migrated_json.contains(FIXTURE_PASSWORD_FLAG));
+        assert!(migrated_json.contains("[REDACTED]"));
+        let migrated_stored: String = Connection::open(path)
+            .unwrap()
+            .query_row("SELECT json FROM grant_requests", [], |row| row.get(0))
+            .unwrap();
+        assert!(!migrated_stored.contains(FIXTURE_PASSWORD_FLAG));
+    }
+
+    #[tokio::test]
     async fn saved_grant_tombstone_survives_restart_and_save_restores_name() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("state.db");
@@ -2121,16 +3773,28 @@ mod tests {
             "inspect".to_string(),
         )
         .unwrap();
+        pending.requested_uses = Some(4);
         pending.issued_session_revision = registry.effective_revision_key(&token);
         store.save_grant_request(pending.clone()).await.unwrap();
         let mut approved = pending.clone();
+        approved.requested_uses = Some(2);
         approved.status = crate::grant_profile::GrantRequestStatus::Approved;
         approved.decided_unix = Some(guard::env::now_unix());
         let mut staged = registry.clone();
         staged.apply_delta(&token, &pending.delta).unwrap();
+        let expected_generation = store.registry_write_gate.lock().await.database_generation;
 
         let error = SessionStore::commit_grant_request_approval_sync(
-            &path, 3600, &pending, &approved, &staged, true,
+            &path,
+            3600,
+            &pending,
+            &approved,
+            &staged,
+            &[],
+            RegistryCommitOptions {
+                fail_before_commit: true,
+                expected_generation,
+            },
         )
         .expect_err("simulated crash must roll back");
         assert!(error.to_string().contains("simulated crash"));
@@ -2149,14 +3813,17 @@ mod tests {
         );
 
         after_crash
-            .commit_grant_request_approval(pending, approved, staged)
+            .commit_grant_request_approval(pending, approved, staged, Vec::new())
             .await
             .unwrap();
         let committed = SessionStore::open(path, 3600).await.unwrap();
+        let committed_requests = committed.load_grant_requests().await.unwrap();
+        let committed_request = &committed_requests[0];
         assert_eq!(
-            committed.load_grant_requests().await.unwrap()[0].status,
+            committed_request.status,
             crate::grant_profile::GrantRequestStatus::Approved
         );
+        assert_eq!(committed_request.requested_uses, Some(2));
         assert_eq!(
             committed
                 .load_registry()
@@ -2215,6 +3882,433 @@ mod tests {
             loaded.has("second"),
             "the stale snapshot must not roll back the newer grant"
         );
+    }
+
+    #[test]
+    fn registry_load_keeps_grants_and_generation_in_one_sqlite_snapshot() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("state.db");
+        let (_, initial_generation) = SessionStore::load_registry_sync(&path, 3600).unwrap();
+        assert_eq!(initial_generation, 0);
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        drop(conn);
+
+        let token = "snapshot-race".to_string();
+        let mut before = SessionRegistry::new();
+        before.grant(
+            token.clone(),
+            SessionGrant {
+                allow: Vec::new(),
+                deny: Vec::new(),
+                allow_exact: Vec::new(),
+                deny_exact: Vec::new(),
+                activated_verbs: vec!["host-inspect".to_string()],
+                override_markers: Vec::new(),
+                scope: IssuedGrantScope {
+                    access_managed: true,
+                    ..IssuedGrantScope::default()
+                },
+                expires_at: None,
+                prompt_append: None,
+                generated_notes: Vec::new(),
+                granted_at: 1,
+                static_only: true,
+                auto_amend: false,
+                owner: SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(1001)),
+            },
+        );
+        before.install_access_grant(
+            &token,
+            Some(1),
+            "access-final-use".to_string(),
+            vec!["host-inspect".to_string()],
+        );
+        let seeded_generation =
+            SessionStore::persist_registry_sync(&path, 3600, &before, initial_generation).unwrap();
+        assert_eq!(seeded_generation, 1);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let reader_barrier = barrier.clone();
+        let reader_path = path.clone();
+        let reader = std::thread::spawn(move || {
+            SessionStore::load_registry_sync_with_hook(&reader_path, 3600, || {
+                reader_barrier.wait();
+                reader_barrier.wait();
+            })
+        });
+        barrier.wait();
+
+        let mut after = before.clone();
+        after
+            .consume_access_use(&token, &["host-inspect".to_string()], None)
+            .unwrap();
+        let advanced_generation =
+            SessionStore::persist_registry_sync(&path, 3600, &after, seeded_generation);
+        barrier.wait();
+        let (loaded, loaded_generation) = reader.join().unwrap().unwrap();
+        assert_eq!(advanced_generation.unwrap(), 2);
+        assert_eq!(loaded_generation, seeded_generation);
+        assert_eq!(
+            loaded.access_grant_uses(&token, "access-final-use"),
+            Some((Some(1), Some(1)))
+        );
+        let stale_write =
+            SessionStore::persist_registry_sync(&path, 3600, &loaded, loaded_generation)
+                .unwrap_err();
+        assert!(SessionStore::is_registry_generation_conflict(&stale_write));
+    }
+
+    #[tokio::test]
+    async fn first_daemon_lease_creates_lock_file_and_excludes_a_second_owner() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("state.db");
+        let first = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let second = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let mut lock_name = path.as_os_str().to_os_string();
+        lock_name.push(".daemon.lock");
+        let lock_path = PathBuf::from(lock_name);
+        if lock_path.exists() {
+            std::fs::remove_file(&lock_path).unwrap();
+        }
+
+        let lease = first.acquire_daemon_lease().await.unwrap();
+        assert!(lock_path.is_file());
+        let error = second.acquire_daemon_lease().await.unwrap_err();
+        assert!(error.to_string().contains("already has an active daemon"));
+        drop(lease);
+        second.acquire_daemon_lease().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_daemon_open_cannot_repair_or_migrate_a_live_database() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("state.db");
+        let seed = SessionStore::open(path.clone(), 3600).await.unwrap();
+        drop(seed);
+
+        let first = SessionStore::open_for_daemon(path.clone(), 3600)
+            .await
+            .unwrap();
+        assert!(first.has_daemon_lease());
+
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "DELETE FROM state_metadata WHERE key = ?1",
+            params![REGISTRY_GENERATION_KEY],
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = SessionStore::open_for_daemon(path.clone(), 3600)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("already has an active daemon"));
+
+        let conn = Connection::open(path).unwrap();
+        let metadata_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM state_metadata WHERE key = ?1",
+                params![REGISTRY_GENERATION_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            metadata_rows, 0,
+            "rejected startup mutated the live database"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn daemon_open_rejects_hard_linked_database_aliases() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("state.db");
+        let alias = tmp.path().join("state-alias.db");
+        let seed = SessionStore::open(path.clone(), 3600).await.unwrap();
+        drop(seed);
+        std::fs::hard_link(&path, &alias).unwrap();
+
+        for candidate in [path, alias] {
+            let error = SessionStore::open_for_daemon(candidate, 3600)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("hard links"), "{error:#}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn daemon_open_rejects_file_and_directory_reparse_aliases() {
+        use std::os::windows::fs::{symlink_dir, symlink_file};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target_dir = tmp.path().join("target");
+        std::fs::create_dir(&target_dir).unwrap();
+        let path = target_dir.join("state.db");
+        let seed = SessionStore::open(path.clone(), 3600).await.unwrap();
+        drop(seed);
+
+        let file_alias = tmp.path().join("state-alias.db");
+        symlink_file(&path, &file_alias).unwrap();
+        let file_error = SessionStore::open_for_daemon(file_alias, 3600)
+            .await
+            .unwrap_err();
+        assert!(file_error.to_string().contains("reparse point"));
+
+        let directory_alias = tmp.path().join("target-alias");
+        symlink_dir(&target_dir, &directory_alias).unwrap();
+        let directory_error = SessionStore::open_for_daemon(directory_alias.join("state.db"), 3600)
+            .await
+            .unwrap_err();
+        assert!(directory_error.to_string().contains("reparse point"));
+
+        let lock_target = target_dir.join("lock-target");
+        std::fs::write(&lock_target, b"fixture").unwrap();
+        let mut lock_name = path.as_os_str().to_os_string();
+        lock_name.push(".daemon.lock");
+        symlink_file(lock_target, PathBuf::from(lock_name)).unwrap();
+        let lease_error = SessionStore::open_for_daemon(path, 3600).await.unwrap_err();
+        assert!(lease_error.to_string().contains("reparse point"));
+    }
+
+    #[tokio::test]
+    async fn second_daemon_cannot_reclassify_a_live_reverting_claim() {
+        use std::collections::BTreeMap;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("state.db");
+        let first = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let second = SessionStore::open(path, 3600).await.unwrap();
+        let reverting = Provisional {
+            handle: "live-revert".to_string(),
+            principal: Some(guard::principal::PrincipalKey::from_uid(1001)),
+            binary: "fixture-forward".to_string(),
+            args: Vec::new(),
+            cwd: None,
+            secret_keys: BTreeMap::new(),
+            secret_file_keys: BTreeMap::new(),
+            revert_binary: "fixture-revert".to_string(),
+            revert_args: Vec::new(),
+            confirm_check_binary: None,
+            confirm_check_args: Vec::new(),
+            control_path: Some("fixture".to_string()),
+            session_fingerprint: None,
+            session_revision: None,
+            secret_entitlements: None,
+            api_revert: None,
+            reason: "bounded change".to_string(),
+            decision_trace: None,
+            created_unix: 1,
+            deadline_unix: u64::MAX,
+            forward_done: true,
+            status: ProvisionalStatus::Reverting,
+            revert_exit: None,
+            revert_detail: None,
+        };
+        let mut armed = reverting.clone();
+        armed.status = ProvisionalStatus::Armed;
+        first.save_provisional(armed.clone()).await.unwrap();
+        first
+            .compare_and_swap_provisional(armed, reverting)
+            .await
+            .unwrap();
+        let _lease = first.acquire_daemon_lease().await.unwrap();
+
+        assert!(second.acquire_daemon_lease().await.is_err());
+        let durable = second.load_provisionals().await.unwrap();
+        assert_eq!(durable[0].status, ProvisionalStatus::Reverting);
+    }
+
+    #[tokio::test]
+    async fn independent_stores_cannot_both_consume_the_final_access_use() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("state.db");
+        let seed = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let token = "bounded-access".to_string();
+        let mut registry = SessionRegistry::new();
+        registry.grant(
+            token.clone(),
+            SessionGrant {
+                allow: Vec::new(),
+                deny: Vec::new(),
+                allow_exact: Vec::new(),
+                deny_exact: Vec::new(),
+                activated_verbs: vec!["host-inspect".to_string()],
+                override_markers: Vec::new(),
+                scope: IssuedGrantScope {
+                    access_managed: true,
+                    ..IssuedGrantScope::default()
+                },
+                expires_at: None,
+                prompt_append: None,
+                generated_notes: Vec::new(),
+                granted_at: 1,
+                static_only: true,
+                auto_amend: false,
+                owner: SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(1001)),
+            },
+        );
+        registry.install_access_grant(
+            &token,
+            Some(1),
+            "access-final-use".to_string(),
+            vec!["host-inspect".to_string()],
+        );
+        registry.install_access_grant(
+            &token,
+            Some(1),
+            "access-later-use".to_string(),
+            vec!["host-maintain".to_string()],
+        );
+        seed.persist_registry(&registry).await.unwrap();
+
+        let first = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let second = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let mut first_snapshot = first.load_registry().await.unwrap();
+        let mut second_snapshot = second.load_registry().await.unwrap();
+        first_snapshot
+            .consume_access_use(&token, &["host-inspect".to_string()], None)
+            .unwrap();
+        second_snapshot
+            .consume_access_use(&token, &["host-inspect".to_string()], None)
+            .unwrap();
+
+        let (first_result, second_result) = tokio::join!(
+            first.persist_registry(&first_snapshot),
+            second.persist_registry(&second_snapshot)
+        );
+        assert_ne!(first_result.is_ok(), second_result.is_ok());
+        let stale_store = if first_result.is_err() {
+            &first
+        } else {
+            &second
+        };
+        let stale_snapshot = if first_result.is_err() {
+            &first_snapshot
+        } else {
+            &second_snapshot
+        };
+        let stale_retry = stale_store.persist_registry(stale_snapshot).await;
+        assert!(
+            stale_retry.is_err(),
+            "a stale store must reload before writing"
+        );
+        assert!(SessionStore::is_registry_generation_conflict(
+            &stale_retry.unwrap_err()
+        ));
+
+        let mut refreshed = stale_store.load_registry().await.unwrap();
+        assert!(refreshed
+            .consume_access_use(&token, &["host-inspect".to_string()], None)
+            .is_err());
+        refreshed
+            .consume_access_use(&token, &["host-maintain".to_string()], None)
+            .unwrap();
+        stale_store.persist_registry(&refreshed).await.unwrap();
+
+        let verifier = SessionStore::open(path, 3600).await.unwrap();
+        let mut durable = verifier.load_registry().await.unwrap();
+        assert_eq!(
+            durable.access_grant_uses(&token, "access-final-use"),
+            Some((Some(1), Some(0)))
+        );
+        assert_eq!(
+            durable.access_grant_uses(&token, "access-later-use"),
+            Some((Some(1), Some(0)))
+        );
+        assert!(durable
+            .consume_access_use(&token, &["host-inspect".to_string()], None)
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn unrelated_interaction_generation_conflict_does_not_stale_lock_admission() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("state.db");
+        let seed = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let token = "interaction-race".to_string();
+        let mut registry = SessionRegistry::new();
+        registry.grant(
+            token.clone(),
+            SessionGrant {
+                allow: Vec::new(),
+                deny: Vec::new(),
+                allow_exact: Vec::new(),
+                deny_exact: Vec::new(),
+                activated_verbs: vec!["host-inspect".to_string()],
+                override_markers: Vec::new(),
+                scope: IssuedGrantScope {
+                    access_managed: true,
+                    ..IssuedGrantScope::default()
+                },
+                expires_at: None,
+                prompt_append: None,
+                generated_notes: Vec::new(),
+                granted_at: 1,
+                static_only: true,
+                auto_amend: false,
+                owner: SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(1001)),
+            },
+        );
+        registry.install_access_grant(
+            &token,
+            Some(1),
+            "access-after-interaction".to_string(),
+            vec!["host-inspect".to_string()],
+        );
+        seed.persist_registry(&registry).await.unwrap();
+
+        let admission_store = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let interaction_store = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let mut stale_admission = admission_store.load_registry().await.unwrap();
+        let mut interaction = interaction_store.load_registry().await.unwrap();
+        interaction.record_interaction(
+            &token,
+            SessionInteraction {
+                at_unix: guard::env::now_unix(),
+                command: "host-inspect".to_string(),
+                allowed: true,
+                source: SessionDecisionSource::StaticPolicy,
+                reason: "fixture interaction".to_string(),
+                risk: Some(0),
+                exec_status: SessionExecStatus::Completed,
+                exit_code: Some(0),
+                exposed_secret_refs: Vec::new(),
+                decision_trace: None,
+            },
+        );
+        interaction_store
+            .persist_registry(&interaction)
+            .await
+            .unwrap();
+
+        stale_admission
+            .consume_access_use(&token, &["host-inspect".to_string()], None)
+            .unwrap();
+        let conflict = admission_store
+            .persist_registry(&stale_admission)
+            .await
+            .unwrap_err();
+        assert!(SessionStore::is_registry_generation_conflict(&conflict));
+
+        let mut refreshed = admission_store.load_registry().await.unwrap();
+        refreshed
+            .consume_access_use(&token, &["host-inspect".to_string()], None)
+            .unwrap();
+        admission_store.persist_registry(&refreshed).await.unwrap();
+
+        let loaded = SessionStore::open(path, 3600)
+            .await
+            .unwrap()
+            .load_registry()
+            .await
+            .unwrap();
+        assert_eq!(
+            loaded.access_grant_uses(&token, "access-after-interaction"),
+            Some((Some(1), Some(0)))
+        );
+        assert_eq!(loaded.show(&token, 10).unwrap().stats.total, 1);
     }
 
     // Synthetic test-fixture credential shapes (never real secrets).
@@ -2318,7 +4412,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v6_migration_stamps_unowned_owner_and_bumps_to_v7() {
+    async fn v6_migration_stamps_unowned_owner_and_bumps_to_current_schema() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("state.db");
         {
@@ -2344,8 +4438,8 @@ mod tests {
             drop(conn);
         }
 
-        // Opening migrates 6 -> 7, adding the owner column with the Unowned
-        // sentinel default.
+        // Opening migrates schema 6 to the current schema, adding the owner
+        // column with the Unowned sentinel default.
         let store = SessionStore::open(path.clone(), 24 * 60 * 60)
             .await
             .expect("migrate store");
@@ -2363,7 +4457,6 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(version, 7);
     }
 
     #[tokio::test]
@@ -2522,6 +4615,177 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn approval_claim_is_owned_by_exactly_one_store_instance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.db");
+        let first = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let second = SessionStore::open(path, 3600).await.unwrap();
+        let pending = Approval {
+            handle: "ap-shared-claim".to_string(),
+            snapshot: guard::gating::approval::ApprovalSnapshot {
+                binary: "fixture-command".to_string(),
+                args: Vec::new(),
+                cwd: None,
+                env: std::collections::BTreeMap::new(),
+                secret_keys: std::collections::BTreeMap::new(),
+                session_fingerprint: None,
+                session_revision: None,
+                secret_entitlements: None,
+                secret_file_keys: std::collections::BTreeMap::new(),
+                verb_name: None,
+                verb_params: std::collections::BTreeMap::new(),
+                catalog_version: None,
+                access_verbs: Vec::new(),
+                access_requests: Vec::new(),
+                principal: Some(guard::principal::PrincipalKey::from_uid(1001)),
+                secret_binding: None,
+            },
+            reason: "fixture approval".to_string(),
+            risk: Some(7),
+            reversibility: Some(guard::gating::Reversibility::Irreversible),
+            decision_trace: None,
+            created_unix: 1,
+            ttl_secs: u64::MAX,
+            status: ApprovalStatus::Pending,
+            decided_unix: None,
+            decided_reason: None,
+            result_exit: None,
+            result_stdout: None,
+            result_stderr: None,
+            notes: Vec::new(),
+        };
+        first.save_approval(pending.clone()).await.unwrap();
+        let mut pending = pending;
+        pending.decision_trace = Some(guard::gating::DecisionTrace::source("static_policy"));
+        first.save_approval(pending.clone()).await.unwrap();
+        let mut approving = pending.clone();
+        approving.status = ApprovalStatus::Approving;
+
+        let (left, right) = tokio::join!(
+            first.compare_and_swap_approval_claim(pending.clone(), approving.clone()),
+            second.compare_and_swap_approval_claim(pending, approving)
+        );
+        assert_ne!(left.is_ok(), right.is_ok());
+        let durable = first.load_approvals().await.unwrap();
+        assert_eq!(durable.len(), 1);
+        assert_eq!(durable[0].status, ApprovalStatus::Approving);
+    }
+
+    #[tokio::test]
+    async fn stale_approval_save_cannot_restore_pending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.db");
+        let store = SessionStore::open(path, 3600).await.unwrap();
+        let pending = pending_approval("ap-no-restore");
+        store.save_approval(pending.clone()).await.unwrap();
+        let mut approving = pending.clone();
+        approving.status = ApprovalStatus::Approving;
+        store
+            .compare_and_swap_approval(pending.clone(), approving.clone())
+            .await
+            .unwrap();
+
+        assert!(store.save_approval(pending).await.is_err());
+        assert_eq!(
+            store.load_approvals().await.unwrap()[0].status,
+            ApprovalStatus::Approving
+        );
+
+        let mut denied = approving.clone();
+        denied.status = ApprovalStatus::Denied;
+        denied.decided_unix = Some(2);
+        denied.decided_reason = Some("late denial".to_string());
+        assert!(store
+            .compare_and_swap_approval(approving, denied)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn approval_store_rejects_plain_environment_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.db");
+        let store = SessionStore::open(path, 3600).await.unwrap();
+        let mut approval = pending_approval("ap-plain-env");
+        approval
+            .snapshot
+            .env
+            .insert("FIXTURE_VALUE".to_string(), "synthetic-secret".to_string());
+
+        assert!(store.save_approval(approval).await.is_err());
+        assert!(store.load_approvals().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn migration_removes_plain_environment_values_from_approval_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+        drop(store);
+        let mut approval = pending_approval("ap-migrate-env");
+        approval.snapshot.env.insert(
+            "FIXTURE_VALUE".to_string(),
+            "synthetic-credential-value".to_string(),
+        );
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO gating_approval (handle, json, status, created_unix)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                approval.handle,
+                serde_json::to_string(&approval).unwrap(),
+                approval.status.as_str(),
+                encode_u64(approval.created_unix).unwrap()
+            ],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 8).unwrap();
+        drop(conn);
+
+        let migrated = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let rows = migrated.load_approvals().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].snapshot.env.is_empty());
+        assert_eq!(rows[0].status, ApprovalStatus::ExecFailed);
+        let stored: String = Connection::open(path)
+            .unwrap()
+            .query_row("SELECT json FROM gating_approval", [], |row| row.get(0))
+            .unwrap();
+        assert!(!stored.contains("synthetic-credential-value"));
+    }
+
+    #[tokio::test]
+    async fn current_schema_rejects_plain_environment_values_in_approval_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let mut approval = pending_approval("ap-current-plain-env");
+        approval.snapshot.env.insert(
+            "FIXTURE_VALUE".to_string(),
+            "synthetic-credential-value".to_string(),
+        );
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO gating_approval (handle, json, status, created_unix)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                approval.handle,
+                serde_json::to_string(&approval).unwrap(),
+                approval.status.as_str(),
+                encode_u64(approval.created_unix).unwrap()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = store
+            .load_approvals()
+            .await
+            .expect_err("current-schema approval environment must fail closed");
+        assert!(error.to_string().contains("prohibited plain environment"));
     }
 
     #[tokio::test]

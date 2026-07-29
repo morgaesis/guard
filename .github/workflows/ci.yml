@@ -57,12 +57,25 @@ jobs:
             echo "checksum manifest included an unexpected file type"
             exit 1
           fi
+          release_job=$(sed -n '/^  release:/,$p' .github/workflows/publish-release.yml)
+          checkout_line=$(printf '%s\n' "$release_job" | grep -n -m1 'uses: actions/checkout@' | cut -d: -f1)
+          create_line=$(printf '%s\n' "$release_job" | grep -n -m1 'name: Create Release' | cut -d: -f1)
+          test -n "$checkout_line"
+          test -n "$create_line"
+          test "$checkout_line" -lt "$create_line"
+          printf '%s\n' "$release_job" | grep -A3 -m1 'uses: actions/checkout@' | grep -q 'persist-credentials: false'
+          printf '%s\n' "$release_job" | grep -A4 -m1 'uses: actions/checkout@' | grep -q 'fetch-depth: 0'
           mkdir /tmp/guard-release-test/verify
           cp /tmp/guard-release-test/a/*.tar.gz /tmp/guard-release-test/b/*.tar.gz /tmp/guard-release-test/verify/
           cp /tmp/guard-release-test/c/*.cdx.json /tmp/guard-release-test/verify/
           cp /tmp/guard-release-test/SHA256SUMS /tmp/guard-release-test/verify/
           (cd /tmp/guard-release-test/verify && sha256sum --check SHA256SUMS)
           rm -rf /tmp/guard-release-test
+
+      - name: Exercise packaged systemd argument expansion
+        if: runner.os == 'Linux'
+        shell: bash
+        run: sudo ./deployment/systemd/test-guard-service-expansion.sh
 
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659  # v1.17.0
@@ -81,6 +94,9 @@ jobs:
       - name: Rustfmt check
         run: cargo fmt --all -- --check
 
+      - name: Fuzz manifest lock check
+        run: cargo metadata --manifest-path fuzz/Cargo.toml --locked --no-deps --format-version 1
+
       - name: User-facing style check
         shell: bash
         run: |
@@ -96,7 +112,43 @@ jobs:
       - name: Run tests
         run: cargo test --all-features
 
-  # The repository ruleset requires a status check literally named "Test & Lint".
+  adversarial_gate:
+    name: Credential-free adversarial gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Run isolated adversarial gate
+        shell: bash
+        run: ./ctf/gating/run.sh attack
+
+  synthetic_user:
+    name: Isolated synthetic-user catalog
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install rootless Podman
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes podman uidmap slirp4netns fuse-overlayfs
+          test "$(podman info --format '{{.Host.Security.Rootless}}')" = true
+      - name: Run isolated synthetic-user catalog
+        shell: bash
+        env:
+          CONTAINER_ENGINE: podman
+        run: ./ctf/gating/run.sh synthetic-user
+
+  release_validation:
+    name: Required release package validation
+    uses: ./.github/workflows/release.yml
+    permissions:
+      contents: read
+
+  # Branch protection requires a status check literally named "Test & Lint".
   # The matrix job above reports as "Test & Lint (ubuntu-latest)" / "Test &
   # Lint (windows-latest)" instead, so that required context could never be
   # satisfied. This aggregator job produces the exact required name and fails
@@ -104,16 +156,36 @@ jobs:
   # stable check regardless of how many OSes the matrix covers.
   test_and_lint:
     name: Test & Lint
-    needs: test
+    needs: [test, adversarial_gate, synthetic_user, release_validation, build_dry_run]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Check matrix result
         env:
           TEST_RESULT: ${{ needs.test.result }}
+          ADVERSARIAL_RESULT: ${{ needs.adversarial_gate.result }}
+          SYNTHETIC_USER_RESULT: ${{ needs.synthetic_user.result }}
+          RELEASE_VALIDATION_RESULT: ${{ needs.release_validation.result }}
+          BUILD_RESULT: ${{ needs.build_dry_run.result }}
         run: |
           if [ "$TEST_RESULT" != "success" ]; then
             echo "Test & Lint matrix did not succeed: $TEST_RESULT"
+            exit 1
+          fi
+          if [ "$ADVERSARIAL_RESULT" != "success" ]; then
+            echo "Credential-free adversarial gate did not succeed: $ADVERSARIAL_RESULT"
+            exit 1
+          fi
+          if [ "$SYNTHETIC_USER_RESULT" != "success" ]; then
+            echo "Isolated synthetic-user catalog did not succeed: $SYNTHETIC_USER_RESULT"
+            exit 1
+          fi
+          if [ "$RELEASE_VALIDATION_RESULT" != "success" ]; then
+            echo "Release package validation did not succeed: $RELEASE_VALIDATION_RESULT"
+            exit 1
+          fi
+          if [ "$BUILD_RESULT" != "success" ]; then
+            echo "Required platform builds did not succeed: $BUILD_RESULT"
             exit 1
           fi
 

@@ -19,9 +19,12 @@ Classification can raise the gate but cannot lower it. Missing or conflicting
 classification holds. Trusted verbs skip evaluator approval, not consequence
 routing.
 
-The operator is the daemon principal: the daemon uid over a Unix socket or the
-daemon SID over a Windows named pipe. TCP lacks kernel-authenticated local peer
-identity and cannot host consequence gating.
+The operator is the daemon principal: the daemon uid over a Unix socket, or the
+daemon SID over a Windows named pipe. Kernel-authenticated local Windows SYSTEM
+is also an operator so the packaged installer can broker elevated decisions.
+Unix root receives no matching exception, and TCP administration requires the
+separate admin bearer. TCP lacks kernel-authenticated local peer identity and
+cannot host consequence gating.
 
 ## Recoverable commands
 
@@ -67,17 +70,20 @@ change remains visible for operator handling instead of using another endpoint.
 
 A held operation has not executed. Guard stores the exact command or API
 request, caller working directory, effective grant revision, applicable verb
-coverage, secret-name/value bindings, and consequence decision. This frozen
-snapshot prevents a later grant edit, verb reload, secret swap, or caller
-environment change from rewriting what the operator reviews.
+coverage, secret-name bindings with salted value hashes, and consequence
+decision. This frozen snapshot prevents a later grant edit, verb reload, secret
+swap, or caller environment change from rewriting what the operator reviews.
 
 ```bash
-guard approvals
-guard approvals <handle>
-guard approval-note <handle> 'Verified maintenance window and target.'
-guard approve <handle>
-guard deny <handle>
+guard access list
+guard access show <request>
+guard access approve <request> --once
+guard access deny <request> --reason 'outside the approved task'
 ```
+
+A consequence hold executes one immutable snapshot and accepts only `--once`.
+Ordinary and N-use approval apply to authority requests created from denied or
+proactive access intent, not to held execution snapshots.
 
 Only the daemon principal or TCP admin principal can approve or deny. The
 original requester may add notes to its hold but cannot decide it. Discussion

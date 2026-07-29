@@ -306,10 +306,13 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 );
             }
 
-            let configured_socket = socket.map(PathBuf::from).or_else(|| {
-                let config = client_config::ClientConfig::load().ok()?;
-                config.server_socket.map(PathBuf::from)
-            });
+            let configured_socket = match socket {
+                Some(socket) => Some(PathBuf::from(socket)),
+                None => client_config::ClientConfig::load()
+                    .context("failed to load client config while resolving the server socket")?
+                    .server_socket
+                    .map(PathBuf::from),
+            };
             // Local transport: a Unix-domain socket on Unix, a named pipe on
             // Windows (winplat::pipe_name maps `--socket <name>` to
             // \\.\pipe\<name>). On Unix it also falls back to a home-dir default.
@@ -368,7 +371,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 .or_else(|| guard_env("AUTH_TOKEN").filter(|token| !token.is_empty()));
             if tcp_port.is_some() && auth_token.is_none() {
                 anyhow::bail!(
-                    "TCP server requires --auth-token or GUARD_AUTH_TOKEN; configure clients with `guard config set-token`"
+                    "TCP server requires GUARD_AUTH_TOKEN; configure clients with `guard config set-token`"
                 );
             }
             let admin_token = admin_token
@@ -376,7 +379,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 .or_else(|| guard_env("ADMIN_TOKEN").filter(|token| !token.is_empty()));
             if tcp_port.is_some() && admin_token.is_none() {
                 tracing::warn!(
-                    "TCP admin RPCs other than ping are disabled; set --admin-token or GUARD_ADMIN_TOKEN to use guard grant/status over TCP"
+                    "TCP admin RPCs other than ping are disabled; set GUARD_ADMIN_TOKEN to use operator access and status commands over TCP"
                 );
             }
 
@@ -483,7 +486,9 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 .or_else(|| std::env::var("OPENROUTER_API_KEY").ok());
 
             if llm_enabled && api_key.is_none() {
-                tracing::warn!("No LLM API key provided (set GUARD_LLM_API_KEY, OPENROUTER_API_KEY, or --llm-api-key)");
+                tracing::warn!(
+                    "No LLM API key provided (set GUARD_LLM_API_KEY or OPENROUTER_API_KEY)"
+                );
             }
 
             let resolved_timeout = llm_timeout
@@ -861,7 +866,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             tracing::info!("Secret backend ready");
 
             // Unify the daemon's own startup secret onto the secret backend: when
-            // no LLM key was supplied via --llm-api-key or env, read it from the
+            // no LLM key was supplied via the environment, read it from the
             // backend as a secret owned by the server principal (GUARD_SERVER_UID,
             // else the daemon's own principal). This reuses the same fetch / cache
             // / redaction path as any brokered secret, so the daemon can source
@@ -956,9 +961,12 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 resolve_history_retention(history_retention, guard_env("HISTORY_RETENTION_SECS"))?;
 
             let (sessions, session_store) = if let Some(ref path) = state_db_path {
-                let store = session_store::SessionStore::open(path.clone(), history_retention_secs)
-                    .await
-                    .with_context(|| format!("failed to open state db {}", path.display()))?;
+                let store = session_store::SessionStore::open_for_daemon(
+                    path.clone(),
+                    history_retention_secs,
+                )
+                .await
+                .with_context(|| format!("failed to open state db {}", path.display()))?;
                 let sessions = store
                     .load_registry()
                     .await
@@ -1603,7 +1611,6 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
         ServerCommands::Connect {
             socket,
             tcp_port,
-            token,
             env_vars,
             secret_vars,
             secret_file_vars,
@@ -1617,9 +1624,6 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                     .map_err(anyhow::Error::msg)?;
             let socket_path = socket.map(PathBuf::from);
             let mut client = daemon_client::Client::new(socket_path, tcp_port);
-            if let Some(token) = token {
-                client = client.with_auth(token);
-            }
             if let Ok(session) = std::env::var("GUARD_SESSION") {
                 if !session.is_empty() {
                     client = client.with_session(session);

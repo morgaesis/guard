@@ -145,7 +145,7 @@ pub(super) fn private_path_is_safe(path: &Path, directory: bool) -> bool {
 }
 
 #[cfg(windows)]
-pub(super) fn harden_existing_private_path(path: &Path, directory: bool) -> bool {
+pub(crate) fn harden_existing_private_path(path: &Path, directory: bool) -> bool {
     use std::os::windows::fs::MetadataExt;
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
     let Ok(meta) = fs::symlink_metadata(path) else {
@@ -161,6 +161,31 @@ pub(super) fn harden_existing_private_path(path: &Path, directory: bool) -> bool
         return false;
     }
     win::set_daemon_only_acl(path).is_ok() && private_path_is_safe(path, directory)
+}
+
+/// Protect durable state from ordinary local users while retaining the
+/// packaged service's administrative maintenance boundary. Windows
+/// administrators and LocalSystem can already take ownership; keeping their
+/// explicit access lets signed installer upgrades back up and restore a
+/// stopped daemon without weakening access for non-administrative principals.
+#[cfg(windows)]
+pub(crate) fn harden_existing_state_path(path: &Path, directory: bool) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || if directory {
+            !meta.is_dir()
+        } else {
+            !meta.is_file()
+        }
+    {
+        return false;
+    }
+    win::set_state_acl(path, directory).is_ok()
+        && win::state_acl_is_safe(path, directory).unwrap_or(false)
 }
 
 /// A child-lifetime collection of secret files. Cleanup removes only the exact
@@ -219,8 +244,12 @@ mod win {
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
     const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    const CONTAINER_INHERIT_ACE: u8 = 0x02;
     const GENERIC_ALL: u32 = 0x1000_0000;
     const FILE_ALL_ACCESS: u32 = 0x001f_01ff;
+    const OBJECT_INHERIT_ACE: u8 = 0x01;
+    const SID_BUILTIN_ADMINISTRATORS: &str = "S-1-5-32-544";
+    const SID_LOCAL_SYSTEM: &str = "S-1-5-18";
 
     fn wide(path: &Path) -> Vec<u16> {
         path.as_os_str()
@@ -264,9 +293,61 @@ mod win {
         Ok(())
     }
 
+    fn set_dacl_from_sddl(path: &Path, sddl: &str) -> Result<()> {
+        let sddl: Vec<u16> = format!("{sddl}\0").encode_utf16().collect();
+        unsafe {
+            let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+            if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                1,
+                &mut descriptor,
+                std::ptr::null_mut(),
+            ) == 0
+            {
+                bail!(
+                    "create protected state security descriptor: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            let ok = SetFileSecurityW(
+                wide(path).as_ptr(),
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                descriptor,
+            );
+            LocalFree(descriptor as _);
+            if ok == 0 {
+                bail!(
+                    "set protected state ACL on {}: {}",
+                    path.display(),
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn set_daemon_only_acl(path: &Path) -> Result<()> {
         let sid = unsafe { crate::server::winplat::process_user_sid() }?;
         set_acl_from_sddl(path, &format!("O:{sid}D:P(A;;GA;;;{sid})"))
+    }
+
+    pub(super) fn set_state_acl(path: &Path, directory: bool) -> Result<()> {
+        let sid = unsafe { crate::server::winplat::process_user_sid() }?;
+        let inheritance = if directory { "OICI" } else { "" };
+        let mut trustees = vec![sid];
+        for trustee in [SID_BUILTIN_ADMINISTRATORS, SID_LOCAL_SYSTEM] {
+            if !trustees
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(trustee))
+            {
+                trustees.push(trustee.to_string());
+            }
+        }
+        let entries = trustees
+            .iter()
+            .map(|trustee| format!("(A;{inheritance};FA;;;{trustee})"))
+            .collect::<String>();
+        set_dacl_from_sddl(path, &format!("D:P{entries}"))
     }
 
     #[cfg(test)]
@@ -339,6 +420,113 @@ mod win {
             }
             LocalFree(descriptor as _);
             Ok(owner_ok && protected && acl_ok)
+        }
+    }
+
+    pub(super) fn state_acl_is_safe(path: &Path, directory: bool) -> Result<bool> {
+        let meta = fs::symlink_metadata(path)?;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || if directory {
+                !meta.is_dir()
+            } else {
+                !meta.is_file()
+            }
+        {
+            return Ok(false);
+        }
+        let daemon_sid = unsafe { crate::server::winplat::process_user_sid() }?;
+        let mut trusted = vec![daemon_sid];
+        for sid in [SID_BUILTIN_ADMINISTRATORS, SID_LOCAL_SYSTEM] {
+            if !trusted
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(sid))
+            {
+                trusted.push(sid.to_string());
+            }
+        }
+        unsafe {
+            let mut owner = std::ptr::null_mut();
+            let mut dacl: *mut ACL = std::ptr::null_mut();
+            let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+            let status = GetNamedSecurityInfoW(
+                wide(path).as_mut_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut descriptor,
+            );
+            if status != 0 {
+                bail!("read ACL from {}: OS error {}", path.display(), status);
+            }
+            let mut control = 0u16;
+            let mut revision = 0u32;
+            let protected = GetSecurityDescriptorControl(descriptor, &mut control, &mut revision)
+                != 0
+                && control & SE_DACL_PROTECTED != 0;
+            let mut owner_string = std::ptr::null_mut();
+            let owner_ok = ConvertSidToStringSidW(owner, &mut owner_string) != 0
+                && trusted.iter().any(|candidate| {
+                    crate::server::winplat::widestring_to_string(owner_string)
+                        .eq_ignore_ascii_case(candidate)
+                });
+            if !owner_string.is_null() {
+                LocalFree(owner_string as _);
+            }
+
+            let mut observed = vec![false; trusted.len()];
+            let mut acl_ok = !dacl.is_null() && usize::from((*dacl).AceCount) == trusted.len();
+            let expected_inheritance = if directory {
+                OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+            } else {
+                0
+            };
+            if acl_ok {
+                for index in 0..(*dacl).AceCount {
+                    let mut ace = std::ptr::null_mut();
+                    if GetAce(dacl, u32::from(index), &mut ace) == 0 {
+                        acl_ok = false;
+                        break;
+                    }
+                    let allowed = ace as *const ACCESS_ALLOWED_ACE;
+                    if (*allowed).Header.AceType != ACCESS_ALLOWED_ACE_TYPE
+                        || (*allowed).Header.AceFlags & (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE)
+                            != expected_inheritance
+                        // Keep the file-specific mask identical to the
+                        // installer's exact FileSystemRights::FullControl
+                        // contract. GENERIC_ALL is equivalent at access-check
+                        // time but persists as a different numeric mask.
+                        || (*allowed).Mask != FILE_ALL_ACCESS
+                    {
+                        acl_ok = false;
+                        break;
+                    }
+                    let sid_ptr = std::ptr::addr_of!((*allowed).SidStart) as *mut core::ffi::c_void;
+                    let mut sid_string = std::ptr::null_mut();
+                    if ConvertSidToStringSidW(sid_ptr, &mut sid_string) == 0 {
+                        acl_ok = false;
+                        break;
+                    }
+                    let actual_sid = crate::server::winplat::widestring_to_string(sid_string);
+                    LocalFree(sid_string as _);
+                    let Some(position) = trusted
+                        .iter()
+                        .position(|candidate| candidate.eq_ignore_ascii_case(&actual_sid))
+                    else {
+                        acl_ok = false;
+                        break;
+                    };
+                    if observed[position] {
+                        acl_ok = false;
+                        break;
+                    }
+                    observed[position] = true;
+                }
+            }
+            LocalFree(descriptor as _);
+            Ok(owner_ok && protected && acl_ok && observed.into_iter().all(|present| present))
         }
     }
 }
@@ -431,5 +619,17 @@ mod tests {
             "a caller-readable ACE must fail the daemon-only contract"
         );
         drop(lease);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_state_contract_allows_only_daemon_and_administrative_maintenance() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("state");
+        fs::create_dir(&root).unwrap();
+        assert!(harden_existing_state_path(&root, true));
+        assert!(win::state_acl_is_safe(&root, true).unwrap());
+        win::add_authenticated_users_read_for_test(&root).unwrap();
+        assert!(!win::state_acl_is_safe(&root, true).unwrap());
     }
 }

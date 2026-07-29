@@ -8,7 +8,7 @@
 FROM docker.io/library/rust@sha256:77fac8b98f9f46062bb680b6d25d5bcaabfc400143952ebc572e924bcbedc3fa
 
 WORKDIR /src
-ARG CARGO_BUILD_JOBS=1
+ARG CARGO_BUILD_JOBS=2
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 # Copy only what the build needs (keeps the Windows target/ out of the image).
 # `tests/` is required so `run.sh test` actually compiles and runs the
@@ -21,18 +21,24 @@ COPY config ./config
 COPY tests ./tests
 COPY examples ./examples
 
-RUN cargo build --release --locked --quiet \
-    && install -m 0755 target/release/guard /usr/local/bin/guard \
-    && rm -rf target
+RUN cargo test --release --locked --quiet --no-run \
+    && install -m 0755 target/release/guard /usr/local/bin/guard
 
-# Two distinct identities: the daemon/operator (uid 1000) and the agent (uid
-# 1001). The gate's bypass-resistance holds precisely because they differ.
-RUN useradd -m -u 1000 guarddaemon && useradd -m -u 1001 agent
+# Three distinct identities: the daemon/operator (uid 1000) and two agents
+# (uids 1001 and 1002). Peer credentials keep their authority separate.
+RUN useradd -m -u 1000 guarddaemon \
+    && useradd -m -u 1001 agent \
+    && useradd -m -u 1002 other-agent
 
 COPY ctf/gating/verbs.yaml /etc/guard/verbs.yaml
 RUN chmod 0644 /etc/guard/verbs.yaml
 COPY ctf/gating/attack.sh /attack.sh
 RUN chmod 0755 /attack.sh
+COPY ctf/gating/synthetic-user.sh /synthetic-user.sh
+RUN chmod 0755 /synthetic-user.sh
+COPY ctf/gating/fake-llm.rs /tmp/fake-llm.rs
+RUN rustc /tmp/fake-llm.rs -o /usr/local/bin/guard-fake-llm \
+    && rm /tmp/fake-llm.rs
 
 # Default: run the adversarial attack. Use the harness script's `test` mode to
 # run the full Linux test suite with the entrypoint overridden.

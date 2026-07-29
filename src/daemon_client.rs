@@ -5,6 +5,7 @@
 use crate::server::{
     AdminRequest, AdminResponse, ExecuteRequest, ExecuteResponse, ExecuteStreamMessage,
     IncomingMessage, OutputStream, RevertSpec, SshHostKeyMode, VerbInvocation,
+    EXECUTE_FEATURE_LOCAL_CWD, EXECUTE_FEATURE_TCP_NO_CWD, EXECUTE_PROTOCOL_VERSION,
 };
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
@@ -100,15 +101,19 @@ impl Client {
 
     pub async fn send_admin(&self, request: AdminRequest) -> Result<AdminResponse> {
         let request_name = match &request {
+            #[cfg(test)]
             AdminRequest::SessionGrant { .. } => "session_grant",
+            #[cfg(test)]
             AdminRequest::SessionAppeal { .. } => "session_appeal",
+            #[cfg(test)]
             AdminRequest::SessionRevoke { .. } => "session_revoke",
-            AdminRequest::SessionExtend { .. } => "session_extend",
-            AdminRequest::SessionLabel { .. } => "session_label",
-            AdminRequest::SessionRevokeFiltered { .. } => "session_revoke_filtered",
+            #[cfg(test)]
             AdminRequest::SessionList { .. } => "session_list",
+            #[cfg(test)]
             AdminRequest::SessionShow { .. } => "session_show",
+            #[cfg(test)]
             AdminRequest::SessionStatus { .. } => "session_status",
+            #[cfg(test)]
             AdminRequest::KubeconfigIssue { .. } => "kubeconfig_issue",
             AdminRequest::SecretSet { .. } => "secret_set",
             AdminRequest::SecretDelete { .. } => "secret_delete",
@@ -133,18 +138,31 @@ impl Client {
             AdminRequest::VerbCreate { .. } => "verb_create",
             AdminRequest::VerbCoverageList => "verb_coverage_list",
             AdminRequest::VerbCoverageClear => "verb_coverage_clear",
-            AdminRequest::SavedGrantList => "saved_grant_list",
-            AdminRequest::SavedGrantShow { .. } => "saved_grant_show",
+            #[cfg(test)]
             AdminRequest::SavedGrantSave { .. } => "saved_grant_save",
+            #[cfg(test)]
             AdminRequest::SavedGrantEdit { .. } => "saved_grant_edit",
-            AdminRequest::SavedGrantDelete { .. } => "saved_grant_delete",
+            #[cfg(test)]
             AdminRequest::SavedGrantRegenerate { .. } => "saved_grant_regenerate",
+            #[cfg(test)]
             AdminRequest::GrantRequestSubmit { .. } => "grant_request_submit",
+            #[cfg(test)]
             AdminRequest::GrantRequestList { .. } => "grant_request_list",
+            #[cfg(test)]
             AdminRequest::GrantRequestShow { .. } => "grant_request_show",
+            #[cfg(test)]
             AdminRequest::GrantRequestApprove { .. } => "grant_request_approve",
+            #[cfg(test)]
             AdminRequest::GrantRequestDeny { .. } => "grant_request_deny",
+            #[cfg(test)]
             AdminRequest::GrantRequestWithdraw { .. } => "grant_request_withdraw",
+            AdminRequest::AccessRequest { .. } => "access_request",
+            AdminRequest::AccessApprove { .. } => "access_approve",
+            AdminRequest::AccessDeny { .. } => "access_deny",
+            AdminRequest::AccessRevoke { .. } => "access_revoke",
+            AdminRequest::AccessExtend { .. } => "access_extend",
+            AdminRequest::AccessList => "access_list",
+            AdminRequest::AccessShow { .. } => "access_show",
             AdminRequest::EvaluateBatch { .. } => "evaluate_batch",
         };
         let envelope = IncomingMessage::Admin {
@@ -220,7 +238,10 @@ impl Client {
         );
 
         if let Some(ref socket_path) = self.socket_path {
-            request.cwd = std::env::current_dir().ok();
+            request.cwd = Some(
+                std::env::current_dir()
+                    .context("capture the current directory for Guard's local execute protocol")?,
+            );
             self.send_local(socket_path, &request).await
         } else if let Some(port) = self.tcp_port {
             self.send_tcp(port, &request).await
@@ -252,7 +273,10 @@ impl Client {
         );
 
         if let Some(ref socket_path) = self.socket_path {
-            request.cwd = std::env::current_dir().ok();
+            request.cwd = Some(
+                std::env::current_dir()
+                    .context("capture the current directory for Guard's local execute protocol")?,
+            );
             self.send_local_streaming(socket_path, &request, &mut on_output)
                 .await
         } else if let Some(port) = self.tcp_port {
@@ -320,7 +344,7 @@ impl Client {
             "sending execute request"
         );
         writer
-            .write_all(serde_json::to_string(request)?.as_bytes())
+            .write_all(execute_envelope_json(request, EXECUTE_FEATURE_LOCAL_CWD)?.as_bytes())
             .await?;
         writer.write_all(b"\n").await?;
         writer.flush().await?;
@@ -371,7 +395,7 @@ impl Client {
             "sending streaming execute request"
         );
         writer
-            .write_all(serde_json::to_string(request)?.as_bytes())
+            .write_all(execute_envelope_json(request, EXECUTE_FEATURE_LOCAL_CWD)?.as_bytes())
             .await?;
         writer.write_all(b"\n").await?;
         writer.flush().await?;
@@ -398,7 +422,7 @@ impl Client {
             "sending execute request"
         );
         writer
-            .write_all(serde_json::to_string(request)?.as_bytes())
+            .write_all(execute_envelope_json(request, EXECUTE_FEATURE_TCP_NO_CWD)?.as_bytes())
             .await?;
         writer.write_all(b"\n").await?;
         writer.flush().await?;
@@ -446,7 +470,7 @@ impl Client {
             "sending streaming execute request"
         );
         writer
-            .write_all(serde_json::to_string(request)?.as_bytes())
+            .write_all(execute_envelope_json(request, EXECUTE_FEATURE_TCP_NO_CWD)?.as_bytes())
             .await?;
         writer.write_all(b"\n").await?;
         writer.flush().await?;
@@ -455,6 +479,15 @@ impl Client {
         let mut reader = BufReader::new(reader).lines();
         read_streaming_response(&mut reader, on_output).await
     }
+}
+
+fn execute_envelope_json(request: &ExecuteRequest, feature: &str) -> Result<String> {
+    serde_json::to_string(&IncomingMessage::Execute {
+        protocol_version: EXECUTE_PROTOCOL_VERSION,
+        features: vec![feature.to_string()],
+        execute: Box::new(request.clone()),
+    })
+    .context("serialize Guard execute protocol envelope")
 }
 
 fn parse_admin_response_line(response_line: &str, request_name: &str) -> Result<AdminResponse> {
@@ -572,7 +605,10 @@ async fn connect_local(path: &Path) -> Result<tokio::net::windows::named_pipe::N
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_admin_response_line, AdminResponse, Client};
+    use super::{
+        execute_envelope_json, parse_admin_response_line, AdminResponse, Client,
+        EXECUTE_FEATURE_TCP_NO_CWD, EXECUTE_PROTOCOL_VERSION,
+    };
     use std::collections::HashMap;
 
     #[test]
@@ -621,5 +657,25 @@ mod tests {
             false,
         );
         assert!(request.cwd.is_none());
+    }
+
+    #[test]
+    fn execute_envelope_declares_version_feature_and_request() {
+        let client = Client::new(None, Some(8123));
+        let request = client.build_execute_request(
+            "id",
+            &[],
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            false,
+        );
+        let value: serde_json::Value = serde_json::from_str(
+            &execute_envelope_json(&request, EXECUTE_FEATURE_TCP_NO_CWD).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["protocol_version"], EXECUTE_PROTOCOL_VERSION);
+        assert_eq!(value["features"][0], EXECUTE_FEATURE_TCP_NO_CWD);
+        assert_eq!(value["execute"]["binary"], "id");
     }
 }

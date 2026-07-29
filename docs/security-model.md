@@ -8,13 +8,13 @@ daemon's credentials or reach protected upstreams by another path.
 
 The operator controls daemon startup, policy, verb and grant catalogs, secret
 storage, listener ACLs, and deployment isolation. The evaluator judges command
-or API intent inside those deterministic limits. The agent controls requests,
-project files, and its own session bearer.
+or API intent inside those deterministic limits. The agent controls requests
+and project files.
 
 The central bypass-prevention invariant is daemon-held credentials. SSH keys,
 SSH agent sockets, kubeconfigs, API tokens, and secret files belong to the daemon
 principal. Brokered clients receive only the local Guard endpoint and scoped
-Guard session authority.
+Guard authority.
 
 Guard is not a sandbox. If the agent can read the same credential, connect to
 the upstream directly, modify daemon policy, replace the daemon binary, or gain
@@ -72,17 +72,19 @@ the child lifetime. Holds store names and salted value hashes. Audit and session
 history store secret names only. Output redaction covers exact resolved values
 and credential-shaped text.
 
-The API proxy consumes a Guard session bearer and injects the endpoint upstream
-credential only after the request is allowed. It strips authentication headers,
-redacts protocol-classified secret responses, rejects uninspectable sensitive
-streams, and binds rollback to the exact endpoint and credential identity.
+The API proxy injects the endpoint upstream credential only after the request is
+allowed. It strips authentication headers, redacts protocol-classified secret
+responses, rejects uninspectable sensitive streams, and binds rollback to the
+exact endpoint and credential identity. The public access workflow exports no
+API bearer.
 
 ## Principals and admin authority
 
 Unix sockets authenticate caller uid through peer credentials. Windows named
-pipes authenticate caller SID and use a restricted pipe ACL. The daemon's own
-uid or SID is the operator principal for holds, provisionals, saved grants,
-verbs, and detailed status.
+pipes authenticate caller SID. The stock Windows DACL admits authenticated local
+users, then Guard isolates their authority by SID; it does not restrict the pipe
+to one configured client SID. The daemon's own uid or SID is the operator
+principal for holds, provisionals, saved grants, verbs, and detailed status.
 
 On Unix, the local socket is private to the daemon unless an operator configures
 a group, in which case it is group-readable and group-writable. SQLite state and
@@ -94,29 +96,22 @@ Loopback TCP carries execution and admin bearer tokens but no kernel-authenticat
 local principal. It therefore refuses consequence gating and per-principal
 credential injection. The execution token cannot perform admin RPCs.
 
-Every session is bound at creation to the authenticated principal it is issued
-for (a Unix uid or Windows SID). On every local path that consumes a session's
-authority - execution, appeals, kubeconfig issuance, batch evaluation, and
-self-inspection - the daemon requires the requesting peer's kernel-authenticated
-principal to equal the session owner, using the identity it reads itself rather
-than any client-supplied value. A different local peer in the socket group that
-learns or replays a handle is refused with a distinct `session principal
-mismatch` audit reason. The daemon (operator) principal is exempt and retains
-cross-session inspection and administration; a non-owner non-operator peer sees
-only its own sessions. The operator names the owning principal when issuing a
-session for an agent that runs under a different uid.
+Every command-access session is bound at creation to the authenticated principal
+that requested it, represented by a Unix uid or Windows SID. On every local path
+that consumes its authority, the daemon requires the requesting peer's
+kernel-authenticated principal to equal the session owner. A different local
+peer in the socket group that learns or replays a request reference or bearer is
+refused with a distinct `session principal mismatch` audit reason. The daemon
+operator principal retains cross-session inspection and administration; a
+non-owner non-operator peer sees only its own requests and sessions.
 
-A session that predates principal binding has no verifiable owner and is refused
-fail-closed for execution and API use with a `session predates principal
-binding` reason; the operator reissues or revokes it.
+Startup rejects sessions without a verifiable owner and matching approved
+access-request provenance. Every active command session has a principal-bound
+request and an explicit use policy.
 
-Session tokens remain bearer authority on the loopback API-proxy transport,
-which carries no kernel-authenticated principal: ownership is bound there at
-issuance (brokered kubeconfig issuance requires the owning local peer) and
-cannot be re-verified per request. Guard fingerprints tokens in logs and
-history. Expiry, revocation, suspension, and saved-grant revision checks occur
-before execution or API forwarding. Treat a leaked session token used over the
-API proxy as an active grant until revoked or expired.
+Access-managed sessions are command-only authority. Guard refuses brokered
+kubeconfig issuance and API-proxy resolution for them, so one-time and N-use
+command admissions cannot become reusable API credentials.
 
 ## Holds, rollback, and autonomy
 
