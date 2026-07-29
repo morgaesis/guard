@@ -73,7 +73,13 @@ current_contexts() {
   local rules rule
   rules=$(gh api "repos/${REPO}/rules/branches/${BRANCH}") || return 2
   rule=$(printf '%s\n' "$rules" \
-    | jq -e 'map(select(.type == "required_status_checks")) | if length == 0 then empty else .[0] end') \
+    | jq -e '
+        map(select(.type == "required_status_checks"))
+        | if length == 1
+          then .[0]
+          else error("expected exactly one required_status_checks rule")
+          end
+      ') \
     || return 2
   printf '%s\n' "$rule" | jq -r '.parameters.required_status_checks[].context'
 }
