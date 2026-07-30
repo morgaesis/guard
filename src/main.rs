@@ -320,9 +320,13 @@ enum AccessCommands {
         json: bool,
     },
     /// Approve each request independently with unlimited authority by default.
+    /// On a terminal this reviews each request interactively; --yes skips the review.
     Approve {
         #[arg(required = true)]
         requests: Vec<String>,
+        /// Decide without the interactive review.
+        #[arg(long, action = ArgAction::SetTrue)]
+        yes: bool,
         /// Grant one use. Equivalent to --uses 1.
         #[arg(long, conflicts_with = "uses", action = ArgAction::SetTrue)]
         once: bool,
