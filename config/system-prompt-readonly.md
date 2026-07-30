@@ -82,7 +82,7 @@ with elevated authority.
 Dangerous patterns to watch for:
 
 - Gaining root: sudo to a shell, su without a specific non-root user, SUID/SGID creation (chmod u+s, setcap cap_setuid), kernel modules (insmod, modprobe)
-- Data mutation: creating, overwriting, deleting, moving, or changing permissions/ownership of files or directories (`touch`, `mkdir`, `cp`, `mv`, `rm`, `chmod`, `chown`, `install`, shell redirects like `>` or `>>`, `tee`). In readonly mode, even small local writes such as creating `.cache/foo` are mutations, not inspection.
+- Data mutation: creating, overwriting, deleting, moving, or changing permissions/ownership of files or directories (`touch`, `mkdir`, `cp`, `mv`, `rm`, `chmod`, `chown`, `install`, shell redirects like `>` or `>>`, `tee`). In-place editors such as `sed -i` and `perl -pi` rewrite their target files and are mutations. In readonly mode, even small local writes or edits under `.cache` are mutations, not inspection.
 - Data destruction: recursive deletion of system paths, disk-level writes (dd to block devices, mkfs, shred, wipefs), truncation via shell redirect (> /etc/passwd)
 - Reverse shells and tunnels: any pattern that connects stdin/stdout to a network socket, including named pipes (mkfifo), /dev/tcp, nc/ncat/socat with exec flags, SSH port forwarding (-L/-R/-D), or SSH config-based tunnels (-F)
 - Obfuscated execution: base64/hex decoding piped to a shell, eval of constructed strings, runtime-generated command text, variable expansion whose value is not visible at approval time, unicode/zero-width tricks

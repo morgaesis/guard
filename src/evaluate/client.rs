@@ -1,7 +1,10 @@
 //! HTTP transport to the LLM API: retry loop, fallback chain, attempt classification.
 
 use super::config::DEFAULT_API_URL;
-use super::parse::{parse_decision_response, provider_error_summary, response_shape_summary};
+use super::parse::{
+    parse_decision_response, provider_error_summary, provider_refusal_response,
+    response_shape_summary,
+};
 use super::prompt::{build_function_call_body, build_json_response_body};
 use super::redact::redact_for_llm;
 use super::result::{EvalResult, EvalSource, LlmResponse};
@@ -392,6 +395,10 @@ impl Evaluator {
             return Err(AttemptError::ClientError(provider_error_summary(&parsed)));
         }
 
+        if let Some(decision) = provider_refusal_response(&parsed) {
+            return Ok((decision, usage));
+        }
+
         let decision = parse_decision_response(&parsed, use_function_calling).map_err(|e| {
             AttemptError::ParseError(format!("{}; {}", e, response_shape_summary(&parsed)))
         })?;
@@ -687,6 +694,23 @@ mod tests {
         let evaluator = mock_server_evaluator(port, 2, vec![]).await;
         let result = evaluator.evaluate_llm("id", None).await;
         assert!(result.is_allow(), "got: {}", result);
+        let _ = mock.await;
+    }
+
+    #[tokio::test]
+    async fn test_explicit_provider_refusal_is_a_deny() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let refusal = r#"{"choices":[{"finish_reason":"content_filter","message":{"role":"assistant","content":"refused","refusal":null}}]}"#.to_string();
+        let responses = vec![(200, refusal, None)];
+        let mock = tokio::spawn(run_mock(listener, responses));
+
+        let evaluator = mock_server_evaluator(port, 0, vec![]).await;
+        let result = evaluator
+            .evaluate_llm("rm -rf /var/lib/app-data", None)
+            .await;
+        assert!(result.is_deny(), "got: {result}");
+        assert_eq!(result.risk(), Some(10));
         let _ = mock.await;
     }
 

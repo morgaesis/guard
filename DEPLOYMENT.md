@@ -79,10 +79,47 @@ Use `--users` to restrict submitting Unix uids when the socket group is broader
 than the intended agent account. Set `GUARD_ALLOWED_UIDS=1000,1001` in
 `/etc/default/guard` when using the packaged service. The unit keeps `--users`
 separate from this systemd expansion. Its default value is UID 0, so ordinary
-agents fail closed until the list is configured. `NoNewPrivileges=true` prevents approved
-children from gaining privilege through setuid helpers. A daemon that must act
-as root is a sudo-like trust boundary and needs narrow callers, binary floors,
-short grants, consequence gating, audit shipping, and separate agent identity.
+agents fail closed until the list is configured. `NoNewPrivileges=true`
+prevents approved children from gaining privilege through setuid helpers; the
+wide-access model below relaxes it deliberately.
+
+## Wide host access
+
+A deployment whose agents debug and administer the local host through Guard
+gives the daemon deliberately broad reach: the guard account carries
+passwordless sudo for brokered children, holds the fleet SSH identity and tool
+credentials, and exposes the socket to the agent group. Passwordless sudo
+requires a host-local sudoers entry for the guard account and, because the
+packaged unit mounts the host filesystem read-only and sets
+`NoNewPrivileges=true`, a service drop-in that removes those restrictions:
+
+```ini
+[Service]
+NoNewPrivileges=false
+ProtectSystem=false
+ProtectHome=false
+```
+
+Run `systemctl daemon-reload` and restart `guard.service` after installing the
+drop-in. These settings let setuid `sudo` elevate and let approved children
+write normal host and home paths. This is the intended shape of a sudo-like
+broker, not a hardening gap. The enforcement surface is the evaluator envelope,
+operator policy and catalogs, and the audit stream - not a minimized daemon.
+Guard alone holding the credentials is what keeps a direct tool invocation
+outside Guard inert.
+
+Wide access raises the cost of instruction defects, so pair it with:
+
+- a narrow socket group and a `--users` restriction;
+- shipped audit and periodic review of allowed mutations;
+- prompt regression coverage for the deployed mode prompt;
+- prompt supplements or typed verbs for house tools the evaluator cannot
+  otherwise judge;
+- saved grants for recurring apply-class work, so denials stay rare and each
+  one is meaningful.
+
+Consequence gating adds holds for the irreversible tail once enabled; keep
+holds exceptional so each one gets real operator attention.
 
 Administrative RPCs authenticate the daemon uid, not the interactive operator's
 uid. Run them through the root-owned wrapper. It uses the `guard` account for

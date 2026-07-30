@@ -38,6 +38,30 @@ pub fn parse_decision_response(
     }
 }
 
+/// Convert an explicit provider safety refusal into a concrete fail-closed
+/// decision. Ordinary malformed responses remain parse errors so outages and
+/// protocol regressions cannot satisfy decision tests.
+pub fn provider_refusal_response(parsed: &serde_json::Value) -> Option<LlmResponse> {
+    let finish_reason = parsed
+        .pointer("/choices/0/finish_reason")
+        .and_then(|value| value.as_str());
+    let refusal = parsed
+        .pointer("/choices/0/message/refusal")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| !value.is_empty());
+
+    if finish_reason == Some("content_filter") || refusal {
+        Some(LlmResponse {
+            decision: "DENY".to_string(),
+            reason: "The command could not be safely evaluated.".to_string(),
+            risk: 10,
+            reversibility: None,
+        })
+    } else {
+        None
+    }
+}
+
 /// Structural description of a response that failed to parse: key names,
 /// counts, and kinds only - never message content, so a provider echo of the
 /// (already redacted) command cannot ride an error string into logs.
@@ -328,7 +352,7 @@ fn permissive_patterns() -> &'static (Regex, Regex) {
 mod tests {
     use super::{
         decision_from_value, lax_extract_json, parse_decision_response, parse_json_content,
-        parse_tool_call, provider_error_summary, response_shape_summary,
+        parse_tool_call, provider_error_summary, provider_refusal_response, response_shape_summary,
     };
     use crate::gating::Reversibility;
 
@@ -343,6 +367,35 @@ mod tests {
         assert!(summary.contains("content:null"));
         assert!(summary.contains("tool_calls:0"));
         assert!(!summary.contains("assistant"));
+    }
+
+    #[test]
+    fn test_provider_refusal_response_requires_explicit_refusal() {
+        let filtered = serde_json::json!({
+            "choices": [{
+                "finish_reason": "content_filter",
+                "message": {"content": "refused", "refusal": null}
+            }]
+        });
+        let explicit = serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"content": null, "refusal": "cannot comply"}
+            }]
+        });
+        let malformed = serde_json::json!({
+            "choices": [{"finish_reason": "stop", "message": {"content": "not json"}}]
+        });
+
+        assert_eq!(
+            provider_refusal_response(&filtered).unwrap().decision,
+            "DENY"
+        );
+        assert_eq!(
+            provider_refusal_response(&explicit).unwrap().decision,
+            "DENY"
+        );
+        assert!(provider_refusal_response(&malformed).is_none());
     }
 
     #[test]
