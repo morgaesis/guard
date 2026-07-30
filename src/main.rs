@@ -78,7 +78,7 @@ use cli_shim::{handle_shim, ShimOptions};
 #[command(
     name = "guard",
     about = "Evaluator-gated command execution for AI agents",
-    after_help = "Access workflow:\n  Agents run ordinary commands and use `guard access request \"<intent>\"` when authority is missing.\n  Operators use `guard access approve <request>...`, optionally with `--once` or `--uses N`.\n  `guard access list` and `show` inspect principal-bound requests, holds, and sessions without bearer tokens.\n  Operators use `guard access revoke <session-or-agent>` to remove active access authority.\n\nUse `guard access --help` for representative examples or `guard help-tree` for the full command map."
+    after_help = "Access workflow:\n  Agents run ordinary commands and use `guard access request \"<intent>\"` when authority is missing.\n  Operators use `guard access approve <request>...`, optionally with `--once` or `--uses N`; on a terminal it reviews each request first, and `--yes` skips the review.\n  `guard access list` and `show` inspect principal-bound requests, holds, and sessions without bearer tokens.\n  Operators use `guard access revoke <session-or-agent>` to remove active access authority.\n\nUse `guard access --help` for representative examples or `guard help-tree` for the full command map."
 )]
 #[allow(clippy::large_enum_variant)]
 enum MainArgs {
@@ -213,7 +213,7 @@ enum MainArgs {
     /// Request, approve, inspect, and extend principal-bound access.
     #[clap(
         subcommand,
-        after_help = "Common workflow:\n  guard access request \"restart the fixture service\"\n  guard access approve <request>\n  guard access approve <request> --once\n  guard access approve <request> --uses 3\n  guard access list\n  guard access show <request-or-session>\n  guard access revoke <session-or-agent>\n\nExit status:\n  1      one or more decisions in the access batch failed"
+        after_help = "Common workflow:\n  guard access request \"restart the fixture service\"\n  guard access approve <request>\n  guard access approve <request> --once\n  guard access approve <request> --uses 3\n  guard access approve <request> --yes\n  guard access list\n  guard access show <request-or-session>\n  guard access revoke <session-or-agent>\n\nOn a terminal, approve reviews each request before deciding; --yes skips the review.\nRequests left undecided by skip or quit stay pending and do not fail the batch.\n\nExit status:\n  1      one or more decisions in the access batch failed"
     )]
     Access(AccessCommands),
     /// Removed legacy authority command. Use `guard access`.
@@ -1589,7 +1589,7 @@ fn print_help_tree(admin: bool) {
         println!("{}", paint("  admin", AnsiColor::Yellow, color));
         println!("    server start");
         println!("    verb show <name>");
-        println!("    access approve <request>... [--once|--uses N]");
+        println!("    access approve <request>... [--once|--uses N|--yes]");
         println!("    access revoke <session-or-agent>");
         println!("    access deny <request>... [--reason text]");
         println!("    access extend <session-or-agent> \"<intent>\" [--once|--uses N]");

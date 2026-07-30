@@ -694,6 +694,7 @@ fn access_command_family_parses_bounded_and_batch_forms() {
             ..
         }))
     ));
+    assert!(MainArgs::try_parse_from(["guard", "access", "approve"]).is_err());
     assert!(matches!(
         MainArgs::try_parse_from([
             "guard",

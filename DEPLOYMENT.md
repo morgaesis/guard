@@ -138,6 +138,9 @@ sudo guard-operator confirm <provisional>
 sudo guard-operator revert <provisional>
 ```
 
+On a console, `access approve` reviews each request interactively before
+deciding; add `--yes` for unattended runs.
+
 Restrict `sudo` access to `/usr/local/sbin/guard-operator` to human operator
 accounts. Access to the wrapper grants the full daemon-principal command surface.
 Keep credentials out of command arguments.

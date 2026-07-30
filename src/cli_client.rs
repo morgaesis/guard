@@ -1115,11 +1115,14 @@ fn access_json_response(response: &server::AdminResponse) -> Result<serde_json::
     }))
 }
 
+fn any_decision_failed(items: &[server::AccessDecisionResult]) -> bool {
+    items.iter().any(|item| !item.success)
+}
+
 fn access_decision_failed(response: &server::AdminResponse) -> bool {
     matches!(
         response,
-        server::AdminResponse::AccessDecisions { items }
-            if items.iter().any(|item| !item.success)
+        server::AdminResponse::AccessDecisions { items } if any_decision_failed(items)
     )
 }
 
@@ -1141,36 +1144,34 @@ fn access_item_human(item: &server::AccessItem) -> String {
         .expires_unix
         .map(|value| value.to_string())
         .unwrap_or_else(|| "none".to_string());
-    let uses = if item.use_policy == "bounded" {
-        item.remaining_uses
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "0".to_string())
-    } else {
-        item.use_policy.clone()
-    };
+    let uses = use_budget_display(&item.use_policy, item.remaining_uses);
     let mut lines = vec![
-        format!("access {} {}", item.kind, item.reference),
-        format!("state: {}", item.state),
-        format!("requester: {}", item.requester),
-        format!("target: {}", item.target),
-        format!("scope: {scope}"),
+        format!(
+            "access {} {}",
+            card_text(&item.kind),
+            card_text(&item.reference)
+        ),
+        format!("state: {}", card_text(&item.state)),
+        format!("requester: {}", card_text(&item.requester)),
+        format!("target: {}", card_text(&item.target)),
+        format!("scope: {}", card_text(&scope)),
         format!("expiry: {expiry}"),
         format!("uses: {uses}"),
     ];
     if let Some(intent) = &item.intent {
-        lines.push(format!("intent: {intent}"));
+        lines.push(format!("intent: {}", card_text(intent)));
     }
     if let Some(reason) = &item.decided_reason {
-        lines.push(format!("reason: {reason}"));
+        lines.push(format!("reason: {}", card_text(reason)));
     }
     if !item.capabilities.is_empty() {
         lines.push("capabilities:".to_string());
         for capability in &item.capabilities {
             lines.push(format!(
                 "  {}: {} consequence={} baseline={} trusted={} revert={}",
-                capability.verb,
-                capability.description,
-                capability.consequence,
+                card_text(&capability.verb),
+                card_text(&capability.description),
+                card_text(&capability.consequence),
                 capability.baseline,
                 capability.trusted,
                 if capability.has_revert {
@@ -1182,22 +1183,35 @@ fn access_item_human(item: &server::AccessItem) -> String {
             if !capability.baseline {
                 let matcher = serde_json::to_string(&capability.matcher)
                     .expect("serde_json::Value serialization cannot fail");
-                lines.push(format!("    matcher: {matcher}"));
-                lines.push(format!("    matcher_digest: {}", capability.matcher_digest));
+                lines.push(format!("    matcher: {}", card_text(&matcher)));
+                lines.push(format!(
+                    "    matcher_digest: {}",
+                    card_text(&capability.matcher_digest)
+                ));
             }
             if let Some(plan) = &capability.credential_plan {
-                lines.push(format!("    credential_plan: {plan}"));
+                lines.push(format!("    credential_plan: {}", card_text(plan)));
             }
             if let Some(evidence) = &capability.evidence {
-                lines.push(format!("    evidence: {evidence}"));
+                lines.push(format!("    evidence: {}", card_text(evidence)));
             }
         }
     }
-    lines.push(format!("next: {}", item.next_action));
+    lines.push(format!("next: {}", card_text(&item.next_action)));
     for command in &item.approval_options {
-        lines.push(format!("approval: {command}"));
+        lines.push(format!("approval: {}", card_text(command)));
     }
     lines.join("\n")
+}
+
+fn use_budget_display(use_policy: &str, remaining_uses: Option<u64>) -> String {
+    if use_policy == "bounded" {
+        remaining_uses
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "0".to_string())
+    } else {
+        use_policy.to_string()
+    }
 }
 
 fn print_access_decision_lines(items: &[server::AccessDecisionResult]) {
@@ -1208,23 +1222,34 @@ fn print_access_decision_lines(items: &[server::AccessDecisionResult]) {
             item.success,
             item.state,
             item.target.as_deref().unwrap_or("none"),
-            if item.use_policy == "bounded" {
-                item.remaining_uses
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "0".to_string())
-            } else {
-                item.use_policy.clone()
-            },
+            use_budget_display(&item.use_policy, item.remaining_uses),
             item.message,
         );
     }
 }
 
-/// The review prompt engages only when a person is present on both ends:
-/// answers come from stdin and decision lines land on stdout, so a piped or
-/// redirected invocation keeps the immediate, prompt-free contract.
+/// The review prompt engages only when a person is present on every stream it
+/// uses: answers come from stdin, cards and prompts render on stderr, and
+/// decision lines land on stdout. Redirecting any of them keeps the immediate,
+/// prompt-free contract instead of blocking on an invisible prompt.
 fn access_review_is_interactive() -> bool {
-    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+    access_review_enabled(
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+        std::io::stderr().is_terminal(),
+    )
+}
+
+fn access_review_enabled(stdin_tty: bool, stdout_tty: bool, stderr_tty: bool) -> bool {
+    stdin_tty && stdout_tty && stderr_tty
+}
+
+/// Escape server-supplied text for terminal display. Request intent and verb
+/// metadata originate from agent input; rendering them raw would let a crafted
+/// request repaint or hide card lines with control sequences at the moment of
+/// decision.
+fn card_text(value: &str) -> String {
+    guard::redact::audit_escape(value).into_owned()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1247,9 +1272,11 @@ fn parse_access_review_choice(input: &str) -> Option<AccessReviewChoice> {
 
 fn access_state_color(state: &str) -> AnsiColor {
     match state {
-        "pending" | "held" => AnsiColor::Yellow,
+        "pending" | "approving" => AnsiColor::Yellow,
         "approved" | "active" => AnsiColor::Green,
-        "denied" | "revoked" | "expired" | "exhausted" => AnsiColor::Red,
+        "denied" | "withdrawn" | "revoked" | "expired" | "exhausted" | "exec_failed" => {
+            AnsiColor::Red
+        }
         _ => AnsiColor::Cyan,
     }
 }
@@ -1265,7 +1292,8 @@ fn consequence_color(consequence: &str) -> AnsiColor {
 /// One reviewable card for the interactive approve prompt. Same facts as
 /// `access_item_human`, arranged for a person deciding rather than a script
 /// parsing: consequence classes are colored, timestamps are readable, and the
-/// exact reviewed matcher stays visible for non-baseline capabilities.
+/// exact reviewed matcher stays visible for non-baseline capabilities. Every
+/// server-supplied string passes through `card_text` before painting.
 fn access_item_card(item: &server::AccessItem, colors: bool) -> Vec<String> {
     let scope = if item.effective_scope.is_empty() {
         "none".to_string()
@@ -1276,68 +1304,79 @@ fn access_item_card(item: &server::AccessItem, colors: bool) -> Vec<String> {
         .expires_unix
         .map(format_timestamp)
         .unwrap_or_else(|| "none".to_string());
-    let uses = if item.use_policy == "bounded" {
-        item.remaining_uses
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "0".to_string())
-    } else {
-        item.use_policy.clone()
-    };
+    let uses = use_budget_display(&item.use_policy, item.remaining_uses);
     let mut lines = vec![
         format!(
             "{} {}",
-            paint(format!("access {}", item.kind), AnsiColor::Bold, colors),
-            paint(&item.reference, AnsiColor::Cyan, colors),
+            paint(
+                format!("access {}", card_text(&item.kind)),
+                AnsiColor::Bold,
+                colors
+            ),
+            paint(card_text(&item.reference), AnsiColor::Cyan, colors),
         ),
         format!(
             "  state:     {}",
-            paint(&item.state, access_state_color(&item.state), colors)
+            paint(
+                card_text(&item.state),
+                access_state_color(&item.state),
+                colors
+            )
         ),
-        format!("  requester: {}", item.requester),
-        format!("  target:    {}", item.target),
+        format!("  requester: {}", card_text(&item.requester)),
+        format!("  target:    {}", card_text(&item.target)),
     ];
     if let Some(intent) = &item.intent {
         lines.push(format!(
             "  intent:    {}",
-            paint(intent, AnsiColor::Bold, colors)
+            paint(card_text(intent), AnsiColor::Bold, colors)
         ));
     }
-    lines.push(format!("  scope:     {scope}"));
+    lines.push(format!("  scope:     {}", card_text(&scope)));
     lines.push(format!("  uses:      {uses}"));
     lines.push(format!("  expiry:    {expiry}"));
     if let Some(reason) = &item.decided_reason {
-        lines.push(format!("  reason:    {reason}"));
+        lines.push(format!("  reason:    {}", card_text(reason)));
     }
     if !item.capabilities.is_empty() {
         lines.push("  grants:".to_string());
         for capability in &item.capabilities {
             lines.push(format!(
-                "    {} {}: {}{}",
+                "    {} {}: {} trusted={} revert={}",
                 paint(
-                    &capability.consequence,
+                    card_text(&capability.consequence),
                     consequence_color(&capability.consequence),
                     colors,
                 ),
-                paint(&capability.verb, AnsiColor::Bold, colors),
-                capability.description,
+                paint(card_text(&capability.verb), AnsiColor::Bold, colors),
+                card_text(&capability.description),
+                capability.trusted,
                 if capability.has_revert {
-                    " (revert available)"
+                    "available"
                 } else {
-                    ""
+                    "none"
                 },
             ));
             if !capability.baseline {
                 let matcher = serde_json::to_string(&capability.matcher)
                     .expect("serde_json::Value serialization cannot fail");
-                lines.push(format!("      matcher: {matcher}"));
+                lines.push(format!("      matcher: {}", card_text(&matcher)));
+                lines.push(format!(
+                    "      matcher_digest: {}",
+                    card_text(&capability.matcher_digest)
+                ));
             }
             if let Some(plan) = &capability.credential_plan {
-                lines.push(format!("      credential_plan: {plan}"));
+                lines.push(format!("      credential_plan: {}", card_text(plan)));
             }
             if let Some(evidence) = &capability.evidence {
-                lines.push(format!("      evidence: {evidence}"));
+                lines.push(format!("      evidence: {}", card_text(evidence)));
             }
         }
+    }
+    lines.push(format!("  next:      {}", card_text(&item.next_action)));
+    for command in &item.approval_options {
+        lines.push(format!("  approval:  {}", card_text(command)));
     }
     lines
 }
@@ -1399,6 +1438,7 @@ async fn handle_access_approve_interactive(
             server::AdminResponse::Error { message } => {
                 any_failed = true;
                 eprintln!("{reference}: {message}");
+                skipped.push(reference);
                 continue;
             }
             other => anyhow::bail!("unexpected access response: {other:?}"),
@@ -1407,10 +1447,35 @@ async fn handle_access_approve_interactive(
         for line in access_item_card(&item, colors) {
             eprintln!("{line}");
         }
+        if item.approval_options.is_empty() {
+            eprintln!(
+                "no approval action available (state: {})",
+                card_text(&item.state)
+            );
+            any_failed = true;
+            skipped.push(reference);
+            continue;
+        }
+        // A consequence hold executes one immutable snapshot and accepts only a
+        // one-time approval; the daemon offers exactly that form.
+        let hold_only_once = item
+            .approval_options
+            .iter()
+            .all(|option| option.ends_with("--once"));
+        let effective_uses = if hold_only_once { Some(1) } else { uses };
+        eprintln!(
+            "an approve grants: {}",
+            match effective_uses {
+                None => "unlimited uses".to_string(),
+                Some(1) if hold_only_once => "1 use (held snapshot, one-time only)".to_string(),
+                Some(1) => "1 use".to_string(),
+                Some(n) => format!("{n} uses"),
+            }
+        );
         let decision = match prompt_access_review_choice(&reference, colors)? {
             AccessReviewChoice::Approve => Some(server::AdminRequest::AccessApprove {
                 handles: vec![reference.clone()],
-                uses,
+                uses: effective_uses,
             }),
             AccessReviewChoice::Deny => Some(server::AdminRequest::AccessDeny {
                 handles: vec![reference.clone()],
@@ -1433,14 +1498,21 @@ async fn handle_access_approve_interactive(
             .map_err(|error| describe_connect_failure(error, &client, source))?
         {
             server::AdminResponse::AccessDecisions { items } => {
-                if items.iter().any(|result| !result.success) {
+                if any_decision_failed(&items) {
                     any_failed = true;
+                    skipped.extend(
+                        items
+                            .iter()
+                            .filter(|result| !result.success)
+                            .map(|result| result.request.clone()),
+                    );
                 }
                 print_access_decision_lines(&items);
             }
             server::AdminResponse::Error { message } => {
                 any_failed = true;
                 eprintln!("{reference}: {message}");
+                skipped.push(reference);
             }
             other => anyhow::bail!("unexpected access response: {other:?}"),
         }
@@ -2323,7 +2395,9 @@ mod tests {
             use_policy: "bounded".to_string(),
             state: "pending".to_string(),
             next_action: "approve or deny".to_string(),
-            approval_options: Vec::new(),
+            approval_options: vec![
+                "guard access approve gr-11111111111111111111111111111111".to_string()
+            ],
             intent: Some("upgrade the netdata release".to_string()),
             capabilities: vec![server::AccessCapability {
                 verb: "helm-upgrade".to_string(),
@@ -2347,14 +2421,94 @@ mod tests {
             "requester: uid:1004",
             "intent:    upgrade the netdata release",
             "uses:      3",
-            "recoverable helm-upgrade: Upgrade one release (revert available)",
+            "recoverable helm-upgrade: Upgrade one release trusted=false revert=available",
             "matcher: {\"binary\":\"helm\"}",
+            "matcher_digest: digest",
             "evidence: rollback validated",
+            "next:      approve or deny",
+            "approval:  guard access approve gr-11111111111111111111111111111111",
         ] {
             assert!(card.contains(fact), "card is missing {fact:?}:\n{card}");
         }
         let colored = access_item_card(&item, true).join("\n");
         assert!(colored.contains('\u{1b}'), "colors on must emit ANSI");
+    }
+
+    #[test]
+    fn access_item_card_escapes_control_characters_in_server_text() {
+        let item = server::AccessItem {
+            reference: "gr-22222222222222222222222222222222".to_string(),
+            kind: "request".to_string(),
+            requester: "uid:1004".to_string(),
+            target: "agent:1004".to_string(),
+            effective_scope: Vec::new(),
+            expires_unix: None,
+            remaining_uses: None,
+            use_policy: "unselected".to_string(),
+            state: "pending".to_string(),
+            next_action: "approve or deny".to_string(),
+            approval_options: vec!["\u{1b}[1A\u{1b}[2Kguard access approve x".to_string()],
+            intent: Some("\u{1b}[2J\u{1b}[H\nintent:    read one log file".to_string()),
+            capabilities: Vec::new(),
+            decided_reason: None,
+        };
+        let card = access_item_card(&item, false).join("\n");
+        assert!(
+            !card.contains('\u{1b}') && !card.contains('\r'),
+            "control characters must not survive into the card:\n{card}"
+        );
+        assert!(
+            card.contains("\\u{1b}[2J") && card.contains("\\nintent:"),
+            "escaped forms must stay visible:\n{card}"
+        );
+        let human = access_item_human(&item);
+        assert!(
+            !human.contains('\u{1b}'),
+            "guard access show must escape the same fields:\n{human}"
+        );
+    }
+
+    #[test]
+    fn access_review_enabled_requires_every_interactive_stream() {
+        assert!(access_review_enabled(true, true, true));
+        for (stdin_tty, stdout_tty, stderr_tty) in [
+            (false, true, true),
+            (true, false, true),
+            (true, true, false),
+            (false, false, false),
+        ] {
+            assert!(
+                !access_review_enabled(stdin_tty, stdout_tty, stderr_tty),
+                "stdin={stdin_tty} stdout={stdout_tty} stderr={stderr_tty}"
+            );
+        }
+    }
+
+    #[test]
+    fn access_colors_map_states_and_consequences() {
+        for state in ["pending", "approving"] {
+            assert!(matches!(access_state_color(state), AnsiColor::Yellow));
+        }
+        for state in ["approved", "active"] {
+            assert!(matches!(access_state_color(state), AnsiColor::Green));
+        }
+        for state in [
+            "denied",
+            "withdrawn",
+            "revoked",
+            "expired",
+            "exhausted",
+            "exec_failed",
+        ] {
+            assert!(matches!(access_state_color(state), AnsiColor::Red));
+        }
+        assert!(matches!(access_state_color("held"), AnsiColor::Cyan));
+        assert!(matches!(consequence_color("irreversible"), AnsiColor::Red));
+        assert!(matches!(
+            consequence_color("recoverable"),
+            AnsiColor::Yellow
+        ));
+        assert!(matches!(consequence_color("reversible"), AnsiColor::Green));
     }
 
     #[test]
