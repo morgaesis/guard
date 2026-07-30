@@ -667,12 +667,14 @@ fn access_command_family_parses_bounded_and_batch_forms() {
     ]) {
         Ok(MainArgs::Access(AccessCommands::Approve {
             requests,
+            yes,
             once,
             uses,
             json,
             ..
         })) => {
             assert_eq!(requests, ["gr-one", "gr-two"]);
+            assert!(!yes);
             assert!(!once);
             assert_eq!(uses, Some(3));
             assert!(json);
@@ -684,6 +686,15 @@ fn access_command_family_parses_bounded_and_batch_forms() {
         "guard", "access", "approve", "gr-one", "--once", "--uses", "2"
     ])
     .is_err());
+    assert!(matches!(
+        MainArgs::try_parse_from(["guard", "access", "approve", "gr-one", "--yes", "--once"]),
+        Ok(MainArgs::Access(AccessCommands::Approve {
+            yes: true,
+            once: true,
+            ..
+        }))
+    ));
+    assert!(MainArgs::try_parse_from(["guard", "access", "approve"]).is_err());
     assert!(matches!(
         MainArgs::try_parse_from([
             "guard",

@@ -100,11 +100,11 @@ pub(crate) use runtime::CommandAdmissionConfig;
 pub(crate) use transport::winplat;
 pub use transport::Server;
 #[cfg(test)]
-pub(crate) use wire::AccessDecisionResult;
+pub(crate) use wire::AccessCapability;
 pub use wire::{
-    AccessItem, AccessRequestGuidance, AdminRequest, AdminResponse, CommandSpec, ExecuteRequest,
-    ExecuteResponse, GateStatus, OutputStream, RevertSpec, SshHostKeyMode, VerbInvocation,
-    VerbMatchInfo, VerbSummary,
+    AccessDecisionResult, AccessItem, AccessRequestGuidance, AdminRequest, AdminResponse,
+    CommandSpec, ExecuteRequest, ExecuteResponse, GateStatus, OutputStream, RevertSpec,
+    SshHostKeyMode, VerbInvocation, VerbMatchInfo, VerbSummary,
 };
 pub(crate) use wire::{
     ExecuteStreamMessage, IncomingMessage, EXECUTE_FEATURE_LOCAL_CWD, EXECUTE_FEATURE_TCP_NO_CWD,

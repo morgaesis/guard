@@ -100,10 +100,12 @@ guard access list
 
 An operator approves one or more durable requests with `guard access approve`.
 `--once` is exactly `--uses 1`; `--uses 3` grants that request three admissions.
-Each approval retains its own scope and count. Denied results offer ordinary,
-one-time, and bounded approval. A held result offers only `--once` because it
-executes one immutable reviewed snapshot. Operators remove an active access
-session with `guard access revoke <session-or-agent>`.
+On a terminal, approve reviews each request first with a colored card and an
+approve, deny, skip, or quit prompt; `--yes` skips the review. Each approval
+retains its own scope and count. Denied results offer ordinary, one-time, and
+bounded approval. A held result offers only `--once` because it executes one
+immutable reviewed snapshot. Operators remove an active access session with
+`guard access revoke <session-or-agent>`.
 
 Structured execution results include a versioned decision trace with a stable
 source, every applicable typed cell, conflicts, and bounded next-step guidance.

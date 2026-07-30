@@ -26,6 +26,19 @@ guard access revoke <session-or-agent>
 `--once` is exactly `--uses 1`. Batch results are per request. One invalid or
 stale item does not widen or roll back another item that succeeds.
 
+On a terminal, `guard access approve` reviews each request before deciding: it
+prints the requester, intent, state, and typed capability coverage with
+consequence classes colored, states the use budget an approve grants, then
+takes an approve, deny, skip, or quit answer per request. A deny accepts an
+optional reason and ignores the use flags, which only shape approvals. A held
+request is approved as one-time automatically, matching the only form it
+accepts. Decisions are sent one request at a time, so quitting mid-batch never
+undoes a decision already made. Requests left undecided by skip or quit stay
+pending, are listed on stderr, and exit 0 unless a lookup or sent decision
+failed. `--yes` decides without the review, a piped, redirected, or `--json`
+invocation decides immediately with unchanged output, and `guard access deny`
+is deliberately immediate in every mode.
+
 ## Resolution and precedence
 
 The daemon reduces intent against typed verbs, daemon baseline authority,
