@@ -36,9 +36,11 @@ counts.
 
 ## Client boundary and attribution
 
-The operator-generated kubeconfig contains no Guard bearer. Its requests are
-unattributed and are safe only within the listener's trusted local or
-single-tenant boundary. Incoming client authorization is never forwarded to the
+The operator-generated kubeconfig carries only the anonymous placeholder
+bearer `guard-anonymous`, which identifies nothing and is stripped by the
+proxy; client-go refuses to send requests from a config whose user has no
+credential field at all. Its requests are unattributed and are safe only
+within the listener's trusted local or single-tenant boundary. Incoming client authorization is never forwarded to the
 upstream. A Guard-session authorization header that does not resolve to live
 internally integrated state fails closed; the public CLI does not create that
 state.

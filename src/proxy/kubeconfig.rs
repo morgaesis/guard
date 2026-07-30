@@ -6,6 +6,13 @@
 
 use std::fmt;
 
+/// Placeholder bearer for the no-session brokered kubeconfig. It identifies
+/// nothing and grants nothing: the proxy strips it and treats the request as
+/// unattributed. It exists because client-go refuses a config whose user
+/// carries no credential at all by prompting for Basic-auth input, which makes
+/// a genuinely credential-free config unusable by kubectl and helm.
+pub const ANONYMOUS_SESSION_TOKEN: &str = "guard-anonymous";
+
 /// Credential-bearing fields under a kubeconfig `user`. Any of these would let
 /// the agent mint real credentials and reach the apiserver around the proxy, so
 /// a brokered config must contain none of them.
@@ -79,9 +86,10 @@ fn brokered_kubeconfig_inner(
     ca_data_b64: &str,
     session_token: Option<&str>,
 ) -> String {
-    let user = session_token
-        .map(|token| serde_json::json!({ "token": token }))
-        .unwrap_or_else(|| serde_json::json!({}));
+    // The no-session config still names a bearer: the anonymous placeholder,
+    // which the proxy strips. A user entry with no credential at all makes
+    // client-go prompt for Basic-auth input instead of sending the request.
+    let user = serde_json::json!({ "token": session_token.unwrap_or(ANONYMOUS_SESSION_TOKEN) });
     let cfg = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Config",
@@ -157,6 +165,12 @@ fn validate_brokered_kubeconfig_inner(
                         found_session = true;
                         continue;
                     }
+                    if field == "token"
+                        && session_token.is_none()
+                        && value.as_str() == Some(ANONYMOUS_SESSION_TOKEN)
+                    {
+                        continue;
+                    }
                     return Err(BrokerError::Credential {
                         user: user_name,
                         field: field.to_string(),
@@ -190,8 +204,14 @@ mod tests {
             doc["clusters"][0]["cluster"]["certificate-authority-data"].as_str(),
             Some("QkFTRTY0Q0E=")
         );
-        // User is empty.
-        assert!(doc["users"][0]["user"].as_mapping().unwrap().is_empty());
+        // The user carries only the anonymous placeholder, so client-go sends
+        // the request instead of prompting for Basic-auth input.
+        assert_eq!(
+            doc["users"][0]["user"]["token"].as_str(),
+            Some(ANONYMOUS_SESSION_TOKEN)
+        );
+        // A session-expecting validation still refuses the anonymous config.
+        assert!(validate_brokered_kubeconfig_with_session(&yaml, "guard-session").is_err());
     }
 
     #[test]
