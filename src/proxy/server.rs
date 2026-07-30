@@ -2207,6 +2207,11 @@ fn take_guard_session(headers: &mut HeaderMap) -> Result<Option<String>, &'stati
         }
         None => None,
     };
+    // The anonymous placeholder from the no-session brokered kubeconfig
+    // identifies nothing: drop it so the request proceeds unattributed instead
+    // of failing closed as an unknown session.
+    let alias = alias.filter(|token| token != super::kubeconfig::ANONYMOUS_SESSION_TOKEN);
+    let bearer = bearer.filter(|token| token != super::kubeconfig::ANONYMOUS_SESSION_TOKEN);
     match (alias, bearer) {
         (Some(alias), Some(bearer)) if alias != bearer => {
             Err("guard api-proxy: conflicting session credentials")
@@ -2900,6 +2905,40 @@ mod tests {
             Some("live-session")
         );
         assert!(!headers.contains_key(header::AUTHORIZATION));
+    }
+
+    #[test]
+    fn anonymous_placeholder_bearer_is_stripped_and_unattributed() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!(
+                "Bearer {}",
+                super::super::kubeconfig::ANONYMOUS_SESSION_TOKEN
+            )
+            .parse()
+            .unwrap(),
+        );
+        assert_eq!(take_guard_session(&mut headers).unwrap(), None);
+        assert!(!headers.contains_key(header::AUTHORIZATION));
+
+        // A real alias next to the placeholder bearer attributes the request
+        // to the alias instead of failing as conflicting credentials.
+        let mut mixed = HeaderMap::new();
+        mixed.insert(GUARD_SESSION_HEADER, "live-session".parse().unwrap());
+        mixed.insert(
+            header::AUTHORIZATION,
+            format!(
+                "Bearer {}",
+                super::super::kubeconfig::ANONYMOUS_SESSION_TOKEN
+            )
+            .parse()
+            .unwrap(),
+        );
+        assert_eq!(
+            take_guard_session(&mut mixed).unwrap().as_deref(),
+            Some("live-session")
+        );
     }
 
     #[test]
