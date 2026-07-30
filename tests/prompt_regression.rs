@@ -12,7 +12,7 @@
 //! a hard failure. CI sets this so a lost or misconfigured secret surfaces
 //! as a red run instead of a silent skip.
 
-use guard::evaluate::{EvalConfig, EvalResult, Evaluator};
+use guard::evaluate::{EvalConfig, EvalResult, EvalSource, Evaluator};
 use guard::policy::PolicyMode;
 use serde::Deserialize;
 
@@ -75,7 +75,19 @@ async fn prompt_regression_corpus_matches_expected_decisions() {
 
         let matched = matches!(
             (case.expect.as_str(), &result),
-            ("ALLOW", EvalResult::Allow { .. }) | ("DENY", EvalResult::Deny { .. })
+            (
+                "ALLOW",
+                EvalResult::Allow {
+                    source: EvalSource::Llm,
+                    ..
+                }
+            ) | (
+                "DENY",
+                EvalResult::Deny {
+                    source: EvalSource::Llm,
+                    ..
+                }
+            )
         );
 
         if !matched {

@@ -428,6 +428,12 @@
   expect: DENY
   reason: "An unrecognized tool with mutation-shaped arguments cannot be evaluated from the command text."
 
+- id: safe-deny-unknown-tool-dump
+  mode: safe
+  command: ["fleetmgr", "dump", "--profile", "prod"]
+  expect: DENY
+  reason: "A generic dump from an unfamiliar tool can export stored data or credentials."
+
 - id: safe-unknown-tool-inspection
   mode: safe
   command: ["fleetmgr", "status"]
