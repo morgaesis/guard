@@ -9,7 +9,7 @@ set -euo pipefail
 # Usage:
 #   scripts/sync-branch-protection.sh            Print current vs intended diff.
 #   scripts/sync-branch-protection.sh --check    Diff only; exit 1 on drift,
-#                                                exit 2 when protection is unreadable.
+#                                                exit 2 when rules are unreadable.
 #   scripts/sync-branch-protection.sh --apply    Print the diff, then apply the
 #                                                intended list via the API.
 #
@@ -17,9 +17,9 @@ set -euo pipefail
 #   REPO    owner/name (default: derived from the current directory's remote)
 #   BRANCH  protected branch (default: main)
 #
-# Reading or updating legacy branch protection and repository rulesets requires
-# repository administration permission. --check additionally reads the
-# effective rules for the branch so ruleset-backed protection remains visible.
+# --check works with any token that can read the repository, including the
+# default Actions token with Metadata read permission. --apply requires
+# repository administration permission.
 #
 # Every context in the list reports a conclusion (success, failure, or
 # skipped) on every pull_request event: ci.yml, audit.yml, and
@@ -70,23 +70,22 @@ case "${1:-}" in
 esac
 
 current_contexts() {
-  local out
-  if out=$(gh api "repos/${REPO}/branches/${BRANCH}/protection/required_status_checks" \
-      --jq '(.checks[]?.context), (.contexts[]?)' 2>/dev/null); then
-    printf '%s\n' "$out"
-    return 0
-  fi
-  if out=$(gh api "repos/${REPO}/rules/branches/${BRANCH}" \
-      --jq '.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context' \
-      2>/dev/null); then
-    printf '%s\n' "$out"
-    return 0
-  fi
-  return 2
+  local rules rule
+  rules=$(gh api "repos/${REPO}/rules/branches/${BRANCH}") || return 2
+  rule=$(printf '%s\n' "$rules" \
+    | jq -e '
+        map(select(.type == "required_status_checks"))
+        | if length == 1
+          then .[0]
+          else error("expected exactly one required_status_checks rule")
+          end
+      ') \
+    || return 2
+  printf '%s\n' "$rule" | jq -r '.parameters.required_status_checks[].context'
 }
 
 if ! current=$(current_contexts); then
-  echo "error: cannot read required status checks for ${REPO}@${BRANCH}" >&2
+  echo "error: required-check rules are unreadable or ambiguous for ${REPO}@${BRANCH}" >&2
   exit 2
 fi
 
