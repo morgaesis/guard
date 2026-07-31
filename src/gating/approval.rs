@@ -93,11 +93,18 @@ pub struct ApprovalSnapshot {
     #[serde(default)]
     pub secret_file_keys: BTreeMap<String, String>,
     /// If this hold originated from a verb, the verb name and the validated
-    /// params, plus the catalog version it was rendered against. A catalog
-    /// change voids the approval.
+    /// params, plus the catalog version it was rendered against. The version
+    /// is the staleness fallback for rows without a `verb_digest`, where any
+    /// catalog change voids the approval.
     pub verb_name: Option<String>,
     pub verb_params: BTreeMap<String, String>,
     pub catalog_version: Option<u64>,
+    /// Definition digest of the matched verb at hold time. The hold is bound
+    /// to the matched verb's definition, so it survives unrelated catalog
+    /// changes; only removing or changing that verb voids the approval.
+    /// Absent on rows written before the digest existed.
+    #[serde(default)]
+    pub verb_digest: Option<String>,
     /// Session-scoped access verbs selected when this immutable hold was
     /// created. Approval consumes their original bounded authority.
     #[serde(default)]
@@ -525,6 +532,7 @@ mod tests {
             verb_name: None,
             verb_params: BTreeMap::new(),
             catalog_version: None,
+            verb_digest: None,
             access_verbs: Vec::new(),
             access_requests: Vec::new(),
             principal: Some(PrincipalKey::from_uid(1001)),

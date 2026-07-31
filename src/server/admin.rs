@@ -190,6 +190,7 @@ mod regeneration_proposal_tests {
                 verb_name: None,
                 verb_params: BTreeMap::new(),
                 catalog_version: None,
+                verb_digest: None,
                 access_verbs: Vec::new(),
                 access_requests: Vec::new(),
                 principal: Some(PrincipalKey::from_uid(1001)),
@@ -352,6 +353,7 @@ mod regeneration_proposal_tests {
             verb_name: Some("host-inspect".to_string()),
             verb_params: BTreeMap::new(),
             catalog_version: Some(1),
+            verb_digest: None,
             access_verbs: vec!["host-inspect".to_string()],
             access_requests: Vec::new(),
             principal: Some(caller),
@@ -2235,7 +2237,7 @@ async fn approve_held_access(
     };
     if let Some(verb_name) = approval.snapshot.verb_name.as_deref() {
         let catalog = server.state.verbs.read().await;
-        if approval.snapshot.catalog_version != Some(catalog.version()) {
+        if let Some(staleness) = held_verb_staleness(&approval.snapshot, verb_name, &catalog) {
             return AccessDecisionResult {
                 request: handle.to_string(),
                 success: false,
@@ -2243,9 +2245,7 @@ async fn approve_held_access(
                 target: Some(format!("agent:{requester}")),
                 remaining_uses: None,
                 use_policy: "unavailable".to_string(),
-                message: format!(
-                    "verb catalog changed since '{verb_name}' was held; re-issue the command"
-                ),
+                message: format!("{}; re-issue the command", staleness.clause(verb_name)),
             };
         }
     }
@@ -5620,6 +5620,45 @@ async fn commit_terminal_approval(
     Ok(())
 }
 
+/// Why a verb-originated hold no longer binds to what the operator reviewed.
+/// `CatalogChanged` applies only to rows written before per-verb digests
+/// existed, where the whole-catalog version is the only available binding.
+enum HeldVerbStaleness {
+    Removed,
+    Changed,
+    CatalogChanged,
+}
+
+impl HeldVerbStaleness {
+    fn clause(&self, verb_name: &str) -> String {
+        match self {
+            Self::Removed => format!("verb '{verb_name}' was removed since it was held"),
+            Self::Changed => format!("verb '{verb_name}' changed since it was held"),
+            Self::CatalogChanged => format!("verb catalog changed since '{verb_name}' was held"),
+        }
+    }
+}
+
+/// Gate-on-prediction staleness for a verb-originated hold: the approval is
+/// bound to the matched verb's definition, so it survives unrelated catalog
+/// changes and is voided only when that verb was removed or its definition
+/// changed. Rows without a stored digest fall back to the whole-catalog
+/// version comparison.
+fn held_verb_staleness(
+    snapshot: &guard::gating::approval::ApprovalSnapshot,
+    verb_name: &str,
+    catalog: &guard::gating::verb::VerbCatalog,
+) -> Option<HeldVerbStaleness> {
+    let Some(current_digest) = catalog.verb_definition_digest(verb_name) else {
+        return Some(HeldVerbStaleness::Removed);
+    };
+    match snapshot.verb_digest.as_deref() {
+        Some(held_digest) => (held_digest != current_digest).then_some(HeldVerbStaleness::Changed),
+        None => (snapshot.catalog_version != Some(catalog.version()))
+            .then_some(HeldVerbStaleness::CatalogChanged),
+    }
+}
+
 async fn handle_approve_claimed(
     server: &ServerContext,
     caller: &CallerIdentity,
@@ -5692,16 +5731,21 @@ async fn handle_approve_claimed(
             stderr: None,
         };
     }
-    // Gate-on-prediction: if this hold came from a verb and the catalog changed
-    // since it was held, the approved artifact may no longer mean what the
-    // operator reviewed. Void the approval rather than execute a stale rendering.
+    // Gate-on-prediction: if this hold came from a verb and that verb was
+    // removed or its definition changed since it was held, the approved
+    // artifact may no longer mean what the operator reviewed. Void the
+    // approval rather than execute a stale rendering; unrelated catalog
+    // changes leave the hold intact.
     if let Some(vname) = &snapshot.verb_name {
-        let current = server.state.verbs.read().await.version();
-        if snapshot.catalog_version != Some(current) {
+        let staleness = {
+            let catalog = server.state.verbs.read().await;
+            held_verb_staleness(&snapshot, vname, &catalog)
+        };
+        if let Some(staleness) = staleness {
             let now = now_unix();
             let detail = format!(
-                "verb catalog changed since '{}' was held; approval voided (re-issue the command)",
-                vname
+                "{}; approval voided (re-issue the command)",
+                staleness.clause(vname)
             );
             let Some(expected) = server.state.approvals.read().await.get(handle).cloned() else {
                 return AdminResponse::Error {

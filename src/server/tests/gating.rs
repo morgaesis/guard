@@ -26,7 +26,6 @@ use guard::gating::approval::{Approval, ApprovalSnapshot, ApprovalStatus};
 use guard::gating::approval::{SecretBinding, ToolSecretBinding};
 #[cfg(unix)]
 use guard::gating::provisional::{ApiRevertPlan, Provisional, ProvisionalStatus};
-#[cfg(unix)]
 use guard::gating::verb::VerbCatalog;
 use guard::gating::{Coverage, GateMode, Reversibility};
 use guard::principal::PrincipalKey;
@@ -1733,6 +1732,7 @@ async fn held_access_projection_expires_before_the_sweeper_and_hides_approval_op
             verb_name: None,
             verb_params: BTreeMap::new(),
             catalog_version: None,
+            verb_digest: None,
             access_verbs: Vec::new(),
             access_requests: Vec::new(),
             principal: Some(principal),
@@ -2358,6 +2358,7 @@ async fn held_access_replay_fails_if_staged_session_was_revoked() {
         verb_name: None,
         verb_params: std::collections::BTreeMap::new(),
         catalog_version: None,
+        verb_digest: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
     };
@@ -3509,41 +3510,48 @@ async fn approval_note_operator_and_owner_post_others_refused() {
     );
 }
 
-/// approve after the verb catalog version changed is voided: the approved
-/// artifact may no longer mean what the operator reviewed, so the daemon
-/// fails it closed rather than executing a stale rendering. Cross-platform:
-/// the void check returns before any child is spawned.
-#[tokio::test]
-async fn approve_voided_when_verb_catalog_version_changed() {
-    let (cfg, operator, agent) = gating_config(7007, 1000);
+/// Minimal catalog for verb-hold staleness tests: one matched verb plus
+/// optional extra content so the whole-catalog version can change without
+/// touching the matched verb's definition.
+const HELD_VERB_YAML: &str = r#"
+verbs:
+  - name: restart-service
+    binary: systemctl
+    args: ["restart", "{unit}"]
+    params:
+      unit: { pattern: "^[a-zA-Z0-9@._-]+$", required: true }
+    consequence: irreversible
+"#;
 
-    // Enqueue a hold that originated from a verb, stamped with a catalog
-    // version that differs from the live (empty) catalog's version. Use a
-    // binary that would clearly execute if the void check were skipped, so a
-    // false pass is detectable.
-    let handle = new_handle();
-    let snapshot = ApprovalSnapshot {
-        binary: "true".to_string(),
-        args: Vec::new(),
-        cwd: None,
-        env: BTreeMap::new(),
-        secret_keys: BTreeMap::new(),
-        session_fingerprint: None,
-        session_revision: None,
-        secret_entitlements: None,
-        secret_file_keys: BTreeMap::new(),
-        verb_name: Some("restart-service".to_string()),
-        verb_params: BTreeMap::new(),
-        // Live catalog (VerbCatalog::empty()) has version 0; a stale stamp.
-        catalog_version: Some(424_242),
-        access_verbs: Vec::new(),
-        access_requests: Vec::new(),
-        principal: agent.principal(),
-        secret_binding: None,
-    };
-    let approval = Approval {
-        handle: handle.clone(),
-        snapshot,
+/// One pending hold bound to `restart-service`, executing `true` so a false
+/// pass through the void check is detectable.
+fn held_verb_approval(
+    handle: &str,
+    catalog_version: Option<u64>,
+    verb_digest: Option<String>,
+    principal: Option<PrincipalKey>,
+) -> Approval {
+    Approval {
+        handle: handle.to_string(),
+        snapshot: ApprovalSnapshot {
+            binary: "true".to_string(),
+            args: Vec::new(),
+            cwd: None,
+            env: BTreeMap::new(),
+            secret_keys: BTreeMap::new(),
+            session_fingerprint: None,
+            session_revision: None,
+            secret_entitlements: None,
+            secret_file_keys: BTreeMap::new(),
+            verb_name: Some("restart-service".to_string()),
+            verb_params: BTreeMap::new(),
+            catalog_version,
+            verb_digest,
+            access_verbs: Vec::new(),
+            access_requests: Vec::new(),
+            principal,
+            secret_binding: None,
+        },
         reason: "verb hold".to_string(),
         risk: Some(8),
         reversibility: Some(Reversibility::Irreversible),
@@ -3557,7 +3565,24 @@ async fn approve_voided_when_verb_catalog_version_changed() {
         result_stdout: None,
         result_stderr: None,
         notes: Vec::new(),
-    };
+    }
+}
+
+/// approve of a legacy row (no stored verb digest) after the verb catalog
+/// version changed is voided: without a digest the whole-catalog version is
+/// the only binding, so the approved artifact may no longer mean what the
+/// operator reviewed. Cross-platform: the void check returns before any
+/// child is spawned.
+#[tokio::test]
+async fn approve_voided_when_verb_catalog_version_changed() {
+    let (cfg, operator, agent) = gating_config(7007, 1000);
+    *cfg.state.verbs.write().await = VerbCatalog::from_yaml(HELD_VERB_YAML).unwrap();
+
+    // Enqueue a hold that originated from a verb, stamped with a catalog
+    // version that differs from the live catalog's version and written
+    // before per-verb digests existed.
+    let handle = new_handle();
+    let approval = held_verb_approval(&handle, Some(424_242), None, agent.principal());
     assert_ne!(
         approval.snapshot.catalog_version,
         Some(cfg.state.verbs.read().await.version()),
@@ -3596,6 +3621,147 @@ async fn approve_voided_when_verb_catalog_version_changed() {
     );
 }
 
+/// A pending hold bound to its verb's definition digest survives an
+/// unrelated verb being appended to the catalog: the whole-catalog version
+/// changes but the matched verb's definition does not, so approve proceeds
+/// instead of voiding.
+#[tokio::test]
+async fn approve_survives_unrelated_verb_append() {
+    let (cfg, operator, agent) = gating_config(7047, 1000);
+    let held_catalog = VerbCatalog::from_yaml(HELD_VERB_YAML).unwrap();
+    let held_version = held_catalog.version();
+    let held_digest = held_catalog
+        .verb_definition_digest("restart-service")
+        .unwrap();
+    *cfg.state.verbs.write().await = held_catalog;
+
+    let handle = new_handle();
+    cfg.state
+        .approvals
+        .write()
+        .await
+        .enqueue(held_verb_approval(
+            &handle,
+            Some(held_version),
+            Some(held_digest.clone()),
+            agent.principal(),
+        ));
+
+    // Append an unrelated verb: the catalog version changes, the matched
+    // verb's definition does not.
+    let appended = VerbCatalog::from_yaml(&format!(
+        "{HELD_VERB_YAML}  - name: unrelated-uptime\n    binary: uptime\n    consequence: reversible\n"
+    ))
+    .unwrap();
+    assert_ne!(appended.version(), held_version);
+    assert_eq!(
+        appended.verb_definition_digest("restart-service").unwrap(),
+        held_digest
+    );
+    *cfg.state.verbs.write().await = appended;
+
+    let response = handle_admin_request(
+        &cfg,
+        &operator,
+        AdminRequest::Approve {
+            handle: handle.clone(),
+        },
+    )
+    .await;
+    if let AdminResponse::Error { message } = &response {
+        assert!(
+            !message.contains("was held"),
+            "an unrelated catalog append must not void the hold, got: {message}"
+        );
+    }
+    let approval = cfg
+        .state
+        .approvals
+        .read()
+        .await
+        .get(&handle)
+        .unwrap()
+        .clone();
+    assert_ne!(approval.status, ApprovalStatus::Pending);
+    assert!(
+        approval
+            .decided_reason
+            .as_deref()
+            .is_none_or(|reason| !reason.contains("was held")),
+        "got: {:?}",
+        approval.decided_reason
+    );
+    if cfg!(unix) {
+        assert_eq!(approval.status, ApprovalStatus::Approved);
+    }
+}
+
+/// A pending hold is voided when the matched verb's own definition changes,
+/// even though the verb still exists under the same name: the operator would
+/// otherwise approve a rendering the current definition no longer produces.
+/// Cross-platform: the void check returns before any child is spawned.
+#[tokio::test]
+async fn approve_voided_when_matched_verb_definition_changed() {
+    let (cfg, operator, agent) = gating_config(7048, 1000);
+    let held_catalog = VerbCatalog::from_yaml(HELD_VERB_YAML).unwrap();
+    let held_version = held_catalog.version();
+    let held_digest = held_catalog
+        .verb_definition_digest("restart-service")
+        .unwrap();
+    *cfg.state.verbs.write().await = held_catalog;
+
+    let handle = new_handle();
+    cfg.state
+        .approvals
+        .write()
+        .await
+        .enqueue(held_verb_approval(
+            &handle,
+            Some(held_version),
+            Some(held_digest.clone()),
+            agent.principal(),
+        ));
+
+    // Change the matched verb's own definition (narrow its unit pattern).
+    let changed =
+        VerbCatalog::from_yaml(&HELD_VERB_YAML.replace("^[a-zA-Z0-9@._-]+$", "^(nginx|sshd)$"))
+            .unwrap();
+    assert_ne!(
+        changed.verb_definition_digest("restart-service").unwrap(),
+        held_digest
+    );
+    *cfg.state.verbs.write().await = changed;
+
+    let voided = handle_admin_request(
+        &cfg,
+        &operator,
+        AdminRequest::Approve {
+            handle: handle.clone(),
+        },
+    )
+    .await;
+    match voided {
+        AdminResponse::Error { message } => {
+            assert!(
+                message.contains("'restart-service' changed since it was held")
+                    && message.contains("voided"),
+                "got: {message}"
+            );
+        }
+        other => panic!("a changed-verb approve must be voided, got {:?}", other),
+    }
+    assert_eq!(
+        cfg.state
+            .approvals
+            .read()
+            .await
+            .get(&handle)
+            .unwrap()
+            .status,
+        ApprovalStatus::ExecFailed
+    );
+}
+
 #[tokio::test]
 async fn approved_snapshot_rechecks_binary_floor_before_exec() {
     let (mut cfg, _, agent) = gating_config(7015, 1000);
@@ -3613,6 +3779,7 @@ async fn approved_snapshot_rechecks_binary_floor_before_exec() {
         verb_name: None,
         verb_params: BTreeMap::new(),
         catalog_version: None,
+        verb_digest: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: agent.principal(),
@@ -3663,6 +3830,7 @@ async fn stored_entitlements_cover_tool_secrets_for_approval_check_and_revert() 
         verb_name: None,
         verb_params: BTreeMap::new(),
         catalog_version: None,
+        verb_digest: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: Some(principal.clone()),
@@ -3800,6 +3968,7 @@ async fn approved_snapshot_rejects_changed_session_revision() {
         verb_name: None,
         verb_params: BTreeMap::new(),
         catalog_version: None,
+        verb_digest: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: agent.principal(),
@@ -3833,6 +4002,7 @@ async fn approved_snapshot_rejects_dangerous_request_env_before_exec() {
         verb_name: None,
         verb_params: BTreeMap::new(),
         catalog_version: None,
+        verb_digest: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: agent.principal(),
@@ -3872,6 +4042,7 @@ async fn approved_snapshot_executes_in_snapshotted_cwd() {
         verb_name: None,
         verb_params: BTreeMap::new(),
         catalog_version: None,
+        verb_digest: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: agent.principal(),
@@ -3912,6 +4083,7 @@ async fn approved_snapshot_rejects_missing_snapshotted_cwd_before_exec() {
         verb_name: None,
         verb_params: BTreeMap::new(),
         catalog_version: None,
+        verb_digest: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: agent.principal(),
@@ -3960,6 +4132,7 @@ async fn approved_snapshot_rejects_retargeted_snapshotted_cwd_before_exec() {
         verb_name: None,
         verb_params: BTreeMap::new(),
         catalog_version: None,
+        verb_digest: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: agent.principal(),

@@ -13,6 +13,7 @@
 //! skip the LLM evaluator entirely (a deterministic allow path, like a static
 //! policy allow), since its shape is already operator-reviewed.
 
+use super::coverage::reversibility_rank;
 use super::Reversibility;
 use anyhow::{bail, Context, Result};
 use regex::Regex;
@@ -301,6 +302,21 @@ pub struct Verb {
     pub promotion_stamp: Option<String>,
 }
 
+impl Verb {
+    /// Content digest (SHA-256 hex) of this verb's full definition. The JSON
+    /// serialization is deterministic because every collection in a verb is a
+    /// `BTreeMap`, so two identical definitions always share one digest. Held
+    /// approvals bind to this digest rather than the whole-catalog version, so
+    /// an unrelated catalog change does not void them.
+    pub fn definition_digest(&self) -> String {
+        let serialized = serde_json::to_string(self).expect("verb serializes");
+        Sha256::digest(serialized.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct CatalogFile {
     #[serde(default)]
@@ -372,6 +388,12 @@ impl VerbCatalog {
 
     pub fn get(&self, name: &str) -> Option<&Verb> {
         self.verbs.get(name)
+    }
+
+    /// Definition digest of one named verb, or `None` if the catalog has no
+    /// verb by that name (see [`Verb::definition_digest`]).
+    pub fn verb_definition_digest(&self, name: &str) -> Option<String> {
+        self.get(name).map(Verb::definition_digest)
     }
 
     pub fn list(&self) -> Vec<Verb> {
@@ -724,11 +746,15 @@ impl VerbCatalog {
         }
         // Synthesis proposes the matcher, not its safety class. Promotion may
         // make the exact matcher deterministic, but consequence routing is
-        // derived locally so a model cannot label a mutation reversible.
+        // derived locally so a model cannot label a mutation reversible. A
+        // matcher that provably wraps operator-reviewed catalog coverage
+        // inherits that coverage's class instead of the irreversible default,
+        // so wrapping a reversible verb does not hold every run for approval.
         verb.consequence = if synthesized_access_is_statically_read_only(&verb) {
             Reversibility::Reversible
         } else {
-            Reversibility::Irreversible
+            self.wrapped_operator_consequence(&verb)
+                .unwrap_or(Reversibility::Irreversible)
         };
         verb.revert = None;
         verb.trusted = true;
@@ -785,6 +811,43 @@ impl VerbCatalog {
             .ok()
             .and_then(|m| m.modified().ok());
         Ok(verb)
+    }
+
+    /// Consequence inherited from operator catalog coverage that a generated
+    /// access matcher wraps. A wrap holds only when every concrete command
+    /// the matcher admits reverse-matches a non-generated catalog verb,
+    /// proven by enumerating the matcher's parameter space and replaying each
+    /// command through the catalog's own reverse match; a matcher broader
+    /// than the operator-reviewed coverage, or one whose parameters are not
+    /// plain literal enumerations, inherits nothing. Each command takes the
+    /// most conservative class among its matches and the wrap takes the most
+    /// conservative class across commands, so inheritance can never assign a
+    /// class less restrictive than the wrapped verb's own.
+    fn wrapped_operator_consequence(&self, candidate: &Verb) -> Option<Reversibility> {
+        if !candidate.coverage.is_empty() || candidate.binary.contains('{') {
+            return None;
+        }
+        let mut inherited: Option<Reversibility> = None;
+        for args in enumerate_matcher_commands(candidate)? {
+            let class = self
+                .match_command_all(&candidate.binary, &args)
+                .into_iter()
+                .filter(|matched| {
+                    matched.action != CoverageAction::Deny
+                        && matched.rendered.name != candidate.name
+                        && !matched.rendered.name.starts_with("grant-")
+                        && !matched.rendered.name.starts_with("access-generated-")
+                })
+                .map(|matched| matched.rendered.consequence)
+                .max_by_key(|class| reversibility_rank(*class))?;
+            inherited = Some(match inherited {
+                Some(previous) if reversibility_rank(previous) >= reversibility_rank(class) => {
+                    previous
+                }
+                _ => class,
+            });
+        }
+        inherited
     }
 
     fn refresh_version(&mut self) -> Result<()> {
@@ -1255,6 +1318,64 @@ fn synthesized_access_is_statically_read_only(verb: &Verb) -> bool {
     }
 }
 
+/// Every concrete argv a generated matcher's template admits, or `None` when
+/// a referenced parameter pattern is not a plain literal enumeration or the
+/// combination space exceeds the bound.
+fn enumerate_matcher_commands(candidate: &Verb) -> Option<Vec<Vec<String>>> {
+    const MAX_COMMANDS: usize = 64;
+    let referenced: BTreeSet<String> = candidate
+        .args
+        .iter()
+        .flat_map(|token| placeholders(token))
+        .collect();
+    let mut combinations: Vec<BTreeMap<String, String>> = vec![BTreeMap::new()];
+    for name in &referenced {
+        let spec = candidate.params.get(name)?;
+        let values = enumerate_pattern_literals(&spec.pattern)?;
+        if combinations.len().checked_mul(values.len())? > MAX_COMMANDS {
+            return None;
+        }
+        combinations = combinations
+            .iter()
+            .flat_map(|combination| {
+                values.iter().map(move |value| {
+                    let mut expanded = combination.clone();
+                    expanded.insert(name.clone(), value.clone());
+                    expanded
+                })
+            })
+            .collect();
+    }
+    combinations
+        .iter()
+        .map(|params| render_args(&candidate.args, params, &candidate.name).ok())
+        .collect()
+}
+
+/// The literal branches of an anchored alternation such as `^(status|df)$`,
+/// or `None` when any branch uses regex syntax beyond a plain literal.
+fn enumerate_pattern_literals(pattern: &str) -> Option<Vec<String>> {
+    let mut inner = pattern.strip_prefix('^').unwrap_or(pattern);
+    inner = inner.strip_suffix('$').unwrap_or(inner);
+    if let Some(stripped) = inner
+        .strip_prefix("(?:")
+        .or_else(|| inner.strip_prefix('('))
+        .and_then(|stripped| stripped.strip_suffix(')'))
+    {
+        inner = stripped;
+    }
+    let branches: Vec<String> = inner.split('|').map(str::to_string).collect();
+    branches
+        .iter()
+        .all(|branch| {
+            !branch.is_empty()
+                && !branch
+                    .chars()
+                    .any(|character| r"\^$.?*+()[]{}|".contains(character))
+        })
+        .then_some(branches)
+}
+
 fn constraint_selector(constraint: &ValueConstraint) -> String {
     constraint
         .position
@@ -1335,6 +1456,32 @@ pub fn validate_synthesized_safety(verb: &Verb) -> Result<()> {
             verb.name,
             verb.binary
         );
+    }
+    if let Some(operator) = verb
+        .args
+        .iter()
+        .find(|argument| matches!(argument.as_str(), ";" | "&&" | "||" | "|" | ">" | "<"))
+    {
+        bail!(
+            "synthesized verb '{}' has argv element {:?}, a literal shell operator; guard runs no \
+             shell, so the element can never chain or redirect and the verb is non-functional",
+            verb.name,
+            operator
+        );
+    }
+    if binary_name == "kubectl" && verb.args.iter().any(|argument| argument == "exec") {
+        if let Some(flag) = verb
+            .args
+            .iter()
+            .find(|argument| matches!(argument.as_str(), "-i" | "-t" | "-it" | "-ti"))
+        {
+            bail!(
+                "synthesized verb '{}' requests an interactive exec stream ('{}'); guard refuses \
+                 interactive stdin/tty at run time, so storing the flag only sets a trap",
+                verb.name,
+                flag
+            );
+        }
     }
     for (pname, spec) in &verb.params {
         validate_param_not_overbroad(pname, spec, "synthesized verb")?;
@@ -2351,6 +2498,43 @@ verbs:
     }
 
     #[test]
+    fn synthesized_shell_operator_argv_element_is_rejected() {
+        for operator in [";", "&&", "||", "|", ">", "<"] {
+            let mut verb = synth_verb("kubectl", None, false, "k-chained");
+            verb.args = args_vec(&["get", "pods", operator, "get", "nodes"]);
+            let error = validate_synthesized_safety(&verb).unwrap_err();
+            assert!(
+                error.to_string().contains("literal shell operator"),
+                "got: {error}"
+            );
+        }
+        // Only a whole argv element equal to an operator is rejected; the
+        // parameter-pattern gates govern embedded characters.
+        let mut plain = synth_verb("kubectl", None, false, "k-wide");
+        plain.args = args_vec(&["get", "pods", "-o", "wide"]);
+        assert!(validate_synthesized_safety(&plain).is_ok());
+    }
+
+    #[test]
+    fn synthesized_interactive_kubectl_exec_flags_are_rejected() {
+        for flag in ["-i", "-t", "-it", "-ti"] {
+            let mut verb = synth_verb("kubectl", None, false, "k-exec");
+            verb.args = args_vec(&["exec", flag, "deploy/tools", "--", "ceph", "status"]);
+            let error = validate_synthesized_safety(&verb).unwrap_err();
+            assert!(error.to_string().contains("interactive"), "got: {error}");
+        }
+        // Non-interactive exec passes the gate.
+        let mut batch = synth_verb("kubectl", None, false, "k-exec-batch");
+        batch.args = args_vec(&["exec", "deploy/tools", "--", "ceph", "status"]);
+        assert!(validate_synthesized_safety(&batch).is_ok());
+        // The flags matter only for kubectl exec; another binary keeps its
+        // own semantics.
+        let mut other = synth_verb("fixturectl", None, false, "fixture-exec");
+        other.args = args_vec(&["exec", "-it", "target"]);
+        assert!(validate_synthesized_safety(&other).is_ok());
+    }
+
+    #[test]
     fn generated_access_promotion_derives_consequence_from_command_shape() {
         let mut catalog = VerbCatalog::default();
         let candidate = |name: &str, binary: &str, args: &[&str], consequence| {
@@ -2414,6 +2598,90 @@ verbs:
             assert!(diagnostic.trusted);
             assert_eq!(diagnostic.consequence, Reversibility::Reversible);
         }
+    }
+
+    const TOOLBOX_CATALOG_YAML: &str = r#"
+verbs:
+  - name: toolbox-ceph-read
+    binary: kubectl
+    args: ["-n", "rook-ceph", "exec", "deploy/rook-ceph-tools", "--", "ceph", "{command}"]
+    params:
+      command: { pattern: "^(status|df|health)$" }
+    consequence: reversible
+    trusted: true
+"#;
+
+    fn toolbox_wrapper(pattern: &str) -> Verb {
+        let mut wrapper = synth_verb("kubectl", None, false, "access-generated-ceph-read");
+        wrapper.baseline = false;
+        wrapper.args = args_vec(&[
+            "-n",
+            "rook-ceph",
+            "exec",
+            "deploy/rook-ceph-tools",
+            "--",
+            "ceph",
+            "{query}",
+        ]);
+        wrapper.params.insert(
+            "query".to_string(),
+            ParamSpec {
+                pattern: pattern.to_string(),
+                required: true,
+                default: None,
+                allow_dash: false,
+            },
+        );
+        wrapper.consequence = Reversibility::Irreversible;
+        wrapper
+    }
+
+    #[test]
+    fn generated_access_matcher_wrapping_catalog_verb_inherits_its_consequence() {
+        let mut catalog = VerbCatalog::from_yaml(TOOLBOX_CATALOG_YAML).unwrap();
+        catalog
+            .upsert_access_verb(toolbox_wrapper("^(status|df)$"))
+            .unwrap();
+        assert_eq!(
+            catalog
+                .get("access-generated-ceph-read")
+                .unwrap()
+                .consequence,
+            Reversibility::Reversible,
+            "every admitted command reverse-matches the reversible catalog verb"
+        );
+    }
+
+    #[test]
+    fn generated_access_matcher_broader_than_catalog_coverage_stays_irreversible() {
+        // One admitted value escapes the wrapped verb's own pattern, so the
+        // matcher is broader than the operator-reviewed coverage and keeps
+        // the fail-closed default.
+        let mut catalog = VerbCatalog::from_yaml(TOOLBOX_CATALOG_YAML).unwrap();
+        catalog
+            .upsert_access_verb(toolbox_wrapper("^(status|osd-purge)$"))
+            .unwrap();
+        assert_eq!(
+            catalog
+                .get("access-generated-ceph-read")
+                .unwrap()
+                .consequence,
+            Reversibility::Irreversible
+        );
+
+        // A free-text parameter is not enumerable, so nothing is inherited
+        // even though every actually-valid value would match the catalog verb.
+        let mut catalog = VerbCatalog::from_yaml(TOOLBOX_CATALOG_YAML).unwrap();
+        catalog
+            .upsert_access_verb(toolbox_wrapper("^[a-z]+$"))
+            .unwrap();
+        assert_eq!(
+            catalog
+                .get("access-generated-ceph-read")
+                .unwrap()
+                .consequence,
+            Reversibility::Irreversible
+        );
     }
 
     #[test]
