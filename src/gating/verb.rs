@@ -1496,6 +1496,41 @@ pub fn validate_synthesized_safety(verb: &Verb) -> Result<()> {
     Ok(())
 }
 
+/// One sentence of operator guidance for a terminal synthesis-gate rejection.
+/// The operator wrote prose and the model wrote the rejected artifact, so the
+/// guidance names the prose change that steers the next synthesis away from
+/// the failure class. Keyed by substring of the gate's own error text because
+/// gate rejections are `anyhow` strings, not typed kinds. `None` for a
+/// rejection class with no prose-level correction.
+pub fn gate_rejection_guidance(reason: &str) -> Option<&'static str> {
+    const GUIDANCE: &[(&str, &str)] = &[
+        (
+            "too permissive",
+            "name the exact allowed values in your prompt so the parameter can be enumerated",
+        ),
+        (
+            "literal shell operator",
+            "ask for a single command; chaining needs separate verbs",
+        ),
+        (
+            "is a shell/interpreter",
+            "ask for non-interactive output, not a shell",
+        ),
+        (
+            "interactive exec stream",
+            "ask for non-interactive output, not a shell",
+        ),
+        (
+            "but no template references",
+            "either mention where the value is used or drop it from the prompt",
+        ),
+    ];
+    GUIDANCE
+        .iter()
+        .find(|(needle, _)| reason.contains(needle))
+        .map(|(_, guidance)| *guidance)
+}
+
 /// Safety gate for a verb `gating::allow_promotion` wants to append to the
 /// catalog automatically, with no operator review, from repeated low-risk LLM
 /// approvals. Deliberately stricter than `validate_synthesized_safety`, whose
@@ -1619,13 +1654,17 @@ fn validate_verb(verb: &Verb) -> Result<()> {
             )
         })?;
     }
-    // Every placeholder referenced by the templates must be a declared param.
+    // Every placeholder referenced by the templates must be a declared param,
+    // and every declared param must be referenced by some template token: an
+    // unused declaration would validate an invocation value that silently never
+    // reaches the rendered command.
     let mut tokens: Vec<&String> = vec![&verb.binary];
     tokens.extend(verb.args.iter());
     if let Some(rev) = &verb.revert {
         tokens.push(&rev.binary);
         tokens.extend(rev.args.iter());
     }
+    let mut referenced: BTreeSet<String> = BTreeSet::new();
     for tok in tokens {
         for placeholder in placeholders(tok) {
             if !verb.params.contains_key(&placeholder) {
@@ -1635,6 +1674,17 @@ fn validate_verb(verb: &Verb) -> Result<()> {
                     placeholder
                 );
             }
+            referenced.insert(placeholder);
+        }
+    }
+    for pname in verb.params.keys() {
+        if !referenced.contains(pname) {
+            bail!(
+                "verb '{}' declares parameter '{}' but no template references {{{}}}",
+                verb.name,
+                pname,
+                pname
+            );
         }
     }
     let mut cell_names = BTreeSet::new();
@@ -3389,5 +3439,101 @@ verbs:
 
     fn args_vec(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn unused_declared_parameter_is_rejected_at_load() {
+        let yaml = r#"
+verbs:
+  - name: show-unit-status
+    binary: systemctl
+    args: ["status"]
+    params:
+      op: { pattern: "^(start|stop)$" }
+    consequence: reversible
+"#;
+        let error = VerbCatalog::from_yaml(yaml).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("declares parameter 'op' but no template references {op}"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn parameter_referenced_only_by_the_revert_template_is_used() {
+        let yaml = r#"
+verbs:
+  - name: enable-unit
+    binary: systemctl
+    args: ["enable", "{unit}"]
+    params:
+      unit: { pattern: "^[a-z-]+$" }
+      scope: { pattern: "^(user|system)$", required: false, default: "system" }
+    consequence: recoverable
+    revert: { binary: systemctl, args: ["disable", "--{scope}", "{unit}"] }
+"#;
+        assert!(VerbCatalog::from_yaml(yaml).is_ok());
+    }
+
+    #[test]
+    fn gate_rejection_guidance_names_the_prose_change_per_failure_class() {
+        let overbroad =
+            validate_synthesized_safety(&synth_verb("uptime", Some("^.+$"), false, "x"))
+                .unwrap_err()
+                .to_string();
+        assert_eq!(
+            gate_rejection_guidance(&overbroad),
+            Some("name the exact allowed values in your prompt so the parameter can be enumerated")
+        );
+
+        let mut chained = synth_verb("uptime", None, false, "x");
+        chained.args = args_vec(&["-p", "&&", "reboot"]);
+        let chained = validate_synthesized_safety(&chained)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            gate_rejection_guidance(&chained),
+            Some("ask for a single command; chaining needs separate verbs")
+        );
+
+        let shell = validate_synthesized_safety(&synth_verb("bash", None, false, "x"))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            gate_rejection_guidance(&shell),
+            Some("ask for non-interactive output, not a shell")
+        );
+
+        let mut interactive = synth_verb("kubectl", None, false, "x");
+        interactive.args = args_vec(&["exec", "-it", "deploy/web"]);
+        let interactive = validate_synthesized_safety(&interactive)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            gate_rejection_guidance(&interactive),
+            Some("ask for non-interactive output, not a shell")
+        );
+
+        let unused = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: show-unit-status
+    binary: systemctl
+    args: ["status"]
+    params:
+      op: { pattern: "^(start|stop)$" }
+    consequence: reversible
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            gate_rejection_guidance(&unused),
+            Some("either mention where the value is used or drop it from the prompt")
+        );
+
+        assert_eq!(gate_rejection_guidance("the daemon has no LLM key"), None);
     }
 }

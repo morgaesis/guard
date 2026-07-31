@@ -136,6 +136,7 @@ impl Client {
             AdminRequest::VerbShow { .. } => "verb_show",
             AdminRequest::VerbDelete { .. } => "verb_delete",
             AdminRequest::VerbCreate { .. } => "verb_create",
+            AdminRequest::VerbCreateFromPreview { .. } => "verb_create_from_preview",
             AdminRequest::VerbCoverageList => "verb_coverage_list",
             AdminRequest::VerbCoverageClear => "verb_coverage_clear",
             #[cfg(test)]

@@ -44,6 +44,90 @@ impl<'a> MakeWriter<'a> for SharedBuf {
     }
 }
 
+/// Minimal LLM stub for verb synthesis tests: serve each connection one
+/// chat-completions response whose forced `create_verb` tool-call arguments
+/// come from `respond`, applied to the raw request (headers plus JSON body) so
+/// a test can branch on what the daemon actually sent.
+async fn run_verb_synthesis_llm_with(
+    listener: tokio::net::TcpListener,
+    respond: fn(&str) -> serde_json::Value,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    loop {
+        let (mut stream, _) = match listener.accept().await {
+            Ok(stream) => stream,
+            Err(_) => return,
+        };
+        tokio::spawn(async move {
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 2048];
+            while let Ok(read) = stream.read(&mut chunk).await {
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .split("\r\n")
+                        .find_map(|line| {
+                            line.strip_prefix("Content-Length: ")
+                                .or_else(|| line.strip_prefix("content-length: "))
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
+            }
+            let arguments = respond(&String::from_utf8_lossy(&request)).to_string();
+            let body = serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "tool_calls": [{
+                            "id": "verb-1",
+                            "type": "function",
+                            "function": {
+                                "name": "create_verb",
+                                "arguments": arguments
+                            }
+                        }]
+                    }
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+    }
+}
+
+fn synthesized_compiler_check_arguments(_request: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": "check-compiler",
+        "description": "Inspect compiler version",
+        "binary": "rustc",
+        "args": ["--version"],
+        "params": {},
+        "consequence": "reversible",
+        "trusted": false,
+        "evidence": "The exact compiler version command is read only."
+    })
+}
+
+/// The fixed-shape stub most synthesis tests use: every request yields the
+/// same safe read-only candidate.
+async fn run_verb_synthesis_llm(listener: tokio::net::TcpListener) {
+    run_verb_synthesis_llm_with(listener, synthesized_compiler_check_arguments).await;
+}
+
 fn make_test_config() -> (ServerContext, SharedBuf) {
     // LLM disabled, no static policy → policy_allowed() never hits
     // this path; we manufacture results directly for audit tests.
