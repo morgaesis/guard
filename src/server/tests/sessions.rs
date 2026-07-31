@@ -1,5 +1,8 @@
-use crate::grant_profile::{EvaluationMode, SavedGrantCatalog};
-use crate::server::admin::handle_admin_request;
+use crate::grant_profile::{EvaluationMode, GrantRequestStatus, SavedGrantCatalog};
+use crate::server::admin::{
+    handle_admin_request, prune_grant_requests, validate_durable_access_provenance,
+    MAX_GRANT_REQUESTS,
+};
 use crate::server::execute::{
     admit_access_use, evaluation_cache_scope, execute_command, session_source_from_eval,
 };
@@ -11,8 +14,8 @@ use crate::server::transport::{claim_session_maintenance, session_maintenance_on
 use crate::server::wire::ExecOutcome;
 use crate::server::wire::{AdminRequest, AdminResponse, CallerIdentity, ExecuteRequest};
 use crate::session::{
-    AccessUseGrant, IssuedGrantScope, SessionDecisionSource, SessionExactRule, SessionExecStatus,
-    SessionGrant, SessionInteraction,
+    session_reference, AccessUseGrant, IssuedGrantScope, SessionDecisionSource, SessionExactRule,
+    SessionExecStatus, SessionGrant, SessionInteraction,
 };
 use crate::session_store::SessionStore;
 use guard::evaluate::{EvalConfig, Evaluator};
@@ -777,7 +780,7 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded() {
         Some(0)
     );
 
-    let target = crate::session::session_reference(&restored_access.token);
+    let target = "agent:1001".to_string();
     let extension = AdminRequest::AccessExtend {
         target: target.clone(),
         intent: "Inspect fixture".to_string(),
@@ -841,6 +844,532 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded() {
     assert!(restored
         .access_token_for_principal(&PrincipalKey::from_uid(1001))
         .is_none());
+}
+
+#[tokio::test]
+async fn access_request_can_name_multiple_catalog_verbs() {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.config.gate = GateMode::Consequence;
+    cfg.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            "verbs:\n  - name: inspect-a\n    description: Inspect system A\n    binary: true\n    args: []\n    baseline: false\n    consequence: reversible\n    trusted: false\n  - name: inspect-b\n    description: Inspect system B\n    binary: printf\n    args: [b]\n    baseline: false\n    consequence: reversible\n    trusted: false\n  - name: run\n    description: Run a different operation\n    binary: printf\n    args: [run]\n    baseline: false\n    consequence: reversible\n    trusted: false\n  - name: stop\n    description: Stop a different operation\n    binary: printf\n    args: [stop]\n    baseline: false\n    consequence: reversible\n    trusted: false\n",
+        )
+        .unwrap(),
+    ));
+    let worker = CallerIdentity::Unix { uid: 1001 };
+    let daemon = CallerIdentity::Unix { uid: 777 };
+
+    let AdminResponse::AccessItem { item } = handle_admin_request(
+        &cfg,
+        &worker,
+        AdminRequest::AccessRequest {
+            intent: "Use inspect-a and `inspect-b` for this task".to_string(),
+        },
+    )
+    .await
+    else {
+        panic!("expected multi-verb access request")
+    };
+    assert_eq!(item.effective_scope, vec!["inspect-a", "inspect-b"]);
+    let mixed_worker = CallerIdentity::Unix { uid: 1002 };
+    let AdminResponse::AccessItem { item: mixed } = handle_admin_request(
+        &cfg,
+        &mixed_worker,
+        AdminRequest::AccessRequest {
+            intent: "Use inspect-a and inspect system B".to_string(),
+        },
+    )
+    .await
+    else {
+        panic!("expected mixed explicit and semantic access request")
+    };
+    assert_eq!(mixed.effective_scope, vec!["inspect-a", "inspect-b"]);
+    let AdminResponse::AccessItem { item: semantic } = handle_admin_request(
+        &cfg,
+        &CallerIdentity::Unix { uid: 1003 },
+        AdminRequest::AccessRequest {
+            intent: "Use inspect-a and run a different operation".to_string(),
+        },
+    )
+    .await
+    else {
+        panic!("expected ordinary one-word verb to resolve from its full description")
+    };
+    assert_eq!(semantic.effective_scope, vec!["inspect-a", "run"]);
+    let AdminResponse::AccessItem { item: exact_clause } = handle_admin_request(
+        &cfg,
+        &CallerIdentity::Unix { uid: 1004 },
+        AdminRequest::AccessRequest {
+            intent: "Use inspect-a and run".to_string(),
+        },
+    )
+    .await
+    else {
+        panic!("expected an exact one-word verb clause to be selected")
+    };
+    assert_eq!(exact_clause.effective_scope, vec!["inspect-a", "run"]);
+    let AdminResponse::AccessItem {
+        item: ordinary_names,
+    } = handle_admin_request(
+        &cfg,
+        &CallerIdentity::Unix { uid: 1006 },
+        AdminRequest::AccessRequest {
+            intent: "Use run and stop".to_string(),
+        },
+    )
+    .await
+    else {
+        panic!("expected two ordinary one-word verb clauses to be selected")
+    };
+    assert_eq!(ordinary_names.effective_scope, vec!["run", "stop"]);
+    let AdminResponse::AccessItem { item: sequenced } = handle_admin_request(
+        &cfg,
+        &CallerIdentity::Unix { uid: 1007 },
+        AdminRequest::AccessRequest {
+            intent: "Use inspect-a then inspect-b".to_string(),
+        },
+    )
+    .await
+    else {
+        panic!("expected sequencing prose between explicit verb names")
+    };
+    assert_eq!(sequenced.effective_scope, vec!["inspect-a", "inspect-b"]);
+    let AdminResponse::AccessItem { item: combined } = handle_admin_request(
+        &cfg,
+        &CallerIdentity::Unix { uid: 1008 },
+        AdminRequest::AccessRequest {
+            intent: "Use inspect-a with run".to_string(),
+        },
+    )
+    .await
+    else {
+        panic!("expected an ordinary verb joined to a distinctive verb with prose")
+    };
+    assert_eq!(combined.effective_scope, vec!["inspect-a", "run"]);
+    let AdminResponse::AccessItem { item: suffixed } = handle_admin_request(
+        &cfg,
+        &CallerIdentity::Unix { uid: 1009 },
+        AdminRequest::AccessRequest {
+            intent: "Use inspect-a and run for this task".to_string(),
+        },
+    )
+    .await
+    else {
+        panic!("expected request prose after an ordinary verb name")
+    };
+    assert_eq!(suffixed.effective_scope, vec!["inspect-a", "run"]);
+    let AdminResponse::AccessItem { item: collision } = handle_admin_request(
+        &cfg,
+        &CallerIdentity::Unix { uid: 1005 },
+        AdminRequest::AccessRequest {
+            intent: "Run inspect-a".to_string(),
+        },
+    )
+    .await
+    else {
+        panic!("expected the distinctive verb name without the ordinary-word collision")
+    };
+    assert_eq!(collision.effective_scope, vec!["inspect-a"]);
+    let request_reference = mixed.reference.clone();
+    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::AccessApprove {
+            handles: vec![mixed.reference],
+            uses: Some(2),
+        },
+    )
+    .await
+    else {
+        panic!("expected multi-verb access approval")
+    };
+    assert!(items[0].success);
+
+    let mut inspect_a = request_with_session("true", Vec::new(), "unused".to_string());
+    inspect_a.session_token = None;
+    let inspect_a = execute_command(inspect_a, &cfg, &mixed_worker).await;
+    assert!(
+        inspect_a.policy_allowed(),
+        "first named verb denied: {}",
+        inspect_a.policy_reason()
+    );
+    assert!(matches!(
+        inspect_a.exec,
+        ExecOutcome::Completed {
+            exit_code: Some(0),
+            ..
+        }
+    ));
+    let mut inspect_b = request_with_session("printf", vec!["b".to_string()], "unused".to_string());
+    inspect_b.session_token = None;
+    let inspect_b = execute_command(inspect_b, &cfg, &mixed_worker).await;
+    assert!(
+        inspect_b.policy_allowed(),
+        "second named verb denied: {}",
+        inspect_b.policy_reason()
+    );
+    assert!(matches!(
+        inspect_b.exec,
+        ExecOutcome::Completed {
+            exit_code: Some(0),
+            ..
+        }
+    ));
+    let sessions = cfg.state.sessions.read().await;
+    let token = sessions
+        .access_token_for_principal(&PrincipalKey::from_uid(1002))
+        .unwrap();
+    assert_eq!(
+        sessions.access_grant_uses(&token, &request_reference),
+        Some((Some(2), Some(0)))
+    );
+}
+
+#[tokio::test]
+async fn agent_label_extension_preserves_session_grants_and_cumulative_intent() {
+    let (mut cfg, _) = make_test_config();
+    let state = tempfile::tempdir().unwrap();
+    let state_db = state.path().join("state.db");
+    cfg.state.session_store = Some(SessionStore::open(state_db.clone(), 3600).await.unwrap());
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            "verbs:\n  - name: inspect-a\n    description: Inspect system A\n    binary: true\n    args: []\n    baseline: false\n    consequence: reversible\n    trusted: true\n  - name: inspect-b\n    description: Inspect system B\n    binary: printf\n    args: [b]\n    baseline: false\n    consequence: reversible\n    trusted: true\n",
+        )
+        .unwrap(),
+    ));
+    let worker = CallerIdentity::Unix { uid: 1001 };
+    let daemon = CallerIdentity::Unix { uid: 777 };
+    let AdminResponse::AccessItem { item: initial } = handle_admin_request(
+        &cfg,
+        &worker,
+        AdminRequest::AccessRequest {
+            intent: "Inspect system A".to_string(),
+        },
+    )
+    .await
+    else {
+        panic!("expected initial access request")
+    };
+    let initial_reference = initial.reference.clone();
+    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::AccessApprove {
+            handles: vec![initial.reference],
+            uses: Some(1),
+        },
+    )
+    .await
+    else {
+        panic!("expected initial approval")
+    };
+    assert!(items[0].success);
+    let original_token = cfg
+        .state
+        .sessions
+        .read()
+        .await
+        .access_token_for_principal(&PrincipalKey::from_uid(1001))
+        .unwrap();
+
+    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::AccessExtend {
+            target: "agent:1001".to_string(),
+            intent: "Use inspect-b for this task".to_string(),
+            uses: Some(2),
+        },
+    )
+    .await
+    else {
+        panic!("expected access extension")
+    };
+    assert!(items[0].success);
+    let extension_reference = items[0].request.clone();
+
+    let sessions = cfg.state.sessions.read().await;
+    assert_eq!(
+        sessions
+            .access_token_for_principal(&PrincipalKey::from_uid(1001))
+            .as_deref(),
+        Some(original_token.as_str())
+    );
+    assert!(sessions
+        .access_grant_uses(&original_token, &initial_reference)
+        .is_some());
+    drop(sessions);
+    let restored = cfg
+        .state
+        .session_store
+        .as_ref()
+        .unwrap()
+        .load_registry()
+        .await
+        .unwrap();
+    assert_eq!(
+        restored
+            .access_token_for_principal(&PrincipalKey::from_uid(1001))
+            .as_deref(),
+        Some(original_token.as_str())
+    );
+    assert_eq!(
+        restored.access_grant_uses(&original_token, &initial_reference),
+        Some((Some(1), Some(1)))
+    );
+    assert_eq!(
+        restored.access_grant_uses(&original_token, &extension_reference),
+        Some((Some(2), Some(2)))
+    );
+    assert!(restored
+        .verb_scope_for(&original_token)
+        .unwrap()
+        .0
+        .contains(&"inspect-b".to_string()));
+    assert!(restored
+        .verb_scope_for(&original_token)
+        .unwrap()
+        .0
+        .contains(&"inspect-a".to_string()));
+    let restored_requests = cfg
+        .state
+        .session_store
+        .as_ref()
+        .unwrap()
+        .load_grant_requests()
+        .await
+        .unwrap();
+    *cfg.state.sessions.write().await = restored;
+    *cfg.state.grant_requests.write().await = restored_requests
+        .into_iter()
+        .map(|request| (request.handle.clone(), request))
+        .collect();
+    let AdminResponse::AccessItems { items } =
+        handle_admin_request(&cfg, &worker, AdminRequest::AccessList).await
+    else {
+        panic!("expected access list")
+    };
+    let session_intent = items
+        .iter()
+        .find(|item| item.kind == "session")
+        .and_then(|item| item.intent.as_deref())
+        .expect("the access session projects its approved intents");
+    assert!(session_intent.contains("Inspect system A"));
+    assert!(session_intent.contains("Use inspect-b for this task"));
+}
+
+#[tokio::test]
+async fn approved_request_without_live_session_projects_as_orphaned() {
+    let (mut cfg, _) = make_test_config();
+    let state = tempfile::tempdir().unwrap();
+    cfg.state.session_store = Some(
+        SessionStore::open(state.path().join("state.db"), 3600)
+            .await
+            .unwrap(),
+    );
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            "verbs:\n  - name: inspect-a\n    description: Inspect system A\n    binary: true\n    args: []\n    baseline: false\n    consequence: reversible\n    trusted: true\n",
+        )
+        .unwrap(),
+    ));
+    let worker = CallerIdentity::Unix { uid: 1001 };
+    let daemon = CallerIdentity::Unix { uid: 777 };
+    let AdminResponse::AccessItem { item: pending } = handle_admin_request(
+        &cfg,
+        &worker,
+        AdminRequest::AccessRequest {
+            intent: "Inspect system A".to_string(),
+        },
+    )
+    .await
+    else {
+        panic!("expected access request")
+    };
+    let request_reference = pending.reference.clone();
+    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::AccessApprove {
+            handles: vec![pending.reference],
+            uses: Some(1),
+        },
+    )
+    .await
+    else {
+        panic!("expected access approval")
+    };
+    let target = items[0].target.clone().unwrap();
+    let AdminResponse::AccessDecisions { items } =
+        handle_admin_request(&cfg, &daemon, AdminRequest::AccessRevoke { target }).await
+    else {
+        panic!("expected access revoke")
+    };
+    assert!(items[0].success);
+
+    let AdminResponse::AccessItem { item: orphaned } = handle_admin_request(
+        &cfg,
+        &worker,
+        AdminRequest::AccessShow {
+            reference: request_reference,
+        },
+    )
+    .await
+    else {
+        panic!("expected orphaned request projection")
+    };
+    assert_eq!(orphaned.state, "orphaned");
+    assert_eq!(orphaned.use_policy, "unavailable");
+    assert!(orphaned
+        .decided_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("no longer attached")));
+}
+
+#[tokio::test]
+async fn request_pruning_preserves_live_access_provenance() {
+    let (mut cfg, _) = make_test_config();
+    let state = tempfile::tempdir().unwrap();
+    let state_db = state.path().join("state.db");
+    cfg.state.session_store = Some(SessionStore::open(state_db.clone(), 3600).await.unwrap());
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            "verbs:\n  - name: inspect-a\n    description: Inspect system A\n    binary: true\n    args: []\n    baseline: false\n    consequence: reversible\n    trusted: true\n",
+        )
+        .unwrap(),
+    ));
+    let worker = CallerIdentity::Unix { uid: 1001 };
+    let daemon = CallerIdentity::Unix { uid: 777 };
+    let AdminResponse::AccessItem { item } = handle_admin_request(
+        &cfg,
+        &worker,
+        AdminRequest::AccessRequest {
+            intent: "Inspect system A".to_string(),
+        },
+    )
+    .await
+    else {
+        panic!("expected access request")
+    };
+    let active_handle = item.reference.clone();
+    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::AccessApprove {
+            handles: vec![item.reference],
+            uses: Some(1),
+        },
+    )
+    .await
+    else {
+        panic!("expected access approval")
+    };
+    assert!(items[0].success);
+
+    let template = {
+        let mut requests = cfg.state.grant_requests.write().await;
+        let active = requests.get_mut(&active_handle).unwrap();
+        active.created_unix = 0;
+        active.clone()
+    };
+    let mut terminal_requests = Vec::with_capacity(MAX_GRANT_REQUESTS - 1);
+    for index in 0..MAX_GRANT_REQUESTS - 1 {
+        let mut terminal = template.clone();
+        terminal.handle = format!("terminal-{index:04}");
+        terminal.status = GrantRequestStatus::Denied;
+        terminal.session_token.clear();
+        terminal.created_unix = 1;
+        terminal_requests.push(terminal);
+    }
+    let durable_terminal_requests = terminal_requests.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut connection = rusqlite::Connection::open(state_db).unwrap();
+        let transaction = connection.transaction().unwrap();
+        {
+            let mut statement = transaction
+                .prepare(
+                    "INSERT OR REPLACE INTO grant_requests (handle, json, status, created_unix) VALUES (?1, ?2, ?3, ?4)",
+                )
+                .unwrap();
+            for request in durable_terminal_requests {
+                let handle = request.handle.clone();
+                let json = serde_json::to_string(&request).unwrap();
+                let status = request.status.as_str().to_string();
+                let created_unix = i64::try_from(request.created_unix).unwrap();
+                statement
+                    .execute(rusqlite::params![
+                        handle,
+                        json,
+                        status,
+                        created_unix,
+                    ])
+                    .unwrap();
+            }
+        }
+        transaction.commit().unwrap();
+    })
+    .await
+    .unwrap();
+    {
+        let mut requests = cfg.state.grant_requests.write().await;
+        for terminal in terminal_requests {
+            requests.insert(terminal.handle.clone(), terminal);
+        }
+    }
+
+    prune_grant_requests(&cfg).await;
+    let requests = cfg.state.grant_requests.read().await;
+    assert!(requests.contains_key(&active_handle));
+    assert!(requests.len() < MAX_GRANT_REQUESTS);
+    drop(requests);
+    let store = cfg.state.session_store.as_ref().unwrap();
+    assert!(store
+        .load_grant_request(active_handle)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(store
+        .load_grant_request("terminal-0000".to_string())
+        .await
+        .unwrap()
+        .is_none());
+    let restored_registry = store.load_registry().await.unwrap();
+    let restored_requests = store.load_grant_requests().await.unwrap();
+    assert_eq!(restored_requests.len(), MAX_GRANT_REQUESTS - 1);
+    let restored_session_reference = session_reference(
+        &restored_registry
+            .access_token_for_principal(&PrincipalKey::from_uid(1001))
+            .unwrap(),
+    );
+    *cfg.state.sessions.write().await = restored_registry;
+    *cfg.state.grant_requests.write().await = restored_requests
+        .into_iter()
+        .map(|request| (request.handle.clone(), request))
+        .collect();
+    assert!(validate_durable_access_provenance(&cfg).await.is_ok());
+    let AdminResponse::AccessItem { item } = handle_admin_request(
+        &cfg,
+        &worker,
+        AdminRequest::AccessShow {
+            reference: restored_session_reference,
+        },
+    )
+    .await
+    else {
+        panic!("expected restored access session")
+    };
+    assert!(item
+        .intent
+        .as_deref()
+        .is_some_and(|intent| intent.contains("Inspect system A")));
 }
 
 #[tokio::test]

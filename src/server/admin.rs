@@ -676,6 +676,93 @@ fn intent_matches_verb(intent: &str, verb: &Verb) -> bool {
     intent == name || (!description.is_empty() && intent == description) || intent == source
 }
 
+fn intent_mentions_verb_name(intent: &str, verb: &Verb) -> bool {
+    if intent.trim().eq_ignore_ascii_case(&verb.name) {
+        return true;
+    }
+    let intent_lower = intent.to_ascii_lowercase();
+    let name_lower = verb.name.to_ascii_lowercase();
+    let quoted_names = [
+        format!("\"{name_lower}\""),
+        format!("'{name_lower}'"),
+        format!("`{name_lower}`"),
+    ];
+    if quoted_names
+        .iter()
+        .any(|pattern| intent_lower.contains(pattern))
+    {
+        return true;
+    }
+    (verb.name.contains('-') || verb.name.contains('_'))
+        && intent
+            .split(|character: char| {
+                !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+            })
+            .any(|token| token.eq_ignore_ascii_case(&verb.name))
+}
+
+fn access_intent_clauses(intent: &str) -> Vec<String> {
+    intent
+        .to_ascii_lowercase()
+        .replace([',', ';'], "\n")
+        .replace(" and ", "\n")
+        .replace(" plus ", "\n")
+        .replace(" then ", "\n")
+        .replace(" before ", "\n")
+        .replace(" after ", "\n")
+        .replace(" with ", "\n")
+        .lines()
+        .map(str::trim)
+        .filter(|clause| !clause.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn explicitly_named_verbs_in_clause<'a>(clause: &str, verbs: &'a [Verb]) -> Vec<&'a Verb> {
+    let direct = verbs
+        .iter()
+        .filter(|verb| intent_mentions_verb_name(clause, verb))
+        .collect::<Vec<_>>();
+    if !direct.is_empty() {
+        return direct;
+    }
+
+    const REQUEST_TERMS: &[&str] = &[
+        "a", "access", "allow", "an", "catalog", "command", "commands", "for", "i", "in", "is",
+        "my", "need", "of", "on", "our", "please", "task", "tasks", "that", "the", "this", "to",
+        "use", "verb", "verbs", "want", "whether", "with", "work",
+    ];
+    let terms = clause
+        .split(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+        })
+        .filter(|term| !term.is_empty())
+        .filter(|term| !REQUEST_TERMS.contains(&term.to_ascii_lowercase().as_str()))
+        .collect::<Vec<_>>();
+    if let [name] = terms.as_slice() {
+        return verbs
+            .iter()
+            .filter(|verb| verb.name.eq_ignore_ascii_case(name))
+            .collect();
+    }
+    Vec::new()
+}
+
+fn clause_without_verb_names(clause: &str, verbs: &[&Verb]) -> String {
+    clause
+        .split(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+        })
+        .filter(|token| {
+            !token.is_empty()
+                && !verbs
+                    .iter()
+                    .any(|verb| token.eq_ignore_ascii_case(&verb.name))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn semantic_intent_terms(value: &str) -> std::collections::BTreeSet<String> {
     const STOP_WORDS: &[&str] = &[
         "a", "an", "for", "in", "is", "of", "on", "please", "that", "the", "this", "to", "whether",
@@ -713,6 +800,24 @@ fn semantic_intent_score(intent: &str, verb: &Verb) -> Option<usize> {
             .then_some(intersection * 1_000 / union.max(1))
     })
     .max()
+}
+
+fn unique_semantic_intent_match<'a>(intent: &str, verbs: &'a [Verb]) -> Option<&'a Verb> {
+    let mut semantic = verbs
+        .iter()
+        .filter_map(|verb| semantic_intent_score(intent, verb).map(|score| (score, verb)))
+        .collect::<Vec<_>>();
+    semantic.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.name.cmp(&right.1.name))
+    });
+    let (best_score, best) = semantic.first()?;
+    semantic
+        .get(1)
+        .is_none_or(|second| second.0 < *best_score)
+        .then_some(*best)
 }
 
 #[cfg(test)]
@@ -754,6 +859,15 @@ mod semantic_intent_tests {
         let inspect = fixture_verb("ssh-inspect", "Inspect the fake SSH service");
         assert!(semantic_intent_score("Restart the fake SSH service", &inspect).is_none());
     }
+
+    #[test]
+    fn prose_can_select_multiple_catalog_verbs_by_exact_name() {
+        let inspect = fixture_verb("inspect-service", "Inspect the service");
+        let restart = fixture_verb("restart-service", "Restart the service");
+        let intent = "Use `inspect-service` and restart-service for this task.";
+        assert!(intent_mentions_verb_name(intent, &inspect));
+        assert!(intent_mentions_verb_name(intent, &restart));
+    }
 }
 
 async fn reduce_access_intent(
@@ -767,6 +881,60 @@ async fn reduce_access_intent(
         }
         catalog.list()
     };
+    let clauses = access_intent_clauses(intent);
+    let named_by_clause = clauses
+        .iter()
+        .map(|clause| explicitly_named_verbs_in_clause(clause, &existing))
+        .collect::<Vec<_>>();
+    let mut selected = named_by_clause
+        .iter()
+        .flatten()
+        .map(|verb| verb.name.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    if !selected.is_empty() {
+        const FILLER_TERMS: &[&str] = &[
+            "access", "allow", "catalog", "command", "commands", "i", "need", "please", "run",
+            "task", "tasks", "to", "use", "verb", "verbs", "want", "with", "work",
+        ];
+        for (clause, named) in clauses.iter().zip(named_by_clause.iter()) {
+            let residual = clause_without_verb_names(clause, named);
+            let terms = semantic_intent_terms(&residual);
+            if terms.is_empty()
+                || terms
+                    .iter()
+                    .all(|term| FILLER_TERMS.contains(&term.as_str()))
+            {
+                continue;
+            }
+            let exact = existing
+                .iter()
+                .filter(|verb| {
+                    let residual_is_name = residual.trim().eq_ignore_ascii_case(&verb.name);
+                    intent_matches_verb(&residual, verb)
+                        && (!residual_is_name || named.iter().any(|named| named.name == verb.name))
+                })
+                .collect::<Vec<_>>();
+            if !exact.is_empty() {
+                selected.extend(exact.into_iter().map(|verb| verb.name.clone()));
+                continue;
+            }
+            if let Some(verb) = unique_semantic_intent_match(&residual, &existing) {
+                selected.insert(verb.name.clone());
+                continue;
+            }
+            return Err(
+                "access intent mixes explicit verb names with unresolved prose; name every required catalog verb explicitly or submit separate requests"
+                    .to_string(),
+            );
+        }
+        return Ok((
+            existing
+                .into_iter()
+                .filter(|verb| selected.contains(&verb.name))
+                .collect(),
+            Vec::new(),
+        ));
+    }
     let matched = existing
         .iter()
         .filter(|verb| intent_matches_verb(intent, verb))
@@ -775,20 +943,8 @@ async fn reduce_access_intent(
     if !matched.is_empty() {
         return Ok((matched, Vec::new()));
     }
-    let mut semantic = existing
-        .iter()
-        .filter_map(|verb| semantic_intent_score(intent, verb).map(|score| (score, verb)))
-        .collect::<Vec<_>>();
-    semantic.sort_by(|left, right| {
-        right
-            .0
-            .cmp(&left.0)
-            .then_with(|| left.1.name.cmp(&right.1.name))
-    });
-    if let Some((best_score, best)) = semantic.first() {
-        if semantic.get(1).is_none_or(|second| second.0 < *best_score) {
-            return Ok((vec![(*best).clone()], Vec::new()));
-        }
+    if let Some(best) = unique_semantic_intent_match(intent, &existing) {
+        return Ok((vec![best.clone()], Vec::new()));
     }
 
     let mut candidate = server
@@ -1194,6 +1350,7 @@ async fn access_item_for_request(server: &ServerContext, request: &GrantRequest)
     let mut remaining_uses = None;
     let mut grant_uses = None;
     let mut expires_unix = Some(request.expires_unix);
+    let mut active_session_found = false;
     if !request.session_token.is_empty() {
         if let Some(summary) = server
             .state
@@ -1204,6 +1361,7 @@ async fn access_item_for_request(server: &ServerContext, request: &GrantRequest)
             .into_iter()
             .find(|summary| summary.token == request.session_token)
         {
+            active_session_found = true;
             target = summary
                 .scope
                 .label
@@ -1221,8 +1379,13 @@ async fn access_item_for_request(server: &ServerContext, request: &GrantRequest)
     }
     let expired = request.status == GrantRequestStatus::Pending
         && (request.expires_unix == 0 || now_unix() >= request.expires_unix);
+    let orphaned = request.status == GrantRequestStatus::Approved
+        && !request.session_token.is_empty()
+        && !active_session_found;
     let state = if expired {
         "expired"
+    } else if orphaned {
+        "orphaned"
     } else {
         request.status.as_str()
     };
@@ -1253,7 +1416,11 @@ async fn access_item_for_request(server: &ServerContext, request: &GrantRequest)
         },
         intent: Some(redact_output_text(&request.justification)),
         capabilities: capabilities_for_request(server, request).await,
-        decided_reason: request.decided_reason.as_deref().map(redact_output_text),
+        decided_reason: if orphaned {
+            Some("approved authority is no longer attached to an active access session".to_string())
+        } else {
+            request.decided_reason.as_deref().map(redact_output_text)
+        },
     }
 }
 
@@ -1279,6 +1446,19 @@ async fn access_item_for_session(
     } else {
         "active"
     };
+    let mut intents = server
+        .state
+        .grant_requests
+        .read()
+        .await
+        .values()
+        .filter(|request| {
+            request.status == GrantRequestStatus::Approved && request.session_token == summary.token
+        })
+        .map(|request| redact_output_text(&request.justification))
+        .collect::<Vec<_>>();
+    intents.sort();
+    intents.dedup();
     AccessItem {
         reference: reference.clone(),
         kind: "session".to_string(),
@@ -1296,7 +1476,7 @@ async fn access_item_for_session(
         state: state.to_string(),
         next_action: format!("guard access show {reference}"),
         approval_options: Vec::new(),
-        intent: None,
+        intent: (!intents.is_empty()).then(|| intents.join("; ")),
         capabilities: capabilities_for(server, &summary.activated_verbs).await,
         decided_reason: None,
     }
@@ -2904,6 +3084,141 @@ async fn handle_session_appeal(
             reason: format!("appeal evaluation error: {err}"),
             risk: None,
         },
+    }
+}
+
+async fn list_access_items(server: &ServerContext, caller: &CallerIdentity) -> AdminResponse {
+    let admin = caller_is_session_admin(server, caller);
+    let principal = caller.principal();
+    let requests = server
+        .state
+        .grant_requests
+        .read()
+        .await
+        .values()
+        .filter(|request| {
+            request.requester.is_some() && (admin || scope_eq(&request.requester, &principal))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let sessions = server
+        .state
+        .sessions
+        .read()
+        .await
+        .list()
+        .into_iter()
+        .filter(|summary| {
+            summary.scope.access_managed
+                && (admin
+                    || matches!(
+                        &summary.owner,
+                        SessionOwner::Principal(owner)
+                            if principal.as_ref().is_some_and(|caller| owner.eq_ci(caller))
+                    ))
+        })
+        .collect::<Vec<_>>();
+    let approvals = server
+        .state
+        .approvals
+        .read()
+        .await
+        .list()
+        .into_iter()
+        .filter(|approval| {
+            approval.snapshot.principal.is_some()
+                && (admin || scope_eq(&approval.snapshot.principal, &principal))
+        })
+        .collect::<Vec<_>>();
+    let mut items = Vec::with_capacity(requests.len() + sessions.len() + approvals.len());
+    for request in requests {
+        items.push(access_item_for_request(server, &request).await);
+    }
+    for approval in approvals {
+        items.push(access_item_for_approval(server, &approval).await);
+    }
+    for summary in sessions {
+        items.push(access_item_for_session(server, &summary).await);
+    }
+    items.sort_by(|left, right| {
+        left.requester
+            .cmp(&right.requester)
+            .then(left.kind.cmp(&right.kind))
+            .then(left.reference.cmp(&right.reference))
+    });
+    AdminResponse::AccessItems { items }
+}
+
+async fn show_access_item(
+    server: &ServerContext,
+    caller: &CallerIdentity,
+    reference: &str,
+) -> AdminResponse {
+    let admin = caller_is_session_admin(server, caller);
+    let principal = caller.principal();
+    if let Some(request) = server
+        .state
+        .grant_requests
+        .read()
+        .await
+        .get(reference)
+        .filter(|request| {
+            request.requester.is_some() && (admin || scope_eq(&request.requester, &principal))
+        })
+        .cloned()
+    {
+        AdminResponse::AccessItem {
+            item: access_item_for_request(server, &request).await,
+        }
+    } else if let Some(approval) = server
+        .state
+        .approvals
+        .read()
+        .await
+        .get(reference)
+        .filter(|approval| {
+            approval.snapshot.principal.is_some()
+                && (admin || scope_eq(&approval.snapshot.principal, &principal))
+        })
+        .cloned()
+    {
+        AdminResponse::AccessItem {
+            item: access_item_for_approval(server, &approval).await,
+        }
+    } else {
+        let mut candidates = server
+            .state
+            .sessions
+            .read()
+            .await
+            .list()
+            .into_iter()
+            .filter(|summary| {
+                summary.scope.access_managed
+                    && (admin
+                        || matches!(
+                            &summary.owner,
+                            SessionOwner::Principal(owner)
+                                if principal.as_ref().is_some_and(|caller| owner.eq_ci(caller))
+                        ))
+            })
+            .filter(|summary| {
+                summary.scope.label.as_deref() == Some(reference)
+                    || session_reference(&summary.token) == reference
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| left.token.cmp(&right.token));
+        match candidates.as_slice() {
+            [summary] => AdminResponse::AccessItem {
+                item: access_item_for_session(server, summary).await,
+            },
+            [] => AdminResponse::Error {
+                message: "unknown or unauthorized access reference".to_string(),
+            },
+            _ => AdminResponse::Error {
+                message: format!("access target '{reference}' is ambiguous"),
+            },
+        }
     }
 }
 
@@ -4722,138 +5037,9 @@ pub(super) async fn handle_admin_request(
             },
             Err(message) => AdminResponse::Error { message },
         },
-        AdminRequest::AccessList => {
-            let admin = caller_is_session_admin(server, caller);
-            let principal = caller.principal();
-            let requests = server
-                .state
-                .grant_requests
-                .read()
-                .await
-                .values()
-                .filter(|request| {
-                    request.requester.is_some()
-                        && (admin || scope_eq(&request.requester, &principal))
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            let sessions = server
-                .state
-                .sessions
-                .read()
-                .await
-                .list()
-                .into_iter()
-                .filter(|summary| {
-                    summary.scope.access_managed
-                        && (admin
-                            || matches!(
-                                &summary.owner,
-                                SessionOwner::Principal(owner)
-                                    if principal.as_ref().is_some_and(|caller| owner.eq_ci(caller))
-                            ))
-                })
-                .collect::<Vec<_>>();
-            let approvals = server
-                .state
-                .approvals
-                .read()
-                .await
-                .list()
-                .into_iter()
-                .filter(|approval| {
-                    approval.snapshot.principal.is_some()
-                        && (admin || scope_eq(&approval.snapshot.principal, &principal))
-                })
-                .collect::<Vec<_>>();
-            let mut items = Vec::with_capacity(requests.len() + sessions.len() + approvals.len());
-            for request in requests {
-                items.push(access_item_for_request(server, &request).await);
-            }
-            for approval in approvals {
-                items.push(access_item_for_approval(server, &approval).await);
-            }
-            for summary in sessions {
-                items.push(access_item_for_session(server, &summary).await);
-            }
-            items.sort_by(|left, right| {
-                left.requester
-                    .cmp(&right.requester)
-                    .then(left.kind.cmp(&right.kind))
-                    .then(left.reference.cmp(&right.reference))
-            });
-            AdminResponse::AccessItems { items }
-        }
+        AdminRequest::AccessList => Box::pin(list_access_items(server, caller)).await,
         AdminRequest::AccessShow { reference } => {
-            let admin = caller_is_session_admin(server, caller);
-            let principal = caller.principal();
-            if let Some(request) = server
-                .state
-                .grant_requests
-                .read()
-                .await
-                .get(&reference)
-                .filter(|request| {
-                    request.requester.is_some()
-                        && (admin || scope_eq(&request.requester, &principal))
-                })
-                .cloned()
-            {
-                AdminResponse::AccessItem {
-                    item: access_item_for_request(server, &request).await,
-                }
-            } else if let Some(approval) = server
-                .state
-                .approvals
-                .read()
-                .await
-                .get(&reference)
-                .filter(|approval| {
-                    approval.snapshot.principal.is_some()
-                        && (admin || scope_eq(&approval.snapshot.principal, &principal))
-                })
-                .cloned()
-            {
-                AdminResponse::AccessItem {
-                    item: access_item_for_approval(server, &approval).await,
-                }
-            } else {
-                let mut candidates = server
-                    .state
-                    .sessions
-                    .read()
-                    .await
-                    .list()
-                    .into_iter()
-                    .filter(|summary| {
-                        summary.scope.access_managed
-                            && (admin
-                                || matches!(
-                                    &summary.owner,
-                                    SessionOwner::Principal(owner)
-                                        if principal
-                                            .as_ref()
-                                            .is_some_and(|caller| owner.eq_ci(caller))
-                                ))
-                    })
-                    .filter(|summary| {
-                        summary.scope.label.as_deref() == Some(reference.as_str())
-                            || session_reference(&summary.token) == reference
-                    })
-                    .collect::<Vec<_>>();
-                candidates.sort_by(|left, right| left.token.cmp(&right.token));
-                match candidates.as_slice() {
-                    [summary] => AdminResponse::AccessItem {
-                        item: access_item_for_session(server, summary).await,
-                    },
-                    [] => AdminResponse::Error {
-                        message: "unknown or unauthorized access reference".to_string(),
-                    },
-                    _ => AdminResponse::Error {
-                        message: format!("access target '{reference}' is ambiguous"),
-                    },
-                }
-            }
+            Box::pin(show_access_item(server, caller, &reference)).await
         }
         AdminRequest::EvaluateBatch {
             session_token,
@@ -5344,43 +5530,45 @@ async fn validate_grant_request_for_approval(
 }
 
 pub(super) async fn prune_grant_requests(server: &ServerContext) {
+    let _transition = server.state.grant_request_transition_gate.lock().await;
     let now = now_unix();
-    let active_tokens = server
+    let active_requests = server
         .state
         .sessions
         .read()
         .await
         .list()
         .into_iter()
-        .map(|summary| summary.token)
+        .flat_map(|summary| summary.scope.access_grants.into_iter())
+        .map(|grant| grant.request)
         .collect::<std::collections::BTreeSet<_>>();
-    let mut requests = server.state.grant_requests.write().await;
-    let mut removed = requests
-        .iter()
-        .filter(|(_, request)| {
-            request.status == GrantRequestStatus::Pending
-                && (request.expires_unix == 0 || request.expires_unix <= now)
-        })
-        .map(|(handle, _)| handle.clone())
-        .collect::<Vec<_>>();
-    let retained_after_expiry = requests.len().saturating_sub(removed.len());
-    let mut retained_count = retained_after_expiry;
-    while retained_count >= MAX_GRANT_REQUESTS {
-        let oldest_terminal = requests
+    let removed = {
+        let requests = server.state.grant_requests.read().await;
+        let mut removed = requests
             .iter()
-            .filter(|(handle, _)| !removed.contains(handle))
-            .filter(|(_, request)| request.status != GrantRequestStatus::Pending)
             .filter(|(_, request)| {
-                request.proposed_verbs.is_empty() || !active_tokens.contains(&request.session_token)
+                request.status == GrantRequestStatus::Pending
+                    && (request.expires_unix == 0 || request.expires_unix <= now)
             })
-            .min_by_key(|(handle, request)| (request.created_unix, *handle))
-            .map(|(handle, _)| handle.clone());
-        let Some(handle) = oldest_terminal else {
-            break;
-        };
-        removed.push(handle);
-        retained_count = retained_count.saturating_sub(1);
-    }
+            .map(|(handle, _)| handle.clone())
+            .collect::<Vec<_>>();
+        let mut retained_count = requests.len().saturating_sub(removed.len());
+        while retained_count >= MAX_GRANT_REQUESTS {
+            let oldest_terminal = requests
+                .iter()
+                .filter(|(handle, _)| !removed.contains(handle))
+                .filter(|(_, request)| request.status != GrantRequestStatus::Pending)
+                .filter(|(handle, _)| !active_requests.contains(handle.as_str()))
+                .min_by_key(|(handle, request)| (request.created_unix, *handle))
+                .map(|(handle, _)| handle.clone());
+            let Some(handle) = oldest_terminal else {
+                break;
+            };
+            removed.push(handle);
+            retained_count = retained_count.saturating_sub(1);
+        }
+        removed
+    };
     if !removed.is_empty() {
         if let Some(store) = &server.state.session_store {
             if let Err(error) = store.delete_grant_requests(removed.clone()).await {
@@ -5388,6 +5576,7 @@ pub(super) async fn prune_grant_requests(server: &ServerContext) {
                 return;
             }
         }
+        let mut requests = server.state.grant_requests.write().await;
         for handle in removed {
             requests.remove(&handle);
         }

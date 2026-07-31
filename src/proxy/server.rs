@@ -657,45 +657,68 @@ impl ApiProxy {
     async fn route(&self, mut req: Request<Incoming>, conn_id: u64) -> Response<ProxyBody> {
         let method = req.method().clone();
         let path = req.uri().path().to_string();
+        let has_identity_override = req.headers().keys().any(is_identity_header);
         let session_token = match take_guard_session(req.headers_mut()) {
             Ok(token) => token,
             Err(reason) => {
                 return self.status_resp(StatusCode::FORBIDDEN, reason, "Forbidden");
             }
         };
-        let session_context =
-            if let Some(token) = session_token.as_deref() {
-                let Some(sink) = self.session_sink.get() else {
+        let session_context = if let Some(token) = session_token.as_deref() {
+            let Some(sink) = self.session_sink.get() else {
+                return self.status_resp(
+                    StatusCode::FORBIDDEN,
+                    "guard api-proxy: session attribution is unavailable",
+                    "Forbidden",
+                );
+            };
+            match sink.resolve(token).await {
+                Some(context) => Some(context),
+                None => {
                     return self.status_resp(
                         StatusCode::FORBIDDEN,
-                        "guard api-proxy: session attribution is unavailable",
+                        "guard api-proxy: unknown or expired session",
                         "Forbidden",
-                    );
-                };
-                match sink.resolve(token).await {
-                    Some(context) => {
-                        if context.secret_entitlements.as_ref().is_some_and(|names| {
-                            !names.iter().any(|name| name == &self.credential_ref)
-                        }) {
-                            return self.status_resp(
-                            StatusCode::FORBIDDEN,
-                            "guard api-proxy: session is not entitled to this upstream credential",
-                            "Forbidden",
-                        );
-                        }
-                        Some(context)
-                    }
-                    None => {
-                        return self.status_resp(
-                            StatusCode::FORBIDDEN,
-                            "guard api-proxy: unknown or expired session",
-                            "Forbidden",
-                        )
-                    }
+                    )
                 }
-            } else {
-                None
-            };
+            }
+        } else {
+            None
+        };
+        if has_identity_override {
+            let response = self.status_resp(
+                StatusCode::FORBIDDEN,
+                "guard api-proxy: identity impersonation is not supported; the request was not forwarded",
+                "Forbidden",
+            );
+            if let (Some(token), Some(sink)) = (session_token.as_deref(), self.session_sink.get()) {
+                sink.record(
+                    token,
+                    ApiSessionEvent {
+                        endpoint: self.endpoint.clone(),
+                        operation: format!("{} {}", method, path),
+                        allowed: false,
+                        status: response.status().as_u16(),
+                        held: false,
+                        credential_ref: self.credential_ref.clone(),
+                    },
+                )
+                .await;
+            }
+            return response;
+        }
+        if session_context.as_ref().is_some_and(|context| {
+            context
+                .secret_entitlements
+                .as_ref()
+                .is_some_and(|names| !names.iter().any(|name| name == &self.credential_ref))
+        }) {
+            return self.status_resp(
+                StatusCode::FORBIDDEN,
+                "guard api-proxy: session is not entitled to this upstream credential",
+                "Forbidden",
+            );
+        }
         if let (Some(token), Some(context)) = (session_token.clone(), session_context.clone()) {
             req.extensions_mut().insert(SessionAuth { token, context });
         }
@@ -2285,20 +2308,10 @@ fn is_hop_by_hop(name: &header::HeaderName) -> bool {
     )
 }
 
-/// Headers that carry or override the upstream request identity. A brokered
-/// client may authenticate to Guard with a session bearer, while the daemon's
-/// separate upstream credential talks to the apiserver. These headers reassign
-/// the request's authenticated identity, and where the daemon's credential
-/// holds the Kubernetes `impersonate` RBAC permission (the identity-override grant, common for
-/// admin/CI service accounts) the apiserver would evaluate a forwarded header
-/// identity instead of the operator's. Since ApiPolicy matches only
-/// verb/resource/namespace and never identity, stripping these headers keeps
-/// each forwarded request bound to the daemon's own upstream credential, so
-/// authorization and ApiPolicy apply to the operator's identity rather than
-/// any header-supplied user/group/serviceaccount. `X-Remote-*` are the
-/// equivalent front-proxy identity headers for aggregated API servers; strip
-/// them for the same reason, though they only take effect where the apiserver
-/// already trusts this proxy's client certificate.
+/// Headers that carry or override the upstream request identity. Guard rejects
+/// requests containing them before policy evaluation or forwarding because
+/// its API policy has no identity dimension. The forwarding layer keeps this
+/// defense in depth and never copies one to the upstream request.
 fn is_identity_header(name: &header::HeaderName) -> bool {
     let s = name.as_str();
     s.starts_with("impersonate-") || s.starts_with("x-remote-")
