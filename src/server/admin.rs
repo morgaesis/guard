@@ -704,8 +704,7 @@ fn intent_mentions_verb_name(intent: &str, verb: &Verb) -> bool {
 fn access_intent_clauses(intent: &str) -> Vec<String> {
     intent
         .to_ascii_lowercase()
-        .replace(',', "\n")
-        .replace(';', "\n")
+        .replace([',', ';'], "\n")
         .replace(" and ", "\n")
         .replace(" plus ", "\n")
         .replace(" then ", "\n")
