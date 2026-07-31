@@ -1,118 +1,236 @@
 #!/usr/bin/env bash
-# Launch the adversarial CTF under podman with defensive flags.
-#
-# Preconditions on the host:
-#   - podman (rootless)
-#   - a built target/release/guard
-#   - claude CLI available; OAuth credentials at ~/.claude/.credentials.json
-#
-# The container:
-#   - drops all caps, disables new-privileges, has a read-only rootfs
-#     with tmpfs for /tmp, /run/guard, /home and /var; no bind mounts of
-#     host paths except the claude credentials (bind-mounted read-only
-#     into attacker's $HOME).
-#   - uses slirp4netns with host-loopback blocked, so the container can
-#     reach public DNS/internet but cannot poke at host services.
-#   - remains stopped long enough to copy bounded transcripts, then is removed.
+# Launch each credentialed adversary scenario in its own rootless container.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 BINARY="$PROJECT_DIR/target/release/guard"
-IMAGE="guard-adversary"
-CONTAINER="guard-adversary"
-RUNS_DIR="$SCRIPT_DIR/runs/$(date -u +%Y%m%dT%H%M%SZ)"
+ATTACKER_KEY_FILE="${ATTACKER_KEY_FILE:-}"
+ATTACKER_MODEL="${ATTACKER_MODEL:-moonshotai/kimi-k3}"
 
-CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude || true)}"
-if [ -L "${CLAUDE_BIN}" ]; then
-    CLAUDE_BIN="$(readlink -f "$CLAUDE_BIN")"
-fi
-CLAUDE_CREDS="${CLAUDE_CREDS:-$HOME/.claude/.credentials.json}"
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
+IMAGE="guard-adversary-$(printf '%s' "$RUN_ID" | tr '[:upper:]' '[:lower:]')"
+EVALUATOR_SECRET="guard-adversary-eval-$RUN_ID"
+RESULTS_VOLUME="guard-adversary-results-$RUN_ID"
+mkdir -p "$SCRIPT_DIR/runs"
+RUNS_DIR="$(mktemp -d "$SCRIPT_DIR/runs/adversary-$RUN_ID.XXXXXX")"
+MAPPING_FILE="$RUNS_DIR/scenario-containers.tsv"
+BUILD_CONTEXT=""
+CREDENTIAL_STAGE=""
+IMAGE_CLEANUP_REQUIRED=0
+SECRET_CLEANUP_REQUIRED=0
+VOLUME_CLEANUP_REQUIRED=0
+declare -a CONTAINERS=()
+declare -a HOME_VOLUMES=()
+declare -A SEEN_SCENARIOS=()
+declare -A SEEN_CONTAINER_IDS=()
 
-if [ -z "$CLAUDE_BIN" ] || [ ! -x "$CLAUDE_BIN" ]; then
-    echo "Error: claude CLI not found (set CLAUDE_BIN or install Claude Code)" >&2
+cleanup() {
+    local container volume
+    trap - EXIT INT TERM
+    if [ "${GUARD_ADVERSARY_KEEP:-0}" = 1 ]; then
+        printf 'Keeping scenario containers and home volumes for inspection (GUARD_ADVERSARY_KEEP=1).\n' >&2
+    else
+        for container in "${CONTAINERS[@]}"; do
+            podman rm --force "$container" >/dev/null 2>&1 || true
+        done
+        for volume in "${HOME_VOLUMES[@]}"; do
+            podman volume rm "$volume" >/dev/null 2>&1 || true
+        done
+    fi
+    if [ "$IMAGE_CLEANUP_REQUIRED" -eq 1 ]; then
+        podman image rm "$IMAGE" >/dev/null 2>&1 || true
+    fi
+    if [ "$SECRET_CLEANUP_REQUIRED" -eq 1 ]; then
+        podman secret rm "$EVALUATOR_SECRET" >/dev/null 2>&1 || true
+    fi
+    if [ "$VOLUME_CLEANUP_REQUIRED" -eq 1 ] && [ "${GUARD_ADVERSARY_KEEP:-0}" != 1 ]; then
+        podman volume rm "$RESULTS_VOLUME" >/dev/null 2>&1 || true
+    fi
+    [ -z "$CREDENTIAL_STAGE" ] || rm -f -- "$CREDENTIAL_STAGE"
+    [ -z "$BUILD_CONTEXT" ] || rm -rf -- "$BUILD_CONTEXT"
+}
+
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+fail() {
+    printf 'Error: %s\n' "$*" >&2
     exit 1
+}
+
+list_scenarios() {
+    awk '/^  - name: / { print $3 }' "$SCRIPT_DIR/scenarios.yaml"
+}
+
+scenario_exists() {
+    local wanted=$1 scenario
+    while IFS= read -r scenario; do
+        [ "$scenario" = "$wanted" ] && return 0
+    done < <(list_scenarios)
+    return 1
+}
+
+if [ "$(id -u)" -eq 0 ]; then
+    fail 'the adversary harness requires rootless podman'
 fi
-if [ ! -s "$CLAUDE_CREDS" ]; then
-    echo "Error: claude OAuth credentials not found at $CLAUDE_CREDS" >&2
-    exit 1
+if ! podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null | grep -qx true; then
+    fail 'podman is not running rootless'
+fi
+if [ ! -s "$ATTACKER_KEY_FILE" ]; then
+    fail 'set ATTACKER_KEY_FILE to an explicit dedicated short-lived OpenRouter key file for the attacker'
+fi
+if [ -z "${GUARD_LLM_API_KEY:-${OPENROUTER_API_KEY:-}}" ]; then
+    fail 'set GUARD_LLM_API_KEY or OPENROUTER_API_KEY in the host environment'
 fi
 if [ ! -x "$BINARY" ]; then
-    echo "Building guard release binary..." >&2
+    printf 'Building guard release binary...\n' >&2
     (cd "$PROJECT_DIR" && cargo build --quiet --release)
 fi
 
-# The daemon inside the container runs the LLM evaluator. It needs an API
-# key. Lift it from ~/.env if not already in the host env. Only the
-# GUARD_LLM_* / OPENROUTER_API_KEY variables are extracted; nothing else is
-# sourced.
-if [ -f "$HOME/.env" ] && [ -z "${GUARD_LLM_API_KEY:-${OPENROUTER_API_KEY:-}}" ]; then
-    eval "$(sed -n 's/^\(GUARD_LLM_API_KEY\|GUARD_LLM_API_URL\|GUARD_LLM_MODEL\|GUARD_LLM_MODELS\|OPENROUTER_API_KEY\)=\(.*\)$/\1=\2; export \1/p' "$HOME/.env")"
+if [ "$#" -gt 0 ]; then
+    SELECTED_SCENARIOS=("$@")
+else
+    mapfile -t SELECTED_SCENARIOS < <(list_scenarios)
 fi
-if [ -z "${GUARD_LLM_API_KEY:-${OPENROUTER_API_KEY:-}}" ]; then
-    echo "Error: set GUARD_LLM_API_KEY (or OPENROUTER_API_KEY) on the host; the daemon inside the container needs it." >&2
-    exit 1
-fi
+[ "${#SELECTED_SCENARIOS[@]}" -gt 0 ] || fail 'no scenarios found in ctf/scenarios.yaml'
 
-cp "$BINARY" "$SCRIPT_DIR/guard"
-cp "$CLAUDE_BIN" "$SCRIPT_DIR/.claude-bin"
-chmod 755 "$SCRIPT_DIR/.claude-bin"
+for scenario in "${SELECTED_SCENARIOS[@]}"; do
+    [[ "$scenario" =~ ^[a-z0-9][a-z0-9-]*$ ]] || fail "invalid scenario name: $scenario"
+    scenario_exists "$scenario" || fail "scenario is not defined: $scenario"
+    [ -z "${SEEN_SCENARIOS[$scenario]:-}" ] || fail "scenario selected more than once: $scenario"
+    SEEN_SCENARIOS[$scenario]=1
+done
 
-STATE_DIR="$SCRIPT_DIR/.adversary-state"
-[ -d "$STATE_DIR" ] && (rm -rf "$STATE_DIR" 2>/dev/null || podman unshare rm -rf "$STATE_DIR")
-mkdir -p "$STATE_DIR"
-cp "$CLAUDE_CREDS" "$STATE_DIR/.credentials.json"
-chmod 600 "$STATE_DIR/.credentials.json"
-printf '{}\n' > "$STATE_DIR/settings.json"
+BUILD_CONTEXT="$(mktemp -d "${TMPDIR:-/tmp}/guard-adversary-build.XXXXXX")"
+CREDENTIAL_STAGE="$(mktemp "${TMPDIR:-/tmp}/guard-adversary-key.XXXXXX")"
+chmod 600 "$CREDENTIAL_STAGE"
+cp -- "$ATTACKER_KEY_FILE" "$CREDENTIAL_STAGE"
+cp -- "$BINARY" "$BUILD_CONTEXT/guard"
+cp -- "$SCRIPT_DIR/Containerfile.adversary" "$BUILD_CONTEXT/Containerfile.adversary"
+cp -- "$SCRIPT_DIR/entrypoint-adversary.sh" "$BUILD_CONTEXT/entrypoint-adversary.sh"
+cp -- "$SCRIPT_DIR/codex-config.toml" "$BUILD_CONTEXT/codex-config.toml"
+cp -- "$SCRIPT_DIR/attacker-exec.sh" "$BUILD_CONTEXT/attacker-exec.sh"
+cp -- "$SCRIPT_DIR/ctf-attacker-prompt.md" "$BUILD_CONTEXT/ctf-attacker-prompt.md"
+cp -- "$SCRIPT_DIR/scenarios.yaml" "$BUILD_CONTEXT/scenarios.yaml"
 
-mkdir -p "$RUNS_DIR"
+printf 'scenario\tcontainer\tcontainer_id\tinvariant\n' > "$MAPPING_FILE"
+printf '=== Building image %s ===\n' "$IMAGE"
+IMAGE_CLEANUP_REQUIRED=1
+podman build -t "$IMAGE" -f "$BUILD_CONTEXT/Containerfile.adversary" "$BUILD_CONTEXT"
 
-echo "=== Building image $IMAGE ==="
-podman build -t "$IMAGE" -f "$SCRIPT_DIR/Containerfile.adversary" "$SCRIPT_DIR"
+# The evaluator key rides a Podman secret into each scenario container,
+# guard-owned and mode 0400, instead of the container environment where PID 1
+# and `podman inspect` would expose it. The guard uid in the image is 900.
+printf '%s' "${GUARD_LLM_API_KEY:-${OPENROUTER_API_KEY:-}}" \
+    | podman secret create "$EVALUATOR_SECRET" - >/dev/null
+SECRET_CLEANUP_REQUIRED=1
 
-# Clean up stale containers from previous runs.
-podman rm --force "$CONTAINER" >/dev/null 2>&1 || true
+# Bounded results live on a per-run volume: tmpfs dies with a stopped
+# container, so nothing under /tmp could be collected after `podman wait`.
+# The host reads the volume through podman unshare at the end of the run.
+podman volume create "$RESULTS_VOLUME" >/dev/null
+VOLUME_CLEANUP_REQUIRED=1
 
-echo "=== Running adversary container ==="
-# Credentials go in via env-file fed through stdin so no secret ever lands
-# in `ps` or shell history.
-CID="$(podman create \
-    --name "$CONTAINER" \
-    --hostname adversary \
-    --read-only \
-    --tmpfs /tmp:rw,exec,size=128m \
-    --tmpfs /run:rw,exec,size=16m \
-    --tmpfs /home:rw,exec,size=64m \
-    --tmpfs /var/tmp:rw,exec,size=32m \
-    --cap-drop=ALL \
-    --security-opt=no-new-privileges \
-    --pids-limit=256 \
-    --memory=1g \
-    --network=slirp4netns:allow_host_loopback=false \
-    --env-file /dev/stdin \
-    -v "$STATE_DIR/.credentials.json:/home/attacker/.claude/.credentials.json:ro" \
-    -v "$STATE_DIR/settings.json:/home/attacker/.claude/settings.json:ro" \
-    "$IMAGE" <<EOF
-GUARD_LLM_API_KEY=${GUARD_LLM_API_KEY:-${OPENROUTER_API_KEY:-}}
+overall_rc=0
+index=0
+for scenario in "${SELECTED_SCENARIOS[@]}"; do
+    index=$((index + 1))
+    container="guard-adversary-$RUN_ID-$index"
+    home_volume="guard-adversary-home-$RUN_ID-$index"
+    CONTAINERS+=("$container")
+    HOME_VOLUMES+=("$home_volume")
+    podman volume create "$home_volume" >/dev/null
+
+    printf '=== Running scenario %s in %s ===\n' "$scenario" "$container"
+
+    cid="$(podman create \
+        --name "$container" \
+        --hostname adversary \
+        --user 0 \
+        --userns=keep-id:uid=1001,gid=1001 \
+        --read-only \
+        --tmpfs /tmp:rw,exec,size=128m \
+        --tmpfs /run:rw,exec,size=16m \
+        --volume "$home_volume:/home:rw" \
+        --tmpfs /var/tmp:rw,exec,size=32m \
+        --cap-drop=ALL \
+        --cap-add=CHOWN \
+        --cap-add=SETGID \
+        --cap-add=SETUID \
+        --security-opt=no-new-privileges \
+        --pids-limit=256 \
+        --cpus=1 \
+        --memory=1g \
+        --memory-swap=1g \
+        --network=slirp4netns:allow_host_loopback=false \
+        --env "CTF_SCENARIO=$scenario" \
+        --env "CTF_CONTAINER_NAME=$container" \
+        --env "ATTACKER_MODEL=$ATTACKER_MODEL" \
+        --env HOME=/home/guard \
+        --env-file /dev/stdin \
+        --secret "source=$EVALUATOR_SECRET,target=/tmp/ctf-secrets/evaluator-api-key,uid=900,gid=900,mode=0400" \
+        --volume "$RESULTS_VOLUME:/tmp/ctf-runs:rw" \
+        "$IMAGE" <<EOF
 GUARD_LLM_API_URL=${GUARD_LLM_API_URL:-}
 GUARD_LLM_MODEL=${GUARD_LLM_MODEL:-}
 GUARD_LLM_MODELS=${GUARD_LLM_MODELS:-}
 EOF
-)"
-set +e
-podman start --attach "$CID"
-RUN_RC=$?
-set -e
+    )"
+    container_id="$(podman inspect --format '{{.Id}}' "$cid")"
+    [ -n "$container_id" ] || fail "scenario $scenario has no container ID"
+    [ -z "${SEEN_CONTAINER_IDS[$container_id]:-}" ] \
+        || fail "container ID was reused for scenario $scenario"
+    SEEN_CONTAINER_IDS[$container_id]=1
+    printf '%s\t%s\t%s\tfresh rootless container; fresh tmpfs and per-scenario home volume; fresh daemon state, flag, and Codex runtime\n' \
+        "$scenario" "$container" "$container_id" >> "$MAPPING_FILE"
 
-# Copy the bounded per-scenario outputs before removing the stopped container.
-podman cp "$CID:/tmp/ctf-runs/." "$RUNS_DIR/" 2>/dev/null || true
-podman cp "$CID:/tmp/guard-daemon.log" "$RUNS_DIR/" 2>/dev/null || true
-podman rm "$CID" >/dev/null
+    if ! podman cp "$CREDENTIAL_STAGE" "$cid:/tmp/ctf-attacker-key"; then
+        printf 'Scenario %s could not receive its staged runtime inputs.\n' "$scenario" >&2
+        overall_rc=1
+        continue
+    fi
 
-rm -f "$SCRIPT_DIR/guard" "$SCRIPT_DIR/.claude-bin"
+    if ! podman start "$cid" >/dev/null; then
+        printf 'Scenario %s could not start.\n' "$scenario" >&2
+        overall_rc=1
+        continue
+    fi
+    set +e
+    wait_status="$(podman wait "$cid")"
+    wait_rc=$?
+    set -e
+    if [ "$wait_rc" -ne 0 ] || [[ ! "$wait_status" =~ ^[0-9]+$ ]]; then
+        printf 'Scenario %s did not return a usable container status.\n' "$scenario" >&2
+        scenario_rc=1
+    else
+        scenario_rc=$wait_status
+    fi
 
-echo ""
-echo "=== CTF finished (rc=$RUN_RC) ==="
-echo "Transcripts under $RUNS_DIR"
-exit "$RUN_RC"
+    scenario_results="$RUNS_DIR/$scenario"
+    [ ! -e "$scenario_results" ] || fail "result path already exists: $scenario_results"
+    results_mount="$(podman volume inspect --format '{{.Mountpoint}}' "$RESULTS_VOLUME")"
+    if ! podman unshare test -d "$results_mount/$scenario"; then
+        printf 'Scenario %s produced no bounded result directory.\n' "$scenario" >&2
+        overall_rc=1
+    else
+        # Result files are subuid-owned inside the user namespace; unshare
+        # maps them so the host can read what the container wrote.
+        if ! podman unshare cp -r "$results_mount/$scenario" "$scenario_results"; then
+            printf 'Scenario %s results could not be collected.\n' "$scenario" >&2
+            overall_rc=1
+        elif [ ! -f "$scenario_results/result" ]; then
+            printf 'Scenario %s results did not land exactly at %s.\n' "$scenario" "$scenario_results" >&2
+            overall_rc=1
+        fi
+    fi
+    if [ "$scenario_rc" -ne 0 ]; then
+        overall_rc=1
+    fi
+done
+
+printf '\n=== CTF finished (rc=%s) ===\n' "$overall_rc"
+printf 'Bounded, redacted results and the container mapping are under %s\n' "$RUNS_DIR"
+exit "$overall_rc"

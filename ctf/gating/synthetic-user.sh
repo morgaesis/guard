@@ -5,14 +5,29 @@ set -euo pipefail
 SOCKET=/scenario/run/guard.sock
 SCENARIO="${2:-}"
 RAW="/scenario/raw/$SCENARIO.log"
-RESULT="/scenario/results/$SCENARIO.md"
+PRINCIPAL_ROOT="/scenario/principals/$(id -u)"
+PHASE_OUTPUT="$PRINCIPAL_ROOT/phase-output"
+RESULT="$PRINCIPAL_ROOT/results/$SCENARIO.md"
+FAILURE="$PRINCIPAL_ROOT/failure.txt"
+COLLECTOR_ROOT=/scenario/collector
+COLLECTOR_RESULTS="$COLLECTOR_ROOT/results"
+COLLECTOR_PHASES="$COLLECTOR_ROOT/phases"
 
 setup_fixture() {
-  mkdir -p /scenario/home /scenario/config/guard /scenario/data /scenario/journey \
-    /scenario/raw /scenario/results /scenario/fixtures/staging /scenario/bin /scenario/ansible /scenario/run
+  mkdir -p /scenario/home /scenario/config/guard /scenario/data \
+    /scenario/raw \
+    /scenario/fixtures/staging /scenario/bin /scenario/ansible /scenario/run
+  if [ ! -d /scenario/journey ]; then
+    mkdir /scenario/journey
+    chmod 1777 /scenario/journey
+  fi
+  if [ ! -d /scenario/principals ]; then
+    mkdir /scenario/principals
+    chmod 1777 /scenario/principals
+  fi
   chmod 0711 /scenario
-  chmod 0777 /scenario/raw /scenario/results /scenario/fixtures /scenario/fixtures/staging \
-    /scenario/ansible /scenario/journey
+  chmod 1777 /scenario/raw
+  chmod 0777 /scenario/fixtures /scenario/fixtures/staging /scenario/ansible
   printf 'synthetic operator note\n' > /scenario/fixtures/operator-note
   printf 'apiVersion: v1\nkind: Config\nsynthetic: true\n' > /scenario/fixtures/daemon.kubeconfig
   printf '[fixture]\nlocalhost\n' > /scenario/ansible/inventory
@@ -103,6 +118,7 @@ daemon() {
 
 record_result() {
   local outcome="$1" classification="$2" evidence="$3"
+  prepare_principal_output
   {
     echo "# $SCENARIO"
     echo
@@ -131,7 +147,7 @@ run_test_filter() {
     printf '%s\n' "$listing" | grep -Eq '[0-9]+ tests, [0-9]+ benchmarks$' || continue
     output="$("$binary" "$filter" --nocapture 2>&1)" || {
       printf '%s\n' "$output" >> "$RAW"
-      printf 'test filter failed: %s\n' "$filter" > /scenario/results/failure.txt
+      printf 'test filter failed: %s\n' "$filter" > "$FAILURE"
       return 1
     }
     printf '%s\n' "$output" >> "$RAW"
@@ -140,7 +156,7 @@ run_test_filter() {
     fi
   done
   if [ "$matched" -ne 1 ]; then
-    printf 'test filter matched no tests: %s\n' "$filter" > /scenario/results/failure.txt
+    printf 'test filter matched no tests: %s\n' "$filter" > "$FAILURE"
   fi
   [ "$matched" -eq 1 ]
 }
@@ -175,17 +191,17 @@ run_contracts() {
       if ! live_output="$(guard verb run failing-revert --confirm-within 1 --socket "$SOCKET" 2>&1)"; then
         printf '%s\n' "$live_output" >> "$RAW"
         printf 'live failing-revert verb did not enter the provisional state: %s\n' \
-          "$(printf '%s\n' "$live_output" | safe_error_line)" > /scenario/results/failure.txt
+          "$(printf '%s\n' "$live_output" | safe_error_line)" > "$FAILURE"
         return 1
       fi
       printf '%s\n' "$live_output" >> "$RAW"
       sleep 5
       guard provisionals --json --socket "$SOCKET" >>"$RAW" 2>&1 || {
-        printf 'caller could not inspect its own live provisional\n' > /scenario/results/failure.txt
+        printf 'caller could not inspect its own live provisional\n' > "$FAILURE"
         return 1
       }
       grep -q 'revert_failed' "$RAW" || {
-        printf 'live failing revert did not surface revert_failed\n' > /scenario/results/failure.txt
+        printf 'live failing revert did not surface revert_failed\n' > "$FAILURE"
         return 1
       }
       ;;
@@ -197,7 +213,7 @@ run_contracts() {
       if ! live_output="$(guard verb run ssh-diagnose --socket "$SOCKET" 2>&1)"; then
         printf '%s\n' "$live_output" >> "$RAW"
         printf 'current versioned client failed against the isolated daemon: %s\n' \
-          "$(printf '%s\n' "$live_output" | safe_error_line)" > /scenario/results/failure.txt
+          "$(printf '%s\n' "$live_output" | safe_error_line)" > "$FAILURE"
         return 1
       fi
       printf '%s\n' "$live_output" >> "$RAW"
@@ -218,6 +234,8 @@ capture_phase() {
   set -e
   printf '%s\n' "$output" > "/scenario/journey/$name.out"
   printf '%s\n' "$status" > "/scenario/journey/$name.status"
+  printf '%s\n' "$output" > "$PHASE_OUTPUT/$name.out"
+  printf '%s\n' "$status" > "$PHASE_OUTPUT/$name.status"
   printf 'phase=%s uid=%s exit=%s\n%s\n' "$name" "$(id -u)" "$status" "$output" >> "$RAW"
   return "$status"
 }
@@ -233,6 +251,9 @@ capture_stdout_phase() {
   set -e
   printf '%s\n' "$output" > "/scenario/journey/$name.out"
   printf '%s\n' "$status" > "/scenario/journey/$name.status"
+  printf '%s\n' "$output" > "$PHASE_OUTPUT/$name.out"
+  printf '%s\n' "$status" > "$PHASE_OUTPUT/$name.status"
+  cp "$stderr_file" "$PHASE_OUTPUT/$name.stderr"
   printf 'phase=%s uid=%s exit=%s stdout\n%s\nstderr\n%s\n' \
     "$name" "$(id -u)" "$status" "$output" "$(cat "$stderr_file")" >> "$RAW"
   return "$status"
@@ -248,6 +269,7 @@ capture_mcp_denial() {
   status=$?
   set -e
   printf '%s\n' "$output" > /scenario/journey/maintenance-mcp.out
+  printf '%s\n' "$output" > "$PHASE_OUTPUT/maintenance-mcp.out"
   printf 'phase=maintenance-mcp uid=%s exit=%s\n%s\n' "$(id -u)" "$status" "$output" >> "$RAW"
   [ "$status" -eq 0 ]
 }
@@ -1315,8 +1337,9 @@ phase_su22() {
 
 run_phase() {
   export GUARD_SOCKET="$SOCKET"
-  RAW="/scenario/raw/$SCENARIO-$(id -u).log"
-  trap 'printf "phase=%s line=%s\n" "${3:-unknown}" "$LINENO" > /scenario/results/failure.txt' ERR
+  prepare_principal_output
+  RAW="$PHASE_OUTPUT/$SCENARIO.log"
+  trap 'printf "phase=%s line=%s\n" "${3:-unknown}" "$LINENO" > "$FAILURE"' ERR
   mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME"
   case "$SCENARIO" in
     SU-13) phase_su13 "$3" ;;
@@ -1398,9 +1421,86 @@ run() {
     return 0
   fi
   record_result failed "Guard defect, fixture defect, or underlying-tool failure pending reduction" \
-    "$(sed -n '1p' /scenario/results/failure.txt 2>/dev/null || printf 'the deterministic reproducer failed')"
+    "$(sed -n '1p' "$FAILURE" 2>/dev/null || printf 'the deterministic reproducer failed')"
   echo "$SCENARIO: failed" >&2
   return 1
+}
+
+prepare_principal_output() {
+  [ -d "$PRINCIPAL_ROOT" ] && [ -O "$PRINCIPAL_ROOT" ]
+  [ -d "$PHASE_OUTPUT" ] && [ -d "$(dirname "$RESULT")" ]
+  umask 022
+}
+
+prepare_principals() {
+  local uid root
+  [ "$(id -u)" -eq 0 ]
+  setup_fixture
+  for uid in 1000 1001 1002; do
+    root="/scenario/principals/$uid"
+    mkdir -p "$root/phase-output" "$root/results"
+    chmod 0710 "$root"
+    chmod 0750 "$root/phase-output" "$root/results"
+    chown -R "$uid:0" "$root"
+  done
+  mkdir -p "$COLLECTOR_RESULTS" "$COLLECTOR_PHASES"
+  chown -R 0:0 "$COLLECTOR_ROOT"
+  chmod 0700 "$COLLECTOR_ROOT" "$COLLECTOR_RESULTS" "$COLLECTOR_PHASES"
+  chown -R 1000:1000 /scenario/home /scenario/config /scenario/data /scenario/raw \
+    /scenario/fixtures /scenario/bin /scenario/ansible /scenario/run
+  chown 1000:1000 /scenario
+}
+
+collect_phase() {
+  local scenario="$2" uid="$3" phase="$4" status="$5" source destination
+  [ "$(id -u)" -eq 0 ]
+  source="/scenario/principals/$uid/phase-output"
+  destination="$COLLECTOR_PHASES/$scenario/$uid/$phase"
+  [ -d "$source" ]
+  mkdir -p "$COLLECTOR_PHASES/$scenario/$uid"
+  mkdir "$destination"
+  find "$source" -maxdepth 1 -type f -exec cp {} "$destination"/ \;
+  find "$destination" -maxdepth 1 -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum \
+    > "$destination.sha256"
+  printf 'scenario=%s uid=%s phase=%s runner_exit=%s\n' \
+    "$scenario" "$uid" "$phase" "$status" >> "$destination.sha256"
+}
+
+collect_result() {
+  local scenario="$2" expected="$3" candidate temporary phase_manifest phase_digest
+  local -a candidates=()
+  local uid
+  [ "$(id -u)" -eq 0 ]
+  for uid in 1000 1001 1002; do
+    candidate="/scenario/principals/$uid/results/$scenario.md"
+    if [ -f "$candidate" ]; then
+      candidates+=("$candidate")
+    fi
+  done
+  temporary="$(mktemp "$COLLECTOR_RESULTS/.${scenario}.XXXXXX")"
+  if [ "$expected" = passed ] && [ "${#candidates[@]}" -eq 1 ] \
+    && grep -Fqx -- "# $scenario" "${candidates[0]}" \
+    && grep -Fqx -- '- Result: passed' "${candidates[0]}"; then
+    head -c 131072 "${candidates[0]}" > "$temporary"
+  else
+    {
+      echo "# $scenario"
+      echo
+      echo "- Result: failed"
+      echo "- Classification: fixture defect"
+      echo "- Evidence: the root collector did not receive one matching successful candidate result"
+      echo "- Isolation: rootless container, private daemon/socket/database/fixtures/principal/network namespace, network disabled"
+      echo "- Raw transcript: retained only in the ephemeral scenario volume and removed during teardown"
+    } > "$temporary"
+  fi
+  phase_manifest="$COLLECTOR_ROOT/$scenario.phase-output.sha256"
+  find "$COLLECTOR_PHASES/$scenario" -type f -name '*.sha256' -print0 2>/dev/null \
+    | LC_ALL=C sort -z | xargs -0 -r sha256sum > "$phase_manifest"
+  phase_digest="$(sha256sum "$phase_manifest" | cut -d ' ' -f 1)"
+  printf '%s\n' "- Principal phase output digest: \`$phase_digest\`" >> "$temporary"
+  printf '%s\n' '- Final result: finalized by the root collector' >> "$temporary"
+  chmod 0600 "$temporary"
+  mv "$temporary" "$COLLECTOR_RESULTS/$scenario.md"
 }
 
 case "${1:-}" in
@@ -1409,8 +1509,20 @@ case "${1:-}" in
   phase) run_phase "$@" ;;
   failure)
     record_result failed 'Guard defect, fixture defect, or underlying-tool failure pending reduction' \
-      "$(sed -n '1p' /scenario/results/failure.txt 2>/dev/null || printf 'a live role-separated journey phase failed')"
+      "$(sed -n '1p' "$FAILURE" 2>/dev/null || printf 'a live role-separated journey phase failed')"
     ;;
   postcheck) postcheck ;;
+  prepare-principals)
+    [ "$(id -u)" -eq 0 ] || { echo 'prepare-principals requires container root' >&2; exit 2; }
+    prepare_principals
+    ;;
+  collect-phase)
+    [ "$(id -u)" -eq 0 ] || { echo 'collect-phase requires container root' >&2; exit 2; }
+    collect_phase "$@"
+    ;;
+  collect-result)
+    [ "$(id -u)" -eq 0 ] || { echo 'collect-result requires container root' >&2; exit 2; }
+    collect_result "$@"
+    ;;
   *) echo "usage: synthetic-user.sh daemon|run|phase SCENARIO [PHASE]" >&2; exit 2 ;;
 esac

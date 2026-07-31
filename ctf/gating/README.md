@@ -21,21 +21,33 @@ host needs different limits.
 
 `synthetic-user` runs SU-01 through SU-11, seven SU-12 workload journeys, and
 SU-13 through SU-22.
-Each scenario receives a separate rootless Podman container, named volume,
+Each scenario receives a separate rootless Podman execution container, named volume,
 Guard daemon, socket, database, fake fixtures, uid-separated principal, and
-network namespace. Runtime networking is disabled. The container has a
+network namespace. Runtime networking is disabled. The execution container has a
 read-only root filesystem, no capabilities, no-new-privileges, bounded CPU,
 memory, and PID resources, tmpfs scratch paths, and no host bind mounts.
 
 The image contains the integrated source and compiled focused test binaries.
 The private scenario volume contains only scenario state and fixtures. No host
 checkout, credential directory, socket, cache, or build output is mounted into
-the container. Only a redacted Markdown result is copied into a unique directory
-beneath `.cache/synthetic-user/runs`. Each run manifest binds the selected
-catalog, commit, image identity, outcomes, and evidence hashes. `latest-run`
-points to the newest run without mixing its results with an older invocation.
-Raw output remains in the scenario volume. The container and volume are removed
-after every result by default.
+the container. Principal phase output is private to its uid. Shared journey
+files are sticky handoff state, so one principal cannot replace another
+principal's files. A root initializer with only the CHOWN capability precreates
+the known principal directories before the daemon starts. The root-owned collector copies
+completed phase evidence and finalizes the only copyable Markdown result. The
+runner copies and hashes that finalized result in a unique directory beneath
+`.cache/synthetic-user/runs`.
+Each run manifest binds the selected catalog, commit, image identity, outcomes,
+and evidence hashes. `latest-run` points to the newest run without mixing its
+results with an older invocation. Raw output remains in the scenario volume.
+The container and volume are removed after every result by default.
+
+Every scenario container and volume carries the run and scenario labels. The
+runner records each created resource in the run-local cleanup manifest before
+starting it. Cleanup and interrupted-run recovery use that manifest and the
+matching labels only. Set `GUARD_SU_RUN_ID` to the interrupted run identifier to
+recover its non-preserved resources. `GUARD_SU_KEEP_FAILED=1` records an
+explicit preservation entry and leaves that failed fixture intact.
 
 Set `GUARD_SU_KEEP_FAILED=1` to intentionally preserve a failed scenario's
 container and volume for inspection. The harness prints both generated names.
