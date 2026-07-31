@@ -91,10 +91,15 @@ struct RecordingSessionSink {
 #[async_trait::async_trait]
 impl ApiSessionSink for RecordingSessionSink {
     async fn resolve(&self, token: &str) -> Option<ApiSessionContext> {
-        (token == "live-session").then(|| ApiSessionContext {
+        let secret_entitlements = match token {
+            "live-session" => None,
+            "restricted-session" => Some(vec!["another-endpoint/token".to_string()]),
+            _ => return None,
+        };
+        Some(ApiSessionContext {
             fingerprint: "session-fingerprint".to_string(),
             revision: "live-session-revision".to_string(),
-            secret_entitlements: None,
+            secret_entitlements,
             intent: Some("manage development pods".to_string()),
             evaluation_mode: ApiEvaluationMode::Evaluator,
             can_evaluate_api_override: true,
@@ -899,6 +904,8 @@ async fn proxy_denies_subresource_and_identity_override_headers() {
     let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).expect("policy");
     let (listener, listen) = reserve_listener().await;
     let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
+    let session_sink = RecordingSessionSink::default();
+    proxy.attach_session_sink(Arc::new(session_sink.clone()));
 
     tokio::spawn(proxy.clone().serve_on(listener));
 
@@ -931,17 +938,52 @@ async fn proxy_denies_subresource_and_identity_override_headers() {
 
     // 2. A request carrying identity headers is rejected instead of silently
     // changing the question by evaluating it as the proxy identity.
-    let resp = client
+    let impersonate_resp = client
         .get(format!("{base}/api/v1/namespaces/dev/pods"))
+        .bearer_auth("live-session")
         .header("Impersonate-User", "system:masters")
         .header("Impersonate-Group", "system:masters")
-        .header("X-Remote-User", "admin")
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 403, "identity overrides must be rejected");
-    let v: Value = resp.json().await.unwrap();
+    assert_eq!(
+        impersonate_resp.status(),
+        403,
+        "Kubernetes impersonation headers must be rejected"
+    );
+    let v: Value = impersonate_resp.json().await.unwrap();
     assert!(v["message"].as_str().unwrap().contains("not supported"));
+
+    let remote_user_resp = client
+        .get(format!("{base}/api/v1/namespaces/dev/pods"))
+        .bearer_auth("live-session")
+        .header("X-Remote-User", "admin")
+        .header("X-Remote-Group", "system:masters")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        remote_user_resp.status(),
+        403,
+        "front-proxy identity headers must be rejected"
+    );
+    let v: Value = remote_user_resp.json().await.unwrap();
+    assert!(v["message"].as_str().unwrap().contains("not supported"));
+    let restricted_resp = client
+        .get(format!("{base}/api/v1/namespaces/dev/pods"))
+        .bearer_auth("restricted-session")
+        .header("Impersonate-User", "system:masters")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restricted_resp.status(), 403);
+    let v: Value = restricted_resp.json().await.unwrap();
+    assert!(v["message"].as_str().unwrap().contains("not supported"));
+    let events = session_sink.events.lock().unwrap();
+    assert_eq!(events.len(), 3);
+    assert!(events
+        .iter()
+        .all(|event| !event.allowed && event.status == 403));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

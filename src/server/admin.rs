@@ -677,11 +677,91 @@ fn intent_matches_verb(intent: &str, verb: &Verb) -> bool {
 }
 
 fn intent_mentions_verb_name(intent: &str, verb: &Verb) -> bool {
+    if intent.trim().eq_ignore_ascii_case(&verb.name) {
+        return true;
+    }
+    let intent_lower = intent.to_ascii_lowercase();
+    let name_lower = verb.name.to_ascii_lowercase();
+    let quoted_names = [
+        format!("\"{name_lower}\""),
+        format!("'{name_lower}'"),
+        format!("`{name_lower}`"),
+    ];
+    if quoted_names
+        .iter()
+        .any(|pattern| intent_lower.contains(pattern))
+    {
+        return true;
+    }
+    (verb.name.contains('-') || verb.name.contains('_'))
+        && intent
+            .split(|character: char| {
+                !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+            })
+            .any(|token| token.eq_ignore_ascii_case(&verb.name))
+}
+
+fn access_intent_clauses(intent: &str) -> Vec<String> {
     intent
+        .to_ascii_lowercase()
+        .replace(',', "\n")
+        .replace(';', "\n")
+        .replace(" and ", "\n")
+        .replace(" plus ", "\n")
+        .replace(" then ", "\n")
+        .replace(" before ", "\n")
+        .replace(" after ", "\n")
+        .replace(" with ", "\n")
+        .lines()
+        .map(str::trim)
+        .filter(|clause| !clause.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn explicitly_named_verbs_in_clause<'a>(clause: &str, verbs: &'a [Verb]) -> Vec<&'a Verb> {
+    let direct = verbs
+        .iter()
+        .filter(|verb| intent_mentions_verb_name(clause, verb))
+        .collect::<Vec<_>>();
+    if !direct.is_empty() {
+        return direct;
+    }
+
+    const REQUEST_TERMS: &[&str] = &[
+        "a", "access", "allow", "an", "catalog", "command", "commands", "for", "i", "in", "is",
+        "my", "need", "of", "on", "our", "please", "task", "tasks", "that", "the", "this", "to",
+        "use", "verb", "verbs", "want", "whether", "with", "work",
+    ];
+    let terms = clause
         .split(|character: char| {
             !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
         })
-        .any(|token| token.eq_ignore_ascii_case(&verb.name))
+        .filter(|term| !term.is_empty())
+        .filter(|term| !REQUEST_TERMS.contains(&term.to_ascii_lowercase().as_str()))
+        .collect::<Vec<_>>();
+    if let [name] = terms.as_slice() {
+        return verbs
+            .iter()
+            .filter(|verb| verb.name.eq_ignore_ascii_case(name))
+            .collect();
+    }
+    Vec::new()
+}
+
+fn clause_without_verb_names(clause: &str, verbs: &[&Verb]) -> String {
+    clause
+        .split(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+        })
+        .filter(|token| {
+            !token.is_empty()
+                && !verbs
+                    .iter()
+                    .any(|verb| token.eq_ignore_ascii_case(&verb.name))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn semantic_intent_terms(value: &str) -> std::collections::BTreeSet<String> {
@@ -721,6 +801,24 @@ fn semantic_intent_score(intent: &str, verb: &Verb) -> Option<usize> {
             .then_some(intersection * 1_000 / union.max(1))
     })
     .max()
+}
+
+fn unique_semantic_intent_match<'a>(intent: &str, verbs: &'a [Verb]) -> Option<&'a Verb> {
+    let mut semantic = verbs
+        .iter()
+        .filter_map(|verb| semantic_intent_score(intent, verb).map(|score| (score, verb)))
+        .collect::<Vec<_>>();
+    semantic.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.name.cmp(&right.1.name))
+    });
+    let (best_score, best) = semantic.first()?;
+    semantic
+        .get(1)
+        .is_none_or(|second| second.0 < *best_score)
+        .then_some(*best)
 }
 
 #[cfg(test)]
@@ -784,13 +882,59 @@ async fn reduce_access_intent(
         }
         catalog.list()
     };
-    let mentioned = existing
+    let clauses = access_intent_clauses(intent);
+    let named_by_clause = clauses
         .iter()
-        .filter(|verb| intent_mentions_verb_name(intent, verb))
-        .cloned()
+        .map(|clause| explicitly_named_verbs_in_clause(clause, &existing))
         .collect::<Vec<_>>();
-    if !mentioned.is_empty() {
-        return Ok((mentioned, Vec::new()));
+    let mut selected = named_by_clause
+        .iter()
+        .flatten()
+        .map(|verb| verb.name.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    if !selected.is_empty() {
+        const FILLER_TERMS: &[&str] = &[
+            "access", "allow", "catalog", "command", "commands", "i", "need", "please", "run",
+            "task", "tasks", "to", "use", "verb", "verbs", "want", "with", "work",
+        ];
+        for (clause, named) in clauses.iter().zip(named_by_clause.iter()) {
+            let residual = clause_without_verb_names(clause, named);
+            let terms = semantic_intent_terms(&residual);
+            if terms.is_empty()
+                || terms
+                    .iter()
+                    .all(|term| FILLER_TERMS.contains(&term.as_str()))
+            {
+                continue;
+            }
+            let exact = existing
+                .iter()
+                .filter(|verb| {
+                    let residual_is_name = residual.trim().eq_ignore_ascii_case(&verb.name);
+                    intent_matches_verb(&residual, verb)
+                        && (!residual_is_name || named.iter().any(|named| named.name == verb.name))
+                })
+                .collect::<Vec<_>>();
+            if !exact.is_empty() {
+                selected.extend(exact.into_iter().map(|verb| verb.name.clone()));
+                continue;
+            }
+            if let Some(verb) = unique_semantic_intent_match(&residual, &existing) {
+                selected.insert(verb.name.clone());
+                continue;
+            }
+            return Err(
+                "access intent mixes explicit verb names with unresolved prose; name every required catalog verb explicitly or submit separate requests"
+                    .to_string(),
+            );
+        }
+        return Ok((
+            existing
+                .into_iter()
+                .filter(|verb| selected.contains(&verb.name))
+                .collect(),
+            Vec::new(),
+        ));
     }
     let matched = existing
         .iter()
@@ -800,20 +944,8 @@ async fn reduce_access_intent(
     if !matched.is_empty() {
         return Ok((matched, Vec::new()));
     }
-    let mut semantic = existing
-        .iter()
-        .filter_map(|verb| semantic_intent_score(intent, verb).map(|score| (score, verb)))
-        .collect::<Vec<_>>();
-    semantic.sort_by(|left, right| {
-        right
-            .0
-            .cmp(&left.0)
-            .then_with(|| left.1.name.cmp(&right.1.name))
-    });
-    if let Some((best_score, best)) = semantic.first() {
-        if semantic.get(1).is_none_or(|second| second.0 < *best_score) {
-            return Ok((vec![(*best).clone()], Vec::new()));
-        }
+    if let Some(best) = unique_semantic_intent_match(intent, &existing) {
+        return Ok((vec![best.clone()], Vec::new()));
     }
 
     let mut candidate = server
@@ -5399,43 +5531,45 @@ async fn validate_grant_request_for_approval(
 }
 
 pub(super) async fn prune_grant_requests(server: &ServerContext) {
+    let _transition = server.state.grant_request_transition_gate.lock().await;
     let now = now_unix();
-    let active_tokens = server
+    let active_requests = server
         .state
         .sessions
         .read()
         .await
         .list()
         .into_iter()
-        .map(|summary| summary.token)
+        .flat_map(|summary| summary.scope.access_grants.into_iter())
+        .map(|grant| grant.request)
         .collect::<std::collections::BTreeSet<_>>();
-    let mut requests = server.state.grant_requests.write().await;
-    let mut removed = requests
-        .iter()
-        .filter(|(_, request)| {
-            request.status == GrantRequestStatus::Pending
-                && (request.expires_unix == 0 || request.expires_unix <= now)
-        })
-        .map(|(handle, _)| handle.clone())
-        .collect::<Vec<_>>();
-    let retained_after_expiry = requests.len().saturating_sub(removed.len());
-    let mut retained_count = retained_after_expiry;
-    while retained_count >= MAX_GRANT_REQUESTS {
-        let oldest_terminal = requests
+    let removed = {
+        let requests = server.state.grant_requests.read().await;
+        let mut removed = requests
             .iter()
-            .filter(|(handle, _)| !removed.contains(handle))
-            .filter(|(_, request)| request.status != GrantRequestStatus::Pending)
             .filter(|(_, request)| {
-                request.proposed_verbs.is_empty() || !active_tokens.contains(&request.session_token)
+                request.status == GrantRequestStatus::Pending
+                    && (request.expires_unix == 0 || request.expires_unix <= now)
             })
-            .min_by_key(|(handle, request)| (request.created_unix, *handle))
-            .map(|(handle, _)| handle.clone());
-        let Some(handle) = oldest_terminal else {
-            break;
-        };
-        removed.push(handle);
-        retained_count = retained_count.saturating_sub(1);
-    }
+            .map(|(handle, _)| handle.clone())
+            .collect::<Vec<_>>();
+        let mut retained_count = requests.len().saturating_sub(removed.len());
+        while retained_count >= MAX_GRANT_REQUESTS {
+            let oldest_terminal = requests
+                .iter()
+                .filter(|(handle, _)| !removed.contains(handle))
+                .filter(|(_, request)| request.status != GrantRequestStatus::Pending)
+                .filter(|(handle, _)| !active_requests.contains(handle.as_str()))
+                .min_by_key(|(handle, request)| (request.created_unix, *handle))
+                .map(|(handle, _)| handle.clone());
+            let Some(handle) = oldest_terminal else {
+                break;
+            };
+            removed.push(handle);
+            retained_count = retained_count.saturating_sub(1);
+        }
+        removed
+    };
     if !removed.is_empty() {
         if let Some(store) = &server.state.session_store {
             if let Err(error) = store.delete_grant_requests(removed.clone()).await {
@@ -5443,6 +5577,7 @@ pub(super) async fn prune_grant_requests(server: &ServerContext) {
                 return;
             }
         }
+        let mut requests = server.state.grant_requests.write().await;
         for handle in removed {
             requests.remove(&handle);
         }

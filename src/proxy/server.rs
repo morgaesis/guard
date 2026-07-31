@@ -657,52 +657,68 @@ impl ApiProxy {
     async fn route(&self, mut req: Request<Incoming>, conn_id: u64) -> Response<ProxyBody> {
         let method = req.method().clone();
         let path = req.uri().path().to_string();
-        if req.headers().keys().any(is_identity_header) {
-            return self.status_resp(
-                StatusCode::FORBIDDEN,
-                "guard api-proxy: identity impersonation is not supported; the request was not forwarded",
-                "Forbidden",
-            );
-        }
+        let has_identity_override = req.headers().keys().any(is_identity_header);
         let session_token = match take_guard_session(req.headers_mut()) {
             Ok(token) => token,
             Err(reason) => {
                 return self.status_resp(StatusCode::FORBIDDEN, reason, "Forbidden");
             }
         };
-        let session_context =
-            if let Some(token) = session_token.as_deref() {
-                let Some(sink) = self.session_sink.get() else {
+        let session_context = if let Some(token) = session_token.as_deref() {
+            let Some(sink) = self.session_sink.get() else {
+                return self.status_resp(
+                    StatusCode::FORBIDDEN,
+                    "guard api-proxy: session attribution is unavailable",
+                    "Forbidden",
+                );
+            };
+            match sink.resolve(token).await {
+                Some(context) => Some(context),
+                None => {
                     return self.status_resp(
                         StatusCode::FORBIDDEN,
-                        "guard api-proxy: session attribution is unavailable",
+                        "guard api-proxy: unknown or expired session",
                         "Forbidden",
-                    );
-                };
-                match sink.resolve(token).await {
-                    Some(context) => {
-                        if context.secret_entitlements.as_ref().is_some_and(|names| {
-                            !names.iter().any(|name| name == &self.credential_ref)
-                        }) {
-                            return self.status_resp(
-                            StatusCode::FORBIDDEN,
-                            "guard api-proxy: session is not entitled to this upstream credential",
-                            "Forbidden",
-                        );
-                        }
-                        Some(context)
-                    }
-                    None => {
-                        return self.status_resp(
-                            StatusCode::FORBIDDEN,
-                            "guard api-proxy: unknown or expired session",
-                            "Forbidden",
-                        )
-                    }
+                    )
                 }
-            } else {
-                None
-            };
+            }
+        } else {
+            None
+        };
+        if has_identity_override {
+            let response = self.status_resp(
+                StatusCode::FORBIDDEN,
+                "guard api-proxy: identity impersonation is not supported; the request was not forwarded",
+                "Forbidden",
+            );
+            if let (Some(token), Some(sink)) = (session_token.as_deref(), self.session_sink.get()) {
+                sink.record(
+                    token,
+                    ApiSessionEvent {
+                        endpoint: self.endpoint.clone(),
+                        operation: format!("{} {}", method, path),
+                        allowed: false,
+                        status: response.status().as_u16(),
+                        held: false,
+                        credential_ref: self.credential_ref.clone(),
+                    },
+                )
+                .await;
+            }
+            return response;
+        }
+        if session_context.as_ref().is_some_and(|context| {
+            context
+                .secret_entitlements
+                .as_ref()
+                .is_some_and(|names| !names.iter().any(|name| name == &self.credential_ref))
+        }) {
+            return self.status_resp(
+                StatusCode::FORBIDDEN,
+                "guard api-proxy: session is not entitled to this upstream credential",
+                "Forbidden",
+            );
+        }
         if let (Some(token), Some(context)) = (session_token.clone(), session_context.clone()) {
             req.extensions_mut().insert(SessionAuth { token, context });
         }
