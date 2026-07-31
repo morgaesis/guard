@@ -3,6 +3,7 @@ use crate::server::execute::execute_command;
 use crate::server::wire::{
     AdminRequest, AdminResponse, CallerIdentity, ExecuteRequest, GateStatus, VerbInvocation,
 };
+use crate::server::ServerContext;
 use crate::session::SessionGrant;
 use guard::evaluate::{EvalConfig, Evaluator};
 use guard::gating::verb::VerbCatalog;
@@ -622,4 +623,214 @@ verbs:
         .await,
         AdminResponse::Verbs { .. }
     ));
+}
+
+fn overbroad_until_gate_feedback_arrives(request: &str) -> serde_json::Value {
+    // The gate complaint about the first candidate names its overbroad
+    // pattern; once the daemon threads that complaint into the synthesis
+    // request, answer with the corrected enumerated shape instead.
+    let pattern = if request.contains("too permissive") {
+        "^(nginx|sshd)$"
+    } else {
+        "^.+$"
+    };
+    serde_json::json!({
+        "name": "show-unit-status",
+        "description": "Show one systemd unit status",
+        "binary": "systemctl",
+        "args": ["status", "{unit}"],
+        "params": {"unit": {"pattern": pattern}},
+        "consequence": "reversible",
+        "trusted": false,
+        "evidence": "Status is read only."
+    })
+}
+
+fn file_backed_catalog() -> (tempfile::TempDir, VerbCatalog) {
+    let dir = tempfile::tempdir().expect("catalog test dir");
+    let path = dir.path().join("verbs.yaml");
+    std::fs::write(&path, "verbs: []\n").expect("write empty catalog");
+    let catalog = VerbCatalog::load(&path).expect("load empty catalog");
+    (dir, catalog)
+}
+
+fn synthesis_test_config(llm_url: String) -> (ServerContext, CallerIdentity) {
+    let (mut cfg, _buf) = make_test_config();
+    cfg.state.evaluator = Arc::new(
+        Evaluator::new(
+            EvalConfig::default()
+                .llm_api_key("test-key".to_string())
+                .llm_api_url(llm_url)
+                .llm_retries(0),
+        )
+        .unwrap(),
+    );
+    cfg.config.daemon_principal = PrincipalKey::from_uid(cfg.config.daemon_uid);
+    let daemon = CallerIdentity::Unix {
+        uid: cfg.config.daemon_uid,
+    };
+    (cfg, daemon)
+}
+
+#[tokio::test]
+async fn preview_digest_round_trip_installs_the_exact_reviewed_candidate() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(super::run_verb_synthesis_llm(listener));
+    let (mut cfg, daemon) = synthesis_test_config(url);
+    let (_dir, catalog) = file_backed_catalog();
+    cfg.state.verbs = Arc::new(RwLock::new(catalog));
+
+    let response = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::VerbCreate {
+            prose: "Inspect compiler version.".to_string(),
+            binary_hint: Some("rustc".to_string()),
+            preview: true,
+            gate_feedback: Vec::new(),
+        },
+    )
+    .await;
+    let AdminResponse::VerbCreated {
+        verb: previewed,
+        persisted,
+        preview_digest,
+    } = response
+    else {
+        panic!("expected previewed verb, got {response:?}");
+    };
+    assert!(!persisted);
+    let digest = preview_digest.expect("a preview response carries its digest");
+    assert_eq!(digest, previewed.definition_digest());
+
+    let response = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::VerbCreateFromPreview {
+            digest: digest[..12].to_string(),
+        },
+    )
+    .await;
+    let AdminResponse::VerbCreated {
+        verb: installed,
+        persisted,
+        preview_digest,
+    } = response
+    else {
+        panic!("expected installed verb, got {response:?}");
+    };
+    assert!(persisted);
+    assert_eq!(preview_digest.as_deref(), Some(digest.as_str()));
+    assert_eq!(
+        installed.definition_digest(),
+        digest,
+        "install must reproduce exactly the reviewed candidate"
+    );
+    let catalog_digest = cfg
+        .state
+        .verbs
+        .read()
+        .await
+        .verb_definition_digest(&installed.name);
+    assert_eq!(catalog_digest.as_deref(), Some(digest.as_str()));
+}
+
+#[tokio::test]
+async fn from_preview_rejects_unknown_and_malformed_digests() {
+    let (mut cfg, _buf) = make_test_config();
+    cfg.config.daemon_principal = PrincipalKey::from_uid(cfg.config.daemon_uid);
+    let daemon = CallerIdentity::Unix {
+        uid: cfg.config.daemon_uid,
+    };
+
+    let response = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::VerbCreateFromPreview {
+            digest: "deadbeef".to_string(),
+        },
+    )
+    .await;
+    let AdminResponse::Error { message } = response else {
+        panic!("expected an error for an unknown digest, got {response:?}");
+    };
+    assert!(
+        message.contains("no previewed candidate matches 'deadbeef'"),
+        "unhelpful unknown-digest error: {message}"
+    );
+
+    let response = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::VerbCreateFromPreview {
+            digest: "not-a-digest".to_string(),
+        },
+    )
+    .await;
+    let AdminResponse::Error { message } = response else {
+        panic!("expected an error for a malformed digest, got {response:?}");
+    };
+    assert!(
+        message.contains("is not a preview digest"),
+        "unhelpful malformed-digest error: {message}"
+    );
+}
+
+#[tokio::test]
+async fn gate_feedback_threads_into_the_next_synthesis_request() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(super::run_verb_synthesis_llm_with(
+        listener,
+        overbroad_until_gate_feedback_arrives,
+    ));
+    let (cfg, daemon) = synthesis_test_config(url);
+
+    // First attempt: the model proposes an overbroad pattern and the safety
+    // gate rejects it before anything touches the catalog.
+    let response = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::VerbCreate {
+            prose: "Show nginx or sshd unit status.".to_string(),
+            binary_hint: Some("systemctl".to_string()),
+            preview: true,
+            gate_feedback: Vec::new(),
+        },
+    )
+    .await;
+    let AdminResponse::Error { message } = response else {
+        panic!("expected a safety-gate rejection, got {response:?}");
+    };
+    let reason = message
+        .strip_prefix("synthesized verb rejected by the safety gate: ")
+        .unwrap_or_else(|| panic!("not a gate rejection: {message}"))
+        .to_string();
+    assert!(
+        reason.contains("too permissive"),
+        "unexpected reason: {reason}"
+    );
+
+    // Retry with the complaint threaded: the stub only corrects the shape when
+    // the complaint reaches the synthesis request body.
+    let response = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::VerbCreate {
+            prose: "Show nginx or sshd unit status.".to_string(),
+            binary_hint: Some("systemctl".to_string()),
+            preview: true,
+            gate_feedback: vec![reason],
+        },
+    )
+    .await;
+    let AdminResponse::VerbCreated { verb, .. } = response else {
+        panic!("expected a corrected candidate, got {response:?}");
+    };
+    assert_eq!(
+        verb.params.get("unit").map(|spec| spec.pattern.as_str()),
+        Some("^(nginx|sshd)$"),
+        "the corrected candidate must reflect the threaded gate feedback"
+    );
 }

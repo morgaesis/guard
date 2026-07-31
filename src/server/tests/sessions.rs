@@ -21,10 +21,9 @@ use guard::gating::GateMode;
 use guard::principal::PrincipalKey;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 
-use super::{capture_async, make_test_config};
+use super::{capture_async, make_test_config, run_verb_synthesis_llm};
 
 fn granted_session(allow: Vec<String>, allow_exact: Vec<SessionExactRule>) -> SessionGrant {
     SessionGrant {
@@ -57,73 +56,6 @@ fn granted_session_owned(
     grant
 }
 
-async fn run_verb_synthesis_llm(listener: tokio::net::TcpListener) {
-    loop {
-        let (mut stream, _) = match listener.accept().await {
-            Ok(stream) => stream,
-            Err(_) => return,
-        };
-        tokio::spawn(async move {
-            let mut request = Vec::new();
-            let mut chunk = [0u8; 2048];
-            while let Ok(read) = stream.read(&mut chunk).await {
-                if read == 0 {
-                    break;
-                }
-                request.extend_from_slice(&chunk[..read]);
-                if let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
-                    let headers = String::from_utf8_lossy(&request[..header_end]);
-                    let content_length = headers
-                        .split("\r\n")
-                        .find_map(|line| {
-                            line.strip_prefix("Content-Length: ")
-                                .or_else(|| line.strip_prefix("content-length: "))
-                                .and_then(|value| value.trim().parse::<usize>().ok())
-                        })
-                        .unwrap_or(0);
-                    if request.len() >= header_end + 4 + content_length {
-                        break;
-                    }
-                }
-            }
-            let arguments = serde_json::json!({
-                "name": "check-compiler",
-                "description": "Inspect compiler version",
-                "binary": "rustc",
-                "args": ["--version"],
-                "params": {},
-                "consequence": "reversible",
-                "trusted": false,
-                "evidence": "The exact compiler version command is read only."
-            })
-            .to_string();
-            let body = serde_json::json!({
-                "choices": [{
-                    "message": {
-                        "tool_calls": [{
-                            "id": "verb-1",
-                            "type": "function",
-                            "function": {
-                                "name": "create_verb",
-                                "arguments": arguments
-                            }
-                        }]
-                    }
-                }],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
-            })
-            .to_string();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-            let _ = stream.shutdown().await;
-        });
-    }
-}
-
 #[tokio::test]
 async fn synthesized_verbs_default_to_session_scope() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -152,6 +84,7 @@ async fn synthesized_verbs_default_to_session_scope() {
             prose: "Inspect compiler version.".to_string(),
             binary_hint: Some("rustc".to_string()),
             preview: true,
+            gate_feedback: Vec::new(),
         },
     )
     .await;

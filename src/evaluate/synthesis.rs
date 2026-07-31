@@ -107,7 +107,14 @@ impl Evaluator {
     /// --prompt` path). Reuses the daemon's own LLM client/key/model. Returns the
     /// model-produced verb; the caller stamps `source_prose` and validates it
     /// against the catalog before persisting. Operator-only at the RPC layer.
-    pub async fn synthesize_verb(&self, prose: &str, binary_hint: Option<&str>) -> Result<Verb> {
+    /// `gate_feedback` carries safety-gate complaints about prior candidates for
+    /// the same prose, so a retried synthesis can correct the rejected shape.
+    pub async fn synthesize_verb(
+        &self,
+        prose: &str,
+        binary_hint: Option<&str>,
+        gate_feedback: &[String],
+    ) -> Result<Verb> {
         // Honor --no-llm: a daemon told not to talk to the model must not emit a
         // synthesis request just because a key happens to be configured.
         if !self.llm_config.enabled {
@@ -128,7 +135,7 @@ impl Evaluator {
             })?;
         let api_url = self.llm_config.api_url();
         let model = self.llm_config.model();
-        let body = build_create_verb_body(&model, prose, binary_hint);
+        let body = build_create_verb_body(&model, prose, binary_hint, gate_feedback);
 
         // A small model occasionally omits a required field or returns
         // unparseable arguments; retry a few times before failing.
@@ -294,15 +301,29 @@ impl Evaluator {
 
 /// Build the function-calling body for verb synthesis: force a single
 /// `create_verb` tool call whose arguments deserialize directly into a `Verb`.
+/// Gate complaints about earlier candidates ride in the user message so the
+/// model corrects the rejected shape instead of reproducing it.
 fn build_create_verb_body(
     model: &str,
     prose: &str,
     binary_hint: Option<&str>,
+    gate_feedback: &[String],
 ) -> serde_json::Value {
-    let user = match binary_hint {
+    let mut user = match binary_hint {
         Some(b) => format!("Target binary: {b}\n\nOperator request:\n{prose}"),
         None => format!("Operator request:\n{prose}"),
     };
+    if !gate_feedback.is_empty() {
+        let complaints = gate_feedback
+            .iter()
+            .map(|complaint| format!("- {complaint}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        user.push_str(&format!(
+            "\n\nEarlier candidates for this request were rejected by the safety gate. \
+             Produce a corrected shape that avoids every complaint:\n{complaints}"
+        ));
+    }
     let user = redact_for_llm(&user);
     serde_json::json!({
         "model": model,

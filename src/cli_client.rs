@@ -824,55 +824,108 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
             prompt,
             binary,
             preview,
+            from_preview,
+            retries,
+            yes,
             socket,
             json,
         } => {
-            let (client, source) = gate_client(socket, json)?;
-            let req = server::AdminRequest::VerbCreate {
-                prose: prompt,
-                binary_hint: binary,
-                preview,
-            };
-            match client
-                .send_admin(req)
-                .await
-                .map_err(|e| describe_connect_failure(e, &client, source))?
-            {
-                server::AdminResponse::VerbCreated { verb, persisted } => {
-                    if json {
-                        return print_json(&serde_json::json!({
-                            "schema_version": JSON_SCHEMA_VERSION,
-                            "type": "verb",
-                            "persisted": persisted,
-                            "verb": verb,
-                        }));
-                    }
-                    if persisted {
-                        println!("Created verb '{}' and added it to the catalog:", verb.name);
-                    } else {
-                        println!(
-                            "Preview of verb '{}' (NOT written). Creating synthesizes again and may differ; every created verb is non-trusted and re-validated by the safety gate.",
-                            verb.name
+            let config = load_client_config(json)?;
+            let (socket_path, tcp_port, source) =
+                resolve_client_endpoint_with_source(socket, &config);
+            let mut client = daemon_client::Client::new(socket_path, tcp_port);
+            if let Some(token) = config.auth_token.clone() {
+                client = client.with_auth(token);
+            }
+            if let Some(reference) = from_preview {
+                let response = client
+                    .send_admin(server::AdminRequest::VerbCreateFromPreview { digest: reference })
+                    .await
+                    .map_err(|e| describe_connect_failure(e, &client, source))?;
+                return render_verb_create_terminal(response, json);
+            }
+            let prompt = prompt.expect("clap requires --prompt without --from-preview");
+            let retries = retries
+                .or(config.verb_create_retries)
+                .unwrap_or(VERB_CREATE_DEFAULT_RETRIES);
+            let attempts = retries.saturating_add(1);
+            let mut gate_feedback: Vec<String> = Vec::new();
+            // Client-driven retry loop: each safety-gate complaint feeds the
+            // next synthesis, and nothing touches the catalog until a candidate
+            // passes, so Ctrl-C between attempts leaves no partial state.
+            let response = loop {
+                let attempt = gate_feedback.len() as u32 + 1;
+                let response = client
+                    .send_admin(server::AdminRequest::VerbCreate {
+                        prose: prompt.clone(),
+                        binary_hint: binary.clone(),
+                        preview,
+                        gate_feedback: gate_feedback.clone(),
+                    })
+                    .await
+                    .map_err(|e| describe_connect_failure(e, &client, source))?;
+                match response {
+                    server::AdminResponse::Error { ref message }
+                        if attempt < attempts && verb_create_rejection(message).is_some() =>
+                    {
+                        let reason = verb_create_rejection(message)
+                            .expect("rejection matched in the guard")
+                            .to_string();
+                        eprintln!(
+                            "synthesis attempt {attempt}/{attempts} rejected by the safety gate: {reason}; retrying"
                         );
+                        gate_feedback.push(reason);
                     }
-                    if let Some(ev) = &verb.evidence {
-                        println!("  evidence: {}", ev);
-                    }
-                    println!();
-                    match serde_yaml_ng::to_string(&verb) {
-                        Ok(y) => print!("{}", y),
-                        Err(_) => println!("{:#?}", verb),
-                    }
+                    other => break other,
+                }
+            };
+            let server::AdminResponse::VerbCreated {
+                verb,
+                persisted,
+                preview_digest,
+            } = response
+            else {
+                return render_verb_create_terminal(response, json);
+            };
+            if json {
+                return print_json(&serde_json::json!({
+                    "schema_version": JSON_SCHEMA_VERSION,
+                    "type": "verb",
+                    "persisted": persisted,
+                    "preview_digest": preview_digest,
+                    "verb": verb,
+                }));
+            }
+            print_verb_create_human(&verb, persisted);
+            let Some(digest) = preview_digest.filter(|_| !persisted) else {
+                return Ok(());
+            };
+            let short = digest.get(..12).unwrap_or(&digest).to_string();
+            println!();
+            println!(
+                "candidate: {}...",
+                paint(&short, AnsiColor::Bold, color_enabled_for_stdout())
+            );
+            println!("  install: guard verb create --from-preview {short}");
+            if yes || !access_review_is_interactive() {
+                return Ok(());
+            }
+            if !prompt_verb_create_now(&short, color_enabled_for_stderr())? {
+                return Ok(());
+            }
+            let response = client
+                .send_admin(server::AdminRequest::VerbCreateFromPreview { digest })
+                .await
+                .map_err(|e| describe_connect_failure(e, &client, source))?;
+            match response {
+                server::AdminResponse::VerbCreated { verb, .. } => {
+                    println!(
+                        "Created verb '{}' and added it to the catalog (candidate {short}).",
+                        verb.name
+                    );
                     Ok(())
                 }
-                server::AdminResponse::Error { message } => {
-                    eprintln!("error: {}", message);
-                    std::process::exit(1);
-                }
-                _ => {
-                    eprintln!("unexpected response");
-                    std::process::exit(1);
-                }
+                other => render_verb_create_terminal(other, false),
             }
         }
         VerbCommands::Coverage { command } => match command {
@@ -949,6 +1002,114 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                 }
             }
         },
+    }
+}
+
+/// Automatic re-synthesis attempts after a safety-gate rejection when neither
+/// `--retries` nor the client config chooses a count.
+const VERB_CREATE_DEFAULT_RETRIES: u32 = 4;
+
+/// The gate complaint inside a daemon verb-create rejection, or `None` for an
+/// operational error (unreachable daemon, missing LLM key, empty prose) that a
+/// re-synthesis cannot fix.
+fn verb_create_rejection(message: &str) -> Option<&str> {
+    [
+        "synthesized verb rejected by the safety gate: ",
+        "synthesized verb rejected by validation: ",
+        "previewed verb rejected by the safety gate: ",
+        "previewed verb rejected by validation: ",
+    ]
+    .iter()
+    .find_map(|prefix| message.strip_prefix(prefix))
+}
+
+fn print_verb_create_human(verb: &guard::gating::verb::Verb, persisted: bool) {
+    if persisted {
+        println!("Created verb '{}' and added it to the catalog:", verb.name);
+    } else {
+        println!(
+            "Preview of verb '{}' (NOT written). Install exactly this candidate with --from-preview; every created verb is non-trusted and re-validated by the safety gate.",
+            verb.name
+        );
+    }
+    if let Some(ev) = &verb.evidence {
+        println!("  evidence: {}", ev);
+    }
+    println!();
+    match serde_yaml_ng::to_string(verb) {
+        Ok(y) => print!("{}", y),
+        Err(_) => println!("{:#?}", verb),
+    }
+}
+
+/// Terminal rendering for a verb-create response outside the interactive
+/// preview flow: a persisted install (including --from-preview) or a final
+/// error. A gate rejection gains one sentence telling the operator what to
+/// change in their prose, since the model, not the operator, wrote the
+/// rejected artifact.
+fn render_verb_create_terminal(response: server::AdminResponse, json: bool) -> Result<()> {
+    match response {
+        server::AdminResponse::VerbCreated {
+            verb,
+            persisted,
+            preview_digest,
+        } => {
+            if json {
+                return print_json(&serde_json::json!({
+                    "schema_version": JSON_SCHEMA_VERSION,
+                    "type": "verb",
+                    "persisted": persisted,
+                    "preview_digest": preview_digest,
+                    "verb": verb,
+                }));
+            }
+            print_verb_create_human(&verb, persisted);
+            Ok(())
+        }
+        server::AdminResponse::Error { message } => {
+            match verb_create_rejection(&message)
+                .and_then(guard::gating::verb::gate_rejection_guidance)
+            {
+                Some(guidance) => eprintln!("error: {message}; {guidance}"),
+                None => eprintln!("error: {message}"),
+            }
+            std::process::exit(1);
+        }
+        _ => {
+            eprintln!("unexpected response");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Offer to install the just-previewed candidate. Same person-present contract
+/// as the access review prompt: answers come from stdin and the prompt renders
+/// on stderr, leaving stdout to the candidate itself.
+fn prompt_verb_create_now(candidate: &str, colors: bool) -> Result<bool> {
+    loop {
+        eprint!(
+            "{} [c]reate now / [q]uit: ",
+            paint(candidate, AnsiColor::Bold, colors)
+        );
+        std::io::stderr().flush()?;
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line)? == 0 {
+            // EOF on the terminal (Ctrl-D) declines the install.
+            eprintln!();
+            return Ok(false);
+        }
+        match parse_verb_create_choice(&line) {
+            Some(create) => return Ok(create),
+            None => eprintln!("answer c or q"),
+        }
+    }
+}
+
+fn parse_verb_create_choice(input: &str) -> Option<bool> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "c" | "create" | "y" | "yes" => Some(true),
+        "q" | "quit" | "n" | "no" => Some(false),
+        _ => None,
     }
 }
 
@@ -2351,6 +2512,53 @@ mod tests {
             }],
         };
         assert!(!access_decision_failed(&all_succeeded));
+    }
+
+    #[test]
+    fn verb_create_rejection_extracts_only_gate_complaints() {
+        assert_eq!(
+            verb_create_rejection(
+                "synthesized verb rejected by the safety gate: parameter 'x' is too permissive"
+            ),
+            Some("parameter 'x' is too permissive")
+        );
+        assert_eq!(
+            verb_create_rejection(
+                "synthesized verb rejected by validation: verb 'x' declares parameter 'op' but no template references {op}"
+            ),
+            Some("verb 'x' declares parameter 'op' but no template references {op}")
+        );
+        assert_eq!(
+            verb_create_rejection("previewed verb rejected by the safety gate: shape changed"),
+            Some("shape changed")
+        );
+        // Operational failures never trigger a re-synthesis.
+        assert_eq!(verb_create_rejection("verb synthesis failed: no key"), None);
+        assert_eq!(
+            verb_create_rejection("verb create requires non-empty --prompt prose"),
+            None
+        );
+    }
+
+    #[test]
+    fn verb_create_choice_accepts_create_and_quit_spellings() {
+        for input in ["c", "C", "create", "y", "yes", " c \n"] {
+            assert_eq!(
+                parse_verb_create_choice(input),
+                Some(true),
+                "input {input:?}"
+            );
+        }
+        for input in ["q", "quit", "n", "no"] {
+            assert_eq!(
+                parse_verb_create_choice(input),
+                Some(false),
+                "input {input:?}"
+            );
+        }
+        for input in ["", "maybe", "cq"] {
+            assert_eq!(parse_verb_create_choice(input), None, "input {input:?}");
+        }
     }
 
     #[test]

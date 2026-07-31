@@ -445,14 +445,29 @@ enum VerbCommands {
     #[clap(hide = true)]
     Create {
         /// Plain-language description of the operation to expose as a verb.
-        #[arg(long)]
-        prompt: String,
+        #[arg(
+            long,
+            required_unless_present = "from_preview",
+            conflicts_with = "from_preview"
+        )]
+        prompt: Option<String>,
         /// Optional hint: the target binary (e.g. cmk, kubectl).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "from_preview")]
         binary: Option<String>,
         /// Synthesize and show the verb but do not write it to the catalog.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "from_preview")]
         preview: bool,
+        /// Install a previewed candidate exactly as reviewed, by its digest or
+        /// an unambiguous prefix. No LLM call.
+        #[arg(long, value_name = "DIGEST")]
+        from_preview: Option<String>,
+        /// Automatic re-synthesis attempts after a safety-gate rejection
+        /// (0 disables). Defaults to the client config or 4.
+        #[arg(long, value_name = "N", conflicts_with = "from_preview")]
+        retries: Option<u32>,
+        /// Skip the interactive create-now prompt after a terminal preview.
+        #[arg(long, action = ArgAction::SetTrue)]
+        yes: bool,
         #[arg(long)]
         socket: Option<String>,
         /// Emit the synthesized verb as machine-readable JSON.

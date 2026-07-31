@@ -397,13 +397,24 @@ pub enum AdminRequest {
     },
     /// Synthesize a typed verb from operator prose via the LLM and (unless
     /// `preview`) append it to the catalog with the prose + evidence recorded.
-    /// Operator-only (mutates the catalog).
+    /// Operator-only (mutates the catalog). `gate_feedback` carries safety-gate
+    /// complaints about prior candidates for the same prose, so a client-driven
+    /// retry can steer the next synthesis away from the rejected shape.
     VerbCreate {
         prose: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         binary_hint: Option<String>,
         #[serde(default)]
         preview: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        gate_feedback: Vec<String>,
+    },
+    /// Install a previously previewed synthesis candidate exactly as reviewed,
+    /// addressed by its definition digest or an unambiguous prefix. No LLM
+    /// call; the stored candidate re-passes the safety gate and catalog
+    /// validation at install time. Operator-only (mutates the catalog).
+    VerbCreateFromPreview {
+        digest: String,
     },
     /// List evaluator-generated API verb coverage. Operator-only because
     /// coverage reveals policy topology and evaluator regime identifiers.
@@ -701,6 +712,10 @@ pub enum AdminResponse {
         verb: guard::gating::verb::Verb,
         /// True when the verb was written to the catalog; false for a preview.
         persisted: bool,
+        /// Definition digest of a previewed or preview-installed candidate.
+        /// Addresses the stored candidate in `VerbCreateFromPreview`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preview_digest: Option<String>,
     },
     VerbCoverage {
         items: Vec<guard::gating::api_promotion::ApiCoverageEntry>,

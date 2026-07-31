@@ -270,6 +270,9 @@ struct ServerState {
     approvals: Arc<RwLock<ApprovalRegistry>>,
     /// Operator-authored verb catalog (the typed, least-expressive interface).
     verbs: Arc<RwLock<VerbCatalog>>,
+    /// Previewed synthesis candidates addressable by definition digest, so
+    /// `verb create --from-preview` installs exactly the reviewed shape.
+    verb_previews: Arc<RwLock<admin::VerbPreviewCache>>,
     /// Reusable grants and their generated typed verbs.
     saved_grants: Arc<RwLock<SavedGrantCatalog>>,
     /// Durable requests to amend a live or saved grant.
@@ -325,6 +328,7 @@ impl ServerState {
             provisional: Arc::new(RwLock::new(ProvisionalRegistry::new())),
             approvals: Arc::new(RwLock::new(ApprovalRegistry::new())),
             verbs: Arc::new(RwLock::new(VerbCatalog::empty())),
+            verb_previews: Arc::new(RwLock::new(admin::VerbPreviewCache::default())),
             saved_grants: Arc::new(RwLock::new(SavedGrantCatalog::empty())),
             grant_requests: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
             grant_request_transition_gate: Arc::new(Mutex::new(())),

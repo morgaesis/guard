@@ -794,7 +794,7 @@ async fn reduce_access_intent(
     let mut candidate = server
         .state
         .evaluator
-        .synthesize_verb(intent, None)
+        .synthesize_verb(intent, None, &[])
         .await
         .map_err(|error| {
             format!("access intent could not be reduced to typed coverage: {error}")
@@ -3784,6 +3784,7 @@ pub(super) async fn handle_admin_request(
                 Some(verb) => AdminResponse::VerbCreated {
                     verb,
                     persisted: true,
+                    preview_digest: None,
                 },
                 None => AdminResponse::Error {
                     message: format!("unknown verb: '{name}'"),
@@ -3802,6 +3803,7 @@ pub(super) async fn handle_admin_request(
             prose,
             binary_hint,
             preview,
+            gate_feedback,
         } => {
             let prose_norm = normalize_ws(&prose);
             if prose_norm.is_empty() {
@@ -3812,7 +3814,7 @@ pub(super) async fn handle_admin_request(
             let mut verb = match server
                 .state
                 .evaluator
-                .synthesize_verb(&prose, binary_hint.as_deref())
+                .synthesize_verb(&prose, binary_hint.as_deref(), &gate_feedback)
                 .await
             {
                 Ok(v) => v,
@@ -3851,21 +3853,78 @@ pub(super) async fn handle_admin_request(
             };
             match result {
                 Ok(()) => {
-                    if !preview {
+                    if preview {
+                        // Store the reviewed candidate so a later install can
+                        // reproduce it exactly instead of synthesizing again.
+                        let digest = verb.definition_digest();
+                        server
+                            .state
+                            .verb_previews
+                            .write()
+                            .await
+                            .insert(digest.clone(), verb.clone());
+                        AdminResponse::VerbCreated {
+                            verb,
+                            persisted: false,
+                            preview_digest: Some(digest),
+                        }
+                    } else {
                         server.emit_audit_ungated(
                             AuditEvent::new(AuditKind::VerbCreated)
                                 .field("name", &verb.name)
                                 .field("consequence", verb.consequence.as_str())
                                 .field("trusted", verb.trusted),
                         );
-                    }
-                    AdminResponse::VerbCreated {
-                        verb,
-                        persisted: !preview,
+                        AdminResponse::VerbCreated {
+                            verb,
+                            persisted: true,
+                            preview_digest: None,
+                        }
                     }
                 }
                 Err(e) => AdminResponse::Error {
                     message: format!("synthesized verb rejected by validation: {e}"),
+                },
+            }
+        }
+        AdminRequest::VerbCreateFromPreview { digest } => {
+            let stored = server.state.verb_previews.read().await.lookup(&digest);
+            let (full_digest, verb) = match stored {
+                Ok(found) => found,
+                Err(message) => return AdminResponse::Error { message },
+            };
+            // The gate re-runs at install time: the daemon's rules may have
+            // tightened since the preview, and the stored shape must never
+            // outrank a live rejection.
+            if let Err(e) = guard::gating::verb::validate_synthesized_safety(&verb) {
+                return AdminResponse::Error {
+                    message: format!("previewed verb rejected by the safety gate: {e}"),
+                };
+            }
+            let result = server.state.verbs.write().await.append_verb(&verb);
+            match result {
+                Ok(()) => {
+                    server
+                        .state
+                        .verb_previews
+                        .write()
+                        .await
+                        .remove(&full_digest);
+                    server.emit_audit_ungated(
+                        AuditEvent::new(AuditKind::VerbCreated)
+                            .field("name", &verb.name)
+                            .field("consequence", verb.consequence.as_str())
+                            .field("trusted", verb.trusted)
+                            .field("preview_digest", &full_digest),
+                    );
+                    AdminResponse::VerbCreated {
+                        verb,
+                        persisted: true,
+                        preview_digest: Some(full_digest),
+                    }
+                }
+                Err(e) => AdminResponse::Error {
+                    message: format!("previewed verb rejected by validation: {e}"),
                 },
             }
         }
@@ -4071,7 +4130,11 @@ pub(super) async fn handle_admin_request(
                         message: "regeneration requires --prompt or a saved prompt".to_string(),
                     };
                 };
-                let synthesized = match server.state.evaluator.synthesize_verb(&prompt, None).await
+                let synthesized = match server
+                    .state
+                    .evaluator
+                    .synthesize_verb(&prompt, None, &[])
+                    .await
                 {
                     Ok(verb) => verb,
                     Err(error) => {
@@ -4914,6 +4977,57 @@ fn normalize_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+const VERB_PREVIEW_CAPACITY: usize = 32;
+
+/// Most recently previewed synthesis candidates, keyed by definition digest,
+/// so `verb create --from-preview` installs exactly the candidate the operator
+/// reviewed. Bounded and in-memory: a preview is a short-lived review aid, not
+/// durable catalog state, and it does not survive a daemon restart.
+#[derive(Default)]
+pub(super) struct VerbPreviewCache {
+    entries: std::collections::VecDeque<(String, Verb)>,
+}
+
+impl VerbPreviewCache {
+    /// Store one previewed candidate, most recent first. Re-previewing an
+    /// identical candidate refreshes its position instead of duplicating it.
+    pub(super) fn insert(&mut self, digest: String, verb: Verb) {
+        self.entries.retain(|(existing, _)| existing != &digest);
+        self.entries.push_front((digest, verb));
+        self.entries.truncate(VERB_PREVIEW_CAPACITY);
+    }
+
+    /// Resolve a full digest or an unambiguous prefix to the stored candidate
+    /// and its full digest. Unknown and ambiguous references are distinct,
+    /// actionable errors.
+    pub(super) fn lookup(&self, reference: &str) -> Result<(String, Verb), String> {
+        if reference.is_empty() || !reference.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(format!(
+                "'{reference}' is not a preview digest; pass the hex digest (or a prefix) printed by guard verb create --preview"
+            ));
+        }
+        let matched: Vec<&(String, Verb)> = self
+            .entries
+            .iter()
+            .filter(|(digest, _)| digest.starts_with(reference))
+            .collect();
+        match matched.as_slice() {
+            [] => Err(format!(
+                "no previewed candidate matches '{reference}'; previews live only for the daemon's lifetime, so run guard verb create --preview again"
+            )),
+            [(digest, verb)] => Ok((digest.clone(), verb.clone())),
+            _ => Err(format!(
+                "preview digest prefix '{reference}' is ambiguous; use more characters"
+            )),
+        }
+    }
+
+    /// Drop one stored candidate after it is installed.
+    pub(super) fn remove(&mut self, digest: &str) {
+        self.entries.retain(|(existing, _)| existing != digest);
+    }
+}
+
 #[cfg(test)]
 fn generated_verb_delta(old: &[Verb], new: &[Verb]) -> (Vec<String>, Vec<String>, Vec<String>) {
     let old = old
@@ -5377,6 +5491,67 @@ async fn handle_confirm(
         exit_code: None,
         stdout: None,
         stderr: None,
+    }
+}
+
+#[cfg(test)]
+mod verb_preview_cache_tests {
+    use super::*;
+
+    fn candidate(name: &str) -> Verb {
+        serde_yaml_ng::from_str(&format!(
+            "name: {name}\nbinary: rustc\nargs: ['--version']\nconsequence: reversible\n"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn lookup_resolves_full_digest_and_unambiguous_prefix() {
+        let mut cache = VerbPreviewCache::default();
+        let verb = candidate("check-compiler");
+        let digest = verb.definition_digest();
+        cache.insert(digest.clone(), verb);
+
+        let (found, _) = cache.lookup(&digest).unwrap();
+        assert_eq!(found, digest);
+        let (found, _) = cache.lookup(&digest[..8]).unwrap();
+        assert_eq!(found, digest);
+
+        cache.remove(&digest);
+        assert!(cache.lookup(&digest).unwrap_err().contains("no previewed"));
+    }
+
+    #[test]
+    fn lookup_rejects_empty_ambiguous_and_non_hex_references() {
+        let mut cache = VerbPreviewCache::default();
+        // Two synthetic digests sharing a prefix make any shared prefix
+        // ambiguous while full digests stay resolvable.
+        cache.insert(format!("aa{}", "0".repeat(62)), candidate("first"));
+        cache.insert(format!("ab{}", "0".repeat(62)), candidate("second"));
+
+        assert!(cache
+            .lookup("")
+            .unwrap_err()
+            .contains("not a preview digest"));
+        assert!(cache
+            .lookup("not-hex")
+            .unwrap_err()
+            .contains("not a preview digest"));
+        assert!(cache.lookup("a").unwrap_err().contains("ambiguous"));
+        assert!(cache.lookup("aa").is_ok());
+    }
+
+    #[test]
+    fn capacity_evicts_the_oldest_preview() {
+        let mut cache = VerbPreviewCache::default();
+        for index in 0..=VERB_PREVIEW_CAPACITY {
+            let digest = format!("{index:02x}{}", "f".repeat(62));
+            cache.insert(digest, candidate("evict-probe"));
+        }
+        let oldest = format!("{:02x}{}", 0, "f".repeat(62));
+        assert!(cache.lookup(&oldest).is_err(), "oldest entry must age out");
+        let newest = format!("{:02x}{}", VERB_PREVIEW_CAPACITY, "f".repeat(62));
+        assert!(cache.lookup(&newest).is_ok());
     }
 }
 

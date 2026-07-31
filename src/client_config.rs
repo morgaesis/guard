@@ -9,6 +9,10 @@ pub struct ClientConfig {
     pub auth_token: Option<String>,
     pub admin_token: Option<String>,
     pub default_user: Option<String>,
+    /// Automatic re-synthesis attempts when `guard verb create` produces a
+    /// candidate the safety gate rejects. The `--retries` flag overrides it;
+    /// unset uses the CLI default and 0 disables retrying.
+    pub verb_create_retries: Option<u32>,
 }
 
 impl ClientConfig {
