@@ -36,6 +36,10 @@ pub struct VerbContext {
     /// same catalog read that produced `catalog_version`. Held approvals bind
     /// to it so unrelated catalog changes do not void them.
     pub verb_digest: Option<String>,
+    /// True only when every selected cell is an operator-approved session
+    /// `evaluate` cell. The executor may then honor the access grant without
+    /// asking the evaluator to decide the same typed operation again.
+    pub access_evaluation_override_eligible: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -259,6 +263,13 @@ pub fn resolve_scoped_matches(
 
     let (context, revert) = if !plan_conflict {
         let first = selected[0];
+        let access_evaluation_override_eligible = decision == VerbDecision::Evaluate
+            && selected.iter().all(|matched| {
+                matched.scope == VerbMatchScope::Session
+                    && matched.matched.action == CoverageAction::Evaluate
+                    && matched.effective_action == CoverageAction::Evaluate
+                    && matched.matched.environment_authorized
+            });
         let class = selected
             .iter()
             .map(|matched| matched.matched.rendered.consequence)
@@ -273,6 +284,7 @@ pub fn resolve_scoped_matches(
                 params: first.matched.rendered.params.clone(),
                 catalog_version,
                 verb_digest: None,
+                access_evaluation_override_eligible,
             }),
             revert,
         )
