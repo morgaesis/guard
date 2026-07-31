@@ -32,6 +32,10 @@ pub struct VerbContext {
     pub trusted: bool,
     pub params: std::collections::BTreeMap<String, String>,
     pub catalog_version: u64,
+    /// Definition digest of the matched verb, captured by the caller from the
+    /// same catalog read that produced `catalog_version`. Held approvals bind
+    /// to it so unrelated catalog changes do not void them.
+    pub verb_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -268,6 +272,7 @@ pub fn resolve_scoped_matches(
                 trusted: true,
                 params: first.matched.rendered.params.clone(),
                 catalog_version,
+                verb_digest: None,
             }),
             revert,
         )
@@ -369,7 +374,7 @@ fn value_domain_dominates(candidate: &ValueDomain, other: &ValueDomain) -> Optio
     Some(strict)
 }
 
-fn reversibility_rank(class: Reversibility) -> u8 {
+pub(crate) fn reversibility_rank(class: Reversibility) -> u8 {
     match class {
         Reversibility::Reversible => 0,
         Reversibility::Recoverable => 1,

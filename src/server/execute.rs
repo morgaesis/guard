@@ -965,7 +965,7 @@ async fn resolve_verb_context<W: AsyncWrite + Unpin>(
         return Ok(VerbResolution::none());
     }
 
-    let (raw_matches, version) = {
+    let (raw_matches, version, definition_digests) = {
         let mut cat = server.state.verbs.write().await;
         if let Err(e) = cat.reload_if_stale() {
             tracing::warn!("verb catalog reload failed, using previous: {}", e);
@@ -985,16 +985,23 @@ async fn resolve_verb_context<W: AsyncWrite + Unpin>(
             .iter()
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect::<BTreeMap<_, _>>();
-        (
-            cat.match_command_all_with_environment(
-                &request.binary,
-                &request.args,
-                &plain,
-                &secrets,
-                &secret_files,
-            ),
-            cat.version(),
-        )
+        let raw_matches = cat.match_command_all_with_environment(
+            &request.binary,
+            &request.args,
+            &plain,
+            &secrets,
+            &secret_files,
+        );
+        // Captured under the same catalog read as the version, so a held
+        // approval binds to exactly the definition that produced the match.
+        let definition_digests = raw_matches
+            .iter()
+            .filter_map(|matched| {
+                cat.verb_definition_digest(&matched.rendered.name)
+                    .map(|digest| (matched.rendered.name.clone(), digest))
+            })
+            .collect::<BTreeMap<_, _>>();
+        (raw_matches, cat.version(), definition_digests)
     };
     if raw_matches.is_empty() {
         return Ok(VerbResolution::none());
@@ -1051,7 +1058,10 @@ async fn resolve_verb_context<W: AsyncWrite + Unpin>(
             overridden,
         });
     }
-    let resolution = resolve_scoped_matches(scoped, version);
+    let mut resolution = resolve_scoped_matches(scoped, version);
+    if let Some(context) = resolution.context.as_mut() {
+        context.verb_digest = definition_digests.get(&context.name).cloned();
+    }
     // The composed resolution carries the selected coverage's revert plan
     // exactly when it produced a verb context; apply it to the pending
     // request so the gate sees the operator-authored rollback.

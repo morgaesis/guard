@@ -25,6 +25,12 @@ Rules:
 - Use {param} placeholders in args; each renders as exactly ONE argv element.
   Never put shell operators, pipes, redirects, spaces-as-separators, or a second
   command in one arg. Never use sh -c / cmd /c / -c style interpreters.
+- An exec target must address a stable controller reference such as
+  deploy/<name>, never a bare pod name.
+- A multi-token subcommand must be separate argv elements or separate
+  enumerated params, never one whitespace-bearing parameter.
+- Parameter patterns must enumerate the allowed values (e.g. ^(status|df)$)
+  rather than admit free text.
 - allow_dash MUST be false unless a value is legitimately a leading-dash token.
 - consequence: "reversible" for read-only/list/get/idempotent; "recoverable"
   ONLY for a mutation with a clean structured inverse, and then ALSO provide a
