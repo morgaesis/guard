@@ -657,6 +657,13 @@ impl ApiProxy {
     async fn route(&self, mut req: Request<Incoming>, conn_id: u64) -> Response<ProxyBody> {
         let method = req.method().clone();
         let path = req.uri().path().to_string();
+        if req.headers().keys().any(is_identity_header) {
+            return self.status_resp(
+                StatusCode::FORBIDDEN,
+                "guard api-proxy: identity impersonation is not supported; the request was not forwarded",
+                "Forbidden",
+            );
+        }
         let session_token = match take_guard_session(req.headers_mut()) {
             Ok(token) => token,
             Err(reason) => {
@@ -2285,20 +2292,10 @@ fn is_hop_by_hop(name: &header::HeaderName) -> bool {
     )
 }
 
-/// Headers that carry or override the upstream request identity. A brokered
-/// client may authenticate to Guard with a session bearer, while the daemon's
-/// separate upstream credential talks to the apiserver. These headers reassign
-/// the request's authenticated identity, and where the daemon's credential
-/// holds the Kubernetes `impersonate` RBAC permission (the identity-override grant, common for
-/// admin/CI service accounts) the apiserver would evaluate a forwarded header
-/// identity instead of the operator's. Since ApiPolicy matches only
-/// verb/resource/namespace and never identity, stripping these headers keeps
-/// each forwarded request bound to the daemon's own upstream credential, so
-/// authorization and ApiPolicy apply to the operator's identity rather than
-/// any header-supplied user/group/serviceaccount. `X-Remote-*` are the
-/// equivalent front-proxy identity headers for aggregated API servers; strip
-/// them for the same reason, though they only take effect where the apiserver
-/// already trusts this proxy's client certificate.
+/// Headers that carry or override the upstream request identity. Guard rejects
+/// requests containing them before policy evaluation or forwarding because
+/// its API policy has no identity dimension. The forwarding layer keeps this
+/// defense in depth and never copies one to the upstream request.
 fn is_identity_header(name: &header::HeaderName) -> bool {
     let s = name.as_str();
     s.starts_with("impersonate-") || s.starts_with("x-remote-")

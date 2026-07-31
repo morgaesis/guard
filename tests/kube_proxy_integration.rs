@@ -888,7 +888,7 @@ async fn spawn_header_echo_upstream() -> String {
 /// (the operator's own credential may hold the `impersonate` RBAC verb, which
 /// would let an agent re-author a request under an arbitrary identity).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn proxy_denies_subresource_and_strips_identity_headers() {
+async fn proxy_denies_subresource_and_identity_override_headers() {
     let mock_base = spawn_header_echo_upstream().await;
     let kubeconfig = format!(
         "apiVersion: v1\nkind: Config\ncurrent-context: ctx\nclusters:\n  - name: c\n    cluster: {{server: \"{mock_base}\"}}\ncontexts:\n  - name: ctx\n    context: {{cluster: c, user: u}}\nusers:\n  - name: u\n    user: {{}}\n"
@@ -929,8 +929,8 @@ async fn proxy_denies_subresource_and_strips_identity_headers() {
         .unwrap();
     assert_eq!(resp.status(), 403, "node proxy subresource must be denied");
 
-    // 2. An allowed request carrying spoofed identity headers must not have
-    // them forwarded upstream; the mock echoes back what it actually saw.
+    // 2. A request carrying identity headers is rejected instead of silently
+    // changing the question by evaluating it as the proxy identity.
     let resp = client
         .get(format!("{base}/api/v1/namespaces/dev/pods"))
         .header("Impersonate-User", "system:masters")
@@ -939,23 +939,9 @@ async fn proxy_denies_subresource_and_strips_identity_headers() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200, "the underlying read is allowed");
+    assert_eq!(resp.status(), 403, "identity overrides must be rejected");
     let v: Value = resp.json().await.unwrap();
-    let received = v["receivedHeaders"]
-        .as_object()
-        .expect("receivedHeaders object");
-    assert!(
-        !received.contains_key("impersonate-user"),
-        "Impersonate-User must not reach the apiserver, got headers: {received:?}"
-    );
-    assert!(
-        !received.contains_key("impersonate-group"),
-        "Impersonate-Group must not reach the apiserver, got headers: {received:?}"
-    );
-    assert!(
-        !received.contains_key("x-remote-user"),
-        "X-Remote-User must not reach the apiserver, got headers: {received:?}"
-    );
+    assert!(v["message"].as_str().unwrap().contains("not supported"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

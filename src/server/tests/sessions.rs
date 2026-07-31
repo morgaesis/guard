@@ -777,7 +777,7 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded() {
         Some(0)
     );
 
-    let target = crate::session::session_reference(&restored_access.token);
+    let target = "agent:1001".to_string();
     let extension = AdminRequest::AccessExtend {
         target: target.clone(),
         intent: "Inspect fixture".to_string(),
@@ -790,6 +790,27 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded() {
     };
     assert!(extended[0].success);
     assert_eq!(extended[0].remaining_uses, Some(2));
+    let after_extension = cfg
+        .state
+        .session_store
+        .as_ref()
+        .unwrap()
+        .load_registry()
+        .await
+        .unwrap();
+    assert_eq!(
+        after_extension
+            .access_token_for_principal(&PrincipalKey::from_uid(1001))
+            .as_deref(),
+        Some(restored_access.token.as_str()),
+        "extending the stable agent label must preserve the session identity"
+    );
+    assert!(
+        after_extension
+            .access_grant_uses(&restored_access.token, &first.reference)
+            .is_some(),
+        "extending authority must retain grants already attached to the session"
+    );
     let AdminResponse::AccessDecisions { items: retried } =
         handle_admin_request(&cfg, &daemon, extension.clone()).await
     else {
@@ -811,6 +832,19 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded() {
         panic!("expected converged access extension")
     };
     assert_eq!(retry_after_use[0].remaining_uses, Some(1));
+
+    let AdminResponse::AccessItems { items } =
+        handle_admin_request(&cfg, &worker, AdminRequest::AccessList).await
+    else {
+        panic!("expected access list before revoke")
+    };
+    let session_intent = items
+        .iter()
+        .find(|item| item.kind == "session")
+        .and_then(|item| item.intent.as_deref())
+        .expect("the access session projects its approved intents");
+    assert!(session_intent.contains("Inspect fixture"));
+    assert!(session_intent.contains("Operate fixture"));
 
     assert!(matches!(
         handle_admin_request(
@@ -841,6 +875,48 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded() {
     assert!(restored
         .access_token_for_principal(&PrincipalKey::from_uid(1001))
         .is_none());
+    let AdminResponse::AccessItem { item: orphaned } = handle_admin_request(
+        &cfg,
+        &worker,
+        AdminRequest::AccessShow {
+            reference: first.reference,
+        },
+    )
+    .await
+    else {
+        panic!("expected revoked request projection")
+    };
+    assert_eq!(orphaned.state, "orphaned");
+    assert_eq!(orphaned.use_policy, "unavailable");
+    assert!(orphaned
+        .decided_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("no longer attached")));
+}
+
+#[tokio::test]
+async fn access_request_can_name_multiple_catalog_verbs() {
+    let (mut cfg, _) = make_test_config();
+    cfg.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            "verbs:\n  - name: inspect-a\n    description: Inspect system A\n    binary: true\n    args: []\n    baseline: false\n    consequence: reversible\n    trusted: true\n  - name: inspect-b\n    description: Inspect system B\n    binary: printf\n    args: [b]\n    baseline: false\n    consequence: reversible\n    trusted: true\n",
+        )
+        .unwrap(),
+    ));
+    let worker = CallerIdentity::Unix { uid: 1001 };
+
+    let AdminResponse::AccessItem { item } = handle_admin_request(
+        &cfg,
+        &worker,
+        AdminRequest::AccessRequest {
+            intent: "Use inspect-a and `inspect-b` for this task".to_string(),
+        },
+    )
+    .await
+    else {
+        panic!("expected multi-verb access request")
+    };
+    assert_eq!(item.effective_scope, vec!["inspect-a", "inspect-b"]);
 }
 
 #[tokio::test]

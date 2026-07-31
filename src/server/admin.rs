@@ -676,6 +676,14 @@ fn intent_matches_verb(intent: &str, verb: &Verb) -> bool {
     intent == name || (!description.is_empty() && intent == description) || intent == source
 }
 
+fn intent_mentions_verb_name(intent: &str, verb: &Verb) -> bool {
+    intent
+        .split(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+        })
+        .any(|token| token.eq_ignore_ascii_case(&verb.name))
+}
+
 fn semantic_intent_terms(value: &str) -> std::collections::BTreeSet<String> {
     const STOP_WORDS: &[&str] = &[
         "a", "an", "for", "in", "is", "of", "on", "please", "that", "the", "this", "to", "whether",
@@ -754,6 +762,15 @@ mod semantic_intent_tests {
         let inspect = fixture_verb("ssh-inspect", "Inspect the fake SSH service");
         assert!(semantic_intent_score("Restart the fake SSH service", &inspect).is_none());
     }
+
+    #[test]
+    fn prose_can_select_multiple_catalog_verbs_by_exact_name() {
+        let inspect = fixture_verb("inspect-service", "Inspect the service");
+        let restart = fixture_verb("restart-service", "Restart the service");
+        let intent = "Use `inspect-service` and restart-service for this task.";
+        assert!(intent_mentions_verb_name(intent, &inspect));
+        assert!(intent_mentions_verb_name(intent, &restart));
+    }
 }
 
 async fn reduce_access_intent(
@@ -767,6 +784,14 @@ async fn reduce_access_intent(
         }
         catalog.list()
     };
+    let mentioned = existing
+        .iter()
+        .filter(|verb| intent_mentions_verb_name(intent, verb))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !mentioned.is_empty() {
+        return Ok((mentioned, Vec::new()));
+    }
     let matched = existing
         .iter()
         .filter(|verb| intent_matches_verb(intent, verb))
@@ -1194,6 +1219,7 @@ async fn access_item_for_request(server: &ServerContext, request: &GrantRequest)
     let mut remaining_uses = None;
     let mut grant_uses = None;
     let mut expires_unix = Some(request.expires_unix);
+    let mut active_session_found = false;
     if !request.session_token.is_empty() {
         if let Some(summary) = server
             .state
@@ -1204,6 +1230,7 @@ async fn access_item_for_request(server: &ServerContext, request: &GrantRequest)
             .into_iter()
             .find(|summary| summary.token == request.session_token)
         {
+            active_session_found = true;
             target = summary
                 .scope
                 .label
@@ -1221,8 +1248,13 @@ async fn access_item_for_request(server: &ServerContext, request: &GrantRequest)
     }
     let expired = request.status == GrantRequestStatus::Pending
         && (request.expires_unix == 0 || now_unix() >= request.expires_unix);
+    let orphaned = request.status == GrantRequestStatus::Approved
+        && !request.session_token.is_empty()
+        && !active_session_found;
     let state = if expired {
         "expired"
+    } else if orphaned {
+        "orphaned"
     } else {
         request.status.as_str()
     };
@@ -1253,7 +1285,11 @@ async fn access_item_for_request(server: &ServerContext, request: &GrantRequest)
         },
         intent: Some(redact_output_text(&request.justification)),
         capabilities: capabilities_for_request(server, request).await,
-        decided_reason: request.decided_reason.as_deref().map(redact_output_text),
+        decided_reason: if orphaned {
+            Some("approved authority is no longer attached to an active access session".to_string())
+        } else {
+            request.decided_reason.as_deref().map(redact_output_text)
+        },
     }
 }
 
@@ -1279,6 +1315,19 @@ async fn access_item_for_session(
     } else {
         "active"
     };
+    let mut intents = server
+        .state
+        .grant_requests
+        .read()
+        .await
+        .values()
+        .filter(|request| {
+            request.status == GrantRequestStatus::Approved && request.session_token == summary.token
+        })
+        .map(|request| redact_output_text(&request.justification))
+        .collect::<Vec<_>>();
+    intents.sort();
+    intents.dedup();
     AccessItem {
         reference: reference.clone(),
         kind: "session".to_string(),
@@ -1296,7 +1345,7 @@ async fn access_item_for_session(
         state: state.to_string(),
         next_action: format!("guard access show {reference}"),
         approval_options: Vec::new(),
-        intent: None,
+        intent: (!intents.is_empty()).then(|| intents.join("; ")),
         capabilities: capabilities_for(server, &summary.activated_verbs).await,
         decided_reason: None,
     }
