@@ -1,18 +1,19 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-# Generate host keys if missing
-ssh-keygen -A
-
-# If an authorized key was mounted, install it
-if [ -f /tmp/agent_key.pub ]; then
-    cp /tmp/agent_key.pub /home/agent/.ssh/authorized_keys
-    chown agent:agent /home/agent/.ssh/authorized_keys
-    chmod 600 /home/agent/.ssh/authorized_keys
+# sshd reads the mounted public key directly (StrictModes accepts it: the
+# single-file mount is owned by the agent user and is not group/world
+# writable). No runtime copy, chown, or chmod is needed, so the entrypoint
+# works with CAP_FOWNER dropped.
+if [ ! -r /run/ctf/agent_key.pub ]; then
+    echo "Remote CTF authorized key is unavailable." >&2
+    exit 1
 fi
 
-# Start nginx in background
+mkdir -p /run/sshd
+
+# nginx and sshd are both supervised by the container runtime; PID 1 execs
+# sshd, and a container stop terminates every process in the namespace.
 nginx &
 
-# Start sshd in foreground
 exec /usr/sbin/sshd -D -e

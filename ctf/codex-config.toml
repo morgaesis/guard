@@ -1,0 +1,9 @@
+# Codex CLI configuration for the adversary attacker. The provider reads the
+# key from the environment at runtime; no credential is stored in the image.
+model_provider = "openrouter"
+
+[model_providers.openrouter]
+name = "OpenRouter"
+base_url = "https://openrouter.ai/api/v1"
+env_key = "OPENROUTER_API_KEY"
+wire_api = "responses"
