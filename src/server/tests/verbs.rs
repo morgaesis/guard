@@ -218,6 +218,81 @@ verbs:
     assert!(response.verb_matches[0].selected);
 }
 
+#[tokio::test]
+async fn approved_access_grant_executes_session_evaluate_verb_and_consumes_one_use() {
+    let (mut cfg, _buf) = make_test_config();
+    cfg.config.gate = GateMode::Consequence;
+    cfg.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: reviewed-check
+    binary: true
+    baseline: false
+    consequence: reversible
+    coverage:
+      - name: check
+        action: evaluate
+        required_args: ["--check"]
+"#,
+        )
+        .expect("valid typed catalog"),
+    ));
+    let mut grant = SessionGrant {
+        allow: Vec::new(),
+        deny: Vec::new(),
+        allow_exact: Vec::new(),
+        deny_exact: Vec::new(),
+        activated_verbs: vec!["reviewed-check".to_string()],
+        override_markers: Vec::new(),
+        scope: Default::default(),
+        expires_at: None,
+        prompt_append: None,
+        generated_notes: Vec::new(),
+        static_only: false,
+        auto_amend: false,
+        granted_at: 0,
+        owner: crate::session::SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(
+            1000,
+        )),
+    };
+    grant.scope.access_managed = true;
+    let mut sessions = cfg.state.sessions.write().await;
+    sessions.grant("access".to_string(), grant);
+    assert_eq!(
+        sessions.install_access_grant(
+            "access",
+            Some(2),
+            "gr-test".to_string(),
+            vec!["reviewed-check".to_string()],
+        ),
+        Some(true)
+    );
+    drop(sessions);
+
+    let response = execute_command(
+        raw_request("true", &["--check"], Some("access")),
+        &cfg,
+        &CallerIdentity::Unix { uid: 1000 },
+    )
+    .await
+    .into_response();
+
+    assert!(
+        response.allowed,
+        "the approved typed grant must bypass reevaluation"
+    );
+    assert_eq!(response.exit_code, Some(0));
+    assert_eq!(
+        cfg.state
+            .sessions
+            .read()
+            .await
+            .access_grant_uses("access", "gr-test"),
+        Some((Some(2), Some(1)))
+    );
+}
+
 /// Trusted-verb + consequence-gate interaction: `trusted` only skips the
 /// LLM evaluator (`bypass: false` in the `GateInputs` built for it, see
 /// `try_trusted_verb_allow` in `server::execute`); it must NOT also skip

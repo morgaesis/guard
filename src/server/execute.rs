@@ -266,10 +266,13 @@ async fn execute_after_verb_resolution<W: AsyncWrite + Unpin>(
         .await;
     }
 
-    let force_evaluate = matches!(
-        verb_resolution.decision,
-        VerbDecision::Evaluate | VerbDecision::Conflict
-    );
+    let approved_access_evaluation =
+        access_evaluation_is_approved(phase, &request, &verb_resolution).await;
+    let force_evaluate = !approved_access_evaluation
+        && matches!(
+            verb_resolution.decision,
+            VerbDecision::Evaluate | VerbDecision::Conflict
+        );
 
     request = match apply_session_rules(
         phase,
@@ -326,6 +329,29 @@ async fn execute_after_verb_resolution<W: AsyncWrite + Unpin>(
         },
     )
     .await
+}
+
+async fn access_evaluation_is_approved<W: AsyncWrite + Unpin>(
+    phase: &ExecPhase<'_, W>,
+    request: &ExecuteRequest,
+    resolution: &VerbResolution,
+) -> bool {
+    if !resolution
+        .context
+        .as_ref()
+        .is_some_and(|context| context.access_evaluation_override_eligible)
+    {
+        return false;
+    }
+    let Some(token) = request.session_token.as_deref() else {
+        return false;
+    };
+    let selected = selected_session_verbs(phase);
+    if selected.is_empty() {
+        return false;
+    }
+    let sessions = phase.server.state.sessions.read().await;
+    sessions.is_access_managed(token) && sessions.select_access_requests(token, &selected).is_ok()
 }
 
 async fn canonicalize_request_cwd<W: AsyncWrite + Unpin>(
