@@ -790,27 +790,6 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded() {
     };
     assert!(extended[0].success);
     assert_eq!(extended[0].remaining_uses, Some(2));
-    let after_extension = cfg
-        .state
-        .session_store
-        .as_ref()
-        .unwrap()
-        .load_registry()
-        .await
-        .unwrap();
-    assert_eq!(
-        after_extension
-            .access_token_for_principal(&PrincipalKey::from_uid(1001))
-            .as_deref(),
-        Some(restored_access.token.as_str()),
-        "extending the stable agent label must preserve the session identity"
-    );
-    assert!(
-        after_extension
-            .access_grant_uses(&restored_access.token, &first.reference)
-            .is_some(),
-        "extending authority must retain grants already attached to the session"
-    );
     let AdminResponse::AccessDecisions { items: retried } =
         handle_admin_request(&cfg, &daemon, extension.clone()).await
     else {
@@ -832,19 +811,6 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded() {
         panic!("expected converged access extension")
     };
     assert_eq!(retry_after_use[0].remaining_uses, Some(1));
-
-    let AdminResponse::AccessItems { items } =
-        handle_admin_request(&cfg, &worker, AdminRequest::AccessList).await
-    else {
-        panic!("expected access list before revoke")
-    };
-    let session_intent = items
-        .iter()
-        .find(|item| item.kind == "session")
-        .and_then(|item| item.intent.as_deref())
-        .expect("the access session projects its approved intents");
-    assert!(session_intent.contains("Inspect fixture"));
-    assert!(session_intent.contains("Operate fixture"));
 
     assert!(matches!(
         handle_admin_request(
@@ -875,23 +841,6 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded() {
     assert!(restored
         .access_token_for_principal(&PrincipalKey::from_uid(1001))
         .is_none());
-    let AdminResponse::AccessItem { item: orphaned } = handle_admin_request(
-        &cfg,
-        &worker,
-        AdminRequest::AccessShow {
-            reference: first.reference,
-        },
-    )
-    .await
-    else {
-        panic!("expected revoked request projection")
-    };
-    assert_eq!(orphaned.state, "orphaned");
-    assert_eq!(orphaned.use_policy, "unavailable");
-    assert!(orphaned
-        .decided_reason
-        .as_deref()
-        .is_some_and(|reason| reason.contains("no longer attached")));
 }
 
 #[tokio::test]
@@ -917,6 +866,168 @@ async fn access_request_can_name_multiple_catalog_verbs() {
         panic!("expected multi-verb access request")
     };
     assert_eq!(item.effective_scope, vec!["inspect-a", "inspect-b"]);
+}
+
+#[tokio::test]
+async fn agent_label_extension_preserves_session_grants_and_cumulative_intent() {
+    let (mut cfg, _) = make_test_config();
+    let state = tempfile::tempdir().unwrap();
+    cfg.state.session_store = Some(
+        SessionStore::open(state.path().join("state.db"), 3600)
+            .await
+            .unwrap(),
+    );
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            "verbs:\n  - name: inspect-a\n    description: Inspect system A\n    binary: true\n    args: []\n    baseline: false\n    consequence: reversible\n    trusted: true\n  - name: inspect-b\n    description: Inspect system B\n    binary: printf\n    args: [b]\n    baseline: false\n    consequence: reversible\n    trusted: true\n",
+        )
+        .unwrap(),
+    ));
+    let worker = CallerIdentity::Unix { uid: 1001 };
+    let daemon = CallerIdentity::Unix { uid: 777 };
+    let AdminResponse::AccessItem { item: initial } = handle_admin_request(
+        &cfg,
+        &worker,
+        AdminRequest::AccessRequest {
+            intent: "Inspect system A".to_string(),
+        },
+    )
+    .await
+    else {
+        panic!("expected initial access request")
+    };
+    let initial_reference = initial.reference.clone();
+    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::AccessApprove {
+            handles: vec![initial.reference],
+            uses: Some(1),
+        },
+    )
+    .await
+    else {
+        panic!("expected initial approval")
+    };
+    assert!(items[0].success);
+    let original_token = cfg
+        .state
+        .sessions
+        .read()
+        .await
+        .access_token_for_principal(&PrincipalKey::from_uid(1001))
+        .unwrap();
+
+    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::AccessExtend {
+            target: "agent:1001".to_string(),
+            intent: "Use inspect-b for this task".to_string(),
+            uses: Some(2),
+        },
+    )
+    .await
+    else {
+        panic!("expected access extension")
+    };
+    assert!(items[0].success);
+
+    let sessions = cfg.state.sessions.read().await;
+    assert_eq!(
+        sessions
+            .access_token_for_principal(&PrincipalKey::from_uid(1001))
+            .as_deref(),
+        Some(original_token.as_str())
+    );
+    assert!(sessions
+        .access_grant_uses(&original_token, &initial_reference)
+        .is_some());
+    drop(sessions);
+    let AdminResponse::AccessItems { items } =
+        handle_admin_request(&cfg, &worker, AdminRequest::AccessList).await
+    else {
+        panic!("expected access list")
+    };
+    let session_intent = items
+        .iter()
+        .find(|item| item.kind == "session")
+        .and_then(|item| item.intent.as_deref())
+        .expect("the access session projects its approved intents");
+    assert!(session_intent.contains("Inspect system A"));
+    assert!(session_intent.contains("Use inspect-b for this task"));
+}
+
+#[tokio::test]
+async fn approved_request_without_live_session_projects_as_orphaned() {
+    let (mut cfg, _) = make_test_config();
+    let state = tempfile::tempdir().unwrap();
+    cfg.state.session_store = Some(
+        SessionStore::open(state.path().join("state.db"), 3600)
+            .await
+            .unwrap(),
+    );
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            "verbs:\n  - name: inspect-a\n    description: Inspect system A\n    binary: true\n    args: []\n    baseline: false\n    consequence: reversible\n    trusted: true\n",
+        )
+        .unwrap(),
+    ));
+    let worker = CallerIdentity::Unix { uid: 1001 };
+    let daemon = CallerIdentity::Unix { uid: 777 };
+    let AdminResponse::AccessItem { item: pending } = handle_admin_request(
+        &cfg,
+        &worker,
+        AdminRequest::AccessRequest {
+            intent: "Inspect system A".to_string(),
+        },
+    )
+    .await
+    else {
+        panic!("expected access request")
+    };
+    let request_reference = pending.reference.clone();
+    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::AccessApprove {
+            handles: vec![pending.reference],
+            uses: Some(1),
+        },
+    )
+    .await
+    else {
+        panic!("expected access approval")
+    };
+    let target = items[0].target.clone().unwrap();
+    let AdminResponse::AccessDecisions { items } =
+        handle_admin_request(&cfg, &daemon, AdminRequest::AccessRevoke { target }).await
+    else {
+        panic!("expected access revoke")
+    };
+    assert!(items[0].success);
+
+    let AdminResponse::AccessItem { item: orphaned } = handle_admin_request(
+        &cfg,
+        &worker,
+        AdminRequest::AccessShow {
+            reference: request_reference,
+        },
+    )
+    .await
+    else {
+        panic!("expected orphaned request projection")
+    };
+    assert_eq!(orphaned.state, "orphaned");
+    assert_eq!(orphaned.use_policy, "unavailable");
+    assert!(orphaned
+        .decided_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("no longer attached")));
 }
 
 #[tokio::test]

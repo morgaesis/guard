@@ -2956,6 +2956,141 @@ async fn handle_session_appeal(
     }
 }
 
+async fn list_access_items(server: &ServerContext, caller: &CallerIdentity) -> AdminResponse {
+    let admin = caller_is_session_admin(server, caller);
+    let principal = caller.principal();
+    let requests = server
+        .state
+        .grant_requests
+        .read()
+        .await
+        .values()
+        .filter(|request| {
+            request.requester.is_some() && (admin || scope_eq(&request.requester, &principal))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let sessions = server
+        .state
+        .sessions
+        .read()
+        .await
+        .list()
+        .into_iter()
+        .filter(|summary| {
+            summary.scope.access_managed
+                && (admin
+                    || matches!(
+                        &summary.owner,
+                        SessionOwner::Principal(owner)
+                            if principal.as_ref().is_some_and(|caller| owner.eq_ci(caller))
+                    ))
+        })
+        .collect::<Vec<_>>();
+    let approvals = server
+        .state
+        .approvals
+        .read()
+        .await
+        .list()
+        .into_iter()
+        .filter(|approval| {
+            approval.snapshot.principal.is_some()
+                && (admin || scope_eq(&approval.snapshot.principal, &principal))
+        })
+        .collect::<Vec<_>>();
+    let mut items = Vec::with_capacity(requests.len() + sessions.len() + approvals.len());
+    for request in requests {
+        items.push(access_item_for_request(server, &request).await);
+    }
+    for approval in approvals {
+        items.push(access_item_for_approval(server, &approval).await);
+    }
+    for summary in sessions {
+        items.push(access_item_for_session(server, &summary).await);
+    }
+    items.sort_by(|left, right| {
+        left.requester
+            .cmp(&right.requester)
+            .then(left.kind.cmp(&right.kind))
+            .then(left.reference.cmp(&right.reference))
+    });
+    AdminResponse::AccessItems { items }
+}
+
+async fn show_access_item(
+    server: &ServerContext,
+    caller: &CallerIdentity,
+    reference: &str,
+) -> AdminResponse {
+    let admin = caller_is_session_admin(server, caller);
+    let principal = caller.principal();
+    if let Some(request) = server
+        .state
+        .grant_requests
+        .read()
+        .await
+        .get(reference)
+        .filter(|request| {
+            request.requester.is_some() && (admin || scope_eq(&request.requester, &principal))
+        })
+        .cloned()
+    {
+        AdminResponse::AccessItem {
+            item: access_item_for_request(server, &request).await,
+        }
+    } else if let Some(approval) = server
+        .state
+        .approvals
+        .read()
+        .await
+        .get(reference)
+        .filter(|approval| {
+            approval.snapshot.principal.is_some()
+                && (admin || scope_eq(&approval.snapshot.principal, &principal))
+        })
+        .cloned()
+    {
+        AdminResponse::AccessItem {
+            item: access_item_for_approval(server, &approval).await,
+        }
+    } else {
+        let mut candidates = server
+            .state
+            .sessions
+            .read()
+            .await
+            .list()
+            .into_iter()
+            .filter(|summary| {
+                summary.scope.access_managed
+                    && (admin
+                        || matches!(
+                            &summary.owner,
+                            SessionOwner::Principal(owner)
+                                if principal.as_ref().is_some_and(|caller| owner.eq_ci(caller))
+                        ))
+            })
+            .filter(|summary| {
+                summary.scope.label.as_deref() == Some(reference)
+                    || session_reference(&summary.token) == reference
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| left.token.cmp(&right.token));
+        match candidates.as_slice() {
+            [summary] => AdminResponse::AccessItem {
+                item: access_item_for_session(server, summary).await,
+            },
+            [] => AdminResponse::Error {
+                message: "unknown or unauthorized access reference".to_string(),
+            },
+            _ => AdminResponse::Error {
+                message: format!("access target '{reference}' is ambiguous"),
+            },
+        }
+    }
+}
+
 pub(super) async fn handle_admin_request(
     server: &ServerContext,
     caller: &CallerIdentity,
@@ -4771,138 +4906,9 @@ pub(super) async fn handle_admin_request(
             },
             Err(message) => AdminResponse::Error { message },
         },
-        AdminRequest::AccessList => {
-            let admin = caller_is_session_admin(server, caller);
-            let principal = caller.principal();
-            let requests = server
-                .state
-                .grant_requests
-                .read()
-                .await
-                .values()
-                .filter(|request| {
-                    request.requester.is_some()
-                        && (admin || scope_eq(&request.requester, &principal))
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            let sessions = server
-                .state
-                .sessions
-                .read()
-                .await
-                .list()
-                .into_iter()
-                .filter(|summary| {
-                    summary.scope.access_managed
-                        && (admin
-                            || matches!(
-                                &summary.owner,
-                                SessionOwner::Principal(owner)
-                                    if principal.as_ref().is_some_and(|caller| owner.eq_ci(caller))
-                            ))
-                })
-                .collect::<Vec<_>>();
-            let approvals = server
-                .state
-                .approvals
-                .read()
-                .await
-                .list()
-                .into_iter()
-                .filter(|approval| {
-                    approval.snapshot.principal.is_some()
-                        && (admin || scope_eq(&approval.snapshot.principal, &principal))
-                })
-                .collect::<Vec<_>>();
-            let mut items = Vec::with_capacity(requests.len() + sessions.len() + approvals.len());
-            for request in requests {
-                items.push(access_item_for_request(server, &request).await);
-            }
-            for approval in approvals {
-                items.push(access_item_for_approval(server, &approval).await);
-            }
-            for summary in sessions {
-                items.push(access_item_for_session(server, &summary).await);
-            }
-            items.sort_by(|left, right| {
-                left.requester
-                    .cmp(&right.requester)
-                    .then(left.kind.cmp(&right.kind))
-                    .then(left.reference.cmp(&right.reference))
-            });
-            AdminResponse::AccessItems { items }
-        }
+        AdminRequest::AccessList => Box::pin(list_access_items(server, caller)).await,
         AdminRequest::AccessShow { reference } => {
-            let admin = caller_is_session_admin(server, caller);
-            let principal = caller.principal();
-            if let Some(request) = server
-                .state
-                .grant_requests
-                .read()
-                .await
-                .get(&reference)
-                .filter(|request| {
-                    request.requester.is_some()
-                        && (admin || scope_eq(&request.requester, &principal))
-                })
-                .cloned()
-            {
-                AdminResponse::AccessItem {
-                    item: access_item_for_request(server, &request).await,
-                }
-            } else if let Some(approval) = server
-                .state
-                .approvals
-                .read()
-                .await
-                .get(&reference)
-                .filter(|approval| {
-                    approval.snapshot.principal.is_some()
-                        && (admin || scope_eq(&approval.snapshot.principal, &principal))
-                })
-                .cloned()
-            {
-                AdminResponse::AccessItem {
-                    item: access_item_for_approval(server, &approval).await,
-                }
-            } else {
-                let mut candidates = server
-                    .state
-                    .sessions
-                    .read()
-                    .await
-                    .list()
-                    .into_iter()
-                    .filter(|summary| {
-                        summary.scope.access_managed
-                            && (admin
-                                || matches!(
-                                    &summary.owner,
-                                    SessionOwner::Principal(owner)
-                                        if principal
-                                            .as_ref()
-                                            .is_some_and(|caller| owner.eq_ci(caller))
-                                ))
-                    })
-                    .filter(|summary| {
-                        summary.scope.label.as_deref() == Some(reference.as_str())
-                            || session_reference(&summary.token) == reference
-                    })
-                    .collect::<Vec<_>>();
-                candidates.sort_by(|left, right| left.token.cmp(&right.token));
-                match candidates.as_slice() {
-                    [summary] => AdminResponse::AccessItem {
-                        item: access_item_for_session(server, summary).await,
-                    },
-                    [] => AdminResponse::Error {
-                        message: "unknown or unauthorized access reference".to_string(),
-                    },
-                    _ => AdminResponse::Error {
-                        message: format!("access target '{reference}' is ambiguous"),
-                    },
-                }
-            }
+            Box::pin(show_access_item(server, caller, &reference)).await
         }
         AdminRequest::EvaluateBatch {
             session_token,
