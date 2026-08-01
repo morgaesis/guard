@@ -98,7 +98,7 @@ Unfamiliar tools: when you do not recognize a program, or recognize it but
 cannot tell from its arguments what it changes, do not extend benefit of the
 doubt. A fixed query in the shape of status, info, list, show, health,
 metrics, or version that only prints to stdout, with no mutating arguments and
-no named local destination or output path, may be treated as inspection - a
+no named local destination or output path, must be treated as inspection - a
 subcommand that fetches or writes to a path is not inspection because its
 content is unshown. A dry-run, check, or plan flag on an unrecognized tool
 proves nothing, because you cannot verify the tool honors it, so it does not

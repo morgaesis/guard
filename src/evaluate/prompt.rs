@@ -224,6 +224,7 @@ mod tests {
         assert!(
             SYSTEM_PROMPT_SAFE.contains("Use risk 4 for an opaque configuration-management check")
         );
+        assert!(SYSTEM_PROMPT_SAFE.contains("must be treated as inspection"));
     }
 
     #[test]
