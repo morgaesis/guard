@@ -85,6 +85,15 @@ fi
 if [ -z "${GUARD_LLM_API_KEY:-${OPENROUTER_API_KEY:-}}" ]; then
     fail 'set GUARD_LLM_API_KEY or OPENROUTER_API_KEY in the host environment'
 fi
+# These values expand into the container's stdin env-file; a newline would
+# inject extra KEY=VALUE lines.
+for config_value in "${GUARD_LLM_API_URL:-}" "${GUARD_LLM_MODEL:-}" "${GUARD_LLM_MODELS:-}"; do
+    case "$config_value" in
+        *$'\n'*|*$'\r'*)
+            fail 'GUARD_LLM_API_URL/GUARD_LLM_MODEL/GUARD_LLM_MODELS must not contain newlines'
+            ;;
+    esac
+done
 if [ ! -x "$BINARY" ]; then
     printf 'Building guard release binary...\n' >&2
     (cd "$PROJECT_DIR" && cargo build --quiet --release)
@@ -119,19 +128,19 @@ cp -- "$SCRIPT_DIR/scenarios.yaml" "$BUILD_CONTEXT/scenarios.yaml"
 printf 'scenario\tcontainer\tcontainer_id\tinvariant\n' > "$MAPPING_FILE"
 printf '=== Building image %s ===\n' "$IMAGE"
 IMAGE_CLEANUP_REQUIRED=1
-podman build -t "$IMAGE" -f "$BUILD_CONTEXT/Containerfile.adversary" "$BUILD_CONTEXT"
+podman build --label "guard.adversary.run=$RUN_ID" -t "$IMAGE" -f "$BUILD_CONTEXT/Containerfile.adversary" "$BUILD_CONTEXT"
 
 # The evaluator key rides a Podman secret into each scenario container,
 # guard-owned and mode 0400, instead of the container environment where PID 1
 # and `podman inspect` would expose it. The guard uid in the image is 900.
 printf '%s' "${GUARD_LLM_API_KEY:-${OPENROUTER_API_KEY:-}}" \
-    | podman secret create "$EVALUATOR_SECRET" - >/dev/null
+    | podman secret create --label "guard.adversary.run=$RUN_ID" "$EVALUATOR_SECRET" - >/dev/null
 SECRET_CLEANUP_REQUIRED=1
 
 # Bounded results live on a per-run volume: tmpfs dies with a stopped
 # container, so nothing under /tmp could be collected after `podman wait`.
 # The host reads the volume through podman unshare at the end of the run.
-podman volume create "$RESULTS_VOLUME" >/dev/null
+podman volume create --label "guard.adversary.run=$RUN_ID" "$RESULTS_VOLUME" >/dev/null
 VOLUME_CLEANUP_REQUIRED=1
 
 overall_rc=0
@@ -142,20 +151,24 @@ for scenario in "${SELECTED_SCENARIOS[@]}"; do
     home_volume="guard-adversary-home-$RUN_ID-$index"
     CONTAINERS+=("$container")
     HOME_VOLUMES+=("$home_volume")
-    podman volume create "$home_volume" >/dev/null
+    podman volume create --label "guard.adversary.run=$RUN_ID" "$home_volume" >/dev/null
 
     printf '=== Running scenario %s in %s ===\n' "$scenario" "$container"
 
+    # loopback-only isolation: wildcard-bound host services remain reachable
+    # via host.containers.internal; the dedicated key is the damage bound
+    # (see ADVERSARY.md).
     cid="$(podman create \
         --name "$container" \
         --hostname adversary \
         --user 0 \
         --userns=keep-id:uid=1001,gid=1001 \
         --read-only \
-        --tmpfs /tmp:rw,exec,size=128m \
-        --tmpfs /run:rw,exec,size=16m \
+        --tmpfs /tmp:rw,exec,nosuid,nodev,size=128m \
+        --tmpfs /run:rw,exec,nosuid,nodev,size=16m \
         --volume "$home_volume:/home:rw" \
-        --tmpfs /var/tmp:rw,exec,size=32m \
+        --tmpfs /var/tmp:rw,exec,nosuid,nodev,size=32m \
+        --label "guard.adversary.run=$RUN_ID" \
         --cap-drop=ALL \
         --cap-add=CHOWN \
         --cap-add=SETGID \
