@@ -715,6 +715,63 @@ fn access_command_family_parses_bounded_and_batch_forms() {
 }
 
 #[test]
+fn resume_and_verb_amend_parse_their_requester_and_cas_inputs() {
+    match MainArgs::try_parse_from([
+        "guard",
+        "resume",
+        "0123456789abcdef",
+        "--socket",
+        "/run/guard.sock",
+        "--json",
+    ]) {
+        Ok(MainArgs::Resume {
+            handle,
+            socket,
+            json,
+        }) => {
+            assert_eq!(handle, "0123456789abcdef");
+            assert_eq!(socket.as_deref(), Some("/run/guard.sock"));
+            assert!(json);
+        }
+        Ok(_) => panic!("unexpected resume command"),
+        Err(error) => panic!("resume did not parse: {error}"),
+    }
+
+    match MainArgs::try_parse_from([
+        "guard",
+        "verb",
+        "amend",
+        "inspect-fixture",
+        "--file",
+        "replacement.yaml",
+        "--socket",
+        "/run/guard.sock",
+        "--json",
+    ]) {
+        Ok(MainArgs::Verb(VerbCommands::Amend {
+            name,
+            file,
+            socket,
+            json,
+        })) => {
+            assert_eq!(name, "inspect-fixture");
+            assert_eq!(file, PathBuf::from("replacement.yaml"));
+            assert_eq!(socket.as_deref(), Some("/run/guard.sock"));
+            assert!(json);
+        }
+        Ok(_) => panic!("unexpected verb amend command"),
+        Err(error) => panic!("verb amend did not parse: {error}"),
+    }
+    assert!(MainArgs::try_parse_from(["guard", "verb", "amend", "inspect-fixture"]).is_err());
+
+    let help = match MainArgs::try_parse_from(["guard", "verb", "--help"]) {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("verb help unexpectedly parsed"),
+    };
+    assert!(help.contains("amend"));
+}
+
+#[test]
 fn access_extend_help_explains_target_and_bounded_use_defaults() {
     let error = match MainArgs::try_parse_from(["guard", "access", "extend", "--help"]) {
         Err(error) => error,
@@ -1342,6 +1399,10 @@ fn machine_readable_flags_cover_read_and_execution_commands() {
     assert!(matches!(
         MainArgs::try_parse_from(["guard", "provisionals", "--json"]),
         Ok(MainArgs::Provisionals { json: true, .. })
+    ));
+    assert!(matches!(
+        MainArgs::try_parse_from(["guard", "resume", "hold-1", "--json"]),
+        Ok(MainArgs::Resume { json: true, .. })
     ));
     assert!(matches!(
         MainArgs::try_parse_from(["guard", "access", "list", "--json"]),

@@ -78,6 +78,11 @@ impl Client {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_admin_token(&self) -> bool {
+        self.admin_token.is_some()
+    }
+
     pub fn with_session(mut self, session_token: String) -> Self {
         self.session_token = Some(session_token);
         self
@@ -138,6 +143,7 @@ impl Client {
             AdminRequest::VerbDelete { .. } => "verb_delete",
             AdminRequest::VerbCreate { .. } => "verb_create",
             AdminRequest::VerbCreateFromPreview { .. } => "verb_create_from_preview",
+            AdminRequest::VerbAmend { .. } => "verb_amend",
             AdminRequest::VerbCoverageList => "verb_coverage_list",
             AdminRequest::VerbCoverageClear => "verb_coverage_clear",
             #[cfg(test)]

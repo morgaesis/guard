@@ -67,8 +67,8 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
 
 use cli_client::{
     handle_access, handle_api, handle_audit_tail, handle_audit_verify, handle_config,
-    handle_gate_action, handle_provisionals, handle_status, handle_verb, run_exec, run_mcp,
-    GatingOptions, RunInjections, SshHostKeyCliMode,
+    handle_gate_action, handle_provisionals, handle_resume, handle_status, handle_verb, run_exec,
+    run_mcp, GatingOptions, RunInjections, SshHostKeyCliMode,
 };
 use cli_secrets::handle_secrets;
 use cli_server::run_server;
@@ -277,6 +277,15 @@ enum MainArgs {
         #[arg(long)]
         socket: Option<String>,
     },
+    /// Execute one operator-approved hold as its original requester.
+    Resume {
+        handle: String,
+        #[arg(long)]
+        socket: Option<String>,
+        /// Emit the persisted execution result as one JSON document.
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
     /// Run or list operator-defined verbs (the typed, least-expressive interface).
     #[clap(subcommand)]
     Verb(VerbCommands),
@@ -416,6 +425,18 @@ enum VerbCommands {
         name: String,
         #[arg(long)]
         socket: Option<String>,
+    },
+    /// Replace one operator-authored verb without clobbering concurrent edits.
+    Amend {
+        name: String,
+        /// YAML file containing exactly one verb definition.
+        #[arg(long, value_name = "PATH")]
+        file: PathBuf,
+        #[arg(long)]
+        socket: Option<String>,
+        /// Emit a machine-readable amendment result.
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
     },
     /// Run a verb with validated parameters: --param key=value (repeatable).
     Run {
@@ -1360,6 +1381,11 @@ async fn run_main() -> Result<()> {
         Ok(MainArgs::Revert { handle, socket }) => {
             handle_gate_action(socket, "revert", handle).await
         }
+        Ok(MainArgs::Resume {
+            handle,
+            socket,
+            json,
+        }) => handle_resume(socket, handle, json).await,
         Ok(MainArgs::Verb(subcommand)) => handle_verb(subcommand).await,
         Ok(MainArgs::Audit(subcommand)) => match subcommand {
             AuditCommands::Verify { socket, json } => handle_audit_verify(socket, json).await,
@@ -1603,6 +1629,7 @@ fn print_help_tree(admin: bool) {
     println!("    access list");
     println!("    access show <request-or-session>");
     println!("    provisionals");
+    println!("    resume <handle>");
     println!("    mcp serve");
     println!();
     println!("  local setup");

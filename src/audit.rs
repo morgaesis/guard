@@ -81,6 +81,7 @@ pub enum AuditKind {
     KubeconfigIssued,
     // Verb catalog and evaluator-generated coverage.
     VerbCreated,
+    VerbAmended,
     ApiVerbCoverageHit,
     ApiVerbCoverageEscalate,
     ApiVerbCoverageCleared,
@@ -142,6 +143,7 @@ impl AuditKind {
             Self::SecretDelete => "SECRET_DELETE",
             Self::KubeconfigIssued => "KUBECONFIG_ISSUED",
             Self::VerbCreated => "VERB_CREATED",
+            Self::VerbAmended => "VERB_AMENDED",
             Self::ApiVerbCoverageHit => "API_VERB_COVERAGE_HIT",
             Self::ApiVerbCoverageEscalate => "API_VERB_COVERAGE_ESCALATE",
             Self::ApiVerbCoverageCleared => "API_VERB_COVERAGE_CLEARED",

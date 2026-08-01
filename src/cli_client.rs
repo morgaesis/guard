@@ -527,6 +527,93 @@ pub(crate) async fn handle_provisionals(socket: Option<String>, json: bool) -> R
     }
 }
 
+fn resume_json_response(
+    handle: &str,
+    message: &str,
+    exit_code: Option<i32>,
+    stdout: Option<&str>,
+    stderr: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": JSON_SCHEMA_VERSION,
+        "type": "resume_result",
+        "handle": handle,
+        "message": message,
+        "exit_code": exit_code,
+        "stdout": stdout,
+        "stderr": stderr,
+    })
+}
+
+/// Resume one held command as the kernel-authenticated requester and render its
+/// captured output and exit status.
+pub(crate) async fn handle_resume(
+    socket: Option<String>,
+    handle: String,
+    json: bool,
+) -> Result<()> {
+    let config = load_client_config(json)?;
+    let (socket_path, tcp_port, source) = resolve_client_endpoint_with_source(socket, &config);
+    let mut client = daemon_client::Client::new(socket_path, tcp_port);
+    if let Some(token) = config.auth_token {
+        client = client.with_auth(token);
+    }
+    let response = client
+        .send_admin(server::AdminRequest::Resume {
+            handle: handle.clone(),
+        })
+        .await
+        .map_err(|error| describe_connect_failure(error, &client, source))?;
+    match response {
+        server::AdminResponse::GateAction {
+            message,
+            exit_code,
+            stdout,
+            stderr,
+        } => {
+            if json {
+                print_json(&resume_json_response(
+                    &handle,
+                    &message,
+                    exit_code,
+                    stdout.as_deref(),
+                    stderr.as_deref(),
+                ))?;
+            } else {
+                if let Some(stdout) = stdout.as_deref() {
+                    print!("{stdout}");
+                    std::io::stdout().flush()?;
+                }
+                if let Some(stderr) = stderr.as_deref() {
+                    eprint!("{stderr}");
+                    if !stderr.ends_with('\n') {
+                        eprintln!();
+                    }
+                }
+                match exit_code {
+                    Some(code) => eprintln!("exit status: {code}"),
+                    None => eprintln!("exit status: unavailable"),
+                }
+            }
+            if let Some(code) = exit_code.filter(|code| *code != 0) {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        server::AdminResponse::Error { message } if json => {
+            print_json(&serde_json::json!({
+                "schema_version": JSON_SCHEMA_VERSION,
+                "type": "resume_error",
+                "handle": handle,
+                "error": message,
+            }))?;
+            std::process::exit(EXIT_GUARD_ERROR);
+        }
+        server::AdminResponse::Error { message } => Err(anyhow::anyhow!(message)),
+        other => Err(anyhow::anyhow!("unexpected admin response: {other:?}")),
+    }
+}
+
 pub(crate) async fn handle_audit_verify(socket: Option<String>, json: bool) -> Result<()> {
     let (client, source) = gate_client(socket, json)?;
     match client
@@ -764,6 +851,72 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                 other => Err(anyhow::anyhow!("unexpected admin response: {other:?}")),
             }
         }
+        VerbCommands::Amend {
+            name,
+            file,
+            socket,
+            json,
+        } => {
+            let yaml = std::fs::read_to_string(&file)
+                .with_context(|| format!("failed to read verb file {}", file.display()))?;
+            let replacement: guard::gating::verb::Verb = serde_yaml_ng::from_str(&yaml)
+                .with_context(|| {
+                    format!("failed to parse {} as one verb definition", file.display())
+                })?;
+            if replacement.name != name {
+                anyhow::bail!(
+                    "verb file names '{}', but amend targets '{}'; the name must be preserved",
+                    replacement.name,
+                    name
+                );
+            }
+
+            let (client, source) = gate_client(socket, json)?;
+            let current = client
+                .send_admin(server::AdminRequest::VerbShow { name: name.clone() })
+                .await
+                .map_err(|error| describe_connect_failure(error, &client, source))?;
+            let server::AdminResponse::VerbCreated { verb: current, .. } = current else {
+                return match current {
+                    server::AdminResponse::Error { message } => Err(anyhow::anyhow!(message)),
+                    other => Err(anyhow::anyhow!("unexpected admin response: {other:?}")),
+                };
+            };
+            let expected_digest = current.definition_digest();
+            let response = client
+                .send_admin(server::AdminRequest::VerbAmend {
+                    name,
+                    expected_digest,
+                    replacement: Box::new(replacement),
+                })
+                .await
+                .map_err(|error| describe_connect_failure(error, &client, source))?;
+            match response {
+                server::AdminResponse::VerbAmended {
+                    verb,
+                    previous_digest,
+                    digest,
+                } => {
+                    if json {
+                        print_json(&serde_json::json!({
+                            "schema_version": JSON_SCHEMA_VERSION,
+                            "type": "verb_amended",
+                            "previous_digest": previous_digest,
+                            "digest": digest,
+                            "verb": verb,
+                        }))
+                    } else {
+                        println!(
+                            "Amended verb '{}' ({} -> {}).",
+                            verb.name, previous_digest, digest
+                        );
+                        Ok(())
+                    }
+                }
+                server::AdminResponse::Error { message } => Err(anyhow::anyhow!(message)),
+                other => Err(anyhow::anyhow!("unexpected admin response: {other:?}")),
+            }
+        }
         VerbCommands::Run {
             name,
             params,
@@ -852,10 +1005,7 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
             let config = load_client_config(json)?;
             let (socket_path, tcp_port, source) =
                 resolve_client_endpoint_with_source(socket, &config);
-            let mut client = daemon_client::Client::new(socket_path, tcp_port);
-            if let Some(token) = config.auth_token.clone() {
-                client = client.with_auth(token);
-            }
+            let client = admin_client(socket_path, tcp_port, &config);
             if let Some(reference) = from_preview {
                 let response = client
                     .send_admin(server::AdminRequest::VerbCreateFromPreview { digest: reference })
@@ -2380,6 +2530,33 @@ mod tests {
         };
         let auth_token = resolve_mcp_daemon_token(&config);
         assert_eq!(auth_token.as_deref(), Some("configured-exec"));
+    }
+
+    #[test]
+    fn verb_mutation_client_carries_the_configured_admin_bearer() {
+        let config = client_config::ClientConfig {
+            admin_token: Some("configured-admin".to_string()),
+            ..Default::default()
+        };
+        let client = admin_client(None, Some(7331), &config);
+        assert!(client.has_admin_token());
+    }
+
+    #[test]
+    fn resume_json_shape_contains_the_execution_result() {
+        let document = resume_json_response(
+            "hold-1",
+            "resumed",
+            Some(7),
+            Some("saved stdout"),
+            Some("saved stderr"),
+        );
+        assert_eq!(document["schema_version"], JSON_SCHEMA_VERSION);
+        assert_eq!(document["type"], "resume_result");
+        assert_eq!(document["handle"], "hold-1");
+        assert_eq!(document["exit_code"], 7);
+        assert_eq!(document["stdout"], "saved stdout");
+        assert_eq!(document["stderr"], "saved stderr");
     }
 
     #[test]

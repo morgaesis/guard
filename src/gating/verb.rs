@@ -20,6 +20,7 @@ use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -859,6 +860,90 @@ impl VerbCatalog {
         Ok(())
     }
 
+    /// Replace one operator-authored file verb only when its live definition
+    /// still matches `expected_digest`. Validation and whole-catalog
+    /// composition complete before the backing file is atomically replaced.
+    /// The in-memory catalog adopts exactly that validated document after the
+    /// durable replacement succeeds.
+    pub fn amend_verb_if_digest(
+        &mut self,
+        name: &str,
+        expected_digest: &str,
+        replacement: &Verb,
+    ) -> Result<Verb> {
+        if expected_digest.len() != 64
+            || !expected_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            bail!("expected verb digest must be 64 lowercase hexadecimal characters");
+        }
+        if replacement.name != name {
+            bail!(
+                "replacement verb name '{}' does not match '{}'; amend preserves the existing name",
+                replacement.name,
+                name
+            );
+        }
+        if reserved_verb_name(name) || replacement.auto_promoted {
+            bail!("generated or reserved verb '{}' cannot be amended", name);
+        }
+        validate_verb(replacement)?;
+
+        self.reload_if_stale()?;
+        let path = self.path.clone().ok_or_else(|| {
+            anyhow::anyhow!("verb catalog is not backed by a file; cannot amend a verb")
+        })?;
+        let existing = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read verb catalog {}", path.display()))?;
+        let disk_catalog = Self::from_yaml(&existing)?;
+        let current = disk_catalog
+            .get(name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("unknown verb: '{}'", name))?;
+        if current.auto_promoted || reserved_verb_name(&current.name) {
+            bail!("generated or reserved verb '{}' cannot be amended", name);
+        }
+        let current_digest = current.definition_digest();
+        if current_digest != expected_digest {
+            bail!(
+                "verb '{}' changed before amend: expected digest {}, found {}",
+                name,
+                expected_digest,
+                current_digest
+            );
+        }
+
+        let new_content = compose_replaced_catalog(&existing, name, replacement)?;
+        let mut validated = Self::from_yaml(&new_content)
+            .context("amending this verb would make the catalog invalid")?;
+
+        let runtime_verbs = self
+            .verbs
+            .values()
+            .filter(|verb| reserved_verb_name(&verb.name))
+            .cloned()
+            .collect::<Vec<_>>();
+        for mut verb in runtime_verbs {
+            if verb.name.starts_with("grant-") {
+                validated.upsert_saved_grant_verb(verb)?;
+            } else {
+                verb.trusted = false;
+                validated.upsert_access_verb(verb)?;
+            }
+        }
+        // Every fallible catalog adoption step completes before the durable
+        // rewrite. After this point, success requires only the atomic file
+        // replacement and assigning the already validated state.
+        atomic_replace_if_unchanged(&path, existing.as_bytes(), new_content.as_bytes())?;
+        validated.path = Some(path.clone());
+        validated.mtime = std::fs::metadata(&path)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
+        *self = validated;
+        Ok(current)
+    }
+
     /// Install or replace a validated daemon-owned verb without writing the
     /// operator catalog. Saved grants use this for generated coverage that is
     /// persisted with the grant definition rather than mixed into the catalog
@@ -1084,6 +1169,82 @@ fn compose_removed_catalog(existing: &str, name: &str) -> Result<String> {
         bail!("unknown verb: '{}'", name);
     }
     serde_yaml_ng::to_string(&doc).context("failed to serialize the updated catalog")
+}
+
+fn compose_replaced_catalog(existing: &str, name: &str, replacement: &Verb) -> Result<String> {
+    let body = existing.strip_prefix('\u{feff}').unwrap_or(existing);
+    let mut doc: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(body).context("the existing verb catalog is not valid YAML")?;
+    let map = doc
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow::anyhow!("verb catalog is not a YAML mapping"))?;
+    let key = serde_yaml_ng::Value::String("verbs".to_string());
+    let Some(serde_yaml_ng::Value::Sequence(verbs)) = map.get_mut(&key) else {
+        bail!("the catalog's `verbs` key is not a sequence");
+    };
+    let replacement = serde_yaml_ng::to_value(replacement).context("failed to serialize verb")?;
+    let mut replaced = false;
+    for value in verbs {
+        let candidate_name = value
+            .as_mapping()
+            .and_then(|verb| verb.get(serde_yaml_ng::Value::String("name".to_string())))
+            .and_then(serde_yaml_ng::Value::as_str);
+        if candidate_name == Some(name) {
+            *value = replacement.clone();
+            replaced = true;
+            break;
+        }
+    }
+    if !replaced {
+        bail!("unknown verb: '{}'", name);
+    }
+    serde_yaml_ng::to_string(&doc).context("failed to serialize the updated catalog")
+}
+
+fn reserved_verb_name(name: &str) -> bool {
+    name.starts_with("grant-") || name.starts_with("access-generated-")
+}
+
+fn atomic_replace_if_unchanged(path: &Path, expected: &[u8], replacement: &[u8]) -> Result<()> {
+    let current = std::fs::read(path)
+        .with_context(|| format!("failed to reread verb catalog {}", path.display()))?;
+    if current != expected {
+        bail!("verb catalog changed before the atomic rewrite; retry the amend");
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).with_context(|| {
+        format!(
+            "failed to create a temporary catalog in {}",
+            parent.display()
+        )
+    })?;
+    temporary
+        .as_file_mut()
+        .write_all(replacement)
+        .with_context(|| format!("failed to write replacement catalog for {}", path.display()))?;
+    if let Ok(metadata) = std::fs::metadata(path) {
+        temporary
+            .as_file()
+            .set_permissions(metadata.permissions())
+            .with_context(|| format!("failed to preserve permissions for {}", path.display()))?;
+    }
+    temporary
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("failed to sync replacement catalog for {}", path.display()))?;
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| {
+            format!(
+                "failed to atomically replace verb catalog {}",
+                path.display()
+            )
+        })?;
+    Ok(())
 }
 
 /// Binaries a synthesized verb may not use: shells and interpreters where a

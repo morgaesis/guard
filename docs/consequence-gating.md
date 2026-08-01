@@ -78,21 +78,28 @@ swap, or caller environment change from rewriting what the operator reviews.
 guard access list
 guard access show <request>
 guard access approve <request> --once
+guard resume <request>
 guard access deny <request> --reason 'outside the approved task'
 ```
 
-A consequence hold executes one immutable snapshot and accepts only `--once`.
-Ordinary and N-use approval apply to authority requests created from denied or
-proactive access intent, not to held execution snapshots.
+A consequence hold accepts only `--once`. Approval arms its immutable snapshot
+without executing it as the operator. The kernel-authenticated requester runs
+the snapshot with `guard resume <request>`, which returns its stdout, stderr,
+and exit status. Each hold can be resumed once. Bounded copies of stdout and
+stderr remain in durable approval state and identify truncation in their stored
+text. Ordinary and N-use approval apply to authority requests created from
+denied or proactive access intent, not to held execution snapshots.
 
 Only the daemon principal or TCP admin principal can approve or deny. The
 original requester may add notes to its hold but cannot decide it. Discussion
 freezes when the hold is decided.
 
-`guard run --wait-approval` waits without a client-side timeout;
-`--wait-approval <seconds>` adds a client bound. `--approval-ttl unbounded`
-keeps a durable hold until a decision, while a numeric TTL fails closed on
-expiry. Disconnecting a waiting client does not grant authority.
+`guard run --wait-approval` waits without a client-side timeout and resumes on
+the same requester connection after approval. `--wait-approval <seconds>` adds
+a client bound. `--approval-ttl unbounded` keeps a durable hold until a
+decision, while a numeric TTL fails closed on expiry. Disconnecting a waiting
+client does not grant authority; the requester can reconnect with `guard
+resume` after approval.
 
 ## Restart and failure behavior
 

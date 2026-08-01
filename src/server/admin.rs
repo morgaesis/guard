@@ -4261,6 +4261,37 @@ pub(super) async fn handle_admin_request(
                 },
             }
         }
+        AdminRequest::VerbAmend {
+            name,
+            expected_digest,
+            replacement,
+        } => {
+            let new_digest = replacement.definition_digest();
+            let result = server.state.verbs.write().await.amend_verb_if_digest(
+                &name,
+                &expected_digest,
+                &replacement,
+            );
+            match result {
+                Ok(previous) => {
+                    debug_assert_eq!(previous.definition_digest(), expected_digest);
+                    server.emit_audit_ungated(
+                        AuditEvent::new(AuditKind::VerbAmended)
+                            .field("name", &name)
+                            .field("previous_digest", &expected_digest)
+                            .field("digest", &new_digest),
+                    );
+                    AdminResponse::VerbAmended {
+                        verb: *replacement,
+                        previous_digest: expected_digest,
+                        digest: new_digest,
+                    }
+                }
+                Err(error) => AdminResponse::Error {
+                    message: format!("verb amend rejected: {error}"),
+                },
+            }
+        }
         AdminRequest::VerbCoverageList => {
             let items = match &server.state.api_coverage {
                 Some(store) => store.read().await.coverage(),

@@ -434,6 +434,13 @@ pub enum AdminRequest {
     VerbCreateFromPreview {
         digest: String,
     },
+    /// Replace one operator-authored verb only if its definition still matches
+    /// the digest observed before editing. Operator-only (mutates the catalog).
+    VerbAmend {
+        name: String,
+        expected_digest: String,
+        replacement: Box<guard::gating::verb::Verb>,
+    },
     /// List evaluator-generated API verb coverage. Operator-only because
     /// coverage reveals policy topology and evaluator regime identifiers.
     VerbCoverageList,
@@ -735,6 +742,11 @@ pub enum AdminResponse {
         /// Addresses the stored candidate in `VerbCreateFromPreview`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         preview_digest: Option<String>,
+    },
+    VerbAmended {
+        verb: guard::gating::verb::Verb,
+        previous_digest: String,
+        digest: String,
     },
     VerbCoverage {
         items: Vec<guard::gating::api_promotion::ApiCoverageEntry>,

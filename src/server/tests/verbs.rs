@@ -756,6 +756,156 @@ fn file_backed_catalog() -> (tempfile::TempDir, VerbCatalog) {
     (dir, catalog)
 }
 
+fn amend_test_catalog() -> (tempfile::TempDir, std::path::PathBuf, VerbCatalog) {
+    let dir = tempfile::tempdir().expect("catalog test dir");
+    let path = dir.path().join("verbs.yaml");
+    std::fs::write(
+        &path,
+        r#"verbs:
+  - name: inspect-fixture
+    description: Inspect one fixture
+    binary: fixturectl
+    args: [show, "{target}"]
+    params:
+      target: { pattern: "^[a-z0-9-]+$" }
+    consequence: reversible
+    trusted: true
+  - name: untouched
+    binary: true
+    consequence: reversible
+"#,
+    )
+    .unwrap();
+    let catalog = VerbCatalog::load(&path).unwrap();
+    (dir, path, catalog)
+}
+
+#[tokio::test]
+async fn verb_amend_replaces_the_expected_definition_and_preserves_the_catalog() {
+    let (mut cfg, _buf) = make_test_config();
+    let (_dir, path, catalog) = amend_test_catalog();
+    let current = catalog.get("inspect-fixture").unwrap().clone();
+    let expected_digest = current.definition_digest();
+    let mut replacement = current.clone();
+    replacement.description = "Inspect one named fixture".to_string();
+    let new_digest = replacement.definition_digest();
+    cfg.state.verbs = Arc::new(RwLock::new(catalog));
+    let operator = CallerIdentity::UnixAdmin { uid: 777 };
+
+    let response = handle_admin_request(
+        &cfg,
+        &operator,
+        AdminRequest::VerbAmend {
+            name: "inspect-fixture".to_string(),
+            expected_digest: expected_digest.clone(),
+            replacement: Box::new(replacement.clone()),
+        },
+    )
+    .await;
+    let AdminResponse::VerbAmended {
+        verb,
+        previous_digest,
+        digest,
+    } = response
+    else {
+        panic!("expected successful amend, got {response:?}")
+    };
+    assert_eq!(verb.description, "Inspect one named fixture");
+    assert_eq!(previous_digest, expected_digest);
+    assert_eq!(digest, new_digest);
+
+    let reloaded = VerbCatalog::load(&path).unwrap();
+    assert_eq!(
+        reloaded.get("inspect-fixture").unwrap().description,
+        "Inspect one named fixture"
+    );
+    assert!(reloaded.get("untouched").is_some());
+}
+
+#[tokio::test]
+async fn verb_amend_rejects_a_stale_digest_without_writing() {
+    let (mut cfg, _buf) = make_test_config();
+    let (_dir, path, catalog) = amend_test_catalog();
+    let original = std::fs::read(&path).unwrap();
+    let mut replacement = catalog.get("inspect-fixture").unwrap().clone();
+    replacement.description = "Stale replacement".to_string();
+    cfg.state.verbs = Arc::new(RwLock::new(catalog));
+
+    let response = handle_admin_request(
+        &cfg,
+        &CallerIdentity::UnixAdmin { uid: 777 },
+        AdminRequest::VerbAmend {
+            name: "inspect-fixture".to_string(),
+            expected_digest: "0".repeat(64),
+            replacement: Box::new(replacement),
+        },
+    )
+    .await;
+    let AdminResponse::Error { message } = response else {
+        panic!("stale digest must fail")
+    };
+    assert!(message.contains("changed before amend"), "{message}");
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+}
+
+#[tokio::test]
+async fn verb_amend_rejects_invalid_or_generated_candidates_without_writing() {
+    let (mut cfg, _buf) = make_test_config();
+    let (_dir, path, catalog) = amend_test_catalog();
+    let original = std::fs::read(&path).unwrap();
+    let current = catalog.get("inspect-fixture").unwrap().clone();
+    let expected_digest = current.definition_digest();
+    cfg.state.verbs = Arc::new(RwLock::new(catalog));
+    let operator = CallerIdentity::UnixAdmin { uid: 777 };
+
+    let mut invalid = current.clone();
+    invalid.params.get_mut("target").unwrap().pattern = "[a-z]+".to_string();
+    let response = handle_admin_request(
+        &cfg,
+        &operator,
+        AdminRequest::VerbAmend {
+            name: "inspect-fixture".to_string(),
+            expected_digest: expected_digest.clone(),
+            replacement: Box::new(invalid),
+        },
+    )
+    .await;
+    assert!(matches!(response, AdminResponse::Error { .. }));
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+
+    let mut generated = current;
+    generated.auto_promoted = true;
+    let response = handle_admin_request(
+        &cfg,
+        &operator,
+        AdminRequest::VerbAmend {
+            name: "inspect-fixture".to_string(),
+            expected_digest,
+            replacement: Box::new(generated),
+        },
+    )
+    .await;
+    let AdminResponse::Error { message } = response else {
+        panic!("generated candidate must fail")
+    };
+    assert!(message.contains("generated or reserved"), "{message}");
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    let replacement = cfg
+        .state
+        .verbs
+        .read()
+        .await
+        .get("inspect-fixture")
+        .unwrap()
+        .clone();
+    assert!(AdminRequest::VerbAmend {
+        name: "inspect-fixture".to_string(),
+        expected_digest: "0".repeat(64),
+        replacement: Box::new(replacement),
+    }
+    .requires_admin_token());
+}
+
 fn synthesis_test_config(llm_url: String) -> (ServerContext, CallerIdentity) {
     let (mut cfg, _buf) = make_test_config();
     cfg.state.evaluator = Arc::new(

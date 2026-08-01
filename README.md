@@ -103,9 +103,10 @@ An operator approves one or more durable requests with `guard access approve`.
 On a terminal, approve reviews each request first with a colored card and an
 approve, deny, skip, or quit prompt; `--yes` skips the review. Each approval
 retains its own scope and count. Denied results offer ordinary, one-time, and
-bounded approval. A held result offers only `--once` because it executes one
-immutable reviewed snapshot. Operators remove an active access session with
-`guard access revoke <session-or-agent>`.
+bounded approval. A held result offers only `--once` because it represents one
+immutable reviewed snapshot. Approval arms that snapshot, and its original
+requester executes it with `guard resume <request>`. Operators remove an active
+access session with `guard access revoke <session-or-agent>`.
 
 Structured execution results include a versioned decision trace with a stable
 source, every applicable typed cell, conflicts, and bounded next-step guidance.
@@ -129,6 +130,7 @@ guard server start --gate consequence \
 
 guard access request 'Restart nginx and verify that it is healthy.'
 guard access approve <request> --once
+guard resume <request>
 guard run systemctl restart nginx
 guard provisionals
 guard confirm <handle>

@@ -14,6 +14,21 @@ guard verb run restart-service --param unit=nginx
 [`examples/verbs.yaml`](../examples/verbs.yaml) contains command-template and
 coverage-cell examples.
 
+Operators replace one catalog entry from a YAML file containing exactly one
+verb definition:
+
+```bash
+guard verb amend restart-service --file restart-service.yaml
+```
+
+The client reads the live definition first and binds the amendment to its
+definition digest. The daemon rejects the write if another catalog edit lands
+between that read and the replacement. It validates the candidate and complete
+catalog before atomically replacing the catalog file. The replacement must
+retain the requested name. Runtime-generated, automatically promoted, and
+reserved-namespace verbs cannot be amended through this command. Like other
+catalog mutations, amend requires the admin bearer.
+
 ## Command templates
 
 A template renders each `{param}` as one argv element without a shell or word
