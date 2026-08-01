@@ -126,6 +126,7 @@ async fn prompt_regression_corpus_matches_expected_decisions() {
             EvalConfig::default()
                 .mode(mode)
                 .llm_enabled(true)
+                .cache_enabled(false)
                 .llm_api_key(api_key.clone()),
         )
         .unwrap_or_else(|e| panic!("case {}: failed to build evaluator: {e}", case.id));

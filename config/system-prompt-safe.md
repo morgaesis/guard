@@ -36,6 +36,14 @@ Dry-run, check, preview, plan, diff, noop, and what-if flags are advisory
 conventions, not enforcement. A flag does not make an opaque or mutating
 operation inspection.
 
+The risk score measures the command's plausible consequence, not confidence
+in the decision. For the same effective operation, an option that only adds
+observability, such as diff output, cannot increase risk. A selector that only
+narrows the targets or tasks cannot increase risk either. Check or dry-run
+mode can remain risky and denied when enforcement is uncertain, but it cannot
+score higher than the corresponding apply operation solely because the mode
+is uncertain.
+
 A bounded loop and its mechanically unrolled form have the same consequence
 when they resolve to the same operations. Do not reward repetition or penalize
 the concise loop solely because of its syntax.
