@@ -163,12 +163,14 @@ jobs:
           archive="${bundle}.tar.gz"
           root="dist/${bundle}"
           mkdir -p "$root/deployment/systemd" "$root/deployment/hardening" \
-            "$root/deployment/windows" "$root/examples" "$root/docs"
+            "$root/deployment/windows" "$root/examples" "$root/docs" "$root/ctf"
           cp "target/${BUILD_TARGET}/release/${ARTIFACT_NAME}" "$root/${ARTIFACT_NAME}"
           binary_hash=$(sha256sum "$root/${ARTIFACT_NAME}" | cut -d ' ' -f 1)
           printf '%s  %s\n' "$binary_hash" "$ARTIFACT_NAME" > "$root/BINARY-SHA256"
-          cp README.md INSTALL.md DEPLOYMENT.md ARCHITECTURE.md ROADMAP.md LICENSE .env.example "$root/"
+          cp README.md INSTALL.md DEPLOYMENT.md DEVELOPMENT.md SECURITY.md \
+            ARCHITECTURE.md ROADMAP.md LICENSE .env.example "$root/"
           cp docs/*.md "$root/docs/"
+          cp ctf/DESIGN.md "$root/ctf/"
           cp examples/*.yaml examples/README.md examples/fallback-models.env "$root/examples/"
           cp deployment/systemd/guard.service \
             deployment/systemd/guard-exec-as-caller.service \
@@ -212,6 +214,8 @@ jobs:
           root="$smoke/$bundle"
           test -f "$root/INSTALL.md"
           test -f "$root/DEPLOYMENT.md"
+          test -f "$root/DEVELOPMENT.md"
+          test -f "$root/SECURITY.md"
           test -f "$root/ARCHITECTURE.md"
           test -f "$root/ROADMAP.md"
           test -f "$root/LICENSE"
@@ -219,6 +223,7 @@ jobs:
           test -f "$root/docs/release-verification.md"
           test -f "$root/docs/configuration.md"
           test -f "$root/docs/api-proxy.md"
+          test -f "$root/ctf/DESIGN.md"
           test -f "$root/examples/verbs.yaml"
           test -f "$root/examples/verbs-readonly.yaml"
           test -f "$root/examples/verbs-kubectl.yaml"
