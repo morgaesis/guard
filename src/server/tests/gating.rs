@@ -27,7 +27,6 @@ use guard::gating::approval::{Approval, ApprovalSnapshot, ApprovalStatus};
 use guard::gating::approval::{SecretBinding, ToolSecretBinding};
 #[cfg(unix)]
 use guard::gating::provisional::{ApiRevertPlan, Provisional, ProvisionalStatus};
-#[cfg(unix)]
 use guard::gating::verb::VerbCatalog;
 use guard::gating::{Coverage, GateMode, Reversibility};
 use guard::principal::PrincipalKey;
