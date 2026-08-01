@@ -1594,7 +1594,16 @@ impl ApiProxy {
             .filter(|operation| self.is_kubernetes_mutation(operation))
         {
             match self
-                .arbitrate_kubernetes_mutation(&parts, &body, path, operation, &route_authority)
+                .arbitrate_kubernetes_mutation(
+                    &parts,
+                    &body,
+                    path,
+                    operation,
+                    &route_authority,
+                    prepared_snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.as_deref()),
+                )
                 .await
             {
                 Ok((guarded_body, snapshot)) => {
@@ -2074,6 +2083,7 @@ impl ApiProxy {
         path: &str,
         op: &ApiOp,
         route_authority: &RouteAuthority,
+        prepared_snapshot: Option<&[u8]>,
     ) -> Result<(Bytes, Option<Vec<u8>>), Response<ProxyBody>> {
         let Some(auth) = parts.extensions.get::<SessionAuth>() else {
             return Err(self.status_resp(
@@ -2090,10 +2100,16 @@ impl ApiProxy {
                 "Kubernetes mutation cannot be bound to one observed object",
             ));
         }
-        let Some(snapshot) = self.fetch_prior_object(path, route_authority).await? else {
-            return Err(self.kubernetes_conflict(
-                "current Kubernetes object could not be read for write arbitration",
-            ));
+        let snapshot = match prepared_snapshot {
+            Some(snapshot) => snapshot.to_vec(),
+            None => {
+                let Some(snapshot) = self.fetch_prior_object(path, route_authority).await? else {
+                    return Err(self.kubernetes_conflict(
+                        "current Kubernetes object could not be read for write arbitration",
+                    ));
+                };
+                snapshot
+            }
         };
         let Some(state) = object_state(op, &snapshot) else {
             return Err(self.kubernetes_conflict(

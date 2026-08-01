@@ -174,7 +174,7 @@ impl ApiSessionSink for ChangingSessionSink {
         let attempt = self.resolutions.fetch_add(1, Ordering::SeqCst);
         (token == "live-then-edited").then(|| ApiSessionContext {
             fingerprint: "stable-audit-fingerprint".to_string(),
-            revision: if attempt == 0 {
+            revision: if attempt < 3 {
                 "original-session-revision"
             } else {
                 "edited-session-revision"
@@ -208,6 +208,18 @@ async fn mock_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, I
             "apiVersion": "v1",
             "metadata": {"name": "cm", "namespace": "dev"},
             "data": {"key": "value"}
+        })
+    } else if req.method() == hyper::Method::GET && path.contains("/pods/") {
+        json!({
+            "kind": "Pod",
+            "apiVersion": "v1",
+            "metadata": {
+                "name": "web-0",
+                "namespace": "dev",
+                "uid": "web-0-uid",
+                "resourceVersion": "12"
+            },
+            "spec": {"containers": []}
         })
     } else {
         json!({"kind": "Status", "apiVersion": "v1", "status": "Success"})
@@ -913,7 +925,11 @@ async fn proxy_gates_redacts_and_forwards() {
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).expect("policy");
     let (listener, listen) = reserve_listener().await;
-    let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
+    let proxy = Arc::new(
+        ApiProxy::new(listen, tls, upstream, policy, None)
+            .with_listener_mode(ApiListenerMode::Policy),
+    );
+    proxy.attach_session_sink(Arc::new(LiveSessionSink));
 
     // The brokered config must point at the proxy and carry no credential.
     let brokered = proxy.brokered_kubeconfig();
@@ -949,8 +965,8 @@ async fn proxy_gates_redacts_and_forwards() {
     let v: Value = resp.json().await.unwrap();
     assert_eq!(v["data"]["key"], "value", "ConfigMap data is not redacted");
 
-    // 3. A policy-held delete with no approval queue attached (no gate sink
-    //    here) fails closed -> 403, apiserver never hit.
+    // 3. An anonymous mutation fails before policy routing because writes need
+    //    attributable Guard session authority.
     let resp = client
         .delete(format!("{base}/api/v1/namespaces/dev/pods/web-0"))
         .send()
@@ -962,7 +978,7 @@ async fn proxy_gates_redacts_and_forwards() {
     assert!(v["message"]
         .as_str()
         .unwrap()
-        .contains("requires operator approval"));
+        .contains("require an attributable Guard session"));
 
     // 4. An interactive subresource is denied outright.
     let resp = client
@@ -977,6 +993,7 @@ async fn proxy_gates_redacts_and_forwards() {
     // 5. A write in a production namespace falls to default-deny.
     let resp = client
         .post(format!("{base}/api/v1/namespaces/prod/pods"))
+        .bearer_auth("live-session")
         .body("{}")
         .send()
         .await
@@ -986,6 +1003,7 @@ async fn proxy_gates_redacts_and_forwards() {
     // 6. A write in a non-production namespace is allowed and forwarded.
     let resp = client
         .post(format!("{base}/api/v1/namespaces/dev/pods"))
+        .bearer_auth("live-session")
         .body("{}")
         .send()
         .await
@@ -1694,7 +1712,7 @@ async fn issued_session_modes_enforce_api_boundary_without_prompt_bypass() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_expansion_is_revalidated_immediately_before_forward() {
-    let mock_base = spawn_mock_upstream().await;
+    let mock_base = spawn_write_mock().await;
     let upstream =
         Upstream::from_kubeconfig_str(&kubeconfig_for(&mock_base), None).expect("upstream");
     let tls = ProxyTls::generate().expect("tls");
@@ -1718,8 +1736,22 @@ async fn session_expansion_is_revalidated_immediately_before_forward() {
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
         .unwrap();
+    assert_eq!(
+        client
+            .get(format!(
+                "https://{listen}/apis/apps/v1/namespaces/dev/deployments/api"
+            ))
+            .bearer_auth("live-then-edited")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
     let response = client
-        .patch(format!("https://{listen}/api/v1/namespaces/dev/pods/web"))
+        .patch(format!(
+            "https://{listen}/apis/apps/v1/namespaces/dev/deployments/api"
+        ))
         .bearer_auth("live-then-edited")
         .header("content-type", "application/merge-patch+json")
         .body(r#"{"metadata":{"labels":{"checked":"true"}}}"#)
@@ -1756,6 +1788,7 @@ async fn hot_reloaded_explicit_deny_is_rechecked_after_evaluator_delay() {
         started: started.clone(),
         release: release.clone(),
     }));
+    proxy.attach_session_sink(Arc::new(LiveSessionSink));
     tokio::spawn(proxy.clone().serve_on(listener));
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
@@ -1764,6 +1797,7 @@ async fn hot_reloaded_explicit_deny_is_rechecked_after_evaluator_delay() {
     let request = tokio::spawn(async move {
         client
             .patch(format!("https://{listen}/api/v1/namespaces/dev/pods/web"))
+            .bearer_auth("live-session")
             .body("{}")
             .send()
             .await
@@ -1789,6 +1823,7 @@ async fn spawn_blocking_snapshot_mock(
     release: Arc<tokio::sync::Notify>,
     writes: Arc<AtomicUsize>,
 ) -> String {
+    let gets = Arc::new(AtomicUsize::new(0));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -1797,15 +1832,19 @@ async fn spawn_blocking_snapshot_mock(
             let started = started.clone();
             let release = release.clone();
             let writes = writes.clone();
+            let gets = gets.clone();
             tokio::spawn(async move {
                 let service = service_fn(move |req: Request<Incoming>| {
                     let started = started.clone();
                     let release = release.clone();
                     let writes = writes.clone();
+                    let gets = gets.clone();
                     async move {
                         if req.method() == hyper::Method::GET {
-                            started.notify_one();
-                            release.notified().await;
+                            if gets.fetch_add(1, Ordering::SeqCst) == 1 {
+                                started.notify_one();
+                                release.notified().await;
+                            }
                         } else {
                             writes.fetch_add(1, Ordering::SeqCst);
                         }
@@ -1833,13 +1872,16 @@ async fn direct_allow_revalidates_session_after_delayed_snapshot() {
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(
-        "default: deny\nrules:\n  - verbs: [patch]\n    resources: [deployments]\n    namespaces: [dev]\n    action: allow\n",
+        "default: deny\nrules:\n  - verbs: [get]\n    resources: [deployments]\n    namespaces: [dev]\n    action: allow\n  - verbs: [patch]\n    resources: [deployments]\n    namespaces: [dev]\n    action: allow\n",
     )
     .unwrap();
     let (listener, listen) = reserve_listener().await;
-    let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
+    let proxy = Arc::new(
+        ApiProxy::new(listen, tls, upstream, policy, None)
+            .with_listener_mode(ApiListenerMode::Policy),
+    );
     proxy.attach_gate(Arc::new(RecordingSink::default()));
-    let remaining = Arc::new(AtomicUsize::new(2));
+    let remaining = Arc::new(AtomicUsize::new(3));
     proxy.attach_session_sink(Arc::new(BudgetSessionSink {
         remaining_resolutions: remaining.clone(),
     }));
@@ -1848,6 +1890,18 @@ async fn direct_allow_revalidates_session_after_delayed_snapshot() {
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
         .unwrap();
+    assert_eq!(
+        client
+            .get(format!(
+                "https://{listen}/apis/apps/v1/namespaces/dev/deployments/api"
+            ))
+            .bearer_auth("budget-session")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
     let request = tokio::spawn(async move {
         client
             .patch(format!(
@@ -1881,26 +1935,41 @@ async fn assert_direct_allow_reload_fails_closed(next_action: &str, next_intent:
     let policy_path = temp.path().join("api-policy.yaml");
     std::fs::write(
         &policy_path,
-        "intent: initial task intent\ndefault: deny\nrules:\n  - verbs: [patch]\n    resources: [deployments]\n    namespaces: [dev]\n    action: allow\n",
+        "intent: initial task intent\ndefault: deny\nrules:\n  - verbs: [get]\n    resources: [deployments]\n    namespaces: [dev]\n    action: allow\n  - verbs: [patch]\n    resources: [deployments]\n    namespaces: [dev]\n    action: allow\n",
     )
     .unwrap();
     let policy = ApiPolicy::load_file(&policy_path).unwrap();
     let (listener, listen) = reserve_listener().await;
     let proxy = Arc::new(
         ApiProxy::new(listen, tls, upstream, policy, Some(policy_path.clone()))
+            .with_listener_mode(ApiListenerMode::Policy)
             .with_policy_reload_interval(Duration::from_millis(50)),
     );
     proxy.attach_gate(Arc::new(RecordingSink::default()));
+    proxy.attach_session_sink(Arc::new(LiveSessionSink));
     tokio::spawn(proxy.clone().serve_on(listener));
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
         .unwrap();
+    assert_eq!(
+        client
+            .get(format!(
+                "https://{listen}/apis/apps/v1/namespaces/dev/deployments/api"
+            ))
+            .bearer_auth("live-session")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
     let request = tokio::spawn(async move {
         client
             .patch(format!(
                 "https://{listen}/apis/apps/v1/namespaces/dev/deployments/api"
             ))
+            .bearer_auth("live-session")
             .body("{}")
             .send()
             .await
@@ -1953,7 +2022,11 @@ async fn proxy_self_access_review_carries_upstream_credential() {
     )
     .expect("policy");
     let (listener, listen) = reserve_listener().await;
-    let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
+    let proxy = Arc::new(
+        ApiProxy::new(listen, tls, upstream, policy, None)
+            .with_listener_mode(ApiListenerMode::Policy),
+    );
+    proxy.attach_session_sink(Arc::new(LiveSessionSink));
 
     tokio::spawn(proxy.clone().serve_on(listener));
 
@@ -1972,6 +2045,7 @@ async fn proxy_self_access_review_carries_upstream_credential() {
         .post(format!(
             "{base}/apis/authorization.k8s.io/v1/selfsubjectaccessreviews"
         ))
+        .bearer_auth("live-session")
         .header("content-type", "application/json")
         .body(review.to_string())
         .send()
@@ -2001,10 +2075,8 @@ async fn create_delete_mock_handler(
     req: Request<Incoming>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let (code, body) = match *req.method() {
-        hyper::Method::POST => (
-            201,
-            json!({"kind": "Pod", "apiVersion": "v1", "metadata": {"name": "check-pod", "namespace": "dev"}}),
-        ),
+        hyper::Method::POST => (201, created_pod_object()),
+        hyper::Method::GET => (200, created_pod_object()),
         hyper::Method::DELETE => (
             200,
             json!({"kind": "Status", "apiVersion": "v1", "status": "Success"}),
@@ -2019,6 +2091,20 @@ async fn create_delete_mock_handler(
         .header("content-type", "application/json")
         .body(Full::new(Bytes::from(body.to_string())))
         .unwrap())
+}
+
+fn created_pod_object() -> Value {
+    json!({
+        "kind": "Pod",
+        "apiVersion": "v1",
+        "metadata": {
+            "name": "check-pod",
+            "namespace": "dev",
+            "uid": "check-pod-uid",
+            "resourceVersion": "7"
+        },
+        "spec": {"containers": []}
+    })
 }
 
 async fn spawn_create_delete_mock() -> String {
@@ -2058,7 +2144,7 @@ async fn spawn_failing_create_delete_mock(outcomes: VecDeque<Option<u16>>) -> St
                     let outcomes = outcomes.clone();
                     async move {
                         if req.method() == hyper::Method::POST {
-                            let body = json!({"kind":"Pod","apiVersion":"v1","metadata":{"name":"check-pod","namespace":"dev"}});
+                            let body = created_pod_object();
                             return Ok::<_, std::io::Error>(
                                 Response::builder()
                                     .status(201)
@@ -2082,7 +2168,8 @@ async fn spawn_failing_create_delete_mock(outcomes: VecDeque<Option<u16>>) -> St
                         }
                         Ok(Response::builder()
                             .status(200)
-                            .body(Full::new(Bytes::from("{}")))
+                            .header("content-type", "application/json")
+                            .body(Full::new(Bytes::from(created_pod_object().to_string())))
                             .unwrap())
                     }
                 });
@@ -2105,7 +2192,7 @@ async fn spawn_truncated_cleanup_mock() -> String {
             tokio::spawn(async move {
                 let service = service_fn(|req: Request<Incoming>| async move {
                     let response: Response<MockBody> = if req.method() == hyper::Method::POST {
-                        let body = json!({"kind":"Pod","apiVersion":"v1","metadata":{"name":"check-pod","namespace":"dev"}}).to_string();
+                        let body = created_pod_object().to_string();
                         Response::builder()
                             .status(201)
                             .header("content-type", "application/json")
@@ -2115,7 +2202,7 @@ async fn spawn_truncated_cleanup_mock() -> String {
                                     .boxed(),
                             )
                             .unwrap()
-                    } else {
+                    } else if req.method() == hyper::Method::DELETE {
                         let frames = futures::stream::iter([
                             Ok(Frame::data(Bytes::from_static(b"{"))),
                             Err(std::io::Error::other("simulated body disconnect")),
@@ -2124,6 +2211,16 @@ async fn spawn_truncated_cleanup_mock() -> String {
                             .status(200)
                             .header("content-type", "application/json")
                             .body(StreamBody::new(frames).boxed())
+                            .unwrap()
+                    } else {
+                        Response::builder()
+                            .status(200)
+                            .header("content-type", "application/json")
+                            .body(
+                                Full::new(Bytes::from(created_pod_object().to_string()))
+                                    .map_err(|never| match never {})
+                                    .boxed(),
+                            )
                             .unwrap()
                     };
                     Ok::<_, Infallible>(response)
@@ -2147,12 +2244,13 @@ async fn start_provenance_proxy(
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).unwrap();
     let (listener, listen) = reserve_listener().await;
-    let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
+    let proxy = Arc::new(
+        ApiProxy::new(listen, tls, upstream, policy, None)
+            .with_listener_mode(ApiListenerMode::Policy),
+    );
     let sink = RecordingSink::default();
     proxy.attach_gate(Arc::new(sink.clone()));
-    if let Some(session_sink) = session_sink {
-        proxy.attach_session_sink(session_sink);
-    }
+    proxy.attach_session_sink(session_sink.unwrap_or_else(|| Arc::new(LiveSessionSink)));
     tokio::spawn(proxy.serve_on(listener));
     let client = SingleConnectionClient::connect(listen, &ca_pem).await;
     (client, sink)
@@ -2192,7 +2290,9 @@ impl SingleConnectionClient {
             hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls_stream))
                 .await
                 .unwrap();
-        tokio::spawn(async move { connection.await.unwrap() });
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
         Self {
             sender,
             authority: listen.to_string(),
@@ -2240,7 +2340,7 @@ async fn proxy_allows_contained_delete_of_created_resource() {
         .request(
             hyper::Method::DELETE,
             "/api/v1/namespaces/dev/pods/other-pod",
-            None,
+            Some("live-session"),
             None,
         )
         .await;
@@ -2251,7 +2351,7 @@ async fn proxy_allows_contained_delete_of_created_resource() {
         .request(
             hyper::Method::POST,
             "/api/v1/namespaces/dev/pods",
-            None,
+            Some("live-session"),
             Some("{}"),
         )
         .await;
@@ -2266,7 +2366,7 @@ async fn proxy_allows_contained_delete_of_created_resource() {
         .request(
             hyper::Method::DELETE,
             "/api/v1/namespaces/dev/pods/check-pod",
-            None,
+            Some("live-session"),
             None,
         )
         .await;
@@ -2292,7 +2392,7 @@ async fn proxy_allows_contained_delete_of_created_resource() {
         .request(
             hyper::Method::DELETE,
             "/api/v1/namespaces/dev/pods/check-pod",
-            None,
+            Some("live-session"),
             None,
         )
         .await;
@@ -2313,7 +2413,7 @@ async fn contained_delete_retains_revert_on_transport_4xx_and_5xx_failures() {
                 .request(
                     hyper::Method::POST,
                     "/api/v1/namespaces/dev/pods",
-                    None,
+                    Some("live-session"),
                     Some("{}"),
                 )
                 .await,
@@ -2324,7 +2424,7 @@ async fn contained_delete_retains_revert_on_transport_4xx_and_5xx_failures() {
             .request(
                 hyper::Method::DELETE,
                 "/api/v1/namespaces/dev/pods/check-pod",
-                None,
+                Some("live-session"),
                 None,
             )
             .await;
@@ -2340,7 +2440,7 @@ async fn contained_delete_retains_revert_on_transport_4xx_and_5xx_failures() {
                     .request(
                         hyper::Method::DELETE,
                         "/api/v1/namespaces/dev/pods/check-pod",
-                        None,
+                        Some("live-session"),
                         None,
                     )
                     .await,
@@ -2418,7 +2518,7 @@ async fn contained_delete_retains_revert_when_a_2xx_body_disconnects() {
             .request(
                 hyper::Method::POST,
                 "/api/v1/namespaces/dev/pods",
-                None,
+                Some("live-session"),
                 Some("{}"),
             )
             .await,
@@ -2430,7 +2530,7 @@ async fn contained_delete_retains_revert_when_a_2xx_body_disconnects() {
             .request(
                 hyper::Method::DELETE,
                 "/api/v1/namespaces/dev/pods/check-pod",
-                None,
+                Some("live-session"),
                 None,
             )
             .await,
@@ -2454,9 +2554,13 @@ async fn created_provenance_never_overrides_an_explicit_policy_deny() {
     )
     .unwrap();
     let (listener, listen) = reserve_listener().await;
-    let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
+    let proxy = Arc::new(
+        ApiProxy::new(listen, tls, upstream, policy, None)
+            .with_listener_mode(ApiListenerMode::Policy),
+    );
     let sink = RecordingSink::default();
     proxy.attach_gate(Arc::new(sink.clone()));
+    proxy.attach_session_sink(Arc::new(LiveSessionSink));
     tokio::spawn(proxy.clone().serve_on(listener));
 
     let client = reqwest::Client::builder()
@@ -2466,6 +2570,7 @@ async fn created_provenance_never_overrides_an_explicit_policy_deny() {
     let base = format!("https://{listen}");
     let created = client
         .post(format!("{base}/api/v1/namespaces/dev/pods"))
+        .bearer_auth("live-session")
         .body("{}")
         .send()
         .await
@@ -2476,6 +2581,7 @@ async fn created_provenance_never_overrides_an_explicit_policy_deny() {
 
     let denied = client
         .delete(format!("{base}/api/v1/namespaces/dev/pods/check-pod"))
+        .bearer_auth("live-session")
         .send()
         .await
         .unwrap();
@@ -2636,10 +2742,14 @@ rules:
     )
     .expect("policy");
     let (listener, listen) = reserve_listener().await;
-    let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
+    let proxy = Arc::new(
+        ApiProxy::new(listen, tls, upstream, policy, None)
+            .with_listener_mode(ApiListenerMode::Policy),
+    );
 
     let sink = RecordingSink::default();
     proxy.attach_gate(Arc::new(sink.clone()));
+    proxy.attach_session_sink(Arc::new(LiveSessionSink));
 
     tokio::spawn(proxy.clone().serve_on(listener));
 
@@ -2649,19 +2759,26 @@ rules:
         .build()
         .unwrap();
 
-    // Evict the pod: allowed by the eviction rule.
+    // Eviction cannot carry Guard's object preconditions, so the concurrency
+    // floor rejects it even though policy would otherwise allow it.
     let resp = client
         .post(format!(
             "{base}/api/v1/namespaces/dev/pods/critical-0/eviction"
         ))
+        .bearer_auth("live-session")
         .body("{}")
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 201, "eviction forwarded");
+    assert_eq!(
+        resp.status(),
+        409,
+        "an eviction that cannot carry object preconditions fails closed"
+    );
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // No auto-revert was armed for a subresource write, so no provenance exists.
+    // No auto-revert was armed for the rejected subresource write, so no
+    // provenance exists.
     assert_eq!(
         sink.calls.lock().unwrap().len(),
         0,
@@ -2671,6 +2788,7 @@ rules:
     // Deleting the evicted pod must stay held: the eviction did not launder it.
     let resp = client
         .delete(format!("{base}/api/v1/namespaces/dev/pods/critical-0"))
+        .bearer_auth("live-session")
         .send()
         .await
         .unwrap();
@@ -2823,6 +2941,10 @@ async fn proxy_hold_forwards_on_approval_and_fails_closed_without_queue() {
     let policy_yaml = r#"
 default: deny
 rules:
+  - verbs: [get]
+    resources: [pods]
+    namespaces: [dev]
+    action: allow
   - verbs: [delete]
     resources: [pods]
     namespaces: [dev]
@@ -2837,6 +2959,7 @@ rules:
     let policy = ApiPolicy::from_yaml(policy_yaml).expect("policy");
     let (listener, listen) = reserve_listener().await;
     let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
+    proxy.attach_session_sink(Arc::new(LiveSessionSink));
     tokio::spawn(proxy.clone().serve_on(listener));
 
     let base = format!("https://{listen}");
@@ -2844,8 +2967,19 @@ rules:
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
         .unwrap();
+    assert_eq!(
+        client
+            .get(format!("{base}/api/v1/namespaces/dev/pods/web-0"))
+            .bearer_auth("live-session")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
     let resp = client
         .delete(format!("{base}/api/v1/namespaces/dev/pods/web-0"))
+        .bearer_auth("live-session")
         .send()
         .await
         .unwrap();
@@ -2874,6 +3008,16 @@ rules:
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
         .unwrap();
+    assert_eq!(
+        client
+            .get(format!("{base}/api/v1/namespaces/dev/pods/web-0"))
+            .bearer_auth("live-session")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
     let resp = client
         .delete(format!("{base}/api/v1/namespaces/dev/pods/web-0"))
         .bearer_auth("live-session")
@@ -2883,9 +3027,9 @@ rules:
     assert_eq!(resp.status(), 200, "an approved hold is forwarded upstream");
     {
         let events = session_sink.events.lock().unwrap();
-        assert_eq!(events.len(), 1, "the held request is recorded once");
-        assert!(events[0].held, "an approved hold remains held in history");
-        assert!(events[0].allowed, "the operator-approved hold was allowed");
+        let held = events.iter().filter(|event| event.held).collect::<Vec<_>>();
+        assert_eq!(held.len(), 1, "the held request is recorded once");
+        assert!(held[0].allowed, "the operator-approved hold was allowed");
     }
 
     for reason in ["operator denied", "approval expired"] {
@@ -2941,6 +3085,7 @@ async fn held_request_captures_complete_body_before_approval_and_stalls_fail_clo
     );
     let sink = SnapshotSink::default();
     proxy.attach_gate(Arc::new(sink.clone()));
+    proxy.attach_session_sink(Arc::new(LiveSessionSink));
     tokio::spawn(proxy.serve_on(listener));
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
@@ -2958,6 +3103,7 @@ async fn held_request_captures_complete_body_before_approval_and_stalls_fail_clo
         async move {
             client
                 .post(format!("{base}/api/v1/namespaces/dev/pods"))
+                .bearer_auth("live-session")
                 .body(reqwest::Body::wrap_stream(stream))
                 .send()
                 .await
@@ -3000,6 +3146,7 @@ async fn held_request_captures_complete_body_before_approval_and_stalls_fail_clo
     let stalled_request = tokio::spawn(async move {
         client
             .post(format!("{base}/api/v1/namespaces/dev/pods"))
+            .bearer_auth("live-session")
             .body(reqwest::Body::wrap_stream(stalled_stream))
             .send()
             .await
@@ -3215,6 +3362,10 @@ rules:
     resources: [configmaps]
     namespaces: [dev]
     action: evaluate
+  - verbs: [get]
+    resources: [deployments]
+    namespaces: [dev]
+    action: allow
   - verbs: [patch]
     resources: [deployments]
     namespaces: [dev]
@@ -3257,6 +3408,17 @@ rules:
         0,
     )
     .await;
+    assert_eq!(
+        client
+            .get(format!(
+                "{base}/apis/apps/v1/namespaces/dev/deployments/api"
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
     let resp = client
         .patch(format!(
             "{base}/apis/apps/v1/namespaces/dev/deployments/api"
@@ -3373,6 +3535,7 @@ rules:
     let secret_value = "super-secret-value";
     let resp = client
         .post(format!("{base}/api/v1/namespaces/dev/configmaps"))
+        .bearer_auth("live-session")
         .header("content-type", "application/json")
         .body(
             json!({
@@ -3631,6 +3794,10 @@ async fn proxy_evaluate_reuses_prior_snapshot_for_arming() {
     let policy = r#"
 default: deny
 rules:
+  - verbs: [get]
+    resources: [deployments]
+    namespaces: [dev]
+    action: allow
   - verbs: [patch]
     resources: [deployments]
     namespaces: [dev]
@@ -3647,6 +3814,17 @@ rules:
         0,
     )
     .await;
+    assert_eq!(
+        client
+            .get(format!(
+                "{base}/apis/apps/v1/namespaces/dev/deployments/api"
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
     let resp = client
         .patch(format!(
             "{base}/apis/apps/v1/namespaces/dev/deployments/api"
@@ -3657,13 +3835,14 @@ rules:
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    // The prior object is fetched twice on the evaluate path: once before the
+    // The object is fetched once for the caller's observation, then twice on
+    // the evaluate path: once before the
     // judge to decide whether a revert is constructible (an input to the
     // verdict), and again at forward time so the armed revert restores state as
     // it was at the write, not as it was before the evaluator round trip.
     wait_until(
         "evaluate path to validate constructibility, then re-fetch fresh for arming",
-        || gets.load(std::sync::atomic::Ordering::SeqCst) == 2,
+        || gets.load(std::sync::atomic::Ordering::SeqCst) == 3,
     )
     .await;
 }
