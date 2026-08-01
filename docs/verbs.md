@@ -57,7 +57,7 @@ requires a trusted verb.
         required_args: [--check]
         inventory:
           options: [-i, --inventory]
-          values: [inventory/production]
+          values: [/srv/guard/inventory/production]
         fanout:
           options: [--limit]
           max: 2
@@ -77,6 +77,12 @@ requires a trusted verb.
 A non-matching cell has no decision. The check cell above allows its bounded
 region and does not deny apply mode, SSH inspection, or any other command. Those
 areas follow their own matching cells or evaluator path.
+
+Known file operands in command and rollback templates must be absolute. Ansible
+inventory coverage likewise accepts only absolute paths or explicit inline host
+lists. If an explicit-inventory Ansible process reports that no inventory was
+parsed, or that every supplied source was unusable, Guard converts exit 0 to a
+failure and emits a diagnostic.
 
 Environment sources are `plain`, `secret`, and `secret-file`. A constraint may
 name exact `values` or a fully anchored `pattern`. A cell with no environment

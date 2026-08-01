@@ -47,6 +47,38 @@ are inspection, and which argument shapes are out of bounds. Typed verbs are
 the deterministic alternative for tools whose semantics should not depend on
 evaluator judgment at all.
 
+For example, an operator-provided `site-admin` binary with
+`inspect --service NAME` and `apply --service NAME` subcommands can use this
+prompt supplement:
+
+```text
+Local tool: site-admin
+- `site-admin inspect --service NAME` reads service state and does not mutate it.
+- `site-admin apply --service NAME` reconciles the named service and may change
+  configuration, processes, and remote state. Treat it as an opaque mutation.
+- Reject unknown subcommands, payload arguments, shell fragments, stdin-driven
+  input, and service names that are not visible as one argv element.
+```
+
+When only a fixed inspection set is required, a typed verb removes evaluator
+ambiguity:
+
+```yaml
+version: 1
+verbs:
+  - name: site-admin-inspect
+    description: Inspect one configured service
+    binary: site-admin
+    args: [inspect, --service, "{service}"]
+    params:
+      service:
+        enum: [api, worker]
+    consequence: reversible
+```
+
+The prompt supplement explains novel invocations. The typed verb is the
+enforcement surface for repeated commands whose executable shapes are finite.
+
 `--policy <yaml>` is an optional pre-evaluator deny path. With the evaluator
 enabled, policy allow patterns do not skip evaluation. `--no-evaluator` makes
 static policy the decision source. Agents request missing authority in prose
@@ -146,6 +178,33 @@ the evaluator subject and cache authority. Raw environment values stay out of
 prompts and audit; Guard binds them with a value digest. Secret bindings expose
 only environment and store names to policy, while resolved values remain inside
 the daemon.
+
+### Tool-owned environment
+
+The daemon loads `tools.yaml` from its Guard configuration directory. Each
+binary can receive fixed environment values and named secrets owned by the
+daemon:
+
+```yaml
+tools:
+  ansible-playbook:
+    env:
+      HOME: /var/lib/guard
+      ANSIBLE_LOCAL_TEMP: /var/lib/guard/.ansible/tmp
+      PATH: /opt/ansible-tools/bin:/usr/local/bin:/usr/bin:/bin
+```
+
+This pattern gives `connection: local` tasks a writable home and temporary
+directory while selecting an operator-managed Python environment for modules.
+Create those directories with service-account ownership before starting Guard.
+Pin `ansible_python_interpreter` in the inventory or a typed verb when a
+playbook must use a particular interpreter. Tool values override the built-in
+safe environment, and a request cannot override the same variable.
+
+Tool configuration is binary-wide. Use separate wrapper binary names when two
+verb families require incompatible environments. Per-user entries under
+`users` can override fixed values or secret references, but the authenticated
+principal's secret namespace remains the source.
 
 ## API proxy
 

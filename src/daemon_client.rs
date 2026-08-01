@@ -128,6 +128,7 @@ impl Client {
             AdminRequest::Revert { .. } => "revert",
             AdminRequest::Provisionals => "provisionals",
             AdminRequest::Approve { .. } => "approve",
+            AdminRequest::Resume { .. } => "resume",
             AdminRequest::Deny { .. } => "deny",
             AdminRequest::ApprovalList => "approval_list",
             AdminRequest::ApprovalShow { .. } => "approval_show",

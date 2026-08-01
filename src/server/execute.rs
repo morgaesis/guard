@@ -139,11 +139,23 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
     stream_output: bool,
     stream_writer: &mut W,
 ) -> ExecuteResult {
-    if request.session_token.is_none() && caller.is_local_peer() {
+    // Local access authority is selected by the kernel-authenticated principal.
+    // Replace only an unknown or expired supplied handle; a known handle stays
+    // attached so the owner check below rejects cross-principal use.
+    if caller.is_local_peer() {
         if let Some(principal) = caller.principal() {
             let sessions = server.state.sessions.read().await;
-            request.session_token =
-                super::admin::access_token_for_principal_ci(&sessions, &principal);
+            let supplied_session_is_known = request
+                .session_token
+                .as_deref()
+                .is_some_and(|token| sessions.owner_for(token).is_some());
+            if request.session_token.is_none() || !supplied_session_is_known {
+                if let Some(token) =
+                    super::admin::access_token_for_principal_ci(&sessions, &principal)
+                {
+                    request.session_token = Some(token);
+                }
+            }
         }
     }
     let admission_scope = caller.to_string();
@@ -2337,6 +2349,97 @@ pub(super) const AUTO_READ_GRANT_TTL_SECS: u64 = 600;
 #[cfg(unix)]
 const AUTO_READ_GRANT_MAX_ROUNDS: usize = 3;
 
+const ANSIBLE_INVENTORY_FAILURE_DIAGNOSTIC: &str =
+    "guard: ansible reported no usable explicit inventory; treating exit 0 as failure\n";
+
+/// Tracks the narrow class of Ansible diagnostics that otherwise produce a
+/// misleading successful exit. An invocation without an explicit inventory is
+/// deliberately ignored because Ansible's implicit localhost behavior is valid.
+#[derive(Debug)]
+pub(super) struct AnsibleInventoryDiagnostics {
+    explicit_sources: BTreeSet<String>,
+    unparseable_sources: BTreeSet<String>,
+    no_inventory_parsed: bool,
+}
+
+impl AnsibleInventoryDiagnostics {
+    pub(super) fn for_command(binary: &str, args: &[String]) -> Option<Self> {
+        if !matches!(
+            Path::new(binary)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(binary)
+                .trim_end_matches(".exe"),
+            "ansible" | "ansible-playbook"
+        ) {
+            return None;
+        }
+
+        let mut explicit_sources = BTreeSet::new();
+        let mut arguments = args.iter();
+        while let Some(argument) = arguments.next() {
+            if matches!(argument.as_str(), "-i" | "--inventory") {
+                if let Some(source) = arguments.next() {
+                    explicit_sources.insert(source.clone());
+                }
+            } else if let Some(source) = argument.strip_prefix("--inventory=") {
+                if !source.is_empty() {
+                    explicit_sources.insert(source.to_string());
+                }
+            }
+        }
+        if explicit_sources.is_empty() {
+            return None;
+        }
+
+        Some(Self {
+            explicit_sources,
+            unparseable_sources: BTreeSet::new(),
+            no_inventory_parsed: false,
+        })
+    }
+
+    pub(super) fn observe(&mut self, output: &str) {
+        for line in output.lines() {
+            let lower = line.to_ascii_lowercase();
+            if lower.contains("no inventory was parsed") {
+                self.no_inventory_parsed = true;
+            }
+            if lower.contains("unable to parse") && lower.contains("as an inventory source") {
+                for source in &self.explicit_sources {
+                    if line.contains(source) {
+                        self.unparseable_sources.insert(source.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    pub(super) fn normalizes_success_to_failure(&self, exit_code: Option<i32>) -> bool {
+        exit_code == Some(0)
+            && (self.no_inventory_parsed
+                || self.unparseable_sources.len() == self.explicit_sources.len())
+    }
+}
+
+fn append_bounded_diagnostic(output: Option<String>, diagnostic: &str) -> Option<String> {
+    let mut output = output.unwrap_or_default();
+    let reserved = diagnostic.len().min(MAX_OUTPUT_BYTES);
+    let maximum_existing = MAX_OUTPUT_BYTES.saturating_sub(reserved);
+    if output.len() > maximum_existing {
+        let mut boundary = maximum_existing;
+        while boundary > 0 && !output.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        output.truncate(boundary);
+    }
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
+    }
+    output.push_str(diagnostic);
+    Some(output)
+}
+
 /// Extract the absolute file path named by a permission-denied error line, if
 /// any. Understands the common shapes: `cat: /path: Permission denied`,
 /// `[Errno 13] Permission denied: '/path'`, and `open /path: permission
@@ -2904,7 +3007,7 @@ pub(super) async fn exec_after_approval_with_secret_authority<W: AsyncWrite + Un
         Some(redact_command_text(server, &redaction_env, s))
     };
 
-    let stderr = if output.stderr.is_empty() {
+    let mut stderr = if output.stderr.is_empty() {
         None
     } else {
         let raw = &output.stderr[..output.stderr.len().min(MAX_OUTPUT_BYTES)];
@@ -2912,8 +3015,20 @@ pub(super) async fn exec_after_approval_with_secret_authority<W: AsyncWrite + Un
         Some(redact_command_text(server, &redaction_env, s))
     };
 
+    let mut exit_code = output.status.code();
+    if let Some(mut diagnostics) =
+        AnsibleInventoryDiagnostics::for_command(&request.binary, &request.args)
+    {
+        diagnostics.observe(&String::from_utf8_lossy(&output.stdout));
+        diagnostics.observe(&String::from_utf8_lossy(&output.stderr));
+        if diagnostics.normalizes_success_to_failure(exit_code) {
+            exit_code = Some(1);
+            stderr = append_bounded_diagnostic(stderr, ANSIBLE_INVENTORY_FAILURE_DIAGNOSTIC);
+        }
+    }
+
     drop(secret_file_lease);
-    ExecuteResult::completed(allow_reason, output.status.code(), stdout, stderr)
+    ExecuteResult::completed(allow_reason, exit_code, stdout, stderr)
         .with_exposed_secret_refs(exposed_secret_refs)
 }
 
@@ -2974,12 +3089,17 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
 
     let mut stdout_redaction = RedactionState::default();
     let mut stderr_redaction = RedactionState::default();
+    let mut ansible_diagnostics =
+        AnsibleInventoryDiagnostics::for_command(&audit.request.binary, &audit.request.args);
     let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(1));
     loop {
         tokio::select! {
             maybe_chunk = rx.recv() => {
                 match maybe_chunk {
                     Some(chunk) => {
+                    if let Some(diagnostics) = &mut ansible_diagnostics {
+                        diagnostics.observe(&chunk.data);
+                    }
                     let redaction_state = match chunk.stream {
                         OutputStream::Stdout => &mut stdout_redaction,
                         OutputStream::Stderr => &mut stderr_redaction,
@@ -3043,7 +3163,25 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
         guard.complete();
     }
 
-    ExecuteResult::completed(allow_reason, status.code(), None, None)
+    let mut exit_code = status.code();
+    if ansible_diagnostics
+        .as_ref()
+        .is_some_and(|diagnostics| diagnostics.normalizes_success_to_failure(exit_code))
+    {
+        exit_code = Some(1);
+        let diagnostic = ExecuteStreamMessage::Stderr {
+            data: ANSIBLE_INVENTORY_FAILURE_DIAGNOSTIC.to_string(),
+        };
+        if let Err(e) = write_stream_message(writer, &diagnostic).await {
+            return ExecuteResult::exec_failed_after_start(
+                allow_reason,
+                format!("client stream error: {}", e),
+            )
+            .with_exposed_secret_refs(audit.exposed_secret_refs);
+        }
+    }
+
+    ExecuteResult::completed(allow_reason, exit_code, None, None)
         .with_exposed_secret_refs(audit.exposed_secret_refs)
 }
 

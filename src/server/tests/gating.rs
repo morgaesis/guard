@@ -4,16 +4,16 @@ use crate::server::execute::audit_session_fingerprint;
 use crate::server::gate_runtime::run_provisional_check;
 use crate::server::gate_runtime::{
     approval_to_result, execute_snapshot, hash_secret_value, hold_for_approval_with_authority,
-    hold_for_approval_with_trace, new_handle, now_unix, route_gated_allow, GateInputs,
-    SessionAuthoritySnapshot,
+    hold_for_approval_with_trace, new_handle, now_unix, resume_approval, route_gated_allow,
+    GateInputs, SessionAuthoritySnapshot,
 };
 #[cfg(unix)]
 use crate::server::gate_runtime::{
     arm_containment_with_authority, finish_due_provisional, finish_revert, DaemonGateSink,
 };
 use crate::server::wire::{
-    AdminRequest, AdminResponse, CallerIdentity, ExecOutcome, ExecuteRequest, ExecuteResult,
-    RevertSpec,
+    approval_is_armed, AdminRequest, AdminResponse, CallerIdentity, ExecOutcome, ExecuteRequest,
+    ExecuteResult, RevertSpec,
 };
 use crate::server::{RequestContext, ServerContext, APPROVAL_TTL_SECS};
 use crate::session::SessionGrant;
@@ -108,6 +108,31 @@ fn contain_request(binary: &str, args: &[&str], revert: RevertSpec) -> ExecuteRe
     }
 }
 
+fn held_request(
+    binary: &str,
+    args: Vec<String>,
+    wait_approval_secs: Option<u64>,
+) -> ExecuteRequest {
+    ExecuteRequest {
+        binary: binary.to_string(),
+        args,
+        auth_token: None,
+        env: HashMap::new(),
+        secrets: HashMap::new(),
+        secret_files: HashMap::new(),
+        stream: false,
+        session_token: None,
+        revert: None,
+        confirm_within_secs: None,
+        reevaluate: false,
+        ssh_hostkey: None,
+        cwd: None,
+        require_approval: None,
+        wait_approval_secs,
+        verb: None,
+    }
+}
+
 fn active_session() -> SessionGrant {
     SessionGrant {
         allow: Vec::new(),
@@ -172,14 +197,12 @@ impl AsyncWrite for FlakyWriter {
     }
 }
 
-/// CONTAINMENT-LEAK (regression for the just-landed disconnect fix): a
-/// contained forward command that LAUNCHES and then fails because the client
-/// stream drops mid-run must STAY ARMED - the provisional stays in the
-/// registry with `forward_done` set so the auto-revert can still fire. A
-/// leak here would let an unconfirmed mutation persist past its deadline.
+/// A contained forward command that launches and then loses its client stream
+/// records an explicit interruption. No confirmation deadline is invented for
+/// a child whose successful completion was never observed.
 #[cfg(unix)]
 #[tokio::test]
-async fn containment_stays_armed_when_client_stream_drops_after_launch() {
+async fn containment_records_interruption_when_client_stream_drops_after_launch() {
     let temp = tempfile::tempdir().expect("tempdir");
     let escaped_marker = temp.path().join("background-child-survived");
     let (cfg, _operator, agent) = gating_config(7001, 1000);
@@ -239,18 +262,21 @@ async fn containment_stays_armed_when_client_stream_drops_after_launch() {
         other => panic!("expected Failed{{started:true}}, got {:?}", other),
     }
 
-    // Invariant: the provisional is STILL ARMED with forward_done set, so the
-    // sweeper's take_due can fire the auto-revert. It must NOT have been
-    // dropped (that would leak the unconfirmed mutation).
+    // The provisional remains queryable, but its forward outcome is explicitly
+    // interrupted and cannot race an automatic rollback timer.
     let reg = cfg.state.provisional.read().await;
     let rows = reg.list();
     assert_eq!(rows.len(), 1, "the armed provisional must be retained");
     let p = &rows[0];
-    assert_eq!(p.status, ProvisionalStatus::Armed);
-    assert!(
-        p.forward_done,
-        "forward_done must be set so the deadline is honored"
-    );
+    assert_eq!(p.status, ProvisionalStatus::NeedsOperatorDecision);
+    assert!(!p.forward_done);
+    assert_eq!(p.deadline_unix, 0);
+    assert_eq!(p.forward_outcome(), "interrupted");
+    assert!(p
+        .revert_detail
+        .as_deref()
+        .is_some_and(|detail| detail.contains("interrupted after launch")));
+    assert!(reg.due_handles(u64::MAX).is_empty());
     assert_eq!(reg.outstanding(), 1, "the armed row still occupies a slot");
     assert_eq!(
         p.secret_file_keys.get("STREAM_SECRET_FILE"),
@@ -267,6 +293,102 @@ async fn containment_stays_armed_when_client_stream_drops_after_launch() {
         !escaped_marker.exists(),
         "same-group background child survived the stream disconnect"
     );
+    drop(reg);
+
+    let AdminResponse::Provisionals { items } =
+        handle_admin_request(&cfg, &agent, AdminRequest::Provisionals).await
+    else {
+        panic!("requester should inspect its interrupted provisional");
+    };
+    assert_eq!(items[0].status, "interrupted");
+    assert_eq!(items[0].forward_outcome, "interrupted");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn confirmation_deadline_starts_after_long_forward_and_survives_restart() {
+    let (mut cfg, _operator, agent) = gating_config(7_041, 1_000);
+    let state = tempfile::tempdir().unwrap();
+    let store = SessionStore::open(state.path().join("state.db"), 3_600)
+        .await
+        .unwrap();
+    cfg.state.session_store = Some(store.clone());
+    let mut request = contain_request(
+        "sh",
+        &["-c", "sleep 2; printf completed"],
+        RevertSpec::new("true", Vec::new()),
+    );
+    request.confirm_within_secs = Some(4);
+    let cfg_for_run = cfg.clone();
+    let agent_for_run = agent.clone();
+    let run = tokio::spawn(async move {
+        let mut sink = tokio::io::sink();
+        arm_containment_with_authority(
+            &mut RequestContext {
+                server: &cfg_for_run,
+                caller: &agent_for_run,
+                depth: 0,
+                stream_output: false,
+                stream_writer: &mut sink,
+            },
+            request,
+            agent_for_run.principal(),
+            "long recoverable change".to_string(),
+            None,
+        )
+        .await
+    });
+
+    let handle = loop {
+        if let Some(row) = cfg.state.provisional.read().await.list().into_iter().next() {
+            assert_eq!(row.forward_outcome(), "running");
+            assert_eq!(row.deadline_unix, 0);
+            assert!(cfg
+                .state
+                .provisional
+                .read()
+                .await
+                .due_handles(u64::MAX)
+                .is_empty());
+            break row.handle;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(8), run)
+        .await
+        .expect("long forward should complete")
+        .unwrap();
+    assert!(matches!(
+        result.exec,
+        ExecOutcome::Provisional {
+            exit_code: Some(0),
+            ..
+        }
+    ));
+    let observed_completion = now_unix();
+    let completed = cfg
+        .state
+        .provisional
+        .read()
+        .await
+        .get(&handle)
+        .cloned()
+        .unwrap();
+    assert_eq!(completed.forward_outcome(), "completed");
+    assert!(completed.forward_done);
+    assert!(completed.deadline_unix >= observed_completion.saturating_add(3));
+    assert!(completed.deadline_unix <= observed_completion.saturating_add(4));
+
+    let durable = store.load_provisionals().await.unwrap();
+    let (restarted, moved) = guard::gating::provisional::ProvisionalRegistry::from_rows(durable);
+    assert!(moved.is_empty());
+    let restored = restarted.get(&handle).unwrap();
+    assert_eq!(restored.deadline_unix, completed.deadline_unix);
+    assert!(restarted
+        .due_handles(restored.deadline_unix.saturating_sub(1))
+        .is_empty());
+    assert_eq!(restarted.due_handles(restored.deadline_unix), vec![handle]);
 }
 
 /// Counterpart to the leak test: a contained forward command that FAILS TO
@@ -1492,19 +1614,27 @@ async fn session_status_does_not_cross_expose_same_principal_provisionals() {
     assert_eq!(provisionals[0].handle, "provisional-status-session-a");
 }
 
-/// hold -> operator approve executes from the bound snapshot; a non-operator
-/// caller cannot approve (validate_admin refuses before any state change).
+/// Approval arms the immutable snapshot without executing it. Only the
+/// authenticated requester can claim the one-shot resume.
 #[cfg(unix)]
 #[tokio::test]
-async fn hold_then_operator_approve_executes_snapshot_nonoperator_refused() {
+async fn hold_approval_arms_then_requester_resumes_once_with_output() {
     let (cfg, operator, agent) = gating_config(7005, 1000);
     let agent_principal = agent.principal();
+    let state = tempfile::tempdir().unwrap();
+    let marker = state.path().join("resumed");
 
-    // Hold a command. `true` is the bound binary; approval must run exactly
-    // this snapshot.
+    // Hold a command with observable stdout, stderr, exit status, and side
+    // effect so approval and execution cannot be confused.
     let request = ExecuteRequest {
-        binary: "true".to_string(),
-        args: Vec::new(),
+        binary: "sh".to_string(),
+        args: vec![
+            "-c".to_string(),
+            format!(
+                "printf requester-stdout; printf requester-stderr >&2; printf resumed > '{}'; exit 7",
+                marker.display()
+            ),
+        ],
         auth_token: None,
         env: HashMap::new(),
         secrets: HashMap::new(),
@@ -1611,8 +1741,7 @@ async fn hold_then_operator_approve_executes_snapshot_nonoperator_refused() {
         );
     }
 
-    // Operator approves: the snapshot executes (`true` -> exit 0) and the row
-    // becomes Approved.
+    // Operator approval arms the snapshot and returns without executing it.
     let ok = handle_admin_request(
         &cfg,
         &operator,
@@ -1625,13 +1754,68 @@ async fn hold_then_operator_approve_executes_snapshot_nonoperator_refused() {
     match ok {
         AdminResponse::AccessDecisions { items } => {
             assert!(items[0].success);
-            assert_eq!(items[0].state, "approved");
+            assert_eq!(items[0].state, "armed");
             assert_eq!(items[0].remaining_uses, None);
             assert_eq!(items[0].use_policy, "unavailable");
             assert_eq!(items[0].target.as_deref(), Some("agent:1000"));
         }
-        other => panic!("operator approve should execute, got {:?}", other),
+        other => panic!("operator approval should arm, got {:?}", other),
     }
+    assert!(
+        !marker.exists(),
+        "approval must not execute the held command"
+    );
+    assert_eq!(
+        cfg.state
+            .approvals
+            .read()
+            .await
+            .get(&handle)
+            .unwrap()
+            .status,
+        ApprovalStatus::Pending
+    );
+    let AdminResponse::Approvals { items } =
+        handle_admin_request(&cfg, &agent, AdminRequest::ApprovalList).await
+    else {
+        panic!("requester should list its armed hold")
+    };
+    assert_eq!(items[0].status, "armed");
+
+    let wrong_requester = CallerIdentity::Unix { uid: 1001 };
+    let refused = handle_admin_request(
+        &cfg,
+        &wrong_requester,
+        AdminRequest::Resume {
+            handle: handle.clone(),
+        },
+    )
+    .await;
+    assert!(matches!(refused, AdminResponse::Error { .. }));
+    assert!(!marker.exists());
+
+    let resumed = handle_admin_request(
+        &cfg,
+        &agent,
+        AdminRequest::Resume {
+            handle: handle.clone(),
+        },
+    )
+    .await;
+    match resumed {
+        AdminResponse::GateAction {
+            exit_code,
+            stdout,
+            stderr,
+            ..
+        } => {
+            assert_eq!(exit_code, Some(7));
+            assert_eq!(stdout.as_deref(), Some("requester-stdout"));
+            assert_eq!(stderr.as_deref(), Some("requester-stderr"));
+        }
+        other => panic!("requester resume should execute, got {other:?}"),
+    }
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "resumed");
     assert_eq!(
         cfg.state
             .approvals
@@ -1642,8 +1826,24 @@ async fn hold_then_operator_approve_executes_snapshot_nonoperator_refused() {
             .status,
         ApprovalStatus::Approved
     );
-    let AdminResponse::AccessItem { item } =
-        handle_admin_request(&cfg, &agent, AdminRequest::AccessShow { reference: handle }).await
+    let replay = handle_admin_request(
+        &cfg,
+        &agent,
+        AdminRequest::Resume {
+            handle: handle.clone(),
+        },
+    )
+    .await;
+    assert!(matches!(replay, AdminResponse::Error { .. }));
+
+    let AdminResponse::AccessItem { item } = handle_admin_request(
+        &cfg,
+        &agent,
+        AdminRequest::AccessShow {
+            reference: handle.clone(),
+        },
+    )
+    .await
     else {
         panic!("requester should inspect its held access request")
     };
@@ -1658,6 +1858,185 @@ async fn hold_then_operator_approve_executes_snapshot_nonoperator_refused() {
             .access_token_for_principal(&PrincipalKey::from_uid(1000))
             .is_none(),
         "one-shot held execution must not leave session authority"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn armed_hold_survives_restart_and_persists_bounded_transcript() {
+    let (mut cfg, operator, agent) = gating_config(7_042, 1_000);
+    let state = tempfile::tempdir().unwrap();
+    let store = SessionStore::open(state.path().join("state.db"), 3_600)
+        .await
+        .unwrap();
+    cfg.state.session_store = Some(store.clone());
+    let request = held_request(
+        "sh",
+        vec![
+            "-c".to_string(),
+            "yes x | head -c 300000; yes y | head -c 300000 >&2".to_string(),
+        ],
+        None,
+    );
+    let mut sink = tokio::io::sink();
+    let held = hold_for_approval_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        request,
+        agent.principal(),
+        GateInputs {
+            reason: "bounded transcript".to_string(),
+            risk: Some(9),
+            reversibility: Some(Reversibility::Irreversible),
+            revert_preauthorized: false,
+            verb: None,
+            bypass: false,
+            authority: None,
+            consume_access_verbs: Vec::new(),
+        },
+    )
+    .await;
+    let ExecOutcome::Held { handle, .. } = held.exec else {
+        panic!("expected held command")
+    };
+    let armed = handle_admin_request(
+        &cfg,
+        &operator,
+        AdminRequest::AccessApprove {
+            handles: vec![handle.clone()],
+            uses: Some(1),
+        },
+    )
+    .await;
+    assert!(matches!(armed, AdminResponse::AccessDecisions { .. }));
+
+    let rows = store.load_approvals().await.unwrap();
+    let (registry, recovered) =
+        guard::gating::approval::ApprovalRegistry::from_rows(rows, now_unix());
+    assert!(recovered.is_empty());
+    assert_eq!(
+        crate::server::wire::ApprovalSummary::from_row(registry.get(&handle).unwrap()).status,
+        "armed"
+    );
+    let (mut restarted, _operator, requester) = gating_config(7_042, 1_000);
+    restarted.state.session_store = Some(store.clone());
+    *restarted.state.approvals.write().await = registry;
+
+    let resumed = handle_admin_request(
+        &restarted,
+        &requester,
+        AdminRequest::Resume {
+            handle: handle.clone(),
+        },
+    )
+    .await;
+    match resumed {
+        AdminResponse::GateAction {
+            exit_code,
+            stdout,
+            stderr,
+            ..
+        } => {
+            assert_eq!(exit_code, Some(0));
+            assert_eq!(stdout.as_deref().map(str::len), Some(300_000));
+            assert_eq!(stderr.as_deref().map(str::len), Some(300_000));
+        }
+        other => panic!("restart resume failed: {other:?}"),
+    }
+
+    let durable = store.load_approvals().await.unwrap();
+    let row = durable.iter().find(|row| row.handle == handle).unwrap();
+    assert_eq!(row.status, ApprovalStatus::Approved);
+    let stdout = row.result_stdout.as_deref().unwrap();
+    let stderr = row.result_stderr.as_deref().unwrap();
+    assert!(stdout.len() <= 262_144);
+    assert!(stderr.len() <= 262_144);
+    assert!(stdout.ends_with("[guard persisted transcript truncated]\n"));
+    assert!(stderr.ends_with("[guard persisted transcript truncated]\n"));
+    let summary = crate::server::wire::ApprovalSummary::from_row(row);
+    assert!(summary.stdout_truncated);
+    assert!(summary.stderr_truncated);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn armed_hold_expires_across_restart_without_execution() {
+    let (mut cfg, operator, agent) = gating_config(7_043, 1_000);
+    cfg.config.approval_ttl_secs = 1;
+    let state = tempfile::tempdir().unwrap();
+    let marker = state.path().join("must-not-run");
+    let store = SessionStore::open(state.path().join("state.db"), 3_600)
+        .await
+        .unwrap();
+    cfg.state.session_store = Some(store.clone());
+    let request = held_request("touch", vec![marker.display().to_string()], None);
+    let mut sink = tokio::io::sink();
+    let held = hold_for_approval_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        request,
+        agent.principal(),
+        GateInputs {
+            reason: "expiring hold".to_string(),
+            risk: Some(9),
+            reversibility: Some(Reversibility::Irreversible),
+            revert_preauthorized: false,
+            verb: None,
+            bypass: false,
+            authority: None,
+            consume_access_verbs: Vec::new(),
+        },
+    )
+    .await;
+    let ExecOutcome::Held { handle, .. } = held.exec else {
+        panic!("expected held command")
+    };
+    let _ = handle_admin_request(
+        &cfg,
+        &operator,
+        AdminRequest::AccessApprove {
+            handles: vec![handle.clone()],
+            uses: Some(1),
+        },
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    let rows = store.load_approvals().await.unwrap();
+    let (registry, recovered) =
+        guard::gating::approval::ApprovalRegistry::from_rows(rows, now_unix());
+    assert!(recovered.is_empty());
+    let (mut restarted, _operator, requester) = gating_config(7_043, 1_000);
+    restarted.state.session_store = Some(store.clone());
+    *restarted.state.approvals.write().await = registry;
+    let response = handle_admin_request(
+        &restarted,
+        &requester,
+        AdminRequest::Resume {
+            handle: handle.clone(),
+        },
+    )
+    .await;
+    assert!(matches!(response, AdminResponse::Error { .. }));
+    assert!(!marker.exists());
+    let durable = store.load_approvals().await.unwrap();
+    assert_eq!(
+        durable
+            .iter()
+            .find(|row| row.handle == handle)
+            .unwrap()
+            .status,
+        ApprovalStatus::Expired
     );
 }
 
@@ -1908,12 +2287,15 @@ async fn held_snapshot_consumes_its_originating_once_authority() {
         panic!("expected held access decision")
     };
     assert!(items[0].success, "approval failed: {:?}", items[0]);
-    assert_eq!(items[0].remaining_uses, Some(0));
+    assert_eq!(items[0].state, "armed");
+    assert_eq!(items[0].remaining_uses, Some(1));
+    let resumed = resume_approval(&cfg, &agent, &handle).await;
+    assert!(matches!(resumed.exec, ExecOutcome::Completed { .. }));
     let AdminResponse::AccessDecisions { items: replay } = handle_admin_request(
         &cfg,
         &operator,
         AdminRequest::AccessApprove {
-            handles: vec![handle],
+            handles: vec![handle.clone()],
             uses: Some(1),
         },
     )
@@ -2061,7 +2443,7 @@ async fn held_snapshot_does_not_fall_through_to_overlapping_authority() {
         &cfg,
         &operator,
         AdminRequest::AccessApprove {
-            handles: vec![handle],
+            handles: vec![handle.clone()],
             uses: Some(1),
         },
     )
@@ -2069,9 +2451,14 @@ async fn held_snapshot_does_not_fall_through_to_overlapping_authority() {
     else {
         panic!("expected held access decision")
     };
-    assert!(!items[0].success);
-    assert_eq!(items[0].state, "exec_failed");
-    assert!(items[0].message.contains("access use limit is exhausted"));
+    assert!(items[0].success);
+    assert_eq!(items[0].state, "armed");
+    let resumed = resume_approval(&cfg, &agent, &handle).await;
+    assert!(matches!(
+        resumed.exec,
+        ExecOutcome::Failed { ref reason, .. }
+            if reason.contains("access use limit is exhausted")
+    ));
     assert_eq!(
         cfg.state
             .sessions
@@ -2187,7 +2574,7 @@ async fn held_snapshot_binds_and_consumes_multiple_originating_requests() {
         &cfg,
         &operator,
         AdminRequest::AccessApprove {
-            handles: vec![handle],
+            handles: vec![handle.clone()],
             uses: Some(1),
         },
     )
@@ -2196,6 +2583,9 @@ async fn held_snapshot_binds_and_consumes_multiple_originating_requests() {
         panic!("expected held access decision")
     };
     assert!(items[0].success, "approval failed: {:?}", items[0]);
+    assert_eq!(items[0].state, "armed");
+    let resumed = resume_approval(&cfg, &agent, &handle).await;
+    assert!(matches!(resumed.exec, ExecOutcome::Completed { .. }));
     assert_eq!(
         cfg.state
             .sessions
@@ -2506,8 +2896,14 @@ async fn approval_rejects_tool_secret_rotated_after_hold() {
     let AdminResponse::AccessDecisions { items } = response else {
         panic!("expected access decision result")
     };
-    assert!(!items[0].success);
-    assert_eq!(items[0].state, "exec_failed");
+    assert!(items[0].success);
+    assert_eq!(items[0].state, "armed");
+    let resumed = resume_approval(&cfg, &agent, &handle).await;
+    assert!(matches!(
+        resumed.exec,
+        ExecOutcome::Failed { ref reason, .. }
+            if reason.contains("tool-configured secret value changed")
+    ));
     let approval = cfg
         .state
         .approvals
@@ -2681,7 +3077,9 @@ async fn approval_state_must_be_durable_before_a_held_snapshot_executes() {
         panic!("expected access decision")
     };
     assert!(!items[0].success);
-    assert!(items[0].message.contains("failed to claim approval"));
+    assert!(items[0]
+        .message
+        .contains("failed to persist terminal approval"));
     assert!(
         !output.exists(),
         "the held snapshot executed without durable admission"
@@ -2999,6 +3397,92 @@ async fn nonstreaming_wait_approval_returns_promptly_on_decision() {
             .as_ref()
             .map(|trace| trace.decision_source.as_str()),
         Some("static_policy")
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn waiting_requester_resumes_armed_hold_and_receives_terminal_output() {
+    let (mut cfg, operator, agent) = gating_config(7_044, 1_000);
+    let state = tempfile::tempdir().unwrap();
+    let store = SessionStore::open(state.path().join("state.db"), 3_600)
+        .await
+        .unwrap();
+    cfg.state.session_store = Some(store.clone());
+    let request = held_request(
+        "sh",
+        vec![
+            "-c".to_string(),
+            "printf waiting-stdout; printf waiting-stderr >&2; exit 9".to_string(),
+        ],
+        Some(30),
+    );
+    let cfg_for_waiter = cfg.clone();
+    let waiter = tokio::spawn(async move {
+        let mut sink = tokio::io::sink();
+        hold_for_approval_with_trace(
+            &mut RequestContext {
+                server: &cfg_for_waiter,
+                caller: &agent,
+                depth: 0,
+                stream_output: false,
+                stream_writer: &mut sink,
+            },
+            request,
+            agent.principal(),
+            GateInputs {
+                reason: "wait for requester resume".to_string(),
+                risk: Some(9),
+                reversibility: Some(Reversibility::Irreversible),
+                revert_preauthorized: false,
+                verb: None,
+                bypass: false,
+                authority: None,
+                consume_access_verbs: Vec::new(),
+            },
+            None,
+        )
+        .await
+    });
+    let handle = wait_for_pending_hold(&cfg).await;
+    let approval = handle_admin_request(
+        &cfg,
+        &operator,
+        AdminRequest::AccessApprove {
+            handles: vec![handle.clone()],
+            uses: Some(1),
+        },
+    )
+    .await;
+    let AdminResponse::AccessDecisions { items } = approval else {
+        panic!("operator approval should return an access decision")
+    };
+    assert_eq!(items[0].state, "armed");
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+        .await
+        .expect("waiting requester should claim the arm promptly")
+        .unwrap();
+    match result.exec {
+        ExecOutcome::Completed {
+            exit_code,
+            stdout,
+            stderr,
+        } => {
+            assert_eq!(exit_code, Some(9));
+            assert_eq!(stdout.as_deref(), Some("waiting-stdout"));
+            assert_eq!(stderr.as_deref(), Some("waiting-stderr"));
+        }
+        other => panic!("expected resumed completion, got {other:?}"),
+    }
+    let durable = store.load_approvals().await.unwrap();
+    assert_eq!(
+        durable
+            .iter()
+            .find(|row| row.handle == handle)
+            .unwrap()
+            .status,
+        ApprovalStatus::Approved
     );
 }
 
@@ -3682,7 +4166,7 @@ async fn approve_survives_unrelated_verb_append() {
         .get(&handle)
         .unwrap()
         .clone();
-    assert_ne!(approval.status, ApprovalStatus::Pending);
+    assert!(approval_is_armed(&approval));
     assert!(
         approval
             .decided_reason
@@ -3691,8 +4175,20 @@ async fn approve_survives_unrelated_verb_append() {
         "got: {:?}",
         approval.decided_reason
     );
-    if cfg!(unix) {
-        assert_eq!(approval.status, ApprovalStatus::Approved);
+    #[cfg(unix)]
+    {
+        let resumed = resume_approval(&cfg, &agent, &handle).await;
+        assert!(matches!(resumed.exec, ExecOutcome::Completed { .. }));
+        assert_eq!(
+            cfg.state
+                .approvals
+                .read()
+                .await
+                .get(&handle)
+                .unwrap()
+                .status,
+            ApprovalStatus::Approved
+        );
     }
 }
 

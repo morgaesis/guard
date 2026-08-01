@@ -115,6 +115,29 @@ struct ChangingSessionSink {
     resolutions: AtomicUsize,
 }
 
+struct PrincipalSessionSink;
+
+#[async_trait::async_trait]
+impl ApiSessionSink for PrincipalSessionSink {
+    async fn resolve(&self, token: &str) -> Option<ApiSessionContext> {
+        let fingerprint = match token {
+            "principal-a" => "principal-a-fingerprint",
+            "principal-b" => "principal-b-fingerprint",
+            _ => return None,
+        };
+        Some(ApiSessionContext {
+            fingerprint: fingerprint.to_string(),
+            revision: "authority-revision-1".to_string(),
+            secret_entitlements: None,
+            intent: Some("manage one development deployment".to_string()),
+            evaluation_mode: ApiEvaluationMode::Evaluator,
+            can_evaluate_api_override: false,
+        })
+    }
+
+    async fn record(&self, _token: &str, _event: ApiSessionEvent) {}
+}
+
 #[derive(Clone)]
 struct BudgetSessionSink {
     remaining_resolutions: Arc<AtomicUsize>,
@@ -218,6 +241,414 @@ async fn spawn_mock_upstream() -> String {
     format!("http://{addr}")
 }
 
+#[derive(Clone)]
+struct ArbitrationMock {
+    object: Arc<std::sync::Mutex<Value>>,
+    forwarded_mutations: Arc<AtomicUsize>,
+    mutation_bodies: Arc<std::sync::Mutex<Vec<(hyper::Method, Value)>>>,
+}
+
+impl ArbitrationMock {
+    fn new() -> Self {
+        Self {
+            object: Arc::new(std::sync::Mutex::new(json!({
+                "kind": "Deployment",
+                "apiVersion": "apps/v1",
+                "metadata": {
+                    "name": "api",
+                    "namespace": "dev",
+                    "uid": "deployment-uid",
+                    "resourceVersion": "1",
+                    "labels": {"owner": "platform"}
+                },
+                "spec": {"replicas": 2},
+                "status": {"readyReplicas": 2}
+            }))),
+            forwarded_mutations: Arc::new(AtomicUsize::new(0)),
+            mutation_bodies: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    fn advance_status(&self) {
+        let mut object = self.object.lock().unwrap();
+        let next = next_resource_version(&object);
+        object["metadata"]["resourceVersion"] = json!(next);
+        object["status"]["readyReplicas"] = json!(1);
+    }
+
+    fn advance_spec(&self) {
+        let mut object = self.object.lock().unwrap();
+        let next = next_resource_version(&object);
+        object["metadata"]["resourceVersion"] = json!(next);
+        object["spec"]["replicas"] = json!(7);
+    }
+}
+
+fn next_resource_version(object: &Value) -> String {
+    object["metadata"]["resourceVersion"]
+        .as_str()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap()
+        .saturating_add(1)
+        .to_string()
+}
+
+async fn arbitration_mock_handler(
+    req: Request<Incoming>,
+    mock: ArbitrationMock,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    if req.method() == hyper::Method::GET {
+        let object = mock.object.lock().unwrap().clone();
+        return Ok(Response::builder()
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from(object.to_string())))
+            .unwrap());
+    }
+
+    mock.forwarded_mutations.fetch_add(1, Ordering::SeqCst);
+    let method = req.method().clone();
+    let bytes = req.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    mock.mutation_bodies
+        .lock()
+        .unwrap()
+        .push((method.clone(), body.clone()));
+    let mut object = mock.object.lock().unwrap();
+    let expected_uid = object["metadata"]["uid"].as_str().unwrap();
+    let expected_version = object["metadata"]["resourceVersion"].as_str().unwrap();
+    let guarded = match method {
+        hyper::Method::PUT | hyper::Method::PATCH => {
+            body["metadata"]["resourceVersion"].as_str() == Some(expected_version)
+        }
+        hyper::Method::DELETE => {
+            body["preconditions"]["uid"].as_str() == Some(expected_uid)
+                && body["preconditions"]["resourceVersion"].as_str() == Some(expected_version)
+        }
+        hyper::Method::POST => true,
+        _ => false,
+    };
+    if !guarded {
+        return Ok(Response::builder()
+            .status(409)
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from(
+                json!({"kind":"Status","status":"Failure","reason":"Conflict","code":409})
+                    .to_string(),
+            )))
+            .unwrap());
+    }
+    if method == hyper::Method::DELETE {
+        return Ok(Response::builder()
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from(
+                json!({"kind":"Status","status":"Success"}).to_string(),
+            )))
+            .unwrap());
+    }
+    if let Some(replicas) = body.pointer("/spec/replicas").cloned() {
+        object["spec"]["replicas"] = replicas;
+    }
+    let next = next_resource_version(&object);
+    object["metadata"]["resourceVersion"] = json!(next);
+    Ok(Response::builder()
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(object.to_string())))
+        .unwrap())
+}
+
+async fn spawn_arbitration_mock() -> (String, ArbitrationMock) {
+    let mock = ArbitrationMock::new();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_mock = mock.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let connection_mock = server_mock.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |request| {
+                    arbitration_mock_handler(request, connection_mock.clone())
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    (format!("http://{addr}"), mock)
+}
+
+async fn spawn_blocking_arbitration_mock(
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+) -> (String, ArbitrationMock) {
+    let mock = ArbitrationMock::new();
+    let get_count = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_mock = mock.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let connection_mock = server_mock.clone();
+            let connection_get_count = get_count.clone();
+            let connection_started = started.clone();
+            let connection_release = release.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |request| {
+                    let request_mock = connection_mock.clone();
+                    let request_get_count = connection_get_count.clone();
+                    let request_started = connection_started.clone();
+                    let request_release = connection_release.clone();
+                    async move {
+                        if request.method() == hyper::Method::GET
+                            && request_get_count.fetch_add(1, Ordering::SeqCst) == 1
+                        {
+                            request_started.notify_one();
+                            request_release.notified().await;
+                        }
+                        arbitration_mock_handler(request, request_mock).await
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    (format!("http://{addr}"), mock)
+}
+
+async fn start_arbitration_proxy(
+    upstream_base: &str,
+    mode: Option<ApiListenerMode>,
+) -> (String, reqwest::Client) {
+    let upstream =
+        Upstream::from_kubeconfig_str(&kubeconfig_for(upstream_base), None).expect("upstream");
+    let tls = ProxyTls::generate().expect("tls");
+    let ca_pem = tls.ca_pem().to_string();
+    let policy = ApiPolicy::from_yaml("default: allow\n").unwrap();
+    let (listener, listen) = reserve_listener().await;
+    let mut proxy = ApiProxy::new(listen, tls, upstream, policy, None);
+    if let Some(mode) = mode {
+        proxy = proxy.with_listener_mode(mode);
+    }
+    let proxy = Arc::new(proxy);
+    proxy.attach_session_sink(Arc::new(PrincipalSessionSink));
+    tokio::spawn(proxy.serve_on(listener));
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    (format!("https://{listen}"), client)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anonymous_default_listener_cannot_mutate_under_allow_policy() {
+    let (upstream, mock) = spawn_arbitration_mock().await;
+    let (base, client) = start_arbitration_proxy(&upstream, None).await;
+
+    for response in [
+        client
+            .post(format!("{base}/api/v1/namespaces/dev/configmaps"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap(),
+        client
+            .patch(format!(
+                "{base}/apis/apps/v1/namespaces/dev/deployments/api"
+            ))
+            .header("content-type", "application/merge-patch+json")
+            .body(r#"{"spec":{"replicas":3}}"#)
+            .send()
+            .await
+            .unwrap(),
+    ] {
+        assert_eq!(response.status(), 403);
+        assert!(response.text().await.unwrap().contains("attributable"));
+    }
+    assert_eq!(mock.forwarded_mutations.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn observations_are_principal_bound_and_arbitrate_interleaved_writes() {
+    let (upstream, mock) = spawn_arbitration_mock().await;
+    let (base, client) = start_arbitration_proxy(&upstream, Some(ApiListenerMode::Policy)).await;
+    let object_url = format!("{base}/apis/apps/v1/namespaces/dev/deployments/api");
+
+    let observed_by_a = client
+        .get(&object_url)
+        .bearer_auth("principal-a")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(observed_by_a.status(), 200);
+
+    let unobserved_b = client
+        .patch(&object_url)
+        .bearer_auth("principal-b")
+        .header("content-type", "application/merge-patch+json")
+        .body(r#"{"spec":{"replicas":3}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unobserved_b.status(), 409);
+    assert_eq!(mock.forwarded_mutations.load(Ordering::SeqCst), 0);
+
+    assert_eq!(
+        client
+            .get(&object_url)
+            .bearer_auth("principal-b")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        client
+            .patch(&object_url)
+            .bearer_auth("principal-a")
+            .header("content-type", "application/merge-patch+json")
+            .body(r#"{"spec":{"replicas":3}}"#)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let stale_b = client
+        .patch(&object_url)
+        .bearer_auth("principal-b")
+        .header("content-type", "application/merge-patch+json")
+        .body(r#"{"spec":{"replicas":4}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale_b.status(), 409);
+    assert_eq!(mock.forwarded_mutations.load(Ordering::SeqCst), 1);
+
+    mock.advance_status();
+    let status_churn = client
+        .put(&object_url)
+        .bearer_auth("principal-a")
+        .header("content-type", "application/json")
+        .body(r#"{"metadata":{"name":"api","namespace":"dev"},"spec":{"replicas":5}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(status_churn.status(), 200);
+    let bodies = mock.mutation_bodies.lock().unwrap();
+    assert_eq!(bodies.last().unwrap().0, hyper::Method::PUT);
+    assert_eq!(
+        bodies.last().unwrap().1["metadata"]["resourceVersion"],
+        "3",
+        "status-only churn advances the atomic precondition to the live version"
+    );
+    drop(bodies);
+
+    mock.advance_spec();
+    let conflicting_spec = client
+        .delete(&object_url)
+        .bearer_auth("principal-a")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(conflicting_spec.status(), 409);
+    assert_eq!(mock.forwarded_mutations.load(Ordering::SeqCst), 2);
+
+    assert_eq!(
+        client
+            .get(&object_url)
+            .bearer_auth("principal-a")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        client
+            .delete(&object_url)
+            .bearer_auth("principal-a")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let bodies = mock.mutation_bodies.lock().unwrap();
+    let delete = bodies.last().unwrap();
+    assert_eq!(delete.0, hyper::Method::DELETE);
+    assert_eq!(delete.1["preconditions"]["uid"], "deployment-uid");
+    assert_eq!(delete.1["preconditions"]["resourceVersion"], "5");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn policy_reload_during_arbitration_prevents_mutable_forwarding() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (upstream_base, mock) =
+        spawn_blocking_arbitration_mock(started.clone(), release.clone()).await;
+    let upstream =
+        Upstream::from_kubeconfig_str(&kubeconfig_for(&upstream_base), None).expect("upstream");
+    let tls = ProxyTls::generate().expect("tls");
+    let ca_pem = tls.ca_pem().to_string();
+    let temp = tempfile::tempdir().unwrap();
+    let policy_path = temp.path().join("api-policy.yaml");
+    let allow_policy = "default: allow\n";
+    std::fs::write(&policy_path, allow_policy).unwrap();
+    let policy = ApiPolicy::load_file(&policy_path).unwrap();
+    let (listener, listen) = reserve_listener().await;
+    let proxy = Arc::new(
+        ApiProxy::new(listen, tls, upstream, policy, Some(policy_path.clone()))
+            .with_listener_mode(ApiListenerMode::Policy)
+            .with_policy_reload_interval(Duration::from_millis(50)),
+    );
+    proxy.attach_session_sink(Arc::new(PrincipalSessionSink));
+    tokio::spawn(proxy.clone().serve_on(listener));
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    let object_url = format!("https://{listen}/apis/apps/v1/namespaces/dev/deployments/api");
+    assert_eq!(
+        client
+            .get(&object_url)
+            .bearer_auth("principal-a")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+
+    let request = tokio::spawn({
+        let client = client.clone();
+        let object_url = object_url.clone();
+        async move {
+            client
+                .patch(object_url)
+                .bearer_auth("principal-a")
+                .header("content-type", "application/merge-patch+json")
+                .body(r#"{"spec":{"replicas":3}}"#)
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    started.notified().await;
+    let deny_policy = "default: deny\n";
+    std::fs::write(&policy_path, deny_policy).unwrap();
+    wait_for_policy_reload(&proxy, deny_policy).await;
+    release.notify_one();
+
+    assert_eq!(request.await.unwrap().status(), 403);
+    assert_eq!(mock.forwarded_mutations.load(Ordering::SeqCst), 0);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ipv6_loopback_listener_serves_with_matching_tls_identity() {
     let mock_base = spawn_mock_upstream().await;
@@ -311,7 +742,8 @@ async fn start_proxy_with(
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(policy_yaml).expect("policy");
     let (listener, listen) = reserve_listener().await;
-    let mut proxy = ApiProxy::new(listen, tls, upstream, policy, None);
+    let mut proxy = ApiProxy::new(listen, tls, upstream, policy, None)
+        .with_listener_mode(ApiListenerMode::Policy);
     if rarity_threshold > 0 {
         proxy = proxy.with_rarity_escalation(rarity_threshold);
     }
@@ -322,9 +754,16 @@ async fn start_proxy_with(
     if let Some(judge) = judge {
         proxy.attach_judge(judge);
     }
+    proxy.attach_session_sink(Arc::new(LiveSessionSink));
     tokio::spawn(proxy.clone().serve_on(listener));
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::AUTHORIZATION,
+        "Bearer live-session".parse().unwrap(),
+    );
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .default_headers(headers)
         .build()
         .unwrap();
     (format!("https://{listen}"), client)
@@ -711,7 +1150,7 @@ async fn write_mock_handler(req: Request<Incoming>) -> Result<Response<Full<Byte
     let (code, body) = if is_create {
         (
             201,
-            json!({"kind": "Pod", "apiVersion": "v1", "metadata": {"name": "web-123", "namespace": "dev"}}),
+            json!({"kind": "Pod", "apiVersion": "v1", "metadata": {"name": "web-123", "namespace": "dev", "uid": "pod-uid", "resourceVersion": "40"}}),
         )
     } else {
         (
@@ -719,7 +1158,7 @@ async fn write_mock_handler(req: Request<Incoming>) -> Result<Response<Full<Byte
             json!({
                 "kind": "Deployment",
                 "apiVersion": "apps/v1",
-                "metadata": {"name": "api", "namespace": "dev", "resourceVersion": "42"},
+                "metadata": {"name": "api", "namespace": "dev", "uid": "deployment-uid", "resourceVersion": "42"},
                 "spec": {"replicas": 3}
             }),
         )
@@ -762,7 +1201,10 @@ async fn proxy_arms_auto_revert_for_writes() {
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).expect("policy");
     let (listener, listen) = reserve_listener().await;
-    let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
+    let proxy = Arc::new(
+        ApiProxy::new(listen, tls, upstream, policy, None)
+            .with_listener_mode(ApiListenerMode::Policy),
+    );
 
     let sink = RecordingSink::default();
     proxy.attach_gate(Arc::new(sink.clone()));
@@ -785,8 +1227,28 @@ async fn proxy_arms_auto_revert_for_writes() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 201, "create forwarded");
+    assert_eq!(
+        resp.headers()
+            .get("x-guard-provisional")
+            .and_then(|value| value.to_str().ok()),
+        Some("test-handle-0")
+    );
+    assert!(resp
+        .headers()
+        .get("warning")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("guard confirm test-handle-0")));
 
     // A patch on a named object snapshots the prior state and arms a restore.
+    let observed = client
+        .get(format!(
+            "{base}/apis/apps/v1/namespaces/dev/deployments/api"
+        ))
+        .bearer_auth("live-session")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(observed.status(), 200, "deployment observation forwarded");
     let resp = client
         .patch(format!(
             "{base}/apis/apps/v1/namespaces/dev/deployments/api"
@@ -798,8 +1260,15 @@ async fn proxy_arms_auto_revert_for_writes() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "patch forwarded");
+    assert_eq!(
+        resp.headers()
+            .get("x-guard-provisional")
+            .and_then(|value| value.to_str().ok()),
+        Some("test-handle-1")
+    );
 
-    // Reverts are armed asynchronously after the response; poll for both.
+    // Both response headers prove the reverts were durable before success was
+    // returned; the sink records the same handles for lifecycle assertions.
     wait_until("both writes to arm a revert", || {
         sink.calls.lock().unwrap().len() == 2
     })

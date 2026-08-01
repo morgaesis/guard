@@ -62,6 +62,10 @@ daemon. It cannot be combined with TCP, the API proxy, or secret-file delivery.
 It also moves more local filesystem authority to the caller, so it is not the
 default credential-broker model.
 
+Grant expiry does not revoke effects an opaque child has already produced or
+credentials it copied while running. The execution-context comparison and SSH
+stream boundary are defined in [Security model](security-model.md#execution-and-credential-isolation).
+
 ## Secrets
 
 Store secrets in the daemon backend, then name them at execution time:

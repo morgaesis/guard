@@ -241,12 +241,6 @@ pub(crate) async fn run_exec(
     if let Some(token) = config.auth_token {
         client = client.with_auth(token);
     }
-    if let Ok(session) = std::env::var("GUARD_SESSION") {
-        if !session.is_empty() {
-            client = client.with_session(session);
-        }
-    }
-
     tracing::info!(
         binary = %binary,
         endpoint = %client.endpoint_for_log(),
@@ -793,11 +787,6 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                 .with_gating(None, confirm_within, false, wait_approval);
             if let Some(token) = config.auth_token {
                 client = client.with_auth(token);
-            }
-            if let Ok(session) = std::env::var("GUARD_SESSION") {
-                if !session.is_empty() {
-                    client = client.with_session(session);
-                }
             }
             // Verb binary/args are rendered server-side; the client sends empty.
             let mut streamed = false;
@@ -1868,10 +1857,6 @@ pub(crate) async fn run_mcp(subcommand: McpCommands) -> Result<()> {
                 resolved_tcp_port = Some(port);
             }
             let auth_token = resolve_mcp_daemon_token(&config);
-            let session_token = std::env::var("GUARD_SESSION")
-                .ok()
-                .filter(|value| !value.is_empty());
-
             let http_addr = match http {
                 Some(addr) => Some(
                     addr.parse::<std::net::SocketAddr>()
@@ -1887,7 +1872,7 @@ pub(crate) async fn run_mcp(subcommand: McpCommands) -> Result<()> {
                 socket_path,
                 tcp_port: resolved_tcp_port,
                 auth_token,
-                session_token,
+                session_token: None,
                 tool_name,
                 http_addr,
                 http_token,

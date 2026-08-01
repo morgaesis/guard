@@ -58,8 +58,8 @@ struct ApiEndpointSpec {
 #[derive(Debug, Clone, Copy, Default, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum ApiEndpointMode {
-    #[default]
     Policy,
+    #[default]
     Readonly,
 }
 

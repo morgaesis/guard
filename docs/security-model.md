@@ -72,6 +72,19 @@ the child lifetime. Holds store names and salted value hashes. Audit and session
 history store secret names only. Output redaction covers exact resolved values
 and credential-shaped text.
 
+Execution identity and credential delivery have different compromise bounds:
+
+| Context | Intended use | Compromise bound |
+|---|---|---|
+| Dedicated non-root service identity | Default broker identity with daemon-owned SSH configuration, agent socket, and secret access | An opaque approved child can retain the service account's authority, copy readable credentials, or create persistence available to that account. A grant TTL limits later Guard admissions but cannot undo those effects. |
+| Root service identity | Deployments that require root before an explicit identity drop | A default child inherits root execution authority. Use `--exec-as-caller` or a dedicated non-root service when root is not an intentional part of the grant. Guard is not a sandbox for a root child. |
+| Per-run environment or secret-file lease | One approved process that needs one named credential | Guard removes the file after the child lifetime and does not disclose the value through its protocol. An opaque child can still copy or use the credential while it is available, so lease expiry is exposure reduction rather than revocation of completed effects. |
+
+Guard has no general scoped SSH credential endpoint. Brokered SSH-using tools
+receive the service identity's configured SSH context. A narrower SSH transport
+requires a separately authenticated stream protocol, destination and forwarding
+constraints, revocation semantics, and an independent security review.
+
 The API proxy injects the endpoint upstream credential only after the request is
 allowed. It strips authentication headers, redacts protocol-classified secret
 responses, rejects uninspectable sensitive streams, and binds rollback to the
