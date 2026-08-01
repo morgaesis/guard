@@ -219,7 +219,8 @@ mod tests {
     #[test]
     fn safe_mode_pins_cluster_read_and_opaque_check_contracts() {
         assert!(SYSTEM_PROMPT_SAFE.contains("including ConfigMaps"));
-        assert!(SYSTEM_PROMPT_SAFE.contains("span all\nnamespaces"));
+        assert!(SYSTEM_PROMPT_SAFE.contains("span all"));
+        assert!(SYSTEM_PROMPT_SAFE.contains("namespaces or return YAML"));
         assert!(
             SYSTEM_PROMPT_SAFE.contains("Use risk 4 for an opaque configuration-management check")
         );
