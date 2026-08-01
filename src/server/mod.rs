@@ -406,10 +406,14 @@ impl ServerContext {
     }
 
     fn caller_is_admin(&self, caller: &CallerIdentity) -> bool {
-        (caller.is_local_peer()
-            && matches!(caller.principal(), Some(ref p) if self.config.daemon_principal.eq_ci(p)))
-            || caller.is_windows_system_operator()
-            || matches!(caller, CallerIdentity::TcpAdmin { .. })
+        // Operator authority is the admin bearer token, never the daemon's
+        // own uid: brokered children inherit that uid in the default model
+        // and must not inherit its operator surface with it.
+        caller.is_windows_system_operator()
+            || matches!(
+                caller,
+                CallerIdentity::TcpAdmin { .. } | CallerIdentity::UnixAdmin { .. }
+            )
     }
 
     fn validate_token(&self, token: Option<&str>) -> Result<()> {

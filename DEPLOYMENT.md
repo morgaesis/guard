@@ -26,9 +26,11 @@ The principal split is mandatory:
 - The agent principal can connect to Guard and receives only non-authoritative
   request and session references. Approved command authority remains in daemon
   state and is bound automatically to the authenticated requester.
-- The operator principal is the daemon uid on Unix. On Windows, the daemon
-  service SID and the kernel-authenticated local SYSTEM SID can perform operator
-  RPCs; the installer runs elevated operator actions as SYSTEM.
+- The operator principal holds the admin bearer token: the root-held token
+  file (see the admin token section) and, on Windows, the daemon service SID
+  and the kernel-authenticated local SYSTEM SID; the installer runs elevated
+  operator actions as SYSTEM. The daemon's own uid never grants operator
+  authority, so a brokered child cannot approve its own work.
 
 An agent that can read daemon credentials or reach the same upstream directly
 can bypass Guard.
@@ -64,6 +66,9 @@ install -m 0755 guard /usr/local/bin/guard
 install -o root -g root -m 0755 deployment/systemd/guard-operator /usr/local/sbin/guard-operator
 install -m 0644 deployment/systemd/guard.service /etc/systemd/system/
 install -m 0600 deployment/systemd/guard.env.example /etc/default/guard
+# Provision the admin token (root-held, root:root 0400) before the first start.
+install -m 0400 -o root -g root /dev/null /etc/guard/admin.token
+openssl rand -hex 32 > /etc/guard/admin.token
 # Edit /etc/default/guard before the first start.
 systemctl daemon-reload
 systemctl enable --now guard.service
@@ -121,10 +126,23 @@ Wide access raises the cost of instruction defects, so pair it with:
 Consequence gating adds holds for the irreversible tail once enabled; keep
 holds exceptional so each one gets real operator attention.
 
-Administrative RPCs authenticate the daemon uid, not the interactive operator's
-uid. Run them through the root-owned wrapper. It uses the `guard` account for
-the standard unit and root for the exec-as-caller unit, and refuses to run when
-both or neither packaged service is active:
+Administrative RPCs authenticate the admin bearer token, never a uid. The
+daemon's own uid grants no operator authority: brokered children inherit that
+uid and must not inherit its command surface. The token reaches the daemon
+only through stdin at startup (`StandardInput=file:` opens the root-held file
+as root and hands over the descriptor), so it never enters the daemon's
+environment, argv, or any file its children can read.
+
+Provision the token file once, as `root:root` mode `0400`:
+
+```bash
+install -m 0400 -o root -g root /dev/null /etc/guard/admin.token
+openssl rand -hex 32 > /etc/guard/admin.token
+```
+
+Run operator RPCs through the root-owned wrapper, which reads the token and
+presents it, and refuses to run when both or neither packaged service is
+active:
 
 ```bash
 sudo guard-operator access list
@@ -139,7 +157,10 @@ sudo guard-operator revert <provisional>
 ```
 
 On a console, `access approve` reviews each request interactively before
-deciding; add `--yes` for unattended runs.
+deciding; add `--yes` for unattended runs. `GUARD_ADMIN_TOKEN` in the
+daemon's own environment is supported for development only: a brokered child
+can read the daemon's `/proc/<pid>/environ`, so production daemons must take
+the token from stdin.
 
 Restrict `sudo` access to `/usr/local/sbin/guard-operator` to human operator
 accounts. Access to the wrapper grants the full daemon-principal command surface.

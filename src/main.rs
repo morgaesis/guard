@@ -574,10 +574,19 @@ enum ServerCommands {
         #[arg(skip)]
         auth_token: Option<String>,
 
-        /// Separate token required for non-Ping TCP admin RPCs. Read from
-        /// GUARD_ADMIN_TOKEN.
+        /// Separate token required for non-Ping admin RPCs on every listener.
+        /// Read from GUARD_ADMIN_TOKEN (development only: a brokered child
+        /// can read the daemon's /proc/<pid>/environ).
         #[arg(skip)]
         admin_token: Option<String>,
+
+        /// Read the admin token's first line from stdin at startup. This is
+        /// the production channel: the operator's service manager opens the
+        /// root-held token file (e.g. systemd StandardInput=file:) so the
+        /// value never enters the daemon's environment, argv, or a file its
+        /// brokered children can read. Env: GUARD_ADMIN_TOKEN_STDIN.
+        #[arg(long = "admin-token-stdin", action = ArgAction::SetTrue)]
+        admin_token_stdin: bool,
 
         /// Group owning the UNIX socket.
         #[arg(long, value_name = "GROUP")]

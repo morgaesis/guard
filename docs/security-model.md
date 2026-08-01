@@ -83,8 +83,15 @@ API bearer.
 Unix sockets authenticate caller uid through peer credentials. Windows named
 pipes authenticate caller SID. The stock Windows DACL admits authenticated local
 users, then Guard isolates their authority by SID; it does not restrict the pipe
-to one configured client SID. The daemon's own uid or SID is the operator
-principal for holds, provisionals, saved grants, verbs, and detailed status.
+to one configured client SID. On Unix, operator authority for holds,
+provisionals, saved grants, verbs, and detailed status is the admin bearer
+token: the token reaches the daemon through stdin at startup and is presented
+only by the root-owned operator wrapper, so a brokered child running as the
+daemon uid holds no operator authority. On Windows, the operator principal
+remains the daemon service SID and the kernel-authenticated local SYSTEM SID;
+approved commands run as the service account there, so a corrupted agent and
+the operator share an identity, and the boundary needs a separate
+exec-identity design rather than a token alone.
 
 On Unix, the local socket is private to the daemon unless an operator configures
 a group, in which case it is group-readable and group-writable. SQLite state and

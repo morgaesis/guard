@@ -113,7 +113,8 @@ daemon() {
     --history-retention 3600 \
     --child-env KUBECONFIG \
     --users 1001,1002 \
-    >>/scenario/raw/daemon.log 2>&1
+    --admin-token-stdin \
+    </scenario/run/admin.token >>/scenario/raw/daemon.log 2>&1
 }
 
 record_result() {
@@ -411,7 +412,8 @@ private_daemon_start() {
       --history-retention 3600 \
       --child-env KUBECONFIG \
       --users 1001,1002 \
-      > "$PRIVATE_ROOT/log/$log_name.log" 2>&1 < /dev/null &
+      --admin-token-stdin \
+      > "$PRIVATE_ROOT/log/$log_name.log" 2>&1 < /scenario/run/admin.token &
   pid=$!
   printf '%s\n' "$pid" > "$PRIVATE_ROOT/run/daemon.pid"
   for _ in $(seq 1 100); do
@@ -1444,6 +1446,12 @@ prepare_principals() {
     chown -R "$uid:0" "$root"
   done
   mkdir -p "$COLLECTOR_RESULTS" "$COLLECTOR_PHASES"
+  # The operator persona (uid 1000) is the only principal that can read the
+  # admin token; the daemon receives it through stdin, and uids 1001/1002
+  # hold neither the file nor the value.
+  printf 'synthetic-operator-token\n' > /scenario/run/admin.token
+  chmod 0400 /scenario/run/admin.token
+  chown 1000:0 /scenario/run/admin.token
   chown -R 0:0 "$COLLECTOR_ROOT"
   chmod 0700 "$COLLECTOR_ROOT" "$COLLECTOR_RESULTS" "$COLLECTOR_PHASES"
   chown -R 1000:1000 /scenario/home /scenario/config /scenario/data /scenario/raw \

@@ -95,6 +95,23 @@ pub(crate) fn resolve_history_retention(
     Ok(value)
 }
 
+/// Read the admin token from stdin: the first line, bounded, never echoed.
+/// Production deployments hand the daemon a root-opened file descriptor
+/// (systemd StandardInput=file:) so the token never enters the daemon's
+/// environment, argv, or a file its brokered children can read.
+fn read_admin_token_stdin() -> Result<String> {
+    use std::io::Read;
+    let mut buffer = String::new();
+    std::io::Read::take(&mut std::io::stdin(), 4096)
+        .read_to_string(&mut buffer)
+        .context("failed to read the admin token from stdin")?;
+    let token = buffer.lines().next().unwrap_or("").trim().to_string();
+    if token.is_empty() {
+        anyhow::bail!("--admin-token-stdin: the admin token on stdin must not be empty");
+    }
+    Ok(token)
+}
+
 fn guard_env_u64(suffix: &str) -> Result<Option<u64>> {
     guard_env(suffix)
         .filter(|value| !value.trim().is_empty())
@@ -190,6 +207,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             tcp_port,
             auth_token,
             admin_token,
+            admin_token_stdin,
             socket_group,
             users,
             policy,
@@ -374,12 +392,16 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                     "TCP server requires GUARD_AUTH_TOKEN; configure clients with `guard config set-token`"
                 );
             }
-            let admin_token = admin_token
-                .filter(|token| !token.is_empty())
-                .or_else(|| guard_env("ADMIN_TOKEN").filter(|token| !token.is_empty()));
-            if tcp_port.is_some() && admin_token.is_none() {
+            let admin_token = if admin_token_stdin {
+                Some(read_admin_token_stdin()?)
+            } else {
+                admin_token
+                    .filter(|token| !token.is_empty())
+                    .or_else(|| guard_env("ADMIN_TOKEN").filter(|token| !token.is_empty()))
+            };
+            if admin_token.is_none() {
                 tracing::warn!(
-                    "TCP admin RPCs other than ping are disabled; set GUARD_ADMIN_TOKEN to use operator access and status commands over TCP"
+                    "admin RPCs other than ping are refused on every listener; configure --admin-token-stdin with a root-held token file (or GUARD_ADMIN_TOKEN for development)"
                 );
             }
 
@@ -943,7 +965,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 );
             }
 
-            tracing::info!("Admin RPCs restricted to daemon UID");
+            tracing::info!("Admin RPCs require the admin bearer token on every listener");
 
             let tool_registry = tool_config::ToolRegistry::load_default().unwrap_or_else(|e| {
                 tracing::warn!("Could not load tool config: {}", e);

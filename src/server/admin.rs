@@ -2850,7 +2850,7 @@ async fn handle_session_appeal(
         };
     }
     // An appeal amends session authority, so it is operator-gated
-    // (`requires_daemon_uid`) and not part of the bearer-replay surface. A
+    // (`requires_admin_token`) and not part of the bearer-replay surface. A
     // session that predates principal binding still cannot be amended: refuse it
     // fail-closed so the operator reissues rather than silently extending a
     // session with no verifiable owner.
@@ -3227,7 +3227,7 @@ pub(super) async fn handle_admin_request(
     caller: &CallerIdentity,
     request: AdminRequest,
 ) -> AdminResponse {
-    if request.requires_daemon_uid() {
+    if request.requires_admin_token() {
         if let Err(e) = server.validate_admin(caller) {
             server.emit_audit_ungated(
                 AuditEvent::new(AuditKind::AdminRejected)
