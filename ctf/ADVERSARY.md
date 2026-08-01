@@ -48,10 +48,21 @@ The harness uses a read-only root filesystem, a full capability drop with only
 `CHOWN`, `SETGID`, and `SETUID` added back for startup provisioning, no-new-
 privileges, rootless user namespaces, blocked host loopback through
 slirp4netns, and PID, CPU, memory, and memory-swap bounds. Raw evidence stays
-in root-owned paths the attacker cannot alter, and a missing raw artifact is a
-failure rather than a pass. These controls define the CTF execution boundary.
+in root-owned paths the attacker cannot alter: the daemon's log and durable
+audit sink and the raw transcripts live under a root-owned directory on the
+results volume, so an attacker who fills its own writable tmpfs cannot drop
+the evidence a verdict depends on. A missing raw artifact is a failure rather
+than a pass. These controls define the CTF execution boundary.
 The harness evaluates guard's per-user secret isolation; it does not establish
 or evaluate container-escape prevention.
+
+Note on the network boundary: `allow_host_loopback=false` blocks only the
+slirp gateway's loopback path. Host services bound to wildcard addresses stay
+reachable from the scenario container via the host's external address
+(pre-resolved as `host.containers.internal`); loopback-bound services are not
+reachable. The attacker identity is therefore still a dedicated,
+credit-limited key: it is the damage bound for anything the autonomous
+attacker reaches, including wildcard-bound host services.
 
 ## Flag
 
