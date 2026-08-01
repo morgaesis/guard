@@ -166,7 +166,7 @@ fn add_reasoning_controls(api_url: &str, body: &mut serde_json::Value) {
 mod tests {
     use super::{
         build_function_call_body, build_json_response_body, COMMAND_FRAME_HEADER,
-        DEFAULT_MAX_COMPLETION_TOKENS,
+        DEFAULT_MAX_COMPLETION_TOKENS, SYSTEM_PROMPT_SAFE,
     };
     use crate::evaluate::config::DEFAULT_API_URL;
     use crate::evaluate::{EvalConfig, Evaluator};
@@ -214,6 +214,15 @@ mod tests {
             );
             assert!(mode.contains("same consequence"));
         }
+    }
+
+    #[test]
+    fn safe_mode_pins_cluster_read_and_opaque_check_contracts() {
+        assert!(SYSTEM_PROMPT_SAFE.contains("including ConfigMaps"));
+        assert!(SYSTEM_PROMPT_SAFE.contains("span all\nnamespaces"));
+        assert!(
+            SYSTEM_PROMPT_SAFE.contains("Use risk 4 for an opaque configuration-management check")
+        );
     }
 
     #[test]

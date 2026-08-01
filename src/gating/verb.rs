@@ -4337,6 +4337,7 @@ verbs:
         let root = tempfile::tempdir().unwrap();
         let root = root.path().canonicalize().unwrap();
         let other = tempfile::tempdir().unwrap();
+        let root_yaml = serde_yaml_ng::to_string(&root.to_string_lossy().to_string()).unwrap();
         let yaml = format!(
             r#"
 verbs:
@@ -4347,9 +4348,9 @@ verbs:
     coverage:
       - name: project-root
         action: preauthorized
-        cwd: "{}"
+        cwd: {}
 "#,
-            root.display()
+            root_yaml.trim()
         );
         let catalog = VerbCatalog::from_yaml(&yaml).unwrap();
         let empty = BTreeMap::new();
