@@ -24,7 +24,9 @@ use crate::session::SessionExactRule;
 use crate::session::SessionGrant;
 use guard::evaluate::{EvalConfig, Evaluator};
 use guard::gating::deny_shape::{DenyLearningConfig, DenyShapeStore};
+#[cfg(unix)]
 use guard::gating::verb::VerbCatalog;
+#[cfg(unix)]
 use guard::gating::GateMode;
 use guard::principal::PrincipalKey;
 use std::collections::HashMap;

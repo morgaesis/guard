@@ -4,12 +4,13 @@ use crate::server::execute::audit_session_fingerprint;
 use crate::server::gate_runtime::run_provisional_check;
 use crate::server::gate_runtime::{
     approval_to_result, execute_snapshot, hash_secret_value, hold_for_approval_with_authority,
-    hold_for_approval_with_trace, new_handle, now_unix, resume_approval, route_gated_allow,
-    GateInputs, SessionAuthoritySnapshot,
+    hold_for_approval_with_trace, new_handle, now_unix, route_gated_allow, GateInputs,
+    SessionAuthoritySnapshot,
 };
 #[cfg(unix)]
 use crate::server::gate_runtime::{
-    arm_containment_with_authority, finish_due_provisional, finish_revert, DaemonGateSink,
+    arm_containment_with_authority, finish_due_provisional, finish_revert, resume_approval,
+    DaemonGateSink,
 };
 use crate::server::wire::{
     approval_is_armed, AdminRequest, AdminResponse, CallerIdentity, ExecOutcome, ExecuteRequest,
@@ -26,6 +27,7 @@ use guard::gating::approval::{Approval, ApprovalSnapshot, ApprovalStatus};
 use guard::gating::approval::{SecretBinding, ToolSecretBinding};
 #[cfg(unix)]
 use guard::gating::provisional::{ApiRevertPlan, Provisional, ProvisionalStatus};
+#[cfg(unix)]
 use guard::gating::verb::VerbCatalog;
 use guard::gating::{Coverage, GateMode, Reversibility};
 use guard::principal::PrincipalKey;
@@ -108,6 +110,7 @@ fn contain_request(binary: &str, args: &[&str], revert: RevertSpec) -> ExecuteRe
     }
 }
 
+#[cfg(unix)]
 fn held_request(
     binary: &str,
     args: Vec<String>,
