@@ -1077,16 +1077,16 @@ async fn approved_ansible_evaluate_verbs_bypass_denial_without_filing_another_re
 verbs:
   - name: validate-atlas-playbook
     binary: ansible-playbook
-    args: ["--syntax-check", "site.yml"]
+    args: ["--syntax-check", "/srv/automation/site.yml"]
     baseline: false
     consequence: reversible
     coverage:
       - name: syntax-check
         action: evaluate
-        required_args: ["--syntax-check", "site.yml"]
+        required_args: ["--syntax-check", "/srv/automation/site.yml"]
   - name: run-atlas-playbook-check-diff
     binary: ansible-playbook
-    args: ["-i", "/srv/automation/inventory", "site.yml", "--limit", "group-a", "--check", "--diff"]
+    args: ["-i", "/srv/automation/inventory", "/srv/automation/site.yml", "--limit", "group-a", "--check", "--diff"]
     baseline: false
     consequence: reversible
     coverage:
@@ -1121,11 +1121,14 @@ verbs:
     drop(sessions);
 
     for args in [
-        vec!["--syntax-check".to_string(), "site.yml".to_string()],
+        vec![
+            "--syntax-check".to_string(),
+            "/srv/automation/site.yml".to_string(),
+        ],
         vec![
             "-i".to_string(),
             "/srv/automation/inventory".to_string(),
-            "site.yml".to_string(),
+            "/srv/automation/site.yml".to_string(),
             "--limit".to_string(),
             "group-a".to_string(),
             "--check".to_string(),

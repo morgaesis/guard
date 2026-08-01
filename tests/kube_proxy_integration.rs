@@ -540,14 +540,15 @@ async fn observations_are_principal_bound_and_arbitrate_interleaved_writes() {
         .await
         .unwrap();
     assert_eq!(status_churn.status(), 200);
-    let bodies = mock.mutation_bodies.lock().unwrap();
-    assert_eq!(bodies.last().unwrap().0, hyper::Method::PUT);
-    assert_eq!(
-        bodies.last().unwrap().1["metadata"]["resourceVersion"],
-        "3",
-        "status-only churn advances the atomic precondition to the live version"
-    );
-    drop(bodies);
+    {
+        let bodies = mock.mutation_bodies.lock().unwrap();
+        assert_eq!(bodies.last().unwrap().0, hyper::Method::PUT);
+        assert_eq!(
+            bodies.last().unwrap().1["metadata"]["resourceVersion"],
+            "3",
+            "status-only churn advances the atomic precondition to the live version"
+        );
+    }
 
     mock.advance_spec();
     let conflicting_spec = client

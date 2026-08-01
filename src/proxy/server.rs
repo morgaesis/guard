@@ -2281,9 +2281,7 @@ impl ApiProxy {
         conn_id: u64,
         session_context: Option<ApiSessionContext>,
     ) -> Option<String> {
-        let Some(gate) = self.gate.get() else {
-            return None;
-        };
+        let gate = self.gate.get()?;
         let plan = match self
             .protocol
             .plan_revert(op, snapshot.as_deref(), response_body)
