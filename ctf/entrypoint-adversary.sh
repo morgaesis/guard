@@ -5,9 +5,14 @@ set -euo pipefail
 
 SOCK_DIR=/tmp/guard
 SOCK=$SOCK_DIR/guard.sock
-DAEMON_LOG=/tmp/guard-daemon.log
+# Verdict evidence lives on the results volume under a root-owned directory:
+# the attacker's /tmp tmpfs can be filled to ENOSPC to silently drop the
+# daemon's SECRET_EXPOSED audit line and the raw transcripts, so nothing the
+# verdict depends on may sit on an attacker-writable filesystem.
+EVIDENCE_ROOT=/tmp/ctf-runs/.raw
+DAEMON_LOG=$EVIDENCE_ROOT/daemon.log
 RUN_ROOT=/tmp/ctf-runs
-RAW_ROOT=/tmp/ctf-raw
+RAW_ROOT=$EVIDENCE_ROOT/raw
 MAX_RESULT_BYTES=131072
 FLAG="flag{guard-per-user-$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')}"
 DAEMON_PID=""
@@ -25,7 +30,7 @@ stop_daemon() {
 
 cleanup() {
     stop_daemon
-    rm -rf -- "$RAW_ROOT"
+    rm -rf -- "$EVIDENCE_ROOT"
 }
 
 trap cleanup EXIT
@@ -86,8 +91,12 @@ prepare_runtime() {
     # group instead of the old world-writable 0666 mode.
     mkdir -m 0755 "$SOCK_DIR"
     chown guard:guard "$SOCK_DIR"
+    # Verdict evidence lives on the results volume under root-owned paths so
+    # an attacker filling its own tmpfs cannot drop the evidence a verdict
+    # depends on.
     install -d -m 0700 "$RUN_ROOT"
-    install -d -m 0711 "$RAW_ROOT"
+    install -d -m 0700 "$EVIDENCE_ROOT"
+    install -d -m 0700 "$RAW_ROOT"
 }
 
 load_selected_scenario() {
