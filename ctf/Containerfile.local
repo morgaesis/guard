@@ -11,6 +11,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     vim \
     git \
     procps \
+    python3-minimal \
+    iproute2 \
     net-tools \
     ca-certificates \
     util-linux \
@@ -35,8 +37,11 @@ RUN chmod 755 /usr/local/bin/guard /usr/local/bin/claude
 
 COPY client.yaml /home/agent/.config/guard/client.yaml
 COPY run-claude-attack.sh /usr/local/bin/run-claude-attack
+COPY egress-proxy.py /usr/local/lib/guard/egress-proxy.py
 COPY ctf-prompt.md /home/agent/ctf-prompt.md
-RUN chmod 755 /usr/local/bin/run-claude-attack && chown -R agent:agent /home/agent
+RUN chmod 755 /usr/local/bin/run-claude-attack \
+ && chmod 644 /usr/local/lib/guard/egress-proxy.py \
+ && chown -R agent:agent /home/agent
 
 COPY entrypoint-local.sh /entrypoint.sh
 RUN chmod 755 /entrypoint.sh

@@ -1513,7 +1513,7 @@ async fn audit_verify_and_tail_admin_rpcs() {
     };
     match handle_admin_request(&cfg, &outsider, AdminRequest::AuditVerify).await {
         AdminResponse::Error { message } => {
-            assert!(message.contains("not the daemon principal"), "{message}")
+            assert!(message.contains("lacks operator authority"), "{message}")
         }
         other => panic!("expected rejection, got {other:?}"),
     }

@@ -17,6 +17,7 @@ not in command-line arguments.
 |---|---|---|
 | `GUARD_LLM_API_KEY` | none | Evaluator API key. `OPENROUTER_API_KEY` is also accepted. |
 | `GUARD_LLM_API_URL` | OpenRouter chat completions | OpenAI-compatible evaluator endpoint. |
+| `GUARD_LLM_PROXY_URL` | unset | HTTP CONNECT proxy used only for evaluator requests. |
 | `GUARD_LLM_MODEL` | `openai/gpt-5.4-mini` | Primary model. |
 | `GUARD_LLM_MODELS` | unset | Comma-separated fallback chain that supersedes the single model. |
 | `GUARD_LLM_RETRIES` | `2` | Transient retries per model, from 0 to 2; larger values are capped at 2. |
@@ -261,7 +262,7 @@ Each record carries `seq` and `prev_hash` (SHA-256 of the previous serialized
 record; a fixed genesis constant for the first), so any truncation, edit, or
 reorder breaks the chain. `guard audit verify` walks the chain and reports
 intact or the first broken sequence; `guard audit tail [-n N]` reads the most
-recent records. Both are daemon-principal-only and support `--json`.
+recent records. Both require operator authority and support `--json`.
 
 If an allow decision, an operator approval, or a confirm cannot be durably
 appended (disk full, permission failure), the action is denied: guard fails

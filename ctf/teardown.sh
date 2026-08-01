@@ -15,7 +15,7 @@ fi
 declare -A resource
 while IFS='=' read -r key value || [ -n "$key" ]; do
     case "$key" in
-        run_id|local_container|remote_container|internal_network|egress_network|local_image|remote_image|evaluator_secret|ssh_secret|admin_token_secret|guard_home_volume|agent_home_volume)
+        run_id|local_container|remote_container|egress_proxy_container|internal_network|egress_network|local_image|remote_image|evaluator_secret|ssh_secret|admin_token_secret|guard_home_volume|agent_home_volume)
             resource["$key"]=$value
             ;;
         *)
@@ -25,7 +25,7 @@ while IFS='=' read -r key value || [ -n "$key" ]; do
     esac
 done < "$MANIFEST"
 
-for key in run_id local_container remote_container internal_network egress_network local_image remote_image evaluator_secret ssh_secret admin_token_secret guard_home_volume agent_home_volume; do
+for key in run_id local_container remote_container egress_proxy_container internal_network egress_network local_image remote_image evaluator_secret ssh_secret admin_token_secret guard_home_volume agent_home_volume; do
     if [ -z "${resource[$key]:-}" ]; then
         echo "Run manifest is missing $key." >&2
         exit 2
@@ -36,6 +36,7 @@ RUN_ID=${resource[run_id]}
 if [[ ! "$RUN_ID" =~ ^guard-ctf-[0-9]+-[0-9]+-[0-9]+$ ]] || \
    [ "${resource[local_container]}" != "$RUN_ID-local" ] || \
    [ "${resource[remote_container]}" != "$RUN_ID-remote" ] || \
+   [ "${resource[egress_proxy_container]}" != "$RUN_ID-egress-proxy" ] || \
    [ "${resource[internal_network]}" != "$RUN_ID-internal" ] || \
    [ "${resource[egress_network]}" != "$RUN_ID-egress" ] || \
    [ "${resource[local_image]}" != "localhost/$RUN_ID-local:latest" ] || \
@@ -54,7 +55,7 @@ label_matches() {
     [ "$(podman "$kind" inspect --format '{{ index .Config.Labels "io.guard.ctf.run" }}' "$name" 2>/dev/null || true)" = "$RUN_ID" ]
 }
 
-for container in "${resource[local_container]}" "${resource[remote_container]}"; do
+for container in "${resource[local_container]}" "${resource[remote_container]}" "${resource[egress_proxy_container]}"; do
     if label_matches container "$container"; then
         podman stop --time 5 "$container" >/dev/null 2>&1 || true
         podman rm "$container" >/dev/null
@@ -98,7 +99,7 @@ for image in "${resource[local_image]}" "${resource[remote_image]}"; do
 done
 
 leftovers=()
-for container in "${resource[local_container]}" "${resource[remote_container]}"; do
+for container in "${resource[local_container]}" "${resource[remote_container]}" "${resource[egress_proxy_container]}"; do
     podman container exists "$container" 2>/dev/null && leftovers+=("container:$container")
 done
 for network in "${resource[internal_network]}" "${resource[egress_network]}"; do

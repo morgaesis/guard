@@ -277,6 +277,13 @@ pub struct VerbCoverageCell {
     pub namespace: Option<ValueConstraint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fanout: Option<FanoutConstraint>,
+    /// Exact canonical caller working directory required by this cell. This
+    /// binds tools whose configuration, plugins, or input selection can be
+    /// discovered from the working directory to an operator-reviewed project
+    /// root. The path is validated as an existing canonical directory when the
+    /// catalog loads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
     /// Caller-controlled environment bindings this cell may preauthorize.
     /// Empty is migration-safe and means no `--env`, `--secret`, or
     /// `--secret-file` injection can skip evaluator review.
@@ -743,6 +750,34 @@ impl VerbCatalog {
         secrets: &BTreeMap<String, String>,
         secret_files: &BTreeMap<String, String>,
     ) -> Vec<CoverageMatch> {
+        self.match_command_all_inner(binary, args, plain, secrets, secret_files, None)
+    }
+
+    /// Collect coverage with a canonical caller working directory. Cells that
+    /// carry `cwd` match only that exact directory. The executor calls this
+    /// after canonicalizing a local request, so configuration discovered from
+    /// the current directory remains within operator-reviewed authority.
+    pub fn match_command_all_with_environment_and_cwd(
+        &self,
+        binary: &str,
+        args: &[String],
+        plain: &BTreeMap<String, String>,
+        secrets: &BTreeMap<String, String>,
+        secret_files: &BTreeMap<String, String>,
+        cwd: Option<&Path>,
+    ) -> Vec<CoverageMatch> {
+        self.match_command_all_inner(binary, args, plain, secrets, secret_files, cwd)
+    }
+
+    fn match_command_all_inner(
+        &self,
+        binary: &str,
+        args: &[String],
+        plain: &BTreeMap<String, String>,
+        secrets: &BTreeMap<String, String>,
+        secret_files: &BTreeMap<String, String>,
+        cwd: Option<&Path>,
+    ) -> Vec<CoverageMatch> {
         let mut matches = Vec::new();
         for verb in self.verbs.values() {
             if !binary_names_match(binary, &verb.binary) {
@@ -789,7 +824,7 @@ impl VerbCatalog {
             }
 
             for cell in &verb.coverage {
-                if let Some((features, specificity)) = coverage_cell_matches(cell, args) {
+                if let Some((features, specificity)) = coverage_cell_matches(cell, args, cwd) {
                     matches.push(CoverageMatch {
                         rendered: rendered.clone(),
                         cell: cell.name.clone(),
@@ -1371,7 +1406,15 @@ fn legacy_template_features(args: &[String]) -> BTreeSet<String> {
 fn coverage_cell_matches(
     cell: &VerbCoverageCell,
     args: &[String],
+    cwd: Option<&Path>,
 ) -> Option<(BTreeSet<String>, CoverageSpecificity)> {
+    if cell
+        .cwd
+        .as_deref()
+        .is_some_and(|required| cwd != Some(required))
+    {
+        return None;
+    }
     if cell.min_args.is_some_and(|minimum| args.len() < minimum)
         || cell.max_args.is_some_and(|maximum| args.len() > maximum)
     {
@@ -1400,6 +1443,10 @@ fn coverage_cell_matches(
         requirements: features.clone(),
         ..CoverageSpecificity::default()
     };
+    if cell.cwd.is_some() {
+        features.insert("cwd:exact".to_string());
+        specificity.requirements.insert("cwd:exact".to_string());
+    }
     if let Some(minimum) = cell.min_args {
         features.insert(format!("argv:min={minimum}"));
         specificity
@@ -2496,6 +2543,9 @@ fn validate_verb(verb: &Verb) -> Result<()> {
         if let Some(inventory) = &cell.inventory {
             validate_inventory_constraint_paths(verb, cell, inventory)?;
         }
+        if let Some(cwd) = &cell.cwd {
+            validate_coverage_cwd(&verb.name, &cell.name, cwd)?;
+        }
         if let Some(fanout) = &cell.fanout {
             if fanout.max == 0 {
                 bail!(
@@ -2569,6 +2619,52 @@ fn validate_verb(verb: &Verb) -> Result<()> {
                 })?;
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_coverage_cwd(verb: &str, cell: &str, cwd: &Path) -> Result<()> {
+    if cwd.as_os_str().is_empty() || !cwd.is_absolute() {
+        bail!(
+            "verb '{}' coverage cell '{}': cwd must be an absolute canonical directory",
+            verb,
+            cell
+        );
+    }
+    let canonical = std::fs::canonicalize(cwd).with_context(|| {
+        format!(
+            "verb '{}' coverage cell '{}': cannot canonicalize cwd '{}'",
+            verb,
+            cell,
+            cwd.display()
+        )
+    })?;
+    if canonical != cwd {
+        bail!(
+            "verb '{}' coverage cell '{}': cwd '{}' is not canonical (use '{}')",
+            verb,
+            cell,
+            cwd.display(),
+            canonical.display()
+        );
+    }
+    if !std::fs::metadata(cwd)
+        .with_context(|| {
+            format!(
+                "verb '{}' coverage cell '{}': cannot stat cwd '{}'",
+                verb,
+                cell,
+                cwd.display()
+            )
+        })?
+        .is_dir()
+    {
+        bail!(
+            "verb '{}' coverage cell '{}': cwd '{}' is not a directory",
+            verb,
+            cell,
+            cwd.display()
+        );
     }
     Ok(())
 }
@@ -3244,6 +3340,7 @@ verbs:
             inventory: None,
             namespace: None,
             fanout: None,
+            cwd: None,
             environment: Vec::new(),
             override_marker: Some("operator:k-check".to_string()),
             sticky: true,
@@ -4233,6 +4330,81 @@ verbs:
         assert!(error
             .to_string()
             .contains("may not authorize caller environment bindings"));
+    }
+
+    #[test]
+    fn cwd_coverage_matches_only_the_operator_approved_canonical_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            r#"
+verbs:
+  - name: project-status
+    binary: true
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: project-root
+        action: preauthorized
+        cwd: "{}"
+"#,
+            root.display()
+        );
+        let catalog = VerbCatalog::from_yaml(&yaml).unwrap();
+        let empty = BTreeMap::new();
+
+        assert_eq!(
+            catalog
+                .match_command_all_with_environment_and_cwd(
+                    "true",
+                    &[],
+                    &empty,
+                    &empty,
+                    &empty,
+                    Some(&root),
+                )
+                .len(),
+            1
+        );
+        assert!(catalog
+            .match_command_all_with_environment_and_cwd(
+                "true",
+                &[],
+                &empty,
+                &empty,
+                &empty,
+                Some(other.path()),
+            )
+            .is_empty());
+        assert!(catalog.match_command_all("true", &[]).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cwd_coverage_rejects_a_symlink_instead_of_approving_its_target() {
+        let parent = tempfile::tempdir().unwrap();
+        let project = parent.path().join("project");
+        let alias = parent.path().join("project-link");
+        std::fs::create_dir(&project).unwrap();
+        std::os::unix::fs::symlink(&project, &alias).unwrap();
+        let yaml = format!(
+            r#"
+verbs:
+  - name: project-status
+    binary: true
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: project-root
+        action: preauthorized
+        cwd: "{}"
+"#,
+            alias.display()
+        );
+
+        let error = VerbCatalog::from_yaml(&yaml).unwrap_err();
+        assert!(error.to_string().contains("is not canonical"), "{error:#}");
     }
 
     #[test]

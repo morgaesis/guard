@@ -83,6 +83,49 @@ verbs:
 }
 
 #[tokio::test]
+async fn cwd_bound_coverage_resolves_after_canonicalization_and_rejects_changed_directory() {
+    let (mut cfg, _buf) = make_test_config();
+    cfg.config.gate = GateMode::Consequence;
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path().canonicalize().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    cfg.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(&format!(
+            r#"
+verbs:
+  - name: project-status
+    binary: true
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: project-root
+        action: preauthorized
+        cwd: "{}"
+"#,
+            root.display()
+        ))
+        .unwrap(),
+    ));
+
+    let mut approved = raw_request("true", &[], None);
+    approved.cwd = Some(root);
+    let approved = execute_command(approved, &cfg, &CallerIdentity::Unix { uid: 1000 })
+        .await
+        .into_response();
+    assert!(approved.allowed, "{approved:?}");
+    assert_eq!(approved.exit_code, Some(0));
+    assert_eq!(approved.verb_matches[0].features, vec!["cwd:exact"]);
+
+    let mut changed = raw_request("true", &[], None);
+    changed.cwd = Some(other.path().to_path_buf());
+    let changed = execute_command(changed, &cfg, &CallerIdentity::Unix { uid: 1000 })
+        .await
+        .into_response();
+    assert!(!changed.allowed, "{changed:?}");
+    assert!(changed.verb_matches.is_empty());
+}
+
+#[tokio::test]
 async fn session_verb_needs_exact_marker_to_override_baseline_evaluation() {
     let (mut cfg, _buf) = make_test_config();
     cfg.config.gate = GateMode::Consequence;

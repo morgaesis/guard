@@ -216,19 +216,16 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
         }
     }
 
+    if let Err(result) = canonicalize_request_cwd(&mut phase, &mut request).await {
+        return result;
+    }
+
     let verb_resolution = match resolve_verb_context(&mut phase, &mut request).await {
         Ok(resolution) => resolution,
         Err(result) => return result,
     };
     phase.verb_matches = verb_resolution.matches.clone();
     phase.verb_guidance = verb_resolution.guidance.clone();
-
-    if let Err(result) = canonicalize_request_cwd(&mut phase, &mut request).await {
-        return result.with_verb_resolution(
-            verb_resolution.matches.clone(),
-            verb_resolution.guidance.clone(),
-        );
-    }
 
     let (depth, command_line) = match validate_exec_request(&mut phase, &request).await {
         Ok(validated) => validated,
@@ -1023,12 +1020,13 @@ async fn resolve_verb_context<W: AsyncWrite + Unpin>(
             .iter()
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect::<BTreeMap<_, _>>();
-        let raw_matches = cat.match_command_all_with_environment(
+        let raw_matches = cat.match_command_all_with_environment_and_cwd(
             &request.binary,
             &request.args,
             &plain,
             &secrets,
             &secret_files,
+            request.cwd.as_deref(),
         );
         // Captured under the same catalog read as the version, so a held
         // approval binds to exactly the definition that produced the match.

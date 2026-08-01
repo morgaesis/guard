@@ -405,6 +405,10 @@ pub enum AdminRequest {
         handle: String,
         text: String,
     },
+    /// Original requester cancels one of its own held commands before it runs.
+    ApprovalWithdraw {
+        handle: String,
+    },
     /// List the operator-defined verb catalog (the agent's menu).
     VerbList,
     VerbShow {
@@ -584,6 +588,11 @@ pub enum AdminRequest {
     AccessShow {
         reference: String,
     },
+    /// Show detailed runtime state for one access-managed session without
+    /// exposing its bearer token.
+    AccessStatus {
+        reference: String,
+    },
     EvaluateBatch {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_token: Option<String>,
@@ -640,10 +649,12 @@ impl AdminRequest {
                 // ApprovalNote does its own operator-or-owner authorization in
                 // the handler, so it is not gated to the daemon UID here.
                 | Self::ApprovalNote { .. }
+                | Self::ApprovalWithdraw { .. }
                 | Self::VerbList
                 | Self::AccessRequest { .. }
                 | Self::AccessList
                 | Self::AccessShow { .. }
+                | Self::AccessStatus { .. }
                 | Self::EvaluateBatch { .. }
         )
     }

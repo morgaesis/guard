@@ -56,7 +56,8 @@ as a backstop.
 
 Coverage cells describe regions of ordinary tool argv. They can constrain exact
 required and forbidden tokens, option spellings and values, positional targets,
-inventory, namespace, bounded fanout, and caller-requested environment bindings.
+inventory, namespace, bounded fanout, an exact canonical working directory, and
+caller-requested environment bindings.
 Their actions are `preauthorized`, `evaluate`, or `deny`; preauthorization
 requires a trusted verb.
 
@@ -104,6 +105,13 @@ name exact `values` or a fully anchored `pattern`. A cell with no environment
 constraints cannot preauthorize a request that adds caller-controlled bindings;
 that request returns to the evaluator. Automatically promoted cells never
 preauthorize environment bindings.
+
+`cwd` binds a cell to one existing, absolute canonical directory. Guard
+canonicalizes the caller directory before coverage resolution and revalidates it
+immediately before execution, so a changed directory or symlink retarget cannot
+reuse the cell. This bounds tools that discover configuration, plugins, or input
+files from a project tree. Cwd-dependent opaque carriers do not enter automatic
+verb promotion; an operator-authored typed verb supplies their durable authority.
 
 ## Reverse matching
 

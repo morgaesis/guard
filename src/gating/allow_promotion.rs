@@ -407,6 +407,43 @@ pub(crate) enum TemplateSlot {
     Param(BTreeSet<String>),
 }
 
+/// Automatic promotion does not create durable authority for tools whose
+/// behavior can be supplied by a project tree, implicit configuration, or
+/// plugins discovered from a caller working directory. Operators express
+/// these tools through a reviewed typed verb with an exact `cwd` constraint.
+pub fn is_cwd_dependent_opaque_carrier(binary: &str) -> bool {
+    let file_name = Path::new(binary)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(binary);
+    let binary = file_name
+        .strip_suffix(".exe")
+        .or_else(|| file_name.strip_suffix(".EXE"))
+        .unwrap_or(file_name)
+        .to_ascii_lowercase();
+    matches!(
+        binary.as_str(),
+        "ansible"
+            | "ansible-playbook"
+            | "ansible-galaxy"
+            | "chef-client"
+            | "helm"
+            | "kustomize"
+            | "make"
+            | "nix"
+            | "nix-build"
+            | "nix-shell"
+            | "packer"
+            | "pulumi"
+            | "puppet"
+            | "salt"
+            | "salt-call"
+            | "terraform"
+            | "terragrunt"
+            | "tofu"
+    )
+}
+
 /// Diff same-arity evidence samples positionally: a position constant across
 /// every sample stays literal; a position with more than one distinct value
 /// becomes a parameter enumerating exactly those values. Returns `None` for
@@ -613,6 +650,7 @@ pub(crate) fn build_candidate_verb(
         inventory: None,
         namespace: None,
         fanout: None,
+        cwd: None,
         environment: Vec::new(),
         override_marker: None,
         sticky: false,
@@ -883,6 +921,14 @@ mod tests {
         assert!(!re.is_match("kube-system"));
         assert!(re.is_match("foo"));
         assert!(re.is_match("bar"));
+    }
+
+    #[test]
+    fn cwd_dependent_opaque_carriers_are_excluded_from_automatic_promotion() {
+        assert!(is_cwd_dependent_opaque_carrier("ansible-playbook"));
+        assert!(is_cwd_dependent_opaque_carrier("terraform"));
+        assert!(is_cwd_dependent_opaque_carrier("helm.exe"));
+        assert!(!is_cwd_dependent_opaque_carrier("kubectl"));
     }
 
     #[test]

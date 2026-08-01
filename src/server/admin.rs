@@ -4,12 +4,12 @@ use crate::grant_profile::{
 use crate::secrets::legacy_sentinel;
 use crate::session::{
     session_reference, IssuedGrantScope, SessionGrant, SessionGrantSummary, SessionOwner,
-    SessionRegistry,
+    SessionRegistry, SessionReport,
 };
 #[cfg(test)]
 use crate::session::{
     HistoricalGrant, SessionAmendment, SessionDecision, SessionDecisionSource, SessionExecStatus,
-    SessionInteraction, SessionReport,
+    SessionInteraction,
 };
 use guard::audit::{AuditEvent, AuditKind};
 #[cfg(test)]
@@ -2612,6 +2612,7 @@ fn stamp_generated_verb(
         inventory: None,
         namespace: None,
         fanout: None,
+        cwd: None,
         environment: Vec::new(),
         override_marker: None,
         sticky: false,
@@ -2797,7 +2798,6 @@ fn redact_historical_grant_for_list(grant: &mut HistoricalGrant, admin: bool, ca
 /// Mask the raw bearer token in a session report shown to its own holder. The
 /// grant contents (rules, prompt, stats) are intentionally left intact for
 /// self-diagnosis; only the token string is hidden so it is not echoed back.
-#[cfg(test)]
 fn mask_session_report_token(report: &mut SessionReport) {
     if let Some(active) = &mut report.active {
         active.token = "(current)".to_string();
@@ -3219,6 +3219,108 @@ async fn show_access_item(
                 message: format!("access target '{reference}' is ambiguous"),
             },
         }
+    }
+}
+
+async fn access_session_token(
+    server: &ServerContext,
+    caller: &CallerIdentity,
+    reference: &str,
+) -> Result<String, AdminResponse> {
+    let admin = caller_is_session_admin(server, caller);
+    let principal = caller.principal();
+    let mut candidates = server
+        .state
+        .sessions
+        .read()
+        .await
+        .list()
+        .into_iter()
+        .filter(|summary| {
+            summary.scope.access_managed
+                && (admin
+                    || matches!(
+                        &summary.owner,
+                        SessionOwner::Principal(owner)
+                            if principal.as_ref().is_some_and(|caller| owner.eq_ci(caller))
+                    ))
+        })
+        .filter(|summary| {
+            summary.scope.label.as_deref() == Some(reference)
+                || session_reference(&summary.token) == reference
+        })
+        .map(|summary| summary.token)
+        .collect::<Vec<_>>();
+    candidates.sort();
+    match candidates.as_slice() {
+        [token] => Ok(token.clone()),
+        [] => Err(AdminResponse::Error {
+            message: "unknown or unauthorized access session reference".to_string(),
+        }),
+        _ => Err(AdminResponse::Error {
+            message: format!("access target '{reference}' is ambiguous"),
+        }),
+    }
+}
+
+async fn session_status_response(
+    server: &ServerContext,
+    token: &str,
+    mask_token: bool,
+) -> AdminResponse {
+    let Some(mut report) = server.state.sessions.read().await.show_with_limits(
+        token,
+        20,
+        &server.config.behavior_limits,
+    ) else {
+        return AdminResponse::Error {
+            message: "access session is no longer active".to_string(),
+        };
+    };
+    if mask_token {
+        mask_session_report_token(&mut report);
+    }
+    report.redact_credentials();
+    let fingerprint = audit_session_fingerprint(Some(token));
+    let approvals = server
+        .state
+        .approvals
+        .read()
+        .await
+        .list()
+        .iter()
+        .filter(|approval| {
+            approval.snapshot.session_fingerprint.as_deref() == Some(fingerprint.as_str())
+        })
+        .map(ApprovalSummary::from_row)
+        .collect();
+    let provisionals = server
+        .state
+        .provisional
+        .read()
+        .await
+        .list()
+        .iter()
+        .filter(|provisional| {
+            provisional.session_fingerprint.as_deref() == Some(fingerprint.as_str())
+        })
+        .map(ProvisionalSummary::from_row)
+        .collect();
+    let requests = server
+        .state
+        .grant_requests
+        .read()
+        .await
+        .values()
+        .filter(|request| request.session_token == token)
+        .cloned()
+        .map(redact_grant_request)
+        .collect();
+    AdminResponse::SessionStatus {
+        report,
+        approvals,
+        provisionals,
+        requests,
     }
 }
 
@@ -4045,6 +4147,9 @@ pub(super) async fn handle_admin_request(
         }
         AdminRequest::ApprovalNote { handle, text } => {
             handle_approval_note(server, caller, &handle, &text).await
+        }
+        AdminRequest::ApprovalWithdraw { handle } => {
+            handle_approval_withdraw(server, caller, &handle).await
         }
         AdminRequest::VerbList => {
             let mut cat = server.state.verbs.write().await;
@@ -5089,6 +5194,13 @@ pub(super) async fn handle_admin_request(
         AdminRequest::AccessList => Box::pin(list_access_items(server, caller)).await,
         AdminRequest::AccessShow { reference } => {
             Box::pin(show_access_item(server, caller, &reference)).await
+        }
+        AdminRequest::AccessStatus { reference } => {
+            let token = match Box::pin(access_session_token(server, caller, &reference)).await {
+                Ok(token) => token,
+                Err(response) => return response,
+            };
+            Box::pin(session_status_response(server, &token, true)).await
         }
         AdminRequest::EvaluateBatch {
             session_token,
@@ -6627,6 +6739,29 @@ pub(super) async fn handle_approval_note(
     }
 }
 
+async fn handle_approval_withdraw(
+    server: &ServerContext,
+    caller: &CallerIdentity,
+    handle: &str,
+) -> AdminResponse {
+    let (_, caller_key) = caller_scope(server, caller);
+    let owned = server
+        .state
+        .approvals
+        .read()
+        .await
+        .get(handle)
+        .is_some_and(|approval| {
+            caller.is_local_peer() && scope_eq(&approval.snapshot.principal, &caller_key)
+        });
+    if !owned {
+        return AdminResponse::Error {
+            message: format!("no approval with handle '{handle}'"),
+        };
+    }
+    handle_deny(server, caller, handle, "requester withdrew held command").await
+}
+
 async fn handle_deny(
     server: &ServerContext,
     caller: &CallerIdentity,
@@ -6675,12 +6810,12 @@ async fn handle_deny(
         at_unix: now,
         handle: Some(handle.to_string()),
         session_fingerprint,
-        reason: Some("operator denied held command".to_string()),
+        reason: Some(reason.to_string()),
         status: Some("denied".to_string()),
         behavior: None,
     });
     AdminResponse::GateAction {
-        message: format!("held command {} denied", handle),
+        message: reason.to_string(),
         exit_code: None,
         stdout: None,
         stderr: None,

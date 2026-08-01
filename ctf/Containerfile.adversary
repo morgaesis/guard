@@ -52,9 +52,11 @@ RUN install -d -m 0700 -o victim -g victim /home/victim/work
 
 COPY entrypoint-adversary.sh /entrypoint-adversary.sh
 COPY attacker-exec.sh /usr/local/bin/attacker-exec
+COPY egress-proxy.py /usr/local/lib/guard/egress-proxy.py
 COPY ctf-attacker-prompt.md  /home/attacker/attacker-prompt.md
 COPY scenarios.yaml          /etc/guard/scenarios.yaml
 RUN chmod 755 /entrypoint-adversary.sh /usr/local/bin/attacker-exec \
+ && chmod 644 /usr/local/lib/guard/egress-proxy.py \
  && chown attacker:attacker /home/attacker/attacker-prompt.md
 
 WORKDIR /tmp

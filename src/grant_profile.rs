@@ -633,6 +633,7 @@ fn migrate_legacy_pattern(
         inventory: None,
         namespace: None,
         fanout: None,
+        cwd: None,
         environment: Vec::new(),
         override_marker: None,
         sticky: true,

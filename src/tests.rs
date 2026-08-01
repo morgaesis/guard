@@ -1405,8 +1405,23 @@ fn machine_readable_flags_cover_read_and_execution_commands() {
         Ok(MainArgs::Resume { json: true, .. })
     ));
     assert!(matches!(
+        MainArgs::try_parse_from(["guard", "approval", "show", "hold-1", "--json"]),
+        Ok(MainArgs::Approval(ApprovalCommands::Show {
+            json: true,
+            ..
+        }))
+    ));
+    assert!(matches!(
+        MainArgs::try_parse_from(["guard", "approval", "withdraw", "hold-1"]),
+        Ok(MainArgs::Approval(ApprovalCommands::Withdraw { .. }))
+    ));
+    assert!(matches!(
         MainArgs::try_parse_from(["guard", "access", "list", "--json"]),
         Ok(MainArgs::Access(AccessCommands::List { json: true, .. }))
+    ));
+    assert!(matches!(
+        MainArgs::try_parse_from(["guard", "access", "status", "session:example", "--json"]),
+        Ok(MainArgs::Access(AccessCommands::Status { json: true, .. }))
     ));
     assert!(matches!(
         MainArgs::try_parse_from(["guard", "verb", "list", "--json"]),

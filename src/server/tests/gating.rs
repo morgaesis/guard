@@ -4,8 +4,8 @@ use crate::server::execute::audit_session_fingerprint;
 use crate::server::gate_runtime::run_provisional_check;
 use crate::server::gate_runtime::{
     approval_to_result, execute_snapshot, hash_secret_value, hold_for_approval_with_authority,
-    hold_for_approval_with_trace, new_handle, now_unix, route_gated_allow, GateInputs,
-    SessionAuthoritySnapshot,
+    hold_for_approval_with_trace, merge_revert_assessment_prompt, new_handle, now_unix,
+    route_gated_allow, GateInputs, SessionAuthoritySnapshot,
 };
 #[cfg(unix)]
 use crate::server::gate_runtime::{
@@ -62,6 +62,16 @@ async fn live_authority(cfg: &ServerContext, token: &str) -> Option<SessionAutho
 // POSIX `echo`/`true`/`false` and are `#[cfg(unix)]`; the authoritative
 // cross-platform run is the Linux container. The pure registry/handler
 // invariants (operator gating, TTL expiry, catalog voiding) run everywhere.
+
+#[test]
+fn rollback_assessment_keeps_session_authority_context() {
+    let merged = merge_revert_assessment_prompt(
+        Some("operate only on the staging namespace"),
+        "CONTAINMENT ENVELOPE ASSESSMENT",
+    );
+    assert!(merged.contains("operate only on the staging namespace"));
+    assert!(merged.contains("CONTAINMENT ENVELOPE ASSESSMENT"));
+}
 
 // The gating types (Approval, ApprovalSnapshot, ApprovalStatus, Provisional,
 // ProvisionalStatus, Coverage, GateMode, Reversibility) and AsyncWrite are
@@ -380,7 +390,10 @@ async fn confirmation_deadline_starts_after_long_forward_and_survives_restart() 
         .unwrap();
     assert_eq!(completed.forward_outcome(), "completed");
     assert!(completed.forward_done);
-    assert!(completed.deadline_unix >= observed_completion.saturating_add(3));
+    assert!(
+        completed.deadline_unix >= completed.created_unix.saturating_add(5),
+        "the four-second window must start after the two-second forward command"
+    );
     assert!(completed.deadline_unix <= observed_completion.saturating_add(4));
 
     let durable = store.load_provisionals().await.unwrap();
@@ -621,7 +634,7 @@ async fn contain_then_operator_confirm_keeps_change_nonoperator_refused() {
     match refused {
         AdminResponse::Error { message } => {
             assert!(
-                message.contains("not the daemon principal"),
+                message.contains("lacks operator authority"),
                 "got: {message}"
             );
         }
@@ -1699,7 +1712,7 @@ async fn hold_approval_arms_then_requester_resumes_once_with_output() {
     match refused {
         AdminResponse::Error { message } => {
             assert!(
-                message.contains("not the daemon principal"),
+                message.contains("lacks operator authority"),
                 "got: {message}"
             );
         }
@@ -2092,6 +2105,33 @@ async fn access_projection_excludes_and_rejects_legacy_sessions() {
         panic!("expected access-managed session")
     };
     assert_eq!(item.kind, "session");
+
+    let AdminResponse::SessionStatus { report, .. } = handle_admin_request(
+        &cfg,
+        &agent,
+        AdminRequest::AccessStatus {
+            reference: crate::session::session_reference("managed-access-projection"),
+        },
+    )
+    .await
+    else {
+        panic!("expected access-managed session status")
+    };
+    assert_eq!(
+        report.active.as_ref().map(|active| active.token.as_str()),
+        Some("(current)")
+    );
+    assert!(matches!(
+        handle_admin_request(
+            &cfg,
+            &operator,
+            AdminRequest::AccessStatus {
+                reference: crate::session::session_reference("legacy-access-projection"),
+            },
+        )
+        .await,
+        AdminResponse::Error { .. }
+    ));
 }
 
 #[tokio::test]
@@ -3981,13 +4021,31 @@ async fn approval_note_operator_and_owner_post_others_refused() {
         AdminResponse::Error { .. }
     ));
 
-    // Once decided, the thread is frozen.
-    cfg.state
-        .approvals
-        .write()
-        .await
-        .deny(&handle, now_unix(), "denied".to_string())
-        .unwrap();
+    // Only the requester can withdraw its hold. Withdrawal is a terminal
+    // denial, so execution never becomes claimable and the thread freezes.
+    assert!(matches!(
+        handle_admin_request(
+            &cfg,
+            &stranger,
+            AdminRequest::ApprovalWithdraw {
+                handle: handle.clone(),
+            },
+        )
+        .await,
+        AdminResponse::Error { .. }
+    ));
+    assert!(matches!(
+        handle_admin_request(
+            &cfg,
+            &agent,
+            AdminRequest::ApprovalWithdraw {
+                handle: handle.clone(),
+            },
+        )
+        .await,
+        AdminResponse::GateAction { message, .. }
+            if message == "requester withdrew held command"
+    ));
     assert!(
         matches!(
             handle_approval_note(&cfg, &operator, &handle, "too late").await,

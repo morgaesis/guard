@@ -17,6 +17,7 @@ REMOTE_BUILD="$RUN_DIR/build-remote"
 KEYDIR="$RUN_DIR/keys"
 LOCAL_CONTAINER="$RUN_ID-local"
 REMOTE_CONTAINER="$RUN_ID-remote"
+EGRESS_PROXY_CONTAINER="$RUN_ID-egress-proxy"
 INTERNAL_NETWORK="$RUN_ID-internal"
 EGRESS_NETWORK="$RUN_ID-egress"
 LOCAL_IMAGE="localhost/$RUN_ID-local:latest"
@@ -26,6 +27,7 @@ SSH_SECRET="$RUN_ID-agent-ssh"
 ADMIN_TOKEN_SECRET="$RUN_ID-admin-token"
 GUARD_HOME_VOLUME="$RUN_ID-guard-home"
 AGENT_HOME_VOLUME="$RUN_ID-agent-home"
+EGRESS_ALLOW_HOSTS="${GUARD_CTF_EGRESS_HOSTS:-api.anthropic.com,openrouter.ai}"
 RUN_LABEL="io.guard.ctf.run=$RUN_ID"
 
 CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude || true)}"
@@ -103,6 +105,7 @@ printf '%s\n' \
     "run_id=$RUN_ID" \
     "local_container=$LOCAL_CONTAINER" \
     "remote_container=$REMOTE_CONTAINER" \
+    "egress_proxy_container=$EGRESS_PROXY_CONTAINER" \
     "internal_network=$INTERNAL_NETWORK" \
     "egress_network=$EGRESS_NETWORK" \
     "local_image=$LOCAL_IMAGE" \
@@ -157,6 +160,7 @@ cp "$SCRIPT_DIR/Containerfile.local" "$LOCAL_BUILD/Containerfile"
 for file in client.yaml entrypoint-local.sh run-claude-attack.sh ctf-prompt.md; do
     cp "$SCRIPT_DIR/$file" "$LOCAL_BUILD/$file"
 done
+cp "$SCRIPT_DIR/egress-proxy.py" "$LOCAL_BUILD/egress-proxy.py"
 cp "$SCRIPT_DIR/Containerfile.remote" "$REMOTE_BUILD/Containerfile"
 cp "$SCRIPT_DIR/entrypoint-remote.sh" "$REMOTE_BUILD/entrypoint-remote.sh"
 
@@ -238,14 +242,47 @@ if ! podman exec "$REMOTE_CONTAINER" /bin/sh -c 'pgrep -x sshd >/dev/null && pgr
     exit 1
 fi
 
+echo "Starting allowlisted model API egress..."
+podman run -d \
+    --name "$EGRESS_PROXY_CONTAINER" \
+    --label "$RUN_LABEL" \
+    --network "$INTERNAL_NETWORK" \
+    --network-alias guard-egress \
+    --network "$EGRESS_NETWORK" \
+    --hostname guard-egress \
+    --user 65534:65534 \
+    --read-only \
+    --read-only-tmpfs=false \
+    --tmpfs "/tmp:rw,nosuid,nodev,noexec,size=8m" \
+    --cap-drop=ALL \
+    --security-opt no-new-privileges \
+    --pids-limit 32 \
+    --cpus 0.25 \
+    --memory 64m \
+    --memory-swap 64m \
+    --env "GUARD_EGRESS_ALLOW_HOSTS=$EGRESS_ALLOW_HOSTS" \
+    --entrypoint /usr/bin/python3 \
+    "$LOCAL_IMAGE" /usr/local/lib/guard/egress-proxy.py >/dev/null
+for _ in {1..20}; do
+    if [ "$(podman inspect --format '{{.State.Running}}' "$EGRESS_PROXY_CONTAINER")" = true ]; then
+        break
+    fi
+    sleep 0.1
+done
+if [ "$(podman inspect --format '{{.State.Running}}' "$EGRESS_PROXY_CONTAINER")" != true ]; then
+    podman logs "$EGRESS_PROXY_CONTAINER" >&2
+    exit 1
+fi
+
 echo "Starting Guard and attacking-agent environment..."
 podman run -d \
     --name "$LOCAL_CONTAINER" \
     --label "$RUN_LABEL" \
     --network "$INTERNAL_NETWORK" \
-    --network "$EGRESS_NETWORK" \
     --hostname guard-local \
     --user 0 \
+    --env HTTPS_PROXY=http://guard-egress:3128 \
+    --env https_proxy=http://guard-egress:3128 \
     "${COMMON_HARDENING[@]}" \
     --cap-add CHOWN \
     --cap-add SETGID \

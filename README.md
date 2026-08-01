@@ -29,6 +29,9 @@ cargo install --path .
 
 Release archives are available for Linux x86-64, Linux ARM64, and Windows
 x86-64. See [INSTALL.md](INSTALL.md) for release and service installation.
+Bug reports, development setup, and the pull-request process are documented in
+[DEVELOPMENT.md](DEVELOPMENT.md). Security reports follow
+[SECURITY.md](SECURITY.md).
 
 ## Quick start
 
@@ -131,6 +134,8 @@ guard server start --gate consequence \
 guard access request 'Restart nginx and verify that it is healthy.'
 guard access approve <request> --once
 guard resume <request>
+guard access status <session>
+guard approval show <request>
 guard run systemctl restart nginx
 guard provisionals
 guard confirm <handle>

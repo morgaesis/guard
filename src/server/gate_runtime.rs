@@ -804,10 +804,15 @@ async fn assess_revert(
             .as_deref()
             .unwrap_or("none; deadline always rolls back")
     );
+    let session_prompt = match forward.session_token.as_deref() {
+        Some(token) => server.state.sessions.read().await.prompt_append_for(token),
+        None => None,
+    };
+    let evaluation_context = merge_revert_assessment_prompt(session_prompt.as_deref(), &context);
     match server
         .state
         .evaluator
-        .evaluate_with_context(&revert_line, Some(&context))
+        .evaluate_with_context(&revert_line, Some(&evaluation_context))
         .await
     {
         guard::evaluate::EvalResult::Allow { .. } => RevertAssessment::Sensible,
@@ -817,6 +822,22 @@ async fn assess_revert(
         guard::evaluate::EvalResult::Error(e) => {
             RevertAssessment::NeedsReview(format!("rollback could not be evaluated: {e}"))
         }
+    }
+}
+
+pub(super) fn merge_revert_assessment_prompt(
+    session_prompt: Option<&str>,
+    context: &str,
+) -> String {
+    match session_prompt
+        .map(str::trim)
+        .filter(|prompt| !prompt.is_empty())
+    {
+        Some(prompt) => format!(
+            "SESSION AUTHORITY CONTEXT. The rollback must remain within this scoped intent:\n\
+             {prompt}\n\n{context}"
+        ),
+        None => context.to_string(),
     }
 }
 

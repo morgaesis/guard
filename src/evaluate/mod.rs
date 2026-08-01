@@ -184,8 +184,12 @@ impl Evaluator {
             system_prompt
         };
 
-        let http_client = Client::builder()
-            .timeout(config.llm.timeout())
+        let mut http_client = Client::builder().timeout(config.llm.timeout());
+        if let Some(proxy_url) = config.llm.proxy_url.as_deref() {
+            http_client =
+                http_client.proxy(reqwest::Proxy::all(proxy_url).context("invalid LLM proxy URL")?);
+        }
+        let http_client = http_client
             .build()
             .context("failed to create HTTP client")?;
 

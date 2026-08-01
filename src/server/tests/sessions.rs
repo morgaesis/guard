@@ -2899,6 +2899,18 @@ fn tcp_admin_token_validation_is_separate_from_exec_token() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn unix_operator_denial_does_not_name_windows_authority() {
+    let (cfg, _) = make_test_config();
+    let error = cfg
+        .validate_admin(&CallerIdentity::Unix { uid: 20_002 })
+        .expect_err("ordinary Unix caller must lack operator authority")
+        .to_string();
+    assert_eq!(error, "admin RPC refused: caller lacks operator authority");
+    assert!(!error.contains("Windows"));
+}
+
 #[cfg(windows)]
 #[test]
 fn authenticated_windows_system_is_an_operator_without_broadening_other_callers() {
@@ -5299,7 +5311,7 @@ async fn principal_binding_hold_confirm_is_operator_only() {
     .await;
     assert!(matches!(
         refused,
-        AdminResponse::Error { message } if message.contains("daemon principal")
+        AdminResponse::Error { message } if message.contains("operator authority")
     ));
 }
 

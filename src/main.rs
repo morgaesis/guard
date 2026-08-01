@@ -66,9 +66,9 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
 }
 
 use cli_client::{
-    handle_access, handle_api, handle_audit_tail, handle_audit_verify, handle_config,
-    handle_gate_action, handle_provisionals, handle_resume, handle_status, handle_verb, run_exec,
-    run_mcp, GatingOptions, RunInjections, SshHostKeyCliMode,
+    handle_access, handle_api, handle_approval, handle_audit_tail, handle_audit_verify,
+    handle_config, handle_gate_action, handle_provisionals, handle_resume, handle_status,
+    handle_verb, run_exec, run_mcp, GatingOptions, RunInjections, SshHostKeyCliMode,
 };
 use cli_secrets::handle_secrets;
 use cli_server::run_server;
@@ -247,7 +247,7 @@ enum MainArgs {
     /// Print a categorized command tree with access markers.
     #[clap(name = "help-tree")]
     HelpTree {
-        /// Include daemon-principal/admin-token commands.
+        /// Include operator-authorized commands.
         #[arg(long, action = ArgAction::SetTrue)]
         admin: bool,
     },
@@ -286,12 +286,51 @@ enum MainArgs {
         #[arg(long, action = ArgAction::SetTrue)]
         json: bool,
     },
+    /// Inspect, discuss, or withdraw requester-owned held commands.
+    #[clap(subcommand)]
+    Approval(ApprovalCommands),
     /// Run or list operator-defined verbs (the typed, least-expressive interface).
     #[clap(subcommand)]
     Verb(VerbCommands),
     /// Inspect the daemon's hash-chained audit log. Daemon-principal only.
     #[clap(subcommand)]
     Audit(AuditCommands),
+}
+
+#[derive(Subcommand)]
+enum ApprovalCommands {
+    /// List held and decided commands visible to the caller.
+    List {
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
+    /// Show one held command and its persisted terminal transcript.
+    Show {
+        handle: String,
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
+    /// Add a requester or operator note before the hold is decided.
+    Note {
+        handle: String,
+        text: String,
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
+    /// Cancel one requester-owned held command before execution.
+    Withdraw {
+        handle: String,
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -392,6 +431,14 @@ enum AccessCommands {
     },
     /// Show detailed request or session coverage and evidence.
     Show {
+        reference: String,
+        #[arg(long)]
+        socket: Option<String>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
+    /// Show detailed runtime state for one access-managed session.
+    Status {
         reference: String,
         #[arg(long)]
         socket: Option<String>,
@@ -1386,6 +1433,7 @@ async fn run_main() -> Result<()> {
             socket,
             json,
         }) => handle_resume(socket, handle, json).await,
+        Ok(MainArgs::Approval(subcommand)) => handle_approval(subcommand).await,
         Ok(MainArgs::Verb(subcommand)) => handle_verb(subcommand).await,
         Ok(MainArgs::Audit(subcommand)) => match subcommand {
             AuditCommands::Verify { socket, json } => handle_audit_verify(socket, json).await,
@@ -1628,8 +1676,10 @@ fn print_help_tree(admin: bool) {
     println!("    access request \"<intent>\"");
     println!("    access list");
     println!("    access show <request-or-session>");
+    println!("    access status <session>");
     println!("    provisionals");
     println!("    resume <handle>");
+    println!("    approval list|show|note|withdraw");
     println!("    mcp serve");
     println!();
     println!("  local setup");
@@ -1652,7 +1702,7 @@ fn print_help_tree(admin: bool) {
         println!(
             "{}",
             paint(
-                "Run `guard help-tree --admin` to include daemon-principal/admin-token commands.",
+                "Run `guard help-tree --admin` to include operator-authorized commands.",
                 AnsiColor::Cyan,
                 color,
             )
@@ -1663,7 +1713,7 @@ fn print_help_tree(admin: bool) {
     println!("  user commands are available to allowed local callers.");
     println!("  local setup commands edit client-side files for the invoking account.");
     println!("  access list and show expose stable references and scoped authority, never raw session tokens.");
-    println!("  admin commands require the daemon principal or the TCP admin token.");
+    println!("  admin commands require operator authority for the active transport.");
 }
 #[cfg(test)]
 mod tests;

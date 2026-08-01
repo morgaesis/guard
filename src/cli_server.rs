@@ -531,6 +531,9 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             if let Some(api_url) = resolved_api_url {
                 eval_config = eval_config.llm_api_url(api_url);
             }
+            if let Some(proxy_url) = guard_env("LLM_PROXY_URL").filter(|value| !value.is_empty()) {
+                eval_config = eval_config.llm_proxy_url(proxy_url);
+            }
 
             // Model resolution precedence (single primary model):
             //   1. --llm-model CLI flag
@@ -2042,6 +2045,7 @@ mod api_endpoint_tests {
             enabled: false,
             api_key: None,
             api_url: None,
+            proxy_url: None,
             model: None,
             models: Vec::new(),
             timeout_secs: 1,

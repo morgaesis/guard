@@ -26,14 +26,16 @@ const VERB_LIST_TOOL_NAME: &str = "guard_verbs";
 const ACCESS_REQUEST_TOOL_NAME: &str = "guard_access_request";
 const APPROVAL_LIST_TOOL_NAME: &str = "guard_access_list";
 const EVALUATE_BATCH_TOOL_NAME: &str = "guard_evaluate_batch";
-const SESSION_STATUS_TOOL_NAME: &str = "guard_access_show";
+const ACCESS_SHOW_TOOL_NAME: &str = "guard_access_show";
+const ACCESS_STATUS_TOOL_NAME: &str = "guard_access_status";
 const BUILT_IN_TOOL_NAMES: &[&str] = &[
     DEFAULT_TOOL_NAME,
     VERB_LIST_TOOL_NAME,
     ACCESS_REQUEST_TOOL_NAME,
     APPROVAL_LIST_TOOL_NAME,
     EVALUATE_BATCH_TOOL_NAME,
-    SESSION_STATUS_TOOL_NAME,
+    ACCESS_SHOW_TOOL_NAME,
+    ACCESS_STATUS_TOOL_NAME,
 ];
 const TOOL_SCHEMA_VERSION: u64 = 1;
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-03-26", "2024-11-05"];
@@ -967,7 +969,10 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                 } else if self.admin_tools && tool_call.name == EVALUATE_BATCH_TOOL_NAME {
                     let result = self.call_evaluate_batch(tool_call.arguments).await;
                     jsonrpc_result_response(id, result)
-                } else if self.admin_tools && tool_call.name == SESSION_STATUS_TOOL_NAME {
+                } else if self.admin_tools && tool_call.name == ACCESS_SHOW_TOOL_NAME {
+                    let result = self.call_access_show(tool_call.arguments).await;
+                    jsonrpc_result_response(id, result)
+                } else if self.admin_tools && tool_call.name == ACCESS_STATUS_TOOL_NAME {
                     let result = self.call_session_status(tool_call.arguments).await;
                     jsonrpc_result_response(id, result)
                 } else {
@@ -1266,7 +1271,7 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                     }
                 },
                 {
-                    "name": SESSION_STATUS_TOOL_NAME,
+                    "name": ACCESS_SHOW_TOOL_NAME,
                     "title": "Show Access State",
                     "description": "Show one caller-visible access request, hold, or session by its stable reference.",
                     "inputSchema": {
@@ -1277,6 +1282,27 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                     "outputSchema": admin_output_schema(
                         "access_show",
                         "item",
+                        json!({ "type": "object" })
+                    ),
+                    "annotations": {
+                        "readOnlyHint": true,
+                        "destructiveHint": false,
+                        "idempotentHint": true,
+                        "openWorldHint": false
+                    }
+                },
+                {
+                    "name": ACCESS_STATUS_TOOL_NAME,
+                    "title": "Show Access Session Status",
+                    "description": "Show requester-scoped activity, decisions, holds, and provisionals for one access-managed session.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": { "reference": { "type": "string" } },
+                        "required": ["reference"]
+                    },
+                    "outputSchema": admin_output_schema(
+                        "access_status",
+                        "report",
                         json!({ "type": "object" })
                     ),
                     "annotations": {
@@ -1421,7 +1447,7 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
         }
     }
 
-    async fn call_session_status(&self, arguments: Value) -> Value {
+    async fn call_access_show(&self, arguments: Value) -> Value {
         let args: AccessShowArgs = match serde_json::from_value(arguments) {
             Ok(args) => args,
             Err(error) => return tool_error_result(format!("invalid tool arguments: {error}")),
@@ -1437,6 +1463,47 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                 "access_show",
                 render_access_text(std::slice::from_ref(&item)),
                 json!({ "item": item }),
+            ),
+            Ok(server::AdminResponse::Error { message }) => tool_error_result(message),
+            Ok(_) => tool_error_result("unexpected response from guard daemon".to_string()),
+            Err(error) => tool_error_result(format!("{error:#}")),
+        }
+    }
+
+    async fn call_session_status(&self, arguments: Value) -> Value {
+        let args: AccessShowArgs = match serde_json::from_value(arguments) {
+            Ok(args) => args,
+            Err(error) => return tool_error_result(format!("invalid tool arguments: {error}")),
+        };
+        match self
+            .admin
+            .send_admin(server::AdminRequest::AccessStatus {
+                reference: args.reference,
+            })
+            .await
+        {
+            Ok(server::AdminResponse::SessionStatus {
+                report,
+                approvals,
+                provisionals,
+                requests,
+            }) => admin_tool_result(
+                "access_status",
+                format!(
+                    "session activity: total={} allowed={} denied={}; requests={} approvals={} provisionals={}",
+                    report.stats.total,
+                    report.stats.allowed,
+                    report.stats.denied,
+                    requests.len(),
+                    approvals.len(),
+                    provisionals.len(),
+                ),
+                json!({
+                    "report": report,
+                    "approvals": approvals,
+                    "provisionals": provisionals,
+                    "requests": requests,
+                }),
             ),
             Ok(server::AdminResponse::Error { message }) => tool_error_result(message),
             Ok(_) => tool_error_result("unexpected response from guard daemon".to_string()),
@@ -2169,7 +2236,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn access_show_sends_the_requested_durable_reference() {
+    async fn access_status_sends_the_requested_session_reference() {
         let executor = Arc::new(FakeExecutor {
             response: Err("unused".to_string()),
         });
@@ -2186,7 +2253,37 @@ mod tests {
                 "id": 43,
                 "method": "tools/call",
                 "params": {
-                    "name": SESSION_STATUS_TOOL_NAME,
+                    "name": ACCESS_STATUS_TOOL_NAME,
+                    "arguments": { "reference": "requested-target" }
+                }
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            recorded.lock().unwrap().as_ref(),
+            Some(server::AdminRequest::AccessStatus { reference })
+                if reference == "requested-target"
+        ));
+    }
+
+    #[tokio::test]
+    async fn access_show_sends_the_requested_durable_reference() {
+        let executor = Arc::new(FakeExecutor {
+            response: Err("unused".to_string()),
+        });
+        let recorded = Arc::new(std::sync::Mutex::new(None));
+        let admin = Arc::new(RecordingAdmin {
+            request: recorded.clone(),
+        });
+        let mut server = McpServer::new(executor, admin, DEFAULT_TOOL_NAME.to_string());
+        server.initialize_seen = true;
+        let _ = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 44,
+                "method": "tools/call",
+                "params": {
+                    "name": ACCESS_SHOW_TOOL_NAME,
                     "arguments": { "reference": "requested-target" }
                 }
             }))
@@ -2784,7 +2881,8 @@ mod tests {
                 ACCESS_REQUEST_TOOL_NAME,
                 APPROVAL_LIST_TOOL_NAME,
                 EVALUATE_BATCH_TOOL_NAME,
-                SESSION_STATUS_TOOL_NAME,
+                ACCESS_SHOW_TOOL_NAME,
+                ACCESS_STATUS_TOOL_NAME,
             ]
         );
         let access_request = &response["result"]["tools"][2];

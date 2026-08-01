@@ -1,5 +1,21 @@
 # Development
 
+## Contributing
+
+Bug reports and enhancement requests use the repository's GitHub issue
+tracker. Security reports follow [SECURITY.md](SECURITY.md) and do not belong in
+public issues.
+
+Contributions use GitHub pull requests against `main`. Keep each pull request
+focused on one coherent change, add behavioral tests for changed behavior, and
+update the existing documentation when a public contract changes. Run the
+pre-commit gate below over the complete diff before requesting review. A
+maintainer review and passing required checks are required before merge.
+
+Contributions are accepted under the repository's MIT license. By submitting a
+contribution, the contributor confirms they have the right to provide it under
+that license.
+
 ## Building
 
 ```bash

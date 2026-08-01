@@ -261,7 +261,7 @@ rollback.
 On Unix, the packaged paths use this upgrade sequence:
 
 ```bash
-release_version=0.6.0
+release_version=0.7.0
 backup_dir="/var/backups/guard-before-v${release_version}"
 standard_state="$(systemctl is-active guard.service || true)"
 caller_state="$(systemctl is-active guard-exec-as-caller.service || true)"
@@ -321,7 +321,7 @@ database and every WAL, SHM, or rollback-journal sidecar before installing the
 backup so SQLite cannot combine files from different snapshots:
 
 ```bash
-release_version=0.6.0
+release_version=0.7.0
 backup_dir="/var/backups/guard-before-v${release_version}"
 standard_state="$(systemctl is-active guard.service || true)"
 caller_state="$(systemctl is-active guard-exec-as-caller.service || true)"

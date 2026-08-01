@@ -138,6 +138,7 @@ impl Client {
             AdminRequest::ApprovalList => "approval_list",
             AdminRequest::ApprovalShow { .. } => "approval_show",
             AdminRequest::ApprovalNote { .. } => "approval_note",
+            AdminRequest::ApprovalWithdraw { .. } => "approval_withdraw",
             AdminRequest::VerbList => "verb_list",
             AdminRequest::VerbShow { .. } => "verb_show",
             AdminRequest::VerbDelete { .. } => "verb_delete",
@@ -171,6 +172,7 @@ impl Client {
             AdminRequest::AccessExtend { .. } => "access_extend",
             AdminRequest::AccessList => "access_list",
             AdminRequest::AccessShow { .. } => "access_show",
+            AdminRequest::AccessStatus { .. } => "access_status",
             AdminRequest::EvaluateBatch { .. } => "evaluate_batch",
         };
         let envelope = IncomingMessage::Admin {

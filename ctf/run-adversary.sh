@@ -8,11 +8,15 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 BINARY="$PROJECT_DIR/target/release/guard"
 ATTACKER_KEY_FILE="${ATTACKER_KEY_FILE:-}"
 ATTACKER_MODEL="${ATTACKER_MODEL:-moonshotai/kimi-k3}"
+EGRESS_ALLOW_HOSTS="${GUARD_ADVERSARY_EGRESS_HOSTS:-openrouter.ai}"
 
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
 IMAGE="guard-adversary-$(printf '%s' "$RUN_ID" | tr '[:upper:]' '[:lower:]')"
 EVALUATOR_SECRET="guard-adversary-eval-$RUN_ID"
 RESULTS_VOLUME="guard-adversary-results-$RUN_ID"
+INTERNAL_NETWORK="guard-adversary-$RUN_ID-internal"
+EGRESS_NETWORK="guard-adversary-$RUN_ID-egress"
+EGRESS_PROXY_CONTAINER="guard-adversary-$RUN_ID-egress"
 mkdir -p "$SCRIPT_DIR/runs"
 RUNS_DIR="$(mktemp -d "$SCRIPT_DIR/runs/adversary-$RUN_ID.XXXXXX")"
 MAPPING_FILE="$RUNS_DIR/scenario-containers.tsv"
@@ -23,11 +27,12 @@ SECRET_CLEANUP_REQUIRED=0
 VOLUME_CLEANUP_REQUIRED=0
 declare -a CONTAINERS=()
 declare -a HOME_VOLUMES=()
+declare -a NETWORKS=()
 declare -A SEEN_SCENARIOS=()
 declare -A SEEN_CONTAINER_IDS=()
 
 cleanup() {
-    local container volume
+    local container volume network
     trap - EXIT INT TERM
     if [ "${GUARD_ADVERSARY_KEEP:-0}" = 1 ]; then
         printf 'Keeping scenario containers and home volumes for inspection (GUARD_ADVERSARY_KEEP=1).\n' >&2
@@ -37,6 +42,9 @@ cleanup() {
         done
         for volume in "${HOME_VOLUMES[@]}"; do
             podman volume rm "$volume" >/dev/null 2>&1 || true
+        done
+        for network in "${NETWORKS[@]}"; do
+            podman network rm "$network" >/dev/null 2>&1 || true
         done
     fi
     if [ "$IMAGE_CLEANUP_REQUIRED" -eq 1 ]; then
@@ -122,6 +130,7 @@ cp -- "$SCRIPT_DIR/Containerfile.adversary" "$BUILD_CONTEXT/Containerfile.advers
 cp -- "$SCRIPT_DIR/entrypoint-adversary.sh" "$BUILD_CONTEXT/entrypoint-adversary.sh"
 cp -- "$SCRIPT_DIR/codex-config.toml" "$BUILD_CONTEXT/codex-config.toml"
 cp -- "$SCRIPT_DIR/attacker-exec.sh" "$BUILD_CONTEXT/attacker-exec.sh"
+cp -- "$SCRIPT_DIR/egress-proxy.py" "$BUILD_CONTEXT/egress-proxy.py"
 cp -- "$SCRIPT_DIR/ctf-attacker-prompt.md" "$BUILD_CONTEXT/ctf-attacker-prompt.md"
 cp -- "$SCRIPT_DIR/scenarios.yaml" "$BUILD_CONTEXT/scenarios.yaml"
 
@@ -143,6 +152,40 @@ SECRET_CLEANUP_REQUIRED=1
 podman volume create --label "guard.adversary.run=$RUN_ID" "$RESULTS_VOLUME" >/dev/null
 VOLUME_CLEANUP_REQUIRED=1
 
+# Scenario containers have no default route. A separate unprivileged sidecar
+# is the only member of both networks and accepts TLS tunnels only for the
+# exact model API host, with public-address and SNI checks.
+podman network create --internal --label "guard.adversary.run=$RUN_ID" "$INTERNAL_NETWORK" >/dev/null
+NETWORKS+=("$INTERNAL_NETWORK")
+podman network create --label "guard.adversary.run=$RUN_ID" "$EGRESS_NETWORK" >/dev/null
+NETWORKS+=("$EGRESS_NETWORK")
+CONTAINERS+=("$EGRESS_PROXY_CONTAINER")
+podman run -d \
+    --name "$EGRESS_PROXY_CONTAINER" \
+    --hostname guard-egress \
+    --network "$INTERNAL_NETWORK" \
+    --network-alias guard-egress \
+    --network "$EGRESS_NETWORK" \
+    --label "guard.adversary.run=$RUN_ID" \
+    --user 65534:65534 \
+    --read-only \
+    --tmpfs /tmp:rw,nosuid,nodev,noexec,size=8m \
+    --cap-drop=ALL \
+    --security-opt=no-new-privileges \
+    --pids-limit=32 \
+    --cpus=0.25 \
+    --memory=64m \
+    --memory-swap=64m \
+    --env "GUARD_EGRESS_ALLOW_HOSTS=$EGRESS_ALLOW_HOSTS" \
+    --entrypoint /usr/bin/python3 \
+    "$IMAGE" /usr/local/lib/guard/egress-proxy.py >/dev/null
+for _ in $(seq 1 20); do
+    [ "$(podman inspect --format '{{.State.Running}}' "$EGRESS_PROXY_CONTAINER")" = true ] && break
+    sleep 0.1
+done
+[ "$(podman inspect --format '{{.State.Running}}' "$EGRESS_PROXY_CONTAINER")" = true ] \
+    || fail 'the allowlisted egress proxy did not start'
+
 overall_rc=0
 index=0
 for scenario in "${SELECTED_SCENARIOS[@]}"; do
@@ -155,9 +198,8 @@ for scenario in "${SELECTED_SCENARIOS[@]}"; do
 
     printf '=== Running scenario %s in %s ===\n' "$scenario" "$container"
 
-    # loopback-only isolation: wildcard-bound host services remain reachable
-    # via host.containers.internal; the dedicated key is the damage bound
-    # (see ADVERSARY.md).
+    # The scenario has only an internal network. HTTPS reaches the public model
+    # API through the allowlisted sidecar and no route reaches the host.
     cid="$(podman create \
         --name "$container" \
         --hostname adversary \
@@ -178,10 +220,12 @@ for scenario in "${SELECTED_SCENARIOS[@]}"; do
         --cpus=1 \
         --memory=1g \
         --memory-swap=1g \
-        --network=slirp4netns:allow_host_loopback=false \
+        --network "$INTERNAL_NETWORK" \
         --env "CTF_SCENARIO=$scenario" \
         --env "CTF_CONTAINER_NAME=$container" \
         --env "ATTACKER_MODEL=$ATTACKER_MODEL" \
+        --env HTTPS_PROXY=http://guard-egress:3128 \
+        --env https_proxy=http://guard-egress:3128 \
         --env HOME=/home/guard \
         --env-file /dev/stdin \
         --secret "source=$EVALUATOR_SECRET,target=/tmp/ctf-secrets/evaluator-api-key,uid=900,gid=900,mode=0400" \

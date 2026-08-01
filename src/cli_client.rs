@@ -1,8 +1,8 @@
 use super::{
     color_enabled_for_stderr, color_enabled_for_stdout, format_timestamp, paint, print_json,
-    AccessCommands, AnsiColor, ApiCommands, ConfigCommands, McpCommands, VerbCommands,
-    VerbCoverageCommands, EXIT_GUARD_ACCESS_DECISION_FAILED, EXIT_GUARD_DENIED, EXIT_GUARD_ERROR,
-    EXIT_GUARD_HELD, JSON_SCHEMA_VERSION,
+    AccessCommands, AnsiColor, ApiCommands, ApprovalCommands, ConfigCommands, McpCommands,
+    VerbCommands, VerbCoverageCommands, EXIT_GUARD_ACCESS_DECISION_FAILED, EXIT_GUARD_DENIED,
+    EXIT_GUARD_ERROR, EXIT_GUARD_HELD, JSON_SCHEMA_VERSION,
 };
 use crate::{client_config, daemon_client, defaults, mcp, server};
 use anyhow::{Context, Result};
@@ -294,7 +294,7 @@ pub(crate) async fn run_exec(
             let color = color_enabled_for_stderr();
             let handle = resp.handle.clone().unwrap_or_default();
             eprintln!(
-                "{} for daemon-principal approval: {}",
+                "{} for operator approval: {}",
                 paint("HELD", AnsiColor::Yellow, color),
                 resp.reason
             );
@@ -324,6 +324,7 @@ pub(crate) async fn run_exec(
             );
             eprintln!("  handle:  {}", handle);
             eprintln!("  confirm: guard confirm {}", handle);
+            eprintln!("  inspect: guard provisionals");
             eprintln!("  result:  executed, auto-reverts unless confirmed");
             print_coverage(&resp.coverage);
             if let Some(code) = resp.exit_code {
@@ -524,6 +525,120 @@ pub(crate) async fn handle_provisionals(socket: Option<String>, json: bool) -> R
             eprintln!("unexpected response");
             std::process::exit(1);
         }
+    }
+}
+
+fn render_approval(item: &server::ApprovalSummary, include_transcript: bool) {
+    println!(
+        "[{}] handle={} cmd={:?} deadline={} reason={:?}",
+        item.status,
+        item.handle,
+        item.command,
+        format_timestamp(item.deadline_unix),
+        item.decided_reason.as_deref().unwrap_or(&item.reason),
+    );
+    if include_transcript {
+        if let Some(stdout) = item.stdout.as_deref() {
+            print!("{stdout}");
+            if item.stdout_truncated {
+                println!("[guard stdout transcript truncated]");
+            }
+        }
+        if let Some(stderr) = item.stderr.as_deref() {
+            eprint!("{stderr}");
+            if item.stderr_truncated {
+                eprintln!("[guard stderr transcript truncated]");
+            }
+        }
+        if let Some(exit_code) = item.exit_code {
+            println!("exit_code={exit_code}");
+        }
+    }
+}
+
+pub(crate) async fn handle_approval(command: ApprovalCommands) -> Result<()> {
+    let (socket, request, json, include_transcript) = match command {
+        ApprovalCommands::List { socket, json } => {
+            (socket, server::AdminRequest::ApprovalList, json, false)
+        }
+        ApprovalCommands::Show {
+            handle,
+            socket,
+            json,
+        } => (
+            socket,
+            server::AdminRequest::ApprovalShow { handle },
+            json,
+            true,
+        ),
+        ApprovalCommands::Note {
+            handle,
+            text,
+            socket,
+            json,
+        } => (
+            socket,
+            server::AdminRequest::ApprovalNote { handle, text },
+            json,
+            true,
+        ),
+        ApprovalCommands::Withdraw {
+            handle,
+            socket,
+            json,
+        } => (
+            socket,
+            server::AdminRequest::ApprovalWithdraw { handle },
+            json,
+            false,
+        ),
+    };
+    let (client, source) = gate_client(socket, json)?;
+    let response = client
+        .send_admin(request)
+        .await
+        .map_err(|error| describe_connect_failure(error, &client, source))?;
+    match response {
+        server::AdminResponse::Approvals { items } => {
+            if json {
+                return print_json(&serde_json::json!({
+                    "schema_version": JSON_SCHEMA_VERSION,
+                    "type": "approval_list",
+                    "items": items,
+                }));
+            }
+            if items.is_empty() {
+                println!("(no held commands)");
+            }
+            for item in &items {
+                render_approval(item, false);
+            }
+            Ok(())
+        }
+        server::AdminResponse::ApprovalShow { item } => {
+            if json {
+                return print_json(&serde_json::json!({
+                    "schema_version": JSON_SCHEMA_VERSION,
+                    "type": "approval",
+                    "item": item,
+                }));
+            }
+            render_approval(&item, include_transcript);
+            Ok(())
+        }
+        server::AdminResponse::GateAction { message, .. } => {
+            if json {
+                return print_json(&serde_json::json!({
+                    "schema_version": JSON_SCHEMA_VERSION,
+                    "type": "approval_withdrawal",
+                    "message": message,
+                }));
+            }
+            println!("{message}");
+            Ok(())
+        }
+        server::AdminResponse::Error { message } => anyhow::bail!(message),
+        _ => anyhow::bail!("unexpected response from guard daemon"),
     }
 }
 
@@ -1350,6 +1465,15 @@ pub(crate) async fn handle_access(command: AccessCommands) -> Result<()> {
             socket,
             json,
         } => (socket, server::AdminRequest::AccessShow { reference }, json),
+        AccessCommands::Status {
+            reference,
+            socket,
+            json,
+        } => (
+            socket,
+            server::AdminRequest::AccessStatus { reference },
+            json,
+        ),
     };
     let config = load_client_config(json)?;
     let (socket_path, tcp_port, source) = resolve_client_endpoint_with_source(socket, &config);
@@ -1413,6 +1537,14 @@ pub(crate) async fn handle_access(command: AccessCommands) -> Result<()> {
         server::AdminResponse::AccessDecisions { items } => {
             print_access_decision_lines(&items);
         }
+        server::AdminResponse::SessionStatus {
+            report,
+            approvals,
+            provisionals,
+            requests,
+        } => {
+            render_access_status(&report, &approvals, &provisionals, &requests);
+        }
         server::AdminResponse::Error { message } => anyhow::bail!(message),
         other => anyhow::bail!("unexpected access response: {other:?}"),
     }
@@ -1435,6 +1567,7 @@ fn access_json_response(response: &server::AdminResponse) -> Result<serde_json::
         server::AdminResponse::AccessItems { .. } => "access_list",
         server::AdminResponse::AccessItem { .. } => "access_item",
         server::AdminResponse::AccessDecisions { .. } => "access_decisions",
+        server::AdminResponse::SessionStatus { .. } => "access_status",
         server::AdminResponse::Error { message } => return Err(message.clone()),
         other => return Err(format!("unexpected access response: {other:?}")),
     };
@@ -1443,6 +1576,77 @@ fn access_json_response(response: &server::AdminResponse) -> Result<serde_json::
         "type": kind,
         "response": response,
     }))
+}
+
+fn render_access_status(
+    report: &crate::session::SessionReport,
+    approvals: &[server::ApprovalSummary],
+    provisionals: &[server::ProvisionalSummary],
+    requests: &[crate::grant_profile::GrantRequest],
+) {
+    println!("access session status");
+    if let Some(active) = &report.active {
+        println!(
+            "  session: {}",
+            active.scope.label.as_deref().unwrap_or("(unlabeled)")
+        );
+        println!(
+            "  expiry: {}",
+            active
+                .expires_at
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        );
+        println!("  owner: {:?}", active.owner);
+        println!(
+            "  verbs: {}",
+            if active.activated_verbs.is_empty() {
+                "(none)".to_string()
+            } else {
+                active.activated_verbs.join(",")
+            }
+        );
+    }
+    println!(
+        "  activity: total={} allowed={} denied={} completed={} failed={} held={}",
+        report.stats.total,
+        report.stats.allowed,
+        report.stats.denied,
+        report.stats.completed,
+        report.stats.exec_failed,
+        report.stats.holds,
+    );
+    println!(
+        "  related: requests={} approvals={} provisionals={} recent={}",
+        requests.len(),
+        approvals.len(),
+        provisionals.len(),
+        report.recent.len(),
+    );
+    for interaction in &report.recent {
+        println!(
+            "  [{}] allowed={} source={} status={:?} command={:?} reason={:?}",
+            interaction.at_unix,
+            interaction.allowed,
+            interaction.source.as_str(),
+            interaction.exec_status,
+            interaction.command,
+            interaction.reason,
+        );
+    }
+    for approval in approvals {
+        render_approval(approval, true);
+    }
+    for provisional in provisionals {
+        println!(
+            "[{}] handle={} cmd={:?} deadline={} reason={:?}",
+            provisional.status,
+            provisional.handle,
+            provisional.command,
+            format_timestamp(provisional.deadline_unix),
+            provisional.reason,
+        );
+    }
 }
 
 fn any_decision_failed(items: &[server::AccessDecisionResult]) -> bool {
@@ -1867,7 +2071,7 @@ fn render_gated_response(
             let color = color_enabled_for_stderr();
             let handle = resp.handle.clone().unwrap_or_default();
             eprintln!(
-                "{} for daemon-principal approval: {}",
+                "{} for operator approval: {}",
                 paint("HELD", AnsiColor::Yellow, color),
                 resp.reason
             );
@@ -1896,6 +2100,7 @@ fn render_gated_response(
             );
             eprintln!("  handle:  {}", handle);
             eprintln!("  confirm: guard confirm {}", handle);
+            eprintln!("  inspect: guard provisionals");
             eprintln!("  result:  executed, auto-reverts unless confirmed");
             print_coverage(&resp.coverage);
             if let Some(code) = resp.exit_code {
@@ -2299,8 +2504,8 @@ pub(crate) async fn handle_status(socket: Option<String>, json: bool) -> Result<
         }
     }
 
-    // Try the full Status RPC. Succeeds for daemon-UID Unix callers or
-    // TCP callers with the configured admin token.
+    // Try the full Status RPC. It succeeds only with operator authority for
+    // the active transport.
     match client.send_admin(server::AdminRequest::Status).await {
         Ok(server::AdminResponse::Status { status }) => {
             if json {

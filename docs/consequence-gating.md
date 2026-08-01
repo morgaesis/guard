@@ -79,6 +79,7 @@ guard access list
 guard access show <request>
 guard access approve <request> --once
 guard resume <request>
+guard approval show <request>
 guard access deny <request> --reason 'outside the approved task'
 ```
 
@@ -87,12 +88,15 @@ without executing it as the operator. The kernel-authenticated requester runs
 the snapshot with `guard resume <request>`, which returns its stdout, stderr,
 and exit status. Each hold can be resumed once. Bounded copies of stdout and
 stderr remain in durable approval state and identify truncation in their stored
-text. Ordinary and N-use approval apply to authority requests created from
-denied or proactive access intent, not to held execution snapshots.
+text. `guard approval show <request>` retrieves that terminal transcript if the
+resume response is lost. The requester can add context with `guard approval
+note` or cancel an unexecuted hold with `guard approval withdraw`. Ordinary and
+N-use approval apply to authority requests created from denied or proactive
+access intent, not to held execution snapshots.
 
-Only the daemon principal or TCP admin principal can approve or deny. The
-original requester may add notes to its hold but cannot decide it. Discussion
-freezes when the hold is decided.
+Only an authenticated operator can approve or deny. The original requester may
+add notes to its hold but cannot decide it. Discussion freezes when the hold is
+decided.
 
 `guard run --wait-approval` waits without a client-side timeout and resumes on
 the same requester connection after approval. `--wait-approval <seconds>` adds

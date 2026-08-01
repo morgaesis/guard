@@ -2,13 +2,18 @@
 
 ## Architecture
 
-Each invocation creates a unique run identifier, two labeled containers, and two labeled networks.
+Each invocation creates a unique run identifier, three labeled containers, and two labeled networks.
 
 ```
-                         model API egress
-                                ^
-                                |
-┌───────────────────────────────┴───────────────┐
+                       model API egress
+                              ^
+                              |
+                   ┌──────────┴──────────┐
+                   │ allowlisted CONNECT │
+                   │ proxy sidecar       │
+                   └──────────┬──────────┘
+                              │ internal CTF network
+┌─────────────────────────────┴─────────────────┐
 │ guard-local                                   │
 │                                                │
 │ agent UID: host UID                            │
@@ -23,7 +28,13 @@ Each invocation creates a unique run identifier, two labeled containers, and two
 └────────────────────────────────────────────────┘
 ```
 
-The remote container belongs only to the internal CTF network. The local container belongs to that network and to a separate egress network so the evaluator and Claude CLI can reach their model APIs. No host ports are published. Egress is model-API only in intent: a container can still reach wildcard-bound host services through the host's external address, so the dedicated test credential is the damage bound for anything reachable, and loopback-bound host services stay unreachable.
+The remote and local containers belong only to the internal CTF network and
+have no default route. The unprivileged proxy sidecar is the only member of both
+the internal and egress networks. It accepts TLS tunnels only for exact model
+API hosts, rejects non-public DNS answers, and requires matching TLS SNI. The
+default allowlist is `api.anthropic.com,openrouter.ai` and
+`GUARD_CTF_EGRESS_HOSTS` supplies a comma-separated replacement when a test uses
+another model endpoint. No host ports are published.
 
 Both containers run through rootless Podman with a read-only root filesystem, all Linux capabilities dropped before adding only `CHOWN`, `SETGID`, and `SETUID` for startup. Both start as container root so their daemons initialize before unprivileged use. The remote also receives `NET_BIND_SERVICE` for SSH and nginx and `SYS_CHROOT` for sshd pre-auth privilege separation. The runner asserts these allowlists and rejects `SYS_ADMIN`, `SYS_PTRACE`, `SYS_MODULE`, `SYS_RAWIO`, and `NET_ADMIN`. Process, CPU, and memory limits apply to both containers. Writable state is limited to explicit tmpfs mounts and two per-run labeled volumes that hold the agent and daemon homes (volumes, unlike tmpfs mount roots, honor both the keep-id user and subuid ownership). Guard receives the private SSH key only through a Podman secret; the remote authorized key and Claude credentials use read-only single-file mounts. No host directory is mounted.
 
@@ -63,7 +74,10 @@ The Claude CLI executes inside the hostile local container. `CLAUDE_CREDS` is re
 
 ## Resource lifecycle
 
-The run manifest records the exact containers, networks, images, volumes, and Podman secrets for one invocation. `teardown.sh` accepts that manifest only, validates every name against its run identifier, removes only matching labeled resources, and fails if any exact recorded resource remains.
+The run manifest records the exact containers, networks, images, volumes, and
+Podman secrets for one invocation. `teardown.sh` accepts that manifest only,
+validates every name against its run identifier, removes only matching labeled
+resources, and fails if any exact recorded resource remains.
 
 ## Remaining limits
 

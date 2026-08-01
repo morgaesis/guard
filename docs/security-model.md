@@ -147,11 +147,15 @@ an unverified environment. These operations require an explicit decision.
 
 ## Process lifetime
 
-On Unix, brokered children lead dedicated process groups. Streaming disconnect,
-request cancellation, daemon shutdown, or SIGTERM terminates the group. A child
-that deliberately detaches through an external service manager or new session
-can outlive the request. Windows service stop and cancellation terminate tracked
-direct children.
+On Unix, brokered children lead dedicated process groups. A streaming client
+disconnect, request cancellation, daemon shutdown, or SIGTERM terminates the
+group. A buffered non-streaming request is daemon-owned after admission and runs
+to completion if its client disconnects; its bounded result remains available
+through the durable hold or provisional record when one exists. Choose streaming
+execution when disconnect means cancel, and buffered execution when completion
+must not depend on the client connection. A child that deliberately detaches
+through an external service manager or new session can outlive the request.
+Windows service stop and cancellation terminate tracked direct children.
 
 Process ownership limits accidental or ordinary orphaning. It is not a kernel
 sandbox against a child that has authority to create an independent service.
