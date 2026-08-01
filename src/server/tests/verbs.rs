@@ -88,6 +88,7 @@ async fn cwd_bound_coverage_resolves_after_canonicalization_and_rejects_changed_
     cfg.config.gate = GateMode::Consequence;
     let root = tempfile::tempdir().unwrap();
     let root = root.path().canonicalize().unwrap();
+    let root_yaml = serde_yaml_ng::to_string(&root).unwrap();
     let other = tempfile::tempdir().unwrap();
     cfg.state.verbs = Arc::new(RwLock::new(
         VerbCatalog::from_yaml(&format!(
@@ -100,9 +101,9 @@ verbs:
     coverage:
       - name: project-root
         action: preauthorized
-        cwd: "{}"
+        cwd: {}
 "#,
-            root.display()
+            root_yaml.trim_end()
         ))
         .unwrap(),
     ));
