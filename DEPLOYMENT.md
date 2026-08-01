@@ -67,7 +67,7 @@ install -o root -g root -m 0755 deployment/systemd/guard-operator /usr/local/sbi
 install -m 0644 deployment/systemd/guard.service /etc/systemd/system/
 install -m 0600 deployment/systemd/guard.env.example /etc/default/guard
 # Provision the admin token (root-held, root:root 0400) before the first start.
-install -m 0600 -o root -g root /dev/null /etc/guard/admin.token
+install -m 0400 -o root -g root /dev/null /etc/guard/admin.token
 openssl rand -hex 32 > /etc/guard/admin.token
 # Edit /etc/default/guard before the first start.
 systemctl daemon-reload
@@ -136,7 +136,7 @@ environment, argv, or any file its children can read.
 Provision the token file once, as `root:root` mode `0400`:
 
 ```bash
-install -m 0600 -o root -g root /dev/null /etc/guard/admin.token
+install -m 0400 -o root -g root /dev/null /etc/guard/admin.token
 openssl rand -hex 32 > /etc/guard/admin.token
 ```
 
