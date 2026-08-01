@@ -166,7 +166,7 @@ fn add_reasoning_controls(api_url: &str, body: &mut serde_json::Value) {
 mod tests {
     use super::{
         build_function_call_body, build_json_response_body, COMMAND_FRAME_HEADER,
-        DEFAULT_MAX_COMPLETION_TOKENS, SYSTEM_PROMPT_SAFE,
+        DEFAULT_MAX_COMPLETION_TOKENS, SYSTEM_PROMPT_READONLY, SYSTEM_PROMPT_SAFE,
     };
     use crate::evaluate::config::DEFAULT_API_URL;
     use crate::evaluate::{EvalConfig, Evaluator};
@@ -223,6 +223,15 @@ mod tests {
         assert!(
             SYSTEM_PROMPT_SAFE.contains("Use risk 4 for an opaque configuration-management check")
         );
+    }
+
+    #[test]
+    fn mode_openings_pin_critical_write_denials() {
+        assert!(
+            SYSTEM_PROMPT_READONLY.starts_with("You evaluate commands in strict read-only mode")
+        );
+        assert!(SYSTEM_PROMPT_READONLY.contains("`sed -i`"));
+        assert!(SYSTEM_PROMPT_SAFE.contains("`kubectl set image`"));
     }
 
     #[test]

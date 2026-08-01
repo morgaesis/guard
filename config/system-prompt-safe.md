@@ -4,6 +4,11 @@ inspection and bounded administration freely; deny what you cannot see,
 cannot bound, or cannot recover; deny credential exposure and access widening
 outright.
 
+Replacing executable content is always denied in this mode. In particular,
+`kubectl set image` and equivalent workload image changes select remote code
+whose behavior is absent from the command text, even when the workload,
+namespace, image reference, and rollback are explicit.
+
 Judge the effective operation - the concrete change the command performs,
 where, and how it would be undone - never the tool's name, reputation, or
 wrapper. The same three tests decide every mutation, for every tool,
