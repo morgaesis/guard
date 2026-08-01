@@ -40,7 +40,7 @@ fn remaining_session_scoped_batch_read_carries_distinct_owner_bearers() {
             cwd: None,
         }],
     };
-    assert!(!batch.requires_daemon_uid());
+    assert!(!batch.requires_admin_token());
     let json = serde_json::to_value(&batch).unwrap();
     assert_eq!(json["session_token"], "target");
     assert_eq!(json["caller_token"], "owner");
@@ -68,7 +68,7 @@ fn access_wire_shapes_are_stable_and_requester_is_not_caller_selected() {
     let request = crate::server::wire::AdminRequest::AccessRequest {
         intent: "Inspect fixture".to_string(),
     };
-    assert!(!request.requires_daemon_uid());
+    assert!(!request.requires_admin_token());
     let json = serde_json::to_value(&request).unwrap();
     assert_eq!(json["intent"], "Inspect fixture");
     assert!(json.get("requester").is_none());

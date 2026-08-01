@@ -1057,7 +1057,7 @@ async fn deterministic_safe_allow_uses_no_evaluator_admission() {
     assert_eq!(counters.evaluator_attempted, 0);
     let status = handle_admin_request(
         &cfg,
-        &CallerIdentity::Unix {
+        &CallerIdentity::UnixAdmin {
             uid: cfg.config.daemon_uid,
         },
         AdminRequest::Status,
@@ -1181,7 +1181,7 @@ async fn audit_verify_and_tail_admin_rpcs() {
     let result = execute_command(basic_request("id", vec![]), &cfg, &caller).await;
     assert!(result.policy_allowed());
 
-    let admin = CallerIdentity::Unix {
+    let admin = CallerIdentity::UnixAdmin {
         uid: cfg.config.daemon_uid,
     };
     match handle_admin_request(&cfg, &admin, AdminRequest::AuditVerify).await {
@@ -1346,7 +1346,7 @@ async fn secret_list_is_per_user_namespaced() {
 
     let user_a = CallerIdentity::Unix { uid: 20_000 };
     let user_b = CallerIdentity::Unix { uid: 20_001 };
-    let daemon = CallerIdentity::Unix { uid: 777 };
+    let daemon = CallerIdentity::UnixAdmin { uid: 777 };
 
     // Both users store the SAME key name with different values.
     let set_a = handle_admin_request(

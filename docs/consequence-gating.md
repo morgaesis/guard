@@ -19,12 +19,12 @@ Classification can raise the gate but cannot lower it. Missing or conflicting
 classification holds. Trusted verbs skip evaluator approval, not consequence
 routing.
 
-The operator is the daemon principal: the daemon uid over a Unix socket, or the
-daemon SID over a Windows named pipe. Kernel-authenticated local Windows SYSTEM
-is also an operator so the packaged installer can broker elevated decisions.
-Unix root receives no matching exception, and TCP administration requires the
-separate admin bearer. TCP lacks kernel-authenticated local peer identity and
-cannot host consequence gating.
+The operator is the admin bearer holder: the root-held admin token over a
+Unix socket, or the daemon SID over a Windows named pipe. Kernel-authenticated
+local Windows SYSTEM is also an operator so the packaged installer can broker
+elevated decisions. Unix root receives no matching exception, and TCP
+administration requires the separate admin bearer. TCP lacks
+kernel-authenticated local peer identity and cannot host consequence gating.
 
 ## Recoverable commands
 

@@ -634,6 +634,7 @@ run_phase() {
     --env HOME="/tmp/synthetic-home-$uid" \
     --env XDG_CONFIG_HOME="/tmp/synthetic-config-$uid" \
     --env XDG_DATA_HOME="/tmp/synthetic-data-$uid" \
+    --env GUARD_ADMIN_TOKEN_FILE=/scenario/run/admin.token \
     "$container" timeout 120 /synthetic-user.sh phase "$scenario" "$phase"
   then
     exec_status=0

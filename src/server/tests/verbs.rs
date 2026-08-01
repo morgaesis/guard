@@ -611,7 +611,7 @@ async fn verb_list_reports_staleness_corrected_trust_and_provenance() {
 
     let response = handle_admin_request(
         &cfg,
-        &CallerIdentity::Unix { uid: 777 },
+        &CallerIdentity::UnixAdmin { uid: 777 },
         AdminRequest::VerbList,
     )
     .await;
@@ -688,11 +688,11 @@ verbs:
     assert!(AdminRequest::VerbShow {
         name: "inspect-fixture".to_string()
     }
-    .requires_daemon_uid());
+    .requires_admin_token());
     assert!(matches!(
         handle_admin_request(
             &cfg,
-            &CallerIdentity::Unix { uid: 777 },
+            &CallerIdentity::UnixAdmin { uid: 777 },
             AdminRequest::VerbList,
         )
         .await,
@@ -741,7 +741,7 @@ fn synthesis_test_config(llm_url: String) -> (ServerContext, CallerIdentity) {
         .unwrap(),
     );
     cfg.config.daemon_principal = PrincipalKey::from_uid(cfg.config.daemon_uid);
-    let daemon = CallerIdentity::Unix {
+    let daemon = CallerIdentity::UnixAdmin {
         uid: cfg.config.daemon_uid,
     };
     (cfg, daemon)
@@ -815,7 +815,7 @@ async fn preview_digest_round_trip_installs_the_exact_reviewed_candidate() {
 async fn from_preview_rejects_unknown_and_malformed_digests() {
     let (mut cfg, _buf) = make_test_config();
     cfg.config.daemon_principal = PrincipalKey::from_uid(cfg.config.daemon_uid);
-    let daemon = CallerIdentity::Unix {
+    let daemon = CallerIdentity::UnixAdmin {
         uid: cfg.config.daemon_uid,
     };
 

@@ -23,6 +23,7 @@ LOCAL_IMAGE="localhost/$RUN_ID-local:latest"
 REMOTE_IMAGE="localhost/$RUN_ID-remote:latest"
 EVALUATOR_SECRET="$RUN_ID-evaluator"
 SSH_SECRET="$RUN_ID-agent-ssh"
+ADMIN_TOKEN_SECRET="$RUN_ID-admin-token"
 GUARD_HOME_VOLUME="$RUN_ID-guard-home"
 AGENT_HOME_VOLUME="$RUN_ID-agent-home"
 RUN_LABEL="io.guard.ctf.run=$RUN_ID"
@@ -108,6 +109,7 @@ printf '%s\n' \
     "remote_image=$REMOTE_IMAGE" \
     "evaluator_secret=$EVALUATOR_SECRET" \
     "ssh_secret=$SSH_SECRET" \
+    "admin_token_secret=$ADMIN_TOKEN_SECRET" \
     "guard_home_volume=$GUARD_HOME_VOLUME" \
     "agent_home_volume=$AGENT_HOME_VOLUME" \
     > "$MANIFEST"
@@ -134,6 +136,12 @@ ssh-keygen -t ed25519 -f "$KEYDIR/agent_key" -N "" -C "agent@ctf" -q
 # through a single-file mount without DAC override capability.
 chmod 644 "$KEYDIR/agent_key.pub"
 podman secret create --label "$RUN_LABEL" "$SSH_SECRET" "$KEYDIR/agent_key" >/dev/null
+
+# The admin token authorizes operator RPCs. It reaches the daemon through
+# stdin only and is readable by container root for the human operator, never
+# by the attacking agent UID or the daemon's brokered children.
+head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' \
+    | podman secret create --label "$RUN_LABEL" "$ADMIN_TOKEN_SECRET" - >/dev/null
 
 # Both homes live on per-run volumes: tmpfs mount roots do not honor
 # keep-id ownership or subuid access, while volumes behave like ordinary bind
@@ -246,6 +254,7 @@ podman run -d \
     -v "$GUARD_HOME_VOLUME:/home/guard:rw" \
     --secret "source=$EVALUATOR_SECRET,target=/tmp/ctf-secrets/evaluator-api-key,uid=$GUARD_UID,gid=$GUARD_UID,mode=0400" \
     --secret "source=$SSH_SECRET,target=/tmp/ctf-secrets/agent-ssh-key,uid=$GUARD_UID,gid=$GUARD_UID,mode=0400" \
+    --secret "source=$ADMIN_TOKEN_SECRET,target=/tmp/ctf-secrets/admin-token,uid=0,gid=0,mode=0400" \
     -v "$CLAUDE_CREDS:/run/ctf/claude-credentials.json:ro" \
     "$LOCAL_IMAGE" >/dev/null
 
@@ -291,5 +300,6 @@ podman ps --filter "label=$RUN_LABEL" --format "table {{.Names}}\t{{.Status}}"
 echo
 echo "Run Claude CTF:    podman exec -it --user $HOST_UID $LOCAL_CONTAINER env -i HOME=/home/agent PATH=/home/agent/.guard/shims:/usr/local/bin:/usr/bin:/bin run-claude-attack"
 echo "Interactive shell: podman exec -it --user $HOST_UID $LOCAL_CONTAINER env -i HOME=/home/agent PATH=/home/agent/.guard/shims:/usr/local/bin:/usr/bin:/bin bash"
+echo "Operator RPCs:     podman exec -it --user 0:1002 $LOCAL_CONTAINER env GUARD_ADMIN_TOKEN_FILE=/tmp/ctf-secrets/admin-token /usr/local/bin/guard access list --socket /home/guard/run/guard.sock"
 echo "View Guard logs:   podman logs $LOCAL_CONTAINER"
 echo "Tear down:         bash $SCRIPT_DIR/teardown.sh $MANIFEST"

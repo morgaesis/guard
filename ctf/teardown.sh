@@ -15,7 +15,7 @@ fi
 declare -A resource
 while IFS='=' read -r key value || [ -n "$key" ]; do
     case "$key" in
-        run_id|local_container|remote_container|internal_network|egress_network|local_image|remote_image|evaluator_secret|ssh_secret|guard_home_volume|agent_home_volume)
+        run_id|local_container|remote_container|internal_network|egress_network|local_image|remote_image|evaluator_secret|ssh_secret|admin_token_secret|guard_home_volume|agent_home_volume)
             resource["$key"]=$value
             ;;
         *)
@@ -25,7 +25,7 @@ while IFS='=' read -r key value || [ -n "$key" ]; do
     esac
 done < "$MANIFEST"
 
-for key in run_id local_container remote_container internal_network egress_network local_image remote_image evaluator_secret ssh_secret guard_home_volume agent_home_volume; do
+for key in run_id local_container remote_container internal_network egress_network local_image remote_image evaluator_secret ssh_secret admin_token_secret guard_home_volume agent_home_volume; do
     if [ -z "${resource[$key]:-}" ]; then
         echo "Run manifest is missing $key." >&2
         exit 2
@@ -42,6 +42,7 @@ if [[ ! "$RUN_ID" =~ ^guard-ctf-[0-9]+-[0-9]+-[0-9]+$ ]] || \
    [ "${resource[remote_image]}" != "localhost/$RUN_ID-remote:latest" ] || \
    [ "${resource[evaluator_secret]}" != "$RUN_ID-evaluator" ] || \
    [ "${resource[ssh_secret]}" != "$RUN_ID-agent-ssh" ] || \
+   [ "${resource[admin_token_secret]}" != "$RUN_ID-admin-token" ] || \
    [ "${resource[guard_home_volume]}" != "$RUN_ID-guard-home" ] || \
    [ "${resource[agent_home_volume]}" != "$RUN_ID-agent-home" ]; then
     echo "Run manifest resource names do not match its run identifier." >&2
@@ -66,7 +67,7 @@ for network in "${resource[internal_network]}" "${resource[egress_network]}"; do
     fi
 done
 
-for secret in "${resource[evaluator_secret]}" "${resource[ssh_secret]}"; do
+for secret in "${resource[evaluator_secret]}" "${resource[ssh_secret]}" "${resource[admin_token_secret]}"; do
     if [ "$(podman secret inspect --format '{{ index .Spec.Labels "io.guard.ctf.run" }}' "$secret" 2>/dev/null || true)" = "$RUN_ID" ]; then
         podman secret rm "$secret" >/dev/null
     fi
@@ -103,7 +104,7 @@ done
 for network in "${resource[internal_network]}" "${resource[egress_network]}"; do
     podman network exists "$network" 2>/dev/null && leftovers+=("network:$network")
 done
-for secret in "${resource[evaluator_secret]}" "${resource[ssh_secret]}"; do
+for secret in "${resource[evaluator_secret]}" "${resource[ssh_secret]}" "${resource[admin_token_secret]}"; do
     podman secret inspect "$secret" >/dev/null 2>&1 && leftovers+=("secret:$secret")
 done
 for volume in "${resource[guard_home_volume]}" "${resource[agent_home_volume]}"; do

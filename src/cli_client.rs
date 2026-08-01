@@ -430,6 +430,33 @@ fn exit_for_execute_response(response: &server::ExecuteResponse) -> ! {
 }
 
 /// Resolve the admin endpoint and build a client for a gate-control RPC.
+/// Operator-side admin token resolution: stored config first, then the
+/// environment, then a token file. GUARD_ADMIN_TOKEN must stay unset for
+/// agent principals; it belongs only to the operator wrapper's context.
+fn resolve_admin_token(config: &client_config::ClientConfig) -> Option<String> {
+    config
+        .admin_token
+        .clone()
+        .or_else(|| guard_env("ADMIN_TOKEN").filter(|token| !token.is_empty()))
+        .or_else(|| {
+            guard_env("ADMIN_TOKEN_FILE").and_then(|path| match std::fs::read_to_string(&path) {
+                Ok(contents) => {
+                    let token = contents.trim().to_string();
+                    if token.is_empty() {
+                        tracing::warn!("GUARD_ADMIN_TOKEN_FILE is empty: {}", path);
+                        None
+                    } else {
+                        Some(token)
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!("GUARD_ADMIN_TOKEN_FILE unreadable: {}: {}", path, error);
+                    None
+                }
+            })
+        })
+}
+
 fn gate_client(
     socket_override: Option<String>,
     json: bool,
@@ -438,8 +465,11 @@ fn gate_client(
     let (socket_path, tcp_port, source) =
         resolve_client_endpoint_with_source(socket_override, &config);
     let mut client = daemon_client::Client::new(socket_path, tcp_port);
-    if let Some(token) = config.auth_token {
-        client = client.with_auth(token);
+    if let Some(ref token) = config.auth_token {
+        client = client.with_auth(token.clone());
+    }
+    if let Some(token) = resolve_admin_token(&config) {
+        client = client.with_admin_token(token);
     }
     Ok((client, source))
 }
@@ -2022,7 +2052,7 @@ pub(crate) fn admin_client(
     config: &client_config::ClientConfig,
 ) -> daemon_client::Client {
     let client = daemon_client::Client::new(socket_path, tcp_port);
-    if let Some(token) = config.admin_token.clone() {
+    if let Some(token) = resolve_admin_token(config) {
         client.with_admin_token(token)
     } else {
         client

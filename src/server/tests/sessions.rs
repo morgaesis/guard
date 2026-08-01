@@ -76,7 +76,7 @@ async fn synthesized_verbs_default_to_session_scope() {
         .unwrap(),
     );
     cfg.config.daemon_principal = PrincipalKey::from_uid(cfg.config.daemon_uid);
-    let daemon = CallerIdentity::Unix {
+    let daemon = CallerIdentity::UnixAdmin {
         uid: cfg.config.daemon_uid,
     };
 
@@ -121,7 +121,7 @@ async fn approved_synthesized_access_executes_deterministically_without_catalog_
     );
     let initial_catalog_version = cfg.state.verbs.read().await.version();
     let worker = CallerIdentity::Unix { uid: 1001 };
-    let daemon = CallerIdentity::Unix { uid: 777 };
+    let daemon = CallerIdentity::UnixAdmin { uid: 777 };
     let AdminResponse::AccessItem { item } = handle_admin_request(
         &cfg,
         &worker,
@@ -240,7 +240,7 @@ async fn equivalent_synthesized_access_converges_across_principals() {
         )
         .unwrap(),
     );
-    let daemon = CallerIdentity::Unix { uid: 777 };
+    let daemon = CallerIdentity::UnixAdmin { uid: 777 };
     let first_principal = CallerIdentity::Unix { uid: 1001 };
     let second_principal = CallerIdentity::Unix { uid: 1002 };
 
@@ -325,7 +325,7 @@ async fn pending_reused_generated_access_survives_revoke_and_restart() {
     let state_db = temporary.path().join("state.db");
     let store = SessionStore::open(state_db.clone(), 3_600).await.unwrap();
     cfg.state.session_store = Some(store.clone());
-    let daemon = CallerIdentity::Unix { uid: 777 };
+    let daemon = CallerIdentity::UnixAdmin { uid: 777 };
     let worker = CallerIdentity::Unix { uid: 1001 };
 
     let AdminResponse::AccessItem { item: initial } = handle_admin_request(
@@ -491,7 +491,7 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded() {
             .await
             .unwrap(),
     );
-    let daemon = CallerIdentity::Unix { uid: 777 };
+    let daemon = CallerIdentity::UnixAdmin { uid: 777 };
     let worker = CallerIdentity::Unix { uid: 1001 };
     let other = CallerIdentity::Unix { uid: 1002 };
 
@@ -859,7 +859,7 @@ async fn access_request_can_name_multiple_catalog_verbs() {
         .unwrap(),
     ));
     let worker = CallerIdentity::Unix { uid: 1001 };
-    let daemon = CallerIdentity::Unix { uid: 777 };
+    let daemon = CallerIdentity::UnixAdmin { uid: 777 };
 
     let AdminResponse::AccessItem { item } = handle_admin_request(
         &cfg,
@@ -1042,7 +1042,7 @@ async fn agent_label_extension_preserves_session_grants_and_cumulative_intent() 
         .unwrap(),
     ));
     let worker = CallerIdentity::Unix { uid: 1001 };
-    let daemon = CallerIdentity::Unix { uid: 777 };
+    let daemon = CallerIdentity::UnixAdmin { uid: 777 };
     let AdminResponse::AccessItem { item: initial } = handle_admin_request(
         &cfg,
         &worker,
@@ -1180,7 +1180,7 @@ async fn approved_request_without_live_session_projects_as_orphaned() {
         .unwrap(),
     ));
     let worker = CallerIdentity::Unix { uid: 1001 };
-    let daemon = CallerIdentity::Unix { uid: 777 };
+    let daemon = CallerIdentity::UnixAdmin { uid: 777 };
     let AdminResponse::AccessItem { item: pending } = handle_admin_request(
         &cfg,
         &worker,
@@ -1247,7 +1247,7 @@ async fn request_pruning_preserves_live_access_provenance() {
         .unwrap(),
     ));
     let worker = CallerIdentity::Unix { uid: 1001 };
-    let daemon = CallerIdentity::Unix { uid: 777 };
+    let daemon = CallerIdentity::UnixAdmin { uid: 777 };
     let AdminResponse::AccessItem { item } = handle_admin_request(
         &cfg,
         &worker,
@@ -1390,7 +1390,7 @@ async fn sequential_approval_keeps_fresh_sibling_extensions_valid() {
         .unwrap(),
     ));
     let worker = CallerIdentity::Unix { uid: 1001 };
-    let daemon = CallerIdentity::Unix { uid: 777 };
+    let daemon = CallerIdentity::UnixAdmin { uid: 777 };
     let AdminResponse::AccessItem { item: initial } = handle_admin_request(
         &cfg,
         &worker,
@@ -1487,7 +1487,7 @@ async fn access_approval_and_revoke_retry_one_registry_generation_conflict() {
         .unwrap(),
     ));
     let worker = CallerIdentity::Unix { uid: 1001 };
-    let daemon = CallerIdentity::Unix { uid: 777 };
+    let daemon = CallerIdentity::UnixAdmin { uid: 777 };
     let AdminResponse::AccessItem { item: pending } = handle_admin_request(
         &cfg,
         &worker,
@@ -1714,7 +1714,7 @@ async fn access_extend_rejects_legacy_session_authority() {
     );
     let response = handle_admin_request(
         &cfg,
-        &CallerIdentity::Unix { uid: 777 },
+        &CallerIdentity::UnixAdmin { uid: 777 },
         AdminRequest::AccessExtend {
             target: crate::session::session_reference("legacy-session"),
             intent: "Inspect fixture".to_string(),
@@ -1746,7 +1746,7 @@ async fn revoked_access_session_cannot_be_resurrected_by_pending_extension() {
         .unwrap(),
     ));
     let worker = CallerIdentity::Unix { uid: 1001 };
-    let daemon = CallerIdentity::Unix { uid: 777 };
+    let daemon = CallerIdentity::UnixAdmin { uid: 777 };
     let AdminResponse::AccessItem { item: initial } = handle_admin_request(
         &cfg,
         &worker,
@@ -2075,7 +2075,7 @@ async fn kubeconfig_issuance_is_local_live_session_scoped_and_secret_free() {
     }
     // The operator (daemon principal) retains cross-session authority.
     assert!(matches!(
-        handle_admin_request(&cfg, &CallerIdentity::Unix { uid: 777 }, request()).await,
+        handle_admin_request(&cfg, &CallerIdentity::UnixAdmin { uid: 777 }, request()).await,
         AdminResponse::KubeconfigIssued { .. }
     ));
 
@@ -2169,7 +2169,7 @@ verbs:
         )
         .expect("valid verb catalog"),
     ));
-    let daemon = CallerIdentity::Unix { uid: 777 };
+    let daemon = CallerIdentity::UnixAdmin { uid: 777 };
 
     let valid = handle_admin_request(
         &cfg,
@@ -2551,7 +2551,7 @@ async fn session_inspection_surfaces_redact_credentials_in_text_and_json() {
     let (mut cfg, _) = make_test_config();
     cfg.config.daemon_uid = 777;
     cfg.config.daemon_principal = PrincipalKey::from_uid(777);
-    let daemon = CallerIdentity::Unix { uid: 777 };
+    let daemon = CallerIdentity::UnixAdmin { uid: 777 };
     let token = "inspection-redaction-token".to_string();
 
     // Install rows the way a pre-sanitization daemon would have persisted
@@ -2751,7 +2751,7 @@ async fn session_list_omits_foreign_sessions() {
     cfg.config.daemon_uid = 777;
     cfg.config.daemon_principal = PrincipalKey::from_uid(777);
 
-    let daemon = CallerIdentity::Unix { uid: 777 };
+    let daemon = CallerIdentity::UnixAdmin { uid: 777 };
     let user = CallerIdentity::Unix { uid: 20_002 };
     let token = format!("session-{}", std::process::id());
 
@@ -2803,7 +2803,7 @@ async fn session_list_shows_current_session_details_without_raw_token_for_user()
     cfg.config.daemon_uid = 777;
     cfg.config.daemon_principal = PrincipalKey::from_uid(777);
 
-    let daemon = CallerIdentity::Unix { uid: 777 };
+    let daemon = CallerIdentity::UnixAdmin { uid: 777 };
     let user = CallerIdentity::Unix { uid: 20_002 };
     let token = format!("session-visible-{}", std::process::id());
 
@@ -2939,7 +2939,7 @@ async fn archived_session_token_cannot_be_reissued_to_another_principal() {
     let (mut cfg, _) = make_test_config();
     cfg.config.daemon_uid = 777;
     cfg.config.daemon_principal = PrincipalKey::from_uid(777);
-    let daemon = CallerIdentity::Unix { uid: 777 };
+    let daemon = CallerIdentity::UnixAdmin { uid: 777 };
     let token = "archived-bearer".to_string();
     let grant_for = |owner: &str| AdminRequest::SessionGrant {
         token: token.clone(),
@@ -2998,7 +2998,7 @@ async fn session_show_reports_recent_stats() {
     cfg.config.daemon_uid = 777;
     cfg.config.daemon_principal = PrincipalKey::from_uid(777);
 
-    let daemon = CallerIdentity::Unix { uid: 777 };
+    let daemon = CallerIdentity::UnixAdmin { uid: 777 };
     let token = format!("session-show-{}", std::process::id());
 
     let grant = handle_admin_request(
@@ -3096,7 +3096,7 @@ async fn session_show_self_token_sees_full_grant() {
     cfg.config.daemon_uid = 777;
     cfg.config.daemon_principal = PrincipalKey::from_uid(777);
 
-    let daemon = CallerIdentity::Unix { uid: 777 };
+    let daemon = CallerIdentity::UnixAdmin { uid: 777 };
     let user = CallerIdentity::Unix { uid: 20_003 };
     let token = format!("session-self-{}", std::process::id());
 
@@ -3211,7 +3211,7 @@ async fn session_show_other_token_denied_for_non_admin() {
     cfg.config.daemon_uid = 777;
     cfg.config.daemon_principal = PrincipalKey::from_uid(777);
 
-    let daemon = CallerIdentity::Unix { uid: 777 };
+    let daemon = CallerIdentity::UnixAdmin { uid: 777 };
     let attacker = CallerIdentity::Unix { uid: 20_004 };
     let token_a = format!("session-a-{}", std::process::id());
     let token_b = format!("session-b-{}", std::process::id());
@@ -3279,7 +3279,7 @@ async fn session_new_from_profile_mints_expected_grant() {
         .expect("valid saved grant catalog"),
     ));
 
-    let daemon = CallerIdentity::Unix { uid: 777 };
+    let daemon = CallerIdentity::UnixAdmin { uid: 777 };
     let token = format!("session-profile-{}", std::process::id());
 
     // Profile-only: no explicit allow/deny/ttl/prompt on the request.
@@ -3336,7 +3336,7 @@ async fn session_new_unknown_profile_fails_clearly() {
     cfg.config.daemon_principal = PrincipalKey::from_uid(777);
     // The profile catalog is left empty.
 
-    let daemon = CallerIdentity::Unix { uid: 777 };
+    let daemon = CallerIdentity::UnixAdmin { uid: 777 };
     let token = format!("session-badprofile-{}", std::process::id());
     let resp = handle_admin_request(
         &cfg,
@@ -3388,7 +3388,7 @@ async fn profile_grant_still_deny_short_circuits_and_falls_through() {
         .expect("valid saved grant catalog"),
     ));
 
-    let daemon = CallerIdentity::Unix { uid: 777 };
+    let daemon = CallerIdentity::UnixAdmin { uid: 777 };
     let token = format!("session-profcheck-{}", std::process::id());
     let resp = handle_admin_request(
         &cfg,
@@ -3434,7 +3434,7 @@ async fn grant_requests_use_the_issued_ceiling_and_redact_session_tokens() {
         )
         .expect("saved grants"),
     ));
-    let daemon = CallerIdentity::Unix { uid: 777 };
+    let daemon = CallerIdentity::UnixAdmin { uid: 777 };
     let worker = CallerIdentity::Unix { uid: 778 };
     let token = "bounded-session".to_string();
     assert!(matches!(
@@ -3667,7 +3667,7 @@ async fn auto_and_operator_approval_fail_without_partial_session_authority() {
             .await
             .unwrap(),
     );
-    let daemon = CallerIdentity::Unix { uid: 777 };
+    let daemon = CallerIdentity::UnixAdmin { uid: 777 };
     let worker = CallerIdentity::Unix { uid: 778 };
     for (token, saved_grant) in [
         ("automatic-approval", "automatic"),
@@ -3795,7 +3795,7 @@ async fn terminal_grant_request_races_have_one_durable_authority_outcome() {
                 .unwrap(),
         );
         let token = format!("terminal-race-{}", competing_status.as_str());
-        let daemon = CallerIdentity::Unix { uid: 777 };
+        let daemon = CallerIdentity::UnixAdmin { uid: 777 };
         let worker = CallerIdentity::Unix { uid: 778 };
         assert!(matches!(
             handle_admin_request(
@@ -3854,7 +3854,7 @@ async fn terminal_grant_request_races_have_one_durable_authority_outcome() {
             approve_barrier.wait().await;
             handle_admin_request(
                 &approve_cfg,
-                &CallerIdentity::Unix { uid: 777 },
+                &CallerIdentity::UnixAdmin { uid: 777 },
                 AdminRequest::GrantRequestApprove {
                     handle: approve_handle,
                 },
@@ -3882,7 +3882,12 @@ async fn terminal_grant_request_races_have_one_durable_authority_outcome() {
                 }
                 _ => unreachable!(),
             };
-            handle_admin_request(&competing_cfg, &CallerIdentity::Unix { uid: 777 }, request).await
+            handle_admin_request(
+                &competing_cfg,
+                &CallerIdentity::UnixAdmin { uid: 777 },
+                request,
+            )
+            .await
         });
         barrier.wait().await;
         let responses = [approve.await.unwrap(), competing.await.unwrap()];
@@ -3944,7 +3949,7 @@ async fn saved_grant_edit_uses_explicit_clear_and_tristate_operations() {
     let (mut cfg, _) = make_test_config();
     cfg.config.daemon_uid = 777;
     cfg.config.daemon_principal = PrincipalKey::from_uid(777);
-    let daemon = CallerIdentity::Unix { uid: 777 };
+    let daemon = CallerIdentity::UnixAdmin { uid: 777 };
     let source = SavedGrantCatalog::from_yaml(
         "grants:\n  - name: editable\n    description: original\n    activated_verbs: [inspect]\n    override_markers: [operator:inspect]\n    secret_names: [service/*]\n    ttl_secs: 300\n    prompt_append: original prompt\n    auto_approve_requests: true\n",
     )
@@ -4059,7 +4064,7 @@ async fn saved_grant_regeneration_previews_exact_apply_and_enforces_both_cas_key
         .unwrap(),
     ));
     cfg.config.daemon_principal = PrincipalKey::from_uid(cfg.config.daemon_uid);
-    let daemon = CallerIdentity::Unix {
+    let daemon = CallerIdentity::UnixAdmin {
         uid: cfg.config.daemon_uid,
     };
     let preview = || AdminRequest::SavedGrantRegenerate {
@@ -4167,7 +4172,7 @@ async fn grant_request_show_and_withdraw_require_the_issuing_session() {
     let (mut cfg, _) = make_test_config();
     cfg.config.daemon_uid = 777;
     cfg.config.daemon_principal = PrincipalKey::from_uid(777);
-    let daemon = CallerIdentity::Unix { uid: 777 };
+    let daemon = CallerIdentity::UnixAdmin { uid: 777 };
     let worker = CallerIdentity::Unix { uid: 778 };
     cfg.state.sessions.write().await.grant(
         "owner-session".to_string(),
@@ -4364,7 +4369,7 @@ async fn evaluate_batch_requires_owned_live_unsuspended_session_or_admin() {
     cfg.config.daemon_uid = 777;
     cfg.config.daemon_principal = PrincipalKey::from_uid(777);
     cfg.config.behavior_limits.max_denials = Some(1);
-    let daemon = CallerIdentity::Unix { uid: 777 };
+    let daemon = CallerIdentity::UnixAdmin { uid: 777 };
     let worker = CallerIdentity::Unix { uid: 778 };
     // batch-owner belongs to the worker; batch-victim belongs to another
     // principal, so the worker may batch-evaluate the former but not the latter.
@@ -4594,7 +4599,7 @@ async fn grant_request_approval_rejects_expiry_and_stale_saved_revision() {
         )
         .unwrap(),
     ));
-    let daemon = CallerIdentity::Unix { uid: 777 };
+    let daemon = CallerIdentity::UnixAdmin { uid: 777 };
     let worker = CallerIdentity::Unix { uid: 778 };
     let token = "revision-session".to_string();
     assert!(matches!(
@@ -4700,7 +4705,7 @@ async fn grant_request_binds_unsaved_session_revision_and_prunes_expired_rows() 
             .await
             .unwrap(),
     );
-    let daemon = CallerIdentity::Unix { uid: 777 };
+    let daemon = CallerIdentity::UnixAdmin { uid: 777 };
     let worker = CallerIdentity::Unix { uid: 778 };
     let token = "unsaved-revision".to_string();
     cfg.state.sessions.write().await.grant(
@@ -4945,7 +4950,7 @@ async fn principal_binding_execute_owner_ok_other_denied_admin_ok() {
     let admin = execute_command(
         request_with_session("true", Vec::new(), token.clone()),
         &cfg,
-        &CallerIdentity::Unix { uid: 777 },
+        &CallerIdentity::UnixAdmin { uid: 777 },
     )
     .await;
     assert!(admin.policy_allowed(), "operator retains cross-session use");
@@ -4977,7 +4982,7 @@ async fn principal_binding_unowned_session_refused_for_execute() {
     // closed and must be reissued.
     for caller in [
         CallerIdentity::Unix { uid: 1001 },
-        CallerIdentity::Unix { uid: 777 },
+        CallerIdentity::UnixAdmin { uid: 777 },
     ] {
         let result = execute_command(
             request_with_session("true", Vec::new(), token.clone()),
@@ -5011,7 +5016,7 @@ async fn principal_binding_revoked_session_denies_regardless_of_principal() {
 
     for caller in [
         CallerIdentity::Unix { uid: 1001 },
-        CallerIdentity::Unix { uid: 777 },
+        CallerIdentity::UnixAdmin { uid: 777 },
     ] {
         let result = execute_command(
             request_with_session("true", Vec::new(), token.clone()),
@@ -5130,7 +5135,7 @@ async fn principal_binding_appeal_refuses_unowned_session() {
 
     let appeal = handle_admin_request(
         &cfg,
-        &CallerIdentity::Unix { uid: 777 },
+        &CallerIdentity::UnixAdmin { uid: 777 },
         AdminRequest::SessionAppeal {
             token: token.clone(),
             binary: "true".to_string(),

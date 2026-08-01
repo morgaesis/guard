@@ -1619,7 +1619,62 @@ where
         };
 
         let request = match incoming {
-            IncomingMessage::Admin { admin, .. } => {
+            IncomingMessage::Admin { admin, admin_token } => {
+                // Admin authority is the admin bearer token, never the peer
+                // uid: brokered children inherit the daemon uid and must not
+                // inherit its operator surface. Ping stays open for health
+                // probes, matching the TCP listener.
+                let caller = if matches!(admin.as_ref(), AdminRequest::Ping) {
+                    caller.clone()
+                } else {
+                    let token_result = server.validate_admin_token(admin_token.as_deref());
+                    if admin.requires_admin_token() {
+                        // Operator-only operations: the bearer is mandatory.
+                        if let Err(e) = token_result {
+                            let resp = AdminResponse::Error {
+                                message: format!("admin RPC refused: {}", e),
+                            };
+                            writer
+                                .write_all(serde_json::to_string(&resp)?.as_bytes())
+                                .await?;
+                            writer.write_all(b"\n").await?;
+                            continue;
+                        }
+                        match caller {
+                            CallerIdentity::Unix { uid } => CallerIdentity::UnixAdmin { uid },
+                            _ => CallerIdentity::TcpAdmin {
+                                token: admin_token
+                                    .clone()
+                                    .unwrap_or_else(|| "<missing>".to_string()),
+                            },
+                        }
+                    } else if admin_token.is_some() {
+                        // Self-scoped operations accept an optional bearer: a
+                        // valid token elevates the caller to the operator view,
+                        // an invalid one is refused outright, and its absence
+                        // leaves the operation self-scoped.
+                        if let Err(e) = token_result {
+                            let resp = AdminResponse::Error {
+                                message: format!("admin RPC refused: {}", e),
+                            };
+                            writer
+                                .write_all(serde_json::to_string(&resp)?.as_bytes())
+                                .await?;
+                            writer.write_all(b"\n").await?;
+                            continue;
+                        }
+                        match caller {
+                            CallerIdentity::Unix { uid } => CallerIdentity::UnixAdmin { uid },
+                            _ => CallerIdentity::TcpAdmin {
+                                token: admin_token
+                                    .clone()
+                                    .unwrap_or_else(|| "<missing>".to_string()),
+                            },
+                        }
+                    } else {
+                        caller.clone()
+                    }
+                };
                 let resp = handle_admin_request(server, &caller, *admin).await;
                 writer
                     .write_all(serde_json::to_string(&resp)?.as_bytes())
@@ -2375,6 +2430,125 @@ mod line_limit_tests {
             next_bounded(&mut reader).await,
             BoundedLine::TooLong
         ));
+    }
+
+    /// Regression: the daemon's own uid must NOT grant operator authority.
+    /// Admin-gated operations require the admin bearer token at the unix
+    /// transport, so a brokered child running as the daemon uid cannot
+    /// approve or inspect operator state.
+    async fn one_admin_roundtrip(
+        caller: CallerIdentity,
+        admin_token_config: Option<&str>,
+        line: &str,
+    ) -> String {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let mut cfg = crate::server::tests::config_for_proposal_test();
+        if let Some(token) = admin_token_config {
+            cfg.config.admin_token = Some(token.to_string());
+        }
+        let task = tokio::spawn(async move { serve_connection(server, caller, &cfg).await });
+        let (read_half, mut write_half) = tokio::io::split(client);
+        write_half
+            .write_all(line.as_bytes())
+            .await
+            .expect("write admin request");
+        write_half.write_all(b"\n").await.expect("write newline");
+        let mut lines = BufReader::new(read_half).lines();
+        let response = tokio::time::timeout(TEST_TIMEOUT, lines.next_line())
+            .await
+            .expect("admin response timed out")
+            .expect("read admin response")
+            .expect("admin response line");
+        drop(lines);
+        drop(write_half);
+        let _ = task.await;
+        response
+    }
+
+    #[tokio::test]
+    async fn unix_admin_gated_op_refused_without_token_even_as_daemon_uid() {
+        let response = one_admin_roundtrip(
+            CallerIdentity::Unix { uid: 1000 },
+            Some("operator-token"),
+            r#"{"admin":{"op":"audit_verify"}}"#,
+        )
+        .await;
+        assert!(
+            response.contains("admin RPC refused"),
+            "gated op must be refused without the token: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unix_admin_gated_op_refused_with_wrong_token() {
+        let response = one_admin_roundtrip(
+            CallerIdentity::Unix { uid: 1000 },
+            Some("operator-token"),
+            r#"{"admin":{"op":"audit_verify"},"admin_token":"wrong"}"#,
+        )
+        .await;
+        assert!(
+            response.contains("admin RPC refused"),
+            "gated op must be refused with a wrong token: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unix_admin_gated_op_refused_when_token_unconfigured() {
+        let response = one_admin_roundtrip(
+            CallerIdentity::Unix { uid: 1000 },
+            None,
+            r#"{"admin":{"op":"audit_verify"},"admin_token":"anything"}"#,
+        )
+        .await;
+        assert!(
+            response.contains("admin RPC refused"),
+            "gated op must be refused when no admin token is configured: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unix_admin_self_scoped_ops_do_not_require_token() {
+        let response = one_admin_roundtrip(
+            CallerIdentity::Unix { uid: 4242 },
+            None,
+            r#"{"admin":{"op":"access_list"}}"#,
+        )
+        .await;
+        assert!(
+            !response.contains("admin RPC refused"),
+            "self-scoped op must not require the token: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unix_admin_exempt_op_with_valid_token_gets_operator_identity() {
+        // An exempt op with a valid bearer must not be refused; without it,
+        // the operator's see-all view is silently lost.
+        let response = one_admin_roundtrip(
+            CallerIdentity::Unix { uid: 1000 },
+            Some("operator-token"),
+            r#"{"admin":{"op":"access_list"},"admin_token":"operator-token"}"#,
+        )
+        .await;
+        assert!(
+            !response.contains("admin RPC refused"),
+            "exempt op with a valid token must be served: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unix_admin_exempt_op_with_wrong_token_is_refused() {
+        let response = one_admin_roundtrip(
+            CallerIdentity::Unix { uid: 1000 },
+            Some("operator-token"),
+            r#"{"admin":{"op":"access_list"},"admin_token":"wrong"}"#,
+        )
+        .await;
+        assert!(
+            response.contains("admin RPC refused"),
+            "an invalid bearer must be refused even on exempt ops: {response}"
+        );
     }
 
     /// A peer that streams more than the cap without a newline gets a denial

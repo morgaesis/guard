@@ -31,6 +31,14 @@ pub(super) enum CallerIdentity {
     Unix {
         uid: u32,
     },
+    /// Local operator over a Unix domain socket whose admin bearer token was
+    /// validated at the transport boundary. Carries the peer uid so operator
+    /// actions attribute to the operator's uid rather than a token
+    /// fingerprint, and never to the daemon's own uid.
+    #[cfg_attr(windows, allow(dead_code))]
+    UnixAdmin {
+        uid: u32,
+    },
     /// Local caller over a Windows named pipe, identified by the kernel-verified
     /// SID of the connecting process (the Windows analog of a peer UID).
     #[cfg(windows)]
@@ -65,6 +73,7 @@ impl CallerIdentity {
     pub fn user_key(&self) -> Option<String> {
         match self {
             Self::Unix { uid } => Some(uid.to_string()),
+            Self::UnixAdmin { uid } => Some(uid.to_string()),
             #[cfg(windows)]
             Self::Windows { sid } => Some(sid.clone()),
             Self::Tcp { token } => Some(token.clone()),
@@ -89,6 +98,7 @@ impl CallerIdentity {
     pub fn is_local_peer(&self) -> bool {
         match self {
             Self::Unix { .. } => true,
+            Self::UnixAdmin { .. } => true,
             #[cfg(windows)]
             Self::Windows { .. } => true,
             _ => false,
@@ -100,6 +110,7 @@ impl std::fmt::Display for CallerIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unix { uid } => write!(f, "uid={}", uid),
+            Self::UnixAdmin { uid } => write!(f, "admin_uid={}", uid),
             #[cfg(windows)]
             Self::Windows { sid } => write!(f, "sid={}", sid),
             Self::Tcp { token } => {
@@ -346,7 +357,7 @@ pub enum AdminRequest {
     },
     SecretList,
     SecretListDetailed,
-    /// Privileged status snapshot. Caller must be the daemon UID.
+    /// Privileged status snapshot. Caller must hold the admin bearer token.
     Status,
     /// No-auth liveness probe. Returns version, uptime, and a small
     /// set of non-elevating posture fields so any allowed client can
@@ -577,11 +588,11 @@ pub enum AdminRequest {
 }
 
 impl AdminRequest {
-    /// Admin RPCs that require the caller to be the daemon UID.
-    /// Ping is a public liveness probe. Secret RPCs and session
-    /// scoped reads are open to connected users and enforce ownership in the
-    /// handler.
-    pub(super) fn requires_daemon_uid(&self) -> bool {
+    /// Admin RPCs that require the admin bearer token. Ping is a public
+    /// liveness probe. Secret RPCs and session-scoped reads are open to
+    /// connected users and enforce ownership in the handler; on those, a
+    /// valid bearer only elevates the caller to the operator view.
+    pub(super) fn requires_admin_token(&self) -> bool {
         #[cfg(test)]
         if matches!(
             self,
@@ -596,11 +607,11 @@ impl AdminRequest {
         ) {
             return false;
         }
-        // Gate-control writes (confirm/revert/approve/deny) are daemon-UID-only:
-        // a corrupted agent must never be able to confirm or approve its own
-        // action. Reads (provisionals/approval list/show) self-scope inside the
-        // handler by the caller's uid or by unguessable handle ownership, so they
-        // do not require the daemon UID.
+        // Gate-control writes (confirm/revert/approve/deny) require the admin
+        // bearer token: a corrupted agent must never be able to confirm or
+        // approve its own action. Reads (provisionals/approval list/show)
+        // self-scope inside the handler by the caller's uid or by unguessable
+        // handle ownership, so they do not require the bearer.
         !matches!(
             self,
             Self::Ping

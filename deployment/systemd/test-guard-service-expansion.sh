@@ -80,6 +80,7 @@ run_expansion_test() {
     -e '/^StateDirectoryMode=/d' \
     -e '/^RuntimeDirectory=/d' \
     -e '/^RuntimeDirectoryMode=/d' \
+    -e '/^StandardInput=/d' \
     -e "s|^ExecStart=/usr/local/bin/guard |ExecStart=$capture |" \
     -e 's|^Restart=.*|Restart=no|' \
     -e '/^AmbientCapabilities=/d' \

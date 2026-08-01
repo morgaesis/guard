@@ -81,7 +81,7 @@ fn gating_config(
     cfg.config.gate = GateMode::Consequence;
     cfg.config.daemon_uid = operator_uid;
     cfg.config.daemon_principal = PrincipalKey::from_uid(operator_uid);
-    let operator = CallerIdentity::Unix { uid: operator_uid };
+    let operator = CallerIdentity::UnixAdmin { uid: operator_uid };
     let agent = CallerIdentity::Unix { uid: agent_uid };
     (cfg, operator, agent)
 }
