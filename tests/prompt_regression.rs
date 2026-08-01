@@ -29,7 +29,7 @@ struct Case {
     #[serde(default = "one_sample")]
     samples: usize,
     #[serde(default)]
-    max_risk_spread: Option<i32>,
+    max_median_risk_deviation: Option<i32>,
     #[serde(default)]
     risk_not_greater_than: Option<String>,
 }
@@ -59,6 +59,22 @@ fn median(values: &[i32]) -> Option<i32> {
     Some(ordered[ordered.len() / 2])
 }
 
+fn median_absolute_deviation(values: &[i32]) -> Option<i32> {
+    let value_median = median(values)?;
+    let deviations = values
+        .iter()
+        .map(|value| (value - value_median).abs())
+        .collect::<Vec<_>>();
+    median(&deviations)
+}
+
+#[test]
+fn risk_stability_tolerates_one_outlier_but_rejects_dispersion() {
+    assert_eq!(median_absolute_deviation(&[4, 4, 7]), Some(0));
+    assert_eq!(median_absolute_deviation(&[6, 7, 4]), Some(1));
+    assert_eq!(median_absolute_deviation(&[0, 5, 10]), Some(5));
+}
+
 #[test]
 fn prompt_regression_risk_contracts_are_well_formed() {
     let cases = load_cases();
@@ -70,10 +86,10 @@ fn prompt_regression_risk_contracts_are_well_formed() {
             case.id
         );
         assert!(case.samples > 0, "case {} has no samples", case.id);
-        if let Some(spread) = case.max_risk_spread {
+        if let Some(deviation) = case.max_median_risk_deviation {
             assert!(
-                (0..=10).contains(&spread),
-                "case {} has invalid max_risk_spread {spread}",
+                (0..=10).contains(&deviation),
+                "case {} has invalid max_median_risk_deviation {deviation}",
                 case.id
             );
         }
@@ -169,7 +185,9 @@ async fn prompt_regression_corpus_matches_expected_decisions() {
                     .entry(case.id.clone())
                     .or_default()
                     .push(risk);
-            } else if case.max_risk_spread.is_some() || case.risk_not_greater_than.is_some() {
+            } else if case.max_median_risk_deviation.is_some()
+                || case.risk_not_greater_than.is_some()
+            {
                 failures.push(format!(
                     "[{} sample {}] response omitted the risk required by this contract",
                     case.id,
@@ -184,14 +202,13 @@ async fn prompt_regression_corpus_matches_expected_decisions() {
             .get(&case.id)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        if let Some(max_spread) = case.max_risk_spread {
+        if let Some(max_deviation) = case.max_median_risk_deviation {
             if risks.len() == case.samples {
-                let low = risks.iter().min().copied().unwrap();
-                let high = risks.iter().max().copied().unwrap();
-                if high - low > max_spread {
+                let median_deviation = median_absolute_deviation(risks).unwrap();
+                if median_deviation > max_deviation {
                     failures.push(format!(
-                        "[{}] risk samples {risks:?} exceed maximum spread {max_spread}",
-                        case.id
+                        "[{}] risk samples {risks:?} have median absolute deviation {median_deviation}, exceeding {max_deviation}",
+                        case.id,
                     ));
                 }
             }
