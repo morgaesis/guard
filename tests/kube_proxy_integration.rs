@@ -115,6 +115,29 @@ struct ChangingSessionSink {
     resolutions: AtomicUsize,
 }
 
+struct PrincipalSessionSink;
+
+#[async_trait::async_trait]
+impl ApiSessionSink for PrincipalSessionSink {
+    async fn resolve(&self, token: &str) -> Option<ApiSessionContext> {
+        let fingerprint = match token {
+            "principal-a" => "principal-a-fingerprint",
+            "principal-b" => "principal-b-fingerprint",
+            _ => return None,
+        };
+        Some(ApiSessionContext {
+            fingerprint: fingerprint.to_string(),
+            revision: "authority-revision-1".to_string(),
+            secret_entitlements: None,
+            intent: Some("manage one development deployment".to_string()),
+            evaluation_mode: ApiEvaluationMode::Evaluator,
+            can_evaluate_api_override: false,
+        })
+    }
+
+    async fn record(&self, _token: &str, _event: ApiSessionEvent) {}
+}
+
 #[derive(Clone)]
 struct BudgetSessionSink {
     remaining_resolutions: Arc<AtomicUsize>,
@@ -151,7 +174,7 @@ impl ApiSessionSink for ChangingSessionSink {
         let attempt = self.resolutions.fetch_add(1, Ordering::SeqCst);
         (token == "live-then-edited").then(|| ApiSessionContext {
             fingerprint: "stable-audit-fingerprint".to_string(),
-            revision: if attempt == 0 {
+            revision: if attempt < 3 {
                 "original-session-revision"
             } else {
                 "edited-session-revision"
@@ -186,6 +209,18 @@ async fn mock_handler(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, I
             "metadata": {"name": "cm", "namespace": "dev"},
             "data": {"key": "value"}
         })
+    } else if req.method() == hyper::Method::GET && path.contains("/pods/") {
+        json!({
+            "kind": "Pod",
+            "apiVersion": "v1",
+            "metadata": {
+                "name": "web-0",
+                "namespace": "dev",
+                "uid": "web-0-uid",
+                "resourceVersion": "12"
+            },
+            "spec": {"containers": []}
+        })
     } else {
         json!({"kind": "Status", "apiVersion": "v1", "status": "Success"})
     };
@@ -216,6 +251,415 @@ async fn spawn_mock_upstream() -> String {
         }
     });
     format!("http://{addr}")
+}
+
+#[derive(Clone)]
+struct ArbitrationMock {
+    object: Arc<std::sync::Mutex<Value>>,
+    forwarded_mutations: Arc<AtomicUsize>,
+    mutation_bodies: Arc<std::sync::Mutex<Vec<(hyper::Method, Value)>>>,
+}
+
+impl ArbitrationMock {
+    fn new() -> Self {
+        Self {
+            object: Arc::new(std::sync::Mutex::new(json!({
+                "kind": "Deployment",
+                "apiVersion": "apps/v1",
+                "metadata": {
+                    "name": "api",
+                    "namespace": "dev",
+                    "uid": "deployment-uid",
+                    "resourceVersion": "1",
+                    "labels": {"owner": "platform"}
+                },
+                "spec": {"replicas": 2},
+                "status": {"readyReplicas": 2}
+            }))),
+            forwarded_mutations: Arc::new(AtomicUsize::new(0)),
+            mutation_bodies: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    fn advance_status(&self) {
+        let mut object = self.object.lock().unwrap();
+        let next = next_resource_version(&object);
+        object["metadata"]["resourceVersion"] = json!(next);
+        object["status"]["readyReplicas"] = json!(1);
+    }
+
+    fn advance_spec(&self) {
+        let mut object = self.object.lock().unwrap();
+        let next = next_resource_version(&object);
+        object["metadata"]["resourceVersion"] = json!(next);
+        object["spec"]["replicas"] = json!(7);
+    }
+}
+
+fn next_resource_version(object: &Value) -> String {
+    object["metadata"]["resourceVersion"]
+        .as_str()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap()
+        .saturating_add(1)
+        .to_string()
+}
+
+async fn arbitration_mock_handler(
+    req: Request<Incoming>,
+    mock: ArbitrationMock,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    if req.method() == hyper::Method::GET {
+        let object = mock.object.lock().unwrap().clone();
+        return Ok(Response::builder()
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from(object.to_string())))
+            .unwrap());
+    }
+
+    mock.forwarded_mutations.fetch_add(1, Ordering::SeqCst);
+    let method = req.method().clone();
+    let bytes = req.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    mock.mutation_bodies
+        .lock()
+        .unwrap()
+        .push((method.clone(), body.clone()));
+    let mut object = mock.object.lock().unwrap();
+    let expected_uid = object["metadata"]["uid"].as_str().unwrap();
+    let expected_version = object["metadata"]["resourceVersion"].as_str().unwrap();
+    let guarded = match method {
+        hyper::Method::PUT | hyper::Method::PATCH => {
+            body["metadata"]["resourceVersion"].as_str() == Some(expected_version)
+        }
+        hyper::Method::DELETE => {
+            body["preconditions"]["uid"].as_str() == Some(expected_uid)
+                && body["preconditions"]["resourceVersion"].as_str() == Some(expected_version)
+        }
+        hyper::Method::POST => true,
+        _ => false,
+    };
+    if !guarded {
+        return Ok(Response::builder()
+            .status(409)
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from(
+                json!({"kind":"Status","status":"Failure","reason":"Conflict","code":409})
+                    .to_string(),
+            )))
+            .unwrap());
+    }
+    if method == hyper::Method::DELETE {
+        return Ok(Response::builder()
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from(
+                json!({"kind":"Status","status":"Success"}).to_string(),
+            )))
+            .unwrap());
+    }
+    if let Some(replicas) = body.pointer("/spec/replicas").cloned() {
+        object["spec"]["replicas"] = replicas;
+    }
+    let next = next_resource_version(&object);
+    object["metadata"]["resourceVersion"] = json!(next);
+    Ok(Response::builder()
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(object.to_string())))
+        .unwrap())
+}
+
+async fn spawn_arbitration_mock() -> (String, ArbitrationMock) {
+    let mock = ArbitrationMock::new();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_mock = mock.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let connection_mock = server_mock.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |request| {
+                    arbitration_mock_handler(request, connection_mock.clone())
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    (format!("http://{addr}"), mock)
+}
+
+async fn spawn_blocking_arbitration_mock(
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+) -> (String, ArbitrationMock) {
+    let mock = ArbitrationMock::new();
+    let get_count = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_mock = mock.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let connection_mock = server_mock.clone();
+            let connection_get_count = get_count.clone();
+            let connection_started = started.clone();
+            let connection_release = release.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |request| {
+                    let request_mock = connection_mock.clone();
+                    let request_get_count = connection_get_count.clone();
+                    let request_started = connection_started.clone();
+                    let request_release = connection_release.clone();
+                    async move {
+                        if request.method() == hyper::Method::GET
+                            && request_get_count.fetch_add(1, Ordering::SeqCst) == 1
+                        {
+                            request_started.notify_one();
+                            request_release.notified().await;
+                        }
+                        arbitration_mock_handler(request, request_mock).await
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    (format!("http://{addr}"), mock)
+}
+
+async fn start_arbitration_proxy(
+    upstream_base: &str,
+    mode: Option<ApiListenerMode>,
+) -> (String, reqwest::Client) {
+    let upstream =
+        Upstream::from_kubeconfig_str(&kubeconfig_for(upstream_base), None).expect("upstream");
+    let tls = ProxyTls::generate().expect("tls");
+    let ca_pem = tls.ca_pem().to_string();
+    let policy = ApiPolicy::from_yaml("default: allow\n").unwrap();
+    let (listener, listen) = reserve_listener().await;
+    let mut proxy = ApiProxy::new(listen, tls, upstream, policy, None);
+    if let Some(mode) = mode {
+        proxy = proxy.with_listener_mode(mode);
+    }
+    let proxy = Arc::new(proxy);
+    proxy.attach_session_sink(Arc::new(PrincipalSessionSink));
+    tokio::spawn(proxy.serve_on(listener));
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    (format!("https://{listen}"), client)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anonymous_default_listener_cannot_mutate_under_allow_policy() {
+    let (upstream, mock) = spawn_arbitration_mock().await;
+    let (base, client) = start_arbitration_proxy(&upstream, None).await;
+
+    for response in [
+        client
+            .post(format!("{base}/api/v1/namespaces/dev/configmaps"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap(),
+        client
+            .patch(format!(
+                "{base}/apis/apps/v1/namespaces/dev/deployments/api"
+            ))
+            .header("content-type", "application/merge-patch+json")
+            .body(r#"{"spec":{"replicas":3}}"#)
+            .send()
+            .await
+            .unwrap(),
+    ] {
+        assert_eq!(response.status(), 403);
+        assert!(response.text().await.unwrap().contains("attributable"));
+    }
+    assert_eq!(mock.forwarded_mutations.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn observations_are_principal_bound_and_arbitrate_interleaved_writes() {
+    let (upstream, mock) = spawn_arbitration_mock().await;
+    let (base, client) = start_arbitration_proxy(&upstream, Some(ApiListenerMode::Policy)).await;
+    let object_url = format!("{base}/apis/apps/v1/namespaces/dev/deployments/api");
+
+    let observed_by_a = client
+        .get(&object_url)
+        .bearer_auth("principal-a")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(observed_by_a.status(), 200);
+
+    let unobserved_b = client
+        .patch(&object_url)
+        .bearer_auth("principal-b")
+        .header("content-type", "application/merge-patch+json")
+        .body(r#"{"spec":{"replicas":3}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unobserved_b.status(), 409);
+    assert_eq!(mock.forwarded_mutations.load(Ordering::SeqCst), 0);
+
+    assert_eq!(
+        client
+            .get(&object_url)
+            .bearer_auth("principal-b")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        client
+            .patch(&object_url)
+            .bearer_auth("principal-a")
+            .header("content-type", "application/merge-patch+json")
+            .body(r#"{"spec":{"replicas":3}}"#)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let stale_b = client
+        .patch(&object_url)
+        .bearer_auth("principal-b")
+        .header("content-type", "application/merge-patch+json")
+        .body(r#"{"spec":{"replicas":4}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale_b.status(), 409);
+    assert_eq!(mock.forwarded_mutations.load(Ordering::SeqCst), 1);
+
+    mock.advance_status();
+    let status_churn = client
+        .put(&object_url)
+        .bearer_auth("principal-a")
+        .header("content-type", "application/json")
+        .body(r#"{"metadata":{"name":"api","namespace":"dev"},"spec":{"replicas":5}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(status_churn.status(), 200);
+    {
+        let bodies = mock.mutation_bodies.lock().unwrap();
+        assert_eq!(bodies.last().unwrap().0, hyper::Method::PUT);
+        assert_eq!(
+            bodies.last().unwrap().1["metadata"]["resourceVersion"],
+            "3",
+            "status-only churn advances the atomic precondition to the live version"
+        );
+    }
+
+    mock.advance_spec();
+    let conflicting_spec = client
+        .delete(&object_url)
+        .bearer_auth("principal-a")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(conflicting_spec.status(), 409);
+    assert_eq!(mock.forwarded_mutations.load(Ordering::SeqCst), 2);
+
+    assert_eq!(
+        client
+            .get(&object_url)
+            .bearer_auth("principal-a")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        client
+            .delete(&object_url)
+            .bearer_auth("principal-a")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let bodies = mock.mutation_bodies.lock().unwrap();
+    let delete = bodies.last().unwrap();
+    assert_eq!(delete.0, hyper::Method::DELETE);
+    assert_eq!(delete.1["preconditions"]["uid"], "deployment-uid");
+    assert_eq!(delete.1["preconditions"]["resourceVersion"], "5");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn policy_reload_during_arbitration_prevents_mutable_forwarding() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (upstream_base, mock) =
+        spawn_blocking_arbitration_mock(started.clone(), release.clone()).await;
+    let upstream =
+        Upstream::from_kubeconfig_str(&kubeconfig_for(&upstream_base), None).expect("upstream");
+    let tls = ProxyTls::generate().expect("tls");
+    let ca_pem = tls.ca_pem().to_string();
+    let temp = tempfile::tempdir().unwrap();
+    let policy_path = temp.path().join("api-policy.yaml");
+    let allow_policy = "default: allow\n";
+    std::fs::write(&policy_path, allow_policy).unwrap();
+    let policy = ApiPolicy::load_file(&policy_path).unwrap();
+    let (listener, listen) = reserve_listener().await;
+    let proxy = Arc::new(
+        ApiProxy::new(listen, tls, upstream, policy, Some(policy_path.clone()))
+            .with_listener_mode(ApiListenerMode::Policy)
+            .with_policy_reload_interval(Duration::from_millis(50)),
+    );
+    proxy.attach_session_sink(Arc::new(PrincipalSessionSink));
+    tokio::spawn(proxy.clone().serve_on(listener));
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    let object_url = format!("https://{listen}/apis/apps/v1/namespaces/dev/deployments/api");
+    assert_eq!(
+        client
+            .get(&object_url)
+            .bearer_auth("principal-a")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+
+    let request = tokio::spawn({
+        let client = client.clone();
+        let object_url = object_url.clone();
+        async move {
+            client
+                .patch(object_url)
+                .bearer_auth("principal-a")
+                .header("content-type", "application/merge-patch+json")
+                .body(r#"{"spec":{"replicas":3}}"#)
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    started.notified().await;
+    let deny_policy = "default: deny\n";
+    std::fs::write(&policy_path, deny_policy).unwrap();
+    wait_for_policy_reload(&proxy, deny_policy).await;
+    release.notify_one();
+
+    assert_eq!(request.await.unwrap().status(), 403);
+    assert_eq!(mock.forwarded_mutations.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -311,7 +755,8 @@ async fn start_proxy_with(
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(policy_yaml).expect("policy");
     let (listener, listen) = reserve_listener().await;
-    let mut proxy = ApiProxy::new(listen, tls, upstream, policy, None);
+    let mut proxy = ApiProxy::new(listen, tls, upstream, policy, None)
+        .with_listener_mode(ApiListenerMode::Policy);
     if rarity_threshold > 0 {
         proxy = proxy.with_rarity_escalation(rarity_threshold);
     }
@@ -322,9 +767,16 @@ async fn start_proxy_with(
     if let Some(judge) = judge {
         proxy.attach_judge(judge);
     }
+    proxy.attach_session_sink(Arc::new(LiveSessionSink));
     tokio::spawn(proxy.clone().serve_on(listener));
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::AUTHORIZATION,
+        "Bearer live-session".parse().unwrap(),
+    );
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .default_headers(headers)
         .build()
         .unwrap();
     (format!("https://{listen}"), client)
@@ -473,7 +925,11 @@ async fn proxy_gates_redacts_and_forwards() {
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).expect("policy");
     let (listener, listen) = reserve_listener().await;
-    let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
+    let proxy = Arc::new(
+        ApiProxy::new(listen, tls, upstream, policy, None)
+            .with_listener_mode(ApiListenerMode::Policy),
+    );
+    proxy.attach_session_sink(Arc::new(LiveSessionSink));
 
     // The brokered config must point at the proxy and carry no credential.
     let brokered = proxy.brokered_kubeconfig();
@@ -509,8 +965,8 @@ async fn proxy_gates_redacts_and_forwards() {
     let v: Value = resp.json().await.unwrap();
     assert_eq!(v["data"]["key"], "value", "ConfigMap data is not redacted");
 
-    // 3. A policy-held delete with no approval queue attached (no gate sink
-    //    here) fails closed -> 403, apiserver never hit.
+    // 3. An anonymous mutation fails before policy routing because writes need
+    //    attributable Guard session authority.
     let resp = client
         .delete(format!("{base}/api/v1/namespaces/dev/pods/web-0"))
         .send()
@@ -522,7 +978,7 @@ async fn proxy_gates_redacts_and_forwards() {
     assert!(v["message"]
         .as_str()
         .unwrap()
-        .contains("requires operator approval"));
+        .contains("require an attributable Guard session"));
 
     // 4. An interactive subresource is denied outright.
     let resp = client
@@ -537,6 +993,7 @@ async fn proxy_gates_redacts_and_forwards() {
     // 5. A write in a production namespace falls to default-deny.
     let resp = client
         .post(format!("{base}/api/v1/namespaces/prod/pods"))
+        .bearer_auth("live-session")
         .body("{}")
         .send()
         .await
@@ -546,6 +1003,7 @@ async fn proxy_gates_redacts_and_forwards() {
     // 6. A write in a non-production namespace is allowed and forwarded.
     let resp = client
         .post(format!("{base}/api/v1/namespaces/dev/pods"))
+        .bearer_auth("live-session")
         .body("{}")
         .send()
         .await
@@ -711,7 +1169,7 @@ async fn write_mock_handler(req: Request<Incoming>) -> Result<Response<Full<Byte
     let (code, body) = if is_create {
         (
             201,
-            json!({"kind": "Pod", "apiVersion": "v1", "metadata": {"name": "web-123", "namespace": "dev"}}),
+            json!({"kind": "Pod", "apiVersion": "v1", "metadata": {"name": "web-123", "namespace": "dev", "uid": "pod-uid", "resourceVersion": "40"}}),
         )
     } else {
         (
@@ -719,7 +1177,7 @@ async fn write_mock_handler(req: Request<Incoming>) -> Result<Response<Full<Byte
             json!({
                 "kind": "Deployment",
                 "apiVersion": "apps/v1",
-                "metadata": {"name": "api", "namespace": "dev", "resourceVersion": "42"},
+                "metadata": {"name": "api", "namespace": "dev", "uid": "deployment-uid", "resourceVersion": "42"},
                 "spec": {"replicas": 3}
             }),
         )
@@ -762,7 +1220,10 @@ async fn proxy_arms_auto_revert_for_writes() {
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).expect("policy");
     let (listener, listen) = reserve_listener().await;
-    let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
+    let proxy = Arc::new(
+        ApiProxy::new(listen, tls, upstream, policy, None)
+            .with_listener_mode(ApiListenerMode::Policy),
+    );
 
     let sink = RecordingSink::default();
     proxy.attach_gate(Arc::new(sink.clone()));
@@ -785,8 +1246,28 @@ async fn proxy_arms_auto_revert_for_writes() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 201, "create forwarded");
+    assert_eq!(
+        resp.headers()
+            .get("x-guard-provisional")
+            .and_then(|value| value.to_str().ok()),
+        Some("test-handle-0")
+    );
+    assert!(resp
+        .headers()
+        .get("warning")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("guard confirm test-handle-0")));
 
     // A patch on a named object snapshots the prior state and arms a restore.
+    let observed = client
+        .get(format!(
+            "{base}/apis/apps/v1/namespaces/dev/deployments/api"
+        ))
+        .bearer_auth("live-session")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(observed.status(), 200, "deployment observation forwarded");
     let resp = client
         .patch(format!(
             "{base}/apis/apps/v1/namespaces/dev/deployments/api"
@@ -798,8 +1279,15 @@ async fn proxy_arms_auto_revert_for_writes() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "patch forwarded");
+    assert_eq!(
+        resp.headers()
+            .get("x-guard-provisional")
+            .and_then(|value| value.to_str().ok()),
+        Some("test-handle-1")
+    );
 
-    // Reverts are armed asynchronously after the response; poll for both.
+    // Both response headers prove the reverts were durable before success was
+    // returned; the sink records the same handles for lifecycle assertions.
     wait_until("both writes to arm a revert", || {
         sink.calls.lock().unwrap().len() == 2
     })
@@ -1224,7 +1712,7 @@ async fn issued_session_modes_enforce_api_boundary_without_prompt_bypass() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_expansion_is_revalidated_immediately_before_forward() {
-    let mock_base = spawn_mock_upstream().await;
+    let mock_base = spawn_write_mock().await;
     let upstream =
         Upstream::from_kubeconfig_str(&kubeconfig_for(&mock_base), None).expect("upstream");
     let tls = ProxyTls::generate().expect("tls");
@@ -1248,8 +1736,22 @@ async fn session_expansion_is_revalidated_immediately_before_forward() {
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
         .unwrap();
+    assert_eq!(
+        client
+            .get(format!(
+                "https://{listen}/apis/apps/v1/namespaces/dev/deployments/api"
+            ))
+            .bearer_auth("live-then-edited")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
     let response = client
-        .patch(format!("https://{listen}/api/v1/namespaces/dev/pods/web"))
+        .patch(format!(
+            "https://{listen}/apis/apps/v1/namespaces/dev/deployments/api"
+        ))
         .bearer_auth("live-then-edited")
         .header("content-type", "application/merge-patch+json")
         .body(r#"{"metadata":{"labels":{"checked":"true"}}}"#)
@@ -1286,6 +1788,7 @@ async fn hot_reloaded_explicit_deny_is_rechecked_after_evaluator_delay() {
         started: started.clone(),
         release: release.clone(),
     }));
+    proxy.attach_session_sink(Arc::new(LiveSessionSink));
     tokio::spawn(proxy.clone().serve_on(listener));
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
@@ -1294,6 +1797,7 @@ async fn hot_reloaded_explicit_deny_is_rechecked_after_evaluator_delay() {
     let request = tokio::spawn(async move {
         client
             .patch(format!("https://{listen}/api/v1/namespaces/dev/pods/web"))
+            .bearer_auth("live-session")
             .body("{}")
             .send()
             .await
@@ -1319,6 +1823,7 @@ async fn spawn_blocking_snapshot_mock(
     release: Arc<tokio::sync::Notify>,
     writes: Arc<AtomicUsize>,
 ) -> String {
+    let gets = Arc::new(AtomicUsize::new(0));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -1327,15 +1832,19 @@ async fn spawn_blocking_snapshot_mock(
             let started = started.clone();
             let release = release.clone();
             let writes = writes.clone();
+            let gets = gets.clone();
             tokio::spawn(async move {
                 let service = service_fn(move |req: Request<Incoming>| {
                     let started = started.clone();
                     let release = release.clone();
                     let writes = writes.clone();
+                    let gets = gets.clone();
                     async move {
                         if req.method() == hyper::Method::GET {
-                            started.notify_one();
-                            release.notified().await;
+                            if gets.fetch_add(1, Ordering::SeqCst) == 1 {
+                                started.notify_one();
+                                release.notified().await;
+                            }
                         } else {
                             writes.fetch_add(1, Ordering::SeqCst);
                         }
@@ -1363,13 +1872,16 @@ async fn direct_allow_revalidates_session_after_delayed_snapshot() {
     let tls = ProxyTls::generate().expect("tls");
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(
-        "default: deny\nrules:\n  - verbs: [patch]\n    resources: [deployments]\n    namespaces: [dev]\n    action: allow\n",
+        "default: deny\nrules:\n  - verbs: [get]\n    resources: [deployments]\n    namespaces: [dev]\n    action: allow\n  - verbs: [patch]\n    resources: [deployments]\n    namespaces: [dev]\n    action: allow\n",
     )
     .unwrap();
     let (listener, listen) = reserve_listener().await;
-    let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
+    let proxy = Arc::new(
+        ApiProxy::new(listen, tls, upstream, policy, None)
+            .with_listener_mode(ApiListenerMode::Policy),
+    );
     proxy.attach_gate(Arc::new(RecordingSink::default()));
-    let remaining = Arc::new(AtomicUsize::new(2));
+    let remaining = Arc::new(AtomicUsize::new(3));
     proxy.attach_session_sink(Arc::new(BudgetSessionSink {
         remaining_resolutions: remaining.clone(),
     }));
@@ -1378,6 +1890,18 @@ async fn direct_allow_revalidates_session_after_delayed_snapshot() {
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
         .unwrap();
+    assert_eq!(
+        client
+            .get(format!(
+                "https://{listen}/apis/apps/v1/namespaces/dev/deployments/api"
+            ))
+            .bearer_auth("budget-session")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
     let request = tokio::spawn(async move {
         client
             .patch(format!(
@@ -1411,26 +1935,41 @@ async fn assert_direct_allow_reload_fails_closed(next_action: &str, next_intent:
     let policy_path = temp.path().join("api-policy.yaml");
     std::fs::write(
         &policy_path,
-        "intent: initial task intent\ndefault: deny\nrules:\n  - verbs: [patch]\n    resources: [deployments]\n    namespaces: [dev]\n    action: allow\n",
+        "intent: initial task intent\ndefault: deny\nrules:\n  - verbs: [get]\n    resources: [deployments]\n    namespaces: [dev]\n    action: allow\n  - verbs: [patch]\n    resources: [deployments]\n    namespaces: [dev]\n    action: allow\n",
     )
     .unwrap();
     let policy = ApiPolicy::load_file(&policy_path).unwrap();
     let (listener, listen) = reserve_listener().await;
     let proxy = Arc::new(
         ApiProxy::new(listen, tls, upstream, policy, Some(policy_path.clone()))
+            .with_listener_mode(ApiListenerMode::Policy)
             .with_policy_reload_interval(Duration::from_millis(50)),
     );
     proxy.attach_gate(Arc::new(RecordingSink::default()));
+    proxy.attach_session_sink(Arc::new(LiveSessionSink));
     tokio::spawn(proxy.clone().serve_on(listener));
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
         .unwrap();
+    assert_eq!(
+        client
+            .get(format!(
+                "https://{listen}/apis/apps/v1/namespaces/dev/deployments/api"
+            ))
+            .bearer_auth("live-session")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
     let request = tokio::spawn(async move {
         client
             .patch(format!(
                 "https://{listen}/apis/apps/v1/namespaces/dev/deployments/api"
             ))
+            .bearer_auth("live-session")
             .body("{}")
             .send()
             .await
@@ -1483,7 +2022,11 @@ async fn proxy_self_access_review_carries_upstream_credential() {
     )
     .expect("policy");
     let (listener, listen) = reserve_listener().await;
-    let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
+    let proxy = Arc::new(
+        ApiProxy::new(listen, tls, upstream, policy, None)
+            .with_listener_mode(ApiListenerMode::Policy),
+    );
+    proxy.attach_session_sink(Arc::new(LiveSessionSink));
 
     tokio::spawn(proxy.clone().serve_on(listener));
 
@@ -1502,6 +2045,7 @@ async fn proxy_self_access_review_carries_upstream_credential() {
         .post(format!(
             "{base}/apis/authorization.k8s.io/v1/selfsubjectaccessreviews"
         ))
+        .bearer_auth("live-session")
         .header("content-type", "application/json")
         .body(review.to_string())
         .send()
@@ -1531,10 +2075,8 @@ async fn create_delete_mock_handler(
     req: Request<Incoming>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let (code, body) = match *req.method() {
-        hyper::Method::POST => (
-            201,
-            json!({"kind": "Pod", "apiVersion": "v1", "metadata": {"name": "check-pod", "namespace": "dev"}}),
-        ),
+        hyper::Method::POST => (201, created_pod_object()),
+        hyper::Method::GET => (200, created_pod_object()),
         hyper::Method::DELETE => (
             200,
             json!({"kind": "Status", "apiVersion": "v1", "status": "Success"}),
@@ -1549,6 +2091,20 @@ async fn create_delete_mock_handler(
         .header("content-type", "application/json")
         .body(Full::new(Bytes::from(body.to_string())))
         .unwrap())
+}
+
+fn created_pod_object() -> Value {
+    json!({
+        "kind": "Pod",
+        "apiVersion": "v1",
+        "metadata": {
+            "name": "check-pod",
+            "namespace": "dev",
+            "uid": "check-pod-uid",
+            "resourceVersion": "7"
+        },
+        "spec": {"containers": []}
+    })
 }
 
 async fn spawn_create_delete_mock() -> String {
@@ -1588,7 +2144,7 @@ async fn spawn_failing_create_delete_mock(outcomes: VecDeque<Option<u16>>) -> St
                     let outcomes = outcomes.clone();
                     async move {
                         if req.method() == hyper::Method::POST {
-                            let body = json!({"kind":"Pod","apiVersion":"v1","metadata":{"name":"check-pod","namespace":"dev"}});
+                            let body = created_pod_object();
                             return Ok::<_, std::io::Error>(
                                 Response::builder()
                                     .status(201)
@@ -1612,7 +2168,8 @@ async fn spawn_failing_create_delete_mock(outcomes: VecDeque<Option<u16>>) -> St
                         }
                         Ok(Response::builder()
                             .status(200)
-                            .body(Full::new(Bytes::from("{}")))
+                            .header("content-type", "application/json")
+                            .body(Full::new(Bytes::from(created_pod_object().to_string())))
                             .unwrap())
                     }
                 });
@@ -1635,7 +2192,7 @@ async fn spawn_truncated_cleanup_mock() -> String {
             tokio::spawn(async move {
                 let service = service_fn(|req: Request<Incoming>| async move {
                     let response: Response<MockBody> = if req.method() == hyper::Method::POST {
-                        let body = json!({"kind":"Pod","apiVersion":"v1","metadata":{"name":"check-pod","namespace":"dev"}}).to_string();
+                        let body = created_pod_object().to_string();
                         Response::builder()
                             .status(201)
                             .header("content-type", "application/json")
@@ -1645,7 +2202,7 @@ async fn spawn_truncated_cleanup_mock() -> String {
                                     .boxed(),
                             )
                             .unwrap()
-                    } else {
+                    } else if req.method() == hyper::Method::DELETE {
                         let frames = futures::stream::iter([
                             Ok(Frame::data(Bytes::from_static(b"{"))),
                             Err(std::io::Error::other("simulated body disconnect")),
@@ -1654,6 +2211,16 @@ async fn spawn_truncated_cleanup_mock() -> String {
                             .status(200)
                             .header("content-type", "application/json")
                             .body(StreamBody::new(frames).boxed())
+                            .unwrap()
+                    } else {
+                        Response::builder()
+                            .status(200)
+                            .header("content-type", "application/json")
+                            .body(
+                                Full::new(Bytes::from(created_pod_object().to_string()))
+                                    .map_err(|never| match never {})
+                                    .boxed(),
+                            )
                             .unwrap()
                     };
                     Ok::<_, Infallible>(response)
@@ -1677,12 +2244,13 @@ async fn start_provenance_proxy(
     let ca_pem = tls.ca_pem().to_string();
     let policy = ApiPolicy::from_yaml(include_str!("../examples/api-policy.yaml")).unwrap();
     let (listener, listen) = reserve_listener().await;
-    let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
+    let proxy = Arc::new(
+        ApiProxy::new(listen, tls, upstream, policy, None)
+            .with_listener_mode(ApiListenerMode::Policy),
+    );
     let sink = RecordingSink::default();
     proxy.attach_gate(Arc::new(sink.clone()));
-    if let Some(session_sink) = session_sink {
-        proxy.attach_session_sink(session_sink);
-    }
+    proxy.attach_session_sink(session_sink.unwrap_or_else(|| Arc::new(LiveSessionSink)));
     tokio::spawn(proxy.serve_on(listener));
     let client = SingleConnectionClient::connect(listen, &ca_pem).await;
     (client, sink)
@@ -1722,7 +2290,9 @@ impl SingleConnectionClient {
             hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls_stream))
                 .await
                 .unwrap();
-        tokio::spawn(async move { connection.await.unwrap() });
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
         Self {
             sender,
             authority: listen.to_string(),
@@ -1770,7 +2340,7 @@ async fn proxy_allows_contained_delete_of_created_resource() {
         .request(
             hyper::Method::DELETE,
             "/api/v1/namespaces/dev/pods/other-pod",
-            None,
+            Some("live-session"),
             None,
         )
         .await;
@@ -1781,7 +2351,7 @@ async fn proxy_allows_contained_delete_of_created_resource() {
         .request(
             hyper::Method::POST,
             "/api/v1/namespaces/dev/pods",
-            None,
+            Some("live-session"),
             Some("{}"),
         )
         .await;
@@ -1796,7 +2366,7 @@ async fn proxy_allows_contained_delete_of_created_resource() {
         .request(
             hyper::Method::DELETE,
             "/api/v1/namespaces/dev/pods/check-pod",
-            None,
+            Some("live-session"),
             None,
         )
         .await;
@@ -1822,7 +2392,7 @@ async fn proxy_allows_contained_delete_of_created_resource() {
         .request(
             hyper::Method::DELETE,
             "/api/v1/namespaces/dev/pods/check-pod",
-            None,
+            Some("live-session"),
             None,
         )
         .await;
@@ -1843,7 +2413,7 @@ async fn contained_delete_retains_revert_on_transport_4xx_and_5xx_failures() {
                 .request(
                     hyper::Method::POST,
                     "/api/v1/namespaces/dev/pods",
-                    None,
+                    Some("live-session"),
                     Some("{}"),
                 )
                 .await,
@@ -1854,7 +2424,7 @@ async fn contained_delete_retains_revert_on_transport_4xx_and_5xx_failures() {
             .request(
                 hyper::Method::DELETE,
                 "/api/v1/namespaces/dev/pods/check-pod",
-                None,
+                Some("live-session"),
                 None,
             )
             .await;
@@ -1870,7 +2440,7 @@ async fn contained_delete_retains_revert_on_transport_4xx_and_5xx_failures() {
                     .request(
                         hyper::Method::DELETE,
                         "/api/v1/namespaces/dev/pods/check-pod",
-                        None,
+                        Some("live-session"),
                         None,
                     )
                     .await,
@@ -1948,7 +2518,7 @@ async fn contained_delete_retains_revert_when_a_2xx_body_disconnects() {
             .request(
                 hyper::Method::POST,
                 "/api/v1/namespaces/dev/pods",
-                None,
+                Some("live-session"),
                 Some("{}"),
             )
             .await,
@@ -1960,7 +2530,7 @@ async fn contained_delete_retains_revert_when_a_2xx_body_disconnects() {
             .request(
                 hyper::Method::DELETE,
                 "/api/v1/namespaces/dev/pods/check-pod",
-                None,
+                Some("live-session"),
                 None,
             )
             .await,
@@ -1984,9 +2554,13 @@ async fn created_provenance_never_overrides_an_explicit_policy_deny() {
     )
     .unwrap();
     let (listener, listen) = reserve_listener().await;
-    let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
+    let proxy = Arc::new(
+        ApiProxy::new(listen, tls, upstream, policy, None)
+            .with_listener_mode(ApiListenerMode::Policy),
+    );
     let sink = RecordingSink::default();
     proxy.attach_gate(Arc::new(sink.clone()));
+    proxy.attach_session_sink(Arc::new(LiveSessionSink));
     tokio::spawn(proxy.clone().serve_on(listener));
 
     let client = reqwest::Client::builder()
@@ -1996,6 +2570,7 @@ async fn created_provenance_never_overrides_an_explicit_policy_deny() {
     let base = format!("https://{listen}");
     let created = client
         .post(format!("{base}/api/v1/namespaces/dev/pods"))
+        .bearer_auth("live-session")
         .body("{}")
         .send()
         .await
@@ -2006,6 +2581,7 @@ async fn created_provenance_never_overrides_an_explicit_policy_deny() {
 
     let denied = client
         .delete(format!("{base}/api/v1/namespaces/dev/pods/check-pod"))
+        .bearer_auth("live-session")
         .send()
         .await
         .unwrap();
@@ -2166,10 +2742,14 @@ rules:
     )
     .expect("policy");
     let (listener, listen) = reserve_listener().await;
-    let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
+    let proxy = Arc::new(
+        ApiProxy::new(listen, tls, upstream, policy, None)
+            .with_listener_mode(ApiListenerMode::Policy),
+    );
 
     let sink = RecordingSink::default();
     proxy.attach_gate(Arc::new(sink.clone()));
+    proxy.attach_session_sink(Arc::new(LiveSessionSink));
 
     tokio::spawn(proxy.clone().serve_on(listener));
 
@@ -2179,19 +2759,26 @@ rules:
         .build()
         .unwrap();
 
-    // Evict the pod: allowed by the eviction rule.
+    // Eviction cannot carry Guard's object preconditions, so the concurrency
+    // floor rejects it even though policy would otherwise allow it.
     let resp = client
         .post(format!(
             "{base}/api/v1/namespaces/dev/pods/critical-0/eviction"
         ))
+        .bearer_auth("live-session")
         .body("{}")
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 201, "eviction forwarded");
+    assert_eq!(
+        resp.status(),
+        409,
+        "an eviction that cannot carry object preconditions fails closed"
+    );
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // No auto-revert was armed for a subresource write, so no provenance exists.
+    // No auto-revert was armed for the rejected subresource write, so no
+    // provenance exists.
     assert_eq!(
         sink.calls.lock().unwrap().len(),
         0,
@@ -2201,6 +2788,7 @@ rules:
     // Deleting the evicted pod must stay held: the eviction did not launder it.
     let resp = client
         .delete(format!("{base}/api/v1/namespaces/dev/pods/critical-0"))
+        .bearer_auth("live-session")
         .send()
         .await
         .unwrap();
@@ -2353,6 +2941,10 @@ async fn proxy_hold_forwards_on_approval_and_fails_closed_without_queue() {
     let policy_yaml = r#"
 default: deny
 rules:
+  - verbs: [get]
+    resources: [pods]
+    namespaces: [dev]
+    action: allow
   - verbs: [delete]
     resources: [pods]
     namespaces: [dev]
@@ -2367,6 +2959,7 @@ rules:
     let policy = ApiPolicy::from_yaml(policy_yaml).expect("policy");
     let (listener, listen) = reserve_listener().await;
     let proxy = Arc::new(ApiProxy::new(listen, tls, upstream, policy, None));
+    proxy.attach_session_sink(Arc::new(LiveSessionSink));
     tokio::spawn(proxy.clone().serve_on(listener));
 
     let base = format!("https://{listen}");
@@ -2374,8 +2967,19 @@ rules:
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
         .unwrap();
+    assert_eq!(
+        client
+            .get(format!("{base}/api/v1/namespaces/dev/pods/web-0"))
+            .bearer_auth("live-session")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
     let resp = client
         .delete(format!("{base}/api/v1/namespaces/dev/pods/web-0"))
+        .bearer_auth("live-session")
         .send()
         .await
         .unwrap();
@@ -2404,6 +3008,16 @@ rules:
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
         .build()
         .unwrap();
+    assert_eq!(
+        client
+            .get(format!("{base}/api/v1/namespaces/dev/pods/web-0"))
+            .bearer_auth("live-session")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
     let resp = client
         .delete(format!("{base}/api/v1/namespaces/dev/pods/web-0"))
         .bearer_auth("live-session")
@@ -2413,9 +3027,9 @@ rules:
     assert_eq!(resp.status(), 200, "an approved hold is forwarded upstream");
     {
         let events = session_sink.events.lock().unwrap();
-        assert_eq!(events.len(), 1, "the held request is recorded once");
-        assert!(events[0].held, "an approved hold remains held in history");
-        assert!(events[0].allowed, "the operator-approved hold was allowed");
+        let held = events.iter().filter(|event| event.held).collect::<Vec<_>>();
+        assert_eq!(held.len(), 1, "the held request is recorded once");
+        assert!(held[0].allowed, "the operator-approved hold was allowed");
     }
 
     for reason in ["operator denied", "approval expired"] {
@@ -2471,6 +3085,7 @@ async fn held_request_captures_complete_body_before_approval_and_stalls_fail_clo
     );
     let sink = SnapshotSink::default();
     proxy.attach_gate(Arc::new(sink.clone()));
+    proxy.attach_session_sink(Arc::new(LiveSessionSink));
     tokio::spawn(proxy.serve_on(listener));
     let client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
@@ -2488,6 +3103,7 @@ async fn held_request_captures_complete_body_before_approval_and_stalls_fail_clo
         async move {
             client
                 .post(format!("{base}/api/v1/namespaces/dev/pods"))
+                .bearer_auth("live-session")
                 .body(reqwest::Body::wrap_stream(stream))
                 .send()
                 .await
@@ -2530,6 +3146,7 @@ async fn held_request_captures_complete_body_before_approval_and_stalls_fail_clo
     let stalled_request = tokio::spawn(async move {
         client
             .post(format!("{base}/api/v1/namespaces/dev/pods"))
+            .bearer_auth("live-session")
             .body(reqwest::Body::wrap_stream(stalled_stream))
             .send()
             .await
@@ -2745,6 +3362,10 @@ rules:
     resources: [configmaps]
     namespaces: [dev]
     action: evaluate
+  - verbs: [get]
+    resources: [deployments]
+    namespaces: [dev]
+    action: allow
   - verbs: [patch]
     resources: [deployments]
     namespaces: [dev]
@@ -2787,6 +3408,17 @@ rules:
         0,
     )
     .await;
+    assert_eq!(
+        client
+            .get(format!(
+                "{base}/apis/apps/v1/namespaces/dev/deployments/api"
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
     let resp = client
         .patch(format!(
             "{base}/apis/apps/v1/namespaces/dev/deployments/api"
@@ -2903,6 +3535,7 @@ rules:
     let secret_value = "super-secret-value";
     let resp = client
         .post(format!("{base}/api/v1/namespaces/dev/configmaps"))
+        .bearer_auth("live-session")
         .header("content-type", "application/json")
         .body(
             json!({
@@ -3161,6 +3794,10 @@ async fn proxy_evaluate_reuses_prior_snapshot_for_arming() {
     let policy = r#"
 default: deny
 rules:
+  - verbs: [get]
+    resources: [deployments]
+    namespaces: [dev]
+    action: allow
   - verbs: [patch]
     resources: [deployments]
     namespaces: [dev]
@@ -3177,6 +3814,17 @@ rules:
         0,
     )
     .await;
+    assert_eq!(
+        client
+            .get(format!(
+                "{base}/apis/apps/v1/namespaces/dev/deployments/api"
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
     let resp = client
         .patch(format!(
             "{base}/apis/apps/v1/namespaces/dev/deployments/api"
@@ -3187,13 +3835,14 @@ rules:
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    // The prior object is fetched twice on the evaluate path: once before the
+    // The object is fetched once for the caller's observation, then twice on
+    // the evaluate path: once before the
     // judge to decide whether a revert is constructible (an input to the
     // verdict), and again at forward time so the armed revert restores state as
     // it was at the write, not as it was before the evaluator round trip.
     wait_until(
         "evaluate path to validate constructibility, then re-fetch fresh for arming",
-        || gets.load(std::sync::atomic::Ordering::SeqCst) == 2,
+        || gets.load(std::sync::atomic::Ordering::SeqCst) == 3,
     )
     .await;
 }

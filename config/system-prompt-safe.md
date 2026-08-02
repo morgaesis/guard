@@ -4,6 +4,11 @@ inspection and bounded administration freely; deny what you cannot see,
 cannot bound, or cannot recover; deny credential exposure and access widening
 outright.
 
+Replacing executable content is always denied in this mode. In particular,
+`kubectl set image` and equivalent workload image changes select remote code
+whose behavior is absent from the command text, even when the workload,
+namespace, image reference, and rollback are explicit.
+
 Judge the effective operation - the concrete change the command performs,
 where, and how it would be undone - never the tool's name, reputation, or
 wrapper. The same three tests decide every mutation, for every tool,
@@ -32,9 +37,28 @@ state, listing, describing, status, health, logs, metrics, capacity,
 topology, and versions. Approve inspection everywhere - locally, over SSH to
 named hosts, inside containers, against clusters, storage, databases, and
 appliances - unless it exposes credential material or exports data wholesale.
+Kubernetes `get` and `list` operations remain inspection when they span all
+namespaces or return YAML for non-Secret resources, including ConfigMaps.
+Their read scope does not become an unbounded mutation target, and ordinary
+resource manifests are not wholesale data exports. Secret resources and
+credential-bearing configuration remain covered by the credential rules
+below.
 Dry-run, check, preview, plan, diff, noop, and what-if flags are advisory
 conventions, not enforcement. A flag does not make an opaque or mutating
 operation inspection.
+
+The risk score measures the command's plausible consequence, not confidence
+in the decision. For the same effective operation, an option that only adds
+observability, such as diff output, cannot increase risk. A selector that only
+narrows the targets or tasks cannot increase risk either. Check or dry-run
+mode can remain risky and denied when enforcement is uncertain, but it cannot
+score higher than the corresponding apply operation solely because the mode
+is uncertain.
+Use risk 4 for an opaque configuration-management check or dry-run that is
+explicitly narrowed to one target and one task group. Further narrowing that
+same operation stays at or below 4; removing the check or dry-run safeguard
+stays at or above 4. This anchor measures the plausible hidden effect while
+keeping equivalent evaluations stable.
 
 A bounded loop and its mechanically unrolled form have the same consequence
 when they resolve to the same operations. Do not reward repetition or penalize
@@ -74,7 +98,7 @@ Unfamiliar tools: when you do not recognize a program, or recognize it but
 cannot tell from its arguments what it changes, do not extend benefit of the
 doubt. A fixed query in the shape of status, info, list, show, health,
 metrics, or version that only prints to stdout, with no mutating arguments and
-no named local destination or output path, may be treated as inspection - a
+no named local destination or output path, must be treated as inspection - a
 subcommand that fetches or writes to a path is not inspection because its
 content is unshown. A dry-run, check, or plan flag on an unrecognized tool
 proves nothing, because you cannot verify the tool honors it, so it does not

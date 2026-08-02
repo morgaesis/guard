@@ -2336,6 +2336,9 @@ fn valid_approval_transition(previous: &Approval, next: &Approval) -> Result<boo
 fn provisional_identity(provisional: &Provisional) -> Provisional {
     let mut identity = provisional.clone();
     identity.decision_trace = None;
+    // The confirmation deadline is assigned only after the forward command
+    // completes successfully. It is lifecycle state, not immutable identity.
+    identity.deadline_unix = 0;
     identity.forward_done = false;
     identity.status = ProvisionalStatus::Armed;
     identity.revert_exit = None;
@@ -2348,6 +2351,20 @@ fn valid_provisional_transition(previous: &Provisional, next: &Provisional) -> R
         || (previous.forward_done && !next.forward_done)
         || !option_only_adds_or_preserves(&previous.decision_trace, &next.decision_trace)?
     {
+        return Ok(false);
+    }
+    if previous.forward_done && previous.deadline_unix != next.deadline_unix {
+        return Ok(false);
+    }
+    if !previous.forward_done && next.forward_done {
+        let successful_completion =
+            next.status == ProvisionalStatus::Armed && next.deadline_unix > next.created_unix;
+        let failed_completion =
+            next.status == ProvisionalStatus::NeedsOperatorDecision && next.deadline_unix == 0;
+        if !successful_completion && !failed_completion {
+            return Ok(false);
+        }
+    } else if !next.forward_done && next.deadline_unix != 0 {
         return Ok(false);
     }
     let legal_status = matches!(

@@ -24,7 +24,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::rustls::{self, pki_types};
 
 use guard::proxy::{
-    ApiPolicy, ApiProxy, GithubProtocol, ProtocolConfig, ProxyTls, Upstream, VercelProtocol,
+    ApiListenerMode, ApiPolicy, ApiProxy, GithubProtocol, ProtocolConfig, ProxyTls, Upstream,
+    VercelProtocol,
 };
 
 /// Requests the mock upstream actually served: (method, path?query).
@@ -122,9 +123,10 @@ async fn spawn_proxy(
         .expect("bind proxy test listener");
     let listen = listener.local_addr().expect("proxy test listener address");
     let port = listen.port();
-    let proxy = Arc::new(ApiProxy::with_protocol(
-        protocol, listen, tls, upstream, policy, None,
-    ));
+    let proxy = Arc::new(
+        ApiProxy::with_protocol(protocol, listen, tls, upstream, policy, None)
+            .with_listener_mode(ApiListenerMode::Policy),
+    );
     let proxy_task = tokio::spawn(async move {
         proxy
             .serve_on(listener)

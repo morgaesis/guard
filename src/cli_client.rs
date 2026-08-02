@@ -1,8 +1,8 @@
 use super::{
     color_enabled_for_stderr, color_enabled_for_stdout, format_timestamp, paint, print_json,
-    AccessCommands, AnsiColor, ApiCommands, ConfigCommands, McpCommands, VerbCommands,
-    VerbCoverageCommands, EXIT_GUARD_ACCESS_DECISION_FAILED, EXIT_GUARD_DENIED, EXIT_GUARD_ERROR,
-    EXIT_GUARD_HELD, JSON_SCHEMA_VERSION,
+    AccessCommands, AnsiColor, ApiCommands, ApprovalCommands, ConfigCommands, McpCommands,
+    VerbCommands, VerbCoverageCommands, EXIT_GUARD_ACCESS_DECISION_FAILED, EXIT_GUARD_DENIED,
+    EXIT_GUARD_ERROR, EXIT_GUARD_HELD, JSON_SCHEMA_VERSION,
 };
 use crate::{client_config, daemon_client, defaults, mcp, server};
 use anyhow::{Context, Result};
@@ -241,12 +241,6 @@ pub(crate) async fn run_exec(
     if let Some(token) = config.auth_token {
         client = client.with_auth(token);
     }
-    if let Ok(session) = std::env::var("GUARD_SESSION") {
-        if !session.is_empty() {
-            client = client.with_session(session);
-        }
-    }
-
     tracing::info!(
         binary = %binary,
         endpoint = %client.endpoint_for_log(),
@@ -300,7 +294,7 @@ pub(crate) async fn run_exec(
             let color = color_enabled_for_stderr();
             let handle = resp.handle.clone().unwrap_or_default();
             eprintln!(
-                "{} for daemon-principal approval: {}",
+                "{} for operator approval: {}",
                 paint("HELD", AnsiColor::Yellow, color),
                 resp.reason
             );
@@ -330,6 +324,7 @@ pub(crate) async fn run_exec(
             );
             eprintln!("  handle:  {}", handle);
             eprintln!("  confirm: guard confirm {}", handle);
+            eprintln!("  inspect: guard provisionals");
             eprintln!("  result:  executed, auto-reverts unless confirmed");
             print_coverage(&resp.coverage);
             if let Some(code) = resp.exit_code {
@@ -530,6 +525,207 @@ pub(crate) async fn handle_provisionals(socket: Option<String>, json: bool) -> R
             eprintln!("unexpected response");
             std::process::exit(1);
         }
+    }
+}
+
+fn render_approval(item: &server::ApprovalSummary, include_transcript: bool) {
+    println!(
+        "[{}] handle={} cmd={:?} deadline={} reason={:?}",
+        item.status,
+        item.handle,
+        item.command,
+        format_timestamp(item.deadline_unix),
+        item.decided_reason.as_deref().unwrap_or(&item.reason),
+    );
+    if include_transcript {
+        if let Some(stdout) = item.stdout.as_deref() {
+            print!("{stdout}");
+            if item.stdout_truncated {
+                println!("[guard stdout transcript truncated]");
+            }
+        }
+        if let Some(stderr) = item.stderr.as_deref() {
+            eprint!("{stderr}");
+            if item.stderr_truncated {
+                eprintln!("[guard stderr transcript truncated]");
+            }
+        }
+        if let Some(exit_code) = item.exit_code {
+            println!("exit_code={exit_code}");
+        }
+    }
+}
+
+pub(crate) async fn handle_approval(command: ApprovalCommands) -> Result<()> {
+    let (socket, request, json, include_transcript) = match command {
+        ApprovalCommands::List { socket, json } => {
+            (socket, server::AdminRequest::ApprovalList, json, false)
+        }
+        ApprovalCommands::Show {
+            handle,
+            socket,
+            json,
+        } => (
+            socket,
+            server::AdminRequest::ApprovalShow { handle },
+            json,
+            true,
+        ),
+        ApprovalCommands::Note {
+            handle,
+            text,
+            socket,
+            json,
+        } => (
+            socket,
+            server::AdminRequest::ApprovalNote { handle, text },
+            json,
+            true,
+        ),
+        ApprovalCommands::Withdraw {
+            handle,
+            socket,
+            json,
+        } => (
+            socket,
+            server::AdminRequest::ApprovalWithdraw { handle },
+            json,
+            false,
+        ),
+    };
+    let (client, source) = gate_client(socket, json)?;
+    let response = client
+        .send_admin(request)
+        .await
+        .map_err(|error| describe_connect_failure(error, &client, source))?;
+    match response {
+        server::AdminResponse::Approvals { items } => {
+            if json {
+                return print_json(&serde_json::json!({
+                    "schema_version": JSON_SCHEMA_VERSION,
+                    "type": "approval_list",
+                    "items": items,
+                }));
+            }
+            if items.is_empty() {
+                println!("(no held commands)");
+            }
+            for item in &items {
+                render_approval(item, false);
+            }
+            Ok(())
+        }
+        server::AdminResponse::ApprovalShow { item } => {
+            if json {
+                return print_json(&serde_json::json!({
+                    "schema_version": JSON_SCHEMA_VERSION,
+                    "type": "approval",
+                    "item": item,
+                }));
+            }
+            render_approval(&item, include_transcript);
+            Ok(())
+        }
+        server::AdminResponse::GateAction { message, .. } => {
+            if json {
+                return print_json(&serde_json::json!({
+                    "schema_version": JSON_SCHEMA_VERSION,
+                    "type": "approval_withdrawal",
+                    "message": message,
+                }));
+            }
+            println!("{message}");
+            Ok(())
+        }
+        server::AdminResponse::Error { message } => anyhow::bail!(message),
+        _ => anyhow::bail!("unexpected response from guard daemon"),
+    }
+}
+
+fn resume_json_response(
+    handle: &str,
+    message: &str,
+    exit_code: Option<i32>,
+    stdout: Option<&str>,
+    stderr: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": JSON_SCHEMA_VERSION,
+        "type": "resume_result",
+        "handle": handle,
+        "message": message,
+        "exit_code": exit_code,
+        "stdout": stdout,
+        "stderr": stderr,
+    })
+}
+
+/// Resume one held command as the kernel-authenticated requester and render its
+/// captured output and exit status.
+pub(crate) async fn handle_resume(
+    socket: Option<String>,
+    handle: String,
+    json: bool,
+) -> Result<()> {
+    let config = load_client_config(json)?;
+    let (socket_path, tcp_port, source) = resolve_client_endpoint_with_source(socket, &config);
+    let mut client = daemon_client::Client::new(socket_path, tcp_port);
+    if let Some(token) = config.auth_token {
+        client = client.with_auth(token);
+    }
+    let response = client
+        .send_admin(server::AdminRequest::Resume {
+            handle: handle.clone(),
+        })
+        .await
+        .map_err(|error| describe_connect_failure(error, &client, source))?;
+    match response {
+        server::AdminResponse::GateAction {
+            message,
+            exit_code,
+            stdout,
+            stderr,
+        } => {
+            if json {
+                print_json(&resume_json_response(
+                    &handle,
+                    &message,
+                    exit_code,
+                    stdout.as_deref(),
+                    stderr.as_deref(),
+                ))?;
+            } else {
+                if let Some(stdout) = stdout.as_deref() {
+                    print!("{stdout}");
+                    std::io::stdout().flush()?;
+                }
+                if let Some(stderr) = stderr.as_deref() {
+                    eprint!("{stderr}");
+                    if !stderr.ends_with('\n') {
+                        eprintln!();
+                    }
+                }
+                match exit_code {
+                    Some(code) => eprintln!("exit status: {code}"),
+                    None => eprintln!("exit status: unavailable"),
+                }
+            }
+            if let Some(code) = exit_code.filter(|code| *code != 0) {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        server::AdminResponse::Error { message } if json => {
+            print_json(&serde_json::json!({
+                "schema_version": JSON_SCHEMA_VERSION,
+                "type": "resume_error",
+                "handle": handle,
+                "error": message,
+            }))?;
+            std::process::exit(EXIT_GUARD_ERROR);
+        }
+        server::AdminResponse::Error { message } => Err(anyhow::anyhow!(message)),
+        other => Err(anyhow::anyhow!("unexpected admin response: {other:?}")),
     }
 }
 
@@ -770,6 +966,72 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                 other => Err(anyhow::anyhow!("unexpected admin response: {other:?}")),
             }
         }
+        VerbCommands::Amend {
+            name,
+            file,
+            socket,
+            json,
+        } => {
+            let yaml = std::fs::read_to_string(&file)
+                .with_context(|| format!("failed to read verb file {}", file.display()))?;
+            let replacement: guard::gating::verb::Verb = serde_yaml_ng::from_str(&yaml)
+                .with_context(|| {
+                    format!("failed to parse {} as one verb definition", file.display())
+                })?;
+            if replacement.name != name {
+                anyhow::bail!(
+                    "verb file names '{}', but amend targets '{}'; the name must be preserved",
+                    replacement.name,
+                    name
+                );
+            }
+
+            let (client, source) = gate_client(socket, json)?;
+            let current = client
+                .send_admin(server::AdminRequest::VerbShow { name: name.clone() })
+                .await
+                .map_err(|error| describe_connect_failure(error, &client, source))?;
+            let server::AdminResponse::VerbCreated { verb: current, .. } = current else {
+                return match current {
+                    server::AdminResponse::Error { message } => Err(anyhow::anyhow!(message)),
+                    other => Err(anyhow::anyhow!("unexpected admin response: {other:?}")),
+                };
+            };
+            let expected_digest = current.definition_digest();
+            let response = client
+                .send_admin(server::AdminRequest::VerbAmend {
+                    name,
+                    expected_digest,
+                    replacement: Box::new(replacement),
+                })
+                .await
+                .map_err(|error| describe_connect_failure(error, &client, source))?;
+            match response {
+                server::AdminResponse::VerbAmended {
+                    verb,
+                    previous_digest,
+                    digest,
+                } => {
+                    if json {
+                        print_json(&serde_json::json!({
+                            "schema_version": JSON_SCHEMA_VERSION,
+                            "type": "verb_amended",
+                            "previous_digest": previous_digest,
+                            "digest": digest,
+                            "verb": verb,
+                        }))
+                    } else {
+                        println!(
+                            "Amended verb '{}' ({} -> {}).",
+                            verb.name, previous_digest, digest
+                        );
+                        Ok(())
+                    }
+                }
+                server::AdminResponse::Error { message } => Err(anyhow::anyhow!(message)),
+                other => Err(anyhow::anyhow!("unexpected admin response: {other:?}")),
+            }
+        }
         VerbCommands::Run {
             name,
             params,
@@ -793,11 +1055,6 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
                 .with_gating(None, confirm_within, false, wait_approval);
             if let Some(token) = config.auth_token {
                 client = client.with_auth(token);
-            }
-            if let Ok(session) = std::env::var("GUARD_SESSION") {
-                if !session.is_empty() {
-                    client = client.with_session(session);
-                }
             }
             // Verb binary/args are rendered server-side; the client sends empty.
             let mut streamed = false;
@@ -863,10 +1120,7 @@ pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
             let config = load_client_config(json)?;
             let (socket_path, tcp_port, source) =
                 resolve_client_endpoint_with_source(socket, &config);
-            let mut client = daemon_client::Client::new(socket_path, tcp_port);
-            if let Some(token) = config.auth_token.clone() {
-                client = client.with_auth(token);
-            }
+            let client = admin_client(socket_path, tcp_port, &config);
             if let Some(reference) = from_preview {
                 let response = client
                     .send_admin(server::AdminRequest::VerbCreateFromPreview { digest: reference })
@@ -1211,6 +1465,15 @@ pub(crate) async fn handle_access(command: AccessCommands) -> Result<()> {
             socket,
             json,
         } => (socket, server::AdminRequest::AccessShow { reference }, json),
+        AccessCommands::Status {
+            reference,
+            socket,
+            json,
+        } => (
+            socket,
+            server::AdminRequest::AccessStatus { reference },
+            json,
+        ),
     };
     let config = load_client_config(json)?;
     let (socket_path, tcp_port, source) = resolve_client_endpoint_with_source(socket, &config);
@@ -1274,6 +1537,14 @@ pub(crate) async fn handle_access(command: AccessCommands) -> Result<()> {
         server::AdminResponse::AccessDecisions { items } => {
             print_access_decision_lines(&items);
         }
+        server::AdminResponse::SessionStatus {
+            report,
+            approvals,
+            provisionals,
+            requests,
+        } => {
+            render_access_status(&report, &approvals, &provisionals, &requests);
+        }
         server::AdminResponse::Error { message } => anyhow::bail!(message),
         other => anyhow::bail!("unexpected access response: {other:?}"),
     }
@@ -1296,6 +1567,7 @@ fn access_json_response(response: &server::AdminResponse) -> Result<serde_json::
         server::AdminResponse::AccessItems { .. } => "access_list",
         server::AdminResponse::AccessItem { .. } => "access_item",
         server::AdminResponse::AccessDecisions { .. } => "access_decisions",
+        server::AdminResponse::SessionStatus { .. } => "access_status",
         server::AdminResponse::Error { message } => return Err(message.clone()),
         other => return Err(format!("unexpected access response: {other:?}")),
     };
@@ -1304,6 +1576,77 @@ fn access_json_response(response: &server::AdminResponse) -> Result<serde_json::
         "type": kind,
         "response": response,
     }))
+}
+
+fn render_access_status(
+    report: &crate::session::SessionReport,
+    approvals: &[server::ApprovalSummary],
+    provisionals: &[server::ProvisionalSummary],
+    requests: &[crate::grant_profile::GrantRequest],
+) {
+    println!("access session status");
+    if let Some(active) = &report.active {
+        println!(
+            "  session: {}",
+            active.scope.label.as_deref().unwrap_or("(unlabeled)")
+        );
+        println!(
+            "  expiry: {}",
+            active
+                .expires_at
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        );
+        println!("  owner: {:?}", active.owner);
+        println!(
+            "  verbs: {}",
+            if active.activated_verbs.is_empty() {
+                "(none)".to_string()
+            } else {
+                active.activated_verbs.join(",")
+            }
+        );
+    }
+    println!(
+        "  activity: total={} allowed={} denied={} completed={} failed={} held={}",
+        report.stats.total,
+        report.stats.allowed,
+        report.stats.denied,
+        report.stats.completed,
+        report.stats.exec_failed,
+        report.stats.holds,
+    );
+    println!(
+        "  related: requests={} approvals={} provisionals={} recent={}",
+        requests.len(),
+        approvals.len(),
+        provisionals.len(),
+        report.recent.len(),
+    );
+    for interaction in &report.recent {
+        println!(
+            "  [{}] allowed={} source={} status={:?} command={:?} reason={:?}",
+            interaction.at_unix,
+            interaction.allowed,
+            interaction.source.as_str(),
+            interaction.exec_status,
+            interaction.command,
+            interaction.reason,
+        );
+    }
+    for approval in approvals {
+        render_approval(approval, true);
+    }
+    for provisional in provisionals {
+        println!(
+            "[{}] handle={} cmd={:?} deadline={} reason={:?}",
+            provisional.status,
+            provisional.handle,
+            provisional.command,
+            format_timestamp(provisional.deadline_unix),
+            provisional.reason,
+        );
+    }
 }
 
 fn any_decision_failed(items: &[server::AccessDecisionResult]) -> bool {
@@ -1728,7 +2071,7 @@ fn render_gated_response(
             let color = color_enabled_for_stderr();
             let handle = resp.handle.clone().unwrap_or_default();
             eprintln!(
-                "{} for daemon-principal approval: {}",
+                "{} for operator approval: {}",
                 paint("HELD", AnsiColor::Yellow, color),
                 resp.reason
             );
@@ -1757,6 +2100,7 @@ fn render_gated_response(
             );
             eprintln!("  handle:  {}", handle);
             eprintln!("  confirm: guard confirm {}", handle);
+            eprintln!("  inspect: guard provisionals");
             eprintln!("  result:  executed, auto-reverts unless confirmed");
             print_coverage(&resp.coverage);
             if let Some(code) = resp.exit_code {
@@ -1871,7 +2215,6 @@ pub(crate) async fn run_mcp(subcommand: McpCommands) -> Result<()> {
             let session_token = std::env::var("GUARD_SESSION")
                 .ok()
                 .filter(|value| !value.is_empty());
-
             let http_addr = match http {
                 Some(addr) => Some(
                     addr.parse::<std::net::SocketAddr>()
@@ -2161,8 +2504,8 @@ pub(crate) async fn handle_status(socket: Option<String>, json: bool) -> Result<
         }
     }
 
-    // Try the full Status RPC. Succeeds for daemon-UID Unix callers or
-    // TCP callers with the configured admin token.
+    // Try the full Status RPC. It succeeds only with operator authority for
+    // the active transport.
     match client.send_admin(server::AdminRequest::Status).await {
         Ok(server::AdminResponse::Status { status }) => {
             if json {
@@ -2392,6 +2735,33 @@ mod tests {
         };
         let auth_token = resolve_mcp_daemon_token(&config);
         assert_eq!(auth_token.as_deref(), Some("configured-exec"));
+    }
+
+    #[test]
+    fn verb_mutation_client_carries_the_configured_admin_bearer() {
+        let config = client_config::ClientConfig {
+            admin_token: Some("configured-admin".to_string()),
+            ..Default::default()
+        };
+        let client = admin_client(None, Some(7331), &config);
+        assert!(client.has_admin_token());
+    }
+
+    #[test]
+    fn resume_json_shape_contains_the_execution_result() {
+        let document = resume_json_response(
+            "hold-1",
+            "resumed",
+            Some(7),
+            Some("saved stdout"),
+            Some("saved stderr"),
+        );
+        assert_eq!(document["schema_version"], JSON_SCHEMA_VERSION);
+        assert_eq!(document["type"], "resume_result");
+        assert_eq!(document["handle"], "hold-1");
+        assert_eq!(document["exit_code"], 7);
+        assert_eq!(document["stdout"], "saved stdout");
+        assert_eq!(document["stderr"], "saved stderr");
     }
 
     #[test]

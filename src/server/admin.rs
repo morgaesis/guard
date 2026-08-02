@@ -4,17 +4,17 @@ use crate::grant_profile::{
 use crate::secrets::legacy_sentinel;
 use crate::session::{
     session_reference, IssuedGrantScope, SessionGrant, SessionGrantSummary, SessionOwner,
-    SessionRegistry,
+    SessionRegistry, SessionReport,
 };
 #[cfg(test)]
 use crate::session::{
     HistoricalGrant, SessionAmendment, SessionDecision, SessionDecisionSource, SessionExecStatus,
-    SessionInteraction, SessionReport,
+    SessionInteraction,
 };
 use guard::audit::{AuditEvent, AuditKind};
-use guard::gating::verb::Verb;
 #[cfg(test)]
 use guard::gating::verb::{CoverageAction, CoverageProbe, CoverageProvenance, VerbCoverageCell};
+use guard::gating::verb::{Verb, VerbCatalog};
 use guard::principal::{scope_eq, PrincipalKey};
 #[cfg(test)]
 use guard::redact::redact_output;
@@ -28,7 +28,7 @@ use super::execute::{
 };
 use super::gate_runtime::{
     finish_revert, forget_proxy_provenance, is_api_proxy_sentinel, now_unix, persist_approval,
-    remove_revert_body,
+    remove_revert_body, resume_approval,
 };
 #[cfg(test)]
 use super::learning::{
@@ -37,10 +37,11 @@ use super::learning::{
 };
 use super::runtime::NotifyEvent;
 use super::wire::{
-    authorize_session_use, verb_effective_trust, AccessCapability, AccessDecisionResult,
-    AccessItem, AdminRequest, AdminResponse, ApprovalSummary, CallerIdentity, ExecOutcome,
-    ProvisionalSummary, SecretDetail, ServerStatus, SessionAuthz, VerbMenuItem, VerbSummary,
-    SESSION_PRINCIPAL_MISMATCH, SESSION_UNOWNED_REFUSED,
+    approval_is_armed, authorize_session_use, verb_effective_trust, AccessCapability,
+    AccessDecisionResult, AccessItem, AdminRequest, AdminResponse, ApprovalSummary, CallerIdentity,
+    ExecOutcome, ExecuteRequest, ProvisionalSummary, SecretDetail, ServerStatus, SessionAuthz,
+    VerbInvocation, VerbMenuItem, VerbSummary, APPROVAL_ARMED_REASON, SESSION_PRINCIPAL_MISMATCH,
+    SESSION_UNOWNED_REFUSED,
 };
 use super::{is_valid_secret_key, ServerContext};
 use guard::gating::approval::{Approval, ApprovalStatus};
@@ -1270,6 +1271,8 @@ async fn access_item_for_approval(server: &ServerContext, approval: &Approval) -
         approval.status == ApprovalStatus::Pending && now_unix() >= approval.deadline_unix();
     let projected_state = if projected_expired {
         "expired"
+    } else if approval_is_armed(approval) {
+        "armed"
     } else {
         approval.status.as_str()
     };
@@ -1323,7 +1326,10 @@ async fn access_item_for_approval(server: &ServerContext, approval: &Approval) -
         effective_scope: scope.clone(),
         expires_unix,
         remaining_uses,
-        use_policy: if approval.status == ApprovalStatus::Pending && !projected_expired {
+        use_policy: if approval.status == ApprovalStatus::Pending
+            && !projected_expired
+            && !approval_is_armed(approval)
+        {
             "unselected"
         } else {
             access_use_policy(grant_uses)
@@ -1331,7 +1337,10 @@ async fn access_item_for_approval(server: &ServerContext, approval: &Approval) -
         .to_string(),
         state: projected_state.to_string(),
         next_action: format!("guard access show {}", approval.handle),
-        approval_options: if approval.status == ApprovalStatus::Pending && !projected_expired {
+        approval_options: if approval.status == ApprovalStatus::Pending
+            && !projected_expired
+            && !approval_is_armed(approval)
+        {
             vec![format!("guard access approve {} --once", approval.handle)]
         } else {
             Vec::new()
@@ -2297,6 +2306,18 @@ async fn approve_held_access(
             message: "unknown access request".to_string(),
         };
     };
+    if approval_is_armed(&approval) {
+        let item = access_item_for_approval(server, &approval).await;
+        return AccessDecisionResult {
+            request: handle.to_string(),
+            success: false,
+            state: "armed".to_string(),
+            target: Some(item.target),
+            remaining_uses: item.remaining_uses,
+            use_policy: item.use_policy,
+            message: "held request is already armed for requester resume".to_string(),
+        };
+    }
     if approval.status != ApprovalStatus::Pending {
         let item = access_item_for_approval(server, &approval).await;
         return AccessDecisionResult {
@@ -2450,38 +2471,8 @@ async fn approve_held_access(
         }
     };
 
-    let snapshot = match claim_approval(server, handle).await {
-        Ok(snapshot) => snapshot,
-        Err(AdminResponse::Error { message }) => {
-            return AccessDecisionResult {
-                request: handle.to_string(),
-                success: false,
-                state: "error".to_string(),
-                target: originating_access_token
-                    .as_deref()
-                    .map(session_reference)
-                    .or_else(|| Some(format!("agent:{requester}"))),
-                remaining_uses: None,
-                use_policy: "unavailable".to_string(),
-                message,
-            };
-        }
-        Err(_) => unreachable!("claim errors use the error response"),
-    };
+    let response = arm_held_command(server, caller, approval).await;
     drop(transition);
-    let response = handle_approve_claimed(server, caller, handle, snapshot).await;
-    let final_status = server
-        .state
-        .approvals
-        .read()
-        .await
-        .get(handle)
-        .map(|item| item.status)
-        .unwrap_or(ApprovalStatus::ExecFailed);
-    let message = match response {
-        AdminResponse::GateAction { message, .. } | AdminResponse::Error { message } => message,
-        _ => "unexpected held access response".to_string(),
-    };
     let aggregate = match originating_access_token.as_deref() {
         Some(token) => server
             .state
@@ -2491,10 +2482,19 @@ async fn approve_held_access(
             .aggregate_access_uses(token),
         None => None,
     };
+    let (success, state, message) = match response {
+        AdminResponse::GateAction { message, .. } => (true, "armed", message),
+        AdminResponse::Error { message } => (false, "error", message),
+        _ => (
+            false,
+            "error",
+            "unexpected held access response".to_string(),
+        ),
+    };
     AccessDecisionResult {
         request: handle.to_string(),
-        success: final_status == ApprovalStatus::Approved,
-        state: final_status.as_str().to_string(),
+        success,
+        state: state.to_string(),
         target: originating_access_token
             .as_deref()
             .map(session_reference)
@@ -2612,6 +2612,7 @@ fn stamp_generated_verb(
         inventory: None,
         namespace: None,
         fanout: None,
+        cwd: None,
         environment: Vec::new(),
         override_marker: None,
         sticky: false,
@@ -2797,7 +2798,6 @@ fn redact_historical_grant_for_list(grant: &mut HistoricalGrant, admin: bool, ca
 /// Mask the raw bearer token in a session report shown to its own holder. The
 /// grant contents (rules, prompt, stats) are intentionally left intact for
 /// self-diagnosis; only the token string is hidden so it is not echoed back.
-#[cfg(test)]
 fn mask_session_report_token(report: &mut SessionReport) {
     if let Some(active) = &mut report.active {
         active.token = "(current)".to_string();
@@ -3219,6 +3219,108 @@ async fn show_access_item(
                 message: format!("access target '{reference}' is ambiguous"),
             },
         }
+    }
+}
+
+async fn access_session_token(
+    server: &ServerContext,
+    caller: &CallerIdentity,
+    reference: &str,
+) -> Result<String, AdminResponse> {
+    let admin = caller_is_session_admin(server, caller);
+    let principal = caller.principal();
+    let mut candidates = server
+        .state
+        .sessions
+        .read()
+        .await
+        .list()
+        .into_iter()
+        .filter(|summary| {
+            summary.scope.access_managed
+                && (admin
+                    || matches!(
+                        &summary.owner,
+                        SessionOwner::Principal(owner)
+                            if principal.as_ref().is_some_and(|caller| owner.eq_ci(caller))
+                    ))
+        })
+        .filter(|summary| {
+            summary.scope.label.as_deref() == Some(reference)
+                || session_reference(&summary.token) == reference
+        })
+        .map(|summary| summary.token)
+        .collect::<Vec<_>>();
+    candidates.sort();
+    match candidates.as_slice() {
+        [token] => Ok(token.clone()),
+        [] => Err(AdminResponse::Error {
+            message: "unknown or unauthorized access session reference".to_string(),
+        }),
+        _ => Err(AdminResponse::Error {
+            message: format!("access target '{reference}' is ambiguous"),
+        }),
+    }
+}
+
+async fn session_status_response(
+    server: &ServerContext,
+    token: &str,
+    mask_token: bool,
+) -> AdminResponse {
+    let Some(mut report) = server.state.sessions.read().await.show_with_limits(
+        token,
+        20,
+        &server.config.behavior_limits,
+    ) else {
+        return AdminResponse::Error {
+            message: "access session is no longer active".to_string(),
+        };
+    };
+    if mask_token {
+        mask_session_report_token(&mut report);
+    }
+    report.redact_credentials();
+    let fingerprint = audit_session_fingerprint(Some(token));
+    let approvals = server
+        .state
+        .approvals
+        .read()
+        .await
+        .list()
+        .iter()
+        .filter(|approval| {
+            approval.snapshot.session_fingerprint.as_deref() == Some(fingerprint.as_str())
+        })
+        .map(ApprovalSummary::from_row)
+        .collect();
+    let provisionals = server
+        .state
+        .provisional
+        .read()
+        .await
+        .list()
+        .iter()
+        .filter(|provisional| {
+            provisional.session_fingerprint.as_deref() == Some(fingerprint.as_str())
+        })
+        .map(ProvisionalSummary::from_row)
+        .collect();
+    let requests = server
+        .state
+        .grant_requests
+        .read()
+        .await
+        .values()
+        .filter(|request| request.session_token == token)
+        .cloned()
+        .map(redact_grant_request)
+        .collect();
+    AdminResponse::SessionStatus {
+        report,
+        approvals,
+        provisionals,
+        requests,
     }
 }
 
@@ -3994,6 +4096,7 @@ pub(super) async fn handle_admin_request(
         AdminRequest::Confirm { handle } => handle_confirm(server, caller, &handle).await,
         AdminRequest::Revert { handle } => handle_manual_revert(server, caller, &handle).await,
         AdminRequest::Approve { handle } => handle_approve(server, caller, &handle).await,
+        AdminRequest::Resume { handle } => handle_resume(server, caller, &handle).await,
         AdminRequest::Deny { handle } => {
             handle_deny(server, caller, &handle, "operator denied").await
         }
@@ -4045,6 +4148,9 @@ pub(super) async fn handle_admin_request(
         AdminRequest::ApprovalNote { handle, text } => {
             handle_approval_note(server, caller, &handle, &text).await
         }
+        AdminRequest::ApprovalWithdraw { handle } => {
+            handle_approval_withdraw(server, caller, &handle).await
+        }
         AdminRequest::VerbList => {
             let mut cat = server.state.verbs.write().await;
             if let Err(e) = cat.reload_if_stale() {
@@ -4068,7 +4174,7 @@ pub(super) async fn handle_admin_request(
                         params: v
                             .params
                             .iter()
-                            .map(|(k, spec)| (k.clone(), spec.pattern.clone()))
+                            .map(|(k, spec)| (k.clone(), spec.pattern_text().to_string()))
                             .collect(),
                         auto_promoted: v.auto_promoted,
                         evidence: v.evidence.clone(),
@@ -4160,11 +4266,20 @@ pub(super) async fn handle_admin_request(
                     message: format!("synthesized verb rejected by the safety gate: {e}"),
                 };
             }
-            let mut cat = server.state.verbs.write().await;
+            if let Err(error) = server.state.verbs.read().await.validate_candidate(&verb) {
+                return AdminResponse::Error {
+                    message: format!("synthesized verb rejected by validation: {error}"),
+                };
+            }
+            if !preview {
+                if let Err(message) = preflight_synthesized_verb(server, caller, &verb).await {
+                    return AdminResponse::Error { message };
+                }
+            }
             let result = if preview {
-                cat.validate_candidate(&verb)
+                Ok(())
             } else {
-                cat.append_verb(&verb)
+                server.state.verbs.write().await.append_verb(&verb)
             };
             match result {
                 Ok(()) => {
@@ -4216,6 +4331,14 @@ pub(super) async fn handle_admin_request(
                     message: format!("previewed verb rejected by the safety gate: {e}"),
                 };
             }
+            if let Err(error) = server.state.verbs.read().await.validate_candidate(&verb) {
+                return AdminResponse::Error {
+                    message: format!("previewed verb rejected by validation: {error}"),
+                };
+            }
+            if let Err(message) = preflight_synthesized_verb(server, caller, &verb).await {
+                return AdminResponse::Error { message };
+            }
             let result = server.state.verbs.write().await.append_verb(&verb);
             match result {
                 Ok(()) => {
@@ -4240,6 +4363,37 @@ pub(super) async fn handle_admin_request(
                 }
                 Err(e) => AdminResponse::Error {
                     message: format!("previewed verb rejected by validation: {e}"),
+                },
+            }
+        }
+        AdminRequest::VerbAmend {
+            name,
+            expected_digest,
+            replacement,
+        } => {
+            let new_digest = replacement.definition_digest();
+            let result = server.state.verbs.write().await.amend_verb_if_digest(
+                &name,
+                &expected_digest,
+                &replacement,
+            );
+            match result {
+                Ok(previous) => {
+                    debug_assert_eq!(previous.definition_digest(), expected_digest);
+                    server.emit_audit_ungated(
+                        AuditEvent::new(AuditKind::VerbAmended)
+                            .field("name", &name)
+                            .field("previous_digest", &expected_digest)
+                            .field("digest", &new_digest),
+                    );
+                    AdminResponse::VerbAmended {
+                        verb: *replacement,
+                        previous_digest: expected_digest,
+                        digest: new_digest,
+                    }
+                }
+                Err(error) => AdminResponse::Error {
+                    message: format!("verb amend rejected: {error}"),
                 },
             }
         }
@@ -5041,6 +5195,13 @@ pub(super) async fn handle_admin_request(
         AdminRequest::AccessShow { reference } => {
             Box::pin(show_access_item(server, caller, &reference)).await
         }
+        AdminRequest::AccessStatus { reference } => {
+            let token = match Box::pin(access_session_token(server, caller, &reference)).await {
+                Ok(token) => token,
+                Err(response) => return response,
+            };
+            Box::pin(session_status_response(server, &token, true)).await
+        }
         AdminRequest::EvaluateBatch {
             session_token,
             caller_token,
@@ -5155,6 +5316,88 @@ pub(super) async fn handle_admin_request(
             AdminResponse::EvaluationBatch { items }
         }
     }
+}
+
+async fn preflight_synthesized_verb(
+    server: &ServerContext,
+    caller: &CallerIdentity,
+    verb: &Verb,
+) -> Result<(), String> {
+    let parameter_sets = verb.finite_parameter_sets().ok_or_else(|| {
+        format!(
+            "synthesized verb admission preflight is incomplete: '{}' has a non-finite parameter pattern or more than 64 rendered candidates; enumerate bounded values before storage",
+            verb.name
+        )
+    })?;
+    let catalog = VerbCatalog::for_admission_preview(verb).map_err(|error| {
+        format!("synthesized verb rejected before admission preflight: {error}")
+    })?;
+
+    // Use the production admission pipeline with execution disabled and every
+    // authority-bearing registry isolated. The candidate is baseline only in
+    // this clone, which forces its untrusted typed coverage through evaluator
+    // admission without granting a live session or mutating the real catalog.
+    let mut preview = server.clone();
+    preview.config.dry_run = true;
+    preview.config.admission_preview = true;
+    preview.config.gate = guard::gating::GateMode::Consequence;
+    preview.state.session_store = None;
+    preview.state.sessions = std::sync::Arc::new(tokio::sync::RwLock::new(SessionRegistry::new()));
+    preview.state.verbs = std::sync::Arc::new(tokio::sync::RwLock::new(catalog));
+    preview.state.saved_grants = std::sync::Arc::new(tokio::sync::RwLock::new(
+        server.state.saved_grants.read().await.clone(),
+    ));
+    preview.state.grant_requests =
+        std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::BTreeMap::new()));
+    preview.state.grant_request_transition_gate = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+    preview.state.provisional = std::sync::Arc::new(tokio::sync::RwLock::new(
+        guard::gating::provisional::ProvisionalRegistry::new(),
+    ));
+    preview.state.approvals = std::sync::Arc::new(tokio::sync::RwLock::new(
+        guard::gating::approval::ApprovalRegistry::new(),
+    ));
+    preview.state.read_grants = std::sync::Arc::new(tokio::sync::RwLock::new(
+        guard::gating::read_grant::GrantReadRegistry::new(),
+    ));
+    preview.state.notify_hook = None;
+
+    for (index, params) in parameter_sets.into_iter().enumerate() {
+        let response = super::execute::execute_command(
+            ExecuteRequest {
+                binary: String::new(),
+                args: Vec::new(),
+                auth_token: None,
+                env: Default::default(),
+                secrets: Default::default(),
+                secret_files: Default::default(),
+                stream: false,
+                session_token: None,
+                revert: None,
+                confirm_within_secs: None,
+                require_approval: None,
+                wait_approval_secs: None,
+                verb: Some(VerbInvocation {
+                    name: verb.name.clone(),
+                    params,
+                }),
+                reevaluate: true,
+                ssh_hostkey: None,
+                cwd: None,
+            },
+            &preview,
+            caller,
+        )
+        .await
+        .into_response();
+        if !response.allowed {
+            return Err(format!(
+                "synthesized verb rejected by admission preflight for rendered candidate {}: {}",
+                index + 1,
+                response.reason
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Collapse runs of whitespace (incl. newlines) to single spaces, so prose and
@@ -6023,6 +6266,105 @@ fn held_verb_staleness(
     }
 }
 
+/// Persist an operator decision without executing the held command. The row
+/// remains `Pending` for storage compatibility, while `decided_reason` carries
+/// the durable arm marker consumed by the requester-only resume path.
+async fn arm_held_command(
+    server: &ServerContext,
+    caller: &CallerIdentity,
+    approval: Approval,
+) -> AdminResponse {
+    let handle = approval.handle.clone();
+    if approval_is_armed(&approval) {
+        return AdminResponse::Error {
+            message: format!("held command {handle} is already armed for requester resume"),
+        };
+    }
+    if approval.status != ApprovalStatus::Pending {
+        return AdminResponse::Error {
+            message: format!(
+                "held command {handle} is already {}",
+                approval.status.as_str()
+            ),
+        };
+    }
+    let now = now_unix();
+    if now >= approval.deadline_unix() {
+        let mut expired = approval.clone();
+        expired.status = ApprovalStatus::Expired;
+        expired.decided_unix = Some(now);
+        expired.decided_reason = Some("expired without operator approval".to_string());
+        return match commit_terminal_approval(server, approval, expired).await {
+            Ok(()) => AdminResponse::Error {
+                message: "expired without operator approval".to_string(),
+            },
+            Err(message) => AdminResponse::Error { message },
+        };
+    }
+    if let Some(verb_name) = approval.snapshot.verb_name.as_deref() {
+        let catalog = server.state.verbs.read().await;
+        if let Some(staleness) = held_verb_staleness(&approval.snapshot, verb_name, &catalog) {
+            let message = format!(
+                "{}; held approval voided, re-issue the command",
+                staleness.clause(verb_name)
+            );
+            drop(catalog);
+            let mut voided = approval.clone();
+            voided.status = ApprovalStatus::ExecFailed;
+            voided.decided_unix = Some(now);
+            voided.decided_reason = Some(message.clone());
+            return match commit_terminal_approval(server, approval, voided).await {
+                Ok(()) => AdminResponse::Error { message },
+                Err(message) => AdminResponse::Error { message },
+            };
+        }
+    }
+    if approval.snapshot.principal.is_none() {
+        return AdminResponse::Error {
+            message: "held command has no authenticated requester".to_string(),
+        };
+    }
+    if !server.emit_audit(
+        AuditEvent::new(AuditKind::Approved)
+            .handle(&handle)
+            .caller(caller)
+            .session_fingerprint(
+                approval
+                    .snapshot
+                    .session_fingerprint
+                    .as_deref()
+                    .unwrap_or("none"),
+            )
+            .cmd(approval.snapshot.command_line())
+            .reason("operator armed held command for requester resume"),
+    ) {
+        return AdminResponse::Error {
+            message: super::AUDIT_UNAVAILABLE_REASON.to_string(),
+        };
+    }
+    let mut armed = approval.clone();
+    armed.decided_unix = Some(now);
+    armed.decided_reason = Some(APPROVAL_ARMED_REASON.to_string());
+    if let Err(message) = commit_terminal_approval(server, approval, armed.clone()).await {
+        return AdminResponse::Error { message };
+    }
+    server.emit_event(NotifyEvent {
+        event: "decision_made",
+        at_unix: now,
+        handle: Some(handle.clone()),
+        session_fingerprint: armed.snapshot.session_fingerprint.clone(),
+        reason: Some(APPROVAL_ARMED_REASON.to_string()),
+        status: Some("armed".to_string()),
+        behavior: None,
+    });
+    AdminResponse::GateAction {
+        message: format!("approved held command {handle}; awaiting requester-bound resume"),
+        exit_code: None,
+        stdout: None,
+        stderr: None,
+    }
+}
+
 async fn handle_approve_claimed(
     server: &ServerContext,
     caller: &CallerIdentity,
@@ -6274,12 +6616,52 @@ async fn handle_approve(
     handle: &str,
 ) -> AdminResponse {
     let transition = server.state.grant_request_transition_gate.lock().await;
+    let Some(approval) = server.state.approvals.read().await.get(handle).cloned() else {
+        return AdminResponse::Error {
+            message: format!("no approval with handle '{handle}'"),
+        };
+    };
+    let api_hold = is_api_proxy_sentinel(&approval.snapshot.binary)
+        && matches!(
+            &approval.snapshot.principal,
+            Some(principal) if server.config.daemon_principal.eq_ci(principal)
+        );
+    if !api_hold {
+        return arm_held_command(server, caller, approval).await;
+    }
     let snapshot = match claim_approval(server, handle).await {
         Ok(snapshot) => snapshot,
         Err(response) => return response,
     };
     drop(transition);
     handle_approve_claimed(server, caller, handle, snapshot).await
+}
+
+async fn handle_resume(
+    server: &ServerContext,
+    caller: &CallerIdentity,
+    handle: &str,
+) -> AdminResponse {
+    let result = resume_approval(server, caller, handle).await;
+    match result.exec.clone() {
+        ExecOutcome::Completed {
+            exit_code,
+            stdout,
+            stderr,
+        } => AdminResponse::GateAction {
+            message: format!("resumed held command {handle} (exit {exit_code:?})"),
+            exit_code,
+            stdout,
+            stderr,
+        },
+        ExecOutcome::Failed { reason, .. } => AdminResponse::Error { message: reason },
+        ExecOutcome::NotAttempted => AdminResponse::Error {
+            message: result.policy_reason().to_string(),
+        },
+        _ => AdminResponse::Error {
+            message: format!("held command {handle} did not produce a terminal execution result"),
+        },
+    }
 }
 
 /// Append a note to a held command's discussion thread, turning the gate into a
@@ -6357,6 +6739,29 @@ pub(super) async fn handle_approval_note(
     }
 }
 
+async fn handle_approval_withdraw(
+    server: &ServerContext,
+    caller: &CallerIdentity,
+    handle: &str,
+) -> AdminResponse {
+    let (_, caller_key) = caller_scope(server, caller);
+    let owned = server
+        .state
+        .approvals
+        .read()
+        .await
+        .get(handle)
+        .is_some_and(|approval| {
+            caller.is_local_peer() && scope_eq(&approval.snapshot.principal, &caller_key)
+        });
+    if !owned {
+        return AdminResponse::Error {
+            message: format!("no approval with handle '{handle}'"),
+        };
+    }
+    handle_deny(server, caller, handle, "requester withdrew held command").await
+}
+
 async fn handle_deny(
     server: &ServerContext,
     caller: &CallerIdentity,
@@ -6405,12 +6810,12 @@ async fn handle_deny(
         at_unix: now,
         handle: Some(handle.to_string()),
         session_fingerprint,
-        reason: Some("operator denied held command".to_string()),
+        reason: Some(reason.to_string()),
         status: Some("denied".to_string()),
         behavior: None,
     });
     AdminResponse::GateAction {
-        message: format!("held command {} denied", handle),
+        message: reason.to_string(),
         exit_code: None,
         stdout: None,
         stderr: None,

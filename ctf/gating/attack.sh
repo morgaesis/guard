@@ -30,6 +30,7 @@ echo "=== Setup ==="
 mkdir -p /work /run/guard /var/lib/guard
 mkdir -p /fakebin /shim
 echo "hello" > /work/seed.txt
+printf '%s\n' '---' '- hosts: web' '  gather_facts: false' '  tasks: []' > /work/site.yml
 mkdir -p /work/ansible-project
 printf '[defaults]\ninventory = inventory\n' > /work/ansible-project/ansible.cfg
 printf 'all\n' > /work/ansible-project/inventory
@@ -165,9 +166,9 @@ case "$OUT" in
   guarded-ansible-cwd:-m\ ping\ all:/work/ansible-project) ok "ansible shim discovered cwd inventory/config without caller ANSIBLE_CONFIG" ;;
   *) bad "ansible cwd discovery output mismatch: '$OUT'"; cat /tmp/ansible-cwd.err ;;
 esac
-OUT=$(cd /work && agent_shim ansible-playbook site.yml --check --diff --limit web 2>/tmp/playbook-shim.err)
+OUT=$(cd /work && agent_shim ansible-playbook /work/site.yml --check --diff --limit web 2>/tmp/playbook-shim.err)
 case "$OUT" in
-  guarded-ansible-playbook:site.yml\ --check\ --diff\ --limit\ web:/work) ok "ansible-playbook shim honored typed check/diff/limit shape" ;;
+  guarded-ansible-playbook:/work/site.yml\ --check\ --diff\ --limit\ web:/work) ok "ansible-playbook shim honored typed check/diff/limit shape" ;;
   *) bad "ansible-playbook shim output mismatch: '$OUT'"; cat /tmp/playbook-shim.err ;;
 esac
 if cd /work && agent_shim ansible-playbook site.yml >/tmp/playbook-deny.out 2>&1; then
@@ -237,11 +238,18 @@ if [ -n "$HHANDLE" ]; then
 fi
 
 echo
-echo "=== 6. operator approve executes from the bound snapshot ==="
+echo "=== 6. operator approval arms the bound snapshot; requester resumes it ==="
 if [ -n "$HHANDLE" ]; then
-  operator guard access approve "$HHANDLE" --once --socket "$SOCK" >/tmp/opapprove.out 2>&1
-  sleep 1
-  [ ! -d /work/secret ] && ok "operator approval executed the held action" || { bad "operator approval did not execute"; cat /tmp/opapprove.out; }
+  if operator guard access approve "$HHANDLE" --once --socket "$SOCK" >/tmp/opapprove.out 2>&1; then
+    [ -d /work/secret ] && ok "operator approval armed the hold without executing it" || bad "operator approval executed as the operator"
+  else
+    bad "operator approval did not arm the hold"; cat /tmp/opapprove.out
+  fi
+  if agent guard resume "$HHANDLE" --socket "$SOCK" >/tmp/resume.out 2>&1; then
+    [ ! -d /work/secret ] && ok "requester resumed the approved snapshot" || bad "requester resume did not execute"
+  else
+    bad "requester could not resume the approved snapshot"; cat /tmp/resume.out
+  fi
 fi
 
 echo

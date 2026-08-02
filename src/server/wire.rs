@@ -377,8 +377,15 @@ pub enum AdminRequest {
     /// List provisional (containment) executions. Daemon UID sees all; other
     /// callers see only their own.
     Provisionals,
-    /// Operator approves a held command (executes it from its bound snapshot).
+    /// Operator approves a held command and arms its bound snapshot. The
+    /// original requester performs the one-shot resume.
     Approve {
+        handle: String,
+    },
+    /// Original requester resumes one operator-armed held command. The daemon
+    /// authenticates ownership from the transport principal and accepts one
+    /// durable execution claim.
+    Resume {
         handle: String,
     },
     /// Operator denies a held command.
@@ -397,6 +404,10 @@ pub enum AdminRequest {
     ApprovalNote {
         handle: String,
         text: String,
+    },
+    /// Original requester cancels one of its own held commands before it runs.
+    ApprovalWithdraw {
+        handle: String,
     },
     /// List the operator-defined verb catalog (the agent's menu).
     VerbList,
@@ -426,6 +437,13 @@ pub enum AdminRequest {
     /// validation at install time. Operator-only (mutates the catalog).
     VerbCreateFromPreview {
         digest: String,
+    },
+    /// Replace one operator-authored verb only if its definition still matches
+    /// the digest observed before editing. Operator-only (mutates the catalog).
+    VerbAmend {
+        name: String,
+        expected_digest: String,
+        replacement: Box<guard::gating::verb::Verb>,
     },
     /// List evaluator-generated API verb coverage. Operator-only because
     /// coverage reveals policy topology and evaluator regime identifiers.
@@ -570,6 +588,11 @@ pub enum AdminRequest {
     AccessShow {
         reference: String,
     },
+    /// Show detailed runtime state for one access-managed session without
+    /// exposing its bearer token.
+    AccessStatus {
+        reference: String,
+    },
     EvaluateBatch {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_token: Option<String>,
@@ -622,13 +645,16 @@ impl AdminRequest {
                 | Self::Provisionals
                 | Self::ApprovalList
                 | Self::ApprovalShow { .. }
+                | Self::Resume { .. }
                 // ApprovalNote does its own operator-or-owner authorization in
                 // the handler, so it is not gated to the daemon UID here.
                 | Self::ApprovalNote { .. }
+                | Self::ApprovalWithdraw { .. }
                 | Self::VerbList
                 | Self::AccessRequest { .. }
                 | Self::AccessList
                 | Self::AccessShow { .. }
+                | Self::AccessStatus { .. }
                 | Self::EvaluateBatch { .. }
         )
     }
@@ -727,6 +753,11 @@ pub enum AdminResponse {
         /// Addresses the stored candidate in `VerbCreateFromPreview`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         preview_digest: Option<String>,
+    },
+    VerbAmended {
+        verb: guard::gating::verb::Verb,
+        previous_digest: String,
+        digest: String,
     },
     VerbCoverage {
         items: Vec<guard::gating::api_promotion::ApiCoverageEntry>,
@@ -915,6 +946,8 @@ fn verb_summary_default_baseline() -> bool {
 pub struct ProvisionalSummary {
     pub handle: String,
     pub status: String,
+    /// Forward process outcome, distinct from rollback lifecycle status.
+    pub forward_outcome: String,
     pub command: String,
     pub revert_command: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -963,6 +996,12 @@ pub struct ApprovalSummary {
     pub stdout: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stderr: Option<String>,
+    /// Persisted transcripts are bounded independently per stream. These flags
+    /// tell clients that the stored text is a prefix, not complete output.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stdout_truncated: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stderr_truncated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decided_reason: Option<String>,
     /// Approval discussion thread (operator <-> requester).
@@ -970,6 +1009,16 @@ pub struct ApprovalSummary {
     pub notes: Vec<guard::gating::approval::ApprovalNote>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_trace: Option<DecisionTrace>,
+}
+
+pub(super) const APPROVAL_ARMED_REASON: &str = "operator approved; awaiting requester-bound resume";
+pub(super) const APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX: &str =
+    "\n[guard persisted transcript truncated]\n";
+
+pub(super) fn approval_is_armed(approval: &Approval) -> bool {
+    approval.status == guard::gating::approval::ApprovalStatus::Pending
+        && approval.decided_unix.is_some()
+        && approval.decided_reason.as_deref() == Some(APPROVAL_ARMED_REASON)
 }
 
 impl ProvisionalSummary {
@@ -984,7 +1033,13 @@ impl ProvisionalSummary {
         };
         Self {
             handle: p.handle.clone(),
-            status: p.status.as_str().to_string(),
+            status: match p.forward_outcome() {
+                "running" => "running".to_string(),
+                "interrupted" => "interrupted".to_string(),
+                "failed" => "forward_failed".to_string(),
+                _ => p.status.as_str().to_string(),
+            },
+            forward_outcome: p.forward_outcome().to_string(),
             command: redact_output_text(&command),
             revert_command: redact_output_text(&p.revert_command_line()),
             confirm_check: p.confirm_check_binary.as_ref().map(|binary| {
@@ -1021,7 +1076,11 @@ impl ApprovalSummary {
         // carry inline credentials.
         Self {
             handle: a.handle.clone(),
-            status: a.status.as_str().to_string(),
+            status: if approval_is_armed(a) {
+                "armed".to_string()
+            } else {
+                a.status.as_str().to_string()
+            },
             command: redact_output_text(&a.snapshot.command_line()),
             reason: redact_output_text(&a.reason),
             risk: a.risk,
@@ -1037,6 +1096,14 @@ impl ApprovalSummary {
             exit_code: a.result_exit,
             stdout: a.result_stdout.as_deref().map(redact_output_text),
             stderr: a.result_stderr.as_deref().map(redact_output_text),
+            stdout_truncated: a
+                .result_stdout
+                .as_deref()
+                .is_some_and(|text| text.ends_with(APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX)),
+            stderr_truncated: a
+                .result_stderr
+                .as_deref()
+                .is_some_and(|text| text.ends_with(APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX)),
             decided_reason: a.decided_reason.as_deref().map(redact_output_text),
             notes: a
                 .notes
@@ -1603,7 +1670,6 @@ impl ExecuteResult {
     /// Reason for the policy decision (allow rationale or denial reason).
     /// Production paths consume the reason via `into_response`; tests assert
     /// on it directly.
-    #[cfg(test)]
     pub(super) fn policy_reason(&self) -> &str {
         match &self.policy {
             PolicyOutcome::Allowed { reason } | PolicyOutcome::Denied { reason } => reason,

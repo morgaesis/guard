@@ -587,6 +587,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn evaluator_uses_its_explicit_http_proxy() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_url = format!("http://{}", listener.local_addr().unwrap());
+        let mock = tokio::spawn(run_mock(
+            listener,
+            vec![(200, tool_call_body("APPROVE"), None)],
+        ));
+        let evaluator = Evaluator::new(
+            EvalConfig::default()
+                .llm_api_key("test-key".to_string())
+                .llm_api_url("http://guard-evaluator.invalid/chat".to_string())
+                .llm_proxy_url(proxy_url)
+                .llm_retries(0),
+        )
+        .expect("evaluator with HTTP proxy");
+
+        let result = evaluator.evaluate_llm("id", None).await;
+        assert!(result.is_allow(), "got: {result}");
+        mock.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_retry_on_429_with_non_numeric_retry_after() {
         // A Retry-After expressed as an HTTP-date (not delta-seconds) must not
         // break the wire path: it parses to None, the evaluator falls back to

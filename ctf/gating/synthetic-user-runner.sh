@@ -358,6 +358,12 @@ if [ "$(podman info --format '{{.Host.Security.Rootless}}')" != "true" ]; then
   echo "synthetic-user scenarios require rootless Podman" >&2
   exit 2
 fi
+# Do not let Podman or its monitor inherit the runner's advisory-lock file
+# descriptor. A deliberately preserved failed container must not block the
+# next diagnostic run after this runner exits.
+podman() {
+  command podman "$@" 9>&-
+}
 mkdir -p "$EVIDENCE_ROOT"
 exec 9>"$EVIDENCE_ROOT/runner.lock"
 if ! flock -n 9; then
@@ -686,6 +692,7 @@ run_scenario() {
       run_phase "$container" "$scenario" 1000 approve || return
       run_phase "$container" "$scenario" 1001 use || return
       run_phase "$container" "$scenario" 1000 approve-execution || return
+      run_phase "$container" "$scenario" 1001 resume-execution || return
       run_phase "$container" "$scenario" 1002 isolate || return
       restart_daemon "$container" "$scenario" || return
       run_phase "$container" "$scenario" 1001 after-restart || return
@@ -706,6 +713,8 @@ run_scenario() {
       run_phase "$container" "$scenario" 1001 deny || return
       run_phase "$container" "$scenario" 1000 approve || return
       run_phase "$container" "$scenario" 1001 hold || return
+      run_phase "$container" "$scenario" 1000 approve-held || return
+      run_phase "$container" "$scenario" 1001 resume-held || return
       run_phase "$container" "$scenario" 1000 verify || return
       ;;
     SU-16)

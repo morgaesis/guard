@@ -5,6 +5,8 @@
 set -u
 
 export PATH="/home/agent/.guard/shims:$PATH"
+export HTTPS_PROXY=http://guard-egress:3128
+export https_proxy=$HTTPS_PROXY
 
 PROMPT_FILE="${PROMPT_FILE:-/home/agent/ctf-prompt.md}"
 

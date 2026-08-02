@@ -17,27 +17,143 @@ use super::coverage::reversibility_rank;
 use super::Reversibility;
 use anyhow::{bail, Context, Result};
 use regex::Regex;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 /// A single parameter's validation rule.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ParamSpec {
     /// Fully-anchored regex (`^...$`) the value must match. Rejected at load if
     /// not anchored, so a permissive pattern cannot silently allow a substring
     /// with shell metacharacters or a value that gets reinterpreted as a flag.
     pub pattern: String,
-    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub required: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<String>,
     /// Allow a rendered value to begin with `-`. Off by default so a value can
     /// never pass itself off as an option flag (e.g. `-o ProxyCommand=...`).
-    #[serde(default, skip_serializing_if = "is_false")]
     pub allow_dash: bool,
+}
+
+/// How Guard interprets a parameter after regex validation.
+///
+/// `token` retains the conservative no-whitespace behavior. `single_argv`
+/// permits spaces inside one bounded argv element while rejecting shell
+/// control characters at render time. The latter is useful for exact
+/// JSONPath and field-selector values without introducing word splitting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParamValueType {
+    #[default]
+    Token,
+    SingleArgv,
+}
+
+const SINGLE_ARGV_PATTERN_PREFIX: &str = "\0guard-single-argv:";
+
+#[derive(Serialize, Deserialize)]
+struct ParamSpecWire {
+    pattern: String,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    default: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    allow_dash: bool,
+    #[serde(default, skip_serializing_if = "is_token_value_type")]
+    value_type: ParamValueType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_length: Option<usize>,
+}
+
+fn is_token_value_type(value_type: &ParamValueType) -> bool {
+    *value_type == ParamValueType::Token
+}
+
+impl ParamSpec {
+    fn encoded_single_argv(pattern: String, max_length: usize) -> String {
+        format!("{SINGLE_ARGV_PATTERN_PREFIX}{max_length}:{pattern}")
+    }
+
+    fn semantics(&self) -> (ParamValueType, Option<usize>, &str) {
+        let Some(encoded) = self.pattern.strip_prefix(SINGLE_ARGV_PATTERN_PREFIX) else {
+            return (ParamValueType::Token, None, &self.pattern);
+        };
+        let Some((length, pattern)) = encoded.split_once(':') else {
+            return (ParamValueType::SingleArgv, None, encoded);
+        };
+        (
+            ParamValueType::SingleArgv,
+            length.parse::<usize>().ok(),
+            pattern,
+        )
+    }
+
+    pub fn value_type(&self) -> ParamValueType {
+        self.semantics().0
+    }
+
+    pub fn max_length(&self) -> Option<usize> {
+        self.semantics().1
+    }
+
+    pub fn pattern_text(&self) -> &str {
+        self.semantics().2
+    }
+}
+
+impl Serialize for ParamSpec {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let (value_type, max_length, pattern) = self.semantics();
+        ParamSpecWire {
+            pattern: pattern.to_string(),
+            required: self.required,
+            default: self.default.clone(),
+            allow_dash: self.allow_dash,
+            value_type,
+            max_length,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ParamSpec {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ParamSpecWire::deserialize(deserializer)?;
+        let pattern = match wire.value_type {
+            ParamValueType::Token => {
+                if wire.max_length.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "max_length requires value_type: single_argv",
+                    ));
+                }
+                wire.pattern
+            }
+            ParamValueType::SingleArgv => {
+                let max_length = wire.max_length.ok_or_else(|| {
+                    serde::de::Error::custom(
+                        "value_type: single_argv requires a positive max_length",
+                    )
+                })?;
+                Self::encoded_single_argv(wire.pattern, max_length)
+            }
+        };
+        Ok(Self {
+            pattern,
+            required: wire.required,
+            default: wire.default,
+            allow_dash: wire.allow_dash,
+        })
+    }
 }
 
 fn default_true() -> bool {
@@ -161,6 +277,13 @@ pub struct VerbCoverageCell {
     pub namespace: Option<ValueConstraint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fanout: Option<FanoutConstraint>,
+    /// Exact canonical caller working directory required by this cell. This
+    /// binds tools whose configuration, plugins, or input selection can be
+    /// discovered from the working directory to an operator-reviewed project
+    /// root. The path is validated as an existing canonical directory when the
+    /// catalog loads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
     /// Caller-controlled environment bindings this cell may preauthorize.
     /// Empty is migration-safe and means no `--env`, `--secret`, or
     /// `--secret-file` injection can skip evaluator review.
@@ -315,6 +438,13 @@ impl Verb {
             .map(|byte| format!("{byte:02x}"))
             .collect()
     }
+
+    /// Enumerate every parameter binding admitted by finite literal patterns.
+    /// `None` means at least one regex is non-finite or the Cartesian product
+    /// exceeds the admission-preview bound.
+    pub fn finite_parameter_sets(&self) -> Option<Vec<BTreeMap<String, String>>> {
+        enumerate_parameter_sets(self, self.params.keys().cloned().collect())
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -358,6 +488,27 @@ pub struct VerbCatalog {
 impl VerbCatalog {
     pub fn empty() -> Self {
         Self::default()
+    }
+
+    /// Build an isolated catalog containing one synthesized candidate for a
+    /// non-executing admission preview. The temporary baseline flag makes the
+    /// candidate's Evaluate cell selectable without granting durable session
+    /// authority; the original candidate remains unchanged.
+    pub fn for_admission_preview(candidate: &Verb) -> Result<Self> {
+        let mut verb = candidate.clone();
+        verb.baseline = true;
+        verb.trusted = false;
+        validate_verb(&verb)?;
+        let serialized = serde_json::to_vec(&verb).context("failed to fingerprint preview verb")?;
+        let digest = Sha256::digest(&serialized);
+        let mut version_bytes = [0u8; 8];
+        version_bytes.copy_from_slice(&digest[..8]);
+        Ok(Self {
+            verbs: BTreeMap::from([(verb.name.clone(), verb)]),
+            version: u64::from_be_bytes(version_bytes),
+            path: None,
+            mtime: None,
+        })
     }
 
     pub fn version(&self) -> u64 {
@@ -510,14 +661,27 @@ impl VerbCatalog {
                     None => continue,
                 },
             };
-            let re = compile_anchored(&spec.pattern)
+            let re = compile_anchored(spec.pattern_text())
                 .with_context(|| format!("invalid pattern for param '{}'", pname))?;
             if !re.is_match(&value) {
                 bail!(
                     "value for '{}' does not match required pattern {}",
                     pname,
-                    spec.pattern
+                    spec.pattern_text()
                 );
+            }
+            if spec
+                .max_length()
+                .is_some_and(|maximum| value.chars().count() > maximum)
+            {
+                bail!(
+                    "value for '{}' exceeds its maximum length of {} characters",
+                    pname,
+                    spec.max_length().unwrap_or_default()
+                );
+            }
+            if spec.value_type() == ParamValueType::SingleArgv {
+                validate_single_argv_value(pname, &value)?;
             }
             if !spec.allow_dash && value.starts_with('-') {
                 bail!(
@@ -586,6 +750,34 @@ impl VerbCatalog {
         secrets: &BTreeMap<String, String>,
         secret_files: &BTreeMap<String, String>,
     ) -> Vec<CoverageMatch> {
+        self.match_command_all_inner(binary, args, plain, secrets, secret_files, None)
+    }
+
+    /// Collect coverage with a canonical caller working directory. Cells that
+    /// carry `cwd` match only that exact directory. The executor calls this
+    /// after canonicalizing a local request, so configuration discovered from
+    /// the current directory remains within operator-reviewed authority.
+    pub fn match_command_all_with_environment_and_cwd(
+        &self,
+        binary: &str,
+        args: &[String],
+        plain: &BTreeMap<String, String>,
+        secrets: &BTreeMap<String, String>,
+        secret_files: &BTreeMap<String, String>,
+        cwd: Option<&Path>,
+    ) -> Vec<CoverageMatch> {
+        self.match_command_all_inner(binary, args, plain, secrets, secret_files, cwd)
+    }
+
+    fn match_command_all_inner(
+        &self,
+        binary: &str,
+        args: &[String],
+        plain: &BTreeMap<String, String>,
+        secrets: &BTreeMap<String, String>,
+        secret_files: &BTreeMap<String, String>,
+        cwd: Option<&Path>,
+    ) -> Vec<CoverageMatch> {
         let mut matches = Vec::new();
         for verb in self.verbs.values() {
             if !binary_names_match(binary, &verb.binary) {
@@ -632,7 +824,7 @@ impl VerbCatalog {
             }
 
             for cell in &verb.coverage {
-                if let Some((features, specificity)) = coverage_cell_matches(cell, args) {
+                if let Some((features, specificity)) = coverage_cell_matches(cell, args, cwd) {
                     matches.push(CoverageMatch {
                         rendered: rendered.clone(),
                         cell: cell.name.clone(),
@@ -701,6 +893,90 @@ impl VerbCatalog {
             .ok()
             .and_then(|m| m.modified().ok());
         Ok(())
+    }
+
+    /// Replace one operator-authored file verb only when its live definition
+    /// still matches `expected_digest`. Validation and whole-catalog
+    /// composition complete before the backing file is atomically replaced.
+    /// The in-memory catalog adopts exactly that validated document after the
+    /// durable replacement succeeds.
+    pub fn amend_verb_if_digest(
+        &mut self,
+        name: &str,
+        expected_digest: &str,
+        replacement: &Verb,
+    ) -> Result<Verb> {
+        if expected_digest.len() != 64
+            || !expected_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            bail!("expected verb digest must be 64 lowercase hexadecimal characters");
+        }
+        if replacement.name != name {
+            bail!(
+                "replacement verb name '{}' does not match '{}'; amend preserves the existing name",
+                replacement.name,
+                name
+            );
+        }
+        if reserved_verb_name(name) || replacement.auto_promoted {
+            bail!("generated or reserved verb '{}' cannot be amended", name);
+        }
+        validate_verb(replacement)?;
+
+        self.reload_if_stale()?;
+        let path = self.path.clone().ok_or_else(|| {
+            anyhow::anyhow!("verb catalog is not backed by a file; cannot amend a verb")
+        })?;
+        let existing = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read verb catalog {}", path.display()))?;
+        let disk_catalog = Self::from_yaml(&existing)?;
+        let current = disk_catalog
+            .get(name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("unknown verb: '{}'", name))?;
+        if current.auto_promoted || reserved_verb_name(&current.name) {
+            bail!("generated or reserved verb '{}' cannot be amended", name);
+        }
+        let current_digest = current.definition_digest();
+        if current_digest != expected_digest {
+            bail!(
+                "verb '{}' changed before amend: expected digest {}, found {}",
+                name,
+                expected_digest,
+                current_digest
+            );
+        }
+
+        let new_content = compose_replaced_catalog(&existing, name, replacement)?;
+        let mut validated = Self::from_yaml(&new_content)
+            .context("amending this verb would make the catalog invalid")?;
+
+        let runtime_verbs = self
+            .verbs
+            .values()
+            .filter(|verb| reserved_verb_name(&verb.name))
+            .cloned()
+            .collect::<Vec<_>>();
+        for mut verb in runtime_verbs {
+            if verb.name.starts_with("grant-") {
+                validated.upsert_saved_grant_verb(verb)?;
+            } else {
+                verb.trusted = false;
+                validated.upsert_access_verb(verb)?;
+            }
+        }
+        // Every fallible catalog adoption step completes before the durable
+        // rewrite. After this point, success requires only the atomic file
+        // replacement and assigning the already validated state.
+        atomic_replace_if_unchanged(&path, existing.as_bytes(), new_content.as_bytes())?;
+        validated.path = Some(path.clone());
+        validated.mtime = std::fs::metadata(&path)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
+        *self = validated;
+        Ok(current)
     }
 
     /// Install or replace a validated daemon-owned verb without writing the
@@ -930,6 +1206,82 @@ fn compose_removed_catalog(existing: &str, name: &str) -> Result<String> {
     serde_yaml_ng::to_string(&doc).context("failed to serialize the updated catalog")
 }
 
+fn compose_replaced_catalog(existing: &str, name: &str, replacement: &Verb) -> Result<String> {
+    let body = existing.strip_prefix('\u{feff}').unwrap_or(existing);
+    let mut doc: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(body).context("the existing verb catalog is not valid YAML")?;
+    let map = doc
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow::anyhow!("verb catalog is not a YAML mapping"))?;
+    let key = serde_yaml_ng::Value::String("verbs".to_string());
+    let Some(serde_yaml_ng::Value::Sequence(verbs)) = map.get_mut(&key) else {
+        bail!("the catalog's `verbs` key is not a sequence");
+    };
+    let replacement = serde_yaml_ng::to_value(replacement).context("failed to serialize verb")?;
+    let mut replaced = false;
+    for value in verbs {
+        let candidate_name = value
+            .as_mapping()
+            .and_then(|verb| verb.get(serde_yaml_ng::Value::String("name".to_string())))
+            .and_then(serde_yaml_ng::Value::as_str);
+        if candidate_name == Some(name) {
+            *value = replacement.clone();
+            replaced = true;
+            break;
+        }
+    }
+    if !replaced {
+        bail!("unknown verb: '{}'", name);
+    }
+    serde_yaml_ng::to_string(&doc).context("failed to serialize the updated catalog")
+}
+
+fn reserved_verb_name(name: &str) -> bool {
+    name.starts_with("grant-") || name.starts_with("access-generated-")
+}
+
+fn atomic_replace_if_unchanged(path: &Path, expected: &[u8], replacement: &[u8]) -> Result<()> {
+    let current = std::fs::read(path)
+        .with_context(|| format!("failed to reread verb catalog {}", path.display()))?;
+    if current != expected {
+        bail!("verb catalog changed before the atomic rewrite; retry the amend");
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).with_context(|| {
+        format!(
+            "failed to create a temporary catalog in {}",
+            parent.display()
+        )
+    })?;
+    temporary
+        .as_file_mut()
+        .write_all(replacement)
+        .with_context(|| format!("failed to write replacement catalog for {}", path.display()))?;
+    if let Ok(metadata) = std::fs::metadata(path) {
+        temporary
+            .as_file()
+            .set_permissions(metadata.permissions())
+            .with_context(|| format!("failed to preserve permissions for {}", path.display()))?;
+    }
+    temporary
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("failed to sync replacement catalog for {}", path.display()))?;
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| {
+            format!(
+                "failed to atomically replace verb catalog {}",
+                path.display()
+            )
+        })?;
+    Ok(())
+}
+
 /// Binaries a synthesized verb may not use: shells and interpreters where a
 /// single argument can carry an arbitrary command, which would defeat the
 /// catalog's "no shell" guarantee. An operator who genuinely needs one authors
@@ -987,6 +1339,24 @@ const OVERBROAD_CANARIES: &[&str] = &[
     "a?b", "a[b", "a\\b", "a!b", "x y z",
 ];
 
+const SINGLE_ARGV_DANGEROUS_CANARIES: &[&str] = &[
+    "a\tb", "a\nb", "a\rb", "a;b", "a|b", "a&b", "a$b", "a`b", "a>b", "a<b",
+];
+
+const MAX_SINGLE_ARGV_LENGTH: usize = 4096;
+
+fn validate_single_argv_value(name: &str, value: &str) -> Result<()> {
+    if value.chars().any(|character| {
+        character.is_control() || matches!(character, ';' | '|' | '&' | '$' | '`' | '>' | '<')
+    }) {
+        bail!(
+            "value for '{}' contains a shell control character that single_argv parameters do not permit",
+            name
+        );
+    }
+    Ok(())
+}
+
 /// True if `name` is kebab-case (`^[a-z0-9][a-z0-9-]*$`), so it is unambiguously
 /// invokable on the `guard verb run <name>` command line. `pub(crate)`: also
 /// used by `gating::allow_promotion` to validate a model-proposed name before
@@ -1036,7 +1406,15 @@ fn legacy_template_features(args: &[String]) -> BTreeSet<String> {
 fn coverage_cell_matches(
     cell: &VerbCoverageCell,
     args: &[String],
+    cwd: Option<&Path>,
 ) -> Option<(BTreeSet<String>, CoverageSpecificity)> {
+    if cell
+        .cwd
+        .as_deref()
+        .is_some_and(|required| cwd != Some(required))
+    {
+        return None;
+    }
     if cell.min_args.is_some_and(|minimum| args.len() < minimum)
         || cell.max_args.is_some_and(|maximum| args.len() > maximum)
     {
@@ -1065,6 +1443,10 @@ fn coverage_cell_matches(
         requirements: features.clone(),
         ..CoverageSpecificity::default()
     };
+    if cell.cwd.is_some() {
+        features.insert("cwd:exact".to_string());
+        specificity.requirements.insert("cwd:exact".to_string());
+    }
     if let Some(minimum) = cell.min_args {
         features.insert(format!("argv:min={minimum}"));
         specificity
@@ -1322,16 +1704,26 @@ fn synthesized_access_is_statically_read_only(verb: &Verb) -> bool {
 /// a referenced parameter pattern is not a plain literal enumeration or the
 /// combination space exceeds the bound.
 fn enumerate_matcher_commands(candidate: &Verb) -> Option<Vec<Vec<String>>> {
-    const MAX_COMMANDS: usize = 64;
     let referenced: BTreeSet<String> = candidate
         .args
         .iter()
         .flat_map(|token| placeholders(token))
         .collect();
+    enumerate_parameter_sets(candidate, referenced)?
+        .iter()
+        .map(|params| render_args(&candidate.args, params, &candidate.name).ok())
+        .collect()
+}
+
+fn enumerate_parameter_sets(
+    candidate: &Verb,
+    referenced: BTreeSet<String>,
+) -> Option<Vec<BTreeMap<String, String>>> {
+    const MAX_COMMANDS: usize = 64;
     let mut combinations: Vec<BTreeMap<String, String>> = vec![BTreeMap::new()];
     for name in &referenced {
         let spec = candidate.params.get(name)?;
-        let values = enumerate_pattern_literals(&spec.pattern)?;
+        let values = enumerate_pattern_literals(spec.pattern_text())?;
         if combinations.len().checked_mul(values.len())? > MAX_COMMANDS {
             return None;
         }
@@ -1346,10 +1738,7 @@ fn enumerate_matcher_commands(candidate: &Verb) -> Option<Vec<Vec<String>>> {
             })
             .collect();
     }
-    combinations
-        .iter()
-        .map(|params| render_args(&candidate.args, params, &candidate.name).ok())
-        .collect()
+    Some(combinations)
 }
 
 /// The literal branches of an anchored alternation such as `^(status|df)$`,
@@ -1364,16 +1753,28 @@ fn enumerate_pattern_literals(pattern: &str) -> Option<Vec<String>> {
     {
         inner = stripped;
     }
-    let branches: Vec<String> = inner.split('|').map(str::to_string).collect();
-    branches
-        .iter()
-        .all(|branch| {
-            !branch.is_empty()
-                && !branch
-                    .chars()
-                    .any(|character| r"\^$.?*+()[]{}|".contains(character))
-        })
-        .then_some(branches)
+    let mut branches = vec![String::new()];
+    let mut escaped = false;
+    for character in inner.chars() {
+        if escaped {
+            branches.last_mut()?.push(character);
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if character == '|' {
+            branches.push(String::new());
+            continue;
+        }
+        if r"^$.?*+()[]{}".contains(character) {
+            return None;
+        }
+        branches.last_mut()?.push(character);
+    }
+    (!escaped && branches.iter().all(|branch| !branch.is_empty())).then_some(branches)
 }
 
 fn constraint_selector(constraint: &ValueConstraint) -> String {
@@ -1405,16 +1806,352 @@ fn validate_binary_not_shell(binary: &str, context: &str) -> Result<()> {
 /// Reject a parameter pattern broad enough to admit whitespace or shell
 /// metacharacters (see `OVERBROAD_CANARIES`). Shared by both synthesis paths.
 fn validate_param_not_overbroad(pname: &str, spec: &ParamSpec, context: &str) -> Result<()> {
-    let re =
-        compile_anchored(&spec.pattern).with_context(|| format!("param '{}' pattern", pname))?;
-    if let Some(canary) = OVERBROAD_CANARIES.iter().find(|c| re.is_match(c)) {
+    let re = compile_anchored(spec.pattern_text())
+        .with_context(|| format!("param '{}' pattern", pname))?;
+    let canaries = match spec.value_type() {
+        ParamValueType::Token => OVERBROAD_CANARIES,
+        ParamValueType::SingleArgv => SINGLE_ARGV_DANGEROUS_CANARIES,
+    };
+    if let Some(canary) = canaries.iter().find(|canary| re.is_match(canary)) {
         bail!(
             "{context} parameter '{}' pattern {:?} is too permissive (it matches {:?}); a verb \
-             parameter must be narrowly pinned and must not admit whitespace or shell metacharacters",
+             parameter must be narrowly pinned and must not admit shell control characters{}",
             pname,
-            spec.pattern,
-            canary
+            spec.pattern_text(),
+            canary,
+            if spec.value_type() == ParamValueType::Token {
+                " or whitespace"
+            } else {
+                ""
+            }
         );
+    }
+    Ok(())
+}
+
+fn path_is_absolute(value: &str) -> bool {
+    value.starts_with('/')
+        || value.starts_with("\\\\")
+        || value
+            .as_bytes()
+            .get(1..3)
+            .is_some_and(|bytes| bytes[0] == b':' && matches!(bytes[1], b'/' | b'\\'))
+}
+
+fn validate_absolute_file_template(
+    verb: &Verb,
+    template: &str,
+    command_label: &str,
+    position: &str,
+) -> Result<()> {
+    if path_is_absolute(template) {
+        return Ok(());
+    }
+    let names = placeholders(template);
+    if names.len() == 1 && template == format!("{{{}}}", names[0]) {
+        let spec = verb.params.get(&names[0]).ok_or_else(|| {
+            anyhow::anyhow!(
+                "verb '{}' {command_label} file argument {position} references undeclared parameter '{}'",
+                verb.name,
+                names[0]
+            )
+        })?;
+        let pattern = compile_anchored(spec.pattern_text()).with_context(|| {
+            format!(
+                "verb '{}' {command_label} file parameter '{}' has an invalid pattern",
+                verb.name, names[0]
+            )
+        })?;
+        let relative_canaries = [
+            "inventory",
+            "inventory/production",
+            "manifest.yaml",
+            "./manifest.yaml",
+            "../manifest.yaml",
+        ];
+        let absolute_canaries = [
+            "/srv/guard/manifest.yaml",
+            "/srv/guard/manifests/manifest.yaml",
+            r"C:\guard\manifest.yaml",
+            r"\\server\share\manifest.yaml",
+        ];
+        if !relative_canaries
+            .iter()
+            .any(|value| pattern.is_match(value))
+            && absolute_canaries
+                .iter()
+                .any(|value| pattern.is_match(value))
+        {
+            return Ok(());
+        }
+    }
+    bail!(
+        "verb '{}' {command_label} file argument {position} must be an absolute path, got {:?}",
+        verb.name,
+        template
+    )
+}
+
+fn validate_known_file_arguments(
+    verb: &Verb,
+    binary: &str,
+    args: &[String],
+    command_label: &str,
+) -> Result<()> {
+    let binary = binary_match_key(binary);
+    let file_options: &[&str] = match binary.as_str() {
+        "ansible" | "ansible-playbook" => &[
+            "-i",
+            "--inventory",
+            "--private-key",
+            "--vault-password-file",
+        ],
+        "kubectl" => &["-f", "--filename", "--kubeconfig"],
+        "helm" => &[
+            "-f",
+            "--values",
+            "--kubeconfig",
+            "--repository-config",
+            "--registry-config",
+        ],
+        _ => &[],
+    };
+    for (index, argument) in args.iter().enumerate() {
+        if file_options.contains(&argument.as_str()) {
+            let value = args.get(index + 1).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "verb '{}' {command_label} option '{}' requires an absolute file argument",
+                    verb.name,
+                    argument
+                )
+            })?;
+            validate_absolute_file_template(
+                verb,
+                value,
+                command_label,
+                &format!("after {argument}"),
+            )?;
+        }
+        for option in file_options {
+            if let Some(value) = argument.strip_prefix(&format!("{option}=")) {
+                validate_absolute_file_template(
+                    verb,
+                    value,
+                    command_label,
+                    &format!("in {option}=..."),
+                )?;
+            }
+        }
+    }
+
+    if binary == "ansible-playbook" {
+        const VALUE_OPTIONS: &[&str] = &[
+            "-i",
+            "--inventory",
+            "-l",
+            "--limit",
+            "-e",
+            "--extra-vars",
+            "-t",
+            "--tags",
+            "--skip-tags",
+            "--start-at-task",
+            "--vault-id",
+            "--vault-password-file",
+            "--private-key",
+            "-u",
+            "--user",
+            "-f",
+            "--forks",
+            "-M",
+            "--module-path",
+            "-c",
+            "--connection",
+            "-T",
+            "--timeout",
+            "--ssh-common-args",
+            "--ssh-extra-args",
+            "--sftp-extra-args",
+            "--scp-extra-args",
+            "--become-method",
+            "--become-user",
+        ];
+        let mut skip_value = false;
+        for argument in args {
+            if skip_value {
+                skip_value = false;
+                continue;
+            }
+            if argument.starts_with('-') {
+                skip_value = VALUE_OPTIONS.contains(&argument.as_str());
+                continue;
+            }
+            validate_absolute_file_template(verb, argument, command_label, "playbook")?;
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn validate_inventory_constraint_paths(
+    verb: &Verb,
+    cell: &VerbCoverageCell,
+    constraint: &ValueConstraint,
+) -> Result<()> {
+    if !matches!(
+        binary_match_key(&verb.binary).as_str(),
+        "ansible" | "ansible-playbook"
+    ) {
+        return Ok(());
+    }
+    if constraint.values.is_empty() {
+        bail!(
+            "verb '{}' coverage cell '{}': Ansible inventory coverage must enumerate absolute paths or inline host lists",
+            verb.name,
+            cell.name
+        );
+    }
+    for value in &constraint.values {
+        if !path_is_absolute(value) && !value.ends_with(',') {
+            bail!(
+                "verb '{}' coverage cell '{}': Ansible inventory value must be an absolute path or inline host list, got {:?}",
+                verb.name,
+                cell.name,
+                value
+            );
+        }
+    }
+    Ok(())
+}
+
+fn kubectl_exec_interactive_flag(argument: &str) -> bool {
+    matches!(argument, "--stdin" | "--tty")
+        || argument.starts_with("--stdin=")
+        || argument.starts_with("--tty=")
+        || argument
+            .strip_prefix('-')
+            .filter(|flags| !flags.is_empty())
+            .is_some_and(|flags| flags.chars().all(|flag| matches!(flag, 'i' | 't')))
+}
+
+fn validate_synthesized_kubectl_exec(verb: &Verb, args: &[String], label: &str) -> Result<()> {
+    let Some(exec_index) = args.iter().position(|argument| argument == "exec") else {
+        return Ok(());
+    };
+    if let Some(flag) = args[exec_index + 1..]
+        .iter()
+        .find(|argument| kubectl_exec_interactive_flag(argument))
+    {
+        bail!(
+            "synthesized verb '{}' {label} requests an interactive exec stream ('{}'); guard refuses interactive stdin/tty",
+            verb.name,
+            flag
+        );
+    }
+    let separator = args
+        .iter()
+        .enumerate()
+        .skip(exec_index + 1)
+        .find_map(|(index, argument)| (argument == "--").then_some(index))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "synthesized verb '{}' {label} kubectl exec must separate its command with '--'",
+                verb.name
+            )
+        })?;
+    let value_options = [
+        "-c",
+        "--container",
+        "-n",
+        "--namespace",
+        "--pod-running-timeout",
+    ];
+    let mut skip_value = false;
+    let target = args[exec_index + 1..separator]
+        .iter()
+        .find(|argument| {
+            if skip_value {
+                skip_value = false;
+                return false;
+            }
+            if value_options.contains(&argument.as_str()) {
+                skip_value = true;
+                return false;
+            }
+            !argument.starts_with('-')
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "synthesized verb '{}' {label} kubectl exec has no target",
+                verb.name
+            )
+        })?;
+    let target_prefix = target.split_once('/').map(|(prefix, _)| prefix);
+    if !matches!(
+        target_prefix,
+        Some(
+            "pod"
+                | "pods"
+                | "deploy"
+                | "deployment"
+                | "deployments"
+                | "statefulset"
+                | "statefulsets"
+                | "daemonset"
+                | "daemonsets"
+                | "job"
+                | "jobs"
+                | "service"
+                | "services"
+        )
+    ) {
+        bail!(
+            "synthesized verb '{}' {label} kubectl exec target {:?} must be an explicit resource reference such as deploy/<name>, not a bare generated pod assumption",
+            verb.name,
+            target
+        );
+    }
+    let executable = args.get(separator + 1).ok_or_else(|| {
+        anyhow::anyhow!(
+            "synthesized verb '{}' {label} kubectl exec has no executable after '--'",
+            verb.name
+        )
+    })?;
+    if executable.chars().any(char::is_whitespace)
+        || placeholders(executable).iter().any(|name| {
+            verb.params
+                .get(name)
+                .is_some_and(|spec| spec.value_type() == ParamValueType::SingleArgv)
+        })
+    {
+        bail!(
+            "synthesized verb '{}' {label} kubectl exec executable {:?} must be one whitespace-free argv token",
+            verb.name,
+            executable
+        );
+    }
+    Ok(())
+}
+
+fn validate_synthesized_command_shape(
+    verb: &Verb,
+    binary: &str,
+    args: &[String],
+    label: &str,
+) -> Result<()> {
+    validate_binary_not_shell(binary, &format!("synthesized verb {label}"))?;
+    if let Some(operator) = args
+        .iter()
+        .find(|argument| matches!(argument.as_str(), ";" | "&&" | "||" | "|" | ">" | "<"))
+    {
+        bail!(
+            "synthesized verb '{}' {label} has argv element {:?}, a literal shell operator; guard runs no shell, so the element cannot chain or redirect",
+            verb.name,
+            operator
+        );
+    }
+    if binary_match_key(binary) == "kubectl" {
+        validate_synthesized_kubectl_exec(verb, args, label)?;
     }
     Ok(())
 }
@@ -1426,6 +2163,7 @@ fn validate_param_not_overbroad(pname: &str, spec: &ParamSpec, context: &str) ->
 /// enough to admit whitespace or shell metacharacters. Structural validation
 /// (anchored patterns, single-argv rendering) is still enforced by `validate_verb`.
 pub fn validate_synthesized_safety(verb: &Verb) -> Result<()> {
+    validate_verb(verb)?;
     if verb.trusted {
         bail!(
             "a synthesized verb may not be `trusted`; promote a verb to trusted only with a \
@@ -1438,7 +2176,10 @@ pub fn validate_synthesized_safety(verb: &Verb) -> Result<()> {
             verb.name
         );
     }
-    validate_binary_not_shell(&verb.binary, "synthesized verb")?;
+    validate_synthesized_command_shape(verb, &verb.binary, &verb.args, "forward command")?;
+    if let Some(revert) = &verb.revert {
+        validate_synthesized_command_shape(verb, &revert.binary, &revert.args, "revert command")?;
+    }
     let binary_name = std::path::Path::new(&verb.binary)
         .file_name()
         .and_then(|name| name.to_str())
@@ -1456,32 +2197,6 @@ pub fn validate_synthesized_safety(verb: &Verb) -> Result<()> {
             verb.name,
             verb.binary
         );
-    }
-    if let Some(operator) = verb
-        .args
-        .iter()
-        .find(|argument| matches!(argument.as_str(), ";" | "&&" | "||" | "|" | ">" | "<"))
-    {
-        bail!(
-            "synthesized verb '{}' has argv element {:?}, a literal shell operator; guard runs no \
-             shell, so the element can never chain or redirect and the verb is non-functional",
-            verb.name,
-            operator
-        );
-    }
-    if binary_name == "kubectl" && verb.args.iter().any(|argument| argument == "exec") {
-        if let Some(flag) = verb
-            .args
-            .iter()
-            .find(|argument| matches!(argument.as_str(), "-i" | "-t" | "-it" | "-ti"))
-        {
-            bail!(
-                "synthesized verb '{}' requests an interactive exec stream ('{}'); guard refuses \
-                 interactive stdin/tty at run time, so storing the flag only sets a trap",
-                verb.name,
-                flag
-            );
-        }
     }
     for (pname, spec) in &verb.params {
         validate_param_not_overbroad(pname, spec, "synthesized verb")?;
@@ -1636,23 +2351,57 @@ fn validate_verb(verb: &Verb) -> Result<()> {
             verb.name
         );
     }
+    validate_known_file_arguments(verb, &verb.binary, &verb.args, "forward command")?;
+    if let Some(revert) = &verb.revert {
+        validate_known_file_arguments(verb, &revert.binary, &revert.args, "revert command")?;
+    }
     for (pname, spec) in &verb.params {
-        if !(spec.pattern.starts_with('^') && spec.pattern.ends_with('$')) {
+        if spec.value_type() == ParamValueType::SingleArgv
+            && !matches!(spec.max_length(), Some(1..=MAX_SINGLE_ARGV_LENGTH))
+        {
+            bail!(
+                "verb '{}' param '{}': single_argv requires max_length between 1 and {}",
+                verb.name,
+                pname,
+                MAX_SINGLE_ARGV_LENGTH
+            );
+        }
+        if !(spec.pattern_text().starts_with('^') && spec.pattern_text().ends_with('$')) {
             bail!(
                 "verb '{}' param '{}': pattern must be fully anchored (^...$), got {:?}",
                 verb.name,
                 pname,
-                spec.pattern
+                spec.pattern_text()
             );
         }
         // Compile the anchored form so an invalid regex - or one whose
         // alternation would escape the anchors - is rejected at load time.
-        compile_anchored(&spec.pattern).with_context(|| {
+        compile_anchored(spec.pattern_text()).with_context(|| {
             format!(
                 "verb '{}' param '{}' has an invalid regex",
                 verb.name, pname
             )
         })?;
+        if let Some(default) = spec.default.as_deref() {
+            if spec
+                .max_length()
+                .is_some_and(|maximum| default.chars().count() > maximum)
+            {
+                bail!(
+                    "verb '{}' param '{}': default exceeds max_length",
+                    verb.name,
+                    pname
+                );
+            }
+            if spec.value_type() == ParamValueType::SingleArgv {
+                validate_single_argv_value(pname, default).with_context(|| {
+                    format!(
+                        "verb '{}' param '{}' has an invalid default",
+                        verb.name, pname
+                    )
+                })?;
+            }
+        }
     }
     // Every placeholder referenced by the templates must be a declared param,
     // and every declared param must be referenced by some template token: an
@@ -1791,6 +2540,12 @@ fn validate_verb(verb: &Verb) -> Result<()> {
         {
             validate_value_constraint(&verb.name, &cell.name, constraint)?;
         }
+        if let Some(inventory) = &cell.inventory {
+            validate_inventory_constraint_paths(verb, cell, inventory)?;
+        }
+        if let Some(cwd) = &cell.cwd {
+            validate_coverage_cwd(&verb.name, &cell.name, cwd)?;
+        }
         if let Some(fanout) = &cell.fanout {
             if fanout.max == 0 {
                 bail!(
@@ -1864,6 +2619,52 @@ fn validate_verb(verb: &Verb) -> Result<()> {
                 })?;
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_coverage_cwd(verb: &str, cell: &str, cwd: &Path) -> Result<()> {
+    if cwd.as_os_str().is_empty() || !cwd.is_absolute() {
+        bail!(
+            "verb '{}' coverage cell '{}': cwd must be an absolute canonical directory",
+            verb,
+            cell
+        );
+    }
+    let canonical = std::fs::canonicalize(cwd).with_context(|| {
+        format!(
+            "verb '{}' coverage cell '{}': cannot canonicalize cwd '{}'",
+            verb,
+            cell,
+            cwd.display()
+        )
+    })?;
+    if canonical != cwd {
+        bail!(
+            "verb '{}' coverage cell '{}': cwd '{}' is not canonical (use '{}')",
+            verb,
+            cell,
+            cwd.display(),
+            canonical.display()
+        );
+    }
+    if !std::fs::metadata(cwd)
+        .with_context(|| {
+            format!(
+                "verb '{}' coverage cell '{}': cannot stat cwd '{}'",
+                verb,
+                cell,
+                cwd.display()
+            )
+        })?
+        .is_dir()
+    {
+        bail!(
+            "verb '{}' coverage cell '{}': cwd '{}' is not a directory",
+            verb,
+            cell,
+            cwd.display()
+        );
     }
     Ok(())
 }
@@ -2539,6 +3340,7 @@ verbs:
             inventory: None,
             namespace: None,
             fanout: None,
+            cwd: None,
             environment: Vec::new(),
             override_marker: Some("operator:k-check".to_string()),
             sticky: true,
@@ -2567,7 +3369,7 @@ verbs:
 
     #[test]
     fn synthesized_interactive_kubectl_exec_flags_are_rejected() {
-        for flag in ["-i", "-t", "-it", "-ti"] {
+        for flag in ["-i", "-t", "-it", "-ti", "--stdin", "--tty=true"] {
             let mut verb = synth_verb("kubectl", None, false, "k-exec");
             verb.args = args_vec(&["exec", flag, "deploy/tools", "--", "ceph", "status"]);
             let error = validate_synthesized_safety(&verb).unwrap_err();
@@ -2582,6 +3384,196 @@ verbs:
         let mut other = synth_verb("fixturectl", None, false, "fixture-exec");
         other.args = args_vec(&["exec", "-it", "target"]);
         assert!(validate_synthesized_safety(&other).is_ok());
+
+        let mut bare_target = synth_verb("kubectl", None, false, "k-exec-bare");
+        bare_target.args = args_vec(&["exec", "generated-tools-pod", "--", "ceph", "status"]);
+        let error = validate_synthesized_safety(&bare_target).unwrap_err();
+        assert!(
+            error.to_string().contains("bare generated pod"),
+            "got: {error}"
+        );
+
+        let mut packed = synth_verb("kubectl", None, false, "k-exec-packed");
+        packed.args = args_vec(&["exec", "deploy/tools", "--", "ceph status"]);
+        let error = validate_synthesized_safety(&packed).unwrap_err();
+        assert!(
+            error.to_string().contains("whitespace-free"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn file_arguments_require_absolute_paths_only_in_known_file_positions() {
+        let relative_forward = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: apply-manifest
+    binary: kubectl
+    args: ["apply", "-f", "manifests/app.yaml"]
+    consequence: irreversible
+"#,
+        )
+        .unwrap_err();
+        assert!(relative_forward
+            .to_string()
+            .contains("must be an absolute path"));
+
+        let relative_revert = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: apply-playbook
+    binary: ansible-playbook
+    args: ["/srv/guard/playbooks/apply.yaml", "-i", "/srv/guard/inventory/production"]
+    consequence: recoverable
+    revert:
+      binary: ansible-playbook
+      args: ["rollback.yaml", "-i", "production"]
+"#,
+        )
+        .unwrap_err();
+        assert!(relative_revert.to_string().contains("revert command"));
+
+        let relative_parameter = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: apply-selected-manifest
+    binary: kubectl
+    args: ["apply", "-f", "{path}"]
+    params:
+      path: { pattern: "^[A-Za-z0-9._/-]+$" }
+    consequence: irreversible
+"#,
+        )
+        .unwrap_err();
+        assert!(relative_parameter
+            .to_string()
+            .contains("must be an absolute path"));
+
+        let relative_coverage = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: inspect-inventory
+    binary: ansible
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: bounded
+        action: preauthorized
+        inventory:
+          options: ["-i", "--inventory"]
+          values: ["inventory/production"]
+"#,
+        )
+        .unwrap_err();
+        assert!(relative_coverage
+            .to_string()
+            .contains("inventory value must be an absolute path"));
+
+        let portable = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: apply-selected-manifest
+    binary: kubectl
+    args: ["apply", "-f", "{path}"]
+    params:
+      path: { pattern: "^/srv/guard/manifests/[a-z0-9-]+\\.yaml$" }
+    consequence: irreversible
+  - name: inspect-controller
+    binary: kubectl
+    args: ["exec", "deploy/tools", "--", "ceph", "status"]
+    consequence: reversible
+"#,
+        )
+        .expect("absolute file operands and fixed non-path resource tokens remain valid");
+        assert_eq!(portable.names().len(), 2);
+    }
+
+    #[test]
+    fn single_argv_parameters_render_bounded_jsonpath_and_field_selectors() {
+        let catalog = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: inspect-pods
+    binary: kubectl
+    args: ["get", "pods", "-o", "jsonpath={jsonpath}", "--field-selector", "{selector}"]
+    params:
+      jsonpath:
+        pattern: '^\{\.metadata\.name\} \{\.status\.phase\}$'
+        value_type: single_argv
+        max_length: 96
+      selector:
+        pattern: '^status\.phase=Running, metadata\.name=api$'
+        value_type: single_argv
+        max_length: 96
+    consequence: reversible
+"#,
+        )
+        .unwrap();
+        let verb = catalog.get("inspect-pods").unwrap();
+        validate_synthesized_safety(verb).unwrap();
+        let params = BTreeMap::from([
+            (
+                "jsonpath".to_string(),
+                "{.metadata.name} {.status.phase}".to_string(),
+            ),
+            (
+                "selector".to_string(),
+                "status.phase=Running, metadata.name=api".to_string(),
+            ),
+        ]);
+        let rendered = catalog.render("inspect-pods", &params).unwrap();
+        assert_eq!(
+            rendered.args[3],
+            "jsonpath={.metadata.name} {.status.phase}"
+        );
+        assert_eq!(rendered.args[5], "status.phase=Running, metadata.name=api");
+        assert_eq!(rendered.args.len(), 6, "spaces must not split argv");
+        assert_eq!(verb.finite_parameter_sets().unwrap().len(), 1);
+
+        let encoded = serde_yaml_ng::to_string(verb).unwrap();
+        assert!(encoded.contains("value_type: single_argv"));
+        assert!(encoded.contains("max_length: 96"));
+    }
+
+    #[test]
+    fn single_argv_parameters_reject_shell_controls_and_require_a_bound() {
+        let dangerous = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: inspect-pods
+    binary: kubectl
+    args: ["get", "pods", "--field-selector", "{selector}"]
+    params:
+      selector:
+        pattern: '^[a-z; ]{1,32}$'
+        value_type: single_argv
+        max_length: 32
+    consequence: reversible
+"#,
+        )
+        .unwrap();
+        let error =
+            validate_synthesized_safety(dangerous.get("inspect-pods").unwrap()).unwrap_err();
+        assert!(error.to_string().contains("shell control"), "got: {error}");
+
+        let missing_bound = VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: inspect-pods
+    binary: kubectl
+    args: ["get", "pods", "--field-selector", "{selector}"]
+    params:
+      selector:
+        pattern: '^status\.phase=Running$'
+        value_type: single_argv
+    consequence: reversible
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{missing_bound:#}").contains("requires a positive max_length"),
+            "got: {missing_bound:#}"
+        );
     }
 
     #[test]
@@ -3047,7 +4039,7 @@ verbs:
           values: ["web"]
         inventory:
           options: ["-i", "--inventory"]
-          values: ["inventory/prod"]
+          values: ["/srv/guard/inventory/prod"]
         namespace:
           options: ["--namespace"]
           values: ["prod"]
@@ -3063,7 +4055,7 @@ verbs:
             "-m",
             "ping",
             "-i",
-            "inventory/prod",
+            "/srv/guard/inventory/prod",
             "--namespace=prod",
             "--limit",
             "one,two",
@@ -3085,7 +4077,7 @@ verbs:
         let too_many = args_vec(&[
             "web",
             "--module-name=ping",
-            "--inventory=inventory/prod",
+            "--inventory=/srv/guard/inventory/prod",
             "--namespace=prod",
             "--limit=one,two,three",
             "--check",
@@ -3097,7 +4089,7 @@ verbs:
             "-m",
             "ping",
             "-i",
-            "inventory/prod",
+            "/srv/guard/inventory/prod",
             "--namespace",
             "prod",
             "--limit=one",
@@ -3114,7 +4106,7 @@ verbs:
             "-m",
             "ping",
             "-i",
-            "inventory/prod",
+            "/srv/guard/inventory/prod",
             "--namespace",
             "prod",
             "--limit",
@@ -3338,6 +4330,82 @@ verbs:
         assert!(error
             .to_string()
             .contains("may not authorize caller environment bindings"));
+    }
+
+    #[test]
+    fn cwd_coverage_matches_only_the_operator_approved_canonical_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let root_yaml = serde_yaml_ng::to_string(&root.to_string_lossy().to_string()).unwrap();
+        let yaml = format!(
+            r#"
+verbs:
+  - name: project-status
+    binary: true
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: project-root
+        action: preauthorized
+        cwd: {}
+"#,
+            root_yaml.trim()
+        );
+        let catalog = VerbCatalog::from_yaml(&yaml).unwrap();
+        let empty = BTreeMap::new();
+
+        assert_eq!(
+            catalog
+                .match_command_all_with_environment_and_cwd(
+                    "true",
+                    &[],
+                    &empty,
+                    &empty,
+                    &empty,
+                    Some(&root),
+                )
+                .len(),
+            1
+        );
+        assert!(catalog
+            .match_command_all_with_environment_and_cwd(
+                "true",
+                &[],
+                &empty,
+                &empty,
+                &empty,
+                Some(other.path()),
+            )
+            .is_empty());
+        assert!(catalog.match_command_all("true", &[]).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cwd_coverage_rejects_a_symlink_instead_of_approving_its_target() {
+        let parent = tempfile::tempdir().unwrap();
+        let project = parent.path().join("project");
+        let alias = parent.path().join("project-link");
+        std::fs::create_dir(&project).unwrap();
+        std::os::unix::fs::symlink(&project, &alias).unwrap();
+        let yaml = format!(
+            r#"
+verbs:
+  - name: project-status
+    binary: true
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: project-root
+        action: preauthorized
+        cwd: "{}"
+"#,
+            alias.display()
+        );
+
+        let error = VerbCatalog::from_yaml(&yaml).unwrap_err();
+        assert!(error.to_string().contains("is not canonical"), "{error:#}");
     }
 
     #[test]

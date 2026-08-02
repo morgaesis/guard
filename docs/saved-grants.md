@@ -94,13 +94,18 @@ creates new review state.
 `guard access list` prints one compact line per request, hold, and session with
 requester, target, effective scope, expiry, remaining uses, state, and next
 action. `guard access show` includes typed capability coverage and evidence.
-Both commands support `--json` with `schema_version: 1`.
+`guard access status` adds activity statistics, recent decisions, approvals,
+provisionals, and authority requests for one access-managed session. These
+commands support `--json` with `schema_version: 1` and never return a raw
+session bearer.
 
 ```bash
 guard access list
 guard access list --json
 guard access show <request-or-session>
 guard access show <request-or-session> --json
+guard access status <session>
+guard access status <session> --json
 ```
 
 Denied operations that can be represented as missing typed authority return one

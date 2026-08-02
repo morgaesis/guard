@@ -5,7 +5,7 @@ use crate::server::binary_path_candidates;
 use crate::server::execute::exec_after_approval_with_secret_authority;
 use crate::server::execute::{
     audit_command_line, audit_session_fingerprint, evaluation_context_prompt, execute_command,
-    log_audit_policy_for_request,
+    log_audit_policy_for_request, AnsibleInventoryDiagnostics,
 };
 use crate::server::gate_runtime::binary_allowed;
 use crate::server::transport::emit_audit_events;
@@ -24,6 +24,10 @@ use crate::session::SessionExactRule;
 use crate::session::SessionGrant;
 use guard::evaluate::{EvalConfig, Evaluator};
 use guard::gating::deny_shape::{DenyLearningConfig, DenyShapeStore};
+#[cfg(unix)]
+use guard::gating::verb::VerbCatalog;
+#[cfg(unix)]
+use guard::gating::GateMode;
 use guard::principal::PrincipalKey;
 use std::collections::HashMap;
 #[cfg(unix)]
@@ -39,6 +43,37 @@ use super::{args, make_test_config, paranoid_test_config};
 
 #[cfg(unix)]
 static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[test]
+fn ansible_inventory_diagnostics_only_fail_explicit_unusable_inventory() {
+    let args = vec!["-i".to_string(), "/srv/inventory-a".to_string()];
+    assert!(AnsibleInventoryDiagnostics::for_command("other-tool", &args).is_none());
+    assert!(AnsibleInventoryDiagnostics::for_command("ansible", &[]).is_none());
+
+    let mut no_inventory =
+        AnsibleInventoryDiagnostics::for_command("ansible-playbook", &args).unwrap();
+    no_inventory
+        .observe("[WARNING]: No inventory was parsed, only implicit localhost is available\n");
+    assert!(no_inventory.normalizes_success_to_failure(Some(0)));
+    assert!(!no_inventory.normalizes_success_to_failure(Some(2)));
+
+    let multiple = vec![
+        "--inventory=/srv/inventory-a".to_string(),
+        "--inventory".to_string(),
+        "/srv/inventory-b".to_string(),
+    ];
+    let mut partial = AnsibleInventoryDiagnostics::for_command("ansible", &multiple).unwrap();
+    partial.observe(
+        "[WARNING]: Unable to parse /srv/inventory-a as an inventory source\nPLAY [all]\n",
+    );
+    assert!(!partial.normalizes_success_to_failure(Some(0)));
+    partial.observe("[WARNING]: Unable to parse /srv/inventory-b as an inventory source\n");
+    assert!(partial.normalizes_success_to_failure(Some(0)));
+
+    let mut unrelated = AnsibleInventoryDiagnostics::for_command("ansible", &args).unwrap();
+    unrelated.observe("Unable to parse /srv/inventory-a as a configuration source\n");
+    assert!(!unrelated.normalizes_success_to_failure(Some(0)));
+}
 
 #[cfg(unix)]
 fn unrestricted_session() -> SessionGrant {
@@ -596,6 +631,65 @@ async fn streaming_secret_exposure_is_recorded_even_on_nonzero_exit() {
     assert!(!logs.contains("secondary-value-never-logged"));
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn ansible_unusable_inventory_normalizes_success_for_buffered_and_streaming_execution() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let executable = directory.path().join("ansible-playbook");
+    std::fs::write(
+        &executable,
+        "#!/bin/sh\nprintf '%s\\n' '[WARNING]: Unable to parse /srv/inventory as an inventory source' >&2\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let caller = CallerIdentity::Unix { uid: 1000 };
+    let (cfg, _) = make_test_config();
+    for stream_output in [false, true] {
+        let request = basic_request(
+            executable.to_str().unwrap(),
+            vec![
+                "-i".to_string(),
+                "/srv/inventory".to_string(),
+                "/srv/playbook.yaml".to_string(),
+            ],
+        );
+        let mut stream = Vec::new();
+        let result = exec_after_approval_with_secret_authority(
+            &mut RequestContext {
+                server: &cfg,
+                caller: &caller,
+                depth: 0,
+                stream_output,
+                stream_writer: &mut stream,
+            },
+            request,
+            "test allow".to_string(),
+            None,
+        )
+        .await;
+
+        assert_eq!(result.exit_code(), Some(1));
+        if stream_output {
+            assert!(
+                String::from_utf8_lossy(&stream).contains("treating exit 0 as failure"),
+                "stream={}",
+                String::from_utf8_lossy(&stream)
+            );
+        } else {
+            match result.exec {
+                ExecOutcome::Completed {
+                    stderr: Some(stderr),
+                    ..
+                } => assert!(stderr.contains("treating exit 0 as failure")),
+                other => panic!("unexpected result: {other:?}"),
+            }
+        }
+    }
+}
+
 // ---- ExecuteResult result-shape tests -----------------------------------
 
 #[test]
@@ -948,6 +1042,193 @@ fn basic_request(binary: &str, args: Vec<String>) -> ExecuteRequest {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn approved_ansible_evaluate_verbs_bypass_denial_without_filing_another_request() {
+    let _env_guard = TEST_ENV_LOCK.lock().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(run_denying_llm(listener));
+
+    let temp = tempfile::tempdir().unwrap();
+    let bin_dir = temp.path().join("bin");
+    std::fs::create_dir(&bin_dir).unwrap();
+    let ansible = bin_dir.join("ansible-playbook");
+    std::fs::write(&ansible, "#!/bin/sh\nprintf 'ansible-fixture:%s' \"$*\"\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = std::fs::metadata(&ansible).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&ansible, permissions).unwrap();
+    let _path_restore = EnvRestore::capture("PATH");
+    std::env::set_var("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()));
+
+    let (mut cfg, _) = make_test_config();
+    cfg.config.gate = GateMode::Consequence;
+    cfg.state.evaluator = Arc::new(
+        Evaluator::new(
+            EvalConfig::default()
+                .llm_api_key("test-key".to_string())
+                .llm_api_url(url)
+                .llm_retries(0),
+        )
+        .unwrap(),
+    );
+    cfg.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: validate-atlas-playbook
+    binary: ansible-playbook
+    args: ["--syntax-check", "/srv/automation/site.yml"]
+    baseline: false
+    consequence: reversible
+    coverage:
+      - name: syntax-check
+        action: evaluate
+        required_args: ["--syntax-check", "/srv/automation/site.yml"]
+  - name: run-atlas-playbook-check-diff
+    binary: ansible-playbook
+    args: ["-i", "/srv/automation/inventory", "/srv/automation/site.yml", "--limit", "group-a", "--check", "--diff"]
+    baseline: false
+    consequence: reversible
+    coverage:
+      - name: check-diff
+        action: evaluate
+        required_args: ["--check", "--diff"]
+"#,
+        )
+        .unwrap(),
+    ));
+
+    let mut grant = unrestricted_session();
+    grant.activated_verbs = vec![
+        "validate-atlas-playbook".to_string(),
+        "run-atlas-playbook-check-diff".to_string(),
+    ];
+    grant.scope.access_managed = true;
+    let mut sessions = cfg.state.sessions.write().await;
+    sessions.grant("approved-ansible".to_string(), grant);
+    assert_eq!(
+        sessions.install_access_grant(
+            "approved-ansible",
+            Some(2),
+            "gr-approved-ansible".to_string(),
+            vec![
+                "validate-atlas-playbook".to_string(),
+                "run-atlas-playbook-check-diff".to_string(),
+            ],
+        ),
+        Some(true)
+    );
+    drop(sessions);
+
+    for args in [
+        vec![
+            "--syntax-check".to_string(),
+            "/srv/automation/site.yml".to_string(),
+        ],
+        vec![
+            "-i".to_string(),
+            "/srv/automation/inventory".to_string(),
+            "/srv/automation/site.yml".to_string(),
+            "--limit".to_string(),
+            "group-a".to_string(),
+            "--check".to_string(),
+            "--diff".to_string(),
+        ],
+    ] {
+        let mut request = basic_request("ansible-playbook", args);
+        request.session_token = Some("approved-ansible".to_string());
+        let response = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 })
+            .await
+            .into_response();
+        assert!(
+            response.allowed,
+            "approved Evaluate verb reached the denying evaluator: {response:?}"
+        );
+        assert_eq!(response.exit_code, Some(0));
+    }
+
+    assert_eq!(
+        cfg.state
+            .sessions
+            .read()
+            .await
+            .access_grant_uses("approved-ansible", "gr-approved-ansible"),
+        Some((Some(2), Some(0)))
+    );
+    assert!(cfg.state.grant_requests.read().await.is_empty());
+    let admission = cfg.state.command_admission.snapshot();
+    assert_eq!(admission.evaluator_attempted, 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn trusted_ceph_style_verb_with_exact_dimensions_never_reaches_evaluator() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(run_denying_llm(listener));
+
+    let (mut cfg, _) = make_test_config();
+    cfg.config.gate = GateMode::Consequence;
+    cfg.state.evaluator = Arc::new(
+        Evaluator::new(
+            EvalConfig::default()
+                .llm_api_key("test-key".to_string())
+                .llm_api_url(url)
+                .llm_retries(0),
+        )
+        .unwrap(),
+    );
+    cfg.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: ceph-osd-df
+    binary: true
+    args: [ceph, osd, df]
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: exact-daemon-kubeconfig
+        action: preauthorized
+        required_args: [ceph, osd, df]
+        environment:
+          - name: KUBECONFIG
+            values: ["/var/lib/guard/.kube/config"]
+"#,
+        )
+        .unwrap(),
+    ));
+
+    for _ in 0..16 {
+        let mut request = basic_request(
+            "true",
+            vec!["ceph".to_string(), "osd".to_string(), "df".to_string()],
+        );
+        request.env.insert(
+            "KUBECONFIG".to_string(),
+            "/var/lib/guard/.kube/config".to_string(),
+        );
+        let response = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 })
+            .await
+            .into_response();
+        assert!(
+            response.allowed,
+            "exact trusted dimensions fell through to evaluator: {response:?}"
+        );
+        assert_eq!(response.exit_code, Some(0));
+        assert_eq!(response.verb_matches.len(), 1);
+        assert_eq!(
+            response.verb_matches[0].action,
+            guard::gating::verb::CoverageAction::Preauthorized
+        );
+    }
+
+    let admission = cfg.state.command_admission.snapshot();
+    assert_eq!(admission.evaluator_attempted, 0);
+}
+
 #[tokio::test]
 async fn repeated_llm_denials_append_count_hint_at_threshold_only() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1232,7 +1513,7 @@ async fn audit_verify_and_tail_admin_rpcs() {
     };
     match handle_admin_request(&cfg, &outsider, AdminRequest::AuditVerify).await {
         AdminResponse::Error { message } => {
-            assert!(message.contains("not the daemon principal"), "{message}")
+            assert!(message.contains("lacks operator authority"), "{message}")
         }
         other => panic!("expected rejection, got {other:?}"),
     }

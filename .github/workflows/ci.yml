@@ -121,7 +121,9 @@ jobs:
           persist-credentials: false
       - name: Run isolated adversarial gate
         shell: bash
-        run: ./ctf/gating/run.sh attack
+        run: |
+          python3 ./ctf/egress-proxy.py --self-test
+          ./ctf/gating/run.sh attack
 
   synthetic_user:
     name: Isolated synthetic-user catalog

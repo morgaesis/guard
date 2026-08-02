@@ -29,6 +29,8 @@ pub struct LlmConfig {
     pub enabled: bool,
     pub api_key: Option<String>,
     pub api_url: Option<String>,
+    /// Optional HTTP CONNECT proxy used only by evaluator traffic.
+    pub proxy_url: Option<String>,
     /// Primary model slug. Used if `models` is empty.
     pub model: Option<String>,
     /// Optional ordered fallback chain. If non-empty, overrides `model` and is
@@ -45,6 +47,7 @@ impl Default for LlmConfig {
             enabled: true,
             api_key: None,
             api_url: None,
+            proxy_url: None,
             model: None,
             models: Vec::new(),
             timeout_secs: DEFAULT_TIMEOUT,
@@ -168,6 +171,11 @@ impl EvalConfig {
         self
     }
 
+    pub fn llm_proxy_url(mut self, url: String) -> Self {
+        self.llm.proxy_url = Some(url);
+        self
+    }
+
     pub fn llm_model(mut self, model: String) -> Self {
         self.llm.model = Some(model);
         self
@@ -253,6 +261,7 @@ mod tests {
         let config = LlmConfig::default();
         assert!(config.enabled);
         assert!(config.api_url.is_none());
+        assert!(config.proxy_url.is_none());
         assert!(config.model.is_none());
         assert!(config.models.is_empty());
         assert_eq!(config.timeout_secs, DEFAULT_TIMEOUT);

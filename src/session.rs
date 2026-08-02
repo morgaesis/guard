@@ -251,34 +251,37 @@ impl SessionInteraction {
     }
 }
 
-#[cfg(test)]
 impl SessionGrantSummary {
     /// Redact credential-shaped material from every field that can carry
     /// command-derived text before the summary leaves the daemon.
     pub fn redact_credentials(&mut self) {
-        sanitize_credentials_vec(&mut self.allow);
-        sanitize_credentials_vec(&mut self.deny);
-        sanitize_credentials_rules(&mut self.allow_exact);
-        sanitize_credentials_rules(&mut self.deny_exact);
+        #[cfg(test)]
+        {
+            sanitize_credentials_vec(&mut self.allow);
+            sanitize_credentials_vec(&mut self.deny);
+            sanitize_credentials_rules(&mut self.allow_exact);
+            sanitize_credentials_rules(&mut self.deny_exact);
+        }
         sanitize_credentials_opt(&mut self.prompt_append);
         sanitize_credentials_vec(&mut self.generated_notes);
     }
 }
 
-#[cfg(test)]
 impl HistoricalGrant {
     /// See [`SessionGrantSummary::redact_credentials`].
     pub fn redact_credentials(&mut self) {
-        sanitize_credentials_vec(&mut self.allow);
-        sanitize_credentials_vec(&mut self.deny);
-        sanitize_credentials_rules(&mut self.allow_exact);
-        sanitize_credentials_rules(&mut self.deny_exact);
+        #[cfg(test)]
+        {
+            sanitize_credentials_vec(&mut self.allow);
+            sanitize_credentials_vec(&mut self.deny);
+            sanitize_credentials_rules(&mut self.allow_exact);
+            sanitize_credentials_rules(&mut self.deny_exact);
+        }
         sanitize_credentials_opt(&mut self.prompt_append);
         sanitize_credentials_vec(&mut self.generated_notes);
     }
 }
 
-#[cfg(test)]
 impl SessionReport {
     /// Redact credential-shaped material from every command-derived field of
     /// the report (active grant, historical grants, recent interactions).

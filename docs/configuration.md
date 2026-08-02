@@ -17,6 +17,7 @@ not in command-line arguments.
 |---|---|---|
 | `GUARD_LLM_API_KEY` | none | Evaluator API key. `OPENROUTER_API_KEY` is also accepted. |
 | `GUARD_LLM_API_URL` | OpenRouter chat completions | OpenAI-compatible evaluator endpoint. |
+| `GUARD_LLM_PROXY_URL` | unset | HTTP CONNECT proxy used only for evaluator requests. |
 | `GUARD_LLM_MODEL` | `openai/gpt-5.4-mini` | Primary model. |
 | `GUARD_LLM_MODELS` | unset | Comma-separated fallback chain that supersedes the single model. |
 | `GUARD_LLM_RETRIES` | `2` | Transient retries per model, from 0 to 2; larger values are capped at 2. |
@@ -46,6 +47,38 @@ describes each such tool there: what its mutation surface is, which invocations
 are inspection, and which argument shapes are out of bounds. Typed verbs are
 the deterministic alternative for tools whose semantics should not depend on
 evaluator judgment at all.
+
+For example, an operator-provided `site-admin` binary with
+`inspect --service NAME` and `apply --service NAME` subcommands can use this
+prompt supplement:
+
+```text
+Local tool: site-admin
+- `site-admin inspect --service NAME` reads service state and does not mutate it.
+- `site-admin apply --service NAME` reconciles the named service and may change
+  configuration, processes, and remote state. Treat it as an opaque mutation.
+- Reject unknown subcommands, payload arguments, shell fragments, stdin-driven
+  input, and service names that are not visible as one argv element.
+```
+
+When only a fixed inspection set is required, a typed verb removes evaluator
+ambiguity:
+
+```yaml
+version: 1
+verbs:
+  - name: site-admin-inspect
+    description: Inspect one configured service
+    binary: site-admin
+    args: [inspect, --service, "{service}"]
+    params:
+      service:
+        enum: [api, worker]
+    consequence: reversible
+```
+
+The prompt supplement explains novel invocations. The typed verb is the
+enforcement surface for repeated commands whose executable shapes are finite.
 
 `--policy <yaml>` is an optional pre-evaluator deny path. With the evaluator
 enabled, policy allow patterns do not skip evaluation. `--no-evaluator` makes
@@ -147,6 +180,33 @@ prompts and audit; Guard binds them with a value digest. Secret bindings expose
 only environment and store names to policy, while resolved values remain inside
 the daemon.
 
+### Tool-owned environment
+
+The daemon loads `tools.yaml` from its Guard configuration directory. Each
+binary can receive fixed environment values and named secrets owned by the
+daemon:
+
+```yaml
+tools:
+  ansible-playbook:
+    env:
+      HOME: /var/lib/guard
+      ANSIBLE_LOCAL_TEMP: /var/lib/guard/.ansible/tmp
+      PATH: /opt/ansible-tools/bin:/usr/local/bin:/usr/bin:/bin
+```
+
+This pattern gives `connection: local` tasks a writable home and temporary
+directory while selecting an operator-managed Python environment for modules.
+Create those directories with service-account ownership before starting Guard.
+Pin `ansible_python_interpreter` in the inventory or a typed verb when a
+playbook must use a particular interpreter. Tool values override the built-in
+safe environment, and a request cannot override the same variable.
+
+Tool configuration is binary-wide. Use separate wrapper binary names when two
+verb families require incompatible environments. Per-user entries under
+`users` can override fixed values or secret references, but the authenticated
+principal's secret namespace remains the source.
+
 ## API proxy
 
 | Variable | Default | Meaning |
@@ -202,7 +262,7 @@ Each record carries `seq` and `prev_hash` (SHA-256 of the previous serialized
 record; a fixed genesis constant for the first), so any truncation, edit, or
 reorder breaks the chain. `guard audit verify` walks the chain and reports
 intact or the first broken sequence; `guard audit tail [-n N]` reads the most
-recent records. Both are daemon-principal-only and support `--json`.
+recent records. Both require operator authority and support `--json`.
 
 If an allow decision, an operator approval, or a confirm cannot be durably
 appended (disk full, permission failure), the action is denied: guard fails

@@ -11,6 +11,10 @@ if [ "$(id -u)" -ne 0 ]; then
     echo "Local CTF initialization requires container root before it drops to the attacker UID." >&2
     exit 1
 fi
+if ip route show default | grep -q .; then
+    echo "The local CTF container unexpectedly has a default network route." >&2
+    exit 1
+fi
 
 # Only the daemon can read evaluator and SSH key material. Both arrive as
 # guard-owned Podman secret files, never through the container environment or
@@ -71,6 +75,7 @@ export HOME=/home/guard
 export PATH=/usr/local/bin:/usr/bin:/bin
 export GUARD_MODE=safe
 export GUARD_LLM_API_KEY="$(< /tmp/ctf-secrets/evaluator-api-key)"
+export GUARD_LLM_PROXY_URL=http://guard-egress:3128
 exec /usr/local/bin/guard server start \
     --socket /home/guard/run/guard.sock \
     --socket-group guard-clients \

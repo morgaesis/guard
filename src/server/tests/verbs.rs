@@ -6,6 +6,7 @@ use crate::server::wire::{
 use crate::server::ServerContext;
 use crate::session::SessionGrant;
 use guard::evaluate::{EvalConfig, Evaluator};
+use guard::gating::approval::ApprovalStatus;
 use guard::gating::verb::VerbCatalog;
 use guard::gating::GateMode;
 use guard::principal::PrincipalKey;
@@ -79,6 +80,50 @@ verbs:
     assert!(!response.verb_matches[0].selected);
     assert!(response.verb_matches[1].selected);
     assert!(response.verb_guidance.is_none());
+}
+
+#[tokio::test]
+async fn cwd_bound_coverage_resolves_after_canonicalization_and_rejects_changed_directory() {
+    let (mut cfg, _buf) = make_test_config();
+    cfg.config.gate = GateMode::Consequence;
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path().canonicalize().unwrap();
+    let root_yaml = serde_yaml_ng::to_string(&root).unwrap();
+    let other = tempfile::tempdir().unwrap();
+    cfg.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(&format!(
+            r#"
+verbs:
+  - name: project-status
+    binary: true
+    consequence: reversible
+    trusted: true
+    coverage:
+      - name: project-root
+        action: preauthorized
+        cwd: {}
+"#,
+            root_yaml.trim_end()
+        ))
+        .unwrap(),
+    ));
+
+    let mut approved = raw_request("true", &[], None);
+    approved.cwd = Some(root);
+    let approved = execute_command(approved, &cfg, &CallerIdentity::Unix { uid: 1000 })
+        .await
+        .into_response();
+    assert!(approved.allowed, "{approved:?}");
+    assert_eq!(approved.exit_code, Some(0));
+    assert_eq!(approved.verb_matches[0].features, vec!["cwd:exact"]);
+
+    let mut changed = raw_request("true", &[], None);
+    changed.cwd = Some(other.path().to_path_buf());
+    let changed = execute_command(changed, &cfg, &CallerIdentity::Unix { uid: 1000 })
+        .await
+        .into_response();
+    assert!(!changed.allowed, "{changed:?}");
+    assert!(changed.verb_matches.is_empty());
 }
 
 #[tokio::test]
@@ -721,12 +766,188 @@ fn overbroad_until_gate_feedback_arrives(request: &str) -> serde_json::Value {
     })
 }
 
+fn nonfinite_synthesis_arguments(_request: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": "inspect-fixture",
+        "description": "Inspect one named fixture",
+        "binary": "fixturectl",
+        "args": ["show", "{target}"],
+        "params": {"target": {"pattern": "^[a-z0-9-]{1,63}$"}},
+        "consequence": "reversible",
+        "trusted": false,
+        "evidence": "The command admits one bounded resource name."
+    })
+}
+
+fn relative_file_synthesis_arguments(_request: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": "apply-fixture",
+        "description": "Apply one fixture manifest",
+        "binary": "kubectl",
+        "args": ["apply", "-f", "manifests/fixture.yaml"],
+        "params": {},
+        "consequence": "irreversible",
+        "trusted": false,
+        "evidence": "The manifest is fixed."
+    })
+}
+
 fn file_backed_catalog() -> (tempfile::TempDir, VerbCatalog) {
     let dir = tempfile::tempdir().expect("catalog test dir");
     let path = dir.path().join("verbs.yaml");
     std::fs::write(&path, "verbs: []\n").expect("write empty catalog");
     let catalog = VerbCatalog::load(&path).expect("load empty catalog");
     (dir, catalog)
+}
+
+fn amend_test_catalog() -> (tempfile::TempDir, std::path::PathBuf, VerbCatalog) {
+    let dir = tempfile::tempdir().expect("catalog test dir");
+    let path = dir.path().join("verbs.yaml");
+    std::fs::write(
+        &path,
+        r#"verbs:
+  - name: inspect-fixture
+    description: Inspect one fixture
+    binary: fixturectl
+    args: [show, "{target}"]
+    params:
+      target: { pattern: "^[a-z0-9-]+$" }
+    consequence: reversible
+    trusted: true
+  - name: untouched
+    binary: true
+    consequence: reversible
+"#,
+    )
+    .unwrap();
+    let catalog = VerbCatalog::load(&path).unwrap();
+    (dir, path, catalog)
+}
+
+#[tokio::test]
+async fn verb_amend_replaces_the_expected_definition_and_preserves_the_catalog() {
+    let (mut cfg, _buf) = make_test_config();
+    let (_dir, path, catalog) = amend_test_catalog();
+    let current = catalog.get("inspect-fixture").unwrap().clone();
+    let expected_digest = current.definition_digest();
+    let mut replacement = current.clone();
+    replacement.description = "Inspect one named fixture".to_string();
+    let new_digest = replacement.definition_digest();
+    cfg.state.verbs = Arc::new(RwLock::new(catalog));
+    let operator = CallerIdentity::UnixAdmin { uid: 777 };
+
+    let response = handle_admin_request(
+        &cfg,
+        &operator,
+        AdminRequest::VerbAmend {
+            name: "inspect-fixture".to_string(),
+            expected_digest: expected_digest.clone(),
+            replacement: Box::new(replacement.clone()),
+        },
+    )
+    .await;
+    let AdminResponse::VerbAmended {
+        verb,
+        previous_digest,
+        digest,
+    } = response
+    else {
+        panic!("expected successful amend, got {response:?}")
+    };
+    assert_eq!(verb.description, "Inspect one named fixture");
+    assert_eq!(previous_digest, expected_digest);
+    assert_eq!(digest, new_digest);
+
+    let reloaded = VerbCatalog::load(&path).unwrap();
+    assert_eq!(
+        reloaded.get("inspect-fixture").unwrap().description,
+        "Inspect one named fixture"
+    );
+    assert!(reloaded.get("untouched").is_some());
+}
+
+#[tokio::test]
+async fn verb_amend_rejects_a_stale_digest_without_writing() {
+    let (mut cfg, _buf) = make_test_config();
+    let (_dir, path, catalog) = amend_test_catalog();
+    let original = std::fs::read(&path).unwrap();
+    let mut replacement = catalog.get("inspect-fixture").unwrap().clone();
+    replacement.description = "Stale replacement".to_string();
+    cfg.state.verbs = Arc::new(RwLock::new(catalog));
+
+    let response = handle_admin_request(
+        &cfg,
+        &CallerIdentity::UnixAdmin { uid: 777 },
+        AdminRequest::VerbAmend {
+            name: "inspect-fixture".to_string(),
+            expected_digest: "0".repeat(64),
+            replacement: Box::new(replacement),
+        },
+    )
+    .await;
+    let AdminResponse::Error { message } = response else {
+        panic!("stale digest must fail")
+    };
+    assert!(message.contains("changed before amend"), "{message}");
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+}
+
+#[tokio::test]
+async fn verb_amend_rejects_invalid_or_generated_candidates_without_writing() {
+    let (mut cfg, _buf) = make_test_config();
+    let (_dir, path, catalog) = amend_test_catalog();
+    let original = std::fs::read(&path).unwrap();
+    let current = catalog.get("inspect-fixture").unwrap().clone();
+    let expected_digest = current.definition_digest();
+    cfg.state.verbs = Arc::new(RwLock::new(catalog));
+    let operator = CallerIdentity::UnixAdmin { uid: 777 };
+
+    let mut invalid = current.clone();
+    invalid.params.get_mut("target").unwrap().pattern = "[a-z]+".to_string();
+    let response = handle_admin_request(
+        &cfg,
+        &operator,
+        AdminRequest::VerbAmend {
+            name: "inspect-fixture".to_string(),
+            expected_digest: expected_digest.clone(),
+            replacement: Box::new(invalid),
+        },
+    )
+    .await;
+    assert!(matches!(response, AdminResponse::Error { .. }));
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+
+    let mut generated = current;
+    generated.auto_promoted = true;
+    let response = handle_admin_request(
+        &cfg,
+        &operator,
+        AdminRequest::VerbAmend {
+            name: "inspect-fixture".to_string(),
+            expected_digest,
+            replacement: Box::new(generated),
+        },
+    )
+    .await;
+    let AdminResponse::Error { message } = response else {
+        panic!("generated candidate must fail")
+    };
+    assert!(message.contains("generated or reserved"), "{message}");
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    let replacement = cfg
+        .state
+        .verbs
+        .read()
+        .await
+        .get("inspect-fixture")
+        .unwrap()
+        .clone();
+    assert!(AdminRequest::VerbAmend {
+        name: "inspect-fixture".to_string(),
+        expected_digest: "0".repeat(64),
+        replacement: Box::new(replacement),
+    }
+    .requires_admin_token());
 }
 
 fn synthesis_test_config(llm_url: String) -> (ServerContext, CallerIdentity) {
@@ -745,6 +966,21 @@ fn synthesis_test_config(llm_url: String) -> (ServerContext, CallerIdentity) {
         uid: cfg.config.daemon_uid,
     };
     (cfg, daemon)
+}
+
+fn install_static_synthesis_policy(cfg: &mut ServerContext, decision: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("policy test dir");
+    let path = dir.path().join("policy.yaml");
+    std::fs::write(
+        &path,
+        format!("policy:\n  commands:\n    {decision}:\n      - \"rustc --version\"\n"),
+    )
+    .expect("write synthesis admission policy");
+    cfg.state.evaluator = Arc::new(
+        Evaluator::new(EvalConfig::default().llm_enabled(false).policy_path(path))
+            .expect("build synthesis admission evaluator"),
+    );
+    dir
 }
 
 #[tokio::test]
@@ -778,6 +1014,8 @@ async fn preview_digest_round_trip_installs_the_exact_reviewed_candidate() {
     assert!(!persisted);
     let digest = preview_digest.expect("a preview response carries its digest");
     assert_eq!(digest, previewed.definition_digest());
+
+    let _policy = install_static_synthesis_policy(&mut cfg, "allow");
 
     let response = handle_admin_request(
         &cfg,
@@ -849,6 +1087,167 @@ async fn from_preview_rejects_unknown_and_malformed_digests() {
     assert!(
         message.contains("is not a preview digest"),
         "unhelpful malformed-digest error: {message}"
+    );
+}
+
+#[tokio::test]
+async fn evaluator_admission_denial_prevents_preview_installation() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(super::run_verb_synthesis_llm(listener));
+    let (mut cfg, daemon) = synthesis_test_config(url);
+    let (_dir, catalog) = file_backed_catalog();
+    cfg.state.verbs = Arc::new(RwLock::new(catalog));
+
+    let preview = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::VerbCreate {
+            prose: "Inspect compiler version.".to_string(),
+            binary_hint: Some("rustc".to_string()),
+            preview: true,
+            gate_feedback: Vec::new(),
+        },
+    )
+    .await;
+    let AdminResponse::VerbCreated {
+        preview_digest: Some(digest),
+        ..
+    } = preview
+    else {
+        panic!("expected preview candidate, got {preview:?}");
+    };
+
+    let _policy = install_static_synthesis_policy(&mut cfg, "deny");
+    let response = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::VerbCreateFromPreview { digest },
+    )
+    .await;
+    let AdminResponse::Error { message } = response else {
+        panic!("expected admission rejection, got {response:?}");
+    };
+    assert!(
+        message.contains("rejected by admission preflight"),
+        "{message}"
+    );
+    assert!(cfg.state.verbs.read().await.get("check-compiler").is_none());
+}
+
+#[tokio::test]
+async fn nonfinite_synthesis_preflight_fails_explicitly_before_storage() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(super::run_verb_synthesis_llm_with(
+        listener,
+        nonfinite_synthesis_arguments,
+    ));
+    let (mut cfg, daemon) = synthesis_test_config(url);
+    let (_dir, catalog) = file_backed_catalog();
+    cfg.state.verbs = Arc::new(RwLock::new(catalog));
+
+    let preview = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::VerbCreate {
+            prose: "Inspect one named fixture.".to_string(),
+            binary_hint: Some("fixturectl".to_string()),
+            preview: true,
+            gate_feedback: Vec::new(),
+        },
+    )
+    .await;
+    let AdminResponse::VerbCreated {
+        preview_digest: Some(digest),
+        ..
+    } = preview
+    else {
+        panic!("expected preview candidate, got {preview:?}");
+    };
+    let response = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::VerbCreateFromPreview { digest },
+    )
+    .await;
+    let AdminResponse::Error { message } = response else {
+        panic!("expected incomplete preflight, got {response:?}");
+    };
+    assert!(
+        message.contains("admission preflight is incomplete"),
+        "{message}"
+    );
+    assert!(
+        message.contains("non-finite parameter pattern"),
+        "{message}"
+    );
+    assert!(cfg
+        .state
+        .verbs
+        .read()
+        .await
+        .get("inspect-fixture")
+        .is_none());
+}
+
+#[tokio::test]
+async fn rejected_direct_create_leaves_a_pending_hold_and_catalog_unchanged() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(super::run_verb_synthesis_llm_with(
+        listener,
+        relative_file_synthesis_arguments,
+    ));
+    let (mut cfg, daemon) = synthesis_test_config(url);
+    cfg.config.gate = GateMode::Consequence;
+    let dir = tempfile::tempdir().expect("catalog test dir");
+    let path = dir.path().join("verbs.yaml");
+    std::fs::write(
+        &path,
+        "verbs:\n  - name: held-fixture\n    binary: true\n    consequence: irreversible\n    trusted: true\n",
+    )
+    .unwrap();
+    cfg.state.verbs = Arc::new(RwLock::new(VerbCatalog::load(&path).unwrap()));
+    let original_version = cfg.state.verbs.read().await.version();
+
+    let mut request = raw_request("", &[], None);
+    request.verb = Some(VerbInvocation {
+        name: "held-fixture".to_string(),
+        params: Default::default(),
+    });
+    let held = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1001 })
+        .await
+        .into_response();
+    let handle = held.handle.expect("irreversible verb creates a hold");
+    assert_eq!(held.status, Some(GateStatus::Held));
+
+    let response = handle_admin_request(
+        &cfg,
+        &daemon,
+        AdminRequest::VerbCreate {
+            prose: "Apply the fixed fixture manifest.".to_string(),
+            binary_hint: Some("kubectl".to_string()),
+            preview: false,
+            gate_feedback: Vec::new(),
+        },
+    )
+    .await;
+    let AdminResponse::Error { message } = response else {
+        panic!("expected relative-file rejection, got {response:?}");
+    };
+    assert!(message.contains("must be an absolute path"), "{message}");
+    assert_eq!(cfg.state.verbs.read().await.version(), original_version);
+    assert!(cfg.state.verbs.read().await.get("apply-fixture").is_none());
+    assert_eq!(
+        cfg.state
+            .approvals
+            .read()
+            .await
+            .get(&handle)
+            .unwrap()
+            .status,
+        ApprovalStatus::Pending
     );
 }
 

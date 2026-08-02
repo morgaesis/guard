@@ -62,6 +62,10 @@ daemon. It cannot be combined with TCP, the API proxy, or secret-file delivery.
 It also moves more local filesystem authority to the caller, so it is not the
 default credential-broker model.
 
+Grant expiry does not revoke effects an opaque child has already produced or
+credentials it copied while running. The execution-context comparison and SSH
+stream boundary are defined in [Security model](security-model.md#execution-and-credential-isolation).
+
 ## Secrets
 
 Store secrets in the daemon backend, then name them at execution time:
@@ -92,9 +96,8 @@ the flag. A novel operation that cannot yet be reduced gives the exact
 operator hard-deny is labeled non-overridable and creates no request. Holds
 render one durable identifier and only one-time approval guidance. Typed denial
 requests offer ordinary, one-time, and bounded access.
-`guard access list
---json` and `guard access show --json` support automation without parsing prose
-or handling bearer tokens.
+`guard access list --json`, `guard access show --json`, and `guard access status
+--json` support automation without parsing prose or handling bearer tokens.
 
 A successful human command does not print verb matching noise. Denied and held
 commands print the matching coverage and the next bounded action on stderr.
@@ -136,7 +139,7 @@ exact access approval commands. It does not create a parallel policy path.
 Normal client configuration supplies the execution token for a TCP daemon. MCP does
 not receive or forward the configured admin bearer.
 
-Local-socket MCP exposes six tools:
+Local-socket MCP exposes seven tools:
 
 | Tool | Purpose | Key arguments | CLI equivalent |
 | ---- | ------- | ------------- | -------------- |
@@ -146,6 +149,7 @@ Local-socket MCP exposes six tools:
 | `guard_access_list` | List the caller's requests, holds, and access sessions | none | `guard access list` |
 | `guard_evaluate_batch` | Dry-evaluate up to 64 command shapes without executing anything | `commands` (array of `{binary, args}`, 1-64 items, required); `session` (string, optional target session) | MCP-only; no CLI equivalent |
 | `guard_access_show` | Show one durable request, hold, or access session | `reference` (string, required) | `guard access show` |
+| `guard_access_status` | Show activity, decisions, holds, and provisionals for one access-managed session | `reference` (string, required) | `guard access status` |
 
 `guard_run` is the default name for the execution tool; `guard mcp serve
 --tool-name` renames it to a name that is not reserved by another built-in

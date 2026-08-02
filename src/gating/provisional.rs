@@ -23,7 +23,8 @@ use crate::principal::{scope_eq, PrincipalKey};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProvisionalStatus {
-    /// Forward command ran; the auto-revert timer is counting down.
+    /// The forward command is running, or it completed successfully and the
+    /// auto-revert timer is counting down. `forward_done` distinguishes them.
     Armed,
     /// The sweeper has claimed this for revert and the revert is in flight.
     /// In-memory transient; if seen on startup it means a revert was
@@ -158,6 +159,23 @@ impl Provisional {
             format!("{} {}", self.revert_binary, self.revert_args.join(" "))
         }
     }
+
+    /// Durable forward-side outcome derived from the lifecycle fields. This is
+    /// separate from the rollback status exposed by [`ProvisionalStatus`].
+    pub fn forward_outcome(&self) -> &'static str {
+        if !self.forward_done {
+            if self.status == ProvisionalStatus::Armed {
+                "running"
+            } else {
+                "interrupted"
+            }
+        } else if self.status == ProvisionalStatus::NeedsOperatorDecision && self.deadline_unix == 0
+        {
+            "failed"
+        } else {
+            "completed"
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,6 +217,13 @@ impl ProvisionalRegistry {
                 || (row.status == ProvisionalStatus::Armed && !row.forward_done);
             if needs_recovery {
                 row.status = ProvisionalStatus::NeedsOperatorDecision;
+                if !row.forward_done {
+                    row.deadline_unix = 0;
+                    row.revert_detail = Some(
+                        "daemon restarted while the forward command was running; outcome unknown"
+                            .to_string(),
+                    );
+                }
                 moved.push(row.handle.clone());
             }
             items.insert(row.handle.clone(), row);
@@ -261,11 +286,45 @@ impl ProvisionalRegistry {
             .count()
     }
 
-    pub fn mark_forward_done(&mut self, handle: &str, exit: Option<i32>) {
-        if let Some(p) = self.items.get_mut(handle) {
-            p.forward_done = true;
-            let _ = exit; // forward exit is recorded by the caller's response path
+    /// Record a completed forward process. A successful exit starts the
+    /// confirmation window at `finished_unix`. A non-zero or signal exit has
+    /// no confirmation deadline and requires an explicit operator decision.
+    pub fn mark_forward_done(
+        &mut self,
+        handle: &str,
+        exit: Option<i32>,
+        finished_unix: u64,
+        window_secs: u64,
+    ) -> Option<Provisional> {
+        let p = self.items.get_mut(handle)?;
+        p.forward_done = true;
+        if exit == Some(0) {
+            p.deadline_unix = finished_unix.saturating_add(window_secs);
+            p.revert_detail = None;
+        } else {
+            p.deadline_unix = 0;
+            p.status = ProvisionalStatus::NeedsOperatorDecision;
+            p.revert_detail = Some(format!(
+                "forward command exited with code {exit:?}; confirmation window was not started"
+            ));
         }
+        Some(p.clone())
+    }
+
+    /// Record a launched forward command whose transport or wait path failed.
+    /// Its partial effects are unknown, so no timer is fabricated from the
+    /// command's start time and the row remains available for operator action.
+    pub fn mark_forward_interrupted(
+        &mut self,
+        handle: &str,
+        detail: String,
+    ) -> Option<Provisional> {
+        let p = self.items.get_mut(handle)?;
+        p.forward_done = false;
+        p.deadline_unix = 0;
+        p.status = ProvisionalStatus::NeedsOperatorDecision;
+        p.revert_detail = Some(detail);
+        Some(p.clone())
     }
 
     /// Operator confirms: keep the change, cancel the timer. Allowed from

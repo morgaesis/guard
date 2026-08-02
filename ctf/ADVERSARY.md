@@ -46,23 +46,27 @@ failure or a missing final report is an inconclusive failing result.
 
 The harness uses a read-only root filesystem, a full capability drop with only
 `CHOWN`, `SETGID`, and `SETUID` added back for startup provisioning, no-new-
-privileges, rootless user namespaces, blocked host loopback through
-slirp4netns, and PID, CPU, memory, and memory-swap bounds. Raw evidence stays
-in root-owned paths the attacker cannot alter: the daemon's log and durable
-audit sink and the raw transcripts live under a root-owned directory on the
-results volume, so an attacker who fills its own writable tmpfs cannot drop
-the evidence a verdict depends on. A missing raw artifact is a failure rather
-than a pass. These controls define the CTF execution boundary.
+privileges, rootless user namespaces, an internal-only scenario network, and
+PID, CPU, memory, and memory-swap bounds. Raw evidence stays in root-owned paths
+the attacker cannot alter: the daemon's log and durable audit sink and the raw
+transcripts live under a root-owned directory on the results volume, so an
+attacker who fills its own writable tmpfs cannot drop the evidence a verdict
+depends on. A missing raw artifact is a failure rather than a pass. These
+controls define the CTF execution boundary.
 The harness evaluates guard's per-user secret isolation; it does not establish
 or evaluate container-escape prevention.
 
-Note on the network boundary: `allow_host_loopback=false` blocks only the
-slirp gateway's loopback path. Host services bound to wildcard addresses stay
-reachable from the scenario container via the host's external address
-(pre-resolved as `host.containers.internal`); loopback-bound services are not
-reachable. The attacker identity is therefore still a dedicated,
-credit-limited key: it is the damage bound for anything the autonomous
-attacker reaches, including wildcard-bound host services.
+The scenario container has no default route and cannot join the egress network.
+An unprivileged sidecar is the only member of both the internal and egress
+networks. It accepts HTTP CONNECT only for `openrouter.ai:443`, rejects DNS
+answers outside globally routable address space, and verifies that the TLS
+ClientHello SNI matches the requested host. The attacker identity remains a
+dedicated, credit-limited key because it is intentionally available to the
+autonomous attacker process.
+
+`GUARD_ADVERSARY_EGRESS_HOSTS` supplies a comma-separated replacement
+allowlist when the evaluator uses another endpoint. The list must retain
+`openrouter.ai` for the attacker model.
 
 ## Flag
 
@@ -109,5 +113,6 @@ result directory is an inconclusive failure.
 - `attacker-exec.sh` launches the scripted attacker with its staged key.
 - `ctf-attacker-prompt.md` defines the attacker task.
 - `entrypoint-adversary.sh` provisions and evaluates one scenario.
+- `egress-proxy.py` restricts outbound TLS to the model API.
 - `run-adversary.sh` builds once and launches the isolated scenario containers.
 - `scenarios.yaml` defines the scenario modes and attacker fixtures.

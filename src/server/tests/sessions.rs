@@ -473,8 +473,24 @@ async fn full_access_queue_rejects_before_synthesis_or_catalog_change() {
     assert_eq!(cfg.state.verbs.read().await.version(), before);
 }
 
-#[tokio::test]
-async fn access_request_is_principal_bound_coalesced_batched_and_bounded() {
+#[test]
+fn access_request_is_principal_bound_coalesced_batched_and_bounded() {
+    std::thread::Builder::new()
+        .name("access-request-lifecycle".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(access_request_is_principal_bound_coalesced_batched_and_bounded_body());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() {
     let (mut cfg, _) = make_test_config();
     cfg.config.daemon_uid = 777;
     cfg.config.daemon_principal = PrincipalKey::from_uid(777);
@@ -598,10 +614,12 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded() {
     let mut execution =
         request_with_session("rustc", vec!["--version".to_string()], "unused".to_string());
     execution.session_token = None;
-    let (first_run, second_run) = tokio::join!(
-        execute_command(execution.clone(), &cfg, &worker),
-        execute_command(execution, &cfg, &worker)
-    );
+    // Keep the two large execute futures off the test thread's bounded stack.
+    // Their simultaneous admission is the behavior under test, not their
+    // placement in the generated test future.
+    let first_execution = Box::pin(execute_command(execution.clone(), &cfg, &worker));
+    let second_execution = Box::pin(execute_command(execution, &cfg, &worker));
+    let (first_run, second_run) = tokio::join!(first_execution, second_execution);
     let admitted = [&first_run, &second_run]
         .into_iter()
         .filter(|result| result.policy_allowed())
@@ -1028,39 +1046,95 @@ async fn access_request_can_name_multiple_catalog_verbs() {
 }
 
 #[tokio::test]
-async fn agent_label_extension_preserves_session_grants_and_cumulative_intent() {
+async fn access_flow_converges_executes_extends_restarts_and_reports_truthfully() {
     let (mut cfg, _) = make_test_config();
     let state = tempfile::tempdir().unwrap();
     let state_db = state.path().join("state.db");
     cfg.state.session_store = Some(SessionStore::open(state_db.clone(), 3600).await.unwrap());
     cfg.config.daemon_uid = 777;
     cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.config.gate = GateMode::Consequence;
     cfg.state.verbs = Arc::new(RwLock::new(
         VerbCatalog::from_yaml(
-            "verbs:\n  - name: inspect-a\n    description: Inspect system A\n    binary: true\n    args: []\n    baseline: false\n    consequence: reversible\n    trusted: true\n  - name: inspect-b\n    description: Inspect system B\n    binary: printf\n    args: [b]\n    baseline: false\n    consequence: reversible\n    trusted: true\n",
+            r#"
+verbs:
+  - name: inspect-limited
+    description: Inspect one bounded target group
+    binary: echo
+    args: ["--limit", "{limit}"]
+    params:
+      limit: { pattern: "^(group-a|group-b)$", required: true }
+    baseline: false
+    consequence: reversible
+    trusted: true
+  - name: inspect-b
+    description: Inspect system B
+    binary: echo
+    args: [inspect-b]
+    baseline: false
+    consequence: reversible
+    trusted: true
+"#,
         )
         .unwrap(),
     ));
     let worker = CallerIdentity::Unix { uid: 1001 };
     let daemon = CallerIdentity::UnixAdmin { uid: 777 };
+
+    let limited_request = |limit: &str| {
+        let mut request = request_with_session(
+            "echo",
+            vec!["--limit".to_string(), limit.to_string()],
+            "unused".to_string(),
+        );
+        request.session_token = None;
+        request
+    };
+    let (first_denial, equivalent_denial) = tokio::join!(
+        execute_command(limited_request("group-a"), &cfg, &worker),
+        execute_command(limited_request("group-a"), &cfg, &worker),
+    );
+    let first_denial = first_denial.into_response();
+    let equivalent_denial = equivalent_denial.into_response();
+    assert!(!first_denial.allowed);
+    assert!(!equivalent_denial.allowed);
+    assert_eq!(first_denial.access_requests.len(), 1);
+    assert_eq!(
+        first_denial.access_requests,
+        equivalent_denial.access_requests
+    );
+    let initial_reference = first_denial.access_requests[0].reference.clone();
+    let durable_requests = cfg
+        .state
+        .session_store
+        .as_ref()
+        .unwrap()
+        .load_grant_requests()
+        .await
+        .unwrap();
+    assert_eq!(durable_requests.len(), 1);
+    assert_eq!(durable_requests[0].handle, initial_reference);
+
     let AdminResponse::AccessItem { item: initial } = handle_admin_request(
         &cfg,
         &worker,
-        AdminRequest::AccessRequest {
-            intent: "Inspect system A".to_string(),
+        AdminRequest::AccessShow {
+            reference: initial_reference.clone(),
         },
     )
     .await
     else {
-        panic!("expected initial access request")
+        panic!("expected the denied command's access request")
     };
-    let initial_reference = initial.reference.clone();
+    assert_eq!(initial.state, "pending");
+    assert_eq!(initial.effective_scope, vec!["inspect-limited"]);
+
     let AdminResponse::AccessDecisions { items } = handle_admin_request(
         &cfg,
         &daemon,
         AdminRequest::AccessApprove {
-            handles: vec![initial.reference],
-            uses: Some(1),
+            handles: vec![initial_reference.clone()],
+            uses: Some(4),
         },
     )
     .await
@@ -1075,6 +1149,41 @@ async fn agent_label_extension_preserves_session_grants_and_cumulative_intent() 
         .await
         .access_token_for_principal(&PrincipalKey::from_uid(1001))
         .unwrap();
+
+    let mut stale_request = limited_request("group-a");
+    stale_request.session_token = Some("retired-legacy-session".to_string());
+    let first_execution = execute_command(stale_request, &cfg, &worker)
+        .await
+        .into_response();
+    assert!(
+        first_execution.allowed,
+        "a stale handle must yield to the caller's principal session: {first_execution:?}"
+    );
+    assert_eq!(first_execution.exit_code, Some(0));
+    assert_eq!(
+        cfg.state
+            .sessions
+            .read()
+            .await
+            .access_grant_uses(&original_token, &initial_reference),
+        Some((Some(4), Some(3)))
+    );
+
+    let varied_execution = execute_command(limited_request("group-b"), &cfg, &worker)
+        .await
+        .into_response();
+    assert!(
+        varied_execution.allowed,
+        "the typed grant must cover another allowed parameter value: {varied_execution:?}"
+    );
+    assert_eq!(
+        cfg.state
+            .sessions
+            .read()
+            .await
+            .access_grant_uses(&original_token, &initial_reference),
+        Some((Some(4), Some(2)))
+    );
 
     let AdminResponse::AccessDecisions { items } = handle_admin_request(
         &cfg,
@@ -1092,6 +1201,24 @@ async fn agent_label_extension_preserves_session_grants_and_cumulative_intent() 
     assert!(items[0].success);
     let extension_reference = items[0].request.clone();
 
+    let preserved_execution = execute_command(limited_request("group-a"), &cfg, &worker)
+        .await
+        .into_response();
+    assert!(
+        preserved_execution.allowed,
+        "extension must preserve the prior typed scope: {preserved_execution:?}"
+    );
+    let mut extension_execution =
+        request_with_session("echo", vec!["inspect-b".to_string()], "unused".to_string());
+    extension_execution.session_token = None;
+    let extension_execution = execute_command(extension_execution, &cfg, &worker)
+        .await
+        .into_response();
+    assert!(
+        extension_execution.allowed,
+        "extension must activate its added scope: {extension_execution:?}"
+    );
+
     let sessions = cfg.state.sessions.read().await;
     assert_eq!(
         sessions
@@ -1102,6 +1229,14 @@ async fn agent_label_extension_preserves_session_grants_and_cumulative_intent() 
     assert!(sessions
         .access_grant_uses(&original_token, &initial_reference)
         .is_some());
+    assert_eq!(
+        sessions.access_grant_uses(&original_token, &initial_reference),
+        Some((Some(4), Some(1)))
+    );
+    assert_eq!(
+        sessions.access_grant_uses(&original_token, &extension_reference),
+        Some((Some(2), Some(1)))
+    );
     drop(sessions);
     let restored = cfg
         .state
@@ -1119,11 +1254,11 @@ async fn agent_label_extension_preserves_session_grants_and_cumulative_intent() 
     );
     assert_eq!(
         restored.access_grant_uses(&original_token, &initial_reference),
-        Some((Some(1), Some(1)))
+        Some((Some(4), Some(1)))
     );
     assert_eq!(
         restored.access_grant_uses(&original_token, &extension_reference),
-        Some((Some(2), Some(2)))
+        Some((Some(2), Some(1)))
     );
     assert!(restored
         .verb_scope_for(&original_token)
@@ -1134,7 +1269,7 @@ async fn agent_label_extension_preserves_session_grants_and_cumulative_intent() 
         .verb_scope_for(&original_token)
         .unwrap()
         .0
-        .contains(&"inspect-a".to_string()));
+        .contains(&"inspect-limited".to_string()));
     let restored_requests = cfg
         .state
         .session_store
@@ -1158,8 +1293,53 @@ async fn agent_label_extension_preserves_session_grants_and_cumulative_intent() 
         .find(|item| item.kind == "session")
         .and_then(|item| item.intent.as_deref())
         .expect("the access session projects its approved intents");
-    assert!(session_intent.contains("Inspect system A"));
+    assert!(session_intent.contains("inspect-limited"));
     assert!(session_intent.contains("Use inspect-b for this task"));
+    let initial_item = items
+        .iter()
+        .find(|item| item.reference == initial_reference)
+        .expect("the initial approval remains visible");
+    assert_eq!(initial_item.state, "approved");
+    assert_eq!(initial_item.use_policy, "bounded");
+    assert_eq!(initial_item.remaining_uses, Some(1));
+    assert_eq!(initial_item.effective_scope, vec!["inspect-limited"]);
+    let extension_item = items
+        .iter()
+        .find(|item| item.reference == extension_reference)
+        .expect("the extension approval remains visible");
+    assert_eq!(extension_item.state, "approved");
+    assert_eq!(extension_item.use_policy, "bounded");
+    assert_eq!(extension_item.remaining_uses, Some(1));
+    assert_eq!(extension_item.effective_scope, vec!["inspect-b"]);
+    let session_item = items
+        .iter()
+        .find(|item| item.kind == "session")
+        .expect("the active session remains visible");
+    assert_eq!(session_item.state, "active");
+    assert!(session_item
+        .effective_scope
+        .contains(&"inspect-limited".to_string()));
+    assert!(session_item
+        .effective_scope
+        .contains(&"inspect-b".to_string()));
+
+    cfg.state.sessions.write().await.grant(
+        "valid-foreign-session".to_string(),
+        granted_session_owned(1002, vec!["echo *".to_string()], Vec::new()),
+    );
+    let foreign = execute_command(
+        request_with_session(
+            "echo",
+            vec!["--limit".to_string(), "group-a".to_string()],
+            "valid-foreign-session".to_string(),
+        ),
+        &cfg,
+        &worker,
+    )
+    .await
+    .into_response();
+    assert!(!foreign.allowed);
+    assert!(foreign.reason.contains("principal mismatch"));
 }
 
 #[tokio::test]
@@ -2717,6 +2897,18 @@ fn tcp_admin_token_validation_is_separate_from_exec_token() {
         .is_err(),
         "an ordinary TCP bearer must not become operator authority by colliding with the daemon principal"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_operator_denial_does_not_name_windows_authority() {
+    let (cfg, _) = make_test_config();
+    let error = cfg
+        .validate_admin(&CallerIdentity::Unix { uid: 20_002 })
+        .expect_err("ordinary Unix caller must lack operator authority")
+        .to_string();
+    assert_eq!(error, "admin RPC refused: caller lacks operator authority");
+    assert!(!error.contains("Windows"));
 }
 
 #[cfg(windows)]
@@ -5119,7 +5311,7 @@ async fn principal_binding_hold_confirm_is_operator_only() {
     .await;
     assert!(matches!(
         refused,
-        AdminResponse::Error { message } if message.contains("daemon principal")
+        AdminResponse::Error { message } if message.contains("operator authority")
     ));
 }
 

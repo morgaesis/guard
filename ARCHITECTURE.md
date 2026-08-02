@@ -68,8 +68,10 @@ changes.
 Approved children receive the caller's canonical working directory but the
 daemon's clean environment, identity, SSH context, and secret bindings. Guard
 does not rewrite command semantics, stage input files, or interpret tool-native
-projects. Child stdout and stderr are redacted before crossing the daemon
-boundary.
+projects. A coverage cell can require one exact canonical working directory;
+the daemon matches it after canonicalization and revalidates the directory
+immediately before execution. Child stdout and stderr are redacted before
+crossing the daemon boundary.
 
 ## Resolver order
 

@@ -17,7 +17,7 @@
 //! and Secret `watch`es are denied: their streams cannot be redacted or gated
 //! per object.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -44,6 +44,7 @@ use super::gate::{
     RevertConstructible,
 };
 use super::k8s_protocol::KubernetesProtocol;
+use super::k8s_protocol::{bind_mutation_preconditions, object_state, KubernetesObjectState};
 use super::op::{ApiOp, Verb};
 use super::policy::{ApiAction, ApiPolicy};
 use super::protocol::ProtocolConfig;
@@ -67,6 +68,7 @@ type ReqwestByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>
 type RedactingStreamState = (ReqwestByteStream, ExactSecretRedactor, bool);
 type JudgeBuilder = dyn Fn(Option<String>) -> Option<Arc<dyn ApiJudge>> + Send + Sync;
 const GUARD_SESSION_HEADER: &str = "x-guard-session";
+const MAX_KUBERNETES_OBSERVATIONS: usize = 4096;
 
 #[derive(Debug, Clone)]
 struct GuardRejected;
@@ -175,6 +177,10 @@ pub struct ApiProxy {
     /// swaps mark the generation odd for their short transition, then publish
     /// the next even value. Routes bind an even generation plus policy digest.
     authority_revision: AtomicU64,
+    /// A policy reload takes the write side; an admitted Kubernetes mutation
+    /// holds the read side from its final authority check through upstream
+    /// dispatch. This closes the check-to-send reload race.
+    mutation_authority_gate: RwLock<()>,
     /// Bridge to the daemon's consequence machinery, attached before serving.
     /// When present, recoverable writes are wrapped in an auto-revert envelope.
     gate: OnceLock<Arc<dyn GateSink>>,
@@ -190,6 +196,7 @@ pub struct ApiProxy {
     /// contained rather than an untracked delete. Entries are scoped to the
     /// creating connection and removed when their revert resolves.
     created: Mutex<CreatedRegistry>,
+    observations: Mutex<ObservationRegistry>,
     /// Monotonic per-connection id, assigned in the accept loop, so a created
     /// resource's provenance is scoped to the connection that created it.
     next_conn: AtomicU64,
@@ -212,9 +219,52 @@ pub struct ApiProxy {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ApiListenerMode {
-    #[default]
     Policy,
+    #[default]
     Readonly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ObservationKey {
+    endpoint: String,
+    session_fingerprint: String,
+    session_revision: String,
+    group: String,
+    version: String,
+    resource: String,
+    subresource: Option<String>,
+    namespace: Option<String>,
+    name: String,
+    uid: String,
+}
+
+#[derive(Debug, Clone)]
+struct ObservedVersion {
+    resource_version: String,
+    contention_fingerprint: String,
+}
+
+#[derive(Debug, Default)]
+struct ObservationRegistry {
+    items: HashMap<ObservationKey, ObservedVersion>,
+    order: VecDeque<ObservationKey>,
+}
+
+impl ObservationRegistry {
+    fn remember(&mut self, key: ObservationKey, observed: ObservedVersion) {
+        self.order.retain(|existing| existing != &key);
+        self.items.insert(key.clone(), observed);
+        self.order.push_back(key);
+        while self.items.len() > MAX_KUBERNETES_OBSERVATIONS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.items.remove(&oldest);
+            }
+        }
+    }
+
+    fn get(&self, key: &ObservationKey) -> Option<ObservedVersion> {
+        self.items.get(key).cloned()
+    }
 }
 
 /// A request shape for rarity accounting: the typed operation minus its object
@@ -389,16 +439,18 @@ impl ApiProxy {
             policy: Arc::new(RwLock::new(policy)),
             policy_path,
             authority_revision: AtomicU64::new(0),
+            mutation_authority_gate: RwLock::new(()),
             gate: OnceLock::new(),
             judge: StdRwLock::new(None),
             judge_builder: OnceLock::new(),
             created: Mutex::new(CreatedRegistry::default()),
+            observations: Mutex::new(ObservationRegistry::default()),
             next_conn: AtomicU64::new(1),
             rarity: RarityTracker::new(0),
             endpoint: "default".to_string(),
             credential_ref: "upstream".to_string(),
             session_sink: OnceLock::new(),
-            listener_mode: ApiListenerMode::Policy,
+            listener_mode: ApiListenerMode::default(),
             request_body_timeout: REQUEST_BODY_READ_TIMEOUT,
             policy_reload_interval: Duration::from_secs(POLICY_RELOAD_SECS),
         }
@@ -789,6 +841,14 @@ impl ApiProxy {
         // the request-level gate cannot inspect or redact per object.
         if let Some(reason) = self.protocol.deny_outright(&op) {
             return self.status_resp(StatusCode::FORBIDDEN, &reason, "Forbidden");
+        }
+
+        if self.is_kubernetes_mutation(&op) && session_context.is_none() {
+            return self.status_resp(
+                StatusCode::FORBIDDEN,
+                "guard api-proxy: Kubernetes mutations require an attributable Guard session or an operator-approved typed verb",
+                "Forbidden",
+            );
         }
 
         let label = format!("{} {}", op.verb.as_str(), path);
@@ -1515,7 +1575,7 @@ impl ApiProxy {
     async fn forward_buffered_with_cleanup(
         &self,
         parts: Parts,
-        body: Bytes,
+        mut body: Bytes,
         path: &str,
         query: &str,
         redact: bool,
@@ -1528,6 +1588,31 @@ impl ApiProxy {
             Some(authority) => authority,
             None => return self.missing_route_authority_response(),
         };
+        let mut arbitration_snapshot = None;
+        if let Some(operation) = op
+            .as_ref()
+            .filter(|operation| self.is_kubernetes_mutation(operation))
+        {
+            match self
+                .arbitrate_kubernetes_mutation(
+                    &parts,
+                    &body,
+                    path,
+                    operation,
+                    &route_authority,
+                    prepared_snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.as_deref()),
+                )
+                .await
+            {
+                Ok((guarded_body, snapshot)) => {
+                    body = guarded_body;
+                    arbitration_snapshot = snapshot;
+                }
+                Err(response) => return response,
+            }
+        }
         // Snapshot reads can block on the upstream. Acquire any snapshot before
         // the common final authority checks so a session edit, expiry, or policy
         // reload during that read is observed immediately before mutation.
@@ -1535,6 +1620,9 @@ impl ApiProxy {
             && op
                 .as_ref()
                 .is_some_and(|op| self.gate.get().is_some() && self.protocol.tracks_write(op));
+        if prepared_snapshot.is_none() {
+            prepared_snapshot = arbitration_snapshot.map(Some);
+        }
         if prepared_snapshot.is_none()
             && track_write
             && self
@@ -1549,6 +1637,14 @@ impl ApiProxy {
         let session_context = match self.revalidate_session(&parts).await {
             Ok(context) => context,
             Err(response) => return response,
+        };
+        let kubernetes_mutation = op
+            .as_ref()
+            .is_some_and(|operation| self.is_kubernetes_mutation(operation));
+        let _mutation_authority_guard = if kubernetes_mutation {
+            Some(self.mutation_authority_gate.read().await)
+        } else {
+            None
         };
         if let Some(response) = self
             .recheck_final_authority(&route_authority, op.as_ref())
@@ -1609,6 +1705,9 @@ impl ApiProxy {
             && op
                 .as_ref()
                 .is_some_and(|o| self.gate.get().is_some() && self.protocol.tracks_write(o));
+        let kubernetes_mutation = op
+            .as_ref()
+            .is_some_and(|operation| self.is_kubernetes_mutation(operation));
         let snapshot = prepared_snapshot.flatten();
 
         let url = if query.is_empty() {
@@ -1657,6 +1756,27 @@ impl ApiProxy {
             .await
         {
             return Ok(response);
+        }
+        if let (Some(operation), Some(context)) = (
+            op.as_ref()
+                .filter(|operation| self.is_kubernetes_mutation(operation)),
+            session_context.as_ref(),
+        ) {
+            let _ = crate::audit::emit_global(
+                &crate::audit::AuditEvent::new(crate::audit::AuditKind::Evaluate)
+                    .session_fingerprint(&context.fingerprint)
+                    .reason("session-attributed Kubernetes mutation passed write arbitration")
+                    .field("decision", "forward")
+                    .field("endpoint", &self.endpoint)
+                    .field("session_revision", &context.revision)
+                    .field("verb", operation.verb.as_str())
+                    .field("resource", &operation.resource)
+                    .field(
+                        "namespace",
+                        operation.namespace.as_deref().unwrap_or("(cluster)"),
+                    )
+                    .field("name", operation.name.as_deref().unwrap_or("(collection)")),
+            );
         }
         let upstream_resp = rb.send().await.context("forward to apiserver")?;
         let status = upstream_resp.status();
@@ -1785,20 +1905,64 @@ impl ApiProxy {
                 .expect("build redacted response"));
         }
 
-        // A tracked write: buffer the (small) object response, arm an auto-revert
-        // on success, and return the body. Writes are not streamed.
-        if track_write {
+        // Kubernetes mutation responses are buffered so the returned object can
+        // become this same session's next observed version. Tracked writes also
+        // use the buffered body to arm their auto-revert.
+        if track_write || kubernetes_mutation {
             let bytes = upstream_resp.bytes().await.context("read write response")?;
+            let mut provisional_handle = None;
             if status.is_success() {
                 if let Some(o) = op.as_ref() {
-                    self.arm_write_revert(o, snapshot, &bytes, conn_id, session_context)
-                        .await;
+                    if let Some(context) = session_context.as_ref() {
+                        self.remember_kubernetes_observation(o, &bytes, context);
+                    }
+                    if track_write {
+                        provisional_handle = self
+                            .arm_write_revert(o, snapshot, &bytes, conn_id, session_context.clone())
+                            .await;
+                    }
                 }
+            }
+            if let Some(handle) = provisional_handle {
+                // Kubernetes clients surface RFC 7234 Warning headers on
+                // stderr, while X-Guard-Provisional gives automation the exact
+                // durable handle. A successful write must never look final
+                // while Guard still has an auto-revert armed behind it.
+                builder = builder.header("x-guard-provisional", &handle).header(
+                    hyper::header::WARNING,
+                    format!(
+                        "299 guard \"change is provisional; confirm with guard confirm {handle}\""
+                    ),
+                );
             }
             let bytes = ExactSecretRedactor::redact_all(response_secrets, &bytes);
             return Ok(builder
                 .body(full_body(bytes))
                 .expect("build write response"));
+        }
+
+        // A successful named-object GET is the only read that establishes a
+        // write observation. Lists and watches cannot bind one object UID and
+        // version, and anonymous reads never establish mutation authority.
+        if status.is_success()
+            && op.as_ref().is_some_and(|operation| {
+                self.protocol.name() == "kubernetes"
+                    && operation.verb == Verb::Get
+                    && operation.name.is_some()
+            })
+            && session_context.is_some()
+        {
+            let bytes = upstream_resp
+                .bytes()
+                .await
+                .context("read Kubernetes object response for observation")?;
+            if let (Some(operation), Some(context)) = (op.as_ref(), session_context.as_ref()) {
+                self.remember_kubernetes_observation(operation, &bytes, context);
+            }
+            let bytes = ExactSecretRedactor::redact_all(response_secrets, &bytes);
+            return Ok(builder
+                .body(full_body(bytes))
+                .expect("build observed object response"));
         }
 
         // Stream ordinary response bodies through exact credential redaction
@@ -1867,6 +2031,127 @@ impl ApiProxy {
             ));
         }
         Ok(current)
+    }
+
+    fn is_kubernetes_mutation(&self, op: &ApiOp) -> bool {
+        self.protocol.name() == "kubernetes" && !op.is_read()
+    }
+
+    fn observation_key(
+        &self,
+        op: &ApiOp,
+        state: &KubernetesObjectState,
+        context: &ApiSessionContext,
+    ) -> ObservationKey {
+        ObservationKey {
+            endpoint: self.endpoint.clone(),
+            session_fingerprint: context.fingerprint.clone(),
+            session_revision: context.revision.clone(),
+            group: op.group.clone(),
+            version: op.version.clone(),
+            resource: op.resource.clone(),
+            subresource: op.subresource.clone(),
+            namespace: state.namespace.clone(),
+            name: state.name.clone(),
+            uid: state.uid.clone(),
+        }
+    }
+
+    fn remember_kubernetes_observation(
+        &self,
+        op: &ApiOp,
+        bytes: &[u8],
+        context: &ApiSessionContext,
+    ) {
+        let Some(state) = object_state(op, bytes) else {
+            return;
+        };
+        let key = self.observation_key(op, &state, context);
+        self.observations.lock().unwrap().remember(
+            key,
+            ObservedVersion {
+                resource_version: state.resource_version,
+                contention_fingerprint: state.contention_fingerprint,
+            },
+        );
+    }
+
+    async fn arbitrate_kubernetes_mutation(
+        &self,
+        parts: &Parts,
+        body: &[u8],
+        path: &str,
+        op: &ApiOp,
+        route_authority: &RouteAuthority,
+        prepared_snapshot: Option<&[u8]>,
+    ) -> Result<(Bytes, Option<Vec<u8>>), Response<ProxyBody>> {
+        let Some(auth) = parts.extensions.get::<SessionAuth>() else {
+            return Err(self.status_resp(
+                StatusCode::FORBIDDEN,
+                "guard api-proxy: Kubernetes mutations require an attributable Guard session or an operator-approved typed verb",
+                "Forbidden",
+            ));
+        };
+        if op.verb == Verb::Create && op.name.is_none() {
+            return Ok((Bytes::copy_from_slice(body), None));
+        }
+        if !matches!(op.verb, Verb::Update | Verb::Patch | Verb::Delete) || op.name.is_none() {
+            return Err(self.kubernetes_conflict(
+                "Kubernetes mutation cannot be bound to one observed object",
+            ));
+        }
+        let snapshot = match prepared_snapshot {
+            Some(snapshot) => snapshot.to_vec(),
+            None => {
+                let Some(snapshot) = self.fetch_prior_object(path, route_authority).await? else {
+                    return Err(self.kubernetes_conflict(
+                        "current Kubernetes object could not be read for write arbitration",
+                    ));
+                };
+                snapshot
+            }
+        };
+        let Some(state) = object_state(op, &snapshot) else {
+            return Err(self.kubernetes_conflict(
+                "current Kubernetes object has no usable UID and resourceVersion",
+            ));
+        };
+        let key = self.observation_key(op, &state, &auth.context);
+        let Some(observed) = self.observations.lock().unwrap().get(&key) else {
+            return Err(self.kubernetes_conflict(
+                "this session has not observed the current Kubernetes object UID",
+            ));
+        };
+        if observed.resource_version != state.resource_version
+            && observed.contention_fingerprint != state.contention_fingerprint
+        {
+            return Err(self
+                .kubernetes_conflict("Kubernetes object changed since this session observed it"));
+        }
+        let guarded = bind_mutation_preconditions(
+            op,
+            &parts.headers,
+            body,
+            &state,
+            &observed.resource_version,
+        )
+        .map_err(|reason| self.kubernetes_conflict(&reason))?;
+        self.observations.lock().unwrap().remember(
+            key,
+            ObservedVersion {
+                resource_version: state.resource_version,
+                contention_fingerprint: state.contention_fingerprint,
+            },
+        );
+        Ok((Bytes::from(guarded), Some(snapshot)))
+    }
+
+    fn kubernetes_conflict(&self, reason: &str) -> Response<ProxyBody> {
+        self.status_resp(
+            StatusCode::CONFLICT,
+            &format!("guard api-proxy: {reason}"),
+            "Conflict",
+        )
     }
 
     fn request_body_error_response(&self, error: RequestBodyError) -> Response<ProxyBody> {
@@ -2011,10 +2296,8 @@ impl ApiProxy {
         response_body: &[u8],
         conn_id: u64,
         session_context: Option<ApiSessionContext>,
-    ) {
-        let Some(gate) = self.gate.get() else {
-            return;
-        };
+    ) -> Option<String> {
+        let gate = self.gate.get()?;
         let plan = match self
             .protocol
             .plan_revert(op, snapshot.as_deref(), response_body)
@@ -2023,7 +2306,7 @@ impl ApiProxy {
             // The write is already live; a failed plan only means no auto-revert.
             Err(reason) => {
                 tracing::warn!(target: "guard::apiproxy", "{reason}");
-                return;
+                return None;
             }
         };
         let created_key = plan.created.map(|c| CreatedKey {
@@ -2060,12 +2343,16 @@ impl ApiProxy {
                 if let Some(key) = created_key {
                     self.created.lock().unwrap().remember(key, handle.clone());
                 }
-                tracing::info!(target: "guard::apiproxy", "armed auto-revert {handle} for {label}")
+                tracing::info!(target: "guard::apiproxy", "armed auto-revert {handle} for {label}");
+                Some(handle)
             }
-            None => tracing::warn!(
-                target: "guard::apiproxy",
-                "could not arm auto-revert for {label} (capacity)"
-            ),
+            None => {
+                tracing::warn!(
+                    target: "guard::apiproxy",
+                    "could not arm auto-revert for {label} (capacity)"
+                );
+                None
+            }
         }
     }
 
@@ -2541,6 +2828,7 @@ async fn policy_reloader(path: PathBuf, proxy: Arc<ApiProxy>) {
         last = modified;
         match ApiPolicy::load_file(&path) {
             Ok(p) => {
+                let _mutation_authority_guard = proxy.mutation_authority_gate.write().await;
                 let old_intent = proxy.policy.read().await.intent.clone();
                 let new_intent = p.intent.clone();
                 proxy.begin_authority_update();

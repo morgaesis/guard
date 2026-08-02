@@ -44,7 +44,7 @@ verbs:
         required_args: ["--check"]
         inventory:
           options: ["-i", "--inventory"]
-          values: ["inventory/production"]
+          values: ["/srv/guard/inventory/production"]
         fanout:
           options: ["--limit"]
           max: 2
@@ -53,7 +53,7 @@ verbs:
         forbidden_args: ["--check"]
         inventory:
           options: ["-i", "--inventory"]
-          values: ["inventory/production"]
+          values: ["/srv/guard/inventory/production"]
         fanout:
           options: ["--limit"]
           max: 1
@@ -67,7 +67,7 @@ verbs:
     credential_plan: ansible-managed-ssh
     revert:
       binary: ansible-playbook
-      args: ["rollback-host-a.yml", "-i", "inventory/production", "--limit", "host-a"]
+      args: ["/srv/guard/playbooks/rollback-host-a.yml", "-i", "/srv/guard/inventory/production", "--limit", "host-a"]
     trusted: true
     coverage:
       - name: host-a-apply
@@ -78,7 +78,7 @@ verbs:
           values: ["host-a"]
         inventory:
           options: ["-i", "--inventory"]
-          values: ["inventory/production"]
+          values: ["/srv/guard/inventory/production"]
         fanout:
           options: ["--limit"]
           values: ["host-a"]

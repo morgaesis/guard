@@ -78,6 +78,11 @@ impl Client {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_admin_token(&self) -> bool {
+        self.admin_token.is_some()
+    }
+
     pub fn with_session(mut self, session_token: String) -> Self {
         self.session_token = Some(session_token);
         self
@@ -128,15 +133,18 @@ impl Client {
             AdminRequest::Revert { .. } => "revert",
             AdminRequest::Provisionals => "provisionals",
             AdminRequest::Approve { .. } => "approve",
+            AdminRequest::Resume { .. } => "resume",
             AdminRequest::Deny { .. } => "deny",
             AdminRequest::ApprovalList => "approval_list",
             AdminRequest::ApprovalShow { .. } => "approval_show",
             AdminRequest::ApprovalNote { .. } => "approval_note",
+            AdminRequest::ApprovalWithdraw { .. } => "approval_withdraw",
             AdminRequest::VerbList => "verb_list",
             AdminRequest::VerbShow { .. } => "verb_show",
             AdminRequest::VerbDelete { .. } => "verb_delete",
             AdminRequest::VerbCreate { .. } => "verb_create",
             AdminRequest::VerbCreateFromPreview { .. } => "verb_create_from_preview",
+            AdminRequest::VerbAmend { .. } => "verb_amend",
             AdminRequest::VerbCoverageList => "verb_coverage_list",
             AdminRequest::VerbCoverageClear => "verb_coverage_clear",
             #[cfg(test)]
@@ -164,6 +172,7 @@ impl Client {
             AdminRequest::AccessExtend { .. } => "access_extend",
             AdminRequest::AccessList => "access_list",
             AdminRequest::AccessShow { .. } => "access_show",
+            AdminRequest::AccessStatus { .. } => "access_status",
             AdminRequest::EvaluateBatch { .. } => "evaluate_batch",
         };
         let envelope = IncomingMessage::Admin {

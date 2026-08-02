@@ -7,7 +7,7 @@ use guard::audit::{AuditEvent, AuditKind};
 use guard::gating::approval::{Approval, ApprovalSnapshot, ApprovalStatus};
 use guard::gating::provisional::{ApiRevertPlan, Provisional, ProvisionalStatus};
 use guard::gating::{decide_gate, Coverage, GateOutcome, Reversibility};
-use guard::principal::PrincipalKey;
+use guard::principal::{scope_eq, PrincipalKey};
 use std::path::PathBuf;
 use tokio::io::AsyncWrite;
 
@@ -19,8 +19,8 @@ use super::grants::{delete_read_grant_row, finish_read_grant_revert, persist_rea
 use super::runtime::NotifyEvent;
 use super::transport::write_stream_message;
 use super::wire::{
-    CallerIdentity, ExecOutcome, ExecuteRequest, ExecuteResult, ExecuteStreamMessage, RevertSpec,
-    VerbContext,
+    approval_is_armed, CallerIdentity, ExecOutcome, ExecuteRequest, ExecuteResult,
+    ExecuteStreamMessage, RevertSpec, VerbContext, APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX,
 };
 use super::{
     RequestContext, ServerContext, DEFAULT_CONFIRM_WITHIN_SECS, GATING_RETENTION_SECS,
@@ -804,10 +804,15 @@ async fn assess_revert(
             .as_deref()
             .unwrap_or("none; deadline always rolls back")
     );
+    let session_prompt = match forward.session_token.as_deref() {
+        Some(token) => server.state.sessions.read().await.prompt_append_for(token),
+        None => None,
+    };
+    let evaluation_context = merge_revert_assessment_prompt(session_prompt.as_deref(), &context);
     match server
         .state
         .evaluator
-        .evaluate_with_context(&revert_line, Some(&context))
+        .evaluate_with_context(&revert_line, Some(&evaluation_context))
         .await
     {
         guard::evaluate::EvalResult::Allow { .. } => RevertAssessment::Sensible,
@@ -817,6 +822,22 @@ async fn assess_revert(
         guard::evaluate::EvalResult::Error(e) => {
             RevertAssessment::NeedsReview(format!("rollback could not be evaluated: {e}"))
         }
+    }
+}
+
+pub(super) fn merge_revert_assessment_prompt(
+    session_prompt: Option<&str>,
+    context: &str,
+) -> String {
+    match session_prompt
+        .map(str::trim)
+        .filter(|prompt| !prompt.is_empty())
+    {
+        Some(prompt) => format!(
+            "SESSION AUTHORITY CONTEXT. The rollback must remain within this scoped intent:\n\
+             {prompt}\n\n{context}"
+        ),
+        None => context.to_string(),
     }
 }
 
@@ -1235,7 +1256,9 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
         reason: reason.clone(),
         decision_trace,
         created_unix: now,
-        deadline_unix: now.saturating_add(window),
+        // No confirmation deadline exists until the forward command exits
+        // successfully. Zero is a persisted sentinel for "not started".
+        deadline_unix: 0,
         forward_done: false,
         status: ProvisionalStatus::Armed,
         revert_exit: None,
@@ -1273,32 +1296,45 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
             stdout,
             stderr,
         } => {
+            let finished_unix = now_unix();
             let updated = {
                 let mut reg = server.state.provisional.write().await;
-                reg.mark_forward_done(&handle, exit_code);
-                reg.get(&handle).cloned()
+                reg.mark_forward_done(&handle, exit_code, finished_unix, window)
             };
             if let Some(u) = updated {
                 persist_provisional(server, &u).await;
             }
-            server.emit_audit_ungated(
-                AuditEvent::new(AuditKind::Provisional)
-                    .handle(&handle)
-                    .caller(caller)
-                    .session_fingerprint(&session_fingerprint)
-                    .field("deadline", now.saturating_add(window))
-                    .field("window", format!("{window}s"))
-                    .field("revert", audit_command_line(&revert.binary, &revert.args)),
-            );
-            server.emit_event(NotifyEvent {
-                event: "provisional_armed",
-                at_unix: now_unix(),
-                handle: Some(handle.clone()),
-                session_fingerprint: Some(session_fingerprint),
-                reason: Some(reason.clone()),
-                status: Some("armed".to_string()),
-                behavior: None,
-            });
+            if exit_code == Some(0) {
+                server.emit_audit_ungated(
+                    AuditEvent::new(AuditKind::Provisional)
+                        .handle(&handle)
+                        .caller(caller)
+                        .session_fingerprint(&session_fingerprint)
+                        .field("deadline", finished_unix.saturating_add(window))
+                        .field("window", format!("{window}s"))
+                        .field("revert", audit_command_line(&revert.binary, &revert.args)),
+                );
+                server.emit_event(NotifyEvent {
+                    event: "provisional_armed",
+                    at_unix: finished_unix,
+                    handle: Some(handle.clone()),
+                    session_fingerprint: Some(session_fingerprint),
+                    reason: Some(reason.clone()),
+                    status: Some("armed".to_string()),
+                    behavior: None,
+                });
+            } else {
+                server.emit_audit_ungated(
+                    AuditEvent::new(AuditKind::ProvisionalInterrupted)
+                        .handle(&handle)
+                        .caller(caller)
+                        .session_fingerprint(&session_fingerprint)
+                        .reason(
+                            "forward command completed unsuccessfully; operator decision required",
+                        )
+                        .field("exit", format!("{exit_code:?}")),
+                );
+            }
             ExecuteResult::provisional(
                 reason,
                 handle,
@@ -1309,16 +1345,20 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
             )
             .with_exposed_secret_refs(exposed_secret_refs)
         }
-        // The child was launched and then failed (e.g. the client stream dropped
-        // mid-run). It may already have applied its mutation, so keep the
-        // provisional armed: the auto-revert timer fires at the deadline and
-        // rolls the unconfirmed change back rather than leaking it. Mark the
-        // forward done so the deadline is honored, and surface the failure.
-        ExecOutcome::Failed { started: true, .. } => {
+        // The child was launched and then failed (for example, the client
+        // stream dropped). Its partial effects are unknown. Persist that
+        // interruption explicitly and require an operator to confirm or revert;
+        // a confirmation timer cannot start from an unobserved completion.
+        ExecOutcome::Failed {
+            started: true,
+            reason: ref failure_detail,
+        } => {
+            let detail = format!(
+                "forward command was interrupted after launch: {failure_detail}; operator confirmation or rollback is required"
+            );
             let updated = {
                 let mut reg = server.state.provisional.write().await;
-                reg.mark_forward_done(&handle, None);
-                reg.get(&handle).cloned()
+                reg.mark_forward_interrupted(&handle, detail.clone())
             };
             if let Some(u) = updated {
                 persist_provisional(server, &u).await;
@@ -1328,8 +1368,7 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
                     .handle(&handle)
                     .caller(caller)
                     .session_fingerprint(&session_fingerprint)
-                    .reason("forward launched then failed; auto-revert armed")
-                    .field("deadline", now.saturating_add(window)),
+                    .reason(&detail),
             );
             result
         }
@@ -1624,6 +1663,7 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
         Some(wait) => {
             wait_for_decision(
                 server,
+                caller,
                 &handle,
                 notify,
                 wait,
@@ -1644,6 +1684,7 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
 /// return the real outcome. On timeout the command stays held.
 async fn wait_for_decision<W: AsyncWrite + Unpin>(
     server: &ServerContext,
+    caller: &CallerIdentity,
     handle: &str,
     notify: std::sync::Arc<tokio::sync::Notify>,
     wait_secs: u64,
@@ -1666,7 +1707,17 @@ async fn wait_for_decision<W: AsyncWrite + Unpin>(
         tokio::pin!(notified);
         notified.as_mut().enable();
 
-        if let Some(a) = server.state.approvals.read().await.get(handle).cloned() {
+        // Drop the registry read guard before attempting requester resume.
+        // Holding it across `resume_approval()` deadlocks when the resume path
+        // installs its `Pending -> Approving` transition under the write lock.
+        let approval = {
+            let approvals = server.state.approvals.read().await;
+            approvals.get(handle).cloned()
+        };
+        if let Some(a) = approval {
+            if approval_is_armed(&a) {
+                return resume_approval(server, caller, handle).await;
+            }
             if a.status.is_decided() {
                 return approval_to_result(&a);
             }
@@ -1702,6 +1753,206 @@ async fn wait_for_decision<W: AsyncWrite + Unpin>(
             }
         }
     }
+}
+
+const APPROVAL_TRANSCRIPT_BYTES: usize = 262_144;
+
+fn bound_persisted_transcript(value: Option<String>) -> Option<String> {
+    let mut value = value?;
+    if value.len() <= APPROVAL_TRANSCRIPT_BYTES {
+        return Some(value);
+    }
+    let mut end =
+        APPROVAL_TRANSCRIPT_BYTES.saturating_sub(APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    value.push_str(APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX);
+    Some(value)
+}
+
+async fn reconcile_resumed_approval(server: &ServerContext, handle: &str) {
+    let Some(store) = &server.state.session_store else {
+        return;
+    };
+    match store.load_approvals().await {
+        Ok(rows) => {
+            if let Some(row) = rows.into_iter().find(|row| row.handle == handle) {
+                let wake = row.status.is_decided();
+                server
+                    .state
+                    .approvals
+                    .write()
+                    .await
+                    .install_persisted(row, wake);
+            }
+        }
+        Err(error) => tracing::warn!("failed to reconcile resumed approval {handle}: {error}"),
+    }
+}
+
+async fn commit_resumed_approval(
+    server: &ServerContext,
+    expected: Approval,
+    next: Approval,
+    wake: bool,
+) -> Result<(), String> {
+    let handle = expected.handle.clone();
+    if let Some(store) = &server.state.session_store {
+        if let Err(error) = store
+            .compare_and_swap_approval(expected, next.clone())
+            .await
+        {
+            reconcile_resumed_approval(server, &handle).await;
+            return Err(format!(
+                "approval transition conflict for {handle}: {error}"
+            ));
+        }
+    }
+    server
+        .state
+        .approvals
+        .write()
+        .await
+        .install_persisted(next, wake);
+    Ok(())
+}
+
+/// Claim and execute one operator-armed hold as its original requester. The
+/// durable `Pending -> Approving` compare-and-set is the one-shot boundary.
+/// A daemon restart while the child runs recovers `Approving` to `ExecFailed`,
+/// so an ambiguous execution is never replayed.
+pub(super) async fn resume_approval(
+    server: &ServerContext,
+    caller: &CallerIdentity,
+    handle: &str,
+) -> ExecuteResult {
+    let transition = server.state.grant_request_transition_gate.lock().await;
+    let Some(expected) = server.state.approvals.read().await.get(handle).cloned() else {
+        return ExecuteResult::denied("no armed held command for this requester");
+    };
+    let caller_principal = caller.principal();
+    if !caller.is_local_peer()
+        || !scope_eq(&expected.snapshot.principal, &caller_principal)
+        || !approval_is_armed(&expected)
+    {
+        return ExecuteResult::denied("no armed held command for this requester");
+    }
+
+    let now = now_unix();
+    if now >= expected.deadline_unix() {
+        let mut expired = expected.clone();
+        expired.status = ApprovalStatus::Expired;
+        expired.decided_unix = Some(now);
+        expired.decided_reason = Some("expired before requester resume".to_string());
+        if let Err(error) = commit_resumed_approval(server, expected, expired, true).await {
+            return ExecuteResult::exec_failed("held command expired", error);
+        }
+        return ExecuteResult::denied("held command expired before requester resume");
+    }
+
+    let mut claimed = expected.clone();
+    claimed.status = ApprovalStatus::Approving;
+    claimed.decided_reason = Some("requester claimed armed hold for execution".to_string());
+    if let Err(error) = commit_resumed_approval(server, expected, claimed.clone(), false).await {
+        return ExecuteResult::denied(error);
+    }
+    drop(transition);
+
+    if !server.emit_audit(
+        AuditEvent::new(AuditKind::ApprovedExecuted)
+            .handle(handle)
+            .caller(caller)
+            .session_fingerprint(
+                claimed
+                    .snapshot
+                    .session_fingerprint
+                    .as_deref()
+                    .unwrap_or("none"),
+            )
+            .cmd(claimed.snapshot.command_line())
+            .field("phase", "requester_claimed"),
+    ) {
+        let mut failed = claimed.clone();
+        failed.status = ApprovalStatus::ExecFailed;
+        failed.decided_unix = Some(now_unix());
+        failed.decided_reason = Some(super::AUDIT_UNAVAILABLE_REASON.to_string());
+        let _ = commit_resumed_approval(server, claimed, failed, true).await;
+        return ExecuteResult::exec_failed(
+            "requester resume refused",
+            super::AUDIT_UNAVAILABLE_REASON.to_string(),
+        );
+    }
+
+    let reason = format!("requester resumed operator-approved hold {handle}");
+    let result = execute_snapshot(server, &claimed.snapshot, &reason).await;
+    let completed_unix = now_unix();
+    let mut terminal = claimed.clone();
+    match &result.exec {
+        ExecOutcome::Completed {
+            exit_code,
+            stdout,
+            stderr,
+        } => {
+            terminal.status = ApprovalStatus::Approved;
+            terminal.decided_unix = Some(completed_unix);
+            terminal.decided_reason = Some("requester resumed operator-approved hold".to_string());
+            terminal.result_exit = *exit_code;
+            terminal.result_stdout = bound_persisted_transcript(stdout.clone());
+            terminal.result_stderr = bound_persisted_transcript(stderr.clone());
+        }
+        ExecOutcome::Failed { reason, .. } => {
+            terminal.status = ApprovalStatus::ExecFailed;
+            terminal.decided_unix = Some(completed_unix);
+            terminal.decided_reason = Some(reason.clone());
+            terminal.result_exit = None;
+            terminal.result_stdout = None;
+            terminal.result_stderr = None;
+        }
+        _ => {
+            terminal.status = ApprovalStatus::ExecFailed;
+            terminal.decided_unix = Some(completed_unix);
+            terminal.decided_reason =
+                Some("resumed execution returned a non-terminal outcome".to_string());
+            terminal.result_exit = None;
+            terminal.result_stdout = None;
+            terminal.result_stderr = None;
+        }
+    }
+    if let Err(error) =
+        commit_resumed_approval(server, claimed.clone(), terminal.clone(), true).await
+    {
+        return ExecuteResult::exec_failed(
+            reason,
+            format!("held command ran but its result was not durable: {error}"),
+        );
+    }
+    server.emit_audit_ungated(
+        AuditEvent::new(AuditKind::ApprovedExecuted)
+            .handle(handle)
+            .caller(caller)
+            .session_fingerprint(
+                claimed
+                    .snapshot
+                    .session_fingerprint
+                    .as_deref()
+                    .unwrap_or("none"),
+            )
+            .field("phase", "completed")
+            .field("status", terminal.status.as_str())
+            .field("exit", format!("{:?}", terminal.result_exit)),
+    );
+    server.emit_event(NotifyEvent {
+        event: "decision_made",
+        at_unix: completed_unix,
+        handle: Some(handle.to_string()),
+        session_fingerprint: claimed.snapshot.session_fingerprint.clone(),
+        reason: terminal.decided_reason.clone(),
+        status: Some(terminal.status.as_str().to_string()),
+        behavior: None,
+    });
+    result
 }
 
 /// Build the client-facing result from a decided approval record.

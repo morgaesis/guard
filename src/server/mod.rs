@@ -103,8 +103,8 @@ pub use transport::Server;
 pub(crate) use wire::AccessCapability;
 pub use wire::{
     AccessDecisionResult, AccessItem, AccessRequestGuidance, AdminRequest, AdminResponse,
-    CommandSpec, ExecuteRequest, ExecuteResponse, GateStatus, OutputStream, RevertSpec,
-    SshHostKeyMode, VerbInvocation, VerbMatchInfo, VerbSummary,
+    ApprovalSummary, CommandSpec, ExecuteRequest, ExecuteResponse, GateStatus, OutputStream,
+    ProvisionalSummary, RevertSpec, SshHostKeyMode, VerbInvocation, VerbMatchInfo, VerbSummary,
 };
 pub(crate) use wire::{
     ExecuteStreamMessage, IncomingMessage, EXECUTE_FEATURE_LOCAL_CWD, EXECUTE_FEATURE_TCP_NO_CWD,
@@ -376,11 +376,9 @@ impl ServerContext {
     #[cfg(unix)]
     fn validate_uid(&self, uid: u32) -> Result<()> {
         if let Some(ref allowed) = self.config.allowed_uids {
-            // The daemon's own UID is always permitted to connect: it
-            // already controls the daemon process (signals, /proc), so
-            // this is not a security boundary. Without this exemption
-            // the daemon could not run admin RPCs against itself, which
-            // breaks self-management.
+            // The daemon's own UID is always permitted to connect: it already
+            // controls the daemon process (signals, /proc), so connection
+            // admission is not an operator-authority boundary.
             if !allowed.contains(&uid) && uid != self.config.daemon_uid {
                 tracing::warn!("connection rejected: uid {} not in allowed list", uid);
                 anyhow::bail!("connection not allowed for this user");
@@ -389,20 +387,18 @@ impl ServerContext {
         Ok(())
     }
 
-    /// Authorize an admin RPC. A local operator is the daemon identity, plus
-    /// the kernel-authenticated SYSTEM principal on Windows so an elevated
-    /// installer task can perform operator actions through the named pipe.
-    /// Unix peers receive no equivalent root exception. TCP administration
-    /// remains restricted to the separately authenticated TcpAdmin transport.
+    /// Authorize an admin RPC. Unix operator authority is represented by the
+    /// admin bearer identity. Windows also accepts the daemon service identity
+    /// and kernel-authenticated SYSTEM so an elevated installer task can
+    /// perform operator actions through the named pipe. TCP administration
+    /// remains restricted to the separately authenticated admin bearer.
     /// Without this rule, an exec-allowed agent process could mint
     /// sessions whose `--prompt` overrides the LLM policy from itself.
     fn validate_admin(&self, caller: &CallerIdentity) -> Result<()> {
         if self.caller_is_admin(caller) {
             return Ok(());
         }
-        anyhow::bail!(
-            "admin RPC refused: caller is not the daemon principal or Windows SYSTEM operator"
-        );
+        anyhow::bail!("admin RPC refused: caller lacks operator authority");
     }
 
     fn caller_is_admin(&self, caller: &CallerIdentity) -> bool {

@@ -74,6 +74,9 @@ redact_and_bound() {
 prepare_runtime() {
     [ -s /tmp/ctf-attacker-key ] || fail 'staged attacker key is missing'
     [ -s /home/attacker/attacker-prompt.md ] || fail 'the attacker prompt is missing from the image'
+    if ip route show default | grep -q .; then
+        fail 'scenario container unexpectedly has a default network route'
+    fi
 
     # The image already provides each home with its client configuration and
     # the attacker prompt; copyup preserves ownership. Only the staged key is
@@ -160,6 +163,7 @@ start_daemon() {
     runuser --preserve-environment -u guard -- /bin/bash -s -- "$SOCK" > "$DAEMON_LOG" 2>&1 <<'GUARD_SERVER' &
 set -euo pipefail
 export GUARD_LLM_API_KEY="$(< /tmp/ctf-secrets/evaluator-api-key)"
+export GUARD_LLM_PROXY_URL=http://guard-egress:3128
 exec guard server start \
     --socket "$1" \
     --socket-group guard-clients \
@@ -220,6 +224,8 @@ run_attacker() {
         GUARD_SOCKET="$SOCK" \
         CTF_SCENARIO="$scenario" \
         ATTACKER_MODEL="${ATTACKER_MODEL:-moonshotai/kimi-k3}" \
+        HTTPS_PROXY=http://guard-egress:3128 \
+        https_proxy=http://guard-egress:3128 \
         "${attacker_env[@]}" \
         timeout "${CTF_ATTACKER_TIMEOUT:-900}" /usr/local/bin/attacker-exec "$scenario" "$report_path" \
         > "$stdout_path" 2> "$stderr_path"

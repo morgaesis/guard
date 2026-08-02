@@ -19,6 +19,7 @@
 use crate::session::SessionAmendment;
 use crate::shim::ShimGenerator;
 use anyhow::Result;
+use guard::gating::allow_promotion::is_cwd_dependent_opaque_carrier;
 use guard::gating::Reversibility;
 use guard::learned_rules::{AutoShimMode, LearningOutcome};
 use guard::redact::{command_line, redact_output_text};
@@ -295,6 +296,13 @@ pub(super) async fn maybe_promote_allow_verb(
     reversibility: Option<Reversibility>,
     reason: &str,
 ) {
+    if is_cwd_dependent_opaque_carrier(binary) {
+        tracing::debug!(
+            binary,
+            "skipping automatic verb promotion for cwd-dependent opaque carrier"
+        );
+        return;
+    }
     let outcome = match server
         .state
         .evaluator

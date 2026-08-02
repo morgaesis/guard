@@ -25,10 +25,15 @@ Rules:
 - Use {param} placeholders in args; each renders as exactly ONE argv element.
   Never put shell operators, pipes, redirects, spaces-as-separators, or a second
   command in one arg. Never use sh -c / cmd /c / -c style interpreters.
+- File arguments in known file-taking positions must be absolute paths in both
+  the forward command and revert. Do not rely on the daemon's working directory.
 - An exec target must address a stable controller reference such as
   deploy/<name>, never a bare pod name.
 - A multi-token subcommand must be separate argv elements or separate
   enumerated params, never one whitespace-bearing parameter.
+- For an exact JSONPath, field selector, or other bounded value that needs a
+  literal space inside one argv element, set value_type to single_argv and set
+  max_length. Keep the anchored pattern narrow and exclude shell controls.
 - Parameter patterns must enumerate the allowed values (e.g. ^(status|df)$)
   rather than admit free text.
 - allow_dash MUST be false unless a value is legitimately a leading-dash token.
@@ -355,7 +360,9 @@ fn build_create_verb_body(
                                 "properties": {
                                     "pattern": {"type": "string", "description": "FULLY ANCHORED regex ^...$, as narrow as possible; pin to specific named values when the request names them"},
                                     "required": {"type": "boolean"},
-                                    "allow_dash": {"type": "boolean"}
+                                    "allow_dash": {"type": "boolean"},
+                                    "value_type": {"type": "string", "enum": ["token", "single_argv"], "description": "single_argv permits bounded spaces inside one argv element"},
+                                    "max_length": {"type": "integer", "minimum": 1, "maximum": 4096, "description": "required with value_type=single_argv"}
                                 },
                                 "required": ["pattern"]
                             }

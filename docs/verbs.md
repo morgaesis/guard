@@ -14,6 +14,21 @@ guard verb run restart-service --param unit=nginx
 [`examples/verbs.yaml`](../examples/verbs.yaml) contains command-template and
 coverage-cell examples.
 
+Operators replace one catalog entry from a YAML file containing exactly one
+verb definition:
+
+```bash
+guard verb amend restart-service --file restart-service.yaml
+```
+
+The client reads the live definition first and binds the amendment to its
+definition digest. The daemon rejects the write if another catalog edit lands
+between that read and the replacement. It validates the candidate and complete
+catalog before atomically replacing the catalog file. The replacement must
+retain the requested name. Runtime-generated, automatically promoted, and
+reserved-namespace verbs cannot be amended through this command. Like other
+catalog mutations, amend requires the admin bearer.
+
 ## Command templates
 
 A template renders each `{param}` as one argv element without a shell or word
@@ -41,7 +56,8 @@ as a backstop.
 
 Coverage cells describe regions of ordinary tool argv. They can constrain exact
 required and forbidden tokens, option spellings and values, positional targets,
-inventory, namespace, bounded fanout, and caller-requested environment bindings.
+inventory, namespace, bounded fanout, an exact canonical working directory, and
+caller-requested environment bindings.
 Their actions are `preauthorized`, `evaluate`, or `deny`; preauthorization
 requires a trusted verb.
 
@@ -57,7 +73,7 @@ requires a trusted verb.
         required_args: [--check]
         inventory:
           options: [-i, --inventory]
-          values: [inventory/production]
+          values: [/srv/guard/inventory/production]
         fanout:
           options: [--limit]
           max: 2
@@ -78,11 +94,24 @@ A non-matching cell has no decision. The check cell above allows its bounded
 region and does not deny apply mode, SSH inspection, or any other command. Those
 areas follow their own matching cells or evaluator path.
 
+Known file operands in command and rollback templates must be absolute. Ansible
+inventory coverage likewise accepts only absolute paths or explicit inline host
+lists. If an explicit-inventory Ansible process reports that no inventory was
+parsed, or that every supplied source was unusable, Guard converts exit 0 to a
+failure and emits a diagnostic.
+
 Environment sources are `plain`, `secret`, and `secret-file`. A constraint may
 name exact `values` or a fully anchored `pattern`. A cell with no environment
 constraints cannot preauthorize a request that adds caller-controlled bindings;
 that request returns to the evaluator. Automatically promoted cells never
 preauthorize environment bindings.
+
+`cwd` binds a cell to one existing, absolute canonical directory. Guard
+canonicalizes the caller directory before coverage resolution and revalidates it
+immediately before execution, so a changed directory or symlink retarget cannot
+reuse the cell. This bounds tools that discover configuration, plugins, or input
+files from a project tree. Cwd-dependent opaque carriers do not enter automatic
+verb promotion; an operator-authored typed verb supplies their durable authority.
 
 ## Reverse matching
 
