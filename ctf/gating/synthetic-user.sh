@@ -733,7 +733,7 @@ phase_su16() {
       [ "$(response_handle /scenario/journey/cross-cloud.out)" = "$(read_handle cloud)" ]
       expect_failure cross-file guard run --json cat /scenario/fixtures/operator-note
       [ "$(response_handle /scenario/journey/cross-file.out)" = "$(read_handle file)" ]
-      (cd /scenario/ansible && expect_failure cross-ansible guard run --json ansible-playbook site.yml --check --diff --limit access-fixture)
+      (cd /scenario/ansible && expect_failure cross-ansible guard run --json ansible-playbook /scenario/ansible/site.yml --check --diff --limit access-fixture)
       [ "$(response_handle /scenario/journey/cross-ansible.out)" = "$(read_handle ansible)" ]
       expect_failure cross-api guard run --json fixture-api access-status
       [ "$(response_handle /scenario/journey/cross-api.out)" = "$(read_handle api)" ]
@@ -799,7 +799,7 @@ phase_su16() {
       grep -q 'use limit is exhausted' /scenario/journey/command-third.out
       capture_phase cloud-use guard run --json cloudstack list virtualmachines zoneid=access-fixture-zone
       capture_phase file-use guard run --json cat /scenario/fixtures/operator-note
-      (cd /scenario/ansible && capture_phase ansible-use guard run --json ansible-playbook site.yml --check --diff --limit access-fixture)
+      (cd /scenario/ansible && capture_phase ansible-use guard run --json ansible-playbook /scenario/ansible/site.yml --check --diff --limit access-fixture)
       printf '%s' synthetic-fixture-token | guard secrets add fixture/api-token >> "$RAW" 2>&1
       capture_phase api-use guard run --json fixture-api access-status
       grep -q 'fixture-api:healthy' /scenario/journey/api-use.out
