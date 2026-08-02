@@ -2638,7 +2638,7 @@ fn caller_can_view_session(
     owner: &SessionOwner,
 ) -> bool {
     matches!(
-        authorize_session_use(owner, caller, &server.config.daemon_principal),
+        authorize_session_use(owner, caller, server.config.allow_windows_system_operator),
         SessionAuthz::Allowed
     )
 }
@@ -2657,7 +2657,9 @@ async fn authorize_session_inspection(
 ) -> Result<(), AdminResponse> {
     let owner = server.state.sessions.read().await.owner_for(token);
     let decision = match &owner {
-        Some(owner) => authorize_session_use(owner, caller, &server.config.daemon_principal),
+        Some(owner) => {
+            authorize_session_use(owner, caller, server.config.allow_windows_system_operator)
+        }
         // No active grant for this token: a non-owner must not learn whether the
         // session ever existed, and cannot prove ownership of a gone session.
         None => SessionAuthz::Mismatch,
@@ -2718,7 +2720,7 @@ async fn enforce_session_owner_for_admin(
             message: format!("{context} refused: {SESSION_UNOWNED_REFUSED}"),
         });
     }
-    match authorize_session_use(&owner, caller, &server.config.daemon_principal) {
+    match authorize_session_use(&owner, caller, server.config.allow_windows_system_operator) {
         SessionAuthz::Allowed => None,
         SessionAuthz::Unowned => {
             server.emit_audit_ungated(

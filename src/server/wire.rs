@@ -145,7 +145,7 @@ pub(super) const SESSION_UNOWNED_REFUSED: &str =
 
 /// Result of checking whether a caller may exercise a session's authority.
 pub(super) enum SessionAuthz {
-    /// The caller is the owning principal, or the daemon/operator principal.
+    /// The caller is the owning principal or an authenticated operator.
     Allowed,
     /// The caller's authenticated principal is not the session owner.
     Mismatch,
@@ -155,7 +155,7 @@ pub(super) enum SessionAuthz {
 
 /// Server-side session-ownership decision. Uses only the principal the daemon
 /// reads itself (`caller.principal()`), never a client-supplied value. The
-/// daemon/operator principal keeps cross-session authority; any other caller
+/// An authenticated operator keeps cross-session authority; any other caller
 /// must be the exact owning principal on a kernel-authenticated local peer.
 ///
 /// `Unowned` legacy sessions resolve to `Allowed` for the operator (so it can
@@ -165,13 +165,13 @@ pub(super) enum SessionAuthz {
 pub(super) fn authorize_session_use(
     owner: &SessionOwner,
     caller: &CallerIdentity,
-    daemon_principal: &PrincipalKey,
+    allow_windows_system_operator: bool,
 ) -> SessionAuthz {
     let caller_principal = caller.principal();
-    let is_operator = (caller.is_local_peer()
-        && matches!(&caller_principal, Some(p) if daemon_principal.eq_ci(p)))
-        || caller.is_windows_system_operator()
-        || matches!(caller, CallerIdentity::TcpAdmin { .. });
+    let is_operator = matches!(
+        caller,
+        CallerIdentity::UnixAdmin { .. } | CallerIdentity::TcpAdmin { .. }
+    ) || (allow_windows_system_operator && caller.is_windows_system_operator());
     match owner {
         SessionOwner::Unowned => {
             if is_operator {
@@ -282,8 +282,8 @@ pub enum AdminRequest {
         /// bound to. The operator sets this when minting a session for an agent
         /// that runs under a different local identity; when omitted the session
         /// is owned by the authenticated caller that issues it (the daemon
-        /// principal for an operator-issued grant). Only the owning principal, or
-        /// the daemon/operator principal, may later exercise the session's
+        /// principal for an operator-issued grant). Only the owning principal
+        /// or an authenticated operator may later exercise the session's
         /// authority.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         owner: Option<String>,
@@ -357,7 +357,7 @@ pub enum AdminRequest {
     },
     SecretList,
     SecretListDetailed,
-    /// Privileged status snapshot. Caller must hold the admin bearer token.
+    /// Privileged status snapshot. Caller must have operator authority.
     Status,
     /// No-auth liveness probe. Returns version, uptime, and a small
     /// set of non-elevating posture fields so any allowed client can
@@ -374,7 +374,7 @@ pub enum AdminRequest {
     Revert {
         handle: String,
     },
-    /// List provisional (containment) executions. Daemon UID sees all; other
+    /// List provisional (containment) executions. Operators see all; other
     /// callers see only their own.
     Provisionals,
     /// Operator approves a held command and arms its bound snapshot. The
@@ -392,7 +392,7 @@ pub enum AdminRequest {
     Deny {
         handle: String,
     },
-    /// List held/decided approvals. Daemon UID sees all; others see their own.
+    /// List held/decided approvals. Operators see all; others see their own.
     ApprovalList,
     /// Fetch one approval's status and result (for the agent to poll its own
     /// held command). Scoped by handle ownership.
@@ -601,9 +601,9 @@ pub enum AdminRequest {
         commands: Vec<BatchCommand>,
     },
     /// Walk the hash-chained audit log and report whether it is intact.
-    /// Daemon-principal only: the audit file is daemon-owned state.
+    /// Operator-only: the audit file is daemon-owned state.
     AuditVerify,
-    /// Read the last `limit` records of the audit log. Daemon-principal only.
+    /// Read the last `limit` records of the audit log. Operator-only.
     AuditTail {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<usize>,
@@ -611,10 +611,12 @@ pub enum AdminRequest {
 }
 
 impl AdminRequest {
-    /// Admin RPCs that require the admin bearer token. Ping is a public
-    /// liveness probe. Secret RPCs and session-scoped reads are open to
-    /// connected users and enforce ownership in the handler; on those, a
-    /// valid bearer only elevates the caller to the operator view.
+    /// Admin RPCs that require operator authority. Unix and foreground Windows
+    /// servers use the admin bearer; the packaged Windows service instead
+    /// accepts kernel-authenticated local SYSTEM on its named pipe. Ping is a
+    /// public liveness probe. Secret RPCs and session-scoped reads are open to
+    /// connected users and enforce ownership in the handler; on those, a valid
+    /// bearer only elevates the caller to the operator view.
     pub(super) fn requires_admin_token(&self) -> bool {
         #[cfg(test)]
         if matches!(
@@ -647,7 +649,7 @@ impl AdminRequest {
                 | Self::ApprovalShow { .. }
                 | Self::Resume { .. }
                 // ApprovalNote does its own operator-or-owner authorization in
-                // the handler, so it is not gated to the daemon UID here.
+                // the handler, so it does not require operator authority here.
                 | Self::ApprovalNote { .. }
                 | Self::ApprovalWithdraw { .. }
                 | Self::VerbList

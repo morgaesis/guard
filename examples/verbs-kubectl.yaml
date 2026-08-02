@@ -22,8 +22,8 @@
 #   irreversible -> held for operator approval before it runs
 #
 # `trusted: true` skips the LLM evaluator (deterministic allow); the declared
-# class still drives the gate. Only the operator (daemon principal) edits this
-# file; it is hot-reloaded. Agents cannot add or alter verbs.
+# class still drives the gate. Only an operator-owned deployment path edits
+# this file; it is hot-reloaded. Agents cannot add or alter verbs.
 
 verbs:
   # ---- Reversible: read-only inspection, runs immediately ----

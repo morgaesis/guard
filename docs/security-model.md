@@ -100,11 +100,17 @@ to one configured client SID. On Unix, operator authority for holds,
 provisionals, saved grants, verbs, and detailed status is the admin bearer
 token: the token reaches the daemon through stdin at startup and is presented
 only by the root-owned operator wrapper, so a brokered child running as the
-daemon uid holds no operator authority. On Windows, the operator principal
-remains the daemon service SID and the kernel-authenticated local SYSTEM SID;
-approved commands run as the service account there, so a corrupted agent and
-the operator share an identity, and the boundary needs a separate
-exec-identity design rather than a token alone.
+daemon uid holds no operator authority. On Windows, kernel-authenticated local
+SYSTEM is the packaged operator principal. The installer runs operator commands
+in transient SYSTEM tasks, while brokered commands run as the daemon service
+SID. The service SID receives no operator exception. Packaged service mode
+requires a named pipe and rejects an admin bearer and TCP listener. A foreground
+Windows server can use an explicitly configured admin bearer instead and gives
+SYSTEM no implicit operator authority.
+
+Windows clients request identification-level named-pipe security. The daemon
+can authenticate the client SID, but a process that wins the pipe name cannot
+impersonate a privileged Guard client.
 
 On Unix, the local socket is private to the daemon unless an operator configures
 a group, in which case it is group-readable and group-writable. SQLite state and

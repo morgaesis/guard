@@ -2,7 +2,7 @@
 //! held at a point of no return until a human approves the exact artifact.
 //!
 //! A held command does not execute. It is enqueued with an immutable execution
-//! snapshot, and only an operator (daemon UID) can approve it. Approval executes
+//! snapshot, and only an authenticated operator can approve it. Approval executes
 //! strictly from the stored snapshot - no fields are accepted at approve time -
 //! so the approval is bound to exactly what was reviewed (gate on prediction).
 //! An unattended queue fails closed: holds past their TTL transition to

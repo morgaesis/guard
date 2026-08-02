@@ -1569,6 +1569,18 @@ fn validation_error_response(reason: String) -> ExecuteResponse {
     }
 }
 
+fn caller_with_valid_admin_bearer(
+    caller: &CallerIdentity,
+    admin_token: Option<&str>,
+) -> CallerIdentity {
+    match caller {
+        CallerIdentity::Unix { uid } => CallerIdentity::UnixAdmin { uid: *uid },
+        _ => CallerIdentity::TcpAdmin {
+            token: admin_token.unwrap_or("<missing>").to_string(),
+        },
+    }
+}
+
 /// Drive the request/response protocol for one connected client, independent of
 /// the underlying transport (UNIX socket or Windows named pipe).
 async fn serve_connection<S>(
@@ -1620,17 +1632,27 @@ where
 
         let request = match incoming {
             IncomingMessage::Admin { admin, admin_token } => {
-                // Admin authority is the admin bearer token, never the peer
-                // uid: brokered children inherit the daemon uid and must not
-                // inherit its operator surface. Ping stays open for health
-                // probes, matching the TCP listener.
+                // Admin authority is the admin bearer token, never the Unix
+                // peer uid or Windows service SID: brokered children inherit
+                // the daemon identity and must not inherit its operator
+                // surface. Kernel-authenticated Windows SYSTEM is the one
+                // local exception used by the packaged operator task. Ping
+                // stays open for health probes, matching the TCP listener.
                 let caller = if matches!(admin.as_ref(), AdminRequest::Ping) {
                     caller.clone()
                 } else {
                     let token_result = server.validate_admin_token(admin_token.as_deref());
                     if admin.requires_admin_token() {
-                        // Operator-only operations: the bearer is mandatory.
-                        if let Err(e) = token_result {
+                        // Operator-only operations require the bearer except
+                        // for a tokenless, kernel-authenticated Windows SYSTEM
+                        // named-pipe caller. Supplying an invalid bearer still
+                        // fails closed, including for SYSTEM.
+                        if server.config.allow_windows_system_operator
+                            && caller.is_windows_system_operator()
+                            && admin_token.is_none()
+                        {
+                            caller.clone()
+                        } else if let Err(e) = token_result {
                             let resp = AdminResponse::Error {
                                 message: format!("admin RPC refused: {}", e),
                             };
@@ -1639,14 +1661,8 @@ where
                                 .await?;
                             writer.write_all(b"\n").await?;
                             continue;
-                        }
-                        match caller {
-                            CallerIdentity::Unix { uid } => CallerIdentity::UnixAdmin { uid },
-                            _ => CallerIdentity::TcpAdmin {
-                                token: admin_token
-                                    .clone()
-                                    .unwrap_or_else(|| "<missing>".to_string()),
-                            },
+                        } else {
+                            caller_with_valid_admin_bearer(&caller, admin_token.as_deref())
                         }
                     } else if admin_token.is_some() {
                         // Self-scoped operations accept an optional bearer: a
@@ -1663,14 +1679,7 @@ where
                             writer.write_all(b"\n").await?;
                             continue;
                         }
-                        match caller {
-                            CallerIdentity::Unix { uid } => CallerIdentity::UnixAdmin { uid },
-                            _ => CallerIdentity::TcpAdmin {
-                                token: admin_token
-                                    .clone()
-                                    .unwrap_or_else(|| "<missing>".to_string()),
-                            },
-                        }
+                        caller_with_valid_admin_bearer(&caller, admin_token.as_deref())
                     } else {
                         caller.clone()
                     }
@@ -2439,6 +2448,7 @@ mod line_limit_tests {
     async fn one_admin_roundtrip(
         caller: CallerIdentity,
         admin_token_config: Option<&str>,
+        allow_windows_system_operator: bool,
         line: &str,
     ) -> String {
         let (client, server) = tokio::io::duplex(64 * 1024);
@@ -2446,6 +2456,7 @@ mod line_limit_tests {
         if let Some(token) = admin_token_config {
             cfg.config.admin_token = Some(token.to_string());
         }
+        cfg.config.allow_windows_system_operator = allow_windows_system_operator;
         let task = tokio::spawn(async move { serve_connection(server, caller, &cfg).await });
         let (read_half, mut write_half) = tokio::io::split(client);
         write_half
@@ -2470,6 +2481,7 @@ mod line_limit_tests {
         let response = one_admin_roundtrip(
             CallerIdentity::Unix { uid: 1000 },
             Some("operator-token"),
+            false,
             r#"{"admin":{"op":"audit_verify"}}"#,
         )
         .await;
@@ -2484,6 +2496,7 @@ mod line_limit_tests {
         let response = one_admin_roundtrip(
             CallerIdentity::Unix { uid: 1000 },
             Some("operator-token"),
+            false,
             r#"{"admin":{"op":"audit_verify"},"admin_token":"wrong"}"#,
         )
         .await;
@@ -2498,6 +2511,7 @@ mod line_limit_tests {
         let response = one_admin_roundtrip(
             CallerIdentity::Unix { uid: 1000 },
             None,
+            false,
             r#"{"admin":{"op":"audit_verify"},"admin_token":"anything"}"#,
         )
         .await;
@@ -2512,6 +2526,7 @@ mod line_limit_tests {
         let response = one_admin_roundtrip(
             CallerIdentity::Unix { uid: 4242 },
             None,
+            false,
             r#"{"admin":{"op":"access_list"}}"#,
         )
         .await;
@@ -2528,6 +2543,7 @@ mod line_limit_tests {
         let response = one_admin_roundtrip(
             CallerIdentity::Unix { uid: 1000 },
             Some("operator-token"),
+            false,
             r#"{"admin":{"op":"access_list"},"admin_token":"operator-token"}"#,
         )
         .await;
@@ -2542,12 +2558,105 @@ mod line_limit_tests {
         let response = one_admin_roundtrip(
             CallerIdentity::Unix { uid: 1000 },
             Some("operator-token"),
+            false,
             r#"{"admin":{"op":"access_list"},"admin_token":"wrong"}"#,
         )
         .await;
         assert!(
             response.contains("admin RPC refused"),
             "an invalid bearer must be refused even on exempt ops: {response}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_system_operator_does_not_require_an_admin_bearer() {
+        let response = one_admin_roundtrip(
+            CallerIdentity::Windows {
+                sid: "S-1-5-18".to_string(),
+            },
+            None,
+            true,
+            r#"{"admin":{"op":"status"}}"#,
+        )
+        .await;
+        let parsed: AdminResponse = serde_json::from_str(&response).expect("admin response");
+        assert!(matches!(parsed, AdminResponse::Status { .. }), "{parsed:?}");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_service_sid_does_not_inherit_operator_authority() {
+        let response = one_admin_roundtrip(
+            CallerIdentity::Windows {
+                sid: "S-1-5-80-12345".to_string(),
+            },
+            None,
+            true,
+            r#"{"admin":{"op":"status"}}"#,
+        )
+        .await;
+        let parsed: AdminResponse = serde_json::from_str(&response).expect("admin response");
+        assert!(
+            matches!(parsed, AdminResponse::Error { ref message } if message == "admin RPC refused: admin token is not configured"),
+            "{parsed:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_ordinary_user_sid_does_not_inherit_operator_authority() {
+        let response = one_admin_roundtrip(
+            CallerIdentity::Windows {
+                sid: "S-1-5-21-1000-1000-1000-1001".to_string(),
+            },
+            None,
+            true,
+            r#"{"admin":{"op":"status"}}"#,
+        )
+        .await;
+        let parsed: AdminResponse = serde_json::from_str(&response).expect("admin response");
+        assert!(
+            matches!(parsed, AdminResponse::Error { ref message } if message == "admin RPC refused: admin token is not configured"),
+            "{parsed:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn foreground_windows_system_does_not_inherit_packaged_operator_authority() {
+        let response = one_admin_roundtrip(
+            CallerIdentity::Windows {
+                sid: "S-1-5-18".to_string(),
+            },
+            None,
+            false,
+            r#"{"admin":{"op":"status"}}"#,
+        )
+        .await;
+        let parsed: AdminResponse = serde_json::from_str(&response).expect("admin response");
+        assert!(
+            matches!(parsed, AdminResponse::Error { ref message } if message == "admin RPC refused: admin token is not configured"),
+            "{parsed:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_system_operator_with_an_invalid_bearer_is_refused() {
+        let response = one_admin_roundtrip(
+            CallerIdentity::Windows {
+                sid: "S-1-5-18".to_string(),
+            },
+            Some("operator-token"),
+            true,
+            r#"{"admin":{"op":"status"},"admin_token":"wrong"}"#,
+        )
+        .await;
+        let parsed: AdminResponse = serde_json::from_str(&response).expect("admin response");
+        assert!(
+            matches!(parsed, AdminResponse::Error { ref message } if message == "admin RPC refused: invalid admin token"),
+            "{parsed:?}"
         );
     }
 

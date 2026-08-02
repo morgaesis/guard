@@ -6,9 +6,9 @@
 //! SCM start/stop handshake from a dispatcher thread, or the SCM kills it with
 //! error 1053 ("the service did not respond to the start or control request in
 //! a timely fashion"). This module provides that handshake and then runs the
-//! exact same [`crate::run_server`] path a foreground daemon runs, so the
-//! service and the interactive daemon share one configuration surface and one
-//! code path - there is no separate service config or policy.
+//! same [`crate::run_server`] path a foreground daemon runs. The hidden service
+//! marker enables the packaged named-pipe operator boundary and rejects an
+//! admin bearer that a brokered service child could inherit.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -149,7 +149,8 @@ fn run_service() -> Result<()> {
 
 /// Re-parse the process argv into the `server start` command. The service is
 /// launched with the full flag set in its binPath, so this reuses the exact
-/// clap definition the foreground CLI uses; the service has no bespoke config.
+/// clap definition the foreground CLI uses. The retained `--service` marker
+/// activates the packaged named-pipe operator boundary in `run_server`.
 fn parse_server_command() -> Result<crate::ServerCommands> {
     match crate::MainArgs::try_parse_from(std::env::args()) {
         Ok(crate::MainArgs::Server(cmd)) => Ok(cmd),

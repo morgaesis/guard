@@ -1,11 +1,11 @@
 #!/bin/bash
 # Adversarial harness for consequence gating. Runs inside the container.
 #
-# Deployment: an UNPRIVILEGED daemon runs as uid 1000 (also the operator); the
-# agent is uid 1001. The operator gate is bypass-resistant because operator
-# authority is the admin bearer token: it lives in a file only the operator
-# uid (1000) can read, the daemon receives it through stdin at startup, and
-# the agent (1001) holds neither. Approved commands execute as the daemon
+# Deployment: an unprivileged daemon runs as uid 1000 and the agent is uid
+# 1001. The operator gate is bypass-resistant because operator authority is
+# the admin bearer token: it lives in a root-owned file, the daemon receives it
+# through stdin at startup, and neither uid inherits its value. Approved
+# commands execute as the daemon
 # identity (this is the policy-gate deployment; the root-broker
 # --exec-as-caller variant is exercised in the WSL deployment, where setuid
 # privilege drop is available).

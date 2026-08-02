@@ -591,7 +591,7 @@ async fn spawn_failure_delete_error_persists_nonrollbackable_tombstone() {
 }
 
 /// contain -> operator confirm keeps the change (no revert fires), and
-/// confirm is daemon-principal-only: a non-operator caller is refused before
+/// Confirm requires operator authority: a non-operator caller is refused before
 /// the registry is touched.
 #[cfg(unix)]
 #[tokio::test]
