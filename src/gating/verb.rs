@@ -8,8 +8,8 @@
 //! (which drives the consequence gate) and, for recoverable verbs, a
 //! structured rollback template.
 //!
-//! The catalog is the "slow clock": it is a file only the operator (daemon UID)
-//! controls; agents cannot add or change verbs at runtime. A trusted verb may
+//! The catalog is the "slow clock": it is a file only an operator-owned
+//! deployment path controls; agents cannot add or change verbs at runtime. A trusted verb may
 //! skip the LLM evaluator entirely (a deterministic allow path, like a static
 //! policy allow), since its shape is already operator-reviewed.
 

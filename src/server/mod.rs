@@ -134,6 +134,10 @@ pub(crate) struct ServerConfig {
     pub(crate) redact: bool,
     pub(crate) auth_token: Option<String>,
     pub(crate) admin_token: Option<String>,
+    /// Permit tokenless operator RPCs from a kernel-authenticated Windows
+    /// SYSTEM named-pipe peer. This is enabled only for the packaged Windows
+    /// service, whose operator wrapper runs in a transient SYSTEM task.
+    pub(crate) allow_windows_system_operator: bool,
     /// Unix-socket transport option; carried but never read on Windows.
     #[cfg_attr(windows, allow(dead_code))]
     pub(crate) socket_group: Option<String>,
@@ -157,13 +161,12 @@ pub(crate) struct ServerConfig {
     /// Wall-clock unix seconds when the daemon started. Surfaced via the
     /// Status admin RPC so callers can compute uptime.
     pub(crate) started_at_unix: u64,
-    /// Effective UID of the daemon process. Admin RPCs require the
-    /// caller to be this UID; there is no token-based elevation.
+    /// Effective UID of the daemon process. This identifies daemon-owned state
+    /// and the default child execution identity; it grants no admin authority.
     pub(crate) daemon_uid: u32,
     /// The daemon's own cross-platform principal: its uid on Unix, its process
-    /// SID on Windows. Operator/admin RPCs require the caller's principal to
-    /// equal this - the single "is the operator" source of truth on both
-    /// platforms.
+    /// SID on Windows. This principal owns internal state and proxy-generated
+    /// records but grants no admin authority.
     pub(crate) daemon_principal: PrincipalKey,
     pub(crate) state_db_path: Option<PathBuf>,
     /// Consequence-gating mode. `Off` preserves legacy behavior; `Consequence`
@@ -217,6 +220,7 @@ impl Default for ServerConfig {
             redact: false,
             auth_token: None,
             admin_token: None,
+            allow_windows_system_operator: false,
             socket_group: None,
             allowed_uids: None,
             shim_dir: None,
@@ -387,11 +391,12 @@ impl ServerContext {
         Ok(())
     }
 
-    /// Authorize an admin RPC. Unix operator authority is represented by the
-    /// admin bearer identity. Windows also accepts the daemon service identity
-    /// and kernel-authenticated SYSTEM so an elevated installer task can
-    /// perform operator actions through the named pipe. TCP administration
-    /// remains restricted to the separately authenticated admin bearer.
+    /// Authorize an admin RPC. Unix and foreground Windows operator authority
+    /// is represented by the admin bearer identity. The packaged Windows
+    /// service instead accepts kernel-authenticated SYSTEM so an elevated
+    /// installer task can perform operator actions through the named pipe; the
+    /// daemon service SID receives no matching exception. TCP administration
+    /// remains restricted to the separate admin bearer.
     /// Without this rule, an exec-allowed agent process could mint
     /// sessions whose `--prompt` overrides the LLM policy from itself.
     fn validate_admin(&self, caller: &CallerIdentity) -> Result<()> {
@@ -402,10 +407,12 @@ impl ServerContext {
     }
 
     fn caller_is_admin(&self, caller: &CallerIdentity) -> bool {
-        // Operator authority is the admin bearer token, never the daemon's
-        // own uid: brokered children inherit that uid in the default model
-        // and must not inherit its operator surface with it.
-        caller.is_windows_system_operator()
+        // Operator authority is the admin bearer identity or, only when the
+        // packaged boundary is enabled, the Windows SYSTEM SID. The daemon's
+        // own uid or service SID grants nothing: brokered children inherit the
+        // daemon identity in the default model and must not inherit its
+        // operator surface with it.
+        (self.config.allow_windows_system_operator && caller.is_windows_system_operator())
             || matches!(
                 caller,
                 CallerIdentity::TcpAdmin { .. } | CallerIdentity::UnixAdmin { .. }
@@ -545,7 +552,7 @@ pub fn resolve_daemon_principal() -> PrincipalKey {
             Ok(sid) => PrincipalKey::from_sid(sid),
             Err(e) => {
                 tracing::error!(
-                    "daemon SID resolution failed ({e}); operator approval disabled (fail-closed)"
+                    "daemon SID resolution failed ({e}); daemon-principal isolation is fail-closed"
                 );
                 PrincipalKey::from_raw("\u{0}daemon-sid-unresolved\u{0}")
             }
@@ -554,8 +561,7 @@ pub fn resolve_daemon_principal() -> PrincipalKey {
 }
 
 /// Read the daemon's effective UID on Unix. Windows has no Unix UID; TCP
-/// callers are represented separately and cannot satisfy daemon-UID admin
-/// checks.
+/// callers are represented separately.
 #[cfg(unix)]
 fn current_uid() -> u32 {
     unsafe { libc::geteuid() as u32 }

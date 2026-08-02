@@ -2612,9 +2612,9 @@ pub(crate) async fn handle_status(socket: Option<String>, json: bool) -> Result<
                     },
                 }));
             }
-            // Expected when caller is not the daemon UID. Hide the rest.
+            // Expected when the caller lacks operator authority. Hide the rest.
             println!();
-            println!("(full server config is restricted to the daemon UID)");
+            println!("(full server config requires operator authority)");
             Ok(())
         }
         Ok(other) => {

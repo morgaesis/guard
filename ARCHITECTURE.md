@@ -173,11 +173,13 @@ token buckets, error circuits, and a reserved evaluator slot bound amplification
 
 ## Principal and credential model
 
-Local transports use kernel-authenticated peer identity. Operator authority is
-the admin bearer token on Unix (root-held, stdin-fed to the daemon at startup)
-and the daemon service SID on Windows; the daemon's own uid grants nothing, so
-a brokered child cannot approve holds, confirm provisionals, change grants,
-edit verbs, or inspect daemon secret ownership.
+Local transports use kernel-authenticated peer identity. Unix and foreground
+Windows servers use an explicitly configured admin bearer for operator
+authority. The packaged Windows service rejects an admin bearer and accepts
+only kernel-authenticated local SYSTEM on its named pipe. The daemon's own uid
+or Windows service SID grants nothing, so a brokered child cannot approve
+holds, confirm provisionals, change grants, edit verbs, or inspect daemon
+secret ownership.
 
 Each command-access session is bound automatically to the authenticated
 requester. Every local path that consumes its authority requires the requesting

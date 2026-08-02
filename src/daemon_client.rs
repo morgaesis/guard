@@ -607,8 +607,15 @@ async fn connect_local(path: &Path) -> Result<tokio::net::UnixStream> {
 #[cfg(windows)]
 async fn connect_local(path: &Path) -> Result<tokio::net::windows::named_pipe::NamedPipeClient> {
     use tokio::net::windows::named_pipe::ClientOptions;
+    use windows_sys::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION;
+
     let name = crate::server::winplat::pipe_name(path);
-    ClientOptions::new()
+    let mut options = ClientOptions::new();
+    // Keep this explicit even though Tokio currently defaults to the same
+    // SQOS. Identification lets Guard read the peer identity but prevents a
+    // pipe server from impersonating a privileged client.
+    options.security_qos_flags(SECURITY_IDENTIFICATION);
+    options
         .open(&name)
         .context("failed to connect to guard server")
 }

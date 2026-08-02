@@ -112,6 +112,35 @@ fn read_admin_token_stdin() -> Result<String> {
     Ok(token)
 }
 
+#[cfg(windows)]
+fn validate_windows_service_operator_config(
+    service: bool,
+    has_socket: bool,
+    has_tcp_listener: bool,
+    admin_token_stdin: bool,
+    has_admin_token: bool,
+) -> Result<()> {
+    if !service {
+        return Ok(());
+    }
+    if admin_token_stdin {
+        anyhow::bail!(
+            "the packaged Windows service rejects --admin-token-stdin; its operator wrapper uses the kernel-authenticated SYSTEM named-pipe identity"
+        );
+    }
+    if has_admin_token {
+        anyhow::bail!(
+            "the packaged Windows service rejects GUARD_ADMIN_TOKEN; brokered children share the service identity and must not inherit an operator bearer"
+        );
+    }
+    if !has_socket || has_tcp_listener {
+        anyhow::bail!(
+            "the packaged Windows service requires exactly one named-pipe listener via --socket and does not accept a TCP listener"
+        );
+    }
+    Ok(())
+}
+
 fn guard_env_u64(suffix: &str) -> Result<Option<u64>> {
     guard_env(suffix)
         .filter(|value| !value.trim().is_empty())
@@ -290,9 +319,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             command_evaluator_burst,
             command_evaluator_error_threshold,
             command_evaluator_circuit_cooldown,
-            // Consumed in `main` (Windows SCM dispatch); irrelevant to the
-            // server run itself, which is identical in service and foreground.
-            service: _,
+            service,
         } => {
             tracing::info!("Starting guard server...");
 
@@ -392,17 +419,37 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                     "TCP server requires GUARD_AUTH_TOKEN; configure clients with `guard config set-token`"
                 );
             }
+            let configured_admin_token = admin_token
+                .filter(|token| !token.is_empty())
+                .or_else(|| guard_env("ADMIN_TOKEN").filter(|token| !token.is_empty()));
+            #[cfg(windows)]
+            validate_windows_service_operator_config(
+                service,
+                socket_path.is_some(),
+                tcp_port.is_some(),
+                admin_token_stdin,
+                configured_admin_token.is_some(),
+            )?;
             let admin_token = if admin_token_stdin {
                 Some(read_admin_token_stdin()?)
             } else {
-                admin_token
-                    .filter(|token| !token.is_empty())
-                    .or_else(|| guard_env("ADMIN_TOKEN").filter(|token| !token.is_empty()))
+                configured_admin_token
             };
             if admin_token.is_none() {
+                #[cfg(not(windows))]
                 tracing::warn!(
                     "admin RPCs other than ping are refused on every listener; configure --admin-token-stdin with a root-held token file (or GUARD_ADMIN_TOKEN for development)"
                 );
+                #[cfg(windows)]
+                if service {
+                    tracing::info!(
+                        "packaged operator RPCs require a kernel-authenticated local SYSTEM named-pipe caller"
+                    );
+                } else {
+                    tracing::warn!(
+                        "admin RPCs other than ping are refused; configure GUARD_ADMIN_TOKEN for a foreground development server"
+                    );
+                }
             }
 
             let shim_dir =
@@ -968,7 +1015,16 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 );
             }
 
+            #[cfg(not(windows))]
             tracing::info!("Admin RPCs require the admin bearer token on every listener");
+            #[cfg(windows)]
+            if service {
+                tracing::info!(
+                    "Admin RPCs require a kernel-authenticated local SYSTEM named-pipe caller"
+                );
+            } else {
+                tracing::info!("Admin RPCs require the admin bearer token");
+            }
 
             let tool_registry = tool_config::ToolRegistry::load_default().unwrap_or_else(|e| {
                 tracing::warn!("Could not load tool config: {}", e);
@@ -1012,6 +1068,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                 redact,
                 auth_token,
                 admin_token,
+                allow_windows_system_operator: cfg!(windows) && service,
                 socket_group,
                 allowed_uids,
                 shim_dir,
@@ -2103,5 +2160,26 @@ mod api_endpoint_tests {
         symlink(&output, &link).unwrap();
         assert!(write_brokered_kubeconfig_output(&link, "replacement", true).is_err());
         assert_eq!(std::fs::read_to_string(output).unwrap(), "new");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_service_operator_tests {
+    use super::validate_windows_service_operator_config;
+
+    #[test]
+    fn packaged_service_requires_one_named_pipe_and_no_bearer() {
+        assert!(validate_windows_service_operator_config(true, true, false, false, false).is_ok());
+        assert!(
+            validate_windows_service_operator_config(true, false, false, false, false).is_err()
+        );
+        assert!(validate_windows_service_operator_config(true, true, true, false, false).is_err());
+        assert!(validate_windows_service_operator_config(true, true, false, true, false).is_err());
+        assert!(validate_windows_service_operator_config(true, true, false, false, true).is_err());
+    }
+
+    #[test]
+    fn foreground_windows_server_retains_explicit_bearer_configuration() {
+        assert!(validate_windows_service_operator_config(false, false, true, true, true).is_ok());
     }
 }

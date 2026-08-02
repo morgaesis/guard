@@ -99,10 +99,11 @@ to the scenario volume.
 
 ## Deployment under test
 
-An unprivileged daemon runs as uid 1000 (also the operator); the agent is uid
-1001. The operator gate is bypass-resistant precisely because the daemon UID
-differs from the agent's: only uid 1000 can approve, deny, confirm, or revert.
-Approved commands execute as the daemon identity (the policy-gate deployment).
+An unprivileged daemon runs as uid 1000; the agent is uid 1001. Operator actions
+carry a separate admin bearer that brokered children cannot read, so neither the
+daemon uid nor the agent uid can approve, deny, confirm, or revert by identity
+alone. Approved commands execute as the daemon identity (the policy-gate
+deployment).
 The root-broker `--exec-as-caller` variant, where commands drop to the caller's
 uid, is the WSL/Linux production deployment. It relies on setuid privilege drop
 that a plain container does not grant, so it is not exercised here.

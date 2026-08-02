@@ -10,9 +10,11 @@
     tree is writable by the service.
 
     Administrative RPCs run in a transient scheduled task as the supported
-    local SYSTEM identity. Guard authorizes only the kernel-authenticated SYSTEM
-    SID as this additional Windows operator. Task operands are validated and
-    base64 encoded as data before PowerShell task syntax is constructed.
+    local SYSTEM identity. Guard accepts that kernel-authenticated SID as the
+    packaged Windows operator, rejects an admin bearer in service mode, and
+    does not grant operator authority to its daemon service SID. Task operands
+    are validated and base64 encoded as data before PowerShell task syntax is
+    constructed.
 
     The named pipe authenticates each local caller SID but does not restrict
     connections to one agent SID. Place mutually untrusted local accounts on

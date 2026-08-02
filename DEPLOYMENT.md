@@ -26,10 +26,10 @@ The principal split is mandatory:
 - The agent principal can connect to Guard and receives only non-authoritative
   request and session references. Approved command authority remains in daemon
   state and is bound automatically to the authenticated requester.
-- The operator principal holds the admin bearer token: the root-held token
-  file (see the admin token section) and, on Windows, the daemon service SID
-  and the kernel-authenticated local SYSTEM SID; the installer runs elevated
-  operator actions as SYSTEM. The daemon's own uid never grants operator
+- On Unix, the operator principal holds the admin bearer token from the
+  root-held token file. The packaged Windows service instead accepts only
+  kernel-authenticated local SYSTEM on its named pipe and rejects an admin
+  bearer. The daemon's own uid or Windows service SID never grants operator
   authority, so a brokered child cannot approve its own work.
 
 An agent that can read daemon credentials or reach the same upstream directly
@@ -188,6 +188,9 @@ uses a transient Task Scheduler task under SYSTEM, whose authenticated named-pip
 SID Guard recognizes as a Windows operator. The interactive agent connects
 under its own SID and cannot satisfy this check or read daemon state.
 `--exec-as-caller` is unavailable; approved children run as the service account.
+Service mode requires exactly one named-pipe listener and rejects
+`GUARD_ADMIN_TOKEN` and `--admin-token-stdin`, so a brokered service child
+cannot inherit or recover operator authority.
 
 The installer maps explicit PowerShell actions to the Guard CLI and runs them as
 SYSTEM. Access requests use exact `gr-` plus 32-hex references. Provisionals use
@@ -228,10 +231,13 @@ time without following reparse points; any nested junction or link aborts the
 operation before that object is given administrative ownership or access.
 
 The stock named-pipe DACL permits authenticated local users to connect. Guard
-keeps those users separate by their kernel-authenticated SIDs and reserves
-administrative RPCs for the service SID and SYSTEM, but the installer does not
-configure a single-client-SID pipe DACL. This is local principal isolation, not
-exclusive pipe reachability. Use the stock installer only on a host where
+keeps those users separate by their kernel-authenticated SIDs. The packaged
+service reserves administrative RPCs for local SYSTEM, and the daemon service
+SID is not an operator. Guard clients explicitly request identification-level
+pipe security, which exposes their identity to the server without letting the
+server impersonate them. The installer does not configure a single-client-SID
+pipe DACL. This is local principal isolation, not exclusive pipe reachability.
+Use the stock installer only on a host where
 authenticated local accounts are inside the submission boundary, or isolate the
 agent in its own Windows host or VM.
 
@@ -261,7 +267,7 @@ rollback.
 On Unix, the packaged paths use this upgrade sequence:
 
 ```bash
-release_version=0.7.0
+release_version=0.7.1
 backup_dir="/var/backups/guard-before-v${release_version}"
 standard_state="$(systemctl is-active guard.service || true)"
 caller_state="$(systemctl is-active guard-exec-as-caller.service || true)"
@@ -321,7 +327,7 @@ database and every WAL, SHM, or rollback-journal sidecar before installing the
 backup so SQLite cannot combine files from different snapshots:
 
 ```bash
-release_version=0.7.0
+release_version=0.7.1
 backup_dir="/var/backups/guard-before-v${release_version}"
 standard_state="$(systemctl is-active guard.service || true)"
 caller_state="$(systemctl is-active guard-exec-as-caller.service || true)"

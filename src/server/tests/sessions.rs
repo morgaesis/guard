@@ -2253,7 +2253,7 @@ async fn kubeconfig_issuance_is_local_live_session_scoped_and_secret_free() {
         }
         other => panic!("expected mismatch denial, got {other:?}"),
     }
-    // The operator (daemon principal) retains cross-session authority.
+    // An authenticated operator retains cross-session authority.
     assert!(matches!(
         handle_admin_request(&cfg, &CallerIdentity::UnixAdmin { uid: 777 }, request()).await,
         AdminResponse::KubeconfigIssued { .. }
@@ -2916,6 +2916,7 @@ fn unix_operator_denial_does_not_name_windows_authority() {
 fn authenticated_windows_system_is_an_operator_without_broadening_other_callers() {
     let (mut cfg, _) = make_test_config();
     cfg.config.daemon_principal = PrincipalKey::from_sid("S-1-5-80-12345");
+    cfg.config.allow_windows_system_operator = true;
 
     assert!(cfg
         .validate_admin(&CallerIdentity::Windows {
@@ -5138,7 +5139,7 @@ async fn principal_binding_execute_owner_ok_other_denied_admin_ok() {
         other.policy_reason()
     );
 
-    // The daemon/operator principal keeps cross-session authority.
+    // An authenticated operator keeps cross-session authority.
     let admin = execute_command(
         request_with_session("true", Vec::new(), token.clone()),
         &cfg,
@@ -5272,10 +5273,10 @@ async fn principal_binding_show_and_status_two_uid() {
         }
         other => panic!("expected mismatch denial, got {other:?}"),
     }
-    // Operator inspects any session.
+    // The daemon uid has no implicit operator authority.
     assert!(matches!(
         show_as(&cfg, 777, &token).await,
-        AdminResponse::SessionShow { .. }
+        AdminResponse::Error { .. }
     ));
 
     // Status mirrors show.
@@ -5289,15 +5290,16 @@ async fn principal_binding_show_and_status_two_uid() {
     ));
     assert!(matches!(
         status_as(&cfg, 777, &token).await,
-        AdminResponse::SessionStatus { .. }
+        AdminResponse::Error { .. }
     ));
 }
 
 #[tokio::test]
 async fn principal_binding_hold_confirm_is_operator_only() {
-    // Confirm/approve/deny are daemon-UID-only: a non-operator peer that holds a
-    // handle cannot confirm a provisional or approve a hold. This keeps a
-    // corrupted agent from confirming its own gated action.
+    // Confirm, approve, and deny require authenticated operator authority. A
+    // non-operator peer that holds a handle cannot confirm a provisional or
+    // approve a hold. This keeps a corrupted agent from confirming its own
+    // gated action.
     let (mut cfg, _) = make_test_config();
     cfg.config.daemon_uid = 777;
     cfg.config.daemon_principal = PrincipalKey::from_uid(777);

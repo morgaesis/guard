@@ -3,10 +3,10 @@ use crate::server::gate_runtime::reconstruct_caller;
 #[cfg(windows)]
 use crate::server::transport::winplat;
 use crate::server::wire::{
-    CallerIdentity, ExecOutcome, ExecuteResult, IncomingMessage, EXECUTE_FEATURE_LOCAL_CWD,
-    EXECUTE_PROTOCOL_VERSION,
+    authorize_session_use, CallerIdentity, ExecOutcome, ExecuteResult, IncomingMessage,
+    SessionAuthz, EXECUTE_FEATURE_LOCAL_CWD, EXECUTE_PROTOCOL_VERSION,
 };
-#[cfg(windows)]
+use crate::session::SessionOwner;
 use guard::principal::PrincipalKey;
 
 /// `IncomingMessage` is untagged, and a versioned execute envelope resolves to
@@ -204,6 +204,19 @@ fn windows_system_operator_check_never_elevates_unix_or_tcp_callers() {
     .is_windows_system_operator());
 }
 
+#[test]
+fn daemon_principal_is_not_implicit_cross_session_authority() {
+    let owner = SessionOwner::Principal(PrincipalKey::from_raw("principal:owner"));
+    assert!(matches!(
+        authorize_session_use(&owner, &CallerIdentity::Unix { uid: 777 }, false),
+        SessionAuthz::Mismatch
+    ));
+    assert!(matches!(
+        authorize_session_use(&owner, &CallerIdentity::UnixAdmin { uid: 777 }, false),
+        SessionAuthz::Allowed
+    ));
+}
+
 #[cfg(windows)]
 #[test]
 fn windows_system_sid_is_the_only_named_pipe_system_operator() {
@@ -215,6 +228,19 @@ fn windows_system_sid_is_the_only_named_pipe_system_operator() {
         sid: "S-1-5-19".into()
     }
     .is_windows_system_operator());
+
+    let owner = SessionOwner::Principal(PrincipalKey::from_raw("principal:owner"));
+    let system = CallerIdentity::Windows {
+        sid: "S-1-5-18".into(),
+    };
+    assert!(matches!(
+        authorize_session_use(&owner, &system, false),
+        SessionAuthz::Mismatch
+    ));
+    assert!(matches!(
+        authorize_session_use(&owner, &system, true),
+        SessionAuthz::Allowed
+    ));
 }
 
 #[test]

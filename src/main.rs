@@ -236,7 +236,7 @@ enum MainArgs {
     },
     /// Show daemon status. Always prints client + server version,
     /// uptime, evaluation mode, and dry-run state. The full config
-    /// snapshot is restricted to the daemon UID.
+    /// snapshot requires operator authority.
     Status {
         #[arg(long)]
         socket: Option<String>,
@@ -1135,7 +1135,8 @@ enum ServerCommands {
         /// The Windows installer sets this in the service binPath so startup
         /// answers the SCM start/stop handshake instead of running in the
         /// foreground. Hidden; it has no effect when not run as a Windows
-        /// service, and the daemon configuration is otherwise identical.
+        /// service. It also selects the packaged SYSTEM named-pipe operator
+        /// boundary and rejects an inheritable admin bearer.
         #[arg(long = "service", hide = true, action = ArgAction::SetTrue)]
         service: bool,
     },

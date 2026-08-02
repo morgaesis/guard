@@ -7,7 +7,7 @@
 # gates individual API operations -- so `helm upgrade`, which performs many
 # create/update/delete calls in-process, is gated per object.
 #
-# Only the operator (daemon principal) edits this file; it is hot-reloaded.
+# Only an operator-owned deployment path edits this file; it is hot-reloaded.
 # Agents cannot add or alter rules.
 #
 # Each rule matches by verb, resource, and namespace (all default to `*`). The

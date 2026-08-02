@@ -718,7 +718,7 @@ impl SessionRegistry {
 
     /// The owner principal bound to a live (non-expired) session, or `None` when
     /// the token is unknown/expired. Callers use this to enforce that only the
-    /// owning principal (or the daemon/operator principal) may exercise the
+    /// owning principal or an authenticated operator may exercise the
     /// session's authority.
     pub fn owner_for(&self, token: &str) -> Option<SessionOwner> {
         let grant = self.grants.get(token)?;

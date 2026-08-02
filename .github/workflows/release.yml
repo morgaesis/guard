@@ -375,6 +375,15 @@ jobs:
             if ($operatorDocument.type -ne 'access_error' -or $operatorDocument.error -notmatch 'unknown or unauthorized access reference') {
               throw 'Unknown access reference returned the wrong structured error.'
             }
+
+            $decisionOutput = @(& pwsh -NoLogo -NoProfile -NonInteractive -File $installer -Action access-approve -Reference 'gr-00000000000000000000000000000000' -Json 2>&1)
+            $decisionStatus = $LASTEXITCODE
+            if ($decisionStatus -ne 1) { throw "Unknown access approval returned native status $decisionStatus instead of 1." }
+            try { $decisionDocument = ($decisionOutput -join "`n") | ConvertFrom-Json -ErrorAction Stop }
+            catch { throw 'Unknown access approval did not return structured JSON.' }
+            if ($decisionDocument.type -ne 'access_decisions' -or $decisionDocument.response.result -ne 'access_decisions' -or $decisionDocument.response.items[0].message -ne 'unknown access request') {
+              throw 'Token-required access approval did not reach the operator handler.'
+            }
             if (@(Get-ScheduledTask -TaskName 'guard-op-*' -ErrorAction SilentlyContinue).Count -ne $taskCount) {
               throw 'Operator failure left a scheduled task behind.'
             }

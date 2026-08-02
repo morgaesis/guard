@@ -4,8 +4,8 @@
 #   guard server start --gate consequence --socket /run/guard/guard.sock \
 #       --verbs /etc/guard/verbs.yaml
 #
-# The catalog is the "slow clock": only the operator (daemon UID) edits this
-# file, and it is hot-reloaded on change. Agents cannot add or alter verbs.
+# The catalog is the "slow clock": only an operator-owned deployment path edits
+# this file, and it is hot-reloaded on change. Agents cannot add or alter verbs.
 #
 # Each verb names a fixed binary and an argv template. `{param}` placeholders are
 # substituted as exactly one argv element (no shell, no word-splitting), so

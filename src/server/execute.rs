@@ -196,7 +196,7 @@ async fn execute_command_inner<W: AsyncWrite + Unpin>(
                 Some(owner) => match authorize_session_use(
                     &owner,
                     caller,
-                    &server.config.daemon_principal,
+                    server.config.allow_windows_system_operator,
                 ) {
                     SessionAuthz::Allowed => None,
                     SessionAuthz::Mismatch => Some(format!(
@@ -1240,12 +1240,13 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
             return Err(ExecuteResult::denied(reason));
         }
         // Principal binding: a session's authority may be exercised only by the
-        // principal that owns it (or the daemon/operator), verified against the
-        // identity the daemon reads itself - never a client-supplied value. This
-        // closes the bearer-replay hole where any local peer in the socket group
-        // who learned a handle inherited another user's authority. Enforced here,
-        // before the command runs, so it also gates provisional arming and every
-        // downstream consequence-gated action taken under this session.
+        // principal that owns it or an authenticated operator, verified
+        // against the identity the daemon reads itself, never a client-supplied
+        // value. This closes the
+        // bearer-replay hole where any local peer in the socket group who
+        // learned a handle inherited another user's authority. Enforced here,
+        // before the command runs, so it also gates provisional arming and
+        // every downstream consequence-gated action taken under this session.
         if let Some(owner) = owner {
             let reason = match &owner {
                 // A session that predates principal binding has no verifiable
@@ -1257,7 +1258,7 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
                 SessionOwner::Principal(_) => match authorize_session_use(
                     &owner,
                     phase.caller,
-                    &server.config.daemon_principal,
+                    server.config.allow_windows_system_operator,
                 ) {
                     SessionAuthz::Allowed => None,
                     SessionAuthz::Mismatch => Some(format!(

@@ -153,6 +153,14 @@ mode on one host without making broad apply authority global.
 
 ## Generation and promotion
 
+`guard verb create --preview` safety-checks and validates a synthesized
+candidate, then keeps it only in a bounded in-memory review cache. The preview
+does not enter the active catalog. Direct creation and
+`guard verb create --from-preview` enumerate every finite parameter binding and
+run each rendered command through the production evaluator admission path with
+execution disabled. A denial, non-finite pattern, or candidate set above the
+admission bound prevents catalog persistence.
+
 `guard access request` synthesizes typed coverage when no existing verb matches
 the normalized intent. Proposed verbs cannot be baseline or trusted, use a
 shell or interpreter binary, or accept patterns with whitespace and shell
