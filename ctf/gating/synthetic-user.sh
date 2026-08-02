@@ -486,8 +486,16 @@ phase_su13() {
       capture_phase synthesized-execution-approve \
         guard access approve "$handle" --once --json
       grep -q '"success": true' /scenario/journey/synthesized-execution-approve.out
-      grep -q 'approved and executed' /scenario/journey/synthesized-execution-approve.out
-      grep -q 'exit Some(0)' /scenario/journey/synthesized-execution-approve.out
+      grep -q '"state": "armed"' /scenario/journey/synthesized-execution-approve.out
+      ! grep -q 'novel-diagnostic:healthy' /scenario/journey/synthesized-execution-approve.out
+      ;;
+    resume-execution)
+      [ "$(id -u)" -eq 1001 ]
+      handle="$(read_handle synthesized-execution)"
+      capture_phase synthesized-execution-resume guard resume "$handle" --json
+      grep -q '"type": "resume_result"' /scenario/journey/synthesized-execution-resume.out
+      grep -q '"exit_code": 0' /scenario/journey/synthesized-execution-resume.out
+      grep -q 'novel-diagnostic:healthy' /scenario/journey/synthesized-execution-resume.out
       ;;
     isolate)
       [ "$(id -u)" -eq 1002 ]
@@ -530,14 +538,14 @@ phase_su13() {
       run_test_filter synthesized_verbs_default_to_session_scope
       run_test_filter legacy_session_revision_fixture_is_stable
       record_result passed 'intended policy' \
-        'live prose synthesis stayed inert until access and immutable execution approval, remained principal-scoped across restart, left the operator catalog unchanged, and failed closed after revoke'
+        'live prose synthesis stayed inert until access, operator arming, and requester resume; it remained principal-scoped across restart, left the operator catalog unchanged, and failed closed after revoke'
       ;;
     *) return 2 ;;
   esac
 }
 
 phase_su14() {
-  local phase="$1" handle retry other session bearer
+  local phase="$1" handle retry other session bearer replay_handle
   case "$phase" in
     request)
       [ "$(id -u)" -eq 1001 ]
@@ -581,7 +589,10 @@ PY
       bearer="$(sed -n '1p' /scenario/journey/exposed-owner.bearer)"
       export GUARD_SESSION="$bearer"
       expect_failure replay-bearer guard run --json helm list --namespace access-fixture
-      grep -q 'session principal mismatch' /scenario/journey/replay-bearer.out
+      grep -q '"allowed": false' /scenario/journey/replay-bearer.out
+      replay_handle="$(response_handle /scenario/journey/replay-bearer.out)"
+      [ -n "$replay_handle" ]
+      [ "$replay_handle" != "$handle" ]
       ! grep -q 'fixture-release' /scenario/journey/replay-bearer.out
       unset GUARD_SESSION
       save_request other 'Inspect the fake SSH service'
@@ -614,7 +625,7 @@ PY
 
 phase_su15() {
   local phase="$1" maintenance delete denied_handle retry_handle hold denied_hold
-  local approved_snapshot_count approved_execution_count denied_execution_count
+  local approved_snapshot_count approved_claim_count approved_completion_count denied_execution_count
   case "$phase" in
     deny)
       [ "$(id -u)" -eq 1001 ]
@@ -660,26 +671,46 @@ phase_su15() {
       require_hold_guidance /scenario/journey/denied-held.out "$denied_hold"
       [ -d /scenario/fixtures/staging ]
       ;;
-    verify)
+    approve-held)
       [ "$(id -u)" -eq 1000 ]
       hold="$(read_handle hold)"
       capture_phase approve-held guard access approve "$hold" --once --json
       grep -q '"success": true' /scenario/journey/approve-held.out
-      grep -q '"state": "approved"' /scenario/journey/approve-held.out
+      grep -q '"state": "armed"' /scenario/journey/approve-held.out
+      [ -d /scenario/fixtures/staging ]
+      ;;
+    resume-held)
+      [ "$(id -u)" -eq 1001 ]
+      hold="$(read_handle hold)"
+      capture_phase resume-held guard resume "$hold" --json
+      grep -q '"type": "resume_result"' /scenario/journey/resume-held.out
+      grep -q '"exit_code": 0' /scenario/journey/resume-held.out
       [ ! -d /scenario/fixtures/staging ]
+      ;;
+    verify)
+      [ "$(id -u)" -eq 1000 ]
+      hold="$(read_handle hold)"
       approved_snapshot_count="$(awk -v handle="$hold" \
         'index($0, "\"kind\":\"APPROVED\"") && index($0, "\"handle\":\"" handle "\"") && index($0, "\"cmd\":\"rm -rf /scenario/fixtures/staging\"") { count++ } END { print count + 0 }' \
         /scenario/data/audit.jsonl)"
       [ "$approved_snapshot_count" -eq 1 ]
-      approved_execution_count="$(awk -v handle="$hold" \
-        'index($0, "\"kind\":\"APPROVED_EXECUTED\"") && index($0, "\"handle\":\"" handle "\"") { count++ } END { print count + 0 }' \
+      approved_claim_count="$(awk -v handle="$hold" \
+        'index($0, "\"kind\":\"APPROVED_EXECUTED\"") && index($0, "\"handle\":\"" handle "\"") && index($0, "[\"phase\",\"requester_claimed\"]") { count++ } END { print count + 0 }' \
         /scenario/data/audit.jsonl)"
-      [ "$approved_execution_count" -eq 1 ]
+      [ "$approved_claim_count" -eq 1 ]
+      approved_completion_count="$(awk -v handle="$hold" \
+        'index($0, "\"kind\":\"APPROVED_EXECUTED\"") && index($0, "\"handle\":\"" handle "\"") && index($0, "[\"phase\",\"completed\"]") { count++ } END { print count + 0 }' \
+        /scenario/data/audit.jsonl)"
+      [ "$approved_completion_count" -eq 1 ]
       expect_failure replay-held guard access approve "$hold" --once --json
-      approved_execution_count="$(awk -v handle="$hold" \
-        'index($0, "\"kind\":\"APPROVED_EXECUTED\"") && index($0, "\"handle\":\"" handle "\"") { count++ } END { print count + 0 }' \
+      approved_claim_count="$(awk -v handle="$hold" \
+        'index($0, "\"kind\":\"APPROVED_EXECUTED\"") && index($0, "\"handle\":\"" handle "\"") && index($0, "[\"phase\",\"requester_claimed\"]") { count++ } END { print count + 0 }' \
         /scenario/data/audit.jsonl)"
-      [ "$approved_execution_count" -eq 1 ]
+      [ "$approved_claim_count" -eq 1 ]
+      approved_completion_count="$(awk -v handle="$hold" \
+        'index($0, "\"kind\":\"APPROVED_EXECUTED\"") && index($0, "\"handle\":\"" handle "\"") && index($0, "[\"phase\",\"completed\"]") { count++ } END { print count + 0 }' \
+        /scenario/data/audit.jsonl)"
+      [ "$approved_completion_count" -eq 1 ]
       denied_hold="$(read_handle denied-hold)"
       capture_phase deny-held guard access deny "$denied_hold" --reason 'fixture remains protected' --json
       grep -q '"state": "denied"' /scenario/journey/deny-held.out
@@ -691,7 +722,7 @@ phase_su15() {
       run_test_filter structured_guidance_preserves_access_commands_and_coverage_detail
       run_test_filter held_tool_text_returns_exact_access_commands
       record_result passed 'intended policy' \
-        'one immutable held snapshot was approved with --once and executed exactly once; a separate hold was denied without execution; denied, provisional, and structured results retained durable identifiers and exact operator commands'
+        'one immutable held snapshot was armed with --once and resumed exactly once by its requester; a separate hold was denied without execution; denied, provisional, and structured results retained durable identifiers and exact operator commands'
       ;;
     *) return 2 ;;
   esac

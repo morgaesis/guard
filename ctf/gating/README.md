@@ -86,9 +86,9 @@ to the scenario volume.
 | SU-10 | Execute protocol version, features, and working-directory rules reject stale or incomplete clients with direct upgrade guidance. |
 | SU-11 | Secret-use audit begins only after successful spawn and records names and provenance without values. |
 | SU-12 | SSH, CloudStack, Kubernetes, Helm, Ansible, host-maintenance, and credential-backed API journeys complete through operator-defined typed enforcement against isolated fixtures. |
-| SU-13 | A loopback-fixture evaluator synthesizes prose coverage that stays inert until access and immutable execution approval, remains principal-scoped across restart, leaves the operator catalog unchanged, and fails closed after revoke. |
+| SU-13 | A loopback-fixture evaluator synthesizes prose coverage that stays inert until access, operator arming, and requester resume, remains principal-scoped across restart, leaves the operator catalog unchanged, and fails closed after revoke. |
 | SU-14 | A sessionless prose request is principal-bound, coalesced, approved without an owner flag, and isolated from another principal that replays both its request reference and a fake leaked bearer. |
-| SU-15 | Denied work offers ordinary, one-time, and bounded approval; one immutable held snapshot is approved with `--once` and executes exactly once, while a separate hold is denied. |
+| SU-15 | Denied work offers ordinary, one-time, and bounded approval; one immutable held snapshot is armed with `--once` and resumed exactly once by its requester, while a separate hold is denied. |
 | SU-16 | Ordinary, one-time, and N-use access approvals remain request-scoped across cross-system attempts, batch partial failure, last-use races, spawn failure, restart, two principals, SSH, CloudStack, Kubernetes, Helm, Ansible, credential-backed API, file, and command workflows. |
 | SU-17 | Proactive extension targets a stable session reference, stores only missing coverage, and converges across retries. |
 | SU-18 | Bare help and inspection are non-mutating; bounded expiry and explicit revoke remain fail-closed across restart. |
