@@ -800,6 +800,12 @@ failures=0
 for scenario in "$@"; do
   if ! run_one "$scenario"; then
     failures=$((failures + 1))
+    # The per-scenario evidence file is not uploaded by CI, so name the failing
+    # scenario and its redacted phase on stderr to make the run log actionable
+    # instead of a bare non-zero exit.
+    printf 'synthetic-user scenario failed: %s (phase=%s category=%s exec_status=%s)\n' \
+      "$scenario" "${HOST_FAILURE_PHASE:-unknown}" \
+      "${HOST_FAILURE_CATEGORY:-unknown}" "${HOST_FAILURE_EXEC_STATUS:-unknown}" >&2
   fi
 done
 
