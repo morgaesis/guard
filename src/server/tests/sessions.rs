@@ -221,6 +221,100 @@ async fn approved_synthesized_access_executes_deterministically_without_catalog_
     assert!(denied.handle.is_some());
 }
 
+fn synthesis_arguments_with_description(description: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": "check-compiler",
+        "description": description,
+        "binary": "rustc",
+        "args": ["--version"],
+        "params": {},
+        "consequence": "reversible",
+        "trusted": false,
+        "evidence": "The exact compiler version command is read only."
+    })
+}
+
+fn described_compiler_check_arguments(_request: &str) -> serde_json::Value {
+    synthesis_arguments_with_description(
+        "Runs rustc --version, which prints the installed compiler version and writes nothing.",
+    )
+}
+
+fn undescribed_compiler_check_arguments(_request: &str) -> serde_json::Value {
+    synthesis_arguments_with_description("")
+}
+
+async fn synthesized_access_capability_description(
+    respond: fn(&str) -> serde_json::Value,
+) -> (String, crate::server::wire::AccessItem) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(super::run_verb_synthesis_llm_with(listener, respond));
+
+    let (mut cfg, _) = make_test_config();
+    cfg.state.evaluator = Arc::new(
+        Evaluator::new(
+            EvalConfig::default()
+                .llm_api_key("test-key".to_string())
+                .llm_api_url(url)
+                .llm_retries(0),
+        )
+        .unwrap(),
+    );
+    let AdminResponse::AccessItem { item } = handle_admin_request(
+        &cfg,
+        &CallerIdentity::Unix { uid: 1001 },
+        AdminRequest::AccessRequest {
+            intent: "Inspect compiler version with a synthesized diagnostic".to_string(),
+        },
+    )
+    .await
+    else {
+        panic!("expected a synthesized access request")
+    };
+    let description = item
+        .capabilities
+        .first()
+        .expect("the request proposes one capability")
+        .description
+        .clone();
+    (description, item)
+}
+
+/// The synthesis call that produces the matcher also describes what it admits,
+/// so an operator reads that sentence rather than reconstructing it from the
+/// matcher.
+#[tokio::test]
+async fn synthesized_access_carries_the_described_grant() {
+    let (description, item) =
+        synthesized_access_capability_description(described_compiler_check_arguments).await;
+    assert_eq!(
+        description,
+        "Runs rustc --version, which prints the installed compiler version and writes nothing."
+    );
+    assert_ne!(
+        Some(description.as_str()),
+        item.intent.as_deref(),
+        "the grant description must describe the matcher, not restate the intent"
+    );
+}
+
+/// A model that returns no usable description must not leave the operator with
+/// a blank card, and must never block the request: the daemon derives the
+/// description from the matcher instead.
+#[tokio::test]
+async fn undescribed_synthesis_falls_back_to_a_matcher_derived_description() {
+    let (description, item) =
+        synthesized_access_capability_description(undescribed_compiler_check_arguments).await;
+    assert_eq!(
+        description,
+        "Runs rustc with pinned arguments --version and no caller-supplied values."
+    );
+    assert_eq!(item.use_policy, "unselected");
+    assert_eq!(item.default_use_policy.as_deref(), Some("unlimited"));
+    assert_eq!(item.default_uses, None);
+}
+
 #[tokio::test]
 async fn equivalent_synthesized_access_converges_across_principals() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

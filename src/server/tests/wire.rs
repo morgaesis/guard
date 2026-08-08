@@ -83,6 +83,8 @@ fn access_wire_shapes_are_stable_and_requester_is_not_caller_selected() {
         expires_unix: Some(123),
         remaining_uses: Some(1),
         use_policy: "unselected".to_string(),
+        default_use_policy: Some("unlimited".to_string()),
+        default_uses: None,
         state: "pending".to_string(),
         next_action: "guard access approve gr-example".to_string(),
         approval_options: Vec::new(),

@@ -43,6 +43,10 @@ Rules:
 - trusted: true only for clearly safe read-only operations; otherwise false so
   the LLM still evaluates the rendered command.
 - Do not invent flags that print or redirect credentials or configuration.
+- description: one or two plain sentences telling an operator what approving
+  this verb admits: the binary and operation, which arguments are pinned, and
+  how broad each parameter is. Describe the command template itself, never the
+  requester's motive, and do not restate the verb name.
 - evidence: one or two sentences justifying the binary, params, patterns, and
   class as least-privilege."#;
 
@@ -345,7 +349,7 @@ fn build_create_verb_body(
                     "type": "object",
                     "properties": {
                         "name": {"type": "string", "description": "short kebab-case verb name"},
-                        "description": {"type": "string"},
+                        "description": {"type": "string", "description": "one or two plain sentences an operator reads before approving: which binary and operation this admits, what the template pins, and how broad each parameter is"},
                         "binary": {"type": "string", "description": "the exact executable name, no path"},
                         "args": {
                             "type": "array",
@@ -379,7 +383,7 @@ fn build_create_verb_body(
                         "trusted": {"type": "boolean", "description": "true only for clearly safe read-only operations"},
                         "evidence": {"type": "string", "description": "one or two sentences justifying this least-privilege shape"}
                     },
-                    "required": ["name", "binary", "consequence", "evidence"]
+                    "required": ["name", "description", "binary", "consequence", "evidence"]
                 }
             }
         }],
