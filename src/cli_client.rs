@@ -1463,6 +1463,7 @@ fn parse_verb_create_choice(input: &str) -> Option<bool> {
 }
 
 pub(crate) async fn handle_access(command: AccessCommands) -> Result<()> {
+    let mut raw_matcher = false;
     let (socket, request, json) = match command {
         AccessCommands::Request {
             intent,
@@ -1527,9 +1528,13 @@ pub(crate) async fn handle_access(command: AccessCommands) -> Result<()> {
         AccessCommands::List { socket, json } => (socket, server::AdminRequest::AccessList, json),
         AccessCommands::Show {
             reference,
+            raw,
             socket,
             json,
-        } => (socket, server::AdminRequest::AccessShow { reference }, json),
+        } => {
+            raw_matcher = raw;
+            (socket, server::AdminRequest::AccessShow { reference }, json)
+        }
         AccessCommands::Status {
             reference,
             socket,
@@ -1597,7 +1602,7 @@ pub(crate) async fn handle_access(command: AccessCommands) -> Result<()> {
             }
         }
         server::AdminResponse::AccessItem { item } => {
-            println!("{}", access_item_human(&item));
+            println!("{}", access_item_human(&item, raw_matcher));
         }
         server::AdminResponse::AccessDecisions { items } => {
             print_access_decision_lines(&items);
@@ -1733,7 +1738,7 @@ fn exit_access_json_error(message: impl Into<String>) -> ! {
     std::process::exit(EXIT_GUARD_ERROR);
 }
 
-fn access_item_human(item: &server::AccessItem) -> String {
+fn access_item_human(item: &server::AccessItem, raw: bool) -> String {
     let scope = if item.effective_scope.is_empty() {
         "none".to_string()
     } else {
@@ -1743,7 +1748,6 @@ fn access_item_human(item: &server::AccessItem) -> String {
         .expires_unix
         .map(|value| value.to_string())
         .unwrap_or_else(|| "none".to_string());
-    let uses = use_budget_display(&item.use_policy, item.remaining_uses);
     let mut lines = vec![
         format!(
             "access {} {}",
@@ -1755,7 +1759,7 @@ fn access_item_human(item: &server::AccessItem) -> String {
         format!("target: {}", card_text(&item.target)),
         format!("scope: {}", card_text(&scope)),
         format!("expiry: {expiry}"),
-        format!("uses: {uses}"),
+        format!("uses: {}", pending_use_display(item)),
     ];
     if let Some(intent) = &item.intent {
         lines.push(format!("intent: {}", card_text(intent)));
@@ -1767,9 +1771,8 @@ fn access_item_human(item: &server::AccessItem) -> String {
         lines.push("capabilities:".to_string());
         for capability in &item.capabilities {
             lines.push(format!(
-                "  {}: {} consequence={} baseline={} trusted={} revert={}",
+                "  {}: consequence={} baseline={} trusted={} revert={}",
                 card_text(&capability.verb),
-                card_text(&capability.description),
                 card_text(&capability.consequence),
                 capability.baseline,
                 capability.trusted,
@@ -1779,21 +1782,7 @@ fn access_item_human(item: &server::AccessItem) -> String {
                     "none"
                 },
             ));
-            if !capability.baseline {
-                let matcher = serde_json::to_string(&capability.matcher)
-                    .expect("serde_json::Value serialization cannot fail");
-                lines.push(format!("    matcher: {}", card_text(&matcher)));
-                lines.push(format!(
-                    "    matcher_digest: {}",
-                    card_text(&capability.matcher_digest)
-                ));
-            }
-            if let Some(plan) = &capability.credential_plan {
-                lines.push(format!("    credential_plan: {}", card_text(plan)));
-            }
-            if let Some(evidence) = &capability.evidence {
-                lines.push(format!("    evidence: {}", card_text(evidence)));
-            }
+            lines.extend(capability_detail_lines(capability, "    ", raw));
         }
     }
     lines.push(format!("next: {}", card_text(&item.next_action)));
@@ -1811,6 +1800,232 @@ fn use_budget_display(use_policy: &str, remaining_uses: Option<u64>) -> String {
     } else {
         use_policy.to_string()
     }
+}
+
+/// Use budget for a detail view. `unselected` names the state of the record but
+/// answers none of the question an operator is actually asking, so a pending
+/// item shows the budget a bare `guard access approve` would apply and how to
+/// choose another one.
+fn pending_use_display(item: &server::AccessItem) -> String {
+    if item.use_policy != "unselected" {
+        return use_budget_display(&item.use_policy, item.remaining_uses);
+    }
+    match (item.default_use_policy.as_deref(), item.default_uses) {
+        (Some("bounded"), Some(1)) => {
+            "1 (default; the only budget this request accepts)".to_string()
+        }
+        (Some("bounded"), Some(uses)) => {
+            format!("{uses} (default; --once or --uses N to change)")
+        }
+        (Some("unlimited"), _) => {
+            "unlimited (default; --once or --uses N to bound the approval)".to_string()
+        }
+        _ => "not selected until approval".to_string(),
+    }
+}
+
+/// Detail lines shared by `guard access show` and the interactive approval
+/// card: what the grant admits in prose, the command line the matcher pins, and
+/// the shape of every value the caller still supplies.
+fn capability_detail_lines(
+    capability: &server::AccessCapability,
+    indent: &str,
+    raw: bool,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !capability.description.is_empty() {
+        lines.push(format!(
+            "{indent}description: {}",
+            card_text(&capability.description)
+        ));
+    }
+    // A matcher the CLI cannot read back as a command template is shown
+    // verbatim: an operator must never be left with less than the daemon sent.
+    let readable = (!capability.baseline)
+        .then(|| matcher_detail_lines(&capability.matcher, indent))
+        .flatten();
+    let unreadable = !capability.baseline && readable.is_none();
+    lines.extend(readable.unwrap_or_default());
+    if let Some(plan) = &capability.credential_plan {
+        lines.push(format!("{indent}credential_plan: {}", card_text(plan)));
+    }
+    if let Some(evidence) = &capability.evidence {
+        lines.push(format!("{indent}evidence: {}", card_text(evidence)));
+    }
+    if !capability.baseline {
+        // Held approvals bind to this digest, so it stays visible even when the
+        // matcher itself is rendered in prose.
+        lines.push(format!(
+            "{indent}matcher_digest: {}",
+            card_text(&capability.matcher_digest)
+        ));
+        if raw || unreadable {
+            let matcher = serde_json::to_string(&capability.matcher)
+                .expect("serde_json::Value serialization cannot fail");
+            lines.push(format!("{indent}matcher: {}", card_text(&matcher)));
+        }
+    }
+    lines
+}
+
+/// Render one reviewed matcher as the command line it admits. Placeholders
+/// appear as `<param>` and each parameter gets its own line with the anchored
+/// pattern and, where it is cheap to derive, a plain reading of what that
+/// pattern accepts. `None` means the document is not a command template and
+/// only its raw form can be shown.
+fn matcher_detail_lines(matcher: &serde_json::Value, indent: &str) -> Option<Vec<String>> {
+    let mut lines = Vec::new();
+    let binary = matcher.get("binary").and_then(|value| value.as_str())?;
+    let args = matcher
+        .get("args")
+        .and_then(|value| value.as_array())
+        .map(|args| {
+            args.iter()
+                .filter_map(|arg| arg.as_str())
+                .map(placeholder_display)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut command = binary.to_string();
+    for arg in &args {
+        command.push(' ');
+        command.push_str(arg);
+    }
+    lines.push(format!("{indent}command: {}", card_text(&command)));
+    let params = matcher
+        .get("params")
+        .cloned()
+        .map(
+            serde_json::from_value::<
+                std::collections::BTreeMap<String, guard::gating::verb::ParamSpec>,
+            >,
+        )
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    for (name, spec) in &params {
+        lines.push(format!(
+            "{indent}param {}",
+            card_text(&param_display(name, spec))
+        ));
+    }
+    let coverage = matcher
+        .get("coverage")
+        .and_then(|value| value.as_array())
+        .map(|cells| {
+            cells
+                .iter()
+                .filter_map(coverage_cell_display)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if !coverage.is_empty() {
+        lines.push(format!(
+            "{indent}coverage: {}",
+            card_text(&coverage.join(", "))
+        ));
+    }
+    Some(lines)
+}
+
+/// Show `{name}` placeholders as `<name>` so the rendered line reads as the
+/// command it admits rather than as a template.
+fn placeholder_display(arg: &str) -> String {
+    let mut out = String::with_capacity(arg.len());
+    let mut rest = arg;
+    while let Some(open) = rest.find('{') {
+        let Some(close) = rest[open + 1..].find('}') else {
+            break;
+        };
+        let name = &rest[open + 1..open + 1 + close];
+        if name.is_empty() {
+            out.push_str(&rest[..open + 1 + close + 1]);
+        } else {
+            out.push_str(&rest[..open]);
+            out.push('<');
+            out.push_str(name);
+            out.push('>');
+        }
+        rest = &rest[open + 1 + close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn param_display(name: &str, spec: &guard::gating::verb::ParamSpec) -> String {
+    let pattern = spec.pattern_text();
+    let mut line = format!("{name}: {pattern}");
+    if let Some(reading) = describe_pattern(pattern) {
+        line.push_str(&format!(" -> {reading}"));
+    }
+    let mut notes = Vec::new();
+    if !spec.required {
+        notes.push(match &spec.default {
+            Some(value) => format!("optional, defaults to {value}"),
+            None => "optional".to_string(),
+        });
+    }
+    if spec.allow_dash {
+        notes.push("may begin with a dash".to_string());
+    }
+    if let Some(max) = spec.max_length() {
+        notes.push(format!("one argv element, up to {max} characters"));
+    }
+    if !notes.is_empty() {
+        line.push_str(&format!(" [{}]", notes.join("; ")));
+    }
+    line
+}
+
+/// Plain reading of an anchored pattern, for the shapes an operator meets most
+/// often: a pinned literal and a closed enumeration. Anything richer is left to
+/// the pattern itself rather than described approximately, because a wrong
+/// summary of what a grant admits is worse than none.
+fn describe_pattern(pattern: &str) -> Option<String> {
+    let inner = pattern.strip_prefix('^')?.strip_suffix('$')?;
+    if inner.is_empty() {
+        return Some("the empty value only".to_string());
+    }
+    if is_pattern_literal(inner) {
+        return Some(format!("fixed value {inner:?}"));
+    }
+    let group = inner
+        .strip_prefix("(?:")
+        .or_else(|| inner.strip_prefix('('))?
+        .strip_suffix(')')?;
+    let alternatives = group.split('|').collect::<Vec<_>>();
+    if !alternatives.iter().all(|part| is_pattern_literal(part)) {
+        return None;
+    }
+    match alternatives.as_slice() {
+        [only] => Some(format!("fixed value {only:?}")),
+        _ => Some(format!(
+            "one of {}",
+            alternatives
+                .iter()
+                .map(|part| format!("{part:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+/// True when every character is its own literal in a regex, so the text between
+/// the anchors is exactly the value admitted.
+fn is_pattern_literal(text: &str) -> bool {
+    !text.is_empty()
+        && text.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '-' | '_' | '/' | ':' | '@' | ',' | '=' | ' ')
+        })
+}
+
+fn coverage_cell_display(cell: &serde_json::Value) -> Option<String> {
+    let name = cell.get("name").and_then(|value| value.as_str())?;
+    let action = cell
+        .get("action")
+        .and_then(|value| value.as_str())
+        .unwrap_or("evaluate");
+    Some(format!("{name} ({action})"))
 }
 
 fn print_access_decision_lines(items: &[server::AccessDecisionResult]) {
@@ -1903,7 +2118,7 @@ fn access_item_card(item: &server::AccessItem, colors: bool) -> Vec<String> {
         .expires_unix
         .map(format_timestamp)
         .unwrap_or_else(|| "none".to_string());
-    let uses = use_budget_display(&item.use_policy, item.remaining_uses);
+    let uses = pending_use_display(item);
     let mut lines = vec![
         format!(
             "{} {}",
@@ -1941,14 +2156,13 @@ fn access_item_card(item: &server::AccessItem, colors: bool) -> Vec<String> {
         lines.push("  grants:".to_string());
         for capability in &item.capabilities {
             lines.push(format!(
-                "    {} {}: {} trusted={} revert={}",
+                "    {} {} trusted={} revert={}",
                 paint(
                     card_text(&capability.consequence),
                     consequence_color(&capability.consequence),
                     colors,
                 ),
                 paint(card_text(&capability.verb), AnsiColor::Bold, colors),
-                card_text(&capability.description),
                 capability.trusted,
                 if capability.has_revert {
                     "available"
@@ -1956,21 +2170,7 @@ fn access_item_card(item: &server::AccessItem, colors: bool) -> Vec<String> {
                     "none"
                 },
             ));
-            if !capability.baseline {
-                let matcher = serde_json::to_string(&capability.matcher)
-                    .expect("serde_json::Value serialization cannot fail");
-                lines.push(format!("      matcher: {}", card_text(&matcher)));
-                lines.push(format!(
-                    "      matcher_digest: {}",
-                    card_text(&capability.matcher_digest)
-                ));
-            }
-            if let Some(plan) = &capability.credential_plan {
-                lines.push(format!("      credential_plan: {}", card_text(plan)));
-            }
-            if let Some(evidence) = &capability.evidence {
-                lines.push(format!("      evidence: {}", card_text(evidence)));
-            }
+            lines.extend(capability_detail_lines(capability, "      ", false));
         }
     }
     lines.push(format!("  next:      {}", card_text(&item.next_action)));
@@ -2061,7 +2261,14 @@ async fn handle_access_approve_interactive(
             .approval_options
             .iter()
             .all(|option| option.ends_with("--once"));
-        let effective_uses = if hold_only_once { Some(1) } else { uses };
+        // Without an explicit budget the daemon applies whatever the request
+        // itself asked for, so the prompt announces that rather than assuming
+        // an unbounded approval.
+        let effective_uses = if hold_only_once {
+            Some(1)
+        } else {
+            uses.or(item.default_uses)
+        };
         eprintln!(
             "an approve grants: {}",
             match effective_uses {
@@ -3171,37 +3378,61 @@ mod tests {
         }
     }
 
-    #[test]
-    fn access_item_card_shows_decision_facts_and_reviewed_matcher() {
-        let item = server::AccessItem {
+    fn helm_upgrade_capability() -> server::AccessCapability {
+        server::AccessCapability {
+            verb: "helm-upgrade".to_string(),
+            description: "Upgrades one Helm release in the monitoring namespace.".to_string(),
+            matcher: serde_json::json!({
+                "binary": "helm",
+                "args": [
+                    "upgrade",
+                    "{release}",
+                    "monitoring/{chart}",
+                    "--namespace",
+                    "monitoring"
+                ],
+                "params": {
+                    "release": {"pattern": "^(netdata|loki)$"},
+                    "chart": {"pattern": "^netdata$"}
+                },
+                "coverage": [{"name": "upgrade", "action": "evaluate"}]
+            }),
+            matcher_digest: "digest".to_string(),
+            consequence: "recoverable".to_string(),
+            credential_plan: None,
+            baseline: false,
+            trusted: false,
+            has_revert: true,
+            evidence: Some("rollback validated".to_string()),
+        }
+    }
+
+    fn pending_access_item(capabilities: Vec<server::AccessCapability>) -> server::AccessItem {
+        server::AccessItem {
             reference: "gr-11111111111111111111111111111111".to_string(),
             kind: "request".to_string(),
             requester: "uid:1004".to_string(),
             target: "agent:1004".to_string(),
             effective_scope: vec!["helm-upgrade".to_string()],
             expires_unix: Some(1_753_000_000),
-            remaining_uses: Some(3),
-            use_policy: "bounded".to_string(),
+            remaining_uses: None,
+            use_policy: "unselected".to_string(),
+            default_use_policy: Some("unlimited".to_string()),
+            default_uses: None,
             state: "pending".to_string(),
             next_action: "approve or deny".to_string(),
             approval_options: vec![
                 "guard access approve gr-11111111111111111111111111111111".to_string()
             ],
             intent: Some("upgrade the netdata release".to_string()),
-            capabilities: vec![server::AccessCapability {
-                verb: "helm-upgrade".to_string(),
-                description: "Upgrade one release".to_string(),
-                matcher: serde_json::json!({"binary": "helm"}),
-                matcher_digest: "digest".to_string(),
-                consequence: "recoverable".to_string(),
-                credential_plan: None,
-                baseline: false,
-                trusted: false,
-                has_revert: true,
-                evidence: Some("rollback validated".to_string()),
-            }],
+            capabilities,
             decided_reason: None,
-        };
+        }
+    }
+
+    #[test]
+    fn access_item_card_renders_the_matcher_as_the_command_line_it_admits() {
+        let item = pending_access_item(vec![helm_upgrade_capability()]);
         let card = access_item_card(&item, false).join("\n");
         assert!(!card.contains('\u{1b}'), "colors off must emit no ANSI");
         for fact in [
@@ -3209,9 +3440,13 @@ mod tests {
             "state:     pending",
             "requester: uid:1004",
             "intent:    upgrade the netdata release",
-            "uses:      3",
-            "recoverable helm-upgrade: Upgrade one release trusted=false revert=available",
-            "matcher: {\"binary\":\"helm\"}",
+            "uses:      unlimited (default; --once or --uses N to bound the approval)",
+            "recoverable helm-upgrade trusted=false revert=available",
+            "description: Upgrades one Helm release in the monitoring namespace.",
+            "command: helm upgrade <release> monitoring/<chart> --namespace monitoring",
+            "param chart: ^netdata$ -> fixed value \"netdata\"",
+            "param release: ^(netdata|loki)$ -> one of \"netdata\", \"loki\"",
+            "coverage: upgrade (evaluate)",
             "matcher_digest: digest",
             "evidence: rollback validated",
             "next:      approve or deny",
@@ -3219,8 +3454,166 @@ mod tests {
         ] {
             assert!(card.contains(fact), "card is missing {fact:?}:\n{card}");
         }
+        assert!(
+            !card.contains("matcher: {"),
+            "the approval card must not fall back to raw matcher JSON:\n{card}"
+        );
         let colored = access_item_card(&item, true).join("\n");
         assert!(colored.contains('\u{1b}'), "colors on must emit ANSI");
+    }
+
+    #[test]
+    fn access_show_keeps_raw_matcher_json_behind_the_flag() {
+        let item = pending_access_item(vec![helm_upgrade_capability()]);
+        let readable = access_item_human(&item, false);
+        assert!(
+            !readable.contains("matcher: {"),
+            "the default rendering must not print the matcher blob:\n{readable}"
+        );
+        assert!(
+            readable.contains("command: helm upgrade <release> monitoring/<chart>"),
+            "the default rendering must show the admitted command:\n{readable}"
+        );
+        let raw = access_item_human(&item, true);
+        assert!(
+            raw.contains("matcher: {\"args\":[\"upgrade\",\"{release}\""),
+            "--raw must add the exact reviewed matcher:\n{raw}"
+        );
+        assert!(
+            raw.contains("command: helm upgrade <release> monitoring/<chart>"),
+            "--raw must keep the readable rendering:\n{raw}"
+        );
+    }
+
+    #[test]
+    fn matcher_without_a_command_template_falls_back_to_the_raw_document() {
+        assert_eq!(
+            matcher_detail_lines(&serde_json::json!({"coverage": []}), "  "),
+            None
+        );
+        let capability = server::AccessCapability {
+            matcher: serde_json::json!({"coverage": []}),
+            ..helm_upgrade_capability()
+        };
+        let lines = capability_detail_lines(&capability, "  ", false).join("\n");
+        assert!(
+            lines.contains("matcher: {\"coverage\":[]}"),
+            "an unreadable matcher must still reach the operator verbatim:\n{lines}"
+        );
+        assert!(
+            !lines.contains("command:"),
+            "no command line can be claimed for a document that has none:\n{lines}"
+        );
+    }
+
+    #[test]
+    fn pending_use_display_names_the_budget_a_bare_approve_grants() {
+        let mut item = pending_access_item(Vec::new());
+        assert_eq!(
+            pending_use_display(&item),
+            "unlimited (default; --once or --uses N to bound the approval)"
+        );
+        item.default_use_policy = Some("bounded".to_string());
+        item.default_uses = Some(3);
+        assert_eq!(
+            pending_use_display(&item),
+            "3 (default; --once or --uses N to change)"
+        );
+        item.default_uses = Some(1);
+        assert_eq!(
+            pending_use_display(&item),
+            "1 (default; the only budget this request accepts)"
+        );
+        item.default_use_policy = None;
+        item.default_uses = None;
+        assert_eq!(pending_use_display(&item), "not selected until approval");
+        item.use_policy = "bounded".to_string();
+        item.remaining_uses = Some(2);
+        assert_eq!(
+            pending_use_display(&item),
+            "2",
+            "a decided item still reports its remaining budget verbatim"
+        );
+    }
+
+    #[test]
+    fn pattern_readings_cover_literals_and_enumerations_only() {
+        assert_eq!(
+            describe_pattern("^monitoring$").as_deref(),
+            Some("fixed value \"monitoring\"")
+        );
+        assert_eq!(
+            describe_pattern("^(?:get|list)$").as_deref(),
+            Some("one of \"get\", \"list\"")
+        );
+        assert_eq!(
+            describe_pattern("^(single)$").as_deref(),
+            Some("fixed value \"single\"")
+        );
+        // An unbounded or otherwise structured pattern gets no summary: a wrong
+        // reading of what a grant admits is worse than the pattern itself.
+        for pattern in ["^[a-z][a-z0-9-]{0,40}$", "^(deploy/[a-z-]+)$", "[a-z]+"] {
+            assert_eq!(describe_pattern(pattern), None, "pattern {pattern:?}");
+        }
+    }
+
+    #[test]
+    fn parameter_lines_carry_pattern_shape_and_admission_notes() {
+        let spec: guard::gating::verb::ParamSpec = serde_json::from_value(serde_json::json!({
+            "pattern": "^-o$",
+            "required": false,
+            "allow_dash": true,
+            "value_type": "single_argv",
+            "max_length": 64
+        }))
+        .unwrap();
+        assert_eq!(
+            param_display("flag", &spec),
+            "flag: ^-o$ -> fixed value \"-o\" [optional; may begin with a dash; one argv element, up to 64 characters]"
+        );
+    }
+
+    /// Baseline coverage applies without a session and carries no reviewed
+    /// matcher, so it names what it does and stops there. Rendering a matcher
+    /// for it would put a decision in front of an operator that no approval
+    /// ever asks for.
+    #[test]
+    fn baseline_capabilities_render_no_matcher_detail() {
+        let capability = server::AccessCapability {
+            baseline: true,
+            ..helm_upgrade_capability()
+        };
+        for raw in [false, true] {
+            let lines = capability_detail_lines(&capability, "  ", raw).join("\n");
+            assert!(
+                lines.contains("description: Upgrades one Helm release"),
+                "baseline coverage still says what it does (raw={raw}):\n{lines}"
+            );
+            for absent in [
+                "command:",
+                "param ",
+                "coverage:",
+                "matcher:",
+                "matcher_digest:",
+            ] {
+                assert!(
+                    !lines.contains(absent),
+                    "baseline coverage must not render {absent:?} (raw={raw}):\n{lines}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn placeholders_render_as_the_values_the_caller_supplies() {
+        assert_eq!(
+            placeholder_display("monitoring/{chart}"),
+            "monitoring/<chart>"
+        );
+        assert_eq!(placeholder_display("--namespace"), "--namespace");
+        assert_eq!(placeholder_display("{a}-{b}"), "<a>-<b>");
+        assert_eq!(placeholder_display("{}"), "{}");
+        assert_eq!(placeholder_display("{unclosed"), "{unclosed");
     }
 
     #[test]
@@ -3234,11 +3627,28 @@ mod tests {
             expires_unix: None,
             remaining_uses: None,
             use_policy: "unselected".to_string(),
+            default_use_policy: None,
+            default_uses: None,
             state: "pending".to_string(),
             next_action: "approve or deny".to_string(),
             approval_options: vec!["\u{1b}[1A\u{1b}[2Kguard access approve x".to_string()],
             intent: Some("\u{1b}[2J\u{1b}[H\nintent:    read one log file".to_string()),
-            capabilities: Vec::new(),
+            capabilities: vec![server::AccessCapability {
+                verb: "log-read".to_string(),
+                description: "\u{1b}[2Kdescription: reads one file".to_string(),
+                matcher: serde_json::json!({
+                    "binary": "cat",
+                    "args": ["{path}"],
+                    "params": {"path": {"pattern": "^\u{1b}[2K/var/log/syslog$"}}
+                }),
+                matcher_digest: "\u{1b}[2Kdigest".to_string(),
+                consequence: "reversible".to_string(),
+                credential_plan: None,
+                baseline: false,
+                trusted: false,
+                has_revert: false,
+                evidence: None,
+            }],
             decided_reason: None,
         };
         let card = access_item_card(&item, false).join("\n");
@@ -3250,7 +3660,7 @@ mod tests {
             card.contains("\\u{1b}[2J") && card.contains("\\nintent:"),
             "escaped forms must stay visible:\n{card}"
         );
-        let human = access_item_human(&item);
+        let human = access_item_human(&item, true);
         assert!(
             !human.contains('\u{1b}'),
             "guard access show must escape the same fields:\n{human}"

@@ -433,6 +433,9 @@ enum AccessCommands {
     /// Show detailed request or session coverage and evidence.
     Show {
         reference: String,
+        /// Print the raw matcher JSON alongside the readable rendering.
+        #[arg(long, action = ArgAction::SetTrue)]
+        raw: bool,
         #[arg(long)]
         socket: Option<String>,
         #[arg(long, action = ArgAction::SetTrue)]
