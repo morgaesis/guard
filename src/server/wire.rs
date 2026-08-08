@@ -399,6 +399,15 @@ pub enum AdminRequest {
     ApprovalShow {
         handle: String,
     },
+    /// Block until one approval is armed or terminal, then return the same
+    /// summary `ApprovalShow` returns. Scoped by handle ownership, with the
+    /// same non-leaking NotFound for any other caller. The wait is bounded by
+    /// `timeout_secs`, clamped by the daemon.
+    ApprovalWait {
+        handle: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_secs: Option<u64>,
+    },
     /// Append a note to a held command's discussion thread. Allowed for the
     /// operator (any hold) or the hold's original requester (its own hold).
     ApprovalNote {
@@ -647,6 +656,7 @@ impl AdminRequest {
                 | Self::Provisionals
                 | Self::ApprovalList
                 | Self::ApprovalShow { .. }
+                | Self::ApprovalWait { .. }
                 | Self::Resume { .. }
                 // ApprovalNote does its own operator-or-owner authorization in
                 // the handler, so it does not require operator authority here.
@@ -841,6 +851,24 @@ pub struct AccessCapability {
     pub evidence: Option<String>,
 }
 
+/// Approving adds authority to a live access session; nothing executes.
+pub const CONSEQUENCE_GRANT: &str = "grant";
+/// Approving arms one frozen snapshot; nothing executes until the requester
+/// resumes it.
+pub const CONSEQUENCE_ARM: &str = "arm";
+/// Approving releases a request already parked and waiting; it proceeds
+/// immediately.
+pub const CONSEQUENCE_RELEASE: &str = "release";
+
+/// One wording for "you cannot wait on a grant". The daemon returns it when a
+/// wait names a grant request; the client quotes it verbatim from its own
+/// pre-flight check, so an operator reads the same sentence either way.
+pub fn grant_class_wait_refusal(reference: &str, target: &str) -> String {
+    format!(
+        "--wait applies to held commands; approving {reference} grants authority and never executes. Watch the session with 'guard access status {target}'."
+    )
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AccessItem {
     pub reference: String,
@@ -853,8 +881,14 @@ pub struct AccessItem {
     pub expires_unix: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remaining_uses: Option<u64>,
-    /// `unselected`, `unlimited`, `bounded`, or `unavailable`.
+    /// `none`, `not-yet-granted`, `unlimited`, `bounded`, or `unavailable`.
+    /// A hold has no use budget in any state and reports `none`.
     pub use_policy: String,
+    /// Consequence class of approving this reference: `grant`, `arm`, or
+    /// `release`. Absent from a daemon that predates the field, where the
+    /// client derives the class from the reference prefix.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub consequence: String,
     pub state: String,
     pub next_action: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -876,8 +910,12 @@ pub struct AccessDecisionResult {
     pub target: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remaining_uses: Option<u64>,
-    /// `unlimited`, `bounded`, or `unavailable`.
+    /// `none`, `unlimited`, `bounded`, or `unavailable`.
     pub use_policy: String,
+    /// Consequence class of the decided reference: `grant`, `arm`, or
+    /// `release`. Absent from a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub consequence: String,
     pub message: String,
 }
 

@@ -1757,7 +1757,7 @@ async fn wait_for_decision<W: AsyncWrite + Unpin>(
 
 const APPROVAL_TRANSCRIPT_BYTES: usize = 262_144;
 
-fn bound_persisted_transcript(value: Option<String>) -> Option<String> {
+pub(super) fn bound_persisted_transcript(value: Option<String>) -> Option<String> {
     let mut value = value?;
     if value.len() <= APPROVAL_TRANSCRIPT_BYTES {
         return Some(value);

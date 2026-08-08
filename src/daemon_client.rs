@@ -137,6 +137,7 @@ impl Client {
             AdminRequest::Deny { .. } => "deny",
             AdminRequest::ApprovalList => "approval_list",
             AdminRequest::ApprovalShow { .. } => "approval_show",
+            AdminRequest::ApprovalWait { .. } => "approval_wait",
             AdminRequest::ApprovalNote { .. } => "approval_note",
             AdminRequest::ApprovalWithdraw { .. } => "approval_withdraw",
             AdminRequest::VerbList => "verb_list",

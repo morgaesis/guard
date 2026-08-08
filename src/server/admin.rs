@@ -27,8 +27,8 @@ use super::execute::{
     session_source_from_eval,
 };
 use super::gate_runtime::{
-    finish_revert, forget_proxy_provenance, is_api_proxy_sentinel, now_unix, persist_approval,
-    remove_revert_body, resume_approval,
+    bound_persisted_transcript, finish_revert, forget_proxy_provenance, is_api_proxy_sentinel,
+    now_unix, persist_approval, remove_revert_body, resume_approval,
 };
 #[cfg(test)]
 use super::learning::{
@@ -37,14 +37,15 @@ use super::learning::{
 };
 use super::runtime::NotifyEvent;
 use super::wire::{
-    approval_is_armed, authorize_session_use, verb_effective_trust, AccessCapability,
-    AccessDecisionResult, AccessItem, AdminRequest, AdminResponse, ApprovalSummary, CallerIdentity,
-    ExecOutcome, ExecuteRequest, ProvisionalSummary, SecretDetail, ServerStatus, SessionAuthz,
-    VerbInvocation, VerbMenuItem, VerbSummary, APPROVAL_ARMED_REASON, SESSION_PRINCIPAL_MISMATCH,
+    approval_is_armed, authorize_session_use, grant_class_wait_refusal, verb_effective_trust,
+    AccessCapability, AccessDecisionResult, AccessItem, AdminRequest, AdminResponse,
+    ApprovalSummary, CallerIdentity, ExecOutcome, ExecuteRequest, ProvisionalSummary, SecretDetail,
+    ServerStatus, SessionAuthz, VerbInvocation, VerbMenuItem, VerbSummary, APPROVAL_ARMED_REASON,
+    CONSEQUENCE_ARM, CONSEQUENCE_GRANT, CONSEQUENCE_RELEASE, SESSION_PRINCIPAL_MISMATCH,
     SESSION_UNOWNED_REFUSED,
 };
 use super::{is_valid_secret_key, ServerContext};
-use guard::gating::approval::{Approval, ApprovalStatus};
+use guard::gating::approval::{Approval, ApprovalSnapshot, ApprovalStatus};
 
 pub(super) const MAX_GRANT_REQUESTS: usize = 1024;
 pub(super) const MAX_PENDING_GRANT_REQUESTS_PER_SESSION: usize = 32;
@@ -1266,7 +1267,66 @@ async fn approved_access_request_is_usable(server: &ServerContext, request: &Gra
     )
 }
 
-async fn access_item_for_approval(server: &ServerContext, approval: &Approval) -> AccessItem {
+/// A release-class hold carries no executable snapshot: it is an API request
+/// parked in the proxy under the daemon's own principal, and approving it
+/// releases that request rather than spawning anything. A caller cannot steer a
+/// real command into the class by naming the sentinel binary, because the row
+/// must also be owned by the daemon principal, which peer credentials assign
+/// only to the daemon's own gate sink.
+fn is_release_class(server: &ServerContext, snapshot: &ApprovalSnapshot) -> bool {
+    is_api_proxy_sentinel(&snapshot.binary)
+        && matches!(
+            &snapshot.principal,
+            Some(principal) if server.config.daemon_principal.eq_ci(principal)
+        )
+}
+
+/// The consequence class of approving one hold. Holds are never grant-class:
+/// they either arm a frozen snapshot or release a parked API request.
+fn approval_consequence(server: &ServerContext, approval: &Approval) -> &'static str {
+    if is_release_class(server, &approval.snapshot) {
+        CONSEQUENCE_RELEASE
+    } else {
+        CONSEQUENCE_ARM
+    }
+}
+
+/// Consequence class of one reference, resolved from daemon state. Grant
+/// requests are grant-class; holds are arm- or release-class. An unknown
+/// reference has no class.
+async fn consequence_for_reference(server: &ServerContext, reference: &str) -> String {
+    if server
+        .state
+        .grant_requests
+        .read()
+        .await
+        .contains_key(reference)
+    {
+        return CONSEQUENCE_GRANT.to_string();
+    }
+    match server.state.approvals.read().await.get(reference) {
+        Some(approval) => approval_consequence(server, approval).to_string(),
+        None => String::new(),
+    }
+}
+
+/// The next command this audience should run against a hold. The operator
+/// decides and then reads the transcript; the requester waits and then resumes.
+fn hold_next_action(handle: &str, state: &str, is_operator: bool) -> String {
+    match (state, is_operator) {
+        ("pending", true) => format!("guard access approve {handle} --once"),
+        ("pending", false) => format!("guard approval show {handle} --wait"),
+        ("armed", true) => format!("guard approval show {handle} --wait"),
+        ("armed", false) => format!("guard approval resume {handle}"),
+        _ => format!("guard approval show {handle}"),
+    }
+}
+
+async fn access_item_for_approval(
+    server: &ServerContext,
+    approval: &Approval,
+    is_operator: bool,
+) -> AccessItem {
     let projected_expired =
         approval.status == ApprovalStatus::Pending && now_unix() >= approval.deadline_unix();
     let projected_state = if projected_expired {
@@ -1320,23 +1380,19 @@ async fn access_item_for_approval(server: &ServerContext, approval: &Approval) -
         .or_else(|| Some(approval.deadline_unix()));
     AccessItem {
         reference: approval.handle.clone(),
-        kind: "request".to_string(),
+        kind: "hold".to_string(),
         requester: requester.clone(),
         target,
         effective_scope: scope.clone(),
         expires_unix,
         remaining_uses,
-        use_policy: if approval.status == ApprovalStatus::Pending
-            && !projected_expired
-            && !approval_is_armed(approval)
-        {
-            "unselected"
-        } else {
-            access_use_policy(grant_uses)
-        }
-        .to_string(),
+        // A hold replays one immutable snapshot, so it has no use budget in any
+        // state; renderers omit the line entirely rather than print a number
+        // that does not govern it.
+        use_policy: "none".to_string(),
+        consequence: approval_consequence(server, approval).to_string(),
         state: projected_state.to_string(),
-        next_action: format!("guard access show {}", approval.handle),
+        next_action: hold_next_action(&approval.handle, projected_state, is_operator),
         approval_options: if approval.status == ApprovalStatus::Pending
             && !projected_expired
             && !approval_is_armed(approval)
@@ -1351,7 +1407,11 @@ async fn access_item_for_approval(server: &ServerContext, approval: &Approval) -
     }
 }
 
-async fn access_item_for_request(server: &ServerContext, request: &GrantRequest) -> AccessItem {
+async fn access_item_for_request(
+    server: &ServerContext,
+    request: &GrantRequest,
+    is_operator: bool,
+) -> AccessItem {
     let mut target = request
         .target
         .clone()
@@ -1410,14 +1470,22 @@ async fn access_item_for_request(server: &ServerContext, request: &GrantRequest)
         effective_scope: request.authority_verbs.clone(),
         expires_unix,
         remaining_uses,
+        // A pending request has no budget yet: the operator selects one when
+        // approving. `not-yet-granted` says that, where `unselected` read as a
+        // budget the requester had failed to pick.
         use_policy: if request.status == GrantRequestStatus::Pending && !expired {
-            "unselected"
+            "not-yet-granted"
         } else {
             access_use_policy(grant_uses)
         }
         .to_string(),
+        consequence: CONSEQUENCE_GRANT.to_string(),
         state: state.to_string(),
-        next_action: format!("guard access show {}", request.handle),
+        next_action: if request.status == GrantRequestStatus::Pending && !expired && is_operator {
+            format!("guard access approve {}", request.handle)
+        } else {
+            format!("guard access show {}", request.handle)
+        },
         approval_options: if request.status == GrantRequestStatus::Pending && !expired {
             approval_options(&request.handle)
         } else {
@@ -1482,6 +1550,7 @@ async fn access_item_for_session(
             None => "unavailable",
         }
         .to_string(),
+        consequence: String::new(),
         state: state.to_string(),
         next_action: format!("guard access show {reference}"),
         approval_options: Vec::new(),
@@ -1582,7 +1651,7 @@ pub(super) async fn submit_access_request(
             if explicit_target.is_some()
                 || approved_access_request_is_usable(server, &existing).await
             {
-                return Ok(access_item_for_request(server, &existing).await);
+                return Ok(access_item_for_request(server, &existing, false).await);
             }
         }
     }
@@ -1620,7 +1689,7 @@ pub(super) async fn submit_access_request(
             .cloned()
         {
             drop(requests);
-            return Ok(access_item_for_request(server, &existing).await);
+            return Ok(access_item_for_request(server, &existing, false).await);
         }
         if requests.len() >= MAX_GRANT_REQUESTS {
             return Err("access request queue is full".to_string());
@@ -1686,7 +1755,7 @@ pub(super) async fn submit_access_request(
             })
             .cloned()
         {
-            return Ok(access_item_for_request(server, &existing).await);
+            return Ok(access_item_for_request(server, &existing, false).await);
         }
         if let Some(token) = session_token {
             let summary = server
@@ -1709,6 +1778,7 @@ pub(super) async fn submit_access_request(
             expires_unix: None,
             remaining_uses: None,
             use_policy: "unlimited".to_string(),
+            consequence: String::new(),
             state: "active".to_string(),
             next_action: "guard access list".to_string(),
             approval_options: Vec::new(),
@@ -1764,7 +1834,7 @@ pub(super) async fn submit_access_request(
             && existing.issued_session_revision == session_revision)
             || approved_access_request_is_usable(server, &existing).await;
         if reusable {
-            return Ok(access_item_for_request(server, &existing).await);
+            return Ok(access_item_for_request(server, &existing, false).await);
         }
     }
     {
@@ -1799,7 +1869,7 @@ pub(super) async fn submit_access_request(
         .await
         .insert(request.handle.clone(), request.clone());
     emit_grant_request_event(server, &request, "access_request_submitted");
-    Ok(access_item_for_request(server, &request).await)
+    Ok(access_item_for_request(server, &request, false).await)
 }
 
 fn new_access_session(requester: PrincipalKey, label: String, expires_at: u64) -> SessionGrant {
@@ -1965,6 +2035,7 @@ async fn approve_access_request(
             remaining_uses: None,
             use_policy: "unavailable".to_string(),
             message: "unknown access request".to_string(),
+            consequence: String::new(),
         };
     };
     if pending.requester.is_none() {
@@ -1976,6 +2047,7 @@ async fn approve_access_request(
             remaining_uses: None,
             use_policy: "unavailable".to_string(),
             message: "legacy grant requests use the hidden compatibility command".to_string(),
+            consequence: String::new(),
         };
     }
     if let Err(message) = validate_access_request_shape(&pending) {
@@ -1987,10 +2059,11 @@ async fn approve_access_request(
             remaining_uses: None,
             use_policy: "unavailable".to_string(),
             message,
+            consequence: String::new(),
         };
     }
     if pending.status == GrantRequestStatus::Approved {
-        let item = access_item_for_request(server, &pending).await;
+        let item = access_item_for_request(server, &pending, true).await;
         return AccessDecisionResult {
             request: handle.to_string(),
             success: true,
@@ -1999,6 +2072,7 @@ async fn approve_access_request(
             remaining_uses: item.remaining_uses,
             use_policy: item.use_policy,
             message: "already approved; authority unchanged".to_string(),
+            consequence: String::new(),
         };
     }
     if pending.status != GrantRequestStatus::Pending {
@@ -2010,6 +2084,7 @@ async fn approve_access_request(
             remaining_uses: None,
             use_policy: "unavailable".to_string(),
             message: format!("request is already {}", pending.status.as_str()),
+            consequence: String::new(),
         };
     }
     if pending.expires_unix == 0 || now_unix() >= pending.expires_unix {
@@ -2021,6 +2096,7 @@ async fn approve_access_request(
             remaining_uses: None,
             use_policy: "unavailable".to_string(),
             message: "access request expired".to_string(),
+            consequence: String::new(),
         };
     }
     let proposed_verbs = match proposed_access_verbs(&pending) {
@@ -2034,6 +2110,7 @@ async fn approve_access_request(
                 remaining_uses: None,
                 use_policy: "unavailable".to_string(),
                 message,
+                consequence: String::new(),
             }
         }
     };
@@ -2048,6 +2125,7 @@ async fn approve_access_request(
             remaining_uses: None,
             use_policy: "unavailable".to_string(),
             message,
+            consequence: String::new(),
         };
     }
 
@@ -2073,6 +2151,7 @@ async fn approve_access_request(
                 use_policy: "unavailable".to_string(),
                 message: "access target expired or was revoked after request submission"
                     .to_string(),
+                consequence: String::new(),
             };
         }
         if staged.has(&token) {
@@ -2088,6 +2167,7 @@ async fn approve_access_request(
                     remaining_uses: None,
                     use_policy: "unavailable".to_string(),
                     message: "access target belongs to a different principal".to_string(),
+                    consequence: String::new(),
                 };
             }
             if !pending.session_token.is_empty()
@@ -2101,6 +2181,7 @@ async fn approve_access_request(
                     remaining_uses: None,
                     use_policy: "unavailable".to_string(),
                     message: "access target changed after request submission".to_string(),
+                    consequence: String::new(),
                 };
             }
             if staged.apply_delta(&token, &pending.delta).is_none() {
@@ -2112,6 +2193,7 @@ async fn approve_access_request(
                     remaining_uses: None,
                     use_policy: "unavailable".to_string(),
                     message: "access target expired during approval".to_string(),
+                    consequence: String::new(),
                 };
             }
         } else {
@@ -2137,6 +2219,7 @@ async fn approve_access_request(
                     remaining_uses: None,
                     use_policy: "unavailable".to_string(),
                     message: "generated access token collided with an issued token".to_string(),
+                    consequence: String::new(),
                 };
             }
             let _ = staged.apply_delta(&token, &pending.delta);
@@ -2160,6 +2243,7 @@ async fn approve_access_request(
                     remaining_uses: None,
                     use_policy: "unavailable".to_string(),
                     message,
+                    consequence: String::new(),
                 }
             }
         };
@@ -2210,6 +2294,7 @@ async fn approve_access_request(
                         remaining_uses: None,
                         use_policy: "unavailable".to_string(),
                         message: format!("failed to rebase sibling access request: {error}"),
+                        consequence: String::new(),
                     };
                 }
             };
@@ -2247,6 +2332,7 @@ async fn approve_access_request(
                             remaining_uses: None,
                             use_policy: "unavailable".to_string(),
                             message,
+                            consequence: String::new(),
                         };
                     }
                     Ok(false) => {}
@@ -2260,6 +2346,7 @@ async fn approve_access_request(
                     remaining_uses: None,
                     use_policy: "unavailable".to_string(),
                     message: format!("failed to persist access approval: {error}"),
+                    consequence: String::new(),
                 };
             }
         }
@@ -2284,6 +2371,7 @@ async fn approve_access_request(
             remaining_uses,
             use_policy: access_use_policy(grant_uses).to_string(),
             message: "access approved".to_string(),
+            consequence: String::new(),
         };
     }
 }
@@ -2304,10 +2392,11 @@ async fn approve_held_access(
             remaining_uses: None,
             use_policy: "unavailable".to_string(),
             message: "unknown access request".to_string(),
+            consequence: String::new(),
         };
     };
     if approval_is_armed(&approval) {
-        let item = access_item_for_approval(server, &approval).await;
+        let item = access_item_for_approval(server, &approval, true).await;
         return AccessDecisionResult {
             request: handle.to_string(),
             success: false,
@@ -2316,10 +2405,11 @@ async fn approve_held_access(
             remaining_uses: item.remaining_uses,
             use_policy: item.use_policy,
             message: "held request is already armed for requester resume".to_string(),
+            consequence: String::new(),
         };
     }
     if approval.status != ApprovalStatus::Pending {
-        let item = access_item_for_approval(server, &approval).await;
+        let item = access_item_for_approval(server, &approval, true).await;
         return AccessDecisionResult {
             request: handle.to_string(),
             success: false,
@@ -2331,6 +2421,7 @@ async fn approve_held_access(
                 "held request is already {}; the immutable snapshot was not re-executed",
                 approval.status.as_str()
             ),
+            consequence: String::new(),
         };
     }
     if now_unix() >= approval.deadline_unix() {
@@ -2355,9 +2446,13 @@ async fn approve_held_access(
             remaining_uses: None,
             use_policy: "unavailable".to_string(),
             message: "expired without operator approval".to_string(),
+            consequence: String::new(),
         };
     }
-    if uses != Some(1) {
+    // A hold replays one immutable snapshot, so one use is the only legal
+    // budget. `--once` states it explicitly and no use flag means the same
+    // thing; any other count is a request the snapshot cannot honour.
+    if !matches!(uses, None | Some(1)) {
         return AccessDecisionResult {
             request: handle.to_string(),
             success: false,
@@ -2371,14 +2466,10 @@ async fn approve_held_access(
             use_policy: "unavailable".to_string(),
             message: "held requests execute one immutable snapshot; approve them with --once"
                 .to_string(),
+            consequence: String::new(),
         };
     }
-    if is_api_proxy_sentinel(&approval.snapshot.binary)
-        && matches!(
-            &approval.snapshot.principal,
-            Some(principal) if server.config.daemon_principal.eq_ci(principal)
-        )
-    {
+    if is_release_class(server, &approval.snapshot) {
         let snapshot = match claim_approval(server, handle).await {
             Ok(snapshot) => snapshot,
             Err(AdminResponse::Error { message }) => {
@@ -2390,6 +2481,7 @@ async fn approve_held_access(
                     remaining_uses: None,
                     use_policy: "unavailable".to_string(),
                     message,
+                    consequence: String::new(),
                 }
             }
             Err(_) => unreachable!("claim errors use the error response"),
@@ -2404,6 +2496,7 @@ async fn approve_held_access(
                 remaining_uses: None,
                 use_policy: "unavailable".to_string(),
                 message,
+                consequence: String::new(),
             },
             AdminResponse::Error { message } => AccessDecisionResult {
                 request: handle.to_string(),
@@ -2413,6 +2506,7 @@ async fn approve_held_access(
                 remaining_uses: None,
                 use_policy: "unavailable".to_string(),
                 message,
+                consequence: String::new(),
             },
             _ => AccessDecisionResult {
                 request: handle.to_string(),
@@ -2422,6 +2516,7 @@ async fn approve_held_access(
                 remaining_uses: None,
                 use_policy: "unavailable".to_string(),
                 message: "unexpected API approval response".to_string(),
+                consequence: String::new(),
             },
         };
     }
@@ -2434,6 +2529,7 @@ async fn approve_held_access(
             remaining_uses: None,
             use_policy: "unavailable".to_string(),
             message: "held access request has no authenticated requester".to_string(),
+            consequence: String::new(),
         };
     };
     if let Some(verb_name) = approval.snapshot.verb_name.as_deref() {
@@ -2447,6 +2543,7 @@ async fn approve_held_access(
                 remaining_uses: None,
                 use_policy: "unavailable".to_string(),
                 message: format!("{}; re-issue the command", staleness.clause(verb_name)),
+                consequence: String::new(),
             };
         }
     }
@@ -2466,6 +2563,7 @@ async fn approve_held_access(
                     remaining_uses: None,
                     use_policy: "unavailable".to_string(),
                     message: "originating access session expired or was revoked".to_string(),
+                    consequence: String::new(),
                 }
             }
         }
@@ -2507,6 +2605,7 @@ async fn approve_held_access(
         }
         .to_string(),
         message,
+        consequence: String::new(),
     }
 }
 
@@ -2522,6 +2621,7 @@ fn access_decision_from_response(handle: &str, response: AdminResponse) -> Acces
             message: request
                 .decided_reason
                 .unwrap_or_else(|| "access request denied".to_string()),
+            consequence: String::new(),
         },
         AdminResponse::Error { message } => AccessDecisionResult {
             request: handle.to_string(),
@@ -2531,6 +2631,7 @@ fn access_decision_from_response(handle: &str, response: AdminResponse) -> Acces
             remaining_uses: None,
             use_policy: "unavailable".to_string(),
             message,
+            consequence: String::new(),
         },
         AdminResponse::GateAction { message, .. } => AccessDecisionResult {
             request: handle.to_string(),
@@ -2540,6 +2641,7 @@ fn access_decision_from_response(handle: &str, response: AdminResponse) -> Acces
             remaining_uses: None,
             use_policy: "unavailable".to_string(),
             message,
+            consequence: String::new(),
         },
         _ => AccessDecisionResult {
             request: handle.to_string(),
@@ -2549,6 +2651,7 @@ fn access_decision_from_response(handle: &str, response: AdminResponse) -> Acces
             remaining_uses: None,
             use_policy: "unavailable".to_string(),
             message: "unexpected access decision response".to_string(),
+            consequence: String::new(),
         },
     }
 }
@@ -3134,10 +3237,10 @@ async fn list_access_items(server: &ServerContext, caller: &CallerIdentity) -> A
         .collect::<Vec<_>>();
     let mut items = Vec::with_capacity(requests.len() + sessions.len() + approvals.len());
     for request in requests {
-        items.push(access_item_for_request(server, &request).await);
+        items.push(access_item_for_request(server, &request, admin).await);
     }
     for approval in approvals {
-        items.push(access_item_for_approval(server, &approval).await);
+        items.push(access_item_for_approval(server, &approval, admin).await);
     }
     for summary in sessions {
         items.push(access_item_for_session(server, &summary).await);
@@ -3170,7 +3273,7 @@ async fn show_access_item(
         .cloned()
     {
         AdminResponse::AccessItem {
-            item: access_item_for_request(server, &request).await,
+            item: access_item_for_request(server, &request, admin).await,
         }
     } else if let Some(approval) = server
         .state
@@ -3185,7 +3288,7 @@ async fn show_access_item(
         .cloned()
     {
         AdminResponse::AccessItem {
-            item: access_item_for_approval(server, &approval).await,
+            item: access_item_for_approval(server, &approval, admin).await,
         }
     } else {
         let mut candidates = server
@@ -4131,22 +4234,17 @@ pub(super) async fn handle_admin_request(
             AdminResponse::Approvals { items }
         }
         AdminRequest::ApprovalShow { handle } => {
-            let (is_daemon, caller_key) = caller_scope(server, caller);
-            let found = server.state.approvals.read().await.get(&handle).cloned();
-            match found {
-                // Handle is an unguessable bearer secret; the owner (or daemon)
-                // may read its status and result. Others get NotFound, not a
-                // leak of existence.
-                Some(a) if is_daemon || scope_eq(&a.snapshot.principal, &caller_key) => {
-                    AdminResponse::ApprovalShow {
-                        item: ApprovalSummary::from_row(&a),
-                    }
-                }
-                _ => AdminResponse::Error {
-                    message: format!("no approval with handle '{}'", handle),
+            match approval_scope_check(server, caller, &handle).await {
+                Ok((approval, _is_operator)) => AdminResponse::ApprovalShow {
+                    item: ApprovalSummary::from_row(&approval),
                 },
+                Err(response) => response,
             }
         }
+        AdminRequest::ApprovalWait {
+            handle,
+            timeout_secs,
+        } => handle_approval_wait(server, caller, &handle, timeout_secs).await,
         AdminRequest::ApprovalNote { handle, text } => {
             handle_approval_note(server, caller, &handle, &text).await
         }
@@ -5027,17 +5125,23 @@ pub(super) async fn handle_admin_request(
         AdminRequest::AccessApprove { handles, uses } => {
             let mut items = Vec::with_capacity(handles.len());
             for handle in handles {
-                if server
+                // Resolve the class before deciding: approving a release-class
+                // hold consumes the row, so the class is no longer readable
+                // from state afterwards.
+                let consequence = consequence_for_reference(server, &handle).await;
+                let mut item = if server
                     .state
                     .grant_requests
                     .read()
                     .await
                     .contains_key(&handle)
                 {
-                    items.push(approve_access_request(server, &handle, uses).await);
+                    approve_access_request(server, &handle, uses).await
                 } else {
-                    items.push(approve_held_access(server, caller, &handle, uses).await);
-                }
+                    approve_held_access(server, caller, &handle, uses).await
+                };
+                item.consequence = consequence;
+                items.push(item);
             }
             AdminResponse::AccessDecisions { items }
         }
@@ -5051,6 +5155,7 @@ pub(super) async fn handle_admin_request(
             };
             let mut items = Vec::with_capacity(handles.len());
             for handle in handles {
+                let consequence = consequence_for_reference(server, &handle).await;
                 let response = if server
                     .state
                     .grant_requests
@@ -5062,7 +5167,9 @@ pub(super) async fn handle_admin_request(
                 } else {
                     handle_deny(server, caller, &handle, &reason).await
                 };
-                items.push(access_decision_from_response(&handle, response));
+                let mut item = access_decision_from_response(&handle, response);
+                item.consequence = consequence;
+                items.push(item);
             }
             AdminResponse::AccessDecisions { items }
         }
@@ -5168,6 +5275,7 @@ pub(super) async fn handle_admin_request(
                         remaining_uses: None,
                         use_policy: "unavailable".to_string(),
                         message: "access revoked".to_string(),
+                        consequence: String::new(),
                     }],
                 };
             }
@@ -5189,6 +5297,7 @@ pub(super) async fn handle_admin_request(
                     remaining_uses: item.remaining_uses,
                     use_policy: item.use_policy,
                     message: "equivalent authority is already active; no change made".to_string(),
+                    consequence: String::new(),
                 }],
             },
             Err(message) => AdminResponse::Error { message },
@@ -6180,8 +6289,11 @@ fn approval_result_row(
     approval.status = ApprovalStatus::Approved;
     approval.decided_unix = Some(now);
     approval.result_exit = exit;
-    approval.result_stdout = stdout;
-    approval.result_stderr = stderr;
+    // Persisted transcripts are bounded per stream on every path that writes
+    // them, so a row can never grow past the cap regardless of which approval
+    // route produced the output.
+    approval.result_stdout = bound_persisted_transcript(stdout);
+    approval.result_stderr = bound_persisted_transcript(stderr);
     Ok(approval)
 }
 
@@ -6379,9 +6491,7 @@ async fn handle_approve_claimed(
     // branch by naming the sentinel binary, because the row must also be owned
     // by the daemon principal, which peer credentials assign only to the
     // daemon's own gate sink.
-    if is_api_proxy_sentinel(&snapshot.binary)
-        && matches!(&snapshot.principal, Some(p) if server.config.daemon_principal.eq_ci(p))
-    {
+    if is_release_class(server, &snapshot) {
         let now = now_unix();
         // The APPROVED record must be durable BEFORE the parked API request is
         // released to the proxy waiter; fail closed otherwise.
@@ -6637,6 +6747,142 @@ async fn handle_approve(
     };
     drop(transition);
     handle_approve_claimed(server, caller, handle, snapshot).await
+}
+
+/// Default bound on one `ApprovalWait` park, in seconds.
+const APPROVAL_WAIT_DEFAULT_SECS: u64 = 300;
+/// Hard ceiling on one `ApprovalWait` park, in seconds.
+const APPROVAL_WAIT_MAX_SECS: u64 = 3600;
+
+fn approval_not_found(handle: &str) -> AdminResponse {
+    AdminResponse::Error {
+        message: format!("no approval with handle '{}'", handle),
+    }
+}
+
+/// Resolve one hold for a scoped reader, returning the row and whether the
+/// caller holds operator authority. The handle is an unguessable bearer secret:
+/// its owning principal may read its status and result, and the operator may
+/// read any hold through the admin bearer. Every other caller gets the same
+/// NotFound, so the response never reveals that the handle exists. Read paths
+/// share this function so the check cannot drift between them.
+async fn approval_scope_check(
+    server: &ServerContext,
+    caller: &CallerIdentity,
+    handle: &str,
+) -> Result<(Approval, bool), AdminResponse> {
+    let (is_operator, caller_key) = caller_scope(server, caller);
+    let found = server.state.approvals.read().await.get(handle).cloned();
+    match found {
+        Some(approval) if is_operator || scope_eq(&approval.snapshot.principal, &caller_key) => {
+            Ok((approval, is_operator))
+        }
+        _ => Err(approval_not_found(handle)),
+    }
+}
+
+/// Block until one hold is armed or terminal, then return the same summary
+/// `ApprovalShow` returns. Arming is not terminal: the row stays `Pending` with
+/// the durable arm marker until its owner resumes it, so a requester waiting to
+/// run its command and an operator waiting for the transcript both return at
+/// the moment that concerns them, and `ApprovalSummary.status` tells them
+/// which happened. On timeout the current (still pending) summary comes back.
+async fn handle_approval_wait(
+    server: &ServerContext,
+    caller: &CallerIdentity,
+    handle: &str,
+    timeout_secs: Option<u64>,
+) -> AdminResponse {
+    // Authorize before parking. A caller that does not own the handle must not
+    // be able to hold a connection open at all, so the refusal is immediate.
+    let approval = match approval_scope_check(server, caller, handle).await {
+        Ok((approval, _is_operator)) => approval,
+        Err(_) => {
+            // A grant request never executes, so waiting on one has no
+            // meaning. Say so where the caller can act on it, but only to a
+            // caller already authorized to see the request.
+            if let Some(message) = grant_request_wait_refusal(server, caller, handle).await {
+                return AdminResponse::Error { message };
+            }
+            return approval_not_found(handle);
+        }
+    };
+    if approval_is_armed(&approval) || approval.status.is_decided() {
+        return AdminResponse::ApprovalShow {
+            item: ApprovalSummary::from_row(&approval),
+        };
+    }
+    // Obtain-or-create under the write lock, then release it before parking:
+    // `ApprovalRegistry::from_rows` rebuilds without notifiers, so a hold
+    // recovered across a restart has none until the first waiter mints it.
+    let Some(notify) = server
+        .state
+        .approvals
+        .write()
+        .await
+        .notifier_or_create(handle)
+    else {
+        return approval_not_found(handle);
+    };
+    let timeout = timeout_secs
+        .unwrap_or(APPROVAL_WAIT_DEFAULT_SECS)
+        .clamp(1, APPROVAL_WAIT_MAX_SECS);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout);
+    loop {
+        // Register with the notifier BEFORE re-reading the row: notify_waiters
+        // wakes only already-registered waiters, so a decision landing between
+        // the read and the park would otherwise be missed for the full timeout.
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        let current = server.state.approvals.read().await.get(handle).cloned();
+        let Some(current) = current else {
+            return approval_not_found(handle);
+        };
+        if approval_is_armed(&current) || current.status.is_decided() {
+            return AdminResponse::ApprovalShow {
+                item: ApprovalSummary::from_row(&current),
+            };
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return AdminResponse::ApprovalShow {
+                item: ApprovalSummary::from_row(&current),
+            };
+        }
+        tokio::select! {
+            _ = &mut notified => {}
+            _ = tokio::time::sleep(remaining) => {}
+        }
+    }
+}
+
+/// The refusal for waiting on a grant request, or `None` when the reference is
+/// not a grant request this caller may see. The wording matches the client's
+/// own pre-flight refusal so an operator reads one sentence either way.
+async fn grant_request_wait_refusal(
+    server: &ServerContext,
+    caller: &CallerIdentity,
+    handle: &str,
+) -> Option<String> {
+    let is_operator = caller_is_session_admin(server, caller);
+    let principal = caller.principal();
+    let request = server
+        .state
+        .grant_requests
+        .read()
+        .await
+        .get(handle)
+        .filter(|request| {
+            request.requester.is_some() && (is_operator || scope_eq(&request.requester, &principal))
+        })
+        .cloned()?;
+    let target = request
+        .target
+        .clone()
+        .unwrap_or_else(|| "the requester's session".to_string());
+    Some(grant_class_wait_refusal(handle, &target))
 }
 
 async fn handle_resume(

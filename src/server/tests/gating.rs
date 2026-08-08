@@ -14,7 +14,7 @@ use crate::server::gate_runtime::{
 };
 use crate::server::wire::{
     approval_is_armed, AdminRequest, AdminResponse, CallerIdentity, ExecOutcome, ExecuteRequest,
-    ExecuteResult, RevertSpec,
+    ExecuteResult, RevertSpec, CONSEQUENCE_ARM,
 };
 use crate::server::{RequestContext, ServerContext, APPROVAL_TTL_SECS};
 use crate::session::SessionGrant;
@@ -1729,32 +1729,32 @@ async fn hold_approval_arms_then_requester_resumes_once_with_output() {
         "a refused approve must not change state"
     );
 
-    for uses in [None, Some(3)] {
-        let response = handle_admin_request(
-            &cfg,
-            &operator,
-            AdminRequest::AccessApprove {
-                handles: vec![handle.clone()],
-                uses,
-            },
-        )
-        .await;
-        let AdminResponse::AccessDecisions { items } = response else {
-            panic!("expected held access decision")
-        };
-        assert!(!items[0].success);
-        assert!(items[0].message.contains("approve them with --once"));
-        assert_eq!(
-            cfg.state
-                .approvals
-                .read()
-                .await
-                .get(&handle)
-                .unwrap()
-                .status,
-            ApprovalStatus::Pending
-        );
-    }
+    // A budget other than one use is the only rejected form: the snapshot
+    // cannot honour it. No use flag means the one legal thing.
+    let response = handle_admin_request(
+        &cfg,
+        &operator,
+        AdminRequest::AccessApprove {
+            handles: vec![handle.clone()],
+            uses: Some(3),
+        },
+    )
+    .await;
+    let AdminResponse::AccessDecisions { items } = response else {
+        panic!("expected held access decision")
+    };
+    assert!(!items[0].success);
+    assert!(items[0].message.contains("approve them with --once"));
+    assert_eq!(
+        cfg.state
+            .approvals
+            .read()
+            .await
+            .get(&handle)
+            .unwrap()
+            .status,
+        ApprovalStatus::Pending
+    );
 
     // Operator approval arms the snapshot and returns without executing it.
     let ok = handle_admin_request(
@@ -2185,7 +2185,11 @@ async fn held_access_projection_expires_before_the_sweeper_and_hides_approval_op
         .expect("held access request remains visible before the sweeper");
     assert_eq!(listed.state, "expired");
     assert!(listed.approval_options.is_empty());
-    assert_eq!(listed.use_policy, "unavailable");
+    // A hold replays one immutable snapshot, so it reports no use budget in
+    // any state and renderers omit the line.
+    assert_eq!(listed.use_policy, "none");
+    assert_eq!(listed.kind, "hold");
+    assert_eq!(listed.consequence, CONSEQUENCE_ARM);
 
     let AdminResponse::AccessItem { item: shown } = handle_admin_request(
         &cfg,

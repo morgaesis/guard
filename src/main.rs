@@ -42,6 +42,9 @@ const EXIT_GUARD_HELD: i32 = 127;
 /// One or more decisions in a completed access batch failed. This is a result
 /// status, not a guard operational failure.
 const EXIT_GUARD_ACCESS_DECISION_FAILED: i32 = 1;
+/// Invalid guard CLI usage, matching clap's own exit status for a rejected
+/// invocation. Used where a rule needs daemon state that clap cannot see.
+const EXIT_GUARD_INVALID_USAGE: i32 = 2;
 const JSON_SCHEMA_VERSION: u32 = 1;
 
 fn parse_unbounded_secs(value: &str) -> Result<u64, String> {
@@ -68,7 +71,8 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
 use cli_client::{
     handle_access, handle_api, handle_approval, handle_audit_tail, handle_audit_verify,
     handle_config, handle_gate_action, handle_provisionals, handle_resume, handle_status,
-    handle_verb, run_exec, run_mcp, GatingOptions, RunInjections, SshHostKeyCliMode,
+    handle_verb, run_exec, run_mcp, warn_resume_alias_deprecated, GatingOptions, RunInjections,
+    SshHostKeyCliMode,
 };
 use cli_secrets::handle_secrets;
 use cli_server::run_server;
@@ -213,7 +217,7 @@ enum MainArgs {
     /// Request, approve, inspect, and extend principal-bound access.
     #[clap(
         subcommand,
-        after_help = "Common workflow:\n  guard access request \"restart the fixture service\"\n  guard access approve <request>\n  guard access approve <request> --once\n  guard access approve <request> --uses 3\n  guard access approve <request> --yes\n  guard access list\n  guard access show <request-or-session>\n  guard access revoke <session-or-agent>\n\nOn a terminal, approve reviews each request before deciding; --yes skips the review.\nRequests left undecided by skip or quit stay pending and do not fail the batch.\n\nExit status:\n  1      one or more decisions in the access batch failed"
+        after_help = "Common workflow:\n  guard access request \"restart the fixture service\"\n  guard access approve <request>\n  guard access approve <request> --once\n  guard access approve <request> --uses 3\n  guard access approve <request> --yes\n  guard access approve <request> --dry-run\n  guard access approve <request> --wait\n  guard access list\n  guard access show <request-or-session>\n  guard access revoke <session-or-agent>\n\nOn a terminal, approve reviews each request before deciding; --yes skips the review.\nThe review states what approving does: grant authority, arm a held snapshot, or release a parked API request.\nRequests left undecided by skip or quit stay pending and do not fail the batch.\n--dry-run and --wait each take a single request.\n\nExit status:\n  1      one or more decisions in the access batch failed\n  2      invalid guard CLI usage\n  127    approved and armed, or still held when --wait elapsed"
     )]
     Access(AccessCommands),
     /// Removed legacy authority command. Use `guard access`.
@@ -277,7 +281,8 @@ enum MainArgs {
         #[arg(long)]
         socket: Option<String>,
     },
-    /// Execute one operator-approved hold as its original requester.
+    /// Superseded spelling of `guard approval resume`. Still works.
+    #[clap(hide = true)]
     Resume {
         handle: String,
         #[arg(long)]
@@ -309,8 +314,25 @@ enum ApprovalCommands {
     /// Show one held command and its persisted terminal transcript.
     Show {
         handle: String,
+        /// Block for SECONDS until the hold is armed or decided, then report.
+        /// A bare flag waits 300 seconds. This is a read: it never executes.
+        #[arg(long, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "300", value_parser = clap::value_parser!(u64).range(1..))]
+        wait: Option<u64>,
         #[arg(long)]
         socket: Option<String>,
+        #[arg(long, action = ArgAction::SetTrue)]
+        json: bool,
+    },
+    /// Execute one operator-approved hold as its original requester.
+    Resume {
+        handle: String,
+        /// Block for SECONDS until the hold is armed, then run it. A bare flag
+        /// waits 300 seconds.
+        #[arg(long, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "300", value_parser = clap::value_parser!(u64).range(1..))]
+        wait: Option<u64>,
+        #[arg(long)]
+        socket: Option<String>,
+        /// Emit the persisted execution result as one JSON document.
         #[arg(long, action = ArgAction::SetTrue)]
         json: bool,
     },
@@ -381,6 +403,14 @@ enum AccessCommands {
         /// Grant exactly N uses. A batch exits 1 if any request fails.
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
         uses: Option<u64>,
+        /// Block for SECONDS after approving a held command, until it is armed
+        /// or decided. A bare flag waits 300 seconds. Single request only.
+        #[arg(long, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "300", value_parser = clap::value_parser!(u64).range(1..))]
+        wait: Option<u64>,
+        /// Print what approving each request would do, then exit without
+        /// deciding anything.
+        #[arg(long = "dry-run", action = ArgAction::SetTrue)]
+        dry_run: bool,
         #[arg(long)]
         socket: Option<String>,
         #[arg(long, action = ArgAction::SetTrue)]
@@ -617,6 +647,34 @@ fn parse_env_bool(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
     )
+}
+
+/// Usage rules clap's grammar cannot express. `--wait` and `--dry-run` each
+/// report one reference's consequence, and a batch has no single outcome to
+/// report, so both take exactly one request.
+fn access_usage_error(command: &AccessCommands) -> Option<String> {
+    let AccessCommands::Approve {
+        requests,
+        wait,
+        dry_run,
+        ..
+    } = command
+    else {
+        return None;
+    };
+    if requests.len() <= 1 {
+        return None;
+    }
+    let flag = if wait.is_some() {
+        "--wait"
+    } else if *dry_run {
+        "--dry-run"
+    } else {
+        return None;
+    };
+    Some(format!(
+        "{flag} takes a single request; a batch cannot report one outcome."
+    ))
 }
 
 fn legacy_authority_error(command: &str, replacement: &str) -> Result<()> {
@@ -1433,7 +1491,10 @@ async fn run_main() -> Result<()> {
             handle,
             socket,
             json,
-        }) => handle_resume(socket, handle, json).await,
+        }) => {
+            warn_resume_alias_deprecated();
+            handle_resume(socket, handle, None, json).await
+        }
         Ok(MainArgs::Approval(subcommand)) => handle_approval(subcommand).await,
         Ok(MainArgs::Verb(subcommand)) => handle_verb(subcommand).await,
         Ok(MainArgs::Audit(subcommand)) => match subcommand {
@@ -1466,7 +1527,15 @@ async fn run_main() -> Result<()> {
         Ok(MainArgs::Config(subcommand)) => handle_config(subcommand).await,
         Ok(MainArgs::Api(subcommand)) => handle_api(subcommand).await,
         Ok(MainArgs::Mcp(subcommand)) => run_mcp(subcommand).await,
-        Ok(MainArgs::Access(subcommand)) => handle_access(subcommand).await,
+        Ok(MainArgs::Access(subcommand)) => {
+            if let Some(message) = access_usage_error(&subcommand) {
+                let error =
+                    MainArgs::command().error(clap::error::ErrorKind::ArgumentConflict, message);
+                log_cli_usage_error(&args, &error);
+                error.exit();
+            }
+            handle_access(subcommand).await
+        }
         Ok(MainArgs::Session { .. }) => legacy_authority_error("session", "guard access"),
         Ok(MainArgs::Grant { .. }) => legacy_authority_error("grant", "guard access"),
         Ok(MainArgs::Appeal { .. }) => {
@@ -1679,8 +1748,9 @@ fn print_help_tree(admin: bool) {
     println!("    access show <request-or-session>");
     println!("    access status <session>");
     println!("    provisionals");
-    println!("    resume <handle>");
     println!("    approval list|show|note|withdraw");
+    println!("    approval show <handle> --wait");
+    println!("    approval resume <handle> [--wait]");
     println!("    mcp serve");
     println!();
     println!("  local setup");
@@ -1692,6 +1762,7 @@ fn print_help_tree(admin: bool) {
         println!("    server start");
         println!("    verb show <name>");
         println!("    access approve <request>... [--once|--uses N|--yes]");
+        println!("    access approve <request> [--dry-run|--wait]");
         println!("    access revoke <session-or-agent>");
         println!("    access deny <request>... [--reason text]");
         println!("    access extend <session-or-agent> \"<intent>\" [--once|--uses N]");

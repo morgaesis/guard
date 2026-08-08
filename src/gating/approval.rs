@@ -294,6 +294,23 @@ impl ApprovalRegistry {
         self.notifiers.get(handle).cloned()
     }
 
+    /// Obtain the notifier for an existing hold, creating it when the row has
+    /// none. `from_rows` rebuilds the registry without notifiers, so every hold
+    /// recovered across a restart needs one minted on first wait; without this
+    /// a waiter parks on a notifier nobody wakes. Returns `None` for an unknown
+    /// handle so a caller cannot mint state for a row that does not exist.
+    pub fn notifier_or_create(&mut self, handle: &str) -> Option<Arc<Notify>> {
+        if !self.items.contains_key(handle) {
+            return None;
+        }
+        Some(
+            self.notifiers
+                .entry(handle.to_string())
+                .or_insert_with(|| Arc::new(Notify::new()))
+                .clone(),
+        )
+    }
+
     /// All holds, newest first.
     pub fn list(&self) -> Vec<Approval> {
         let mut v: Vec<_> = self.items.values().cloned().collect();
