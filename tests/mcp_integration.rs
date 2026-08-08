@@ -700,6 +700,8 @@ async fn mcp_end_to_end_initialize_list_call() {
             "guard_evaluate_batch",
             "guard_access_show",
             "guard_access_status",
+            "guard_approval_show",
+            "guard_approval_resume",
         ],
         "MCP must advertise the complete intentional tool contract"
     );

@@ -28,6 +28,8 @@ const APPROVAL_LIST_TOOL_NAME: &str = "guard_access_list";
 const EVALUATE_BATCH_TOOL_NAME: &str = "guard_evaluate_batch";
 const ACCESS_SHOW_TOOL_NAME: &str = "guard_access_show";
 const ACCESS_STATUS_TOOL_NAME: &str = "guard_access_status";
+const APPROVAL_SHOW_TOOL_NAME: &str = "guard_approval_show";
+const APPROVAL_RESUME_TOOL_NAME: &str = "guard_approval_resume";
 const BUILT_IN_TOOL_NAMES: &[&str] = &[
     DEFAULT_TOOL_NAME,
     VERB_LIST_TOOL_NAME,
@@ -36,6 +38,8 @@ const BUILT_IN_TOOL_NAMES: &[&str] = &[
     EVALUATE_BATCH_TOOL_NAME,
     ACCESS_SHOW_TOOL_NAME,
     ACCESS_STATUS_TOOL_NAME,
+    APPROVAL_SHOW_TOOL_NAME,
+    APPROVAL_RESUME_TOOL_NAME,
 ];
 const TOOL_SCHEMA_VERSION: u64 = 1;
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-03-26", "2024-11-05"];
@@ -125,8 +129,8 @@ impl Default for McpConfig {
 // arguments) live in the library crate (`guard::wire::mcp`) so their parsing
 // surface can be fuzzed.
 use guard::wire::mcp::{
-    parse_jsonrpc_envelope, AccessShowArgs, EvaluateBatchArgs, GuardToolArgs, JsonRpcEnvelopeError,
-    ToolCallParams, WaitApproval,
+    parse_jsonrpc_envelope, AccessShowArgs, ApprovalArgs, EvaluateBatchArgs, GuardToolArgs,
+    JsonRpcEnvelopeError, ToolCallParams, WaitApproval,
 };
 
 #[derive(Debug, Clone)]
@@ -341,6 +345,11 @@ pub async fn serve(config: McpConfig) -> Result<()> {
     config.validate()?;
 
     let expose_admin_tools = config.socket_path.is_some() && config.tcp_port.is_none();
+    // Resuming a hold executes an operator-approved snapshot. The daemon
+    // authenticates this MCP process's peer credentials, not the HTTP caller's,
+    // so over HTTP any holder of the bearer could run a snapshot belonging to a
+    // different logical agent. The execute verb is therefore stdio-only.
+    let expose_execute_admin_tools = expose_admin_tools && config.http_addr.is_none();
     let executor = Arc::new(ClientExecutor {
         socket_path: config.socket_path.clone(),
         tcp_port: config.tcp_port,
@@ -349,7 +358,8 @@ pub async fn serve(config: McpConfig) -> Result<()> {
     });
     let server = McpServer::new(executor.clone(), executor, config.tool_name)
         .with_caller_token(config.session_token)
-        .with_admin_tools(expose_admin_tools);
+        .with_admin_tools(expose_admin_tools)
+        .with_execute_admin_tools(expose_execute_admin_tools);
 
     match config.http_addr {
         Some(addr) => {
@@ -827,6 +837,7 @@ struct McpServer<E: GuardExecutor, A: GuardAdmin> {
     admin: Arc<A>,
     tool_name: String,
     admin_tools: bool,
+    execute_admin_tools: bool,
     initialize_seen: bool,
     seen_request_ids: HashSet<String>,
     caller_token: Option<String>,
@@ -839,6 +850,7 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
             admin,
             tool_name,
             admin_tools: true,
+            execute_admin_tools: true,
             initialize_seen: false,
             seen_request_ids: HashSet::new(),
             caller_token: None,
@@ -855,12 +867,18 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
         self
     }
 
+    fn with_execute_admin_tools(mut self, execute_admin_tools: bool) -> Self {
+        self.execute_admin_tools = execute_admin_tools;
+        self
+    }
+
     fn fresh_connection(&self) -> Self {
         Self {
             executor: self.executor.clone(),
             admin: self.admin.clone(),
             tool_name: self.tool_name.clone(),
             admin_tools: self.admin_tools,
+            execute_admin_tools: self.execute_admin_tools,
             initialize_seen: false,
             seen_request_ids: HashSet::new(),
             caller_token: self.caller_token.clone(),
@@ -975,6 +993,15 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                 } else if self.admin_tools && tool_call.name == ACCESS_STATUS_TOOL_NAME {
                     let result = self.call_session_status(tool_call.arguments).await;
                     jsonrpc_result_response(id, result)
+                } else if self.admin_tools && tool_call.name == APPROVAL_SHOW_TOOL_NAME {
+                    let result = self.call_approval_show(tool_call.arguments).await;
+                    jsonrpc_result_response(id, result)
+                } else if self.execute_admin_tools
+                    && self.admin_tools
+                    && tool_call.name == APPROVAL_RESUME_TOOL_NAME
+                {
+                    let result = self.call_approval_resume(tool_call.arguments).await;
+                    jsonrpc_result_response(id, result)
                 } else {
                     jsonrpc_error_response(
                         id,
@@ -1029,7 +1056,7 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                 {
                     "name": self.tool_name,
                     "title": "Run Command Through Guard",
-                    "description": "Execute a command through the guard daemon. Provide binary (with optional args) for a raw command, or verb for a catalog verb invocation; one of the two is required. The command is evaluated against security policy before execution. Plain environment overrides and named secret references are optional; secret values are resolved by the daemon and never exposed to the client.",
+                    "description": "Execute a command through the guard daemon. Provide binary (with optional args) for a raw command, or verb for a catalog verb invocation; one of the two is required. The command is evaluated against security policy before execution. Plain environment overrides and named secret references are optional; secret values are resolved by the daemon and never exposed to the client. Branch on `status`, not on `allowed`: `held` and `provisional` are both `allowed: true` because the request was authorized, and `held` means it has not executed. A held command waits for an operator; retrieve its outcome with guard_approval_show.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -1314,11 +1341,15 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                 }
             ]
         });
+        let tools = result["tools"]
+            .as_array_mut()
+            .expect("tools result is an array");
+        tools.push(approval_show_tool());
+        tools.push(approval_resume_tool());
         if !self.admin_tools {
-            result["tools"]
-                .as_array_mut()
-                .expect("tools result is an array")
-                .truncate(1);
+            tools.truncate(1);
+        } else if !self.execute_admin_tools {
+            tools.retain(|tool| tool["name"] != APPROVAL_RESUME_TOOL_NAME);
         }
         result
     }
@@ -1470,6 +1501,81 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
         }
     }
 
+    /// Proxy `ApprovalShow`, or `ApprovalWait` when the caller asked to block.
+    /// This is the path by which an agent retrieves the outcome of a command it
+    /// did not hold a connection open for. The daemon scopes it to the hold's
+    /// owner (or the operator) and returns the same not-found for anyone else,
+    /// so this tool grants no read authority the caller did not already have.
+    async fn call_approval_show(&self, arguments: Value) -> Value {
+        let args: ApprovalArgs = match serde_json::from_value(arguments) {
+            Ok(args) => args,
+            Err(error) => return tool_error_result(format!("invalid tool arguments: {error}")),
+        };
+        let request = match args.wait {
+            Some(timeout_secs) => server::AdminRequest::ApprovalWait {
+                handle: args.reference,
+                timeout_secs: Some(timeout_secs),
+            },
+            None => server::AdminRequest::ApprovalShow {
+                handle: args.reference,
+            },
+        };
+        match self.admin.send_admin(request).await {
+            Ok(server::AdminResponse::ApprovalShow { item }) => admin_tool_result(
+                "approval_show",
+                render_approval_text(&item),
+                json!({ "item": item }),
+            ),
+            Ok(server::AdminResponse::Error { message }) => tool_error_result(message),
+            Ok(_) => tool_error_result("unexpected response from guard daemon".to_string()),
+            Err(error) => tool_error_result(format!("{error:#}")),
+        }
+    }
+
+    /// Proxy `AdminRequest::Resume`. This is an execute verb, exposed only over
+    /// stdio; see `expose_execute_admin_tools`.
+    async fn call_approval_resume(&self, arguments: Value) -> Value {
+        let args: AccessShowArgs = match serde_json::from_value(arguments) {
+            Ok(args) => args,
+            Err(error) => return tool_error_result(format!("invalid tool arguments: {error}")),
+        };
+        match self
+            .admin
+            .send_admin(server::AdminRequest::Resume {
+                handle: args.reference,
+            })
+            .await
+        {
+            Ok(server::AdminResponse::GateAction {
+                message,
+                exit_code,
+                stdout,
+                stderr,
+            }) => {
+                let text = format!(
+                    "{message}\n{}{}",
+                    stdout.as_deref().unwrap_or_default(),
+                    stderr.as_deref().unwrap_or_default()
+                );
+                admin_tool_result(
+                    "approval_resume",
+                    text,
+                    json!({
+                        "result": {
+                            "message": message,
+                            "exit_code": exit_code,
+                            "stdout": stdout,
+                            "stderr": stderr,
+                        }
+                    }),
+                )
+            }
+            Ok(server::AdminResponse::Error { message }) => tool_error_result(message),
+            Ok(_) => tool_error_result("unexpected response from guard daemon".to_string()),
+            Err(error) => tool_error_result(format!("{error:#}")),
+        }
+    }
+
     async fn call_session_status(&self, arguments: Value) -> Value {
         let args: AccessShowArgs = match serde_json::from_value(arguments) {
             Ok(args) => args,
@@ -1534,6 +1640,91 @@ fn render_verbs_text(items: &[server::VerbSummary]) -> String {
     lines.join("\n")
 }
 
+/// The read tool by which an agent retrieves its own held command's outcome.
+fn approval_show_tool() -> Value {
+    json!({
+        "name": APPROVAL_SHOW_TOOL_NAME,
+        "title": "Show a Held Command",
+        "description": "Show one held command owned by the caller, including its persisted transcript and exit code once it has run. With `wait`, block until an operator arms it or it reaches a terminal state, up to that many seconds. Read-only: it never approves and never executes. `status` is `pending` while it awaits a decision, `armed` once an operator approved it and it is waiting to be resumed, and a terminal value once it is finished.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "reference": { "type": "string" },
+                "wait": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional: seconds to block for the hold to be armed or decided. Omit to read the current state and return immediately."
+                }
+            },
+            "required": ["reference"]
+        },
+        "outputSchema": admin_output_schema("approval_show", "item", json!({ "type": "object" })),
+        "annotations": {
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false
+        }
+    })
+}
+
+/// The execute verb for an armed hold. Listed only over stdio.
+fn approval_resume_tool() -> Value {
+    json!({
+        "name": APPROVAL_RESUME_TOOL_NAME,
+        "title": "Resume an Armed Held Command",
+        "description": "Run one held command that an operator armed, as its original requester. The daemon accepts a single durable execution claim, so a hold runs at most once. Use guard_approval_show first to confirm the hold is armed.",
+        "inputSchema": {
+            "type": "object",
+            "properties": { "reference": { "type": "string" } },
+            "required": ["reference"]
+        },
+        "outputSchema": admin_output_schema("approval_resume", "result", json!({ "type": "object" })),
+        "annotations": {
+            "readOnlyHint": false,
+            "destructiveHint": true,
+            "idempotentHint": false,
+            "openWorldHint": true
+        }
+    })
+}
+
+/// One held command as text an agent can act on. `status` is the field to
+/// branch on; the transcript is present once the hold has run.
+fn render_approval_text(item: &server::ApprovalSummary) -> String {
+    let mut line = format!(
+        "{} status={} command={} deadline={}",
+        item.handle, item.status, item.command, item.deadline_unix
+    );
+    if let Some(reason) = item.decided_reason.as_deref() {
+        line.push_str(&format!("\nreason: {reason}"));
+    }
+    match item.status.as_str() {
+        "pending" => line.push_str("\nno operator decision yet; nothing has executed"),
+        "armed" => line.push_str(&format!(
+            "\napproved and armed; run it with guard_approval_resume {}",
+            item.handle
+        )),
+        _ => {}
+    }
+    if let Some(exit_code) = item.exit_code {
+        line.push_str(&format!("\nexit_code: {exit_code}"));
+    }
+    if let Some(stdout) = item.stdout.as_deref() {
+        line.push_str(&format!("\nstdout:\n{stdout}"));
+        if item.stdout_truncated {
+            line.push_str("\n[guard stdout transcript truncated]");
+        }
+    }
+    if let Some(stderr) = item.stderr.as_deref() {
+        line.push_str(&format!("\nstderr:\n{stderr}"));
+        if item.stderr_truncated {
+            line.push_str("\n[guard stderr transcript truncated]");
+        }
+    }
+    line
+}
+
 fn render_access_text(items: &[server::AccessItem]) -> String {
     if items.is_empty() {
         return "(no access requests or sessions)".to_string();
@@ -1541,8 +1732,20 @@ fn render_access_text(items: &[server::AccessItem]) -> String {
     items
         .iter()
         .map(|item| {
+            // A hold has no use budget, so the segment is omitted rather than
+            // carrying a value that governs nothing.
+            let uses = match item.use_policy.as_str() {
+                "none" => String::new(),
+                "bounded" => format!(
+                    " uses={}",
+                    item.remaining_uses
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "0".to_string())
+                ),
+                other => format!(" uses={other}"),
+            };
             let mut line = format!(
-                "{} requester={} target={} scope={} expiry={} uses={} state={} next={}",
+                "{} requester={} target={} scope={} expiry={}{} state={} next={}",
                 item.reference,
                 item.requester,
                 item.target,
@@ -1554,13 +1757,7 @@ fn render_access_text(items: &[server::AccessItem]) -> String {
                 item.expires_unix
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "none".to_string()),
-                match item.use_policy.as_str() {
-                    "bounded" => item
-                        .remaining_uses
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "0".to_string()),
-                    other => other.to_string(),
-                },
+                uses,
                 item.state,
                 item.next_action
             );
@@ -2883,6 +3080,8 @@ mod tests {
                 EVALUATE_BATCH_TOOL_NAME,
                 ACCESS_SHOW_TOOL_NAME,
                 ACCESS_STATUS_TOOL_NAME,
+                APPROVAL_SHOW_TOOL_NAME,
+                APPROVAL_RESUME_TOOL_NAME,
             ]
         );
         let access_request = &response["result"]["tools"][2];

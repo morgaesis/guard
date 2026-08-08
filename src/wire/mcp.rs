@@ -184,6 +184,16 @@ pub struct AccessShowArgs {
     pub reference: String,
 }
 
+/// Arguments for the approval tools. `wait` names a bounded number of seconds
+/// to block for the hold to be armed or decided; omitting it reads the current
+/// state and returns immediately.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApprovalArgs {
+    pub reference: String,
+    #[serde(default)]
+    pub wait: Option<u64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
