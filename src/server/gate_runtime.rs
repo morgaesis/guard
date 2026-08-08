@@ -423,6 +423,8 @@ impl guard::proxy::GateSink for DaemonGateSink {
             decision_trace: Some(guard::gating::DecisionTrace::source("api_proxy")),
             created_unix: now,
             deadline_unix: now.saturating_add(self.window_secs),
+            window_secs: self.window_secs,
+            auto_reverted_unix: None,
             forward_done: true,
             status: ProvisionalStatus::Armed,
             revert_exit: None,
@@ -1259,6 +1261,8 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
         // No confirmation deadline exists until the forward command exits
         // successfully. Zero is a persisted sentinel for "not started".
         deadline_unix: 0,
+        window_secs: 0,
+        auto_reverted_unix: None,
         forward_done: false,
         status: ProvisionalStatus::Armed,
         revert_exit: None,
@@ -1301,6 +1305,12 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
                 let mut reg = server.state.provisional.write().await;
                 reg.mark_forward_done(&handle, exit_code, finished_unix, window)
             };
+            // Zero on a forward command that did not exit cleanly: no timer was
+            // armed, so the response must not advertise a deadline.
+            let (armed_deadline, armed_window) = updated
+                .as_ref()
+                .map(|u| (u.deadline_unix, u.window_secs))
+                .unwrap_or((0, 0));
             if let Some(u) = updated {
                 persist_provisional(server, &u).await;
             }
@@ -1342,6 +1352,8 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
                 exit_code,
                 stdout,
                 stderr,
+                armed_deadline,
+                armed_window,
             )
             .with_exposed_secret_refs(exposed_secret_refs)
         }
@@ -2953,10 +2965,15 @@ pub(super) async fn finish_revert(
             ),
         }
     };
+    // `kind` names who drove this rollback ("auto"/"auto-check-failed" for the
+    // deadline sweeper, "manual" for `guard revert`). Only the sweeper's own
+    // rollback stamps the row, so a later `guard confirm` can say the timer
+    // fired rather than only that the handle is spent.
+    let auto_reverted_unix = kind.starts_with("auto").then(now_unix);
     let updated = {
         let mut reg = server.state.provisional.write().await;
         if status_ok {
-            reg.set_reverted(&p.handle, exit);
+            reg.set_reverted(&p.handle, exit, auto_reverted_unix);
         } else {
             reg.set_revert_failed(
                 &p.handle,

@@ -155,6 +155,32 @@ fn print_verb_guidance(response: &server::ExecuteResponse) {
     }
 }
 
+/// The `result:` and `window:` lines of a PROVISIONAL banner. The armed
+/// deadline is the operative fact: without it the banner reads as an
+/// indefinite hold, and the automatic rollback that follows looks like a
+/// malfunction. A daemon that does not report the window falls back to the
+/// deadline-free wording rather than inventing one.
+fn provisional_window_lines(response: &server::ExecuteResponse) -> Vec<String> {
+    let (Some(deadline), Some(window)) =
+        (response.confirm_deadline_unix, response.confirm_window_secs)
+    else {
+        return vec!["result:  executed, auto-reverts unless confirmed".to_string()];
+    };
+    vec![
+        format!(
+            "result:  executed, auto-reverts in {window}s (at {}) unless confirmed",
+            format_timestamp(deadline)
+        ),
+        "window:  set with --confirm-within SECONDS".to_string(),
+    ]
+}
+
+fn print_provisional_window(response: &server::ExecuteResponse) {
+    for line in provisional_window_lines(response) {
+        eprintln!("  {line}");
+    }
+}
+
 fn access_request_guidance_lines(response: &server::ExecuteResponse) -> Vec<String> {
     if !response.access_requests.is_empty() {
         return response
@@ -325,7 +351,7 @@ pub(crate) async fn run_exec(
             eprintln!("  handle:  {}", handle);
             eprintln!("  confirm: guard confirm {}", handle);
             eprintln!("  inspect: guard provisionals");
-            eprintln!("  result:  executed, auto-reverts unless confirmed");
+            print_provisional_window(&resp);
             print_coverage(&resp.coverage);
             if let Some(code) = resp.exit_code {
                 std::process::exit(code);
@@ -2101,7 +2127,7 @@ fn render_gated_response(
             eprintln!("  handle:  {}", handle);
             eprintln!("  confirm: guard confirm {}", handle);
             eprintln!("  inspect: guard provisionals");
-            eprintln!("  result:  executed, auto-reverts unless confirmed");
+            print_provisional_window(resp);
             print_coverage(&resp.coverage);
             if let Some(code) = resp.exit_code {
                 std::process::exit(code);
@@ -2808,6 +2834,8 @@ mod tests {
             coverage: None,
             verb_matches: Vec::new(),
             verb_guidance: Some("request access".to_string()),
+            confirm_deadline_unix: None,
+            confirm_window_secs: None,
             decision_source: "access_gate".to_string(),
             decision_trace: None,
         };
@@ -2824,6 +2852,59 @@ mod tests {
                 "inspect: guard access show gr-22222222222222222222222222222222",
             ]
         );
+    }
+
+    fn provisional_response(
+        confirm_deadline_unix: Option<u64>,
+        confirm_window_secs: Option<u64>,
+    ) -> server::ExecuteResponse {
+        server::ExecuteResponse {
+            allowed: true,
+            reason: "recoverable change".to_string(),
+            exit_code: Some(0),
+            stdout: None,
+            stderr: None,
+            status: Some(server::GateStatus::Provisional),
+            handle: Some("pv-1".to_string()),
+            approval_options: Vec::new(),
+            access_requests: Vec::new(),
+            coverage: None,
+            verb_matches: Vec::new(),
+            verb_guidance: None,
+            confirm_deadline_unix,
+            confirm_window_secs,
+            decision_source: "llm".to_string(),
+            decision_trace: None,
+        }
+    }
+
+    #[test]
+    fn the_provisional_banner_states_the_armed_deadline_and_how_to_change_it() {
+        let lines = provisional_window_lines(&provisional_response(Some(1_700_000_300), Some(300)));
+        assert_eq!(
+            lines,
+            vec![
+                "result:  executed, auto-reverts in 300s (at 2023-11-14T22:18:20Z (1700000300)) \
+                 unless confirmed"
+                    .to_string(),
+                "window:  set with --confirm-within SECONDS".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_daemon_that_reports_no_deadline_keeps_the_deadline_free_wording() {
+        for response in [
+            provisional_response(None, None),
+            provisional_response(Some(1_700_000_300), None),
+            provisional_response(None, Some(300)),
+        ] {
+            let lines = provisional_window_lines(&response);
+            assert_eq!(
+                lines,
+                vec!["result:  executed, auto-reverts unless confirmed".to_string()]
+            );
+        }
     }
 
     #[test]
@@ -3266,6 +3347,8 @@ mod tests {
             coverage: None,
             verb_matches: Vec::new(),
             verb_guidance: None,
+            confirm_deadline_unix: None,
+            confirm_window_secs: None,
             decision_source: "static_policy".to_string(),
             decision_trace: Some(guard::gating::DecisionTrace::source("static_policy")),
         };

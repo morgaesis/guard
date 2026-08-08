@@ -1270,6 +1270,14 @@ pub struct ExecuteResponse {
     /// Actionable guidance for denied or held coverage decisions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verb_guidance: Option<String>,
+    /// Wall-clock second at which an armed containment envelope auto-reverts,
+    /// and the window in seconds behind it. Present only on a `Provisional`
+    /// response; absent from an older daemon, whose clients keep the previous
+    /// deadline-free wording.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm_deadline_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm_window_secs: Option<u64>,
     /// Stable source label for the admission decision.
     #[serde(default = "default_decision_source")]
     pub decision_source: String,
@@ -1406,6 +1414,9 @@ pub(super) enum ExecOutcome {
         exit_code: Option<i32>,
         stdout: Option<String>,
         stderr: Option<String>,
+        /// Armed auto-revert deadline and the window behind it.
+        deadline_unix: u64,
+        window_secs: u64,
     },
 }
 
@@ -1562,6 +1573,7 @@ impl ExecuteResult {
     }
 
     /// Approved and executed inside a containment envelope.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn provisional(
         reason: impl Into<String>,
         handle: String,
@@ -1569,6 +1581,8 @@ impl ExecuteResult {
         exit_code: Option<i32>,
         stdout: Option<String>,
         stderr: Option<String>,
+        deadline_unix: u64,
+        window_secs: u64,
     ) -> Self {
         Self {
             policy: PolicyOutcome::Allowed {
@@ -1580,6 +1594,8 @@ impl ExecuteResult {
                 exit_code,
                 stdout,
                 stderr,
+                deadline_unix,
+                window_secs,
             },
             request_handle: None,
             access_requests: Vec::new(),
@@ -1735,6 +1751,8 @@ impl ExecuteResult {
                 coverage: None,
                 verb_matches,
                 verb_guidance,
+                confirm_deadline_unix: None,
+                confirm_window_secs: None,
                 decision_source,
                 decision_trace,
             },
@@ -1758,6 +1776,8 @@ impl ExecuteResult {
                 coverage: None,
                 verb_matches,
                 verb_guidance,
+                confirm_deadline_unix: None,
+                confirm_window_secs: None,
                 decision_source,
                 decision_trace,
             },
@@ -1776,6 +1796,8 @@ impl ExecuteResult {
                 coverage,
                 verb_matches,
                 verb_guidance,
+                confirm_deadline_unix: None,
+                confirm_window_secs: None,
                 decision_source,
                 decision_trace,
             },
@@ -1792,6 +1814,8 @@ impl ExecuteResult {
                 coverage: None,
                 verb_matches,
                 verb_guidance,
+                confirm_deadline_unix: None,
+                confirm_window_secs: None,
                 decision_source,
                 decision_trace,
             },
@@ -1815,6 +1839,8 @@ impl ExecuteResult {
                     coverage: Some(coverage),
                     verb_matches,
                     verb_guidance,
+                    confirm_deadline_unix: None,
+                    confirm_window_secs: None,
                     decision_source,
                     decision_trace,
                 }
@@ -1825,6 +1851,8 @@ impl ExecuteResult {
                 exit_code,
                 stdout,
                 stderr,
+                deadline_unix,
+                window_secs,
             } => ExecuteResponse {
                 allowed: true,
                 reason: policy_reason,
@@ -1838,6 +1866,8 @@ impl ExecuteResult {
                 coverage: Some(coverage),
                 verb_matches,
                 verb_guidance,
+                confirm_deadline_unix: (deadline_unix > 0).then_some(deadline_unix),
+                confirm_window_secs: (window_secs > 0).then_some(window_secs),
                 decision_source,
                 decision_trace,
             },
