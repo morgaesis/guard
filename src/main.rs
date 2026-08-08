@@ -1580,38 +1580,12 @@ struct UtcTimestamp;
 impl FormatTime for UtcTimestamp {
     fn format_time(&self, writer: &mut Writer<'_>) -> std::fmt::Result {
         let now = guard::env::now_unix();
-        write!(writer, "{}", unix_seconds_to_utc(now))
+        write!(writer, "{}", guard::env::unix_seconds_to_utc(now))
     }
-}
-
-fn unix_seconds_to_utc(ts: u64) -> String {
-    let days = (ts / 86_400) as i64;
-    let seconds = ts % 86_400;
-    let hour = seconds / 3_600;
-    let minute = (seconds % 3_600) / 60;
-    let second = seconds % 60;
-    let (year, month, day) = civil_from_days(days);
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
-}
-
-fn civil_from_days(days_since_epoch: i64) -> (i64, u64, u64) {
-    let z = days_since_epoch + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let mut year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = mp + if mp < 10 { 3 } else { -9 };
-    if month <= 2 {
-        year += 1;
-    }
-    (year, month as u64, day as u64)
 }
 
 fn format_timestamp(ts: u64) -> String {
-    format!("{} ({ts})", unix_seconds_to_utc(ts))
+    format!("{} ({ts})", guard::env::unix_seconds_to_utc(ts))
 }
 
 fn log_cli_usage_error(args: &[String], error: &clap::Error) {

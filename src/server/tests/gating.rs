@@ -1183,6 +1183,8 @@ async fn api_revert_without_running_proxy_defers_to_operator() {
         decision_trace: None,
         created_unix: now,
         deadline_unix: now,
+        window_secs: 0,
+        auto_reverted_unix: None,
         forward_done: true,
         status: ProvisionalStatus::Reverting,
         revert_exit: None,
@@ -1302,6 +1304,8 @@ async fn api_revert_executes_through_registered_proxy_upstream() {
         decision_trace: None,
         created_unix: now,
         deadline_unix: now,
+        window_secs: 0,
+        auto_reverted_unix: None,
         forward_done: true,
         status: ProvisionalStatus::Reverting,
         revert_exit: None,
@@ -1606,6 +1610,8 @@ async fn session_status_does_not_cross_expose_same_principal_provisionals() {
             decision_trace: None,
             created_unix: now_unix(),
             deadline_unix: now_unix().saturating_add(60),
+            window_secs: 0,
+            auto_reverted_unix: None,
             forward_done: true,
             status: ProvisionalStatus::Armed,
             revert_exit: None,
@@ -4430,6 +4436,8 @@ async fn stored_entitlements_cover_tool_secrets_for_approval_check_and_revert() 
         decision_trace: None,
         created_unix: now_unix(),
         deadline_unix: now_unix(),
+        window_secs: 0,
+        auto_reverted_unix: None,
         forward_done: true,
         status: ProvisionalStatus::Reverting,
         revert_exit: None,
@@ -4745,6 +4753,8 @@ async fn provisional_revert_executes_in_snapshotted_cwd() {
         decision_trace: None,
         created_unix: now_unix(),
         deadline_unix: now_unix(),
+        window_secs: 0,
+        auto_reverted_unix: None,
         forward_done: true,
         status: ProvisionalStatus::Reverting,
         revert_exit: None,
@@ -4778,6 +4788,8 @@ fn provisional_result_carries_contain_coverage() {
         Some(0),
         None,
         None,
+        1_700_000_300,
+        300,
     );
     match &r.exec {
         ExecOutcome::Provisional {
@@ -4788,4 +4800,7 @@ fn provisional_result_carries_contain_coverage() {
         }
         other => panic!("expected Provisional, got {:?}", other),
     }
+    let response = r.into_response();
+    assert_eq!(response.confirm_deadline_unix, Some(1_700_000_300));
+    assert_eq!(response.confirm_window_secs, Some(300));
 }

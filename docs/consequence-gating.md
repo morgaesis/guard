@@ -45,6 +45,9 @@ deadline, and control path together. A chain that can sever the SSH, API,
 socket, credential, daemon, or other authority required to verify or revert is
 held. A recoverable operation without a usable rollback is also held.
 
+The `PROVISIONAL` banner states the armed deadline, in both elapsed seconds and
+wall-clock time, and names `--confirm-within` as the flag that sets it.
+
 At the deadline, a confirmation check that exits zero keeps the change. Any
 other outcome, including timeout or spawn failure, runs the rollback. Without a
 check, an unconfirmed envelope rolls back. An operator can decide early:
@@ -54,6 +57,10 @@ guard provisionals
 guard confirm <handle>
 guard revert <handle>
 ```
+
+A `guard confirm` or `guard revert` on a handle whose deadline already fired
+reports when the automatic rollback ran and the window that elapsed, so an
+envelope that did what it was armed to do is distinguishable from a fault.
 
 Forward, verification, and rollback preserve the canonical working directory,
 principal, and approved daemon-side credential bindings. Persisted plans store

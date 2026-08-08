@@ -2336,9 +2336,12 @@ fn valid_approval_transition(previous: &Approval, next: &Approval) -> Result<boo
 fn provisional_identity(provisional: &Provisional) -> Provisional {
     let mut identity = provisional.clone();
     identity.decision_trace = None;
-    // The confirmation deadline is assigned only after the forward command
-    // completes successfully. It is lifecycle state, not immutable identity.
+    // The confirmation deadline, the window behind it, and the automatic
+    // rollback stamp are all assigned after the forward command completes.
+    // They are lifecycle state, not immutable identity.
     identity.deadline_unix = 0;
+    identity.window_secs = 0;
+    identity.auto_reverted_unix = None;
     identity.forward_done = false;
     identity.status = ProvisionalStatus::Armed;
     identity.revert_exit = None;
@@ -2353,7 +2356,10 @@ fn valid_provisional_transition(previous: &Provisional, next: &Provisional) -> R
     {
         return Ok(false);
     }
-    if previous.forward_done && previous.deadline_unix != next.deadline_unix {
+    if previous.forward_done
+        && (previous.deadline_unix != next.deadline_unix
+            || previous.window_secs != next.window_secs)
+    {
         return Ok(false);
     }
     if !previous.forward_done && next.forward_done {
@@ -2364,7 +2370,7 @@ fn valid_provisional_transition(previous: &Provisional, next: &Provisional) -> R
         if !successful_completion && !failed_completion {
             return Ok(false);
         }
-    } else if !next.forward_done && next.deadline_unix != 0 {
+    } else if !next.forward_done && (next.deadline_unix != 0 || next.window_secs != 0) {
         return Ok(false);
     }
     let legal_status = matches!(
@@ -3265,6 +3271,8 @@ mod tests {
                 decision_trace: Some(trace.clone()),
                 created_unix: 1,
                 deadline_unix: u64::MAX,
+                window_secs: 0,
+                auto_reverted_unix: None,
                 forward_done: true,
                 status: ProvisionalStatus::Armed,
                 revert_exit: None,
@@ -3529,6 +3537,8 @@ mod tests {
             decision_trace: None,
             created_unix: 1,
             deadline_unix: 2,
+            window_secs: 0,
+            auto_reverted_unix: None,
             forward_done: true,
             status: ProvisionalStatus::Armed,
             revert_exit: None,
@@ -4119,6 +4129,8 @@ mod tests {
             decision_trace: None,
             created_unix: 1,
             deadline_unix: u64::MAX,
+            window_secs: 0,
+            auto_reverted_unix: None,
             forward_done: true,
             status: ProvisionalStatus::Reverting,
             revert_exit: None,

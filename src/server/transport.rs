@@ -278,6 +278,8 @@ mod api_session_event_tests {
             decision_trace: None,
             created_unix: 1,
             deadline_unix: u64::MAX,
+            window_secs: 0,
+            auto_reverted_unix: None,
             forward_done: true,
             status: ProvisionalStatus::Armed,
             revert_exit: None,
@@ -1564,6 +1566,8 @@ fn validation_error_response(reason: String) -> ExecuteResponse {
         coverage: None,
         verb_matches: Vec::new(),
         verb_guidance: None,
+        confirm_deadline_unix: None,
+        confirm_window_secs: None,
         decision_source: "validation".to_string(),
         decision_trace: Some(guard::gating::DecisionTrace::source("validation")),
     }
