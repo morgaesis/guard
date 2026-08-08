@@ -22,6 +22,23 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// Denial reason for a command that matched no rule in a loaded policy.
+pub const DEFAULT_DENY_REASON: &str = "default-deny: no matching allow rule";
+
+/// Denial reason when neither a policy nor the evaluator is available to
+/// decide. Like [`DEFAULT_DENY_REASON`] this is the absence of an approval.
+pub const NO_DECIDER_DEFAULT_DENY_REASON: &str = "no policy and LLM disabled: default-deny";
+
+/// True when a denial fell through to a default-deny rather than matching an
+/// operator-authored deny rule. The two are both reported as the static-policy
+/// decision source but differ in authority: a matched deny rule is an operator
+/// decision that only the operator can change, while a default-deny is missing
+/// coverage that an access request can supply. Callers append context to the
+/// reason before it reaches a client, so the match is on the prefix.
+pub fn is_default_deny_reason(reason: &str) -> bool {
+    reason.starts_with(DEFAULT_DENY_REASON) || reason.starts_with(NO_DECIDER_DEFAULT_DENY_REASON)
+}
+
 /// Built-in operating modes for the policy engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyMode {
@@ -364,7 +381,7 @@ impl PolicyEngine {
         }
 
         // 4. Default-deny: anything not explicitly allowed is denied
-        PolicyResult::deny("default-deny: no matching allow rule".to_string())
+        PolicyResult::deny(DEFAULT_DENY_REASON.to_string())
     }
 
     /// Pre-LLM fast-reject check: returns `Some(reason)` only when `cmd`

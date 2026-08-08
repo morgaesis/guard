@@ -154,9 +154,11 @@ or coverage changes invalidate affected authority.
 | `GUARD_API_VERB_COVERAGE_MIN_DENIALS` | `3` | Evidence required for API deny coverage. |
 | `GUARD_API_VERB_COVERAGE_STATE` | state directory | Generated API coverage state. |
 
-`guard run --reevaluate` skips only a generated deny-shape match. It never
-bypasses operator-authored policy. Automatically promoted allows remain subject
-to the consequence floor, regime stamps, and declared coverage boundaries.
+`guard run --reevaluate` skips only a generated deny-shape match, reported as
+`source: learned-deny` on the denial. It never bypasses operator-authored
+policy and does not clear the decision cache. Automatically promoted allows
+remain subject to the consequence floor, regime stamps, and declared coverage
+boundaries.
 
 ## Child execution and secrets
 

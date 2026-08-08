@@ -587,7 +587,7 @@ impl Evaluator {
         }
 
         EvalResult::Deny {
-            reason: "no policy and LLM disabled: default-deny".to_string(),
+            reason: crate::policy::NO_DECIDER_DEFAULT_DENY_REASON.to_string(),
             source: EvalSource::StaticPolicy,
             risk: None,
         }

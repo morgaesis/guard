@@ -12,6 +12,8 @@ $ guard run uptime
 
 $ guard run rm -rf /etc/nginx
 DENIED: Recursive deletion of system configuration.
+  source:  static-policy
+  appeal:  operator-authored policy deny; absolute -- --reevaluate never skips it
 ```
 
 Guard combines operator policy and prose-first access requests with an LLM
