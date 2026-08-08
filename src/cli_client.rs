@@ -194,6 +194,70 @@ fn print_access_request_guidance(response: &server::ExecuteResponse) {
     }
 }
 
+/// The authority behind a denial, as the caller needs to act on it. This is a
+/// narrowing of the daemon's decision source: the evaluator's two spellings (a
+/// fresh model call and a cached verdict from one) are the same authority, and
+/// the static-policy source splits by whether a deny rule actually matched.
+fn deny_source_tag(decision_source: &str, reason: &str) -> String {
+    match decision_source {
+        "static_policy" if guard::policy::is_default_deny_reason(reason) => {
+            "static-default-deny".to_string()
+        }
+        "llm" => "evaluator".to_string(),
+        "cache" => "evaluator-cache".to_string(),
+        other => other.replace('_', "-"),
+    }
+}
+
+/// One line of accurate appeal guidance for a denial, keyed on its tag. Only a
+/// matched operator-authored deny rule is unappealable; every other source has
+/// a real route back, and naming the wrong one sends operators chasing a policy
+/// change that does not exist.
+fn deny_source_note(tag: &str) -> Option<&'static str> {
+    match tag {
+        "static-policy" => {
+            Some("operator-authored policy deny; absolute -- --reevaluate never skips it")
+        }
+        "static-default-deny" => Some(
+            "no policy rule covers this command; ask for coverage with guard access request",
+        ),
+        "learned-deny" => Some(
+            "auto-learned deny shape, not operator policy; --reevaluate forces a fresh evaluator look",
+        ),
+        "evaluator" => {
+            Some("evaluator judgment; revise the command or escalate with guard access request")
+        }
+        "evaluator-cache" => Some(
+            "cached evaluator judgment; --reevaluate skips learned shapes only, so escalate with guard access request",
+        ),
+        "session-deny" | "session-static-only" => Some(
+            "the attached session's own boundaries reject this; amend the session or escalate with guard access request",
+        ),
+        "evaluator-error" => Some(
+            "no decision was produced and the gate failed closed; retry once the evaluator is reachable",
+        ),
+        "validation" => Some("rejected before evaluation; correct the request itself"),
+        _ => None,
+    }
+}
+
+/// Source tag and appeal guidance printed under a `DENIED` line.
+fn deny_source_lines(response: &server::ExecuteResponse) -> Vec<String> {
+    let tag = deny_source_tag(&response.decision_source, &response.reason);
+    let note = deny_source_note(&tag);
+    let mut lines = vec![format!("source:  {tag}")];
+    if let Some(note) = note {
+        lines.push(format!("appeal:  {note}"));
+    }
+    lines
+}
+
+fn print_deny_source(response: &server::ExecuteResponse) {
+    for line in deny_source_lines(response) {
+        eprintln!("  {line}");
+    }
+}
+
 pub(crate) async fn run_exec(
     binary: String,
     args: Vec<String>,
@@ -379,6 +443,7 @@ pub(crate) async fn run_exec(
             paint("DENIED", AnsiColor::Red, color),
             resp.reason
         );
+        print_deny_source(&resp);
         print_access_request_guidance(&resp);
         print_verb_guidance(&resp);
         std::process::exit(EXIT_GUARD_DENIED);
@@ -2144,6 +2209,7 @@ fn render_gated_response(
                     label,
                     resp.reason
                 );
+                print_deny_source(resp);
                 print_access_request_guidance(resp);
                 print_verb_guidance(resp);
                 std::process::exit(EXIT_GUARD_DENIED);
@@ -2824,6 +2890,121 @@ mod tests {
                 "inspect: guard access show gr-22222222222222222222222222222222",
             ]
         );
+    }
+
+    fn denied_response(decision_source: &str) -> server::ExecuteResponse {
+        server::ExecuteResponse {
+            allowed: false,
+            reason: "rejected".to_string(),
+            exit_code: None,
+            stdout: None,
+            stderr: None,
+            status: None,
+            handle: None,
+            approval_options: Vec::new(),
+            access_requests: Vec::new(),
+            coverage: None,
+            verb_matches: Vec::new(),
+            verb_guidance: None,
+            decision_source: decision_source.to_string(),
+            decision_trace: None,
+        }
+    }
+
+    #[test]
+    fn every_deny_source_renders_a_distinct_tag_and_appeal_route() {
+        let rendered = [
+            ("static_policy", "matched deny pattern: rm*"),
+            ("static_policy", guard::policy::DEFAULT_DENY_REASON),
+            ("learned_deny", "repeatedly denied shape"),
+            ("llm", "destroys unbacked state"),
+            ("cache", "destroys unbacked state"),
+            ("session_deny", "outside the session boundary"),
+            ("evaluator_error", "evaluation error: upstream timeout"),
+            ("validation", "cwd must be an absolute path"),
+        ]
+        .map(|(source, reason)| {
+            let mut response = denied_response(source);
+            response.reason = reason.to_string();
+            deny_source_lines(&response).join("\n")
+        });
+
+        for (index, text) in rendered.iter().enumerate() {
+            assert_eq!(text.lines().count(), 2, "{text}");
+            for other in rendered.iter().skip(index + 1) {
+                assert_ne!(text, other);
+            }
+        }
+
+        let static_policy = &rendered[0];
+        assert!(
+            static_policy.contains("source:  static-policy"),
+            "{static_policy}"
+        );
+        assert!(static_policy.contains("absolute"), "{static_policy}");
+
+        let default_deny = &rendered[1];
+        assert!(
+            default_deny.contains("source:  static-default-deny"),
+            "{default_deny}"
+        );
+        assert!(
+            default_deny.contains("guard access request"),
+            "{default_deny}"
+        );
+
+        let learned = &rendered[2];
+        assert!(learned.contains("source:  learned-deny"), "{learned}");
+        assert!(learned.contains("--reevaluate"), "{learned}");
+
+        let evaluator = &rendered[3];
+        assert!(evaluator.contains("source:  evaluator"), "{evaluator}");
+        assert!(evaluator.contains("guard access request"), "{evaluator}");
+    }
+
+    #[test]
+    fn only_a_matched_policy_deny_rule_is_described_as_absolute() {
+        let appealable = [
+            ("static_policy", guard::policy::DEFAULT_DENY_REASON),
+            (
+                "static_policy",
+                guard::policy::NO_DECIDER_DEFAULT_DENY_REASON,
+            ),
+            ("learned_deny", "repeatedly denied shape"),
+            ("llm", "destroys unbacked state"),
+            ("cache", "destroys unbacked state"),
+            ("session_deny", "outside the session boundary"),
+            ("session_static_only", "outside the session boundary"),
+            ("evaluator_error", "evaluation error: upstream timeout"),
+            ("validation", "cwd must be an absolute path"),
+            ("api_proxy", "protocol hard-deny"),
+        ];
+        for (source, reason) in appealable {
+            let mut response = denied_response(source);
+            response.reason = reason.to_string();
+            let text = deny_source_lines(&response).join("\n");
+            assert!(!text.contains("absolute"), "{source}: {text}");
+            assert!(!text.contains("unappealable"), "{source}: {text}");
+        }
+    }
+
+    #[test]
+    fn a_default_deny_keeps_its_tag_once_the_daemon_appends_request_context() {
+        let mut response = denied_response("static_policy");
+        response.reason = format!(
+            "{}; access_request=gr-27e22174de1485fd77aacf889c524a42",
+            guard::policy::DEFAULT_DENY_REASON
+        );
+        assert_eq!(
+            deny_source_lines(&response)[0],
+            "source:  static-default-deny"
+        );
+    }
+
+    #[test]
+    fn an_unknown_deny_source_still_reports_its_tag() {
+        let lines = deny_source_lines(&denied_response("api_proxy"));
+        assert_eq!(lines, vec!["source:  api-proxy".to_string()]);
     }
 
     #[test]

@@ -118,6 +118,14 @@ rollback commands, and unavailable gate infrastructure fail to deny or hold.
 `DENIED` always means the forward operation did not execute. A provisional
 result states that execution occurred and rollback remains armed.
 
+A denial names the authority that produced it on a `source:` line and the route
+back on an `appeal:` line. `static-policy` is a matched operator-authored deny
+rule and is absolute; `static-default-deny` is missing coverage that `guard
+access request` supplies; `learned-deny` is a generated fast path that
+`--reevaluate` skips; `evaluator` and `evaluator-cache` are model judgments
+that `guard access request` escalates. The underlying source also appears in
+structured output as `decision_source`.
+
 ## Autonomous operation
 
 The operational target is deploy-and-forget authority for routine bounded work,
