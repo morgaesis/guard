@@ -3392,6 +3392,37 @@ mod tests {
         );
     }
 
+    /// Baseline coverage applies without a session and carries no reviewed
+    /// matcher, so it names what it does and stops there. Rendering a matcher
+    /// for it would put a decision in front of an operator that no approval
+    /// ever asks for.
+    #[test]
+    fn baseline_capabilities_render_no_matcher_detail() {
+        let capability = server::AccessCapability {
+            baseline: true,
+            ..helm_upgrade_capability()
+        };
+        for raw in [false, true] {
+            let lines = capability_detail_lines(&capability, "  ", raw).join("\n");
+            assert!(
+                lines.contains("description: Upgrades one Helm release"),
+                "baseline coverage still says what it does (raw={raw}):\n{lines}"
+            );
+            for absent in [
+                "command:",
+                "param ",
+                "coverage:",
+                "matcher:",
+                "matcher_digest:",
+            ] {
+                assert!(
+                    !lines.contains(absent),
+                    "baseline coverage must not render {absent:?} (raw={raw}):\n{lines}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn placeholders_render_as_the_values_the_caller_supplies() {
         assert_eq!(
