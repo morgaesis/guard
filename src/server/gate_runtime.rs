@@ -1423,13 +1423,12 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
                     .write()
                     .await
                     .mark_forward_persistence_failed(&handle, exit_code);
-                let response_reason = if exit_code == Some(0) {
-                    "command executed, but its durable auto-revert state could not be recorded; operator decision required".to_string()
-                } else {
-                    format!(
-                        "forward command exited with code {}, but its durable outcome could not be recorded; operator decision required",
-                        exit_code.unwrap_or_default()
-                    )
+                let response_reason = match exit_code {
+                    Some(0) => "command executed, but its durable auto-revert state could not be recorded; operator decision required".to_string(),
+                    Some(exit_code) => format!(
+                        "forward command exited with code {exit_code}, but its durable outcome could not be recorded; operator decision required"
+                    ),
+                    None => "forward command ended without an exit code, but its durable outcome could not be recorded; operator decision required".to_string(),
                 };
                 server.emit_audit_ungated(
                     AuditEvent::new(AuditKind::ProvisionalInterrupted)

@@ -583,6 +583,80 @@ async fn post_forward_persistence_failure_reports_no_durable_auto_revert_and_rec
 }
 
 #[cfg(unix)]
+#[tokio::test]
+async fn signal_and_post_forward_persistence_failure_remain_distinct() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = SessionStore::open(temp.path().join("state.db"), 3_600)
+        .await
+        .expect("open store");
+    let (mut cfg, _operator, agent) = gating_config(7_049, 1_000);
+    cfg.state.session_store = Some(store.clone());
+    let request = contain_request(
+        "sh",
+        &["-c", "sleep 0.2; kill -TERM $$"],
+        RevertSpec::new("true", Vec::new()),
+    );
+    let cfg_for_run = cfg.clone();
+    let agent_for_run = agent.clone();
+    let run = tokio::spawn(async move {
+        let mut sink = tokio::io::sink();
+        arm_containment_with_authority(
+            &mut RequestContext {
+                server: &cfg_for_run,
+                caller: &agent_for_run,
+                depth: 0,
+                stream_output: false,
+                stream_writer: &mut sink,
+            },
+            request,
+            agent_for_run.principal(),
+            "recoverable change".to_string(),
+            None,
+        )
+        .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if cfg
+                .state
+                .provisional
+                .read()
+                .await
+                .list()
+                .iter()
+                .any(|row| row.forward_outcome() == "running")
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("forward command should start");
+    store.fail_next_write_for_test();
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(4), run)
+        .await
+        .expect("forward command should finish")
+        .expect("forward task should not panic");
+    let response = result.into_response();
+    assert!(matches!(
+        response.status,
+        Some(GateStatus::ContainmentFailed(
+            ContainmentOutcome::PersistenceFailure {
+                command_started: true,
+                forward_exit_code: None,
+            }
+        ))
+    ));
+    assert!(response.reason.contains("without an exit code"));
+    assert!(!response.reason.contains("code 0"));
+    assert!(response.confirm_deadline_unix.is_none());
+    assert!(response.confirm_window_secs.is_none());
+}
+
+#[cfg(unix)]
 async fn post_forward_persistence_failure_fixture() -> (
     ServerContext,
     CallerIdentity,

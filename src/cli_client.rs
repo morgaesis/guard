@@ -179,11 +179,15 @@ fn provisional_window_lines(response: &server::ExecuteResponse) -> Vec<String> {
                 command_started: true,
                 forward_exit_code,
             } => match forward_exit_code {
-                Some(exit_code) if *exit_code != 0 => vec![format!(
+                Some(0) => vec![
+                    "result:  executed, but its durable auto-revert state could not be recorded; operator decision required"
+                        .to_string(),
+                ],
+                Some(exit_code) => vec![format!(
                     "result:  forward command exited with code {exit_code}, but its durable outcome could not be recorded; auto-revert was not armed; operator decision required"
                 )],
-                _ => vec![
-                    "result:  executed, but its durable auto-revert state could not be recorded; operator decision required"
+                None => vec![
+                    "result:  forward command ended without an exit code, and its durable outcome could not be recorded; auto-revert was not armed; operator decision required"
                         .to_string(),
                 ],
             },
@@ -3382,6 +3386,25 @@ mod tests {
             provisional_window_lines(&response),
             vec![
                 "result:  containment failed before forward execution because durable rollback state was unavailable"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_signal_plus_durability_failure_preserves_both_facts() {
+        let mut response = provisional_response(None, None);
+        response.exit_code = None;
+        response.status = Some(server::GateStatus::ContainmentFailed(
+            server::ContainmentOutcome::PersistenceFailure {
+                command_started: true,
+                forward_exit_code: None,
+            },
+        ));
+        assert_eq!(
+            provisional_window_lines(&response),
+            vec![
+                "result:  forward command ended without an exit code, and its durable outcome could not be recorded; auto-revert was not armed; operator decision required"
                     .to_string()
             ]
         );
