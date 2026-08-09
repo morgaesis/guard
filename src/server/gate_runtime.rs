@@ -1192,7 +1192,7 @@ pub(super) async fn arm_containment_with_authority<W: AsyncWrite + Unpin>(
     .await
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) async fn arm_containment_with_access_use_for_test<W: AsyncWrite + Unpin>(
     context: &mut RequestContext<'_, W>,
     request: ExecuteRequest,

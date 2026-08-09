@@ -1785,7 +1785,7 @@ impl SessionStore {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn fail_next_provisional_delete_for_test(&self) {
         self.fail_next_provisional_delete
             .store(true, std::sync::atomic::Ordering::SeqCst);
