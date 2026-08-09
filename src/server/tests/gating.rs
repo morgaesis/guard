@@ -422,7 +422,12 @@ async fn confirmation_deadline_starts_after_long_forward_and_survives_restart() 
 #[cfg(unix)]
 #[tokio::test]
 async fn containment_dropped_when_forward_fails_to_spawn() {
-    let (cfg, _operator, agent) = gating_config(7002, 1000);
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = SessionStore::open(temp.path().join("state.db"), 3_600)
+        .await
+        .expect("open store");
+    let (mut cfg, _operator, agent) = gating_config(7002, 1000);
+    cfg.state.session_store = Some(store);
     let agent_principal = agent.principal();
 
     let request = contain_request(
