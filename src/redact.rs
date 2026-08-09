@@ -519,9 +519,15 @@ enum OptionValueKind {
 
 struct BinaryOptionAlias {
     binaries: &'static [&'static str],
-    required_argument: Option<&'static str>,
+    required_subcommand: Option<&'static str>,
     options: &'static [&'static str],
     value_kind: OptionValueKind,
+}
+
+struct BinaryValuelessOption {
+    binaries: &'static [&'static str],
+    required_subcommand: Option<&'static str>,
+    options: &'static [&'static str],
 }
 
 /// Opaque credential-taking options whose spelling does not carry enough
@@ -532,45 +538,66 @@ struct BinaryOptionAlias {
 const BINARY_OPTION_ALIASES: &[BinaryOptionAlias] = &[
     BinaryOptionAlias {
         binaries: &["curl"],
-        required_argument: None,
+        required_subcommand: None,
         options: &["-u", "--user", "--proxy-user"],
         value_kind: OptionValueKind::Credential,
     },
     BinaryOptionAlias {
         binaries: &["curl"],
-        required_argument: None,
+        required_subcommand: None,
         options: &["-H", "--header", "--proxy-header"],
         value_kind: OptionValueKind::NamedField,
     },
     BinaryOptionAlias {
         binaries: &["http", "https"],
-        required_argument: None,
+        required_subcommand: None,
         options: &["-a", "--auth"],
         value_kind: OptionValueKind::Credential,
     },
     BinaryOptionAlias {
         binaries: &["mysql", "mariadb", "mysqldump"],
-        required_argument: None,
+        required_subcommand: None,
         options: &["-p"],
         value_kind: OptionValueKind::Credential,
     },
     BinaryOptionAlias {
         binaries: &["redis-cli"],
-        required_argument: None,
+        required_subcommand: None,
         options: &["-a"],
         value_kind: OptionValueKind::Credential,
     },
     BinaryOptionAlias {
         binaries: &["sshpass"],
-        required_argument: None,
+        required_subcommand: None,
         options: &["-p"],
         value_kind: OptionValueKind::Credential,
     },
     BinaryOptionAlias {
         binaries: &["docker", "podman"],
-        required_argument: Some("login"),
+        required_subcommand: Some("login"),
         options: &["-p"],
         value_kind: OptionValueKind::Credential,
+    },
+];
+
+/// Secret-related options that acquire values outside argv, such as an
+/// interactive prompt or stdin. They do not consume the following argument.
+const BINARY_VALUELESS_OPTIONS: &[BinaryValuelessOption] = &[
+    BinaryValuelessOption {
+        binaries: &["ansible", "ansible-playbook", "ansible-galaxy"],
+        required_subcommand: None,
+        options: &[
+            "-k",
+            "-K",
+            "--ask-pass",
+            "--ask-become-pass",
+            "--ask-vault-pass",
+        ],
+    },
+    BinaryValuelessOption {
+        binaries: &["docker", "podman"],
+        required_subcommand: Some("login"),
+        options: &["--password-stdin"],
     },
 ];
 
@@ -584,6 +611,9 @@ struct ClassifiedCommand {
     binary: String,
     args: Vec<String>,
 }
+
+pub const SENSITIVE_ARGV_REPLAY_GUIDANCE: &str =
+    "command was not stored: replayable argv contains a literal credential; use managed --secret or --secret-file bindings";
 
 fn parse_leading_option(argument: &str) -> Option<ParsedOption<'_>> {
     if !argument.starts_with('-') {
@@ -613,46 +643,135 @@ fn strict_cli_secret_name(option: &str) -> bool {
             .any(|candidate| name.eq_ignore_ascii_case(candidate))
 }
 
-fn binary_name(binary: &str) -> &str {
-    binary.rsplit(['/', '\\']).next().unwrap_or(binary)
+fn binary_lookup_name(binary: &str) -> String {
+    let basename = binary.rsplit(['/', '\\']).next().unwrap_or(binary);
+    let lowercase = basename.to_ascii_lowercase();
+    [".exe", ".cmd", ".bat", ".com"]
+        .iter()
+        .find_map(|suffix| lowercase.strip_suffix(suffix))
+        .unwrap_or(&lowercase)
+        .to_string()
 }
 
-fn alias_value_kind(
-    binary: &str,
-    args: &[String],
-    option_index: usize,
-    option: &str,
-) -> Option<OptionValueKind> {
-    let binary = binary_name(binary);
-    BINARY_OPTION_ALIASES.iter().find_map(|alias| {
-        let binary_matches = alias
-            .binaries
+fn container_subcommand(args: &[String]) -> Option<(usize, &str)> {
+    const VALUE_OPTIONS: &[&str] = &["--config", "-c", "--context", "--host", "-H", "--log-level"];
+    let mut consumes_next = false;
+    for (index, argument) in args.iter().enumerate() {
+        if consumes_next {
+            consumes_next = false;
+            continue;
+        }
+        if argument == "--" {
+            return args.get(index + 1).map(|value| (index + 1, value.as_str()));
+        }
+        if !argument.starts_with('-') {
+            return Some((index, argument));
+        }
+        if VALUE_OPTIONS.contains(&argument.as_str()) {
+            consumes_next = true;
+            continue;
+        }
+        if VALUE_OPTIONS.iter().any(|option| {
+            argument
+                .strip_prefix(option)
+                .is_some_and(|suffix| !suffix.is_empty())
+        }) {
+            continue;
+        }
+    }
+    None
+}
+
+fn parsed_subcommand<'a>(binary: &str, args: &'a [String]) -> Option<(usize, &'a str)> {
+    match binary_lookup_name(binary).as_str() {
+        "docker" | "podman" => container_subcommand(args),
+        _ => args
             .iter()
-            .any(|candidate| binary.eq_ignore_ascii_case(candidate));
-        let context_matches = alias.required_argument.is_none_or(|required| {
-            args[..option_index]
-                .iter()
-                .any(|argument| argument.eq_ignore_ascii_case(required))
-        });
-        (binary_matches
-            && context_matches
-            && alias
-                .options
-                .iter()
-                .any(|candidate| option.eq_ignore_ascii_case(candidate)))
-        .then_some(alias.value_kind)
-    })
+            .enumerate()
+            .find(|(_, argument)| !argument.starts_with('-'))
+            .map(|(index, argument)| (index, argument.as_str())),
+    }
 }
 
-fn option_value_kind(
+fn alias_context_matches(
     binary: &str,
     args: &[String],
     option_index: usize,
-    option: &str,
-) -> Option<OptionValueKind> {
-    strict_cli_secret_name(option)
-        .then_some(OptionValueKind::Credential)
-        .or_else(|| alias_value_kind(binary, args, option_index, option))
+    binaries: &[&str],
+    required_subcommand: Option<&str>,
+) -> bool {
+    let binary = binary_lookup_name(binary);
+    binaries.contains(&binary.as_str())
+        && required_subcommand.is_none_or(|required| {
+            parsed_subcommand(&binary, args)
+                .is_some_and(|(index, subcommand)| index < option_index && subcommand == required)
+        })
+}
+
+fn parse_binary_alias_option<'a>(
+    binary: &str,
+    args: &[String],
+    option_index: usize,
+    argument: &'a str,
+) -> Option<(ParsedOption<'a>, OptionValueKind)> {
+    for alias in BINARY_OPTION_ALIASES {
+        if !alias_context_matches(
+            binary,
+            args,
+            option_index,
+            alias.binaries,
+            alias.required_subcommand,
+        ) {
+            continue;
+        }
+        for option in alias.options {
+            if argument == *option {
+                return Some((
+                    ParsedOption {
+                        name: argument,
+                        value_start: None,
+                    },
+                    alias.value_kind,
+                ));
+            }
+            let Some(suffix) = argument.strip_prefix(option) else {
+                continue;
+            };
+            let short_alias = option.len() == 2 && option.starts_with('-');
+            let separated_long = suffix
+                .chars()
+                .next()
+                .is_some_and(|character| matches!(character, '=' | ':') || character.is_control());
+            if !suffix.is_empty() && (short_alias || separated_long) {
+                return Some((
+                    ParsedOption {
+                        name: option,
+                        value_start: Some(option.len()),
+                    },
+                    alias.value_kind,
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn is_known_valueless_option(
+    binary: &str,
+    args: &[String],
+    option_index: usize,
+    option: &ParsedOption<'_>,
+) -> bool {
+    option.value_start.is_none()
+        && BINARY_VALUELESS_OPTIONS.iter().any(|rule| {
+            alias_context_matches(
+                binary,
+                args,
+                option_index,
+                rule.binaries,
+                rule.required_subcommand,
+            ) && rule.options.contains(&option.name)
+        })
 }
 
 fn named_secret_value_start(argument: &str) -> Option<usize> {
@@ -692,8 +811,28 @@ fn classify_command(binary: &str, args: &[String]) -> ClassifiedCommand {
             }
         }
 
-        if let Some(option) = parse_leading_option(argument) {
-            if let Some(value_kind) = option_value_kind(binary, args, index, option.name) {
+        let parsed_alias = parse_binary_alias_option(binary, args, index, argument);
+        let parsed_option = parsed_alias
+            .as_ref()
+            .map(|(option, _)| ParsedOption {
+                name: option.name,
+                value_start: option.value_start,
+            })
+            .or_else(|| parse_leading_option(argument));
+        if let Some(option) = parsed_option {
+            let value_kind = parsed_alias
+                .as_ref()
+                .map(|(_, value_kind)| *value_kind)
+                .or_else(|| {
+                    strict_cli_secret_name(option.name).then_some(OptionValueKind::Credential)
+                });
+            if let Some(value_kind) = value_kind {
+                if is_known_valueless_option(binary, args, index, &option) {
+                    let redacted = redact_output_text(argument);
+                    sensitive |= redacted != *argument;
+                    redacted_args.push(redacted);
+                    continue;
+                }
                 if let Some(value_start) = option.value_start {
                     let delimiter = argument[value_start..]
                         .chars()
@@ -746,11 +885,18 @@ pub fn command_contains_sensitive_literals(binary: &str, args: &[String]) -> boo
     classify_command(binary, args).sensitive
 }
 
+/// Redact one structured command without discarding executable or argv
+/// boundaries.
+fn redact_command_argv(binary: &str, args: &[String]) -> (String, Vec<String>) {
+    let command = classify_command(binary, args);
+    (command.binary, command.args)
+}
+
 /// Render one command for display while retaining argv context during
 /// redaction. This is display-only and never feeds matcher authority.
 pub fn redact_command_line(binary: &str, args: &[String]) -> String {
-    let command = classify_command(binary, args);
-    command_line(&command.binary, &command.args)
+    let (binary, args) = redact_command_argv(binary, args);
+    command_line(&binary, &args)
 }
 
 /// Redact exact secret values from output. This catches cases the regex patterns miss,
@@ -838,6 +984,103 @@ mod tests {
             "ansible",
             &["-a".to_string(), "echo ordinary payload".to_string()]
         ));
+    }
+
+    #[test]
+    fn binary_alias_matrix_covers_platform_and_value_spellings() {
+        let value = ["q", "7"].concat();
+        let suffixes = ["", ".EXE", ".cmd", ".Bat", ".cOm"];
+        for alias in BINARY_OPTION_ALIASES {
+            for binary in alias.binaries {
+                for option in alias.options {
+                    for executable_suffix in suffixes {
+                        let spelling = if executable_suffix.is_empty() {
+                            (*binary).to_string()
+                        } else {
+                            format!(
+                                "C:\\Tools\\{}{}",
+                                binary.to_ascii_uppercase(),
+                                executable_suffix
+                            )
+                        };
+                        let credential = match alias.value_kind {
+                            OptionValueKind::Credential => value.clone(),
+                            OptionValueKind::NamedField => {
+                                format!("Authorization: {value}")
+                            }
+                        };
+                        let prefix = alias
+                            .required_subcommand
+                            .into_iter()
+                            .map(str::to_string)
+                            .collect::<Vec<_>>();
+                        let mut spellings = vec![
+                            vec![option.to_string(), credential.clone()],
+                            vec![format!("{option}={credential}")],
+                            vec![format!("{option}:{credential}")],
+                            vec![format!("{option}\n{credential}")],
+                        ];
+                        if option.len() == 2 {
+                            spellings.push(vec![format!("{option}{credential}")]);
+                        }
+                        for mut option_args in spellings {
+                            let mut args = prefix.clone();
+                            args.append(&mut option_args);
+                            assert!(command_contains_sensitive_literals(&spelling, &args));
+                            assert!(!redact_command_line(&spelling, &args).contains(&value));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn alias_context_and_valueless_options_preserve_benign_argv() {
+        let value = ["q", "7"].concat();
+        assert!(!command_contains_sensitive_literals(
+            "docker",
+            &[
+                "run".to_string(),
+                "login".to_string(),
+                "-p".to_string(),
+                "8080".to_string(),
+            ]
+        ));
+        assert!(!command_contains_sensitive_literals(
+            "docker.exe",
+            &[
+                "--config".to_string(),
+                "login".to_string(),
+                "run".to_string(),
+                "-p".to_string(),
+                "8080".to_string(),
+            ]
+        ));
+        assert!(command_contains_sensitive_literals(
+            "docker.com",
+            &["login".to_string(), "-p".to_string(), value,]
+        ));
+        for (binary, args) in [
+            (
+                "ansible",
+                vec!["--ask-pass".to_string(), "host-a".to_string()],
+            ),
+            (
+                "ansible-playbook.exe",
+                vec!["--ask-vault-pass".to_string(), "site.yml".to_string()],
+            ),
+            (
+                "docker",
+                vec![
+                    "login".to_string(),
+                    "--password-stdin".to_string(),
+                    "registry.example".to_string(),
+                ],
+            ),
+        ] {
+            assert!(!command_contains_sensitive_literals(binary, &args));
+        }
     }
 
     #[test]

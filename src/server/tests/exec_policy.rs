@@ -151,6 +151,15 @@ fn audit_command_line_masks_sensitive_original_argv() {
     let line = audit_command_line("curl", &["-u".to_string(), value.clone()]);
     assert!(!line.contains(&value));
 
+    let line = audit_command_line("curl.EXE", &[format!("-u:{value}")]);
+    assert!(!line.contains(&value));
+
+    let line = audit_command_line(
+        r"C:\Tools\docker.CMD",
+        &["login".to_string(), format!("-p{value}")],
+    );
+    assert!(!line.contains(&value));
+
     let line = audit_command_line("ssh", &["-p".to_string(), "2222".to_string()]);
     assert!(line.contains("-p 2222"));
 }

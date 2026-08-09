@@ -1105,14 +1105,8 @@ pub(super) fn approval_is_armed(approval: &Approval) -> bool {
 
 impl ProvisionalSummary {
     pub(super) fn from_row(p: &Provisional) -> Self {
-        // Summaries are operator-facing display records (session status,
-        // provisional listings), never the executed command, so credential
-        // material embedded in argv is redacted at this boundary.
-        let command = if p.args.is_empty() {
-            p.binary.clone()
-        } else {
-            format!("{} {}", p.binary, p.args.join(" "))
-        };
+        // Summaries retain structured argv until the shared classifier has
+        // produced each display command.
         Self {
             handle: p.handle.clone(),
             status: match p.forward_outcome() {
@@ -1125,15 +1119,9 @@ impl ProvisionalSummary {
                 _ => p.status.as_str().to_string(),
             },
             forward_outcome: p.forward_outcome().to_string(),
-            command: redact_output_text(&command),
-            revert_command: redact_output_text(&p.revert_command_line()),
-            confirm_check: p.confirm_check_binary.as_ref().map(|binary| {
-                redact_output_text(&if p.confirm_check_args.is_empty() {
-                    binary.clone()
-                } else {
-                    format!("{} {}", binary, p.confirm_check_args.join(" "))
-                })
-            }),
+            command: p.command_line(),
+            revert_command: p.revert_command_line(),
+            confirm_check: p.confirm_check_command_line(),
             control_path: p.control_path.clone(),
             session_fingerprint: p.session_fingerprint.clone(),
             reason: redact_output_text(&p.reason),
@@ -1157,8 +1145,7 @@ impl ProvisionalSummary {
 
 impl ApprovalSummary {
     pub(super) fn from_row(a: &Approval) -> Self {
-        // See `ProvisionalSummary::from_row`: display boundary, argv may
-        // carry inline credentials.
+        // `ApprovalSnapshot::command_line` applies the structured classifier.
         let (stdout, stdout_truncated) = exposed_transcript(a.result_stdout.as_deref());
         let (stderr, stderr_truncated) = exposed_transcript(a.result_stderr.as_deref());
         Self {
@@ -1168,7 +1155,7 @@ impl ApprovalSummary {
             } else {
                 a.status.as_str().to_string()
             },
-            command: redact_output_text(&a.snapshot.command_line()),
+            command: a.snapshot.command_line(),
             reason: redact_output_text(&a.reason),
             risk: a.risk,
             reversibility: a.reversibility.map(|r| r.as_str().to_string()),

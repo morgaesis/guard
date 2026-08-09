@@ -10,6 +10,9 @@ use guard::gating::approval::{
 use guard::gating::provisional::{ApiRevertPlan, Provisional, ProvisionalStatus};
 use guard::gating::{decide_gate, Coverage, GateOutcome, Reversibility};
 use guard::principal::{scope_eq, PrincipalKey};
+use guard::redact::{
+    command_contains_sensitive_literals, redact_command_line, SENSITIVE_ARGV_REPLAY_GUIDANCE,
+};
 use std::path::PathBuf;
 use tokio::io::AsyncWrite;
 
@@ -846,6 +849,16 @@ async fn assess_revert(
     forward: &ExecuteRequest,
     revert: &RevertSpec,
 ) -> RevertAssessment {
+    let sensitive_check = revert
+        .confirm_check
+        .as_ref()
+        .is_some_and(|check| command_contains_sensitive_literals(&check.binary, &check.args));
+    if command_contains_sensitive_literals(&forward.binary, &forward.args)
+        || command_contains_sensitive_literals(&revert.binary, &revert.args)
+        || sensitive_check
+    {
+        return RevertAssessment::NeedsReview(SENSITIVE_ARGV_REPLAY_GUIDANCE.to_string());
+    }
     if let Some(reason) = invalid_binary_reason(&revert.binary) {
         return RevertAssessment::NeedsReview(reason);
     }
@@ -868,23 +881,12 @@ async fn assess_revert(
             ));
         }
     }
-    let forward_line = if forward.args.is_empty() {
-        forward.binary.clone()
-    } else {
-        format!("{} {}", forward.binary, forward.args.join(" "))
-    };
-    let revert_line = if revert.args.is_empty() {
-        revert.binary.clone()
-    } else {
-        format!("{} {}", revert.binary, revert.args.join(" "))
-    };
-    let check_line = revert.confirm_check.as_ref().map(|check| {
-        if check.args.is_empty() {
-            check.binary.clone()
-        } else {
-            format!("{} {}", check.binary, check.args.join(" "))
-        }
-    });
+    let forward_line = redact_command_line(&forward.binary, &forward.args);
+    let revert_line = redact_command_line(&revert.binary, &revert.args);
+    let check_line = revert
+        .confirm_check
+        .as_ref()
+        .map(|check| redact_command_line(&check.binary, &check.args));
     let window = forward
         .confirm_within_secs
         .unwrap_or(DEFAULT_CONFIRM_WITHIN_SECS)
@@ -1253,6 +1255,17 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
         None => return ExecuteResult::held(reason, new_handle(), Coverage::hold()),
     };
 
+    let sensitive_check = revert
+        .confirm_check
+        .as_ref()
+        .is_some_and(|check| command_contains_sensitive_literals(&check.binary, &check.args));
+    if command_contains_sensitive_literals(&request.binary, &request.args)
+        || command_contains_sensitive_literals(&revert.binary, &revert.args)
+        || sensitive_check
+    {
+        return ExecuteResult::denied(SENSITIVE_ARGV_REPLAY_GUIDANCE);
+    }
+
     if let Some(why) = invalid_binary_reason(&revert.binary) {
         return ExecuteResult::exec_failed(reason, why);
     }
@@ -1286,10 +1299,9 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
     if server.config.dry_run {
         return ExecuteResult::dry_run_gated(
             format!(
-                "{} [GATE] would execute inside a containment envelope (auto-revert: {} {})",
+                "{} [GATE] would execute inside a containment envelope (auto-revert: {})",
                 reason,
-                revert.binary,
-                revert.args.join(" ")
+                redact_command_line(&revert.binary, &revert.args)
             ),
             Coverage::contain(),
         );
@@ -1739,6 +1751,9 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
         consume_access_verbs,
         ..
     } = inputs;
+    if command_contains_sensitive_literals(&request.binary, &request.args) {
+        return ExecuteResult::denied(SENSITIVE_ARGV_REPLAY_GUIDANCE);
+    }
     if server.config.dry_run {
         return ExecuteResult::dry_run_gated(
             format!(
@@ -2306,6 +2321,12 @@ pub(super) async fn execute_snapshot_with_access_request(
     reason: &str,
     preferred_access_requests: Option<&[String]>,
 ) -> ExecuteResult {
+    if snapshot.contains_sensitive_literals() {
+        return ExecuteResult::exec_failed(
+            reason.to_string(),
+            SENSITIVE_ARGV_REPLAY_GUIDANCE.to_string(),
+        );
+    }
     if !binary_allowed(&server.config.allowed_binaries, &snapshot.binary) {
         return ExecuteResult::exec_failed(
             reason.to_string(),
@@ -2761,6 +2782,14 @@ pub(super) async fn gating_sweeper(server: ServerContext) {
 /// Run the revert for a provisional under the original caller's identity, with no
 /// client stream. Used by the sweeper and `guard revert`.
 async fn run_provisional_revert(server: &ServerContext, p: &Provisional) -> ExecuteResult {
+    if p.api_revert.is_none()
+        && command_contains_sensitive_literals(&p.revert_binary, &p.revert_args)
+    {
+        return ExecuteResult::exec_failed(
+            format!("auto-revert of provisional {}", p.handle),
+            SENSITIVE_ARGV_REPLAY_GUIDANCE.to_string(),
+        );
+    }
     if let Some(reason) = invalid_binary_reason(&p.revert_binary) {
         return ExecuteResult::exec_failed(
             format!("auto-revert of provisional {}", p.handle),
@@ -2825,6 +2854,12 @@ pub(super) async fn run_provisional_check(
     p: &Provisional,
 ) -> ExecuteResult {
     let binary = p.confirm_check_binary.as_deref().unwrap_or_default();
+    if command_contains_sensitive_literals(binary, &p.confirm_check_args) {
+        return ExecuteResult::exec_failed(
+            format!("confirmation check for provisional {}", p.handle),
+            SENSITIVE_ARGV_REPLAY_GUIDANCE.to_string(),
+        );
+    }
     if let Some(reason) = invalid_binary_reason(binary) {
         return ExecuteResult::exec_failed(
             format!("confirmation check for provisional {}", p.handle),

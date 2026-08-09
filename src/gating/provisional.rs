@@ -169,15 +169,64 @@ pub struct Provisional {
 }
 
 impl Provisional {
+    pub fn command_line(&self) -> String {
+        crate::redact::redact_command_line(&self.binary, &self.args)
+    }
+
     pub fn revert_command_line(&self) -> String {
         if let Some(api) = &self.api_revert {
-            return format!("{} {} {}", api.protocol, api.method, api.path);
+            return crate::redact::redact_output_text(&format!(
+                "{} {} {}",
+                api.protocol, api.method, api.path
+            ));
         }
-        if self.revert_args.is_empty() {
-            self.revert_binary.clone()
-        } else {
-            format!("{} {}", self.revert_binary, self.revert_args.join(" "))
+        crate::redact::redact_command_line(&self.revert_binary, &self.revert_args)
+    }
+
+    pub fn confirm_check_command_line(&self) -> Option<String> {
+        self.confirm_check_binary
+            .as_ref()
+            .map(|binary| crate::redact::redact_command_line(binary, &self.confirm_check_args))
+    }
+
+    pub fn contains_sensitive_literals(&self) -> bool {
+        crate::redact::command_contains_sensitive_literals(&self.binary, &self.args)
+            || (self.api_revert.is_none()
+                && crate::redact::command_contains_sensitive_literals(
+                    &self.revert_binary,
+                    &self.revert_args,
+                ))
+            || self.confirm_check_binary.as_ref().is_some_and(|binary| {
+                crate::redact::command_contains_sensitive_literals(binary, &self.confirm_check_args)
+            })
+    }
+
+    /// Remove literal-sensitive command fields after replay has been disabled.
+    pub fn scrub_sensitive_literals(&mut self) -> bool {
+        let mut changed = false;
+        if crate::redact::command_contains_sensitive_literals(&self.binary, &self.args) {
+            self.binary = "<unavailable>".to_string();
+            self.args.clear();
+            changed = true;
         }
+        if self.api_revert.is_none()
+            && crate::redact::command_contains_sensitive_literals(
+                &self.revert_binary,
+                &self.revert_args,
+            )
+        {
+            self.revert_binary = "<unavailable>".to_string();
+            self.revert_args.clear();
+            changed = true;
+        }
+        if self.confirm_check_binary.as_ref().is_some_and(|binary| {
+            crate::redact::command_contains_sensitive_literals(binary, &self.confirm_check_args)
+        }) {
+            self.confirm_check_binary = Some("<unavailable>".to_string());
+            self.confirm_check_args.clear();
+            changed = true;
+        }
+        changed
     }
 
     /// Why a lifecycle transition is refused from this row's current state.

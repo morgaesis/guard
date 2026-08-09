@@ -5738,6 +5738,224 @@ async fn approved_snapshot_rechecks_binary_floor_before_exec() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn sensitive_hold_and_containment_snapshots_fail_before_persistence() {
+    let (mut cfg, _operator, agent) = gating_config(7_050, 1_000);
+    let (audit_directory, _audit) = super::attach_test_audit_log(&mut cfg);
+    let state = tempfile::tempdir().unwrap();
+    let store = SessionStore::open(state.path().join("state.db"), 3_600)
+        .await
+        .unwrap();
+    cfg.state.session_store = Some(store.clone());
+    let sensitive = ["q", "7"].concat();
+    let mut sink = tokio::io::sink();
+
+    let held = hold_for_approval_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        held_request("curl.EXE", vec![format!("-u{sensitive}")], None),
+        agent.principal(),
+        GateInputs {
+            reason: "requires approval".to_string(),
+            risk: Some(9),
+            reversibility: Some(Reversibility::Irreversible),
+            revert_preauthorized: false,
+            verb: None,
+            bypass: false,
+            authority: None,
+            consume_access_verbs: Vec::new(),
+        },
+    )
+    .await;
+    assert!(matches!(&held.exec, ExecOutcome::NotAttempted));
+
+    let contained = arm_containment_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        contain_request(
+            "true",
+            &[],
+            RevertSpec::new("curl", vec!["-u".to_string(), sensitive.clone()]),
+        ),
+        agent.principal(),
+        "recoverable change".to_string(),
+        None,
+    )
+    .await;
+    assert!(matches!(&contained.exec, ExecOutcome::NotAttempted));
+    assert!(cfg.state.approvals.read().await.list().is_empty());
+    assert!(cfg.state.provisional.read().await.list().is_empty());
+    assert!(store.load_approvals().await.unwrap().is_empty());
+    assert!(store.load_provisionals().await.unwrap().is_empty());
+    assert!(!serde_json::to_string(&held.into_response())
+        .unwrap()
+        .contains(&sensitive));
+    assert!(!serde_json::to_string(&contained.into_response())
+        .unwrap()
+        .contains(&sensitive));
+    let audit = std::fs::read_to_string(audit_directory.path().join("audit.jsonl")).unwrap();
+    assert!(!audit.contains(&sensitive));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sensitive_armed_approval_is_redacted_and_cannot_resume() {
+    let (mut cfg, operator, agent) = gating_config(7_051, 1_000);
+    let (audit_directory, _audit) = super::attach_test_audit_log(&mut cfg);
+    let mut sink = tokio::io::sink();
+    let held = hold_for_approval_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        held_request("true", Vec::new(), None),
+        agent.principal(),
+        GateInputs {
+            reason: "requires approval".to_string(),
+            risk: Some(9),
+            reversibility: Some(Reversibility::Irreversible),
+            revert_preauthorized: false,
+            verb: None,
+            bypass: false,
+            authority: None,
+            consume_access_verbs: Vec::new(),
+        },
+    )
+    .await;
+    let ExecOutcome::Held { handle, .. } = held.exec else {
+        panic!("expected held command")
+    };
+    let armed = handle_admin_request_for_test(
+        &cfg,
+        &operator,
+        AdminRequest::AccessApprove {
+            handles: vec![handle.clone()],
+            uses: Some(1),
+            wait_secs: None,
+        },
+    )
+    .await;
+    assert!(matches!(armed, AdminResponse::AccessDecisions { .. }));
+
+    let sensitive = ["q", "7"].concat();
+    {
+        let mut approvals = cfg.state.approvals.write().await;
+        let mut rows = approvals.list();
+        let row = rows.iter_mut().find(|row| row.handle == handle).unwrap();
+        row.snapshot.binary = "docker.CMD".to_string();
+        row.snapshot.args = vec!["login".to_string(), format!("-p:{sensitive}")];
+        let (registry, recovered) =
+            guard::gating::approval::ApprovalRegistry::from_rows(rows, now_unix());
+        assert!(recovered.is_empty());
+        *approvals = registry;
+    }
+    let listed = handle_admin_request_for_test(&cfg, &agent, AdminRequest::ApprovalList).await;
+    assert!(!serde_json::to_string(&listed).unwrap().contains(&sensitive));
+    let operator_listed =
+        handle_admin_request_for_test(&cfg, &operator, AdminRequest::ApprovalList).await;
+    assert!(!serde_json::to_string(&operator_listed)
+        .unwrap()
+        .contains(&sensitive));
+    let resumed = handle_admin_request_for_test(
+        &cfg,
+        &agent,
+        AdminRequest::Resume {
+            handle: handle.clone(),
+        },
+    )
+    .await;
+    assert!(!serde_json::to_string(&resumed)
+        .unwrap()
+        .contains(&sensitive));
+    assert_eq!(
+        cfg.state
+            .approvals
+            .read()
+            .await
+            .get(&handle)
+            .unwrap()
+            .status,
+        ApprovalStatus::ExecFailed
+    );
+    let audit = std::fs::read_to_string(audit_directory.path().join("audit.jsonl")).unwrap();
+    assert!(!audit.contains(&sensitive));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sensitive_provisional_snapshots_are_redacted_and_cannot_replay() {
+    let (mut cfg, _operator, agent) = gating_config(7_052, 1_000);
+    let (audit_directory, _audit) = super::attach_test_audit_log(&mut cfg);
+    let sensitive = ["q", "7"].concat();
+    let provisional = Provisional {
+        handle: "sensitive-provisional-replay".to_string(),
+        principal: agent.principal(),
+        binary: "curl.EXE".to_string(),
+        args: vec![format!("-u{sensitive}")],
+        cwd: None,
+        secret_keys: BTreeMap::new(),
+        secret_file_keys: BTreeMap::new(),
+        revert_binary: "docker.CMD".to_string(),
+        revert_args: vec!["login".to_string(), format!("-p={sensitive}")],
+        confirm_check_binary: Some("redis-cli.COM".to_string()),
+        confirm_check_args: vec![format!("-a:{sensitive}")],
+        control_path: Some("fixture".to_string()),
+        session_fingerprint: None,
+        session_revision: None,
+        secret_entitlements: None,
+        api_revert: None,
+        reason: "fixture provisional".to_string(),
+        decision_trace: None,
+        created_unix: now_unix(),
+        deadline_unix: now_unix(),
+        window_secs: 0,
+        auto_reverted_unix: None,
+        forward_done: true,
+        forward_exit: Some(0),
+        forward_persistence_failed: false,
+        status: ProvisionalStatus::Reverting,
+        revert_exit: None,
+        revert_detail: None,
+    };
+    let summary = crate::server::wire::ProvisionalSummary::from_row(&provisional);
+    assert!(!serde_json::to_string(&summary)
+        .unwrap()
+        .contains(&sensitive));
+    let checked = run_provisional_check(&cfg, &provisional).await;
+    assert!(matches!(
+        &checked.exec,
+        ExecOutcome::Failed { started: false, .. }
+    ));
+    assert!(!serde_json::to_string(&checked.into_response())
+        .unwrap()
+        .contains(&sensitive));
+
+    cfg.state
+        .provisional
+        .write()
+        .await
+        .insert(provisional.clone());
+    let (message, exit) = finish_revert(&cfg, &provisional, &agent, "operator retry").await;
+    assert_eq!(exit, None);
+    assert!(!message.contains(&sensitive));
+    let audit = std::fs::read_to_string(audit_directory.path().join("audit.jsonl")).unwrap();
+    assert!(!audit.contains(&sensitive));
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn stored_entitlements_cover_tool_secrets_for_approval_check_and_revert() {
     let (cfg, _, agent) = gating_config(7020, 1000);
     let principal = agent.principal().unwrap();

@@ -255,7 +255,7 @@ async fn execute_after_verb_resolution<W: AsyncWrite + Unpin>(
     command_line: String,
     depth: u32,
 ) -> ExecuteResult {
-    if let Err(result) = enforce_binary_policy(phase, &request, &command_line).await {
+    if let Err(result) = enforce_binary_policy(phase, &request).await {
         return result;
     }
 
@@ -267,7 +267,6 @@ async fn execute_after_verb_resolution<W: AsyncWrite + Unpin>(
         return deny_and_record(
             phase,
             &request,
-            command_line,
             SessionDecisionSource::SessionDeny,
             None,
             reason,
@@ -287,7 +286,6 @@ async fn execute_after_verb_resolution<W: AsyncWrite + Unpin>(
         phase,
         request,
         &verb_resolution.context,
-        &command_line,
         depth,
         force_evaluate,
     )
@@ -306,20 +304,13 @@ async fn execute_after_verb_resolution<W: AsyncWrite + Unpin>(
     }
 
     if !force_evaluate {
-        request = match try_trusted_verb_allow(
-            phase,
-            request,
-            &verb_resolution.context,
-            &command_line,
-            depth,
-        )
-        .await
-        {
-            Ok(request) => request,
-            Err(result) => return result,
-        };
+        request =
+            match try_trusted_verb_allow(phase, request, &verb_resolution.context, depth).await {
+                Ok(request) => request,
+                Err(result) => return result,
+            };
 
-        request = match try_static_fast_allow(phase, request, &command_line, depth).await {
+        request = match try_static_fast_allow(phase, request, depth).await {
             Ok(request) => request,
             Err(result) => return result,
         };
@@ -376,7 +367,6 @@ async fn canonicalize_request_cwd<W: AsyncWrite + Unpin>(
         return Err(deny_and_record(
             phase,
             request,
-            command_line(&request.binary, &request.args),
             SessionDecisionSource::Validation,
             None,
             reason,
@@ -388,7 +378,6 @@ async fn canonicalize_request_cwd<W: AsyncWrite + Unpin>(
         return Err(deny_and_record(
             phase,
             request,
-            command_line(&request.binary, &request.args),
             SessionDecisionSource::Validation,
             None,
             reason,
@@ -406,7 +395,6 @@ async fn canonicalize_request_cwd<W: AsyncWrite + Unpin>(
             return Err(deny_and_record(
                 phase,
                 request,
-                command_line(&request.binary, &request.args),
                 SessionDecisionSource::Validation,
                 None,
                 reason,
@@ -425,7 +413,6 @@ async fn canonicalize_request_cwd<W: AsyncWrite + Unpin>(
             return Err(deny_and_record(
                 phase,
                 request,
-                command_line(&request.binary, &request.args),
                 SessionDecisionSource::Validation,
                 None,
                 reason,
@@ -441,7 +428,6 @@ async fn canonicalize_request_cwd<W: AsyncWrite + Unpin>(
         return Err(deny_and_record(
             phase,
             request,
-            command_line(&request.binary, &request.args),
             SessionDecisionSource::Validation,
             None,
             reason,
@@ -553,7 +539,6 @@ fn selected_session_verbs<W: AsyncWrite + Unpin>(phase: &ExecPhase<'_, W>) -> Ve
 async fn deny_and_record<W: AsyncWrite + Unpin>(
     phase: &mut ExecPhase<'_, W>,
     request: &ExecuteRequest,
-    _command: String,
     source: SessionDecisionSource,
     risk: Option<i32>,
     mut reason: String,
@@ -840,7 +825,6 @@ async fn route_allow_and_record<W: AsyncWrite + Unpin>(
     phase: &mut ExecPhase<'_, W>,
     request: ExecuteRequest,
     inputs: GateInputs,
-    _command: String,
     source: SessionDecisionSource,
     depth: u32,
 ) -> ExecuteResult {
@@ -1131,7 +1115,6 @@ async fn validate_exec_request<W: AsyncWrite + Unpin>(
         return Err(deny_and_record(
             phase,
             request,
-            request.binary.clone(),
             SessionDecisionSource::Validation,
             None,
             reason,
@@ -1145,7 +1128,6 @@ async fn validate_exec_request<W: AsyncWrite + Unpin>(
         return Err(deny_and_record(
             phase,
             request,
-            request.binary.clone(),
             SessionDecisionSource::Validation,
             None,
             reason,
@@ -1159,7 +1141,6 @@ async fn validate_exec_request<W: AsyncWrite + Unpin>(
         return Err(deny_and_record(
             phase,
             request,
-            request.binary.clone(),
             SessionDecisionSource::Validation,
             None,
             reason,
@@ -1177,7 +1158,6 @@ async fn validate_exec_request<W: AsyncWrite + Unpin>(
         return Err(deny_and_record(
             phase,
             request,
-            command_line.clone(),
             SessionDecisionSource::Validation,
             None,
             reason,
@@ -1199,7 +1179,6 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
     phase: &mut ExecPhase<'_, W>,
     request: ExecuteRequest,
     verb_ctx: &Option<VerbContext>,
-    command_line: &str,
     depth: u32,
     force_evaluate: bool,
 ) -> Result<ExecuteRequest, ExecuteResult> {
@@ -1296,7 +1275,6 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
             return Err(deny_and_record(
                 phase,
                 &request,
-                command_line.to_string(),
                 SessionDecisionSource::SessionDeny,
                 None,
                 reason,
@@ -1309,7 +1287,6 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
                     return Err(deny_and_record(
                         phase,
                         &request,
-                        command_line.to_string(),
                         SessionDecisionSource::SessionDeny,
                         None,
                         reason,
@@ -1347,7 +1324,6 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
                             return Err(deny_and_record(
                                 phase,
                                 &request,
-                                command_line.to_string(),
                                 SessionDecisionSource::SessionDeny,
                                 None,
                                 reason,
@@ -1369,7 +1345,6 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
                         phase,
                         request,
                         inputs,
-                        command_line.to_string(),
                         SessionDecisionSource::SessionAllow,
                         depth,
                     )
@@ -1388,7 +1363,6 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
             return Err(deny_and_record(
                 phase,
                 &request,
-                command_line.to_string(),
                 SessionDecisionSource::SessionStaticOnly,
                 None,
                 reason,
@@ -1404,7 +1378,6 @@ async fn apply_session_rules<W: AsyncWrite + Unpin>(
 async fn enforce_binary_policy<W: AsyncWrite + Unpin>(
     phase: &mut ExecPhase<'_, W>,
     request: &ExecuteRequest,
-    command_line: &str,
 ) -> Result<(), ExecuteResult> {
     let server = phase.server;
     // Server-wide binary allow-list: a hard floor enforced before evaluation on
@@ -1418,7 +1391,6 @@ async fn enforce_binary_policy<W: AsyncWrite + Unpin>(
         return Err(deny_and_record(
             phase,
             request,
-            command_line.to_string(),
             SessionDecisionSource::Validation,
             None,
             reason,
@@ -1434,7 +1406,6 @@ async fn enforce_binary_policy<W: AsyncWrite + Unpin>(
         return Err(deny_and_record(
             phase,
             request,
-            command_line.to_string(),
             SessionDecisionSource::Validation,
             None,
             reason,
@@ -1447,7 +1418,6 @@ async fn enforce_binary_policy<W: AsyncWrite + Unpin>(
             return Err(deny_and_record(
                 phase,
                 request,
-                command_line.to_string(),
                 SessionDecisionSource::Validation,
                 None,
                 reason,
@@ -1469,7 +1439,6 @@ async fn enforce_binary_policy<W: AsyncWrite + Unpin>(
 async fn try_static_fast_allow<W: AsyncWrite + Unpin>(
     phase: &mut ExecPhase<'_, W>,
     request: ExecuteRequest,
-    command_line: &str,
     depth: u32,
 ) -> Result<ExecuteRequest, ExecuteResult> {
     let server = phase.server;
@@ -1503,7 +1472,6 @@ async fn try_static_fast_allow<W: AsyncWrite + Unpin>(
                     return Err(deny_and_record(
                         phase,
                         &request,
-                        command_line.to_string(),
                         SessionDecisionSource::SessionDeny,
                         None,
                         reason,
@@ -1525,7 +1493,6 @@ async fn try_static_fast_allow<W: AsyncWrite + Unpin>(
                 phase,
                 request,
                 inputs,
-                command_line.to_string(),
                 SessionDecisionSource::StaticPolicy,
                 depth,
             )
@@ -1583,7 +1550,6 @@ async fn try_trusted_verb_allow<W: AsyncWrite + Unpin>(
     phase: &mut ExecPhase<'_, W>,
     request: ExecuteRequest,
     verb_ctx: &Option<VerbContext>,
-    command_line: &str,
     depth: u32,
 ) -> Result<ExecuteRequest, ExecuteResult> {
     if let Some(vc) = verb_ctx.clone() {
@@ -1611,7 +1577,6 @@ async fn try_trusted_verb_allow<W: AsyncWrite + Unpin>(
                     return Err(deny_and_record(
                         phase,
                         &request,
-                        command_line.to_string(),
                         SessionDecisionSource::SessionDeny,
                         None,
                         reason,
@@ -1633,7 +1598,6 @@ async fn try_trusted_verb_allow<W: AsyncWrite + Unpin>(
                 phase,
                 request,
                 inputs,
-                command_line.to_string(),
                 SessionDecisionSource::StaticPolicy,
                 depth,
             )
@@ -1666,7 +1630,6 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
             return deny_and_record(
                 phase,
                 &request,
-                command_line,
                 SessionDecisionSource::SessionDeny,
                 None,
                 reason,
@@ -1685,7 +1648,6 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
             return deny_and_record(
                 phase,
                 &request,
-                command_line,
                 SessionDecisionSource::EvaluatorError,
                 None,
                 reason.to_string(),
@@ -1764,7 +1726,6 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
             deny_and_record(
                 phase,
                 &request,
-                command_line,
                 session_source_from_eval(source),
                 risk,
                 reason,
@@ -1777,7 +1738,6 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
             deny_and_record(
                 phase,
                 &request,
-                command_line,
                 SessionDecisionSource::EvaluatorError,
                 None,
                 reason,
@@ -1890,7 +1850,6 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
                 phase,
                 request,
                 inputs,
-                command_line,
                 session_source_from_eval(source),
                 depth,
             )

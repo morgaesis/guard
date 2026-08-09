@@ -131,7 +131,21 @@ pub struct ApprovalSnapshot {
 
 impl ApprovalSnapshot {
     pub fn command_line(&self) -> String {
-        crate::redact::command_line(&self.binary, &self.args)
+        crate::redact::redact_command_line(&self.binary, &self.args)
+    }
+
+    pub fn contains_sensitive_literals(&self) -> bool {
+        crate::redact::command_contains_sensitive_literals(&self.binary, &self.args)
+    }
+
+    /// Remove literal-sensitive argv after the row has become non-replayable.
+    pub fn scrub_sensitive_literals(&mut self) -> bool {
+        if !self.contains_sensitive_literals() {
+            return false;
+        }
+        self.binary = "<unavailable>".to_string();
+        self.args.clear();
+        true
     }
 
     /// Short, stable fingerprint shown to the operator so two visually-similar

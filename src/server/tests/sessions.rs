@@ -2613,6 +2613,11 @@ async fn strict_and_opaque_sensitive_argv_do_not_reach_durable_or_audit_surfaces
             "curl",
             vec!["-H".to_string(), format!("Authorization: {sensitive}")],
         ),
+        ("curl.EXE", vec![format!("-u{sensitive}")]),
+        (
+            "docker.CMD",
+            vec!["login".to_string(), format!("-p:{sensitive}")],
+        ),
     ] {
         assert_sensitive_argv_rejected(binary, args, &sensitive).await;
     }
@@ -2638,11 +2643,7 @@ async fn split_sensitive_argv_is_redacted_in_live_and_durable_session_history() 
     store.persist_registry(&initial_registry).await.unwrap();
 
     let sensitive = ["q", "7"].concat();
-    let request = request_with_session(
-        "curl",
-        vec!["-u".to_string(), sensitive.clone()],
-        token.clone(),
-    );
+    let request = request_with_session("curl.EXE", vec![format!("-u{sensitive}")], token.clone());
     let response = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1001 })
         .await
         .into_response();

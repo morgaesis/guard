@@ -418,6 +418,7 @@ impl GrantRequest {
             || !self.request_key.is_empty()
             || !self.authority_verbs.is_empty()
             || !self.proposed_verbs.is_empty()
+            || self.requested_uses.is_some()
     }
 
     /// Validate the pure shape of a principal-bound access request. Catalog
