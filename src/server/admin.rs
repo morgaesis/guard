@@ -929,12 +929,11 @@ async fn reduce_access_intent(
                     .to_string(),
             );
         }
-        return Ok((
+        return Ok(access_reduction(
             existing
                 .into_iter()
                 .filter(|verb| selected.contains(&verb.name))
                 .collect(),
-            Vec::new(),
         ));
     }
     let matched = existing
@@ -943,10 +942,10 @@ async fn reduce_access_intent(
         .cloned()
         .collect::<Vec<_>>();
     if !matched.is_empty() {
-        return Ok((matched, Vec::new()));
+        return Ok(access_reduction(matched));
     }
     if let Some(best) = unique_semantic_intent_match(intent, &existing) {
-        return Ok((vec![best.clone()], Vec::new()));
+        return Ok(access_reduction(vec![best.clone()]));
     }
 
     let mut candidate = server
@@ -971,12 +970,7 @@ async fn reduce_access_intent(
         .iter()
         .find(|verb| access_verb_shape(verb) == access_verb_shape(&candidate))
     {
-        if reused.name.starts_with("access-generated-") {
-            let mut proposal = reused.clone();
-            proposal.trusted = false;
-            return Ok((vec![proposal.clone()], vec![proposal]));
-        }
-        return Ok((vec![reused.clone()], Vec::new()));
+        return Ok(access_reduction(vec![reused.clone()]));
     }
 
     let catalog = server.state.verbs.read().await;
@@ -985,16 +979,11 @@ async fn reduce_access_intent(
         .into_iter()
         .find(|verb| access_verb_shape(verb) == access_verb_shape(&candidate))
     {
-        if reused.name.starts_with("access-generated-") {
-            let mut proposal = reused;
-            proposal.trusted = false;
-            return Ok((vec![proposal.clone()], vec![proposal]));
-        }
-        return Ok((vec![reused], Vec::new()));
+        return Ok(access_reduction(vec![reused]));
     }
     let digest = access_matcher_digest(&access_verb_shape(&candidate));
     candidate.name = format!("access-generated-{}", &digest[..16]);
-    candidate.description = format!("Generated access matcher for {}", candidate.binary);
+    candidate.description = access_grant_description(&candidate);
     candidate.source_prose = None;
     candidate.evidence = None;
     candidate.prompt_context = None;
@@ -1004,6 +993,92 @@ async fn reduce_access_intent(
         .validate_candidate(&candidate)
         .map_err(|error| format!("invalid non-baseline access coverage: {error}"))?;
     Ok((vec![candidate.clone()], vec![candidate]))
+}
+
+/// Split a reduction into the coverage it authorizes and the coverage that has
+/// to be reviewed again. A generated access matcher lives only in the running
+/// catalog, is never operator-authored, and loses its trust on restart, so an
+/// intent that resolves to one re-proposes it however the reduction found it:
+/// by explicit name, by matching prose, or by an identical matcher shape.
+fn access_reduction(matched: Vec<Verb>) -> (Vec<Verb>, Vec<Verb>) {
+    let mut proposed = Vec::new();
+    let reduced = matched
+        .into_iter()
+        .map(|verb| {
+            if !verb.name.starts_with("access-generated-") {
+                return verb;
+            }
+            let mut proposal = verb;
+            proposal.trusted = false;
+            proposed.push(proposal.clone());
+            proposal
+        })
+        .collect();
+    (reduced, proposed)
+}
+
+/// Bounds on a grant description the daemon renders. A model can answer with a
+/// single word or with a page, and an approval card has to stay both
+/// informative and readable, so a description outside this range is replaced by
+/// the deterministic template rather than shown or truncated mid-sentence.
+const MIN_ACCESS_DESCRIPTION_CHARS: usize = 12;
+const MAX_ACCESS_DESCRIPTION_CHARS: usize = 400;
+
+/// Plain-language account of the access a synthesized matcher admits, written
+/// for the operator deciding on the request rather than restating the
+/// requester's intent. The synthesis call that produces the matcher also
+/// returns this description, so it costs no extra round trip and can neither
+/// delay nor fail request creation: an unusable description falls back to a
+/// deterministic template derived from the matcher itself.
+fn access_grant_description(verb: &Verb) -> String {
+    synthesized_access_description(verb).unwrap_or_else(|| derived_access_description(verb))
+}
+
+fn synthesized_access_description(verb: &Verb) -> Option<String> {
+    let text = verb
+        .description
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let length = text.chars().count();
+    if !(MIN_ACCESS_DESCRIPTION_CHARS..=MAX_ACCESS_DESCRIPTION_CHARS).contains(&length) {
+        return None;
+    }
+    // The description is displayed at the moment of decision. Text that
+    // survives redaction unchanged is safe to render; anything else is not.
+    if redact_output_text(&text) != text {
+        return None;
+    }
+    if text.eq_ignore_ascii_case(&verb.name) || text.eq_ignore_ascii_case(&verb.binary) {
+        return None;
+    }
+    Some(text)
+}
+
+/// Description built only from the matcher: the binary, the arguments the
+/// template pins, and the values the caller still supplies.
+fn derived_access_description(verb: &Verb) -> String {
+    let pinned = verb
+        .args
+        .iter()
+        .filter(|arg| !arg.contains('{'))
+        .cloned()
+        .collect::<Vec<_>>();
+    let params = verb.params.keys().cloned().collect::<Vec<_>>();
+    let mut text = format!("Runs {}", verb.binary);
+    if !pinned.is_empty() {
+        text.push_str(&format!(" with pinned arguments {}", pinned.join(" ")));
+    }
+    match params.len() {
+        0 => text.push_str(" and no caller-supplied values"),
+        1 => text.push_str(&format!(" and one caller-supplied value ({})", params[0])),
+        count => text.push_str(&format!(
+            " and {count} caller-supplied values ({})",
+            params.join(", ")
+        )),
+    }
+    text.push('.');
+    text
 }
 
 fn access_capability(verb: &Verb) -> AccessCapability {
@@ -1378,6 +1453,9 @@ async fn access_item_for_approval(
         .as_ref()
         .and_then(|summary| summary.expires_at)
         .or_else(|| Some(approval.deadline_unix()));
+    let awaiting_decision = approval.status == ApprovalStatus::Pending
+        && !projected_expired
+        && !approval_is_armed(approval);
     AccessItem {
         reference: approval.handle.clone(),
         kind: "hold".to_string(),
@@ -1391,12 +1469,15 @@ async fn access_item_for_approval(
         // that does not govern it.
         use_policy: "none".to_string(),
         consequence: approval_consequence(server, approval).to_string(),
+        default_use_policy: None,
+        default_uses: None,
         state: projected_state.to_string(),
         next_action: hold_next_action(&approval.handle, projected_state, is_operator),
         approval_options: if approval.status == ApprovalStatus::Pending
             && !projected_expired
             && !approval_is_armed(approval)
         {
+        approval_options: if awaiting_decision {
             vec![format!("guard access approve {} --once", approval.handle)]
         } else {
             Vec::new()
@@ -1458,6 +1539,7 @@ async fn access_item_for_request(
     } else {
         request.status.as_str()
     };
+    let awaiting_decision = request.status == GrantRequestStatus::Pending && !expired;
     AccessItem {
         reference: request.handle.clone(),
         kind: "request".to_string(),
@@ -1473,13 +1555,25 @@ async fn access_item_for_request(
         // A pending request has no budget yet: the operator selects one when
         // approving. `not-yet-granted` says that, where `unselected` read as a
         // budget the requester had failed to pick.
-        use_policy: if request.status == GrantRequestStatus::Pending && !expired {
+        use_policy: if awaiting_decision {
             "not-yet-granted"
         } else {
             access_use_policy(grant_uses)
         }
         .to_string(),
         consequence: CONSEQUENCE_GRANT.to_string(),
+        // These fields preserve the old-daemon detail fallback while the
+        // consequence-aware use policy tells new clients what is pending.
+        default_use_policy: awaiting_decision.then(|| {
+            if request.requested_uses.is_some() {
+                "bounded".to_string()
+            } else {
+                "unlimited".to_string()
+            }
+        }),
+        default_uses: awaiting_decision
+            .then_some(request.requested_uses)
+            .flatten(),
         state: state.to_string(),
         next_action: if request.status == GrantRequestStatus::Pending && !expired && is_operator {
             format!("guard access approve {}", request.handle)
@@ -1487,6 +1581,7 @@ async fn access_item_for_request(
             format!("guard access show {}", request.handle)
         },
         approval_options: if request.status == GrantRequestStatus::Pending && !expired {
+        approval_options: if awaiting_decision {
             approval_options(&request.handle)
         } else {
             Vec::new()
@@ -1551,6 +1646,8 @@ async fn access_item_for_session(
         }
         .to_string(),
         consequence: String::new(),
+        default_use_policy: None,
+        default_uses: None,
         state: state.to_string(),
         next_action: format!("guard access show {reference}"),
         approval_options: Vec::new(),
@@ -1779,6 +1876,8 @@ pub(super) async fn submit_access_request(
             remaining_uses: None,
             use_policy: "unlimited".to_string(),
             consequence: String::new(),
+            default_use_policy: None,
+            default_uses: None,
             state: "active".to_string(),
             next_action: "guard access list".to_string(),
             approval_options: Vec::new(),

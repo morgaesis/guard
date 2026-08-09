@@ -889,6 +889,14 @@ pub struct AccessItem {
     /// client derives the class from the reference prefix.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub consequence: String,
+    /// Budget an approval applies when the operator names neither `--once` nor
+    /// `--uses`: `unlimited` or `bounded`. Present only while `use_policy` is
+    /// `unselected`, so a reviewer sees what a bare approve would grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_use_policy: Option<String>,
+    /// Bounded default budget accompanying `default_use_policy: bounded`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_uses: Option<u64>,
     pub state: String,
     pub next_action: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

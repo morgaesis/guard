@@ -84,6 +84,8 @@ fn access_wire_shapes_are_stable_and_requester_is_not_caller_selected() {
         remaining_uses: Some(1),
         use_policy: "not-yet-granted".to_string(),
         consequence: crate::server::wire::CONSEQUENCE_GRANT.to_string(),
+        default_use_policy: Some("unlimited".to_string()),
+        default_uses: None,
         state: "pending".to_string(),
         next_action: "guard access approve gr-example".to_string(),
         approval_options: Vec::new(),
