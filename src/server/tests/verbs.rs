@@ -16,6 +16,27 @@ use tokio::sync::RwLock;
 
 use super::make_test_config;
 
+fn authority_tempdir() -> tempfile::TempDir {
+    let directory = tempfile::tempdir().expect("catalog test dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("harden catalog test dir");
+    }
+    directory
+}
+
+fn write_authority_file(path: &std::path::Path, content: impl AsRef<[u8]>) {
+    std::fs::write(path, content).expect("write catalog test file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .expect("harden catalog test file");
+    }
+}
+
 fn raw_request(binary: &str, args: &[&str], session_token: Option<&str>) -> ExecuteRequest {
     ExecuteRequest {
         binary: binary.to_string(),
@@ -822,17 +843,17 @@ fn relative_file_synthesis_arguments(_request: &str) -> serde_json::Value {
 }
 
 fn file_backed_catalog() -> (tempfile::TempDir, VerbCatalog) {
-    let dir = tempfile::tempdir().expect("catalog test dir");
+    let dir = authority_tempdir();
     let path = dir.path().join("verbs.yaml");
-    std::fs::write(&path, "verbs: []\n").expect("write empty catalog");
+    write_authority_file(&path, "verbs: []\n");
     let catalog = VerbCatalog::load(&path).expect("load empty catalog");
     (dir, catalog)
 }
 
 fn amend_test_catalog() -> (tempfile::TempDir, std::path::PathBuf, VerbCatalog) {
-    let dir = tempfile::tempdir().expect("catalog test dir");
+    let dir = authority_tempdir();
     let path = dir.path().join("verbs.yaml");
-    std::fs::write(
+    write_authority_file(
         &path,
         r#"verbs:
   - name: inspect-fixture
@@ -847,10 +868,72 @@ fn amend_test_catalog() -> (tempfile::TempDir, std::path::PathBuf, VerbCatalog) 
     binary: true
     consequence: reversible
 "#,
-    )
-    .unwrap();
+    );
     let catalog = VerbCatalog::load(&path).unwrap();
     (dir, path, catalog)
+}
+
+#[tokio::test]
+async fn unavailable_catalog_disables_invocation_reverse_match_and_session_activation() {
+    let (mut cfg, _buf) = make_test_config();
+    cfg.config.gate = GateMode::Consequence;
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    let directory = authority_tempdir();
+    let path = directory.path().join("verbs.yaml");
+    write_authority_file(
+        &path,
+        "verbs:\n  - name: session-safe\n    binary: true\n    baseline: false\n    consequence: reversible\n    trusted: true\n",
+    );
+    cfg.state.verbs = Arc::new(RwLock::new(VerbCatalog::load(&path).unwrap()));
+    write_authority_file(&path, "verbs:\n  - malformed\n");
+
+    let mut invocation = raw_request("", &[], None);
+    invocation.verb = Some(VerbInvocation {
+        name: "session-safe".to_string(),
+        params: Default::default(),
+    });
+    let invoked = execute_command(invocation, &cfg, &CallerIdentity::Unix { uid: 1000 })
+        .await
+        .into_response();
+    assert!(!invoked.allowed);
+    assert!(invoked.reason.contains("catalog authority is unavailable"));
+
+    let reversed = execute_command(
+        raw_request("true", &[], None),
+        &cfg,
+        &CallerIdentity::Unix { uid: 1000 },
+    )
+    .await
+    .into_response();
+    assert!(!reversed.allowed);
+    assert!(reversed.reason.contains("catalog authority is unavailable"));
+
+    let session = handle_admin_request_for_test(
+        &cfg,
+        &CallerIdentity::UnixAdmin { uid: 777 },
+        AdminRequest::SessionGrant {
+            token: "catalog-unavailable".to_string(),
+            allow: Vec::new(),
+            deny: Vec::new(),
+            activated_verbs: vec!["session-safe".to_string()],
+            override_markers: Vec::new(),
+            ttl_secs: None,
+            prompt_append: None,
+            prose: None,
+            saved_grant: None,
+            profile: None,
+            evaluation_mode: None,
+            static_only: false,
+            auto_amend: false,
+            owner: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        session,
+        AdminResponse::Error { message } if message.contains("catalog authority is unavailable")
+    ));
 }
 
 #[tokio::test]
@@ -1321,13 +1404,12 @@ async fn rejected_direct_create_leaves_a_pending_hold_and_catalog_unchanged() {
     ));
     let (mut cfg, daemon) = synthesis_test_config(url);
     cfg.config.gate = GateMode::Consequence;
-    let dir = tempfile::tempdir().expect("catalog test dir");
+    let dir = authority_tempdir();
     let path = dir.path().join("verbs.yaml");
-    std::fs::write(
+    write_authority_file(
         &path,
         "verbs:\n  - name: held-fixture\n    binary: true\n    consequence: irreversible\n    trusted: true\n",
-    )
-    .unwrap();
+    );
     cfg.state.verbs = Arc::new(RwLock::new(VerbCatalog::load(&path).unwrap()));
     let original_version = cfg.state.verbs.read().await.version();
 

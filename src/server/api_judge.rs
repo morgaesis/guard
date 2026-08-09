@@ -324,13 +324,13 @@ async fn lookup_api_coverage(
     summary: &ApiRequestSummary,
 ) -> ApiCoverageVerdict {
     let request_stamp = request_stamp(stamp, summary);
-    let mut guard = store.write().await;
-    if guard.refresh_for_decision().is_err() {
+    if refresh_api_coverage_once(store).await.is_err() {
         return ApiCoverageVerdict::Deny {
             reason: "API coverage authority is unavailable".to_string(),
             operator: false,
         };
     }
+    let guard = store.read().await;
     if let Some(hit) = guard.learned_deny(summary, &request_stamp) {
         return ApiCoverageVerdict::Deny {
             reason: hit.reason,
@@ -360,6 +360,18 @@ async fn lookup_api_coverage(
         }
     }
     ApiCoverageVerdict::None
+}
+
+pub(super) async fn refresh_api_coverage_once(
+    store: &Arc<RwLock<ApiPromotionStore>>,
+) -> anyhow::Result<()> {
+    let refresh_source = store.read().await.clone();
+    let refreshed = tokio::task::spawn_blocking(move || refresh_source.refreshed_copy())
+        .await
+        .map_err(|error| anyhow::anyhow!("API coverage refresh task failed: {error}"))??;
+    let mut current = store.write().await;
+    *current = refreshed;
+    Ok(())
 }
 
 fn request_stamp(stamp: &str, summary: &ApiRequestSummary) -> String {
@@ -430,13 +442,13 @@ impl ApiJudge for DaemonApiJudge {
     async fn judge(&self, summary: &ApiRequestSummary) -> ApiJudgeVerdict {
         let request_stamp = self.request_stamp(summary);
         if let Some(store) = &self.api_promotion {
+            if refresh_api_coverage_once(store).await.is_err() {
+                return sanitize_api_judge_verdict(ApiJudgeVerdict::Deny {
+                    reason: "API coverage authority is unavailable".to_string(),
+                });
+            }
             let hit = {
-                let mut guard = store.write().await;
-                if guard.refresh_for_decision().is_err() {
-                    return sanitize_api_judge_verdict(ApiJudgeVerdict::Deny {
-                        reason: "API coverage authority is unavailable".to_string(),
-                    });
-                }
+                let guard = store.read().await;
                 guard.learned_deny(summary, &request_stamp)
             };
             if let Some(hit) = hit {
@@ -463,12 +475,7 @@ impl ApiJudge for DaemonApiJudge {
 
             if !summary.rarity {
                 let hit = {
-                    let mut guard = store.write().await;
-                    if guard.refresh_for_decision().is_err() {
-                        return sanitize_api_judge_verdict(ApiJudgeVerdict::Deny {
-                            reason: "API coverage authority is unavailable".to_string(),
-                        });
-                    }
+                    let guard = store.read().await;
                     guard.learned_allow(summary, &request_stamp)
                 };
                 if let Some(hit) = hit {
@@ -507,12 +514,7 @@ impl ApiJudge for DaemonApiJudge {
                 baseline.session_revision = None;
                 baseline.session_intent = None;
                 let deny = {
-                    let mut guard = store.write().await;
-                    if guard.refresh_for_decision().is_err() {
-                        return sanitize_api_judge_verdict(ApiJudgeVerdict::Deny {
-                            reason: "API coverage authority is unavailable".to_string(),
-                        });
-                    }
+                    let guard = store.read().await;
                     guard.learned_deny(&baseline, &self.stamp)
                 };
                 if let Some(hit) = deny {
@@ -625,23 +627,41 @@ impl DaemonApiJudge {
         let Some(store) = &self.api_promotion else {
             return;
         };
-        let outcome = {
-            let mut guard = store.write().await;
-            guard.record_allow(
-                summary,
-                risk,
-                reversibility,
-                reason,
-                &self.request_stamp(summary),
-            )
+        let baseline = store.read().await.clone();
+        let mut candidate = baseline.clone();
+        let request_stamp = self.request_stamp(summary);
+        let summary = summary.clone();
+        let reason = reason.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            let outcome =
+                candidate.record_allow(&summary, risk, reversibility, &reason, &request_stamp)?;
+            Ok::<_, anyhow::Error>((candidate, outcome))
+        })
+        .await;
+        let outcome = match result {
+            Ok(Ok((committed, outcome))) => {
+                let mut current = store.write().await;
+                if current.same_snapshot(&baseline) {
+                    *current = committed;
+                }
+                outcome
+            }
+            Ok(Err(error)) => {
+                tracing::warn!("failed to record API allow-shape observation: {error}");
+                return;
+            }
+            Err(error) => {
+                tracing::warn!("API allow-shape observation task failed: {error}");
+                return;
+            }
         };
         match outcome {
-            Ok(Some(ApiPromotionOutcome::AllowPromoted {
+            Some(ApiPromotionOutcome::AllowPromoted {
                 shape,
                 approvals,
                 risk,
                 reversibility,
-            })) => {
+            }) => {
                 let _ = guard::audit::emit_global(
                     &guard::audit::AuditEvent::new(
                         guard::audit::AuditKind::ApiVerbCoverageActivated,
@@ -653,9 +673,7 @@ impl DaemonApiJudge {
                     .field("reversibility", reversibility),
                 );
             }
-            Ok(Some(ApiPromotionOutcome::DenyLearned { .. })) => {}
-            Ok(None) => {}
-            Err(err) => tracing::warn!("failed to record API allow-shape observation: {}", err),
+            Some(ApiPromotionOutcome::DenyLearned { .. }) | None => {}
         }
     }
 
@@ -663,12 +681,35 @@ impl DaemonApiJudge {
         let Some(store) = &self.api_promotion else {
             return;
         };
-        let outcome = {
-            let mut guard = store.write().await;
-            guard.record_deny(summary, reason, &self.request_stamp(summary))
+        let baseline = store.read().await.clone();
+        let mut candidate = baseline.clone();
+        let request_stamp = self.request_stamp(summary);
+        let summary = summary.clone();
+        let reason = reason.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            let outcome = candidate.record_deny(&summary, &reason, &request_stamp)?;
+            Ok::<_, anyhow::Error>((candidate, outcome))
+        })
+        .await;
+        let outcome = match result {
+            Ok(Ok((committed, outcome))) => {
+                let mut current = store.write().await;
+                if current.same_snapshot(&baseline) {
+                    *current = committed;
+                }
+                outcome
+            }
+            Ok(Err(error)) => {
+                tracing::warn!("failed to record API deny-shape observation: {error}");
+                return;
+            }
+            Err(error) => {
+                tracing::warn!("API deny-shape observation task failed: {error}");
+                return;
+            }
         };
         match outcome {
-            Ok(Some(ApiPromotionOutcome::DenyLearned { shape, denials })) => {
+            Some(ApiPromotionOutcome::DenyLearned { shape, denials }) => {
                 let _ = guard::audit::emit_global(
                     &guard::audit::AuditEvent::new(
                         guard::audit::AuditKind::ApiVerbCoverageActivated,
@@ -678,9 +719,7 @@ impl DaemonApiJudge {
                     .field("denials", denials),
                 );
             }
-            Ok(Some(ApiPromotionOutcome::AllowPromoted { .. })) => {}
-            Ok(None) => {}
-            Err(err) => tracing::warn!("failed to record API deny-shape observation: {}", err),
+            Some(ApiPromotionOutcome::AllowPromoted { .. }) | None => {}
         }
     }
 }
@@ -723,6 +762,17 @@ mod tests {
     use guard::proxy::RevertConstructible;
     use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn authority_tempdir() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().expect("API coverage test dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("harden API coverage test dir");
+        }
+        directory
+    }
 
     #[test]
     fn api_judge_prompt_contains_intent() {
@@ -937,7 +987,7 @@ mod tests {
             1,
             Some("reversible"),
         ));
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let path = temp.path().join("api.yaml");
         let store = promotion_store(path.clone(), 5, 3);
         let judge = DaemonApiJudge::build(
@@ -1010,7 +1060,7 @@ mod tests {
 
     #[tokio::test]
     async fn coverage_lookup_observes_a_deny_committed_by_another_instance() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let path = temp.path().join("api.yaml");
         let summary = api_summary("freshness", false);
         let store = promotion_store(path.clone(), 2, 1);
@@ -1046,6 +1096,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coverage_refresh_failure_disables_stale_generated_allow() {
+        let temp = authority_tempdir();
+        let path = temp.path().join("api.yaml");
+        let summary = api_summary("refresh-failure", false);
+        let store = promotion_store(path.clone(), 2, 1);
+        for _ in 0..2 {
+            store
+                .write()
+                .await
+                .record_allow(
+                    &summary,
+                    Some(1),
+                    Some(guard::gating::Reversibility::Reversible),
+                    "safe",
+                    "",
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            lookup_api_coverage(&store, "", &summary).await,
+            ApiCoverageVerdict::Allow { .. }
+        ));
+        std::fs::write(&path, b"not: [valid").unwrap();
+
+        assert!(matches!(
+            lookup_api_coverage(&store, "", &summary).await,
+            ApiCoverageVerdict::Deny { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn api_shape_allow_promotes_and_skips_llm_except_rarity() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -1058,7 +1139,7 @@ mod tests {
             6,
             Some("recoverable"),
         ));
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let store = promotion_store(temp.path().join("api.yaml"), 5, 3);
         let judge = DaemonApiJudge::build(
             llm_config(url),
@@ -1124,7 +1205,7 @@ mod tests {
             8,
             None,
         ));
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let store = promotion_store(temp.path().join("api.yaml"), 5, 3);
         let judge = DaemonApiJudge::build(
             llm_config(url),
@@ -1179,7 +1260,7 @@ mod tests {
         ));
         let llm = llm_config(url);
         let stamp = regime_stamp(&llm, Some("global policy"));
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let store = promotion_store(temp.path().join("api.yaml"), 2, 2);
         let global = api_summary("global", false);
         for _ in 0..2 {
@@ -1236,7 +1317,7 @@ mod tests {
         ));
         let llm = llm_config(url);
         let stamp = regime_stamp(&llm, Some("global policy"));
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let store = promotion_store(temp.path().join("api.yaml"), 2, 2);
         let global = api_summary("global", false);
         for _ in 0..2 {

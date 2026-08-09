@@ -863,11 +863,12 @@ async fn reduce_access_intent(
     intent: &str,
     observed_argv: Option<(&str, &[String])>,
 ) -> Result<(Vec<Verb>, Vec<Verb>), String> {
+    server
+        .refresh_verb_catalog_for_decision()
+        .await
+        .map_err(|error| format!("verb catalog authority is unavailable: {error}"))?;
     let existing = {
-        let mut catalog = server.state.verbs.write().await;
-        if let Err(error) = catalog.reload_if_stale() {
-            tracing::warn!("verb catalog reload failed, using previous: {error}");
-        }
+        let catalog = server.state.verbs.read().await;
         catalog
             .list()
             .into_iter()
@@ -3686,10 +3687,12 @@ async fn dispatch_admin_request(
                 }
             }
             if !activated_verbs.is_empty() || !override_markers.is_empty() {
-                let mut catalog = server.state.verbs.write().await;
-                if let Err(error) = catalog.reload_if_stale() {
-                    tracing::warn!("verb catalog reload failed, using previous: {}", error);
+                if let Err(error) = server.refresh_verb_catalog_for_decision().await {
+                    return AdminResponse::Error {
+                        message: format!("verb catalog authority is unavailable: {error}"),
+                    };
                 }
+                let catalog = server.state.verbs.read().await;
                 for name in &activated_verbs {
                     let Some(verb) = catalog.get(name) else {
                         return AdminResponse::Error {
@@ -4294,10 +4297,12 @@ async fn dispatch_admin_request(
                 .map(|m| m.as_str().to_string())
                 .unwrap_or_else(|| "readonly".to_string());
             let (verb_catalog_hash, verb_catalog_changed_unix) = {
-                let mut catalog = server.state.verbs.write().await;
-                if let Err(error) = catalog.reload_if_stale() {
-                    tracing::warn!("verb catalog reload failed during status: {}", error);
+                if let Err(error) = server.refresh_verb_catalog_for_decision().await {
+                    return AdminResponse::Error {
+                        message: format!("verb catalog authority is unavailable: {error}"),
+                    };
                 }
+                let catalog = server.state.verbs.read().await;
                 (catalog.short_hash(), catalog.changed_unix())
             };
 
@@ -4403,10 +4408,12 @@ async fn dispatch_admin_request(
             handle_approval_withdraw(server, caller, &handle).await
         }
         AdminRequest::VerbList => {
-            let mut cat = server.state.verbs.write().await;
-            if let Err(e) = cat.reload_if_stale() {
-                tracing::warn!("verb catalog reload failed: {}", e);
+            if let Err(error) = server.refresh_verb_catalog_for_decision().await {
+                return AdminResponse::Error {
+                    message: format!("verb catalog authority is unavailable: {error}"),
+                };
             }
+            let cat = server.state.verbs.read().await;
             if caller_is_session_admin(server, caller) {
                 let current_stamp = server.state.evaluator.verb_promotion_stamp();
                 let items = cat
@@ -4448,10 +4455,12 @@ async fn dispatch_admin_request(
             }
         }
         AdminRequest::VerbShow { name } => {
-            let mut catalog = server.state.verbs.write().await;
-            if let Err(error) = catalog.reload_if_stale() {
-                tracing::warn!("verb catalog reload failed: {}", error);
+            if let Err(error) = server.refresh_verb_catalog_for_decision().await {
+                return AdminResponse::Error {
+                    message: format!("verb catalog authority is unavailable: {error}"),
+                };
             }
+            let catalog = server.state.verbs.read().await;
             match catalog.get(&name).cloned() {
                 Some(verb) => AdminResponse::VerbCreated {
                     verb,
@@ -4659,7 +4668,14 @@ async fn dispatch_admin_request(
         }
         AdminRequest::VerbCoverageList => {
             let items = match &server.state.api_coverage {
-                Some(store) => store.read().await.coverage(),
+                Some(store) => {
+                    if let Err(error) = super::api_judge::refresh_api_coverage_once(store).await {
+                        return AdminResponse::Error {
+                            message: format!("API coverage authority is unavailable: {error}"),
+                        };
+                    }
+                    store.read().await.coverage()
+                }
                 None => Vec::new(),
             };
             AdminResponse::VerbCoverage { items }
@@ -4668,16 +4684,37 @@ async fn dispatch_admin_request(
             let Some(store) = &server.state.api_coverage else {
                 return AdminResponse::VerbCoverageCleared { removed: 0 };
             };
-            match store.write().await.clear_generated() {
-                Ok(removed) => {
+            let baseline = store.read().await.clone();
+            let mut candidate = baseline.clone();
+            let cleared = tokio::task::spawn_blocking(move || {
+                let removed = candidate.clear_generated()?;
+                Ok::<_, anyhow::Error>((candidate, removed))
+            })
+            .await;
+            match cleared {
+                Ok(Ok((committed, removed))) => {
+                    let mut current = store.write().await;
+                    if current.same_snapshot(&baseline) {
+                        *current = committed;
+                    } else if current.has_generated_coverage() {
+                        return AdminResponse::Error {
+                            message:
+                                "API coverage changed while generated coverage was being cleared"
+                                    .to_string(),
+                        };
+                    }
+                    drop(current);
                     server.emit_audit_ungated(
                         AuditEvent::new(AuditKind::ApiVerbCoverageCleared)
                             .field("removed", removed),
                     );
                     AdminResponse::VerbCoverageCleared { removed }
                 }
-                Err(error) => AdminResponse::Error {
+                Ok(Err(error)) => AdminResponse::Error {
                     message: format!("failed to clear generated API verb coverage: {error}"),
+                },
+                Err(error) => AdminResponse::Error {
+                    message: format!("API coverage clear task failed: {error}"),
                 },
             }
         }

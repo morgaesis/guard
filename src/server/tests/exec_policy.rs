@@ -1389,6 +1389,11 @@ async fn repeated_llm_denials_append_count_hint_at_threshold_only() {
     tokio::spawn(run_denying_llm(listener));
 
     let temp = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let mut deny_config = DenyLearningConfig::new(temp.path().join("deny.yaml"));
     deny_config.min_denials = 2;
     let deny_store = DenyShapeStore::load(deny_config).unwrap();

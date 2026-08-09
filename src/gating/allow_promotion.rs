@@ -82,8 +82,7 @@ use crate::env::now_unix;
 use crate::learned_rules::write_learning_file_atomically;
 use crate::learned_rules::{infer_service_from_binary, looks_dangerous_for_learned_allow};
 use crate::learned_rules::{
-    load_expected_learning_file_snapshot, retry_learning_snapshot_conflicts,
-    rewrite_learning_file_bounded, sanitize_learning_text,
+    retry_learning_snapshot_conflicts, rewrite_learning_file_bounded, sanitize_learning_text,
     write_learning_file_atomically_for_locked_snapshot, LearningFileSnapshot, LearningWriteOutcome,
 };
 use crate::redact::{
@@ -460,13 +459,11 @@ impl AllowPromotionStore {
         if candidate == self.data {
             return Ok(());
         }
-        let content = self.canonical_content(&candidate)?;
         let outcome = self.save_data(&candidate)?;
-        let committed =
-            load_expected_learning_file_snapshot(&self.config.path, content.as_bytes())?;
+        let (committed, warning) = outcome.into_parts();
         self.data = candidate;
         self.snapshot = committed;
-        if let Some(error) = outcome.warning() {
+        if let Some(error) = warning {
             tracing::warn!(
                 "allow-promotion replacement committed with a durability warning: {}",
                 error
@@ -822,7 +819,7 @@ mod tests {
 
     #[test]
     fn repeated_reversible_approvals_become_ready_once() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store =
             AllowPromotionStore::load(config(temp.path().join("allow.yaml"), 2)).unwrap();
         let a = args(&["get", "pods", "-n", "foo"]);
@@ -870,7 +867,7 @@ mod tests {
 
     #[test]
     fn failed_allow_promotion_write_keeps_memory_and_durable_state_unchanged() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let path = temp.path().join("allow.yaml");
         let mut store = AllowPromotionStore::load(config(path.clone(), 2)).unwrap();
         let command_args = args(&["get", "pods"]);
@@ -887,7 +884,7 @@ mod tests {
         let before_memory = store.data.clone();
         let before_file = std::fs::read(&path).unwrap();
         let blocker = temp.path().join("blocker");
-        std::fs::write(&blocker, "not a directory").unwrap();
+        crate::learned_rules::write_authority_file(&blocker, "not a directory").unwrap();
         store.config.path = blocker.join("allow.yaml");
 
         assert!(store
@@ -906,7 +903,7 @@ mod tests {
 
     #[test]
     fn sensitive_allow_observations_are_rejected_and_purged_idempotently() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let path = temp.path().join("allow.yaml");
         let config = config(path.clone(), 2);
         let mut store = AllowPromotionStore::load(config.clone()).unwrap();
@@ -959,7 +956,7 @@ mod tests {
 
     #[test]
     fn allow_promotion_prose_is_sanitized_without_changing_samples() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let path = temp.path().join("allow.yaml");
         let config = config(path.clone(), 2);
         let value = ["q", "7"].concat();
@@ -1032,7 +1029,7 @@ mod tests {
 
     #[test]
     fn irreversible_is_never_recorded() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store =
             AllowPromotionStore::load(config(temp.path().join("allow.yaml"), 1)).unwrap();
         let result = store
@@ -1053,7 +1050,7 @@ mod tests {
     fn missing_reversibility_is_never_recorded() {
         // Gate mode off: no classification at all. This module must stay
         // completely inert rather than guessing.
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store =
             AllowPromotionStore::load(config(temp.path().join("allow.yaml"), 1)).unwrap();
         let result = store
@@ -1071,7 +1068,7 @@ mod tests {
 
     #[test]
     fn risk_at_or_above_ceiling_is_not_recorded() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store =
             AllowPromotionStore::load(config(temp.path().join("allow.yaml"), 1)).unwrap();
         // Reversible ceiling is EXECUTE_NOW_MAX_RISK (4).
@@ -1090,7 +1087,7 @@ mod tests {
 
     #[test]
     fn mixed_classification_permanently_disqualifies_the_bucket() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store =
             AllowPromotionStore::load(config(temp.path().join("allow.yaml"), 2)).unwrap();
         let a = args(&["scale", "deployment", "web", "--replicas", "3"]);
@@ -1134,7 +1131,7 @@ mod tests {
 
     #[test]
     fn dangerous_command_is_never_recorded() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store =
             AllowPromotionStore::load(config(temp.path().join("allow.yaml"), 1)).unwrap();
         let result = store
@@ -1287,7 +1284,7 @@ mod tests {
         // this module's entire premise, so 0 or 1 must not degenerate into
         // treating a single approval as sufficient.
         for degenerate in [0u32, 1] {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = crate::learned_rules::authority_tempdir();
             let mut degenerate_config = config(temp.path().join("allow.yaml"), 1);
             degenerate_config.min_approvals = degenerate;
             let mut store = AllowPromotionStore::load(degenerate_config).unwrap();
@@ -1312,7 +1309,7 @@ mod tests {
 
     #[test]
     fn resolved_bucket_never_becomes_ready_again() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store =
             AllowPromotionStore::load(config(temp.path().join("allow.yaml"), 2)).unwrap();
         let a = args(&["get", "pods"]);
@@ -1366,7 +1363,7 @@ mod tests {
 
     #[test]
     fn mark_resolved_on_missing_bucket_is_a_harmless_noop() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store =
             AllowPromotionStore::load(config(temp.path().join("allow.yaml"), 2)).unwrap();
         // No observation was ever recorded for this key; this must not error.
@@ -1377,7 +1374,7 @@ mod tests {
 
     #[test]
     fn observation_buckets_are_capped_by_evicting_the_oldest() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store =
             AllowPromotionStore::load(config(temp.path().join("allow.yaml"), 2)).unwrap();
 
@@ -1424,7 +1421,7 @@ mod tests {
 
     #[test]
     fn stale_allow_instances_reapply_commutative_observations() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let config = config(temp.path().join("allow.yaml"), 2);
         let mut first = AllowPromotionStore::load(config.clone()).unwrap();
         let mut second = AllowPromotionStore::load(config.clone()).unwrap();

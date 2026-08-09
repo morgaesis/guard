@@ -581,15 +581,15 @@ impl Evaluator {
         if !reevaluate {
             if let Some(ref store) = self.deny_shapes {
                 let (binary, args_joined) = split_command_line(command);
+                if refresh_deny_shapes_once(store).await.is_err() {
+                    return EvalResult::Deny {
+                        reason: "learned deny authority is unavailable".to_string(),
+                        source: EvalSource::LearnedDeny,
+                        risk: None,
+                    };
+                }
                 let hit = {
-                    let mut guard = store.write().await;
-                    if guard.refresh_for_decision().is_err() {
-                        return EvalResult::Deny {
-                            reason: "learned deny authority is unavailable".to_string(),
-                            source: EvalSource::LearnedDeny,
-                            risk: None,
-                        };
-                    }
+                    let guard = store.read().await;
                     guard
                         .matches(binary, args_joined)
                         .map(|shape| shape.last_reason.clone())
@@ -694,6 +694,16 @@ impl Evaluator {
             risk: None,
         }
     }
+}
+
+async fn refresh_deny_shapes_once(store: &Arc<RwLock<DenyShapeStore>>) -> anyhow::Result<()> {
+    let refresh_source = store.read().await.clone();
+    let refreshed = tokio::task::spawn_blocking(move || refresh_source.refreshed_copy())
+        .await
+        .map_err(|error| anyhow::anyhow!("learned deny refresh task failed: {error}"))??;
+    let mut current = store.write().await;
+    *current = refreshed;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -881,7 +891,7 @@ mod tests {
         // matches nothing. Proven here by reaching the LLM stage (which
         // errors for lack of an API key) rather than short-circuiting to a
         // StaticPolicy deny on bare default-deny fallthrough.
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let path = temp.path().join("deny-only.yaml");
         std::fs::write(
             &path,
@@ -914,7 +924,7 @@ mod tests {
         // LLM, and allow matches do not skip the LLM either (no LLM-skip
         // glob mechanism is supported while the LLM is enabled -- use
         // `guard verb` for that; see examples/verbs-readonly.yaml).
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let path = temp.path().join("allow-only.yaml");
         std::fs::write(&path, "policy:\n  commands:\n    allow:\n      - \"id\"\n").unwrap();
 
@@ -939,7 +949,7 @@ mod tests {
         // `guard verb create`, can grant that. With no LLM key configured the
         // call must still reach (and fail in) the LLM path, not short-circuit
         // to an allow from the learned-rule store.
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store = LearnedRuleStore::load(crate::learned_rules::LearningConfig {
             path: temp.path().join("learned.yaml"),
             min_approvals: 1,
@@ -980,7 +990,7 @@ mod tests {
         // synthesis LLM call itself is a separate, mocked-free unit boundary
         // covered in gating::deny_shape) and prove the wiring in
         // evaluate_with_context consults it before the LLM path.
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store = DenyShapeStore::load(crate::gating::deny_shape::DenyLearningConfig::new(
             temp.path().join("deny.yaml"),
         ))
@@ -1025,7 +1035,7 @@ mod tests {
 
     #[tokio::test]
     async fn reevaluate_flag_skips_only_the_learned_deny_store() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store = DenyShapeStore::load(crate::gating::deny_shape::DenyLearningConfig::new(
             temp.path().join("deny.yaml"),
         ))
@@ -1069,5 +1079,41 @@ mod tests {
             }
             other => panic!("expected reevaluate to skip the learned-deny store, got {other:?}"),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn learned_deny_refresh_does_not_block_tokio_workers_or_hold_the_async_guard() {
+        let temp = crate::learned_rules::authority_tempdir();
+        let path = temp.path().join("deny.yaml");
+        let store = DenyShapeStore::load(crate::gating::deny_shape::DenyLearningConfig::new(
+            path.clone(),
+        ))
+        .unwrap();
+        let evaluator = Evaluator::new(
+            EvalConfig::default()
+                .llm_enabled(false)
+                .deny_shapes(Arc::new(RwLock::new(store))),
+        )
+        .unwrap();
+        let acquired = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let lock_thread = {
+            let acquired = acquired.clone();
+            let release = release.clone();
+            std::thread::spawn(move || {
+                crate::learned_rules::hold_learning_file_lock_for_test(&path, &acquired, &release);
+            })
+        };
+        acquired.wait();
+
+        let evaluation = tokio::spawn(async move { evaluator.evaluate("fixturectl status").await });
+        tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            tokio::task::yield_now().await;
+        })
+        .await
+        .expect("Tokio worker remained responsive during filesystem lock contention");
+        release.wait();
+        let _ = evaluation.await.unwrap();
+        lock_thread.join().unwrap();
     }
 }

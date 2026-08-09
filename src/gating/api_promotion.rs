@@ -17,9 +17,9 @@ use std::path::{Path, PathBuf};
 use super::{Reversibility, EXECUTE_NOW_MAX_RISK, HOLD_RISK_THRESHOLD};
 use crate::env::now_unix;
 use crate::learned_rules::{
-    load_expected_learning_file_snapshot, load_learning_file_snapshot,
-    preserve_corrupt_learning_file, retry_learning_snapshot_conflicts, sanitize_learning_text,
-    write_learning_file_atomically_for_locked_snapshot, LearningFileSnapshot, LearningWriteOutcome,
+    load_learning_file_snapshot, preserve_corrupt_learning_file, retry_learning_snapshot_conflicts,
+    sanitize_learning_text, write_learning_file_atomically_for_locked_snapshot,
+    LearningFileSnapshot, LearningWriteOutcome,
 };
 use crate::proxy::ApiRequestSummary;
 use crate::redact::{named_value_contains_sensitive_literals, text_contains_sensitive_literals};
@@ -469,9 +469,9 @@ impl ApiPromotionStore {
                 &store.snapshot,
                 &content,
             )?;
-            store.snapshot =
-                load_expected_learning_file_snapshot(&store.config.path, content.as_bytes())?;
-            if let Some(error) = outcome.warning() {
+            let (committed, warning) = outcome.into_parts();
+            store.snapshot = committed;
+            if let Some(error) = warning {
                 tracing::warn!(
                     "API coverage migration committed with a durability warning: {}",
                     error
@@ -513,6 +513,16 @@ impl ApiPromotionStore {
         Ok(())
     }
 
+    #[doc(hidden)]
+    pub fn refreshed_copy(&self) -> Result<Self> {
+        Self::load(self.config.clone())
+    }
+
+    #[doc(hidden)]
+    pub fn same_snapshot(&self, other: &Self) -> bool {
+        self.snapshot.same_authority(&other.snapshot)
+    }
+
     pub fn coverage(&self) -> Vec<ApiCoverageEntry> {
         let now = now_unix();
         self.data
@@ -552,16 +562,30 @@ impl ApiPromotionStore {
             .collect()
     }
 
-    pub fn clear_generated(&mut self) -> Result<usize> {
-        let mut candidate = self.data.clone();
-        let before = candidate.buckets.len();
-        candidate
+    #[doc(hidden)]
+    pub fn has_generated_coverage(&self) -> bool {
+        self.data
             .buckets
-            .retain(|_, bucket| bucket.provenance == ApiCoverageProvenance::Operator);
-        let removed = before.saturating_sub(candidate.buckets.len());
-        if removed > 0 {
-            self.commit_candidate(candidate)?;
-        }
+            .values()
+            .any(|bucket| bucket.provenance == ApiCoverageProvenance::Evaluator)
+    }
+
+    pub fn clear_generated(&mut self) -> Result<usize> {
+        let config = self.config.clone();
+        let (current, removed) = retry_learning_snapshot_conflicts(|| {
+            let mut current = Self::load(config.clone())?;
+            let mut candidate = current.data.clone();
+            let before = candidate.buckets.len();
+            candidate
+                .buckets
+                .retain(|_, bucket| bucket.provenance == ApiCoverageProvenance::Operator);
+            let removed = before.saturating_sub(candidate.buckets.len());
+            if removed > 0 {
+                current.commit_candidate(candidate)?;
+            }
+            Ok((current, removed))
+        })?;
+        *self = current;
         Ok(removed)
     }
 
@@ -893,13 +917,11 @@ impl ApiPromotionStore {
         if candidate == self.data {
             return Ok(());
         }
-        let content = self.canonical_content(&candidate)?;
         let outcome = self.save_data(&candidate)?;
-        let committed =
-            load_expected_learning_file_snapshot(&self.config.path, content.as_bytes())?;
+        let (committed, warning) = outcome.into_parts();
         self.data = candidate;
         self.snapshot = committed;
-        if let Some(error) = outcome.warning() {
+        if let Some(error) = warning {
             tracing::warn!(
                 "API coverage replacement committed with a durability warning: {}",
                 error
@@ -988,7 +1010,7 @@ mod tests {
 
     #[test]
     fn approvals_promote_at_threshold_with_max_risk_and_class() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store =
             ApiPromotionStore::load(config(temp.path().join("api.yaml"), 2, 3)).unwrap();
         let s = summary("api");
@@ -1022,7 +1044,7 @@ mod tests {
 
     #[test]
     fn failed_durable_write_does_not_commit_api_learning_state() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let path = temp.path().join("api.yaml");
         let mut store = ApiPromotionStore::load(config(path.clone(), 3, 2)).unwrap();
         let request = summary("api");
@@ -1039,7 +1061,7 @@ mod tests {
 
     #[test]
     fn corrupt_api_coverage_fails_closed_and_deduplicates_verified_copies() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let path = temp.path().join("api.yaml");
         let config = config(path.clone(), 3, 1);
         let request = summary("api");
@@ -1047,7 +1069,7 @@ mod tests {
         store.record_deny(&request, "no", "regime").unwrap();
         let mut corrupt = std::fs::read(&path).unwrap();
         corrupt.push(0xff);
-        std::fs::write(&path, &corrupt).unwrap();
+        crate::learned_rules::write_authority_file(&path, &corrupt).unwrap();
 
         assert!(ApiPromotionStore::load(config.clone()).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), corrupt);
@@ -1071,7 +1093,7 @@ mod tests {
 
     #[test]
     fn current_api_coverage_rejects_newer_schema_unknown_fields_and_key_mismatch() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let path = temp.path().join("api.yaml");
         let cfg = config(path.clone(), 2, 1);
         let request = summary("api");
@@ -1081,12 +1103,16 @@ mod tests {
 
         let mut newer = store.data.clone();
         newer.version = default_version() + 1;
-        std::fs::write(&path, serde_yaml_ng::to_string(&newer).unwrap()).unwrap();
+        crate::learned_rules::write_authority_file(
+            &path,
+            serde_yaml_ng::to_string(&newer).unwrap(),
+        )
+        .unwrap();
         assert!(ApiPromotionStore::load(cfg.clone()).is_err());
 
         let mut unknown = String::from_utf8(original.clone()).unwrap();
         unknown.push_str("unknown_authority_field: true\n");
-        std::fs::write(&path, unknown).unwrap();
+        crate::learned_rules::write_authority_file(&path, unknown).unwrap();
         assert!(ApiPromotionStore::load(cfg.clone()).is_err());
 
         let mut missing_version: serde_yaml_ng::Value =
@@ -1095,19 +1121,27 @@ mod tests {
             .as_mapping_mut()
             .unwrap()
             .remove(serde_yaml_ng::Value::String("version".to_string()));
-        std::fs::write(&path, serde_yaml_ng::to_string(&missing_version).unwrap()).unwrap();
+        crate::learned_rules::write_authority_file(
+            &path,
+            serde_yaml_ng::to_string(&missing_version).unwrap(),
+        )
+        .unwrap();
         assert!(ApiPromotionStore::load(cfg.clone()).is_err());
 
         let mut mismatched = store.data.clone();
         let (key, bucket) = mismatched.buckets.pop_first().unwrap();
         mismatched.buckets.insert(format!("{key}-changed"), bucket);
-        std::fs::write(&path, serde_yaml_ng::to_string(&mismatched).unwrap()).unwrap();
+        crate::learned_rules::write_authority_file(
+            &path,
+            serde_yaml_ng::to_string(&mismatched).unwrap(),
+        )
+        .unwrap();
         assert!(ApiPromotionStore::load(cfg).is_err());
     }
 
     #[test]
     fn legacy_api_key_collision_fails_closed_without_rewriting_authority() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let path = temp.path().join("api.yaml");
         let cfg = config(path.clone(), 2, 1);
         let request = summary("api");
@@ -1123,7 +1157,7 @@ mod tests {
             .insert("legacy-one".to_string(), bucket.clone());
         legacy.buckets.insert("legacy-two".to_string(), bucket);
         let bytes = serde_yaml_ng::to_string(&legacy).unwrap();
-        std::fs::write(&path, &bytes).unwrap();
+        crate::learned_rules::write_authority_file(&path, &bytes).unwrap();
 
         assert!(ApiPromotionStore::load(cfg).is_err());
         assert_eq!(std::fs::read_to_string(path).unwrap(), bytes);
@@ -1132,7 +1166,7 @@ mod tests {
     #[test]
     fn sensitive_api_authority_is_rejected_without_changing_safe_state() {
         let value = ["q", "7"].concat();
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let path = temp.path().join("api.yaml");
         let config = config(path.clone(), 2, 2);
         let mut store = ApiPromotionStore::load(config.clone()).unwrap();
@@ -1163,7 +1197,7 @@ mod tests {
             .buckets
             .insert("contaminated".to_string(), bucket);
         let bytes = serde_yaml_ng::to_string(&contaminated).unwrap();
-        std::fs::write(&path, &bytes).unwrap();
+        crate::learned_rules::write_authority_file(&path, &bytes).unwrap();
         assert!(ApiPromotionStore::load(config).is_err());
         assert_eq!(std::fs::read_to_string(path).unwrap(), bytes);
     }
@@ -1171,7 +1205,7 @@ mod tests {
     #[test]
     fn api_reason_fields_are_sanitized_on_mutation_and_reload() {
         let value = ["q", "7"].concat();
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let path = temp.path().join("api.yaml");
         let config = config(path.clone(), 2, 1);
         let mut store = ApiPromotionStore::load(config.clone()).unwrap();
@@ -1192,7 +1226,7 @@ mod tests {
 
     #[test]
     fn value_bearing_mutations_never_promote_without_field_constraints() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store =
             ApiPromotionStore::load(config(temp.path().join("api.yaml"), 2, 3)).unwrap();
         let mut write = summary("api");
@@ -1216,7 +1250,7 @@ mod tests {
 
     #[test]
     fn evaluator_evidence_never_mutates_operator_coverage() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store =
             ApiPromotionStore::load(config(temp.path().join("api.yaml"), 2, 2)).unwrap();
         let request = summary("api");
@@ -1257,7 +1291,7 @@ mod tests {
 
     #[test]
     fn mixed_classes_disqualify_allow_promotion() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store =
             ApiPromotionStore::load(config(temp.path().join("api.yaml"), 2, 3)).unwrap();
         let s = summary("api");
@@ -1275,7 +1309,7 @@ mod tests {
 
     #[test]
     fn full_session_revision_partitions_coverage_and_unchanged_revision_hits() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store =
             ApiPromotionStore::load(config(temp.path().join("api.yaml"), 2, 2)).unwrap();
         let mut first = summary("api");
@@ -1322,7 +1356,7 @@ mod tests {
 
     #[test]
     fn risk_ceiling_blocks_allow_promotion_evidence() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store =
             ApiPromotionStore::load(config(temp.path().join("api.yaml"), 2, 3)).unwrap();
         let s = summary("api");
@@ -1346,7 +1380,7 @@ mod tests {
 
     #[test]
     fn denials_learn_fast_deny_at_threshold() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store =
             ApiPromotionStore::load(config(temp.path().join("api.yaml"), 5, 2)).unwrap();
         let s = summary("api");
@@ -1363,7 +1397,7 @@ mod tests {
 
     #[test]
     fn observation_buckets_are_lru_capped() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store =
             ApiPromotionStore::load(config(temp.path().join("api.yaml"), 2, 2)).unwrap();
 
@@ -1421,7 +1455,7 @@ mod tests {
 
     #[test]
     fn yaml_round_trip_preserves_promoted_shape() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let path = temp.path().join("api.yaml");
         let s = summary("api");
         {
@@ -1440,7 +1474,7 @@ mod tests {
 
     #[test]
     fn object_name_is_excluded_from_keying() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store =
             ApiPromotionStore::load(config(temp.path().join("api.yaml"), 2, 3)).unwrap();
 
@@ -1469,7 +1503,7 @@ mod tests {
 
     #[test]
     fn dry_run_requests_never_feed_promotion() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store =
             ApiPromotionStore::load(config(temp.path().join("api.yaml"), 2, 2)).unwrap();
         let mut s = summary("api");
@@ -1490,7 +1524,7 @@ mod tests {
 
     #[test]
     fn a_different_body_shape_is_a_different_bucket() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store =
             ApiPromotionStore::load(config(temp.path().join("api.yaml"), 2, 2)).unwrap();
         let base = summary("api");
@@ -1510,7 +1544,7 @@ mod tests {
 
     #[test]
     fn an_ineligible_allow_disqualifies_the_shape() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store =
             ApiPromotionStore::load(config(temp.path().join("api.yaml"), 2, 2)).unwrap();
         let s = summary("api");
@@ -1536,7 +1570,7 @@ mod tests {
 
     #[test]
     fn a_stamp_change_invalidates_prior_learning() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let path = temp.path().join("api.yaml");
         let s = summary("api");
         {
@@ -1580,9 +1614,9 @@ mod tests {
 
     #[test]
     fn old_generated_coverage_migrates_to_bounded_expiry() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let path = temp.path().join("api.yaml");
-        std::fs::write(
+        crate::learned_rules::write_authority_file(
             &path,
             r#"version: 1
 buckets:
@@ -1613,10 +1647,10 @@ buckets:
 
     #[test]
     fn old_bucket_keys_migrate_to_the_default_endpoint() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let path = temp.path().join("api.yaml");
         let now = now_unix();
-        std::fs::write(
+        crate::learned_rules::write_authority_file(
             &path,
             format!(
                 r#"version: 1
@@ -1651,7 +1685,7 @@ buckets:
 
     #[test]
     fn any_deny_disqualifies_an_existing_generated_allow() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store =
             ApiPromotionStore::load(config(temp.path().join("api.yaml"), 2, 2)).unwrap();
         let s = summary("api");
@@ -1675,7 +1709,7 @@ buckets:
 
     #[test]
     fn generated_coverage_is_scoped_by_endpoint_and_session() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store =
             ApiPromotionStore::load(config(temp.path().join("api.yaml"), 2, 2)).unwrap();
         let mut scoped = summary("api");
@@ -1705,7 +1739,7 @@ buckets:
 
     #[test]
     fn expired_coverage_restarts_evidence_collection() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store =
             ApiPromotionStore::load(config(temp.path().join("api.yaml"), 2, 2)).unwrap();
         let s = summary("api");
@@ -1739,7 +1773,7 @@ buckets:
 
     #[test]
     fn stale_api_instances_merge_observations_and_preserve_concurrent_denies() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let config = config(temp.path().join("api.yaml"), 2, 1);
         let mut first = ApiPromotionStore::load(config.clone()).unwrap();
         let mut second = ApiPromotionStore::load(config.clone()).unwrap();
@@ -1787,7 +1821,7 @@ buckets:
 
     #[test]
     fn stale_api_fast_path_refreshes_a_concurrent_deny_before_allowing() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let config = config(temp.path().join("api.yaml"), 2, 1);
         let request = summary("api");
         let mut stale = ApiPromotionStore::load(config.clone()).unwrap();
@@ -1810,5 +1844,31 @@ buckets:
         stale.refresh_for_decision().unwrap();
         assert!(stale.learned_allow(&request, "regime").is_none());
         assert!(stale.learned_deny(&request, "regime").is_some());
+    }
+
+    #[test]
+    fn stale_clear_commits_against_fresh_generated_coverage() {
+        let temp = crate::learned_rules::authority_tempdir();
+        let config = config(temp.path().join("api.yaml"), 1, 1);
+        let request = summary("api");
+        let mut stale = ApiPromotionStore::load(config.clone()).unwrap();
+        let mut writer = ApiPromotionStore::load(config.clone()).unwrap();
+        writer
+            .record_allow(
+                &request,
+                Some(1),
+                Some(Reversibility::Reversible),
+                "safe",
+                "regime",
+            )
+            .unwrap();
+        assert!(writer.has_generated_coverage());
+
+        assert_eq!(stale.clear_generated().unwrap(), 1);
+        assert!(!stale.has_generated_coverage());
+        let first_restart = ApiPromotionStore::load(config.clone()).unwrap();
+        assert!(!first_restart.has_generated_coverage());
+        let second_restart = ApiPromotionStore::load(config).unwrap();
+        assert!(!second_restart.has_generated_coverage());
     }
 }

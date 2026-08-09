@@ -455,7 +455,7 @@ mod tests {
     async fn mark_allow_promotion_resolved_permanently_excludes_the_bucket() {
         use crate::gating::allow_promotion::{AllowPromotionConfig, AllowPromotionStore};
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut config = AllowPromotionConfig::new(temp.path().join("allow.yaml"));
         config.min_approvals = 2;
         let store = AllowPromotionStore::load(config).unwrap();

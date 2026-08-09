@@ -99,6 +99,8 @@ async fn start_daemon_with_gate(
     let verbs_path = tmp.path().join("verbs.yaml");
     std::fs::write(&policy_path, POLICY_YAML).expect("write policy yaml");
     std::fs::write(&verbs_path, VERBS_YAML).expect("write verbs yaml");
+    std::fs::set_permissions(&verbs_path, std::fs::Permissions::from_mode(0o600))
+        .expect("restrict verb catalog permissions");
     let test_secret_env = format!("GUARD_SECRET_U{}_mcp-test-placeholder", current_uid());
 
     let mut command = Command::new(GUARD_BIN);

@@ -29,8 +29,8 @@ use crate::env::now_unix;
 #[cfg(test)]
 use crate::learned_rules::write_learning_file_atomically;
 use crate::learned_rules::{
-    infer_service_from_binary, load_expected_learning_file_snapshot, load_learning_file_snapshot,
-    retry_learning_snapshot_conflicts, rewrite_learning_file_bounded, sanitize_learning_text,
+    infer_service_from_binary, load_learning_file_snapshot, retry_learning_snapshot_conflicts,
+    rewrite_learning_file_bounded, sanitize_learning_text,
     write_learning_file_atomically_for_locked_snapshot, LearningFileSnapshot, LearningWriteOutcome,
 };
 use crate::redact::{
@@ -276,6 +276,10 @@ impl DenyShapeStore {
         Ok(())
     }
 
+    pub(crate) fn refreshed_copy(&self) -> Result<Self> {
+        Self::load(self.config.clone())
+    }
+
     /// Fast-path lookup: does an already-synthesized shape cover this
     /// binary/args? `args_joined` must be built the same way the evaluator
     /// splits a flattened command line (space-joined argv tail).
@@ -470,13 +474,11 @@ impl DenyShapeStore {
         if candidate == self.data {
             return Ok(());
         }
-        let content = self.canonical_content(&candidate)?;
         let outcome = self.save_data(&candidate)?;
-        let committed =
-            load_expected_learning_file_snapshot(&self.config.path, content.as_bytes())?;
+        let (committed, warning) = outcome.into_parts();
         self.data = candidate;
         self.snapshot = committed;
-        if let Some(error) = outcome.warning() {
+        if let Some(error) = warning {
             tracing::warn!(
                 "deny-shape replacement committed with a durability warning: {}",
                 error
@@ -594,7 +596,7 @@ mod tests {
 
     #[test]
     fn repeated_denials_become_ready_to_synthesize_once() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store = DenyShapeStore::load(config(temp.path().join("deny.yaml"), 2)).unwrap();
         let args = vec!["delete".into(), "namespace".into(), "prod".into()];
 
@@ -630,7 +632,7 @@ mod tests {
 
     #[test]
     fn failed_deny_shape_write_keeps_memory_and_durable_state_unchanged() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let path = temp.path().join("deny.yaml");
         let mut store = DenyShapeStore::load(config(path.clone(), 2)).unwrap();
         let command_args = vec!["delete".to_string(), "pod".to_string()];
@@ -640,7 +642,7 @@ mod tests {
         let before_memory = store.data.clone();
         let before_file = std::fs::read(&path).unwrap();
         let blocker = temp.path().join("blocker");
-        std::fs::write(&blocker, "not a directory").unwrap();
+        crate::learned_rules::write_authority_file(&blocker, "not a directory").unwrap();
         store.config.path = blocker.join("deny.yaml");
 
         assert!(store
@@ -652,7 +654,7 @@ mod tests {
 
     #[test]
     fn sensitive_deny_records_are_rejected_and_purged_idempotently() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let path = temp.path().join("deny.yaml");
         let config = config(path.clone(), 1);
         let mut store = DenyShapeStore::load(config.clone()).unwrap();
@@ -721,7 +723,7 @@ mod tests {
 
     #[test]
     fn deny_shape_regex_and_legacy_delimiter_evidence_fail_closed() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let path = temp.path().join("deny.yaml");
         let config = config(path.clone(), 1);
         let mut store = DenyShapeStore::load(config.clone()).unwrap();
@@ -772,7 +774,7 @@ mod tests {
 
     #[test]
     fn deny_learning_prose_is_sanitized_without_changing_shape_authority() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let path = temp.path().join("deny.yaml");
         let config = config(path.clone(), 1);
         let value = ["q", "7"].concat();
@@ -822,7 +824,7 @@ mod tests {
 
     #[test]
     fn disabled_store_records_nothing() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut cfg = config(temp.path().join("deny.yaml"), 1);
         cfg.enabled = false;
         let mut store = DenyShapeStore::load(cfg).unwrap();
@@ -834,7 +836,7 @@ mod tests {
 
     #[test]
     fn promoted_shape_matches_binary_and_args() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store = DenyShapeStore::load(config(temp.path().join("deny.yaml"), 2)).unwrap();
         store
             .promote_shape(
@@ -862,7 +864,7 @@ mod tests {
         // path-qualified location, and vice versa -- deny-only, so this isn't
         // a bypass that could be misused, but it should behave the same way
         // the codebase's other binary matching does.
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store = DenyShapeStore::load(config(temp.path().join("deny.yaml"), 2)).unwrap();
         store
             .promote_shape(
@@ -890,7 +892,7 @@ mod tests {
         // never matches the long shell-command-chain canary -- but it would
         // still match almost any short evidence string. Multiple canary
         // lengths close this gap.
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store = DenyShapeStore::load(config(temp.path().join("deny.yaml"), 2)).unwrap();
         let err = store
             .promote_shape(
@@ -907,7 +909,7 @@ mod tests {
 
     #[test]
     fn promote_shape_rejects_unanchored_pattern() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store = DenyShapeStore::load(config(temp.path().join("deny.yaml"), 2)).unwrap();
         let err = store
             .promote_shape(
@@ -924,7 +926,7 @@ mod tests {
 
     #[test]
     fn promote_shape_rejects_overbroad_pattern() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store = DenyShapeStore::load(config(temp.path().join("deny.yaml"), 2)).unwrap();
         let err = store
             .promote_shape(
@@ -941,7 +943,7 @@ mod tests {
 
     #[test]
     fn promote_shape_rejects_pattern_that_does_not_match_its_own_evidence() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store = DenyShapeStore::load(config(temp.path().join("deny.yaml"), 2)).unwrap();
         let err = store
             .promote_shape(
@@ -967,7 +969,7 @@ mod tests {
 
     #[test]
     fn observation_buckets_are_capped_by_evicting_the_oldest() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let mut store = DenyShapeStore::load(config(temp.path().join("deny.yaml"), 2)).unwrap();
 
         // Fill directly to the cap (bypassing record_denial's per-call file
@@ -1008,14 +1010,14 @@ mod tests {
         // solely to fast-reject) and accessors for counts/config. There is
         // no method anywhere in this module that returns or implies an
         // allow decision.
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let store = DenyShapeStore::load(config(temp.path().join("deny.yaml"), 2)).unwrap();
         assert_eq!(store.shape_count(), 0);
     }
 
     #[test]
     fn stale_deny_instances_merge_observations_but_reject_authority_conflicts() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::learned_rules::authority_tempdir();
         let config = config(temp.path().join("deny.yaml"), 2);
         let mut first = DenyShapeStore::load(config.clone()).unwrap();
         let mut second = DenyShapeStore::load(config.clone()).unwrap();

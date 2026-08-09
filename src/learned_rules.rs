@@ -34,24 +34,91 @@ use crate::redact::{
 
 /// Outcome of an atomic learning-file replacement.
 ///
-/// `CommittedWithWarning` means the destination contains the requested bytes,
-/// but a later durability or cleanup operation failed. Callers must adopt the
-/// candidate in memory before returning the warning to avoid diverging from
-/// the authority on disk.
+/// A warning means the destination contains the returned snapshot, but a later
+/// durability or cleanup operation failed. Callers adopt this snapshot before
+/// surfacing the warning so memory does not diverge from committed authority.
 #[derive(Debug)]
 #[cfg_attr(windows, allow(dead_code))]
-pub(crate) enum LearningWriteOutcome {
-    Durable,
-    CommittedWithWarning(anyhow::Error),
+pub(crate) struct LearningWriteOutcome {
+    snapshot: LearningFileSnapshot,
+    warning: Option<anyhow::Error>,
 }
 
 impl LearningWriteOutcome {
-    pub(crate) fn warning(self) -> Option<anyhow::Error> {
-        match self {
-            Self::Durable => None,
-            Self::CommittedWithWarning(error) => Some(error),
+    #[cfg(test)]
+    pub(crate) fn committed_snapshot(&self) -> &LearningFileSnapshot {
+        &self.snapshot
+    }
+
+    #[cfg(test)]
+    pub(crate) fn warning(&self) -> Option<&anyhow::Error> {
+        self.warning.as_ref()
+    }
+
+    pub(crate) fn into_parts(self) -> (LearningFileSnapshot, Option<anyhow::Error>) {
+        #[cfg(test)]
+        let hook = {
+            let mut hook = post_commit_adoption_hook()
+                .lock()
+                .expect("post-commit hook lock");
+            if hook.as_ref().is_some_and(|(needle, _, _)| {
+                self.snapshot.content().is_some_and(|content| {
+                    std::str::from_utf8(content).is_ok_and(|content| content.contains(needle))
+                })
+            }) {
+                hook.take()
+            } else {
+                None
+            }
+        };
+        #[cfg(test)]
+        if let Some((_, committed, release)) = hook {
+            committed.wait();
+            release.wait();
+        }
+        (self.snapshot, self.warning)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn committed_with_warning_for_test(
+        snapshot: LearningFileSnapshot,
+        warning: anyhow::Error,
+    ) -> Self {
+        Self {
+            snapshot,
+            warning: Some(warning),
         }
     }
+}
+
+#[cfg(test)]
+type PostCommitAdoptionHook = (
+    String,
+    std::sync::Arc<std::sync::Barrier>,
+    std::sync::Arc<std::sync::Barrier>,
+);
+
+#[cfg(test)]
+fn post_commit_adoption_hook() -> &'static std::sync::Mutex<Option<PostCommitAdoptionHook>> {
+    static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<PostCommitAdoptionHook>>> =
+        std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+pub(crate) fn pause_post_commit_adoption_for_test(
+    needle: &str,
+) -> (
+    std::sync::Arc<std::sync::Barrier>,
+    std::sync::Arc<std::sync::Barrier>,
+) {
+    let committed = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+    *post_commit_adoption_hook()
+        .lock()
+        .expect("post-commit hook lock") =
+        Some((needle.to_string(), committed.clone(), release.clone()));
+    (committed, release)
 }
 
 #[derive(Debug)]
@@ -139,11 +206,7 @@ where
         };
         match write_learning_file_atomically_for_locked_snapshot(path, &snapshot, &content) {
             Ok(outcome) => {
-                let warning = outcome.warning();
-                let committed = load_learning_file_snapshot(path)?;
-                if committed.content() != Some(content.as_bytes()) {
-                    continue;
-                }
+                let (committed, warning) = outcome.into_parts();
                 return Ok((adoption, committed, warning));
             }
             Err(error) if is_learning_snapshot_conflict(&error) => continue,
@@ -171,6 +234,53 @@ pub fn create_hardened_file_if_absent(path: &Path, content: &str) -> Result<()> 
         tracing::warn!("authority-file creation committed with a durability warning: {error}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn authority_tempdir() -> tempfile::TempDir {
+    let directory = tempfile::tempdir().expect("create authority test directory");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("harden authority test directory");
+    }
+    directory
+}
+
+#[cfg(test)]
+pub(crate) fn write_authority_file(
+    path: impl AsRef<Path>,
+    content: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    let path = path.as_ref();
+    std::fs::write(path, content)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn create_authority_directory(path: impl AsRef<Path>) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = path.as_ref();
+    std::fs::create_dir(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(test)]
+pub(crate) fn hold_learning_file_lock_for_test(
+    path: &Path,
+    acquired: &std::sync::Barrier,
+    release: &std::sync::Barrier,
+) {
+    let lock = DestinationLock::acquire(path).expect("acquire authority test lock");
+    acquired.wait();
+    release.wait();
+    drop(lock);
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -282,6 +392,19 @@ fn validate_generation_digest(digest: &str) -> Result<()> {
         anyhow::bail!("invalid learning transaction generation digest")
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn validate_recoverable_unix_mode(mode: u32) -> Result<()> {
+    if mode & 0o600 != 0o600 || mode & 0o7111 != 0 || mode & 0o022 != 0 || mode > 0o7777 {
+        anyhow::bail!("transaction marker records an unsafe authority-file mode")
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_recoverable_unix_mode(_mode: u32) -> Result<()> {
+    anyhow::bail!("Unix authority-file modes are invalid on this platform")
 }
 
 fn transaction_paths(path: &Path, identity: &str) -> Result<LearningTransactionPaths> {
@@ -453,12 +576,11 @@ fn directory_identity(_file: &File) -> Result<DirectoryIdentity> {
 fn validate_trusted_parent(parent: &File, path: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     let metadata = parent.metadata()?;
-    if metadata.uid() != unsafe { libc::geteuid() } {
-        anyhow::bail!("destination directory is not owned by the effective user")
+    let effective_user = unsafe { libc::geteuid() };
+    if metadata.uid() != effective_user && metadata.uid() != 0 {
+        anyhow::bail!("destination directory is not owned by a trusted principal")
     }
-    let untrusted_group_write =
-        metadata.mode() & 0o020 != 0 && metadata.gid() != unsafe { libc::getegid() };
-    if metadata.mode() & 0o002 != 0 || untrusted_group_write {
+    if metadata.mode() & 0o022 != 0 {
         anyhow::bail!("destination directory permits untrusted entry replacement")
     }
     if !metadata.is_dir() {
@@ -467,12 +589,211 @@ fn validate_trusted_parent(parent: &File, path: &Path) -> Result<()> {
     parent_identity_matches(parent, path)
 }
 
+#[cfg(unix)]
+fn validate_authority_file(file: &File) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    let effective_user = unsafe { libc::geteuid() };
+    if !metadata.is_file()
+        || (metadata.uid() != effective_user && metadata.uid() != 0)
+        || metadata.mode() & 0o022 != 0
+        || metadata.nlink() != 1
+    {
+        anyhow::bail!("authority file ownership, permissions, or link count are unsafe")
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 fn validate_trusted_parent(parent: &File, path: &Path) -> Result<()> {
-    // The held directory excludes delete sharing, which prevents another
-    // process from retargeting entries during the transaction. Identity is
-    // checked again before releasing the destination lock.
+    validate_windows_authority_handle(parent, true)?;
     parent_identity_matches(parent, path)
+}
+
+#[cfg(windows)]
+fn validate_authority_file(file: &File) -> Result<()> {
+    validate_windows_authority_handle(file, false)
+}
+
+#[cfg(windows)]
+fn validate_windows_authority_handle(file: &File, directory: bool) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
+    use windows_sys::Win32::Security::Authorization::{
+        GetExplicitEntriesFromAclW, GetSecurityInfo, GRANT_ACCESS, SET_ACCESS, SE_FILE_OBJECT,
+        TRUSTEE_IS_SID,
+    };
+    use windows_sys::Win32::Security::{
+        CreateWellKnownSid, EqualSid, GetTokenInformation, TokenUser, WinBuiltinAdministratorsSid,
+        WinLocalSystemSid, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSID,
+        SECURITY_MAX_SID_SIZE, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_APPEND_DATA, FILE_DELETE_CHILD, FILE_WRITE_DATA,
+        FILE_WRITE_EA,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    fn well_known_sid(kind: i32) -> Result<Vec<u8>> {
+        let mut sid = vec![0u8; SECURITY_MAX_SID_SIZE as usize];
+        let mut size = sid.len() as u32;
+        if unsafe {
+            CreateWellKnownSid(
+                kind,
+                std::ptr::null_mut(),
+                sid.as_mut_ptr().cast(),
+                &mut size,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to construct a trusted Windows SID");
+        }
+        sid.truncate(size as usize);
+        Ok(sid)
+    }
+
+    fn current_user_sid() -> Result<Vec<u8>> {
+        let mut token = std::ptr::null_mut();
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to open the current Windows process token");
+        }
+        let mut needed = 0;
+        unsafe {
+            GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+        }
+        if needed == 0 {
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(token) };
+            return Err(std::io::Error::last_os_error())
+                .context("failed to size the current Windows user SID");
+        }
+        let mut token_user = vec![0u8; needed as usize];
+        let loaded = unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                token_user.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            )
+        };
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(token) };
+        if loaded == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to read the current Windows user SID");
+        }
+        let user = unsafe { &*(token_user.as_ptr().cast::<TOKEN_USER>()) };
+        let sid_length = unsafe { windows_sys::Win32::Security::GetLengthSid(user.User.Sid) };
+        if sid_length == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to measure the current Windows user SID");
+        }
+        let mut sid = vec![0u8; sid_length as usize];
+        if unsafe {
+            windows_sys::Win32::Security::CopySid(
+                sid_length,
+                sid.as_mut_ptr().cast(),
+                user.User.Sid,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to copy the current Windows user SID");
+        }
+        Ok(sid)
+    }
+
+    let system = well_known_sid(WinLocalSystemSid)?;
+    let administrators = well_known_sid(WinBuiltinAdministratorsSid)?;
+    let current_user = current_user_sid()?;
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut dacl = std::ptr::null_mut();
+    let mut descriptor = std::ptr::null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS || descriptor.is_null() || owner.is_null() || dacl.is_null() {
+        if !descriptor.is_null() {
+            unsafe { LocalFree(descriptor) };
+        }
+        anyhow::bail!("authority object has no inspectable owner-only Windows DACL");
+    }
+
+    let trusted_owner = unsafe { EqualSid(owner, current_user.as_ptr().cast_mut().cast()) } != 0
+        || unsafe { EqualSid(owner, system.as_ptr().cast_mut().cast()) } != 0
+        || unsafe { EqualSid(owner, administrators.as_ptr().cast_mut().cast()) } != 0;
+    if !trusted_owner {
+        unsafe { LocalFree(descriptor) };
+        anyhow::bail!("authority object is not owned by a trusted Windows principal");
+    }
+    let mut count = 0;
+    let mut entries = std::ptr::null_mut();
+    let entries_status = unsafe { GetExplicitEntriesFromAclW(dacl, &mut count, &mut entries) };
+    if entries_status != ERROR_SUCCESS {
+        unsafe { LocalFree(descriptor) };
+        anyhow::bail!("failed to enumerate the Windows authority DACL");
+    }
+
+    let dangerous = if directory {
+        FILE_ADD_FILE
+            | FILE_ADD_SUBDIRECTORY
+            | FILE_DELETE_CHILD
+            | FILE_WRITE_EA
+            | 0x0001_0000
+            | 0x0004_0000
+            | 0x0008_0000
+            | 0x1000_0000
+            | 0x4000_0000
+    } else {
+        FILE_WRITE_DATA
+            | FILE_APPEND_DATA
+            | FILE_WRITE_EA
+            | 0x0001_0000
+            | 0x0004_0000
+            | 0x0008_0000
+            | 0x1000_0000
+            | 0x4000_0000
+    };
+    let result = (|| -> Result<()> {
+        for entry in unsafe { std::slice::from_raw_parts(entries, count as usize) } {
+            if !matches!(entry.grfAccessMode, GRANT_ACCESS | SET_ACCESS)
+                || entry.grfAccessPermissions & dangerous == 0
+            {
+                continue;
+            }
+            if entry.Trustee.TrusteeForm != TRUSTEE_IS_SID || entry.Trustee.ptstrName.is_null() {
+                anyhow::bail!("authority DACL grants mutation rights to an unverified trustee");
+            }
+            let trustee = entry.Trustee.ptstrName.cast();
+            let trusted = unsafe { EqualSid(trustee, owner) } != 0
+                || unsafe { EqualSid(trustee, system.as_ptr().cast_mut().cast()) } != 0
+                || unsafe { EqualSid(trustee, administrators.as_ptr().cast_mut().cast()) } != 0;
+            if !trusted {
+                anyhow::bail!("authority DACL grants mutation rights to an untrusted principal");
+            }
+        }
+        Ok(())
+    })();
+    unsafe {
+        LocalFree(entries.cast());
+        LocalFree(descriptor);
+    }
+    result
+}
+
+#[cfg(not(any(unix, windows)))]
+fn validate_authority_file(_file: &File) -> Result<()> {
+    anyhow::bail!("authority-file validation is unsupported on this platform")
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -513,7 +834,9 @@ fn validate_lock_file(file: &File, path: &Path) -> Result<()> {
             (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
         ))
     }
+    validate_windows_authority_handle(file, false)?;
     let current = owner_only_options().read(true).write(true).open(path)?;
+    validate_windows_authority_handle(&current, false)?;
     if identity(file)? != identity(&current)? {
         anyhow::bail!("learning-file lock identity changed while held")
     }
@@ -1228,6 +1551,9 @@ fn read_transaction_marker(
             if let Some(expected) = &marker.expected_security_generation {
                 validate_generation_digest(expected)?;
             }
+            if let Some(mode) = marker.expected_unix_mode {
+                validate_recoverable_unix_mode(mode)?;
+            }
             Ok(DecodedLearningTransactionMarker::Current(marker))
         }
         2 => {
@@ -1348,17 +1674,6 @@ pub(crate) fn load_learning_file_snapshot(path: &Path) -> Result<LearningFileSna
     read_learning_file_snapshot_locked(&lock)
 }
 
-pub(crate) fn load_expected_learning_file_snapshot(
-    path: &Path,
-    expected: &[u8],
-) -> Result<LearningFileSnapshot> {
-    let snapshot = load_learning_file_snapshot(path)?;
-    if snapshot.content() != Some(expected) {
-        return Err(snapshot_conflict());
-    }
-    Ok(snapshot)
-}
-
 fn read_learning_file_snapshot_locked(lock: &DestinationLock) -> Result<LearningFileSnapshot> {
     let path = lock.destination();
     let parent_identity = lock.parent_identity()?;
@@ -1377,18 +1692,16 @@ fn read_learning_file_snapshot_locked(lock: &DestinationLock) -> Result<Learning
         {
             use std::os::windows::fs::OpenOptionsExt;
             use windows_sys::Win32::Storage::FileSystem::{
-                FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
             };
             options
-                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .share_mode(FILE_SHARE_READ)
                 .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
         }
         let mut file = options
             .open(path)
             .with_context(|| format!("failed to open locked snapshot {}", path.display()))?;
-        if !file.metadata()?.is_file() {
-            anyhow::bail!("learning destination is not a regular file")
-        }
+        validate_authority_file(&file)?;
         let modified = file
             .metadata()
             .ok()
@@ -1406,6 +1719,34 @@ fn read_learning_file_snapshot_locked(lock: &DestinationLock) -> Result<Learning
         parent_identity,
         modified,
     })
+}
+
+fn committed_write_outcome(
+    lock: &DestinationLock,
+    expected_content: &[u8],
+    mut warning: Option<anyhow::Error>,
+) -> Result<LearningWriteOutcome> {
+    let snapshot = match read_learning_file_snapshot_locked(lock) {
+        Ok(snapshot) if snapshot.content() == Some(expected_content) => snapshot,
+        Ok(_) => anyhow::bail!("committed authority bytes do not match the replacement candidate"),
+        Err(capture_error) => {
+            warning = Some(match warning {
+                Some(error) => anyhow::anyhow!(
+                    "{error}; the committed snapshot could not be reopened through the pinned authority namespace: {capture_error}"
+                ),
+                None => anyhow::anyhow!(
+                    "the committed snapshot could not be reopened through the pinned authority namespace: {capture_error}"
+                ),
+            });
+            LearningFileSnapshot {
+                content: Some(expected_content.to_vec()),
+                generation: Some(content_digest(expected_content)),
+                parent_identity: lock.parent_identity()?,
+                modified: None,
+            }
+        }
+    };
+    Ok(LearningWriteOutcome { snapshot, warning })
 }
 
 #[cfg(unix)]
@@ -1713,6 +2054,7 @@ fn restore_replacement_metadata(
 ) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let expected = marker.expected_unix_mode.unwrap_or(0o600);
+    validate_recoverable_unix_mode(expected)?;
     let actual = std::fs::metadata(destination)?.permissions().mode() & 0o7777;
     if actual != expected {
         std::fs::set_permissions(destination, std::fs::Permissions::from_mode(expected))?;
@@ -2114,8 +2456,8 @@ where
             return Err(snapshot_conflict());
         }
     }
+    let current = read_learning_file_snapshot_locked(&lock)?;
     if let Some(expected) = expected {
-        let current = read_learning_file_snapshot_locked(&lock)?;
         if current.content() != expected {
             return Err(snapshot_conflict());
         }
@@ -2128,6 +2470,10 @@ where
     let original_mode = std::fs::metadata(path)
         .ok()
         .map(|metadata| metadata.permissions().mode() & 0o7777);
+    #[cfg(unix)]
+    if let Some(mode) = original_mode {
+        validate_recoverable_unix_mode(mode)?;
+    }
     #[cfg(not(unix))]
     let original_mode = None;
     let original_sha256 = path.exists().then(|| digest_file(path)).transpose()?;
@@ -2182,6 +2528,19 @@ where
     if let Err(error) = rename_write_through(&paths.source, path) {
         let recovery = recover_learning_file_transaction_locked(path);
         return match recovery {
+            Ok(())
+                if digest_file(path).ok().as_deref()
+                    == Some(marker.candidate_generation.as_str()) =>
+            {
+                committed_write_outcome(
+                    &lock,
+                    content.as_bytes(),
+                    Some(anyhow::Error::new(error).context(format!(
+                        "replacement reported failure after committing {}",
+                        path.display()
+                    ))),
+                )
+            }
             Ok(()) => Err(error).with_context(|| format!("failed to replace {}", path.display())),
             Err(recovery_error) => anyhow::bail!(
                 "failed to replace {} and recovery failed: {} (replacement error: {})",
@@ -2195,22 +2554,22 @@ where
         .and_then(|()| std::fs::File::open(path)?.sync_all().map_err(Into::into))
         .with_context(|| format!("failed to restore metadata for {}", path.display()))
     {
-        return Ok(LearningWriteOutcome::CommittedWithWarning(error));
+        return committed_write_outcome(&lock, content.as_bytes(), Some(error));
     }
     if let Err(error) = sync_directory(parent)
         .with_context(|| format!("failed to sync parent directory {}", parent.display()))
     {
-        return Ok(LearningWriteOutcome::CommittedWithWarning(error));
+        return committed_write_outcome(&lock, content.as_bytes(), Some(error));
     }
     if let Err(error) = lock.verify_parent_binding() {
-        return Ok(LearningWriteOutcome::CommittedWithWarning(error));
+        return committed_write_outcome(&lock, content.as_bytes(), Some(error));
     }
     marker.phase = LearningTransactionPhase::ReplacementDurable;
     if let Err(error) = write_transaction_marker(&paths, &marker)
         .and_then(|()| sync_directory(parent))
         .context("failed to persist durable replacement phase")
     {
-        return Ok(LearningWriteOutcome::CommittedWithWarning(error));
+        return committed_write_outcome(&lock, content.as_bytes(), Some(error));
     }
     if let Err(error) = remove_verified_artifact(&paths.backup, original_sha256.as_deref())
         .and_then(|()| {
@@ -2222,14 +2581,14 @@ where
             })
         })
     {
-        return Ok(LearningWriteOutcome::CommittedWithWarning(error));
+        return committed_write_outcome(&lock, content.as_bytes(), Some(error));
     }
     marker.phase = LearningTransactionPhase::BackupRemoved;
     if let Err(error) = write_transaction_marker(&paths, &marker)
         .and_then(|()| sync_directory(parent))
         .context("failed to persist rollback-cleanup phase")
     {
-        return Ok(LearningWriteOutcome::CommittedWithWarning(error));
+        return committed_write_outcome(&lock, content.as_bytes(), Some(error));
     }
     if let Err(error) = remove_if_present(&paths.marker).and_then(|()| {
         sync_directory(parent).with_context(|| {
@@ -2239,9 +2598,9 @@ where
             )
         })
     }) {
-        return Ok(LearningWriteOutcome::CommittedWithWarning(error));
+        return committed_write_outcome(&lock, content.as_bytes(), Some(error));
     }
-    Ok(LearningWriteOutcome::Durable)
+    committed_write_outcome(&lock, content.as_bytes(), None)
 }
 
 fn copy_file_owner_only(source: &Path, destination: &Path) -> Result<()> {
@@ -2543,8 +2902,8 @@ fn write_learning_file_atomically_windows(
             return Err(snapshot_conflict());
         }
     }
+    let current = read_learning_file_snapshot_locked(&lock)?;
     if let Some(expected) = expected {
-        let current = read_learning_file_snapshot_locked(&lock)?;
         if current.content() != expected {
             return Err(snapshot_conflict());
         }
@@ -2659,6 +3018,19 @@ fn write_learning_file_atomically_windows(
     if let Err(replacement_error) = replacement {
         let recovery = recover_learning_file_transaction_locked(path);
         return match recovery {
+            Ok(())
+                if digest_file(path).ok().as_deref()
+                    == Some(marker.candidate_generation.as_str()) =>
+            {
+                committed_write_outcome(
+                    &lock,
+                    content.as_bytes(),
+                    Some(anyhow::Error::new(replacement_error).context(format!(
+                        "replacement reported failure after committing {}",
+                        path.display()
+                    ))),
+                )
+            }
             Ok(()) => Err(replacement_error)
                 .with_context(|| format!("failed to replace {}", path.display())),
             Err(recovery_error) => anyhow::bail!(
@@ -2705,34 +3077,42 @@ fn write_learning_file_atomically_windows(
         // marker and backup for restart recovery, report the late failure as a
         // committed outcome, and let callers adopt the exact candidate now on
         // disk instead of retaining stale in-memory authority.
-        return Ok(LearningWriteOutcome::CommittedWithWarning(finalize_error));
+        return committed_write_outcome(&lock, content.as_bytes(), Some(finalize_error));
     }
     if let Err(error) = lock.verify_parent_binding() {
-        return Ok(LearningWriteOutcome::CommittedWithWarning(error));
+        return committed_write_outcome(&lock, content.as_bytes(), Some(error));
     }
     marker.phase = LearningTransactionPhase::ReplacementDurable;
     if let Err(error) = write_transaction_marker(&paths, &marker) {
-        return Ok(LearningWriteOutcome::CommittedWithWarning(
-            error.context("failed to persist durable replacement phase"),
-        ));
+        return committed_write_outcome(
+            &lock,
+            content.as_bytes(),
+            Some(error.context("failed to persist durable replacement phase")),
+        );
     }
     if let Err(error) =
         remove_verified_artifact(&paths.backup, marker.expected_generation.as_deref())
     {
-        return Ok(LearningWriteOutcome::CommittedWithWarning(error));
+        return committed_write_outcome(&lock, content.as_bytes(), Some(error));
     }
     marker.phase = LearningTransactionPhase::BackupRemoved;
     if let Err(error) = write_transaction_marker(&paths, &marker) {
-        return Ok(LearningWriteOutcome::CommittedWithWarning(
-            error.context("failed to persist rollback-cleanup phase"),
-        ));
+        return committed_write_outcome(
+            &lock,
+            content.as_bytes(),
+            Some(error.context("failed to persist rollback-cleanup phase")),
+        );
     }
     if let Err(error) = remove_if_present(&paths.marker) {
-        return Ok(LearningWriteOutcome::CommittedWithWarning(error));
+        return committed_write_outcome(&lock, content.as_bytes(), Some(error));
     }
-    Ok(LearningWriteOutcome::CommittedWithWarning(anyhow::anyhow!(
-        "Windows flushes replacement content and publishes transaction phases with write-through moves, but does not expose independent directory-entry flush confirmation"
-    )))
+    committed_write_outcome(
+        &lock,
+        content.as_bytes(),
+        Some(anyhow::anyhow!(
+            "Windows flushes replacement content and publishes transaction phases with write-through moves, but does not expose independent directory-entry flush confirmation"
+        )),
+    )
 }
 
 pub(crate) fn sanitize_learning_text(value: &str) -> String {
@@ -3054,13 +3434,11 @@ impl LearnedRuleStore {
         if candidate == self.data {
             return Ok(());
         }
-        let content = self.canonical_content(&candidate)?;
         let outcome = self.save_data(&candidate)?;
-        let committed =
-            load_expected_learning_file_snapshot(&self.config.path, content.as_bytes())?;
+        let (committed, warning) = outcome.into_parts();
         self.data = candidate;
         self.snapshot = committed;
-        if let Some(error) = outcome.warning() {
+        if let Some(error) = warning {
             tracing::warn!(
                 "learning-file replacement committed with a durability warning: {}",
                 error
@@ -3415,9 +3793,9 @@ mod tests {
 
     #[test]
     fn atomic_writer_propagates_parent_sync_failure_after_replace() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let path = temp.path().join("learned.yaml");
-        std::fs::write(&path, "old").unwrap();
+        write_authority_file(&path, "old").unwrap();
         let mut syncs = 0;
         let outcome = write_learning_file_atomically_with_sync(&path, "new", |_| {
             syncs += 1;
@@ -3436,16 +3814,16 @@ mod tests {
 
     #[test]
     fn atomic_writer_rejects_a_stale_candidate_under_the_destination_lock() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let path = temp.path().join("learned.yaml");
-        std::fs::write(&path, "current").unwrap();
+        write_authority_file(&path, "current").unwrap();
         assert!(write_learning_file_atomically_if_unchanged(&path, b"stale", "candidate").is_err());
         assert_eq!(std::fs::read_to_string(path).unwrap(), "current");
     }
 
     #[test]
     fn atomic_writer_durably_creates_each_missing_parent() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let first = temp.path().join("one");
         let second = first.join("two");
         let path = second.join("learned.yaml");
@@ -3498,12 +3876,12 @@ mod tests {
 
     #[test]
     fn learning_transaction_recovery_resolves_committed_and_interrupted_states() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let destination = temp.path().join("learned.yaml");
         let paths = transaction_paths(&destination, "00000000000000000000000000000001").unwrap();
-        std::fs::write(&destination, "candidate").unwrap();
-        std::fs::write(&paths.source, "candidate").unwrap();
-        std::fs::write(&paths.backup, "original").unwrap();
+        write_authority_file(&destination, "candidate").unwrap();
+        write_authority_file(&paths.source, "candidate").unwrap();
+        write_authority_file(&paths.backup, "original").unwrap();
         let paths = test_marker(&destination, 1, b"candidate", true);
         recover_learning_file_transaction(&destination).unwrap();
         assert_eq!(std::fs::read_to_string(&destination).unwrap(), "candidate");
@@ -3512,8 +3890,8 @@ mod tests {
         assert!(!paths.marker.exists());
 
         let paths = transaction_paths(&destination, "00000000000000000000000000000002").unwrap();
-        std::fs::write(&paths.source, "candidate-two").unwrap();
-        std::fs::write(&paths.backup, "original-two").unwrap();
+        write_authority_file(&paths.source, "candidate-two").unwrap();
+        write_authority_file(&paths.backup, "original-two").unwrap();
         std::fs::remove_file(&destination).unwrap();
         let paths = test_marker(&destination, 2, b"candidate-two", true);
         recover_learning_file_transaction(&destination).unwrap();
@@ -3557,13 +3935,13 @@ mod tests {
             LearningTransactionPhase::Replacing,
         ];
         for (index, phase) in phases.into_iter().enumerate() {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = authority_tempdir();
             let destination = temp.path().join("learned.yaml");
-            std::fs::write(&destination, "original").unwrap();
+            write_authority_file(&destination, "original").unwrap();
             let identity = format!("{index:032x}");
             let paths = transaction_paths(&destination, &identity).unwrap();
-            std::fs::write(&paths.source, "candidate").unwrap();
-            std::fs::write(&paths.backup, "original").unwrap();
+            write_authority_file(&paths.source, "candidate").unwrap();
+            write_authority_file(&paths.backup, "original").unwrap();
             write_current_phase_marker(
                 &destination,
                 &identity,
@@ -3583,13 +3961,13 @@ mod tests {
             LearningTransactionPhase::ReplacementDurable,
             LearningTransactionPhase::BackupRemoved,
         ] {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = authority_tempdir();
             let destination = temp.path().join("learned.yaml");
-            std::fs::write(&destination, "candidate").unwrap();
+            write_authority_file(&destination, "candidate").unwrap();
             let identity = format!("{:032x}", phase as u8 + 10);
             let paths = transaction_paths(&destination, &identity).unwrap();
             if phase != LearningTransactionPhase::BackupRemoved {
-                std::fs::write(&paths.backup, "original").unwrap();
+                write_authority_file(&paths.backup, "original").unwrap();
             }
             write_current_phase_marker(
                 &destination,
@@ -3605,11 +3983,11 @@ mod tests {
             assert!(!paths.marker.exists());
         }
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let destination = temp.path().join("learned.yaml");
         let identity = "00000000000000000000000000000020";
         let paths = transaction_paths(&destination, identity).unwrap();
-        std::fs::write(&paths.backup, "original").unwrap();
+        write_authority_file(&paths.backup, "original").unwrap();
         write_current_phase_marker(
             &destination,
             identity,
@@ -3631,9 +4009,9 @@ mod tests {
             "backup_staging",
             "backup",
         ] {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = authority_tempdir();
             let destination = temp.path().join("learned.yaml");
-            std::fs::write(&destination, "original").unwrap();
+            write_authority_file(&destination, "original").unwrap();
             let identity = "00000000000000000000000000000021";
             let paths = transaction_paths(&destination, identity).unwrap();
             write_current_phase_marker(
@@ -3644,10 +4022,10 @@ mod tests {
                 Some(b"original"),
             );
             match partial_role {
-                "marker_staging" => std::fs::write(&paths.marker_staging, "partial").unwrap(),
-                "source" => std::fs::write(&paths.source, "partial").unwrap(),
-                "backup_staging" => std::fs::write(&paths.backup_staging, "partial").unwrap(),
-                "backup" => std::fs::write(&paths.backup, "partial").unwrap(),
+                "marker_staging" => write_authority_file(&paths.marker_staging, "partial").unwrap(),
+                "source" => write_authority_file(&paths.source, "partial").unwrap(),
+                "backup_staging" => write_authority_file(&paths.backup_staging, "partial").unwrap(),
+                "backup" => write_authority_file(&paths.backup, "partial").unwrap(),
                 _ => {}
             }
             recover_learning_file_transaction(&destination).unwrap();
@@ -3658,12 +4036,12 @@ mod tests {
 
     #[test]
     fn cleanup_phase_never_discards_unrecorded_rollback_state() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let destination = temp.path().join("learned.yaml");
-        std::fs::write(&destination, "candidate").unwrap();
+        write_authority_file(&destination, "candidate").unwrap();
         let identity = "00000000000000000000000000000025";
         let paths = transaction_paths(&destination, identity).unwrap();
-        std::fs::write(&paths.backup, "original").unwrap();
+        write_authority_file(&paths.backup, "original").unwrap();
         write_current_phase_marker(
             &destination,
             identity,
@@ -3701,18 +4079,18 @@ mod tests {
     #[test]
     fn version_one_transactions_recover_only_unambiguous_derived_states() {
         for state in ["precommit", "committed", "restore", "new_precommit"] {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = authority_tempdir();
             let destination = temp.path().join("learned.yaml");
             let identity = "00000000000000000000000000000022";
             let expected = (state != "new_precommit").then_some(b"original".as_slice());
             let paths = transaction_paths(&destination, identity).unwrap();
-            std::fs::write(&paths.source, "candidate").unwrap();
+            write_authority_file(&paths.source, "candidate").unwrap();
             if expected.is_some() {
-                std::fs::write(&paths.backup, "original").unwrap();
+                write_authority_file(&paths.backup, "original").unwrap();
             }
             match state {
-                "precommit" => std::fs::write(&destination, "original").unwrap(),
-                "committed" => std::fs::write(&destination, "candidate").unwrap(),
+                "precommit" => write_authority_file(&destination, "original").unwrap(),
+                "committed" => write_authority_file(&destination, "candidate").unwrap(),
                 "restore" | "new_precommit" => {}
                 _ => unreachable!(),
             }
@@ -3738,13 +4116,13 @@ mod tests {
 
     #[test]
     fn version_two_transaction_recovers_with_constrained_derived_paths() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let destination = temp.path().join("learned.yaml");
-        std::fs::write(&destination, "candidate").unwrap();
+        write_authority_file(&destination, "candidate").unwrap();
         let identity = "00000000000000000000000000000027";
         let paths = transaction_paths(&destination, identity).unwrap();
-        std::fs::write(&paths.source, "candidate").unwrap();
-        std::fs::write(&paths.backup, "original").unwrap();
+        write_authority_file(&paths.source, "candidate").unwrap();
+        write_authority_file(&paths.backup, "original").unwrap();
         let marker = serde_json::json!({
             "version": 2,
             "transaction_id": identity,
@@ -3768,13 +4146,13 @@ mod tests {
             ("backup", "sibling.yaml"),
             ("destination", "sibling.yaml"),
         ] {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = authority_tempdir();
             let destination = temp.path().join("learned.yaml");
-            std::fs::write(&destination, "original").unwrap();
+            write_authority_file(&destination, "original").unwrap();
             let identity = "00000000000000000000000000000023";
             let paths = transaction_paths(&destination, identity).unwrap();
-            std::fs::write(&paths.source, "candidate").unwrap();
-            std::fs::write(&paths.backup, "original").unwrap();
+            write_authority_file(&paths.source, "candidate").unwrap();
+            write_authority_file(&paths.backup, "original").unwrap();
             let mut marker = serde_json::json!({
                 "version": 1,
                 "destination": destination.file_name().unwrap().to_str().unwrap(),
@@ -3794,13 +4172,13 @@ mod tests {
             assert!(paths.backup.exists());
         }
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let destination = temp.path().join("learned.yaml");
-        std::fs::write(&destination, "original").unwrap();
+        write_authority_file(&destination, "original").unwrap();
         let identity = "00000000000000000000000000000024";
         let paths = transaction_paths(&destination, identity).unwrap();
-        std::fs::write(&paths.source, "candidate").unwrap();
-        std::fs::write(&paths.backup, "original").unwrap();
+        write_authority_file(&paths.source, "candidate").unwrap();
+        write_authority_file(&paths.backup, "original").unwrap();
         write_v1_marker(
             &destination,
             identity,
@@ -3814,12 +4192,12 @@ mod tests {
 
     #[test]
     fn ambiguous_learning_transaction_fails_closed_and_preserves_copies() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let destination = temp.path().join("learned.yaml");
         let paths = transaction_paths(&destination, "00000000000000000000000000000003").unwrap();
-        std::fs::write(&destination, "unexpected").unwrap();
-        std::fs::write(&paths.source, "candidate").unwrap();
-        std::fs::write(&paths.backup, "original").unwrap();
+        write_authority_file(&destination, "unexpected").unwrap();
+        write_authority_file(&paths.source, "candidate").unwrap();
+        write_authority_file(&paths.backup, "original").unwrap();
         let paths = test_marker(&destination, 3, b"candidate", true);
 
         assert!(recover_learning_file_transaction(&destination).is_err());
@@ -3831,7 +4209,7 @@ mod tests {
 
     #[test]
     fn destination_lock_serializes_independent_writers() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let destination = temp.path().join("learned.yaml");
         let first = DestinationLock::acquire(&destination).unwrap();
         let (send, receive) = std::sync::mpsc::channel();
@@ -3854,10 +4232,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn destination_lock_uses_the_canonical_parent_identity() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let real = temp.path().join("real");
         let alias = temp.path().join("alias");
-        std::fs::create_dir(&real).unwrap();
+        create_authority_directory(&real).unwrap();
         std::os::unix::fs::symlink(&real, &alias).unwrap();
         let first = DestinationLock::acquire(&real.join("learned.yaml")).unwrap();
         let (send, receive) = std::sync::mpsc::channel();
@@ -3880,17 +4258,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn destination_binding_detects_parent_retargeting_before_file_operations() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let parent = temp.path().join("authority");
         let moved = temp.path().join("authority-moved");
-        std::fs::create_dir(&parent).unwrap();
+        create_authority_directory(&parent).unwrap();
         let destination = parent.join("learned.yaml");
         let lock = DestinationLock::acquire(&destination).unwrap();
 
         std::fs::rename(&parent, &moved).unwrap();
-        std::fs::create_dir(&parent).unwrap();
+        create_authority_directory(&parent).unwrap();
         let unrelated = parent.join("unrelated.yaml");
-        std::fs::write(&unrelated, "operator state").unwrap();
+        write_authority_file(&unrelated, "operator state").unwrap();
 
         assert!(lock.verify_parent_binding().is_err());
         assert_eq!(
@@ -3902,12 +4280,12 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn atomic_writer_never_redirects_into_a_retargeted_parent() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let parent = temp.path().join("authority");
         let moved = temp.path().join("authority-moved");
-        std::fs::create_dir(&parent).unwrap();
+        create_authority_directory(&parent).unwrap();
         let destination = parent.join("learned.yaml");
-        std::fs::write(&destination, "original").unwrap();
+        write_authority_file(&destination, "original").unwrap();
         let replacement_destination = destination.clone();
         let mut syncs = 0;
 
@@ -3916,8 +4294,8 @@ mod tests {
                 syncs += 1;
                 if syncs == 1 {
                     std::fs::rename(&parent, &moved)?;
-                    std::fs::create_dir(&parent)?;
-                    std::fs::write(&replacement_destination, "unrelated")?;
+                    create_authority_directory(&parent)?;
+                    write_authority_file(&replacement_destination, "unrelated")?;
                 }
                 sync_parent_directory(bound_parent)
             });
@@ -3943,7 +4321,7 @@ mod tests {
     fn hardened_initial_creation_is_restrictive_from_nested_parent_creation() {
         use std::os::unix::fs::PermissionsExt;
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let first = temp.path().join("state");
         let second = first.join("catalog");
         let destination = second.join("verbs.yaml");
@@ -3979,13 +4357,13 @@ mod tests {
     #[test]
     fn transaction_marker_rejects_malformed_bounded_and_foreign_identities() {
         for bytes in [b"{".as_slice(), b"[]".as_slice()] {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = authority_tempdir();
             let destination = temp.path().join("learned.yaml");
             write_raw_marker(&destination, bytes);
             assert!(recover_learning_file_transaction(&destination).is_err());
         }
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let destination = temp.path().join("learned.yaml");
         write_raw_marker(
             &destination,
@@ -3998,7 +4376,7 @@ mod tests {
             "sibling",
             "ABCDEF00000000000000000000000000",
         ] {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = authority_tempdir();
             let destination = temp.path().join("learned.yaml");
             let marker = serde_json::json!({
                 "version": LEARNING_TRANSACTION_VERSION,
@@ -4016,7 +4394,7 @@ mod tests {
             ("backup", "learned.yaml"),
             ("destination", "sibling.yaml"),
         ] {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = authority_tempdir();
             let destination = temp.path().join("learned.yaml");
             let mut marker = serde_json::json!({
                 "version": LEARNING_TRANSACTION_VERSION,
@@ -4036,13 +4414,13 @@ mod tests {
 
     #[test]
     fn transaction_recovery_never_removes_unverified_or_unrelated_files() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let destination = temp.path().join("learned.yaml");
         let unrelated = temp.path().join("operator.yaml");
-        std::fs::write(&unrelated, "operator data").unwrap();
+        write_authority_file(&unrelated, "operator data").unwrap();
         let paths = transaction_paths(&destination, "00000000000000000000000000000004").unwrap();
-        std::fs::write(&paths.source, "different candidate").unwrap();
-        std::fs::write(&paths.backup, "different original").unwrap();
+        write_authority_file(&paths.source, "different candidate").unwrap();
+        write_authority_file(&paths.backup, "different original").unwrap();
         write_transaction_marker(
             &paths,
             &LearningTransactionMarker {
@@ -4065,10 +4443,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn transaction_recovery_rejects_symlinked_artifacts_without_touching_the_target() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let destination = temp.path().join("learned.yaml");
         let unrelated = temp.path().join("operator.yaml");
-        std::fs::write(&unrelated, "operator data").unwrap();
+        write_authority_file(&unrelated, "operator data").unwrap();
         let paths = transaction_paths(&destination, "00000000000000000000000000000006").unwrap();
         std::os::unix::fs::symlink(&unrelated, &paths.source).unwrap();
         write_transaction_marker(
@@ -4095,9 +4473,9 @@ mod tests {
     fn transaction_artifacts_are_owner_only_before_sensitive_bytes_are_committed() {
         use std::os::unix::fs::PermissionsExt;
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let destination = temp.path().join("learned.yaml");
-        std::fs::write(&destination, "original").unwrap();
+        write_authority_file(&destination, "original").unwrap();
         let mut syncs = 0;
         let outcome =
             write_learning_file_atomically_with_sync(&destination, "candidate", |parent| {
@@ -4125,9 +4503,9 @@ mod tests {
 
     #[test]
     fn post_commit_sync_failure_leaves_recoverable_artifacts_until_restart() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let destination = temp.path().join("learned.yaml");
-        std::fs::write(&destination, "original").unwrap();
+        write_authority_file(&destination, "original").unwrap();
         let mut syncs = 0;
         let outcome =
             write_learning_file_atomically_with_sync(&destination, "candidate", |parent| {
@@ -4150,10 +4528,10 @@ mod tests {
 
     #[test]
     fn corrupt_recovery_copy_is_content_addressed_and_preserves_permissions() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let path = temp.path().join("learned.yaml");
         let bytes = b"not valid state";
-        std::fs::write(&path, bytes).unwrap();
+        write_authority_file(&path, bytes).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -4260,9 +4638,9 @@ mod tests {
             descriptor
         }
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let path = temp.path().join("learned.yaml");
-        std::fs::write(&path, "old").unwrap();
+        write_authority_file(&path, "old").unwrap();
         let path_wide = wide(path.as_os_str());
         let sddl = wide(std::ffi::OsStr::new("D:P(A;;FA;;;OW)"));
         let mut descriptor = std::ptr::null_mut();
@@ -4310,7 +4688,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_recovery_restores_only_the_recorded_backup_dacl() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let destination = temp.path().join("learned.yaml");
         let mut original = open_owner_only_new(&destination).unwrap();
         original.write_all(b"original").unwrap();
@@ -4394,7 +4772,7 @@ mod tests {
 
     #[test]
     fn repeated_low_risk_approval_becomes_a_candidate_not_a_bypass() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let config = LearningConfig {
             path: temp.path().join("learned.yaml"),
             min_approvals: 2,
@@ -4422,7 +4800,7 @@ mod tests {
 
     #[test]
     fn failed_learned_rule_write_keeps_memory_and_durable_state_unchanged() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let path = temp.path().join("learned.yaml");
         let config = LearningConfig {
             path: path.clone(),
@@ -4444,7 +4822,7 @@ mod tests {
         let before_memory = store.data.clone();
         let before_file = std::fs::read(&path).unwrap();
         let blocker = temp.path().join("blocker");
-        std::fs::write(&blocker, "not a directory").unwrap();
+        write_authority_file(&blocker, "not a directory").unwrap();
         store.config.path = blocker.join("learned.yaml");
 
         assert!(store
@@ -4462,7 +4840,7 @@ mod tests {
 
     #[test]
     fn sensitive_learning_records_are_rejected_and_purged_idempotently() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let path = temp.path().join("learned.yaml");
         let config = LearningConfig {
             path: path.clone(),
@@ -4515,7 +4893,7 @@ mod tests {
 
     #[test]
     fn learned_rule_prose_is_sanitized_without_changing_safe_authority() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let path = temp.path().join("learned.yaml");
         let config = LearningConfig {
             path: path.clone(),
@@ -4569,7 +4947,7 @@ mod tests {
 
     #[test]
     fn high_risk_approval_is_not_learned() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let config = LearningConfig {
             path: temp.path().join("learned.yaml"),
             min_approvals: 1,
@@ -4593,7 +4971,7 @@ mod tests {
 
     #[test]
     fn shell_control_without_spaces_is_not_learned() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let config = LearningConfig {
             path: temp.path().join("learned.yaml"),
             min_approvals: 1,
@@ -4630,7 +5008,7 @@ mod tests {
 
     #[test]
     fn stale_learning_instances_reapply_observations_without_losing_authority() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let config = LearningConfig {
             path: temp.path().join("learned.yaml"),
             min_approvals: 2,
@@ -4659,8 +5037,70 @@ mod tests {
     }
 
     #[test]
+    fn successor_commit_after_replacement_does_not_replay_the_first_observation() {
+        let temp = authority_tempdir();
+        let config = LearningConfig {
+            path: temp.path().join("learned.yaml"),
+            min_approvals: 3,
+            max_risk: 2,
+            auto_shim: AutoShimMode::Off,
+        };
+        let mut first = LearnedRuleStore::load(config.clone()).unwrap();
+        let mut successor = LearnedRuleStore::load(config.clone()).unwrap();
+        let (committed, release) = pause_post_commit_adoption_for_test("post-commit-race");
+
+        let first_thread = std::thread::spawn(move || {
+            let args = ["post-commit-race".to_string()];
+            let outcome = first
+                .record_approval(
+                    "fixturectl",
+                    &args,
+                    "fixturectl post-commit-race",
+                    Some(1),
+                    "safe",
+                )
+                .unwrap()
+                .unwrap();
+            (first, outcome.approvals)
+        });
+        committed.wait();
+        let args = ["post-commit-race".to_string()];
+        let successor_outcome = successor
+            .record_approval(
+                "fixturectl",
+                &args,
+                "fixturectl post-commit-race",
+                Some(1),
+                "safe",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(successor_outcome.approvals, 2);
+        release.wait();
+        let (mut first, first_approvals) = first_thread.join().unwrap();
+        assert_eq!(first_approvals, 1);
+
+        let final_outcome = first
+            .record_approval(
+                "fixturectl",
+                &args,
+                "fixturectl post-commit-race",
+                Some(1),
+                "safe",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_outcome.approvals, 3);
+        let loaded = LearnedRuleStore::load(config).unwrap();
+        assert_eq!(
+            loaded.data.observations.values().next().unwrap().approvals,
+            3
+        );
+    }
+
+    #[test]
     fn three_stale_learning_instances_preserve_every_commutative_observation() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let config = LearningConfig {
             path: temp.path().join("learned.yaml"),
             min_approvals: 3,
@@ -4688,9 +5128,9 @@ mod tests {
 
     #[test]
     fn markerless_staging_is_cleaned_before_authority_is_loaded() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let destination = temp.path().join("learned.yaml");
-        std::fs::write(&destination, "safe").unwrap();
+        write_authority_file(&destination, "safe").unwrap();
         let paths = transaction_paths(&destination, "000000000000000000000000000000aa").unwrap();
         let mut staging = open_owner_only_new(&paths.marker_staging).unwrap();
         staging.write_all(b"{").unwrap();
@@ -4706,7 +5146,7 @@ mod tests {
 
     #[test]
     fn concurrent_equivalent_initialization_converges() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let destination = temp.path().join("verbs.yaml");
         let first_path = destination.clone();
         let second_path = destination.clone();
@@ -4725,33 +5165,85 @@ mod tests {
     fn untrusted_parent_and_replaced_lock_fail_closed() {
         use std::os::unix::fs::PermissionsExt;
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let unsafe_parent = temp.path().join("unsafe");
-        std::fs::create_dir(&unsafe_parent).unwrap();
+        create_authority_directory(&unsafe_parent).unwrap();
         std::fs::set_permissions(&unsafe_parent, std::fs::Permissions::from_mode(0o777)).unwrap();
         assert!(DestinationLock::acquire(&unsafe_parent.join("learned.yaml")).is_err());
+
+        let same_group_parent = temp.path().join("same-group");
+        create_authority_directory(&same_group_parent).unwrap();
+        std::fs::set_permissions(&same_group_parent, std::fs::Permissions::from_mode(0o770))
+            .unwrap();
+        assert!(DestinationLock::acquire(&same_group_parent.join("learned.yaml")).is_err());
+
+        let writable_destination = temp.path().join("writable.yaml");
+        write_authority_file(&writable_destination, "safe").unwrap();
+        std::fs::set_permissions(
+            &writable_destination,
+            std::fs::Permissions::from_mode(0o620),
+        )
+        .unwrap();
+        assert!(load_learning_file_snapshot(&writable_destination).is_err());
 
         let destination = temp.path().join("safe.yaml");
         let lock = DestinationLock::acquire(&destination).unwrap();
         let displaced = temp.path().join("displaced-lock");
         std::fs::rename(&lock.canonical_lock_path, &displaced).unwrap();
-        std::fs::write(&lock.canonical_lock_path, "replacement").unwrap();
+        write_authority_file(&lock.canonical_lock_path, "replacement").unwrap();
         assert!(lock.verify_parent_binding().is_err());
     }
 
     #[cfg(unix)]
     #[test]
+    fn current_journal_rejects_unsafe_recorded_modes_before_recovery() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = authority_tempdir();
+        let destination = temp.path().join("learned.yaml");
+        write_authority_file(&destination, "safe").unwrap();
+        let original_mode = std::fs::metadata(&destination)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        let paths = transaction_paths(&destination, "000000000000000000000000000000bb").unwrap();
+        for mode in [0o700, 0o660, 0o602, 0o4600, 0o400, 0o10_600] {
+            let marker = LearningTransactionMarker {
+                version: LEARNING_TRANSACTION_VERSION,
+                transaction_id: "000000000000000000000000000000bb".to_string(),
+                phase: LearningTransactionPhase::ReplacementDurable,
+                candidate_generation: content_digest(b"safe"),
+                expected_generation: Some(content_digest(b"original")),
+                expected_security_generation: None,
+                expected_unix_mode: Some(mode),
+            };
+            write_authority_file(&paths.marker, serde_json::to_vec(&marker).unwrap()).unwrap();
+            assert!(read_transaction_marker(&paths.marker, &destination).is_err());
+            assert_eq!(
+                std::fs::metadata(&destination)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                original_mode
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn locked_snapshot_rejects_parent_retarget_during_read() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let parent = temp.path().join("authority");
         let moved = temp.path().join("authority-moved");
-        std::fs::create_dir(&parent).unwrap();
+        create_authority_directory(&parent).unwrap();
         let destination = parent.join("learned.yaml");
-        std::fs::write(&destination, "safe").unwrap();
+        write_authority_file(&destination, "safe").unwrap();
         let lock = DestinationLock::acquire(&destination).unwrap();
         std::fs::rename(&parent, &moved).unwrap();
-        std::fs::create_dir(&parent).unwrap();
-        std::fs::write(parent.join("learned.yaml"), "other").unwrap();
+        create_authority_directory(&parent).unwrap();
+        write_authority_file(parent.join("learned.yaml"), "other").unwrap();
         assert!(read_learning_file_snapshot_locked(&lock).is_err());
     }
 
@@ -4760,13 +5252,13 @@ mod tests {
     fn committed_recovery_restores_journaled_file_mode_before_cleanup() {
         use std::os::unix::fs::PermissionsExt;
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = authority_tempdir();
         let destination = temp.path().join("learned.yaml");
-        std::fs::write(&destination, "candidate").unwrap();
+        write_authority_file(&destination, "candidate").unwrap();
         std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o600)).unwrap();
         let identity = "000000000000000000000000000000bb";
         let paths = transaction_paths(&destination, identity).unwrap();
-        std::fs::write(&paths.backup, "original").unwrap();
+        write_authority_file(&paths.backup, "original").unwrap();
         write_transaction_marker(
             &paths,
             &LearningTransactionMarker {

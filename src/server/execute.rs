@@ -739,10 +739,7 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
             }
         } else {
             let matching_intent = {
-                let mut catalog = phase.server.state.verbs.write().await;
-                if let Err(error) = catalog.reload_if_stale() {
-                    tracing::warn!("verb catalog reload failed, using previous: {error}");
-                }
+                let catalog = phase.server.state.verbs.read().await;
                 catalog
                     .match_command_all(&request.binary, &request.args)
                     .into_iter()
@@ -921,17 +918,28 @@ struct EvaluationConstraints {
 /// Resolve a verb invocation into a concrete command BEFORE any validation or
 /// evaluation. The rendered binary/args then pass through the same checks as a
 /// raw command; the verb's declared consequence class and rollback drive the
-/// gate. Verbs are operator-authored, so the catalog is hot-reloaded by mtime.
+/// gate. Verbs are operator-authored, so each deterministic decision refreshes
+/// from one locked durable snapshot before using catalog authority.
 async fn resolve_verb_context<W: AsyncWrite + Unpin>(
     phase: &mut ExecPhase<'_, W>,
     request: &mut ExecuteRequest,
 ) -> Result<VerbResolution, ExecuteResult> {
     let server = phase.server;
-    if let Some(invocation) = request.verb.clone() {
-        if !server.config.gate.is_on() {
-            let reason =
-                "verbs require consequence gating (start the daemon with --gate consequence)"
-                    .to_string();
+    if request.verb.is_some() && !server.config.gate.is_on() {
+        let reason = "verbs require consequence gating (start the daemon with --gate consequence)"
+            .to_string();
+        let _ = write_policy_decision(
+            phase.stream_output,
+            &mut *phase.stream_writer,
+            false,
+            &reason,
+        )
+        .await;
+        return Err(ExecuteResult::denied(reason));
+    }
+    if server.config.gate.is_on() {
+        if let Err(error) = server.refresh_verb_catalog_for_decision().await {
+            let reason = format!("verb catalog authority is unavailable: {error}");
             let _ = write_policy_decision(
                 phase.stream_output,
                 &mut *phase.stream_writer,
@@ -941,11 +949,10 @@ async fn resolve_verb_context<W: AsyncWrite + Unpin>(
             .await;
             return Err(ExecuteResult::denied(reason));
         }
+    }
+    if let Some(invocation) = request.verb.clone() {
         let rendered = {
-            let mut cat = server.state.verbs.write().await;
-            if let Err(e) = cat.reload_if_stale() {
-                tracing::warn!("verb catalog reload failed, using previous: {}", e);
-            }
+            let cat = server.state.verbs.read().await;
             cat.render(&invocation.name, &invocation.params)
                 .map(|r| (r, cat.version()))
         };
@@ -988,10 +995,7 @@ async fn resolve_verb_context<W: AsyncWrite + Unpin>(
     }
 
     let (raw_matches, version, definition_digests) = {
-        let mut cat = server.state.verbs.write().await;
-        if let Err(e) = cat.reload_if_stale() {
-            tracing::warn!("verb catalog reload failed, using previous: {}", e);
-        }
+        let cat = server.state.verbs.read().await;
         let plain = request
             .env
             .iter()

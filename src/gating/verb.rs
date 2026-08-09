@@ -16,9 +16,8 @@
 use super::coverage::reversibility_rank;
 use super::Reversibility;
 use crate::learned_rules::{
-    load_expected_learning_file_snapshot, load_learning_file_snapshot,
-    rewrite_learning_file_bounded, write_learning_file_atomically_for_locked_snapshot,
-    LearningFileSnapshot,
+    load_learning_file_snapshot, rewrite_learning_file_bounded,
+    write_learning_file_atomically_for_locked_snapshot, LearningFileSnapshot,
 };
 use crate::redact::{
     command_contains_sensitive_literals, named_value_contains_sensitive_literals,
@@ -734,6 +733,49 @@ impl VerbCatalog {
         Ok(true)
     }
 
+    #[doc(hidden)]
+    pub fn refreshed_copy(&self) -> Result<Self> {
+        let Some(path) = self.path.clone() else {
+            return Ok(self.clone());
+        };
+        let runtime_verbs = self
+            .verbs
+            .values()
+            .filter(|verb| reserved_verb_name(&verb.name))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut reloaded = Self::load(&path)?;
+        for mut verb in runtime_verbs {
+            if verb.name.starts_with("grant-") {
+                reloaded.upsert_saved_grant_verb(verb)?;
+            } else {
+                verb.trusted = false;
+                reloaded.upsert_access_verb(verb)?;
+            }
+        }
+        Ok(reloaded)
+    }
+
+    #[doc(hidden)]
+    pub fn adopt_refreshed_file_authority(&mut self, mut refreshed: Self) -> Result<()> {
+        refreshed.verbs.retain(|name, _| !reserved_verb_name(name));
+        for mut verb in self
+            .verbs
+            .values()
+            .filter(|verb| reserved_verb_name(&verb.name))
+            .cloned()
+        {
+            if verb.name.starts_with("grant-") {
+                refreshed.upsert_saved_grant_verb(verb)?;
+            } else {
+                verb.trusted = false;
+                refreshed.upsert_access_verb(verb)?;
+            }
+        }
+        *self = refreshed;
+        Ok(())
+    }
+
     /// Render a verb invocation into a concrete, gated command. Each param is
     /// validated against its anchored pattern; placeholders become single argv
     /// elements; values may not begin with `-` unless the spec opts in.
@@ -1013,13 +1055,12 @@ impl VerbCatalog {
         let durable_content = canonical.as_deref().unwrap_or(&new_content);
         let outcome =
             write_learning_file_atomically_for_locked_snapshot(&path, &snapshot, durable_content)?;
-        let warning = outcome.warning();
+        let (committed, warning) = outcome.into_parts();
         // Adopt the already-validated content rather than re-reading the file: a
         // post-write reload failure would otherwise report an error to the
         // operator even though the write landed, desyncing memory from disk.
         self.verbs = validated.verbs;
         self.version = validated.version;
-        let committed = load_expected_learning_file_snapshot(&path, durable_content.as_bytes())?;
         self.mtime = committed.modified();
         self.snapshot = Some(committed);
         if let Some(error) = warning {
@@ -1107,12 +1148,15 @@ impl VerbCatalog {
         // Every fallible catalog adoption step completes before the durable
         // rewrite. After this point, success requires only the atomic file
         // replacement and assigning the already validated state.
-        atomic_replace_if_unchanged(&path, &snapshot, durable_content.as_bytes())?;
+        let outcome = atomic_replace_if_unchanged(&path, &snapshot, durable_content.as_bytes())?;
+        let (committed, warning) = outcome.into_parts();
         validated.path = Some(path.clone());
-        let committed = load_expected_learning_file_snapshot(&path, durable_content.as_bytes())?;
         validated.mtime = committed.modified();
         validated.snapshot = Some(committed);
         *self = validated;
+        if let Some(error) = warning {
+            tracing::warn!("catalog amendment committed with a durability warning: {error}");
+        }
         Ok(current)
     }
 
@@ -1222,10 +1266,9 @@ impl VerbCatalog {
         let durable_content = canonical.as_deref().unwrap_or(&new_content);
         let outcome =
             write_learning_file_atomically_for_locked_snapshot(&path, &snapshot, durable_content)?;
-        let warning = outcome.warning();
+        let (committed, warning) = outcome.into_parts();
         self.verbs = validated.verbs;
         self.version = validated.version;
-        let committed = load_expected_learning_file_snapshot(&path, durable_content.as_bytes())?;
         self.mtime = committed.modified();
         self.snapshot = Some(committed);
         if let Some(error) = warning {
@@ -1286,17 +1329,16 @@ impl VerbCatalog {
 
 #[cfg(test)]
 fn catalog_repair_warning(
-    path: &Path,
     canonical: &str,
     outcome: crate::learned_rules::LearningWriteOutcome,
 ) -> Result<Option<anyhow::Error>> {
-    let Some(error) = outcome.warning() else {
-        return Ok(None);
-    };
-    let committed = load_learning_file_snapshot(path)?;
-    if committed.content() != Some(canonical.as_bytes()) {
+    if outcome.committed_snapshot().content() != Some(canonical.as_bytes()) {
         bail!("committed catalog repair does not match its canonical candidate");
     }
+    let (_, warning) = outcome.into_parts();
+    let Some(error) = warning else {
+        return Ok(None);
+    };
     Ok(Some(error))
 }
 
@@ -1426,14 +1468,10 @@ fn atomic_replace_if_unchanged(
     path: &Path,
     expected: &LearningFileSnapshot,
     replacement: &[u8],
-) -> Result<()> {
+) -> Result<crate::learned_rules::LearningWriteOutcome> {
     let replacement =
         std::str::from_utf8(replacement).context("catalog replacement is not UTF-8")?;
-    let outcome = write_learning_file_atomically_for_locked_snapshot(path, expected, replacement)?;
-    if let Some(error) = outcome.warning() {
-        tracing::warn!("catalog replacement committed with a durability warning: {error}");
-    }
-    Ok(())
+    write_learning_file_atomically_for_locked_snapshot(path, expected, replacement)
 }
 
 /// Binaries a synthesized verb may not use: shells and interpreters where a
@@ -3514,9 +3552,9 @@ verbs:
 
     #[test]
     fn append_verb_persists_provenance_and_pins() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::learned_rules::authority_tempdir();
         let path = dir.path().join("verbs.yaml");
-        std::fs::write(
+        crate::learned_rules::write_authority_file(
             &path,
             "verbs:\n  - name: existing\n    binary: echo\n    consequence: reversible\n",
         )
@@ -3575,10 +3613,10 @@ verbs:
 
     #[test]
     fn append_verb_rejects_duplicate_and_invalid_without_writing() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::learned_rules::authority_tempdir();
         let path = dir.path().join("verbs.yaml");
         let initial = "verbs:\n  - name: dup\n    binary: echo\n    consequence: reversible\n";
-        std::fs::write(&path, initial).unwrap();
+        crate::learned_rules::write_authority_file(&path, initial).unwrap();
         let mut cat = VerbCatalog::load(&path).unwrap();
 
         let mk = |name: &str, pattern: Option<&str>| {
@@ -3626,13 +3664,13 @@ verbs:
 
     #[test]
     fn append_tolerates_bom_and_keeps_one_verbs_key() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::learned_rules::authority_tempdir();
         let path = dir.path().join("verbs.yaml");
         // Seed with a leading UTF-8 BOM, as a Windows editor or PowerShell's
         // utf8 mode would write it.
         let seed =
             "\u{feff}verbs:\n  - name: existing\n    binary: echo\n    consequence: reversible\n";
-        std::fs::write(&path, seed).unwrap();
+        crate::learned_rules::write_authority_file(&path, seed).unwrap();
         let mut cat = VerbCatalog::load(&path).unwrap();
 
         let v = Verb {
@@ -3770,9 +3808,9 @@ verbs:
         verb.evidence = Some(contaminated.clone());
         verb.promotion_stamp = Some("regime-safe".to_string());
         let yaml = serde_yaml_ng::to_string(&CatalogFile { verbs: vec![verb] }).unwrap();
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::learned_rules::authority_tempdir();
         let path = directory.path().join("verbs.yaml");
-        std::fs::write(&path, yaml).unwrap();
+        crate::learned_rules::write_authority_file(&path, yaml).unwrap();
 
         let mut first = VerbCatalog::load(&path).unwrap();
         let repaired = std::fs::read_to_string(&path).unwrap();
@@ -3801,46 +3839,48 @@ verbs:
     #[test]
     fn safe_catalog_load_preserves_exact_bytes() {
         let yaml = "# operator comment\nverbs:\n  - name: safe\n    binary: true\n    consequence: reversible\n";
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::learned_rules::authority_tempdir();
         let path = directory.path().join("verbs.yaml");
-        std::fs::write(&path, yaml).unwrap();
+        crate::learned_rules::write_authority_file(&path, yaml).unwrap();
         VerbCatalog::load(&path).unwrap();
         assert_eq!(std::fs::read_to_string(path).unwrap(), yaml);
     }
 
     #[test]
     fn committed_catalog_repair_warning_adopts_only_verified_canonical_bytes() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::learned_rules::authority_tempdir();
         let path = directory.path().join("verbs.yaml");
         let canonical = "verbs: []\n";
-        std::fs::write(&path, canonical).unwrap();
+        crate::learned_rules::write_authority_file(&path, canonical).unwrap();
+        let snapshot = load_learning_file_snapshot(&path).unwrap();
         let warning = catalog_repair_warning(
-            &path,
             canonical,
-            crate::learned_rules::LearningWriteOutcome::CommittedWithWarning(anyhow::anyhow!(
-                "simulated cleanup warning"
-            )),
+            crate::learned_rules::LearningWriteOutcome::committed_with_warning_for_test(
+                snapshot,
+                anyhow::anyhow!("simulated cleanup warning"),
+            ),
         )
         .unwrap();
         assert!(warning.is_some());
         assert!(VerbCatalog::from_yaml(canonical).is_ok());
 
-        std::fs::write(&path, "verbs:\n  - invalid\n").unwrap();
+        crate::learned_rules::write_authority_file(&path, "verbs:\n  - invalid\n").unwrap();
+        let snapshot = load_learning_file_snapshot(&path).unwrap();
         assert!(catalog_repair_warning(
-            &path,
             canonical,
-            crate::learned_rules::LearningWriteOutcome::CommittedWithWarning(anyhow::anyhow!(
-                "simulated cleanup warning"
-            )),
+            crate::learned_rules::LearningWriteOutcome::committed_with_warning_for_test(
+                snapshot,
+                anyhow::anyhow!("simulated cleanup warning"),
+            ),
         )
         .is_err());
     }
 
     #[test]
     fn stale_catalog_instances_reapply_nonconflicting_appends() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::learned_rules::authority_tempdir();
         let path = directory.path().join("verbs.yaml");
-        std::fs::write(&path, "verbs: []\n").unwrap();
+        crate::learned_rules::write_authority_file(&path, "verbs: []\n").unwrap();
         let mut first = VerbCatalog::load(&path).unwrap();
         let mut second = VerbCatalog::load(&path).unwrap();
 
@@ -3867,6 +3907,44 @@ verbs:
     }
 
     #[test]
+    fn successor_catalog_commit_does_not_turn_the_first_commit_into_failure() {
+        let directory = crate::learned_rules::authority_tempdir();
+        let path = directory.path().join("verbs.yaml");
+        crate::learned_rules::write_authority_file(&path, "verbs: []\n").unwrap();
+        let mut first = VerbCatalog::load(&path).unwrap();
+        let mut successor = VerbCatalog::load(&path).unwrap();
+        let (committed, release) =
+            crate::learned_rules::pause_post_commit_adoption_for_test("safe-race-first");
+        let first_thread = std::thread::spawn(move || {
+            first
+                .append_verb(&synth_verb(
+                    "fixturectl",
+                    Some("^(first)$"),
+                    false,
+                    "safe-race-first",
+                ))
+                .unwrap();
+            first
+        });
+        committed.wait();
+        successor
+            .append_verb(&synth_verb(
+                "fixturectl",
+                Some("^(second)$"),
+                false,
+                "safe-race-second",
+            ))
+            .unwrap();
+        release.wait();
+        let first = first_thread.join().unwrap();
+        assert!(first.get("safe-race-first").is_some());
+
+        let loaded = VerbCatalog::load(&path).unwrap();
+        assert!(loaded.get("safe-race-first").is_some());
+        assert!(loaded.get("safe-race-second").is_some());
+    }
+
+    #[test]
     fn sensitive_synthesized_name_fails_before_preview_or_catalog_load() {
         let value = ["q", "7"].concat();
         let mut verb = synth_verb("fixturectl", Some("^(status)$"), false, "safe");
@@ -3876,9 +3954,9 @@ verbs:
         assert!(VerbCatalog::for_admission_preview(&verb).is_err());
 
         let yaml = serde_yaml_ng::to_string(&CatalogFile { verbs: vec![verb] }).unwrap();
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::learned_rules::authority_tempdir();
         let path = directory.path().join("verbs.yaml");
-        std::fs::write(&path, &yaml).unwrap();
+        crate::learned_rules::write_authority_file(&path, &yaml).unwrap();
         assert!(VerbCatalog::load(&path).is_err());
         assert_eq!(std::fs::read_to_string(path).unwrap(), yaml);
     }
@@ -4408,9 +4486,9 @@ verbs:
             "verbs:\n  - name: a\n    binary: echo\n    consequence: reversible\ndefaults:\n  timeout: 30\n",
         ];
         for seed in seeds {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::learned_rules::authority_tempdir();
             let path = dir.path().join("verbs.yaml");
-            std::fs::write(&path, seed).unwrap();
+            crate::learned_rules::write_authority_file(&path, seed).unwrap();
             let mut cat = VerbCatalog::load(&path).unwrap();
             cat.append_verb(&v)
                 .unwrap_or_else(|e| panic!("append failed for seed {seed:?}: {e}"));
@@ -4969,9 +5047,9 @@ verbs:
 
     #[test]
     fn cwd_coverage_matches_only_the_operator_approved_canonical_directory() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::learned_rules::authority_tempdir();
         let root = root.path().canonicalize().unwrap();
-        let other = tempfile::tempdir().unwrap();
+        let other = crate::learned_rules::authority_tempdir();
         let root_yaml = serde_yaml_ng::to_string(&root.to_string_lossy().to_string()).unwrap();
         let yaml = format!(
             r#"
@@ -5019,7 +5097,7 @@ verbs:
     #[cfg(unix)]
     #[test]
     fn cwd_coverage_rejects_a_symlink_instead_of_approving_its_target() {
-        let parent = tempfile::tempdir().unwrap();
+        let parent = crate::learned_rules::authority_tempdir();
         let project = parent.path().join("project");
         let alias = parent.path().join("project-link");
         std::fs::create_dir(&project).unwrap();
@@ -5103,9 +5181,9 @@ verbs:
 
     #[test]
     fn hot_reload_preserves_daemon_owned_coverage() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::learned_rules::authority_tempdir();
         let path = dir.path().join("verbs.yaml");
-        std::fs::write(
+        crate::learned_rules::write_authority_file(
             &path,
             "verbs:\n  - name: operator-one\n    binary: uptime\n    consequence: reversible\n",
         )
@@ -5127,7 +5205,7 @@ verbs:
         let access_name = access.name.clone();
         catalog.upsert_access_verb(access).unwrap();
 
-        std::fs::write(
+        crate::learned_rules::write_authority_file(
             &path,
             "verbs:\n  - name: operator-two\n    binary: hostname\n    consequence: reversible\n",
         )
