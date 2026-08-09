@@ -158,13 +158,43 @@ async fn gate_capacity_reason(
 }
 
 async fn try_persist_provisional(server: &ServerContext, p: &Provisional) -> Result<(), String> {
-    if let Some(store) = &server.state.session_store {
-        store
-            .save_provisional(p.clone())
-            .await
-            .map_err(|error| format!("failed to persist provisional {}: {error}", p.handle))?;
+    let Some(store) = &server.state.session_store else {
+        return Err("durable provisional state is unavailable".to_string());
+    };
+    store
+        .save_provisional(p.clone())
+        .await
+        .map_err(|error| format!("failed to persist provisional {}: {error}", p.handle))
+}
+
+/// Complete the safe transition from the live post-forward persistence-loss
+/// row to durable state before an operator decision is applied. The detailed
+/// store error is kept in local diagnostics only.
+pub(super) async fn converge_forward_persistence_failure(
+    server: &ServerContext,
+    provisional: &Provisional,
+) -> bool {
+    if !provisional.forward_persistence_failed {
+        return true;
     }
-    Ok(())
+    let Some(store) = &server.state.session_store else {
+        tracing::error!(
+            "cannot converge provisional {}: durable state store is unavailable",
+            provisional.handle
+        );
+        return false;
+    };
+    match store.save_provisional(provisional.clone()).await {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::error!(
+                "cannot converge provisional {} after forward persistence failure: {}",
+                provisional.handle,
+                error
+            );
+            false
+        }
+    }
 }
 
 pub(super) async fn persist_provisional(server: &ServerContext, p: &Provisional) {
@@ -356,6 +386,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
         // promised, so it holds rather than forward an uncontainable write.
         let principal = Some(self.server.config.daemon_principal.clone());
         self.snapshot_dir_safe
+            && self.server.state.session_store.is_some()
             && gate_capacity_reason(&self.server, principal.as_ref())
                 .await
                 .is_none()
@@ -426,6 +457,8 @@ impl guard::proxy::GateSink for DaemonGateSink {
             window_secs: self.window_secs,
             auto_reverted_unix: None,
             forward_done: true,
+            forward_exit: Some(0),
+            forward_persistence_failed: false,
             status: ProvisionalStatus::Armed,
             revert_exit: None,
             revert_detail: None,
@@ -1264,6 +1297,8 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
         window_secs: 0,
         auto_reverted_unix: None,
         forward_done: false,
+        forward_exit: None,
+        forward_persistence_failed: false,
         status: ProvisionalStatus::Armed,
         revert_exit: None,
         revert_detail: None,
@@ -1272,9 +1307,14 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
     // Commit BEFORE exec so a crash between exec and arm still leaves a
     // recoverable revert (startup recovery routes it to needs_operator_decision).
     if let Err(detail) = try_persist_provisional(server, &provisional).await {
+        tracing::error!(
+            "containment provisional {} was not durable before forward execution: {}",
+            handle,
+            detail
+        );
         return ExecuteResult::exec_failed(
             reason,
-            format!("command was not run because its rollback state was not durable: {detail}"),
+            "command was not run because durable rollback state is unavailable".to_string(),
         );
     }
     server
@@ -1322,13 +1362,25 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
                                 0
                             },
                             exit_code == Some(0),
-                            reason.clone(),
+                            if exit_code == Some(0) {
+                                reason.clone()
+                            } else {
+                                format!(
+                                    "{reason}; forward command exited with code {exit_code:?}; auto-revert was not armed; operator decision required"
+                                )
+                            },
                         ),
                         Err(detail) => {
                             tracing::error!("post-forward provisional persistence failed: {detail}");
-                            let response_reason = format!(
-                                "{reason}; command executed without a durable auto-revert; operator decision required"
-                            );
+                            let response_reason = if exit_code == Some(0) {
+                                format!(
+                                    "{reason}; command executed, but its durable auto-revert state could not be recorded; operator decision required"
+                                )
+                            } else {
+                                format!(
+                                    "{reason}; forward command exited with code {exit_code:?}, and its outcome could not be recorded durably; operator decision required"
+                                )
+                            };
                             let _ = server
                                 .state
                                 .provisional
@@ -1336,7 +1388,7 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
                                 .await
                                 .mark_forward_persistence_failed(
                                     &handle,
-                                    response_reason.clone(),
+                                    exit_code,
                                 );
                             (0, 0, false, response_reason)
                         }
@@ -1462,9 +1514,7 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
                         );
                         return ExecuteResult::exec_failed(
                             reason,
-                            format!(
-                                "{spawn_detail}; rollback state could not be retired safely: {save_error}; {delete_error}"
-                            ),
+                            format!("{spawn_detail}; rollback state could not be retired safely"),
                         );
                     }
                 },
@@ -2898,8 +2948,8 @@ async fn defer_revert(
             );
             return (
                 format!(
-                    "provisional {} revert was deferred but persistence failed: {}",
-                    p.handle, error
+                    "provisional {} revert was deferred but its durable state could not be recorded; retry the operator action",
+                    p.handle
                 ),
                 None,
             );
@@ -3029,8 +3079,8 @@ pub(super) async fn finish_revert(
             );
             return (
                 format!(
-                    "provisional {} rollback completed but terminal persistence failed: {}",
-                    p.handle, error
+                    "provisional {} rollback completed but its terminal state could not be recorded",
+                    p.handle
                 ),
                 exit,
             );

@@ -162,8 +162,13 @@ fn print_verb_guidance(response: &server::ExecuteResponse) {
 /// deadline-free wording rather than inventing one.
 fn provisional_window_lines(response: &server::ExecuteResponse) -> Vec<String> {
     if response.auto_revert_durable == Some(false) {
+        if let Some(exit_code) = response.exit_code.filter(|code| *code != 0) {
+            return vec![format!(
+                "result:  forward command failed with exit code {exit_code}; auto-revert was not armed; operator decision required"
+            )];
+        }
         return vec![
-            "result:  executed without a durable auto-revert; operator decision required"
+            "result:  executed, but its durable auto-revert state could not be recorded; operator decision required"
                 .to_string(),
         ];
     }
@@ -3203,7 +3208,21 @@ mod tests {
         assert_eq!(
             provisional_window_lines(&response),
             vec![
-                "result:  executed without a durable auto-revert; operator decision required"
+                "result:  executed, but its durable auto-revert state could not be recorded; operator decision required"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_forward_nonzero_exit_has_failure_wording_separate_from_persistence_loss() {
+        let mut response = provisional_response(None, None);
+        response.exit_code = Some(17);
+        response.auto_revert_durable = Some(false);
+        assert_eq!(
+            provisional_window_lines(&response),
+            vec![
+                "result:  forward command failed with exit code 17; auto-revert was not armed; operator decision required"
                     .to_string()
             ]
         );

@@ -152,6 +152,15 @@ pub struct Provisional {
     /// before exec with `forward_done=false` that survives a restart is
     /// indeterminate and routes to `NeedsOperatorDecision`.
     pub forward_done: bool,
+    /// Exit status observed from the forward command. `None` means the
+    /// process was interrupted before a normal exit was observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forward_exit: Option<i32>,
+    /// The forward command completed, but the completed outcome could not be
+    /// committed after execution. Operator action first converges this live
+    /// row with the durable pre-forward row.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub forward_persistence_failed: bool,
     pub status: ProvisionalStatus,
     /// Exit code of the revert, once it has run.
     pub revert_exit: Option<i32>,
@@ -195,13 +204,18 @@ impl Provisional {
     /// Durable forward-side outcome derived from the lifecycle fields. This is
     /// separate from the rollback status exposed by [`ProvisionalStatus`].
     pub fn forward_outcome(&self) -> &'static str {
-        if !self.forward_done {
+        if self.forward_persistence_failed {
+            "persistence_failed"
+        } else if !self.forward_done {
             if self.status == ProvisionalStatus::Armed {
                 "running"
             } else {
                 "interrupted"
             }
-        } else if self.status == ProvisionalStatus::NeedsOperatorDecision && self.deadline_unix == 0
+        } else if self.forward_exit.is_some_and(|exit| exit != 0)
+            || (self.forward_exit.is_none()
+                && self.status == ProvisionalStatus::NeedsOperatorDecision
+                && self.deadline_unix == 0)
         {
             "failed"
         } else {
@@ -330,6 +344,8 @@ impl ProvisionalRegistry {
     ) -> Option<Provisional> {
         let p = self.items.get_mut(handle)?;
         p.forward_done = true;
+        p.forward_exit = exit;
+        p.forward_persistence_failed = false;
         if exit == Some(0) {
             p.deadline_unix = finished_unix.saturating_add(window_secs);
             p.window_secs = window_secs;
@@ -355,6 +371,8 @@ impl ProvisionalRegistry {
     ) -> Option<Provisional> {
         let p = self.items.get_mut(handle)?;
         p.forward_done = false;
+        p.forward_exit = None;
+        p.forward_persistence_failed = false;
         p.deadline_unix = 0;
         p.status = ProvisionalStatus::NeedsOperatorDecision;
         p.revert_detail = Some(detail);
@@ -368,14 +386,17 @@ impl ProvisionalRegistry {
     pub fn mark_forward_persistence_failed(
         &mut self,
         handle: &str,
-        detail: String,
+        exit: Option<i32>,
     ) -> Option<Provisional> {
         let p = self.items.get_mut(handle)?;
         p.forward_done = true;
+        p.forward_exit = exit;
+        p.forward_persistence_failed = true;
         p.deadline_unix = 0;
         p.window_secs = 0;
         p.status = ProvisionalStatus::NeedsOperatorDecision;
-        p.revert_detail = Some(detail);
+        p.revert_detail =
+            Some("forward command completed but its durable outcome was not recorded".to_string());
         Some(p.clone())
     }
 
@@ -556,6 +577,8 @@ mod tests {
             window_secs: 0,
             auto_reverted_unix: None,
             forward_done: true,
+            forward_exit: Some(0),
+            forward_persistence_failed: false,
             status: ProvisionalStatus::Armed,
             revert_exit: None,
             revert_detail: None,

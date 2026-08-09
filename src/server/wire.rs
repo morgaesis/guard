@@ -6,7 +6,7 @@ use crate::session::{
     SessionReport,
 };
 use guard::gating::approval::Approval;
-use guard::gating::provisional::Provisional;
+use guard::gating::provisional::{Provisional, ProvisionalStatus};
 use guard::gating::{Coverage, DecisionTrace, DecisionVerbMatch};
 use guard::principal::PrincipalKey;
 use guard::redact::redact_output_text;
@@ -1047,6 +1047,9 @@ impl ProvisionalSummary {
                 "running" => "running".to_string(),
                 "interrupted" => "interrupted".to_string(),
                 "failed" => "forward_failed".to_string(),
+                "persistence_failed" if p.status == ProvisionalStatus::NeedsOperatorDecision => {
+                    "persistence_failed".to_string()
+                }
                 _ => p.status.as_str().to_string(),
             },
             forward_outcome: p.forward_outcome().to_string(),

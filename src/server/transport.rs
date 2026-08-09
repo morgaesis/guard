@@ -281,6 +281,8 @@ mod api_session_event_tests {
             window_secs: 0,
             auto_reverted_unix: None,
             forward_done: true,
+            forward_exit: Some(0),
+            forward_persistence_failed: false,
             status: ProvisionalStatus::Armed,
             revert_exit: None,
             revert_detail: None,

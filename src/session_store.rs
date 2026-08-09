@@ -2343,6 +2343,8 @@ fn provisional_identity(provisional: &Provisional) -> Provisional {
     identity.window_secs = 0;
     identity.auto_reverted_unix = None;
     identity.forward_done = false;
+    identity.forward_exit = None;
+    identity.forward_persistence_failed = false;
     identity.status = ProvisionalStatus::Armed;
     identity.revert_exit = None;
     identity.revert_detail = None;
@@ -3274,6 +3276,8 @@ mod tests {
                 window_secs: 0,
                 auto_reverted_unix: None,
                 forward_done: true,
+                forward_exit: Some(0),
+                forward_persistence_failed: false,
                 status: ProvisionalStatus::Armed,
                 revert_exit: None,
                 revert_detail: None,
@@ -3540,6 +3544,8 @@ mod tests {
             window_secs: 0,
             auto_reverted_unix: None,
             forward_done: true,
+            forward_exit: Some(0),
+            forward_persistence_failed: false,
             status: ProvisionalStatus::Armed,
             revert_exit: None,
             revert_detail: None,
@@ -4132,6 +4138,8 @@ mod tests {
             window_secs: 0,
             auto_reverted_unix: None,
             forward_done: true,
+            forward_exit: Some(0),
+            forward_persistence_failed: false,
             status: ProvisionalStatus::Reverting,
             revert_exit: None,
             revert_detail: None,
