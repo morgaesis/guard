@@ -5713,6 +5713,11 @@ pub(super) struct VerbPreviewCache {
 }
 
 impl VerbPreviewCache {
+    #[cfg(test)]
+    pub(super) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     /// Store one previewed candidate, most recent first. Re-previewing an
     /// identical candidate refreshes its position instead of duplicating it.
     pub(super) fn insert(&mut self, digest: String, verb: Verb) {

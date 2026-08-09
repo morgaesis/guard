@@ -24,7 +24,6 @@ use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -457,6 +456,13 @@ struct CatalogFile {
     verbs: Vec<Verb>,
 }
 
+fn is_synthesized_verb(verb: &Verb) -> bool {
+    verb.auto_promoted
+        || verb.source_prose.is_some()
+        || verb.evidence.is_some()
+        || verb.promotion_stamp.is_some()
+}
+
 /// The result of rendering a verb invocation: a concrete command ready to gate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedVerb {
@@ -501,6 +507,9 @@ impl VerbCatalog {
     /// authority; the original candidate remains unchanged.
     pub fn for_admission_preview(candidate: &Verb) -> Result<Self> {
         let mut verb = candidate.clone();
+        if is_synthesized_verb(&verb) {
+            validate_canonical_synthesized_verb_envelope(&verb)?;
+        }
         verb.baseline = true;
         verb.trusted = false;
         validate_verb(&verb)?;
@@ -560,10 +569,18 @@ impl VerbCatalog {
     /// duplicate names, non-anchored param patterns, invalid regexes, and
     /// template placeholders that reference an undeclared param.
     pub fn from_yaml(text: &str) -> Result<Self> {
+        Self::from_yaml_with_repair(text).map(|(catalog, _)| catalog)
+    }
+
+    fn from_yaml_with_repair(text: &str) -> Result<(Self, Option<String>)> {
         let file: CatalogFile =
             serde_yaml_ng::from_str(text).context("failed to parse verb catalog")?;
         let mut verbs = BTreeMap::new();
+        let mut repaired = false;
         for mut verb in file.verbs {
+            if is_synthesized_verb(&verb) && text_contains_sensitive_literals(&verb.name) {
+                bail!("generated verb name contains sensitive material");
+            }
             if verb.name.starts_with("grant-") {
                 bail!(
                     "verb name '{}' uses the reserved saved-grant namespace",
@@ -576,14 +593,15 @@ impl VerbCatalog {
                     verb.name
                 );
             }
-            if verb.source_prose.is_some() || verb.evidence.is_some() {
+            if is_synthesized_verb(&verb) {
+                let original = serde_json::to_value(&verb)?;
                 sanitize_synthesized_verb_prose(&mut verb);
                 if generated_authority_contains_sensitive_literal(&verb) {
                     bail!(
-                        "generated verb '{}' contains sensitive authority metadata or literal argv",
-                        verb.name
+                        "generated verb contains sensitive authority metadata or literal credential argv"
                     );
                 }
+                repaired |= original != serde_json::to_value(&verb)?;
             }
             normalize_operator_boundaries(&mut verb);
             validate_verb(&verb)?;
@@ -591,22 +609,40 @@ impl VerbCatalog {
                 bail!("duplicate verb name: '{}'", verb.name);
             }
         }
-        let digest = Sha256::digest(text.as_bytes());
+        let canonical = repaired
+            .then(|| canonical_catalog_yaml(text, verbs.values()))
+            .transpose()?;
+        let version_text = canonical.as_deref().unwrap_or(text);
+        let digest = Sha256::digest(version_text.as_bytes());
         let mut version_bytes = [0u8; 8];
         version_bytes.copy_from_slice(&digest[..8]);
-        Ok(Self {
-            verbs,
-            version: u64::from_be_bytes(version_bytes),
-            path: None,
-            mtime: None,
-        })
+        Ok((
+            Self {
+                verbs,
+                version: u64::from_be_bytes(version_bytes),
+                path: None,
+                mtime: None,
+            },
+            canonical,
+        ))
     }
 
     /// Load a catalog from a file, recording its path and mtime for reloads.
     pub fn load(path: &Path) -> Result<Self> {
+        crate::learned_rules::recover_learning_file_transaction(path)?;
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read verb catalog {}", path.display()))?;
-        let mut catalog = Self::from_yaml(&text)?;
+        let (mut catalog, repair) = Self::from_yaml_with_repair(&text)?;
+        if let Some(canonical) = repair {
+            let outcome = crate::learned_rules::write_learning_file_atomically_if_unchanged(
+                path,
+                text.as_bytes(),
+                &canonical,
+            )?;
+            if let Some(error) = outcome.warning() {
+                return Err(error).context("catalog repair committed without confirmed durability");
+            }
+        }
         catalog.path = Some(path.to_path_buf());
         catalog.mtime = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
         Ok(catalog)
@@ -899,6 +935,22 @@ impl VerbCatalog {
     /// reflect the write. Requires the catalog to be file-backed. Nothing is
     /// written if validation fails.
     pub fn append_verb(&mut self, verb: &Verb) -> Result<()> {
+        let canonical;
+        let verb = if is_synthesized_verb(verb) {
+            canonical = {
+                let mut candidate = verb.clone();
+                sanitize_synthesized_verb_prose(&mut candidate);
+                if generated_authority_contains_sensitive_literal(&candidate) {
+                    bail!(
+                        "generated verb contains sensitive authority metadata or literal credential argv"
+                    );
+                }
+                candidate
+            };
+            &canonical
+        } else {
+            verb
+        };
         self.validate_candidate(verb)?;
         let path = self.path.clone().ok_or_else(|| {
             anyhow::anyhow!("verb catalog is not backed by a file; cannot persist a new verb")
@@ -909,8 +961,12 @@ impl VerbCatalog {
         // bad or duplicate verb can never corrupt the catalog on disk.
         let validated = Self::from_yaml(&new_content)
             .context("appending this verb would make the catalog invalid")?;
-        std::fs::write(&path, &new_content)
-            .with_context(|| format!("failed to write verb catalog {}", path.display()))?;
+        let outcome = crate::learned_rules::write_learning_file_atomically_if_unchanged(
+            &path,
+            existing.as_bytes(),
+            &new_content,
+        )?;
+        let warning = outcome.warning();
         // Adopt the already-validated content rather than re-reading the file: a
         // post-write reload failure would otherwise report an error to the
         // operator even though the write landed, desyncing memory from disk.
@@ -919,6 +975,9 @@ impl VerbCatalog {
         self.mtime = std::fs::metadata(&path)
             .ok()
             .and_then(|m| m.modified().ok());
+        if let Some(error) = warning {
+            tracing::warn!("catalog append committed with a durability warning: {error}");
+        }
         Ok(())
     }
 
@@ -1102,13 +1161,20 @@ impl VerbCatalog {
         let new_content = compose_removed_catalog(&existing, name)?;
         let validated = Self::from_yaml(&new_content)
             .context("deleting this verb would make the catalog invalid")?;
-        std::fs::write(&path, &new_content)
-            .with_context(|| format!("failed to write verb catalog {}", path.display()))?;
+        let outcome = crate::learned_rules::write_learning_file_atomically_if_unchanged(
+            &path,
+            existing.as_bytes(),
+            &new_content,
+        )?;
+        let warning = outcome.warning();
         self.verbs = validated.verbs;
         self.version = validated.version;
         self.mtime = std::fs::metadata(&path)
             .ok()
             .and_then(|m| m.modified().ok());
+        if let Some(error) = warning {
+            tracing::warn!("catalog deletion committed with a durability warning: {error}");
+        }
         Ok(verb)
     }
 
@@ -1204,6 +1270,27 @@ fn compose_appended_catalog(existing: &str, verb: &Verb) -> Result<String> {
     serde_yaml_ng::to_string(&doc).context("failed to serialize the updated catalog")
 }
 
+fn canonical_catalog_yaml<'a>(
+    existing: &str,
+    verbs: impl Iterator<Item = &'a Verb>,
+) -> Result<String> {
+    let body = existing.strip_prefix('\u{feff}').unwrap_or(existing);
+    let mut document: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(body).context("the existing verb catalog is not valid YAML")?;
+    let mapping = document
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow::anyhow!("verb catalog is not a YAML mapping"))?;
+    let values = verbs
+        .map(serde_yaml_ng::to_value)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to serialize canonical verbs")?;
+    mapping.insert(
+        serde_yaml_ng::Value::String("verbs".to_string()),
+        serde_yaml_ng::Value::Sequence(values),
+    );
+    serde_yaml_ng::to_string(&document).context("failed to serialize the canonical catalog")
+}
+
 fn compose_removed_catalog(existing: &str, name: &str) -> Result<String> {
     let body = existing.strip_prefix('\u{feff}').unwrap_or(existing);
     let mut doc: serde_yaml_ng::Value =
@@ -1269,39 +1356,16 @@ fn atomic_replace_if_unchanged(path: &Path, expected: &[u8], replacement: &[u8])
     if current != expected {
         bail!("verb catalog changed before the atomic rewrite; retry the amend");
     }
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let mut temporary = tempfile::NamedTempFile::new_in(parent).with_context(|| {
-        format!(
-            "failed to create a temporary catalog in {}",
-            parent.display()
-        )
-    })?;
-    temporary
-        .as_file_mut()
-        .write_all(replacement)
-        .with_context(|| format!("failed to write replacement catalog for {}", path.display()))?;
-    if let Ok(metadata) = std::fs::metadata(path) {
-        temporary
-            .as_file()
-            .set_permissions(metadata.permissions())
-            .with_context(|| format!("failed to preserve permissions for {}", path.display()))?;
+    let replacement =
+        std::str::from_utf8(replacement).context("catalog replacement is not UTF-8")?;
+    let outcome = crate::learned_rules::write_learning_file_atomically_if_unchanged(
+        path,
+        expected,
+        replacement,
+    )?;
+    if let Some(error) = outcome.warning() {
+        tracing::warn!("catalog replacement committed with a durability warning: {error}");
     }
-    temporary
-        .as_file()
-        .sync_all()
-        .with_context(|| format!("failed to sync replacement catalog for {}", path.display()))?;
-    temporary
-        .persist(path)
-        .map_err(|error| error.error)
-        .with_context(|| {
-            format!(
-                "failed to atomically replace verb catalog {}",
-                path.display()
-            )
-        })?;
     Ok(())
 }
 
@@ -2304,7 +2368,8 @@ fn value_constraint_contains_sensitive_literal(constraint: &ValueConstraint) -> 
 }
 
 fn generated_authority_contains_sensitive_literal(verb: &Verb) -> bool {
-    if command_contains_sensitive_literals(&verb.binary, &verb.args)
+    if text_contains_sensitive_literals(&verb.name)
+        || command_contains_sensitive_literals(&verb.binary, &verb.args)
         || verb
             .revert
             .as_ref()
@@ -3622,6 +3687,61 @@ verbs:
     }
 
     #[test]
+    fn catalog_load_durably_repairs_synthesized_metadata_and_is_idempotent() {
+        let value = ["q", "7"].concat();
+        let contaminated = format!("password={value}");
+        let mut verb = synth_verb("fixturectl", Some("^(status)$"), false, "inspect-fixture");
+        verb.source_prose = Some(contaminated.clone());
+        verb.evidence = Some(contaminated.clone());
+        let yaml = serde_yaml_ng::to_string(&CatalogFile { verbs: vec![verb] }).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("verbs.yaml");
+        std::fs::write(&path, yaml).unwrap();
+
+        let mut first = VerbCatalog::load(&path).unwrap();
+        let repaired = std::fs::read_to_string(&path).unwrap();
+        assert!(!repaired.contains(&value));
+        assert!(!serde_json::to_string(&first.list())
+            .unwrap()
+            .contains(&value));
+
+        let second = VerbCatalog::load(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), repaired);
+        assert_eq!(first.list().len(), second.list().len());
+
+        let appended = synth_verb("true", None, false, "safe-appended");
+        first.append_verb(&appended).unwrap();
+        assert!(!std::fs::read_to_string(path).unwrap().contains(&value));
+    }
+
+    #[test]
+    fn safe_catalog_load_preserves_exact_bytes() {
+        let yaml = "# operator comment\nverbs:\n  - name: safe\n    binary: true\n    consequence: reversible\n";
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("verbs.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        VerbCatalog::load(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), yaml);
+    }
+
+    #[test]
+    fn sensitive_synthesized_name_fails_before_preview_or_catalog_load() {
+        let value = ["q", "7"].concat();
+        let mut verb = synth_verb("fixturectl", Some("^(status)$"), false, "safe");
+        verb.name = format!("password={value}");
+        verb.source_prose = Some("generated inspection".to_string());
+        assert!(generated_authority_contains_sensitive_literal(&verb));
+        assert!(VerbCatalog::for_admission_preview(&verb).is_err());
+
+        let yaml = serde_yaml_ng::to_string(&CatalogFile { verbs: vec![verb] }).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("verbs.yaml");
+        std::fs::write(&path, &yaml).unwrap();
+        assert!(VerbCatalog::load(&path).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), yaml);
+    }
+
+    #[test]
     fn synthesis_safety_gate_blocks_dangerous_shapes() {
         // shell / interpreter binaries (incl. path and .exe forms)
         assert!(validate_synthesized_safety(&synth_verb("sh", Some("^.+$"), false, "x")).is_err());
@@ -4108,7 +4228,8 @@ verbs:
             let path = entry.unwrap().path();
             let name = path.file_name().unwrap().to_string_lossy();
             if name.starts_with("verbs") && name.ends_with(".yaml") {
-                VerbCatalog::load(&path)
+                let yaml = std::fs::read_to_string(&path).unwrap();
+                VerbCatalog::from_yaml(&yaml)
                     .unwrap_or_else(|e| panic!("{} failed to load: {e}", path.display()));
                 checked += 1;
             }

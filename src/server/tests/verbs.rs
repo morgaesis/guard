@@ -794,6 +794,20 @@ fn synthesis_arguments_with_sensitive_prose(_request: &str) -> serde_json::Value
     })
 }
 
+fn synthesis_arguments_with_sensitive_name(_request: &str) -> serde_json::Value {
+    let value = ["q", "7"].concat();
+    serde_json::json!({
+        "name": format!("password={value}"),
+        "description": "Inspect compiler version",
+        "binary": "rustc",
+        "args": ["--version"],
+        "params": {},
+        "consequence": "reversible",
+        "trusted": false,
+        "evidence": "The exact compiler version command is read only."
+    })
+}
+
 fn relative_file_synthesis_arguments(_request: &str) -> serde_json::Value {
     serde_json::json!({
         "name": "apply-fixture",
@@ -1120,6 +1134,39 @@ async fn successful_synthesis_sanitizes_preview_persistence_and_admin_projection
     assert!(!std::fs::read_to_string(catalog_path)
         .unwrap()
         .contains(&value));
+}
+
+#[tokio::test]
+async fn sensitive_synthesized_name_never_reaches_preview_catalog_or_response() {
+    let value = ["q", "7"].concat();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(super::run_verb_synthesis_llm_with(
+        listener,
+        synthesis_arguments_with_sensitive_name,
+    ));
+    let (mut cfg, daemon) = synthesis_test_config(url);
+    let (catalog_dir, catalog) = file_backed_catalog();
+    cfg.state.verbs = Arc::new(RwLock::new(catalog));
+
+    let response = handle_admin_request_for_test(
+        &cfg,
+        &daemon,
+        AdminRequest::VerbCreate {
+            prose: "Inspect compiler version.".to_string(),
+            binary_hint: Some("rustc".to_string()),
+            preview: true,
+            gate_feedback: Vec::new(),
+        },
+    )
+    .await;
+    assert!(matches!(response, AdminResponse::Error { .. }));
+    assert!(!serde_json::to_string(&response).unwrap().contains(&value));
+    assert_eq!(
+        std::fs::read_to_string(catalog_dir.path().join("verbs.yaml")).unwrap(),
+        "verbs: []\n"
+    );
+    assert!(cfg.state.verb_previews.read().await.is_empty());
 }
 
 #[tokio::test]
