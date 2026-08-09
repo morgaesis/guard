@@ -198,12 +198,6 @@ pub(super) async fn converge_forward_persistence_failure(
     }
 }
 
-pub(super) async fn persist_provisional(server: &ServerContext, p: &Provisional) {
-    if let Err(error) = try_persist_provisional(server, p).await {
-        tracing::warn!("{error}");
-    }
-}
-
 /// Drop any API-proxy delete-provenance tied to a now-resolved auto-revert
 /// handle. A proxy-armed create records provenance so a later contained delete
 /// of that object cancels the moot create-revert; once the revert itself

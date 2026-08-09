@@ -1135,7 +1135,7 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                             "stdout": { "type": ["string", "null"] },
                             "stderr": { "type": ["string", "null"] },
                             "status": { "type": ["string", "null"], "description": "Consequence-gate outcome: executed, provisional, held, reverted, or dry_run. Null also covers a typed containment failure." },
-                            "handle": { "type": ["string", "null"], "description": "A durable request, provisional containment, or resolvable containment-recovery handle when applicable." },
+                            "handle": { "type": ["string", "null"], "description": "A denied or held durable request, provisional containment, or resolvable containment-recovery handle when applicable." },
                             "approval_options": {
                                 "type": "array",
                                 "items": { "type": "string" },
