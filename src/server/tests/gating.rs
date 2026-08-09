@@ -14,7 +14,7 @@ use crate::server::gate_runtime::{
 };
 use crate::server::wire::{
     approval_is_armed, AdminRequest, AdminResponse, CallerIdentity, ExecOutcome, ExecuteRequest,
-    ExecuteResult, RevertSpec, CONSEQUENCE_ARM,
+    ExecuteResult, RevertSpec, VerbContext, CONSEQUENCE_ARM,
 };
 #[cfg(unix)]
 use crate::server::wire::{
@@ -2696,6 +2696,68 @@ async fn session_status_does_not_cross_expose_same_principal_provisionals() {
 
 /// Approval arms the immutable snapshot without executing it. Only the
 /// authenticated requester can claim the one-shot resume.
+#[cfg(unix)]
+#[tokio::test]
+async fn approval_snapshot_omits_rendered_verb_parameter_values() {
+    let (mut cfg, _, agent) = gating_config(7004, 1000);
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("state.db");
+    let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+    cfg.state.session_store = Some(store.clone());
+    let value = ["q", "7"].concat();
+    let mut sink = tokio::io::sink();
+    let held = hold_for_approval_with_authority(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        held_request("true", Vec::new(), None),
+        agent.principal(),
+        GateInputs {
+            reason: "needs sign-off".to_string(),
+            risk: Some(9),
+            reversibility: Some(Reversibility::Irreversible),
+            revert_preauthorized: false,
+            verb: Some(VerbContext {
+                name: "fixture-verb".to_string(),
+                class: Reversibility::Irreversible,
+                trusted: false,
+                params: BTreeMap::from([("rollback_only".to_string(), value.clone())]),
+                catalog_version: 1,
+                verb_digest: None,
+                access_evaluation_override_eligible: false,
+            }),
+            bypass: false,
+            authority: None,
+            consume_access_verbs: Vec::new(),
+        },
+    )
+    .await;
+    let ExecOutcome::Held { handle, .. } = held.exec else {
+        panic!("expected held command")
+    };
+    let approval = cfg
+        .state
+        .approvals
+        .read()
+        .await
+        .get(&handle)
+        .unwrap()
+        .clone();
+    assert!(approval.snapshot.verb_params.is_empty());
+    assert!(store.load_approvals().await.unwrap()[0]
+        .snapshot
+        .verb_params
+        .is_empty());
+    let durable = std::fs::read(path).unwrap();
+    assert!(!durable
+        .windows(value.len())
+        .any(|window| window == value.as_bytes()));
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn hold_approval_arms_then_requester_resumes_once_with_output() {

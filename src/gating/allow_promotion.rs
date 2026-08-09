@@ -78,7 +78,11 @@ use super::verb::{
 };
 use super::{Reversibility, EXECUTE_NOW_MAX_RISK, HOLD_RISK_THRESHOLD};
 use crate::env::now_unix;
+use crate::learned_rules::write_learning_file_atomically;
 use crate::learned_rules::{infer_service_from_binary, looks_dangerous_for_learned_allow};
+use crate::redact::{
+    command_contains_sensitive_literals, flattened_command_contains_sensitive_literals,
+};
 
 /// Evidence samples kept per observation bucket: enough to see whether more
 /// than one distinct value occupies a varying position, bounded so neither
@@ -190,7 +194,7 @@ pub struct AllowPromotionStore {
 
 impl AllowPromotionStore {
     pub fn load(config: AllowPromotionConfig) -> Result<Self> {
-        let data = if config.path.exists() {
+        let mut data = if config.path.exists() {
             let content = std::fs::read_to_string(&config.path)
                 .with_context(|| format!("failed to read {}", config.path.display()))?;
             if content.trim().is_empty() {
@@ -202,7 +206,14 @@ impl AllowPromotionStore {
         } else {
             AllowPromotionFile::default()
         };
-        Ok(Self { config, data })
+        let original_len = data.observations.len();
+        data.observations
+            .retain(|_, observation| !allow_observation_contains_sensitive_literals(observation));
+        let store = Self { config, data };
+        if original_len != store.data.observations.len() {
+            store.save()?;
+        }
+        Ok(store)
     }
 
     pub fn path(&self) -> &Path {
@@ -238,6 +249,9 @@ impl AllowPromotionStore {
         reversibility: Option<Reversibility>,
         reason: &str,
     ) -> Result<Option<AllowPromotionOutcome>> {
+        if command_contains_sensitive_literals(binary, args) {
+            return Ok(None);
+        }
         if !self.config.enabled {
             return Ok(None);
         }
@@ -386,14 +400,17 @@ impl AllowPromotionStore {
     }
 
     fn save(&self) -> Result<()> {
-        if let Some(parent) = self.config.path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
         let content = serde_yaml_ng::to_string(&self.data)?;
-        std::fs::write(&self.config.path, content)
-            .with_context(|| format!("failed to write {}", self.config.path.display()))
+        write_learning_file_atomically(&self.config.path, &content)
     }
+}
+
+fn allow_observation_contains_sensitive_literals(observation: &AllowObservation) -> bool {
+    observation
+        .samples
+        .iter()
+        .any(|args| command_contains_sensitive_literals(&observation.binary, args))
+        || flattened_command_contains_sensitive_literals(&observation.last_command)
 }
 
 /// One derived template slot: either a literal token (identical across every
@@ -759,6 +776,59 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!third.ready_to_synthesize);
+    }
+
+    #[test]
+    fn sensitive_allow_observations_are_rejected_and_purged_idempotently() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("allow.yaml");
+        let config = config(path.clone(), 2);
+        let mut store = AllowPromotionStore::load(config.clone()).unwrap();
+        let safe = args(&["get", "pods"]);
+        store
+            .record_approval(
+                "kubectl",
+                &safe,
+                "kubectl get pods",
+                Some(1),
+                Some(Reversibility::Reversible),
+                "safe",
+            )
+            .unwrap();
+        let safe_bytes = std::fs::read(&path).unwrap();
+        let value = ["q", "7"].concat();
+        assert!(store
+            .record_approval(
+                "redis-cli",
+                &["-a".to_string(), value.clone()],
+                &format!("redis-cli -a {value}"),
+                Some(1),
+                Some(Reversibility::Reversible),
+                "ignored",
+            )
+            .unwrap()
+            .is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), safe_bytes);
+
+        let mut contaminated = store.data.clone();
+        let mut observation = contaminated.observations.values().next().unwrap().clone();
+        observation.binary = "redis-cli".to_string();
+        observation.samples = vec![vec!["-a".to_string(), value.clone()]];
+        observation.last_command = format!("redis-cli -a {value}");
+        contaminated
+            .observations
+            .insert("sensitive".to_string(), observation);
+        write_learning_file_atomically(&path, &serde_yaml_ng::to_string(&contaminated).unwrap())
+            .unwrap();
+
+        let loaded = AllowPromotionStore::load(config.clone()).unwrap();
+        assert_eq!(loaded.data.observations.len(), 1);
+        let sanitized = std::fs::read(&path).unwrap();
+        assert!(!sanitized
+            .windows(value.len())
+            .any(|window| window == value.as_bytes()));
+        AllowPromotionStore::load(config).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), sanitized);
     }
 
     #[test]

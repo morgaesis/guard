@@ -22,7 +22,7 @@ use anyhow::Result;
 use guard::gating::allow_promotion::is_cwd_dependent_opaque_carrier;
 use guard::gating::Reversibility;
 use guard::learned_rules::{AutoShimMode, LearningOutcome};
-use guard::redact::{command_line, redact_output_text};
+use guard::redact::{command_contains_sensitive_literals, command_line};
 use std::path::PathBuf;
 
 use super::execute::persist_session_snapshot;
@@ -62,12 +62,7 @@ pub(super) fn validate_session_exact_rule_candidate(
             return Err("appeal command contains control characters".to_string());
         }
     }
-    // A session exact rule persists this argv verbatim in the state database
-    // and echoes it from every session inspection command. If credential
-    // redaction would change the command line, the rule would either store a
-    // secret or never match; refuse the amendment instead.
-    let command = command_line(binary, args);
-    if redact_output_text(&command) != command {
+    if command_contains_sensitive_literals(binary, args) {
         return Err(
             "appeal command contains credential-shaped material and cannot be stored as a session rule"
                 .to_string(),
@@ -167,6 +162,9 @@ pub(super) async fn maybe_auto_amend_session_after_llm(
     cwd: Option<&PathBuf>,
     risk: Option<i32>,
 ) -> Option<String> {
+    if command_contains_sensitive_literals(binary, args) {
+        return None;
+    }
     let token = token?;
     let enabled = {
         let reg = server.state.sessions.read().await;
@@ -296,6 +294,9 @@ pub(super) async fn maybe_promote_allow_verb(
     reversibility: Option<Reversibility>,
     reason: &str,
 ) {
+    if command_contains_sensitive_literals(binary, args) {
+        return;
+    }
     if is_cwd_dependent_opaque_carrier(binary) {
         tracing::debug!(
             binary,

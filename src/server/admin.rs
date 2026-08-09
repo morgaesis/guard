@@ -19,9 +19,9 @@ use guard::gating::verb::{
 #[cfg(test)]
 use guard::gating::verb::{CoverageAction, CoverageProbe, CoverageProvenance, VerbCoverageCell};
 use guard::principal::{scope_eq, PrincipalKey};
-use guard::redact::{command_line, redact_output_text};
 #[cfg(test)]
-use guard::redact::{redact_command_line, redact_output};
+use guard::redact::redact_output;
+use guard::redact::{redact_command_line, redact_output_text};
 
 use super::execute::audit_session_fingerprint;
 #[cfg(test)]
@@ -5504,7 +5504,7 @@ async fn dispatch_admin_request(
             preview.state.notify_hook = None;
             let mut items = Vec::with_capacity(commands.len());
             for command in commands {
-                let rendered = command_line(&command.binary, &command.args);
+                let rendered = redact_command_line(&command.binary, &command.args);
                 let response = super::execute::execute_command(
                     super::wire::ExecuteRequest {
                         binary: command.binary,

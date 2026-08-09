@@ -93,10 +93,11 @@ pub struct ApprovalSnapshot {
     /// env-var -> secret-key mapping materialized as child-lifetime files.
     #[serde(default)]
     pub secret_file_keys: BTreeMap<String, String>,
-    /// If this hold originated from a verb, the verb name and the validated
-    /// params, plus the catalog version it was rendered against. The version
-    /// is the staleness fallback for rows without a `verb_digest`, where any
-    /// catalog change voids the approval.
+    /// If this hold originated from a verb, the verb name and catalog version.
+    /// `verb_params` remains for schema compatibility and is always empty;
+    /// replay uses the rendered immutable argv above. The version is the
+    /// staleness fallback for rows without a `verb_digest`, where any catalog
+    /// change voids the approval.
     pub verb_name: Option<String>,
     pub verb_params: BTreeMap<String, String>,
     pub catalog_version: Option<u64>,

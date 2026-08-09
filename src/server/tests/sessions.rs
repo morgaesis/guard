@@ -5578,6 +5578,53 @@ async fn evaluate_batch_requires_owned_live_unsuspended_session_or_admin() {
 }
 
 #[tokio::test]
+async fn evaluate_batch_redacts_structured_alias_commands_before_projection() {
+    let (cfg, _) = make_test_config();
+    let token = "batch-redaction-owner".to_string();
+    cfg.state
+        .sessions
+        .write()
+        .await
+        .grant(token.clone(), granted_session(Vec::new(), Vec::new()));
+    let value = ["q", "7"].concat();
+    let commands = vec![
+        guard::wire::BatchCommand {
+            binary: "curl.EXE".to_string(),
+            args: vec![format!("-u{value}")],
+            env: HashMap::new(),
+            secrets: HashMap::new(),
+            secret_files: HashMap::new(),
+            cwd: None,
+        },
+        guard::wire::BatchCommand {
+            binary: "docker.CMD".to_string(),
+            args: vec!["login".to_string(), format!("-p:{value}")],
+            env: HashMap::new(),
+            secrets: HashMap::new(),
+            secret_files: HashMap::new(),
+            cwd: None,
+        },
+    ];
+
+    let response = handle_admin_request_for_test(
+        &cfg,
+        &CallerIdentity::Unix { uid: 1000 },
+        AdminRequest::EvaluateBatch {
+            session_token: Some(token.clone()),
+            caller_token: Some(token),
+            commands,
+        },
+    )
+    .await;
+    let AdminResponse::EvaluationBatch { items } = response else {
+        panic!("expected batch evaluation")
+    };
+    assert_eq!(items.len(), 2);
+    assert!(items.iter().all(|item| item.command.contains("[REDACTED]")));
+    assert!(items.iter().all(|item| !item.command.contains(&value)));
+}
+
+#[tokio::test]
 async fn evaluate_batch_seeds_the_identical_real_run_cache_key() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());

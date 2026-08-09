@@ -1896,7 +1896,7 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
         verb_name: verb.as_ref().map(|v| v.name.clone()),
-        verb_params: verb.as_ref().map(|v| v.params.clone()).unwrap_or_default(),
+        verb_params: std::collections::BTreeMap::new(),
         catalog_version: verb.as_ref().map(|v| v.catalog_version),
         verb_digest: verb.as_ref().and_then(|v| v.verb_digest.clone()),
         access_verbs: consume_access_verbs,

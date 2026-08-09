@@ -20,9 +20,39 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::env::now_unix;
+use crate::redact::{
+    command_contains_sensitive_literals, flattened_command_contains_sensitive_literals,
+};
+
+pub(crate) fn write_learning_file_atomically(path: &Path, content: &str) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("failed to create temporary file in {}", parent.display()))?;
+    if let Ok(metadata) = std::fs::metadata(path) {
+        temporary
+            .as_file()
+            .set_permissions(metadata.permissions())
+            .with_context(|| format!("failed to preserve permissions for {}", path.display()))?;
+    }
+    temporary
+        .write_all(content.as_bytes())
+        .with_context(|| format!("failed to write temporary file for {}", path.display()))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("failed to sync temporary file for {}", path.display()))?;
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("failed to replace {}", path.display()))?;
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 pub struct LearningConfig {
@@ -153,7 +183,7 @@ pub struct LearnedRuleStore {
 
 impl LearnedRuleStore {
     pub fn load(config: LearningConfig) -> Result<Self> {
-        let data = if config.path.exists() {
+        let mut data = if config.path.exists() {
             let content = std::fs::read_to_string(&config.path)
                 .with_context(|| format!("failed to read {}", config.path.display()))?;
             if content.trim().is_empty() {
@@ -166,7 +196,19 @@ impl LearnedRuleStore {
             LearnedRulesFile::default()
         };
 
-        Ok(Self { config, data })
+        let original_observations = data.observations.len();
+        let original_rules = data.rules.len();
+        data.observations
+            .retain(|_, observation| !learned_observation_contains_sensitive_literals(observation));
+        data.rules
+            .retain(|rule| !learned_rule_contains_sensitive_literals(rule));
+        let changed =
+            original_observations != data.observations.len() || original_rules != data.rules.len();
+        let store = Self { config, data };
+        if changed {
+            store.save()?;
+        }
+        Ok(store)
     }
 
     pub fn path(&self) -> &Path {
@@ -197,6 +239,9 @@ impl LearnedRuleStore {
         risk: Option<i32>,
         reason: &str,
     ) -> Result<Option<LearningOutcome>> {
+        if command_contains_sensitive_literals(binary, args) {
+            return Ok(None);
+        }
         let risk = risk.unwrap_or(5);
         if risk > self.config.max_risk {
             return Ok(Some(LearningOutcome {
@@ -295,14 +340,38 @@ impl LearnedRuleStore {
     }
 
     fn save(&self) -> Result<()> {
-        if let Some(parent) = self.config.path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
         let content = serde_yaml_ng::to_string(&self.data)?;
-        std::fs::write(&self.config.path, content)
-            .with_context(|| format!("failed to write {}", self.config.path.display()))
+        write_learning_file_atomically(&self.config.path, &content)
     }
+}
+
+fn learned_shim_contains_sensitive_literals(shim: &LearnedShim) -> bool {
+    command_contains_sensitive_literals(&shim.target_binary, &shim.target_args)
+}
+
+fn learned_observation_contains_sensitive_literals(observation: &LearnedObservation) -> bool {
+    flattened_command_contains_sensitive_literals(&observation.pattern)
+        || observation
+            .equivalent_patterns
+            .iter()
+            .any(|pattern| flattened_command_contains_sensitive_literals(pattern))
+        || flattened_command_contains_sensitive_literals(&observation.last_command)
+        || observation
+            .shim
+            .as_ref()
+            .is_some_and(learned_shim_contains_sensitive_literals)
+}
+
+fn learned_rule_contains_sensitive_literals(rule: &LearnedRule) -> bool {
+    flattened_command_contains_sensitive_literals(&rule.pattern)
+        || rule
+            .equivalent_patterns
+            .iter()
+            .any(|pattern| flattened_command_contains_sensitive_literals(pattern))
+        || rule
+            .shim
+            .as_ref()
+            .is_some_and(learned_shim_contains_sensitive_literals)
 }
 
 #[derive(Debug, Clone)]
@@ -636,6 +705,59 @@ mod tests {
         // Crossing the threshold persists a reviewable candidate record, but
         // grants nothing: this module has no lookup that can return an allow.
         assert_eq!(store.rule_count(), 1);
+    }
+
+    #[test]
+    fn sensitive_learning_records_are_rejected_and_purged_idempotently() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("learned.yaml");
+        let config = LearningConfig {
+            path: path.clone(),
+            min_approvals: 1,
+            max_risk: 2,
+            auto_shim: AutoShimMode::Suggest,
+        };
+        let mut store = LearnedRuleStore::load(config.clone()).unwrap();
+        let safe_args = vec!["status".to_string()];
+        store
+            .record_approval("fixturectl", &safe_args, "fixturectl status", Some(1), "ok")
+            .unwrap();
+        let safe_bytes = std::fs::read(&path).unwrap();
+        let value = ["q", "7"].concat();
+        assert!(store
+            .record_approval(
+                "curl",
+                &["-u".to_string(), value.clone()],
+                &format!("curl -u {value}"),
+                Some(1),
+                "ignored"
+            )
+            .unwrap()
+            .is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), safe_bytes);
+
+        let mut contaminated = store.data.clone();
+        let mut observation = contaminated.observations.values().next().unwrap().clone();
+        observation.pattern = format!("curl -u {value}");
+        observation.last_command = observation.pattern.clone();
+        contaminated
+            .observations
+            .insert("sensitive".to_string(), observation);
+        let mut rule = contaminated.rules[0].clone();
+        rule.pattern = format!("curl --user={value}");
+        contaminated.rules.push(rule);
+        write_learning_file_atomically(&path, &serde_yaml_ng::to_string(&contaminated).unwrap())
+            .unwrap();
+
+        let loaded = LearnedRuleStore::load(config.clone()).unwrap();
+        assert_eq!(loaded.data.observations.len(), 1);
+        assert_eq!(loaded.data.rules.len(), 1);
+        let sanitized = std::fs::read(&path).unwrap();
+        assert!(!sanitized
+            .windows(value.len())
+            .any(|window| window == value.as_bytes()));
+        LearnedRuleStore::load(config).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), sanitized);
     }
 
     #[test]

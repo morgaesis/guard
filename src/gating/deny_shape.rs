@@ -26,7 +26,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::env::now_unix;
-use crate::learned_rules::infer_service_from_binary;
+use crate::learned_rules::{infer_service_from_binary, write_learning_file_atomically};
+use crate::redact::{
+    command_contains_sensitive_literals, flattened_args_contain_sensitive_literals,
+    flattened_command_contains_sensitive_literals,
+};
 
 /// Canary strings a synthesized args pattern must NOT match. Each canary
 /// carries a distinctive marker that cannot legitimately appear in evidence
@@ -180,7 +184,7 @@ pub struct DenyShapeStore {
 
 impl DenyShapeStore {
     pub fn load(config: DenyLearningConfig) -> Result<Self> {
-        let data = if config.path.exists() {
+        let mut data = if config.path.exists() {
             let content = std::fs::read_to_string(&config.path)
                 .with_context(|| format!("failed to read {}", config.path.display()))?;
             if content.trim().is_empty() {
@@ -192,7 +196,19 @@ impl DenyShapeStore {
         } else {
             DenyShapeFile::default()
         };
-        Ok(Self { config, data })
+        let original_observations = data.observations.len();
+        let original_shapes = data.shapes.len();
+        data.observations
+            .retain(|_, observation| !deny_observation_contains_sensitive_literals(observation));
+        data.shapes
+            .retain(|shape| !deny_shape_contains_sensitive_literals(shape));
+        let store = Self { config, data };
+        if original_observations != store.data.observations.len()
+            || original_shapes != store.data.shapes.len()
+        {
+            store.save()?;
+        }
+        Ok(store)
     }
 
     pub fn path(&self) -> &Path {
@@ -242,6 +258,9 @@ impl DenyShapeStore {
         command: &str,
         reason: &str,
     ) -> Result<Option<DenyLearningOutcome>> {
+        if command_contains_sensitive_literals(binary, args) {
+            return Ok(None);
+        }
         if !self.config.enabled {
             return Ok(None);
         }
@@ -327,6 +346,12 @@ impl DenyShapeStore {
         reason: &str,
         denials: u32,
     ) -> Result<()> {
+        if evidence
+            .iter()
+            .any(|args| flattened_args_contain_sensitive_literals(binary, args))
+        {
+            bail!("deny shape evidence contains literal credential material");
+        }
         validate_deny_shape_safety(args_pattern, evidence)?;
         let now = now_unix();
         if let Some(existing) = self
@@ -368,14 +393,24 @@ impl DenyShapeStore {
     }
 
     fn save(&self) -> Result<()> {
-        if let Some(parent) = self.config.path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
         let content = serde_yaml_ng::to_string(&self.data)?;
-        std::fs::write(&self.config.path, content)
-            .with_context(|| format!("failed to write {}", self.config.path.display()))
+        write_learning_file_atomically(&self.config.path, &content)
     }
+}
+
+fn deny_observation_contains_sensitive_literals(observation: &DenyObservation) -> bool {
+    observation
+        .evidence_args
+        .iter()
+        .any(|args| flattened_args_contain_sensitive_literals(&observation.binary, args))
+        || flattened_command_contains_sensitive_literals(&observation.last_command)
+}
+
+fn deny_shape_contains_sensitive_literals(shape: &DenyShape) -> bool {
+    shape
+        .evidence
+        .split(" | ")
+        .any(|args| flattened_args_contain_sensitive_literals(&shape.binary, args))
 }
 
 /// Reject a synthesized args pattern that isn't anchored, doesn't compile,
@@ -473,6 +508,75 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(fourth.ready_to_synthesize);
+    }
+
+    #[test]
+    fn sensitive_deny_records_are_rejected_and_purged_idempotently() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("deny.yaml");
+        let config = config(path.clone(), 1);
+        let mut store = DenyShapeStore::load(config.clone()).unwrap();
+        let safe_args = vec!["delete".to_string(), "pod".to_string()];
+        store
+            .record_denial("kubectl", &safe_args, "kubectl delete pod", "denied")
+            .unwrap();
+        store
+            .promote_shape(
+                "kubernetes",
+                "kubectl",
+                "^delete pod$",
+                &["delete pod".to_string()],
+                "denied",
+                1,
+            )
+            .unwrap();
+        let safe_bytes = std::fs::read(&path).unwrap();
+        let value = ["q", "7"].concat();
+        assert!(store
+            .record_denial(
+                "docker",
+                &["login".to_string(), "-p".to_string(), value.clone()],
+                &format!("docker login -p {value}"),
+                "ignored",
+            )
+            .unwrap()
+            .is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), safe_bytes);
+        assert!(store
+            .promote_shape(
+                "container",
+                "docker",
+                ".*",
+                &[format!("login -p {value}")],
+                "ignored",
+                1,
+            )
+            .is_err());
+
+        let mut contaminated = store.data.clone();
+        let mut observation = contaminated.observations.values().next().unwrap().clone();
+        observation.binary = "docker".to_string();
+        observation.evidence_args = vec![format!("login -p {value}")];
+        observation.last_command = format!("docker login -p {value}");
+        contaminated
+            .observations
+            .insert("sensitive".to_string(), observation);
+        let mut shape = contaminated.shapes[0].clone();
+        shape.binary = "docker".to_string();
+        shape.evidence = format!("login --password={value}");
+        contaminated.shapes.push(shape);
+        write_learning_file_atomically(&path, &serde_yaml_ng::to_string(&contaminated).unwrap())
+            .unwrap();
+
+        let loaded = DenyShapeStore::load(config.clone()).unwrap();
+        assert_eq!(loaded.data.observations.len(), 1);
+        assert_eq!(loaded.data.shapes.len(), 1);
+        let sanitized = std::fs::read(&path).unwrap();
+        assert!(!sanitized
+            .windows(value.len())
+            .any(|window| window == value.as_bytes()));
+        DenyShapeStore::load(config).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), sanitized);
     }
 
     #[test]

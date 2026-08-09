@@ -517,11 +517,18 @@ enum OptionValueKind {
     NamedField,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OptionArity {
+    Required,
+    AttachedOnly,
+}
+
 struct BinaryOptionAlias {
     binaries: &'static [&'static str],
     required_subcommand: Option<&'static str>,
     options: &'static [&'static str],
     value_kind: OptionValueKind,
+    arity: OptionArity,
 }
 
 struct BinaryValuelessOption {
@@ -541,42 +548,49 @@ const BINARY_OPTION_ALIASES: &[BinaryOptionAlias] = &[
         required_subcommand: None,
         options: &["-u", "--user", "--proxy-user"],
         value_kind: OptionValueKind::Credential,
+        arity: OptionArity::Required,
     },
     BinaryOptionAlias {
         binaries: &["curl"],
         required_subcommand: None,
         options: &["-H", "--header", "--proxy-header"],
         value_kind: OptionValueKind::NamedField,
+        arity: OptionArity::Required,
     },
     BinaryOptionAlias {
         binaries: &["http", "https"],
         required_subcommand: None,
         options: &["-a", "--auth"],
         value_kind: OptionValueKind::Credential,
+        arity: OptionArity::Required,
     },
     BinaryOptionAlias {
         binaries: &["mysql", "mariadb", "mysqldump"],
         required_subcommand: None,
-        options: &["-p"],
+        options: &["-p", "--password"],
         value_kind: OptionValueKind::Credential,
+        arity: OptionArity::AttachedOnly,
     },
     BinaryOptionAlias {
         binaries: &["redis-cli"],
         required_subcommand: None,
         options: &["-a"],
         value_kind: OptionValueKind::Credential,
+        arity: OptionArity::Required,
     },
     BinaryOptionAlias {
         binaries: &["sshpass"],
         required_subcommand: None,
         options: &["-p"],
         value_kind: OptionValueKind::Credential,
+        arity: OptionArity::Required,
     },
     BinaryOptionAlias {
         binaries: &["docker", "podman"],
         required_subcommand: Some("login"),
         options: &["-p"],
         value_kind: OptionValueKind::Credential,
+        arity: OptionArity::Required,
     },
 ];
 
@@ -593,6 +607,11 @@ const BINARY_VALUELESS_OPTIONS: &[BinaryValuelessOption] = &[
             "--ask-become-pass",
             "--ask-vault-pass",
         ],
+    },
+    BinaryValuelessOption {
+        binaries: &["mysql", "mariadb", "mysqldump"],
+        required_subcommand: None,
+        options: &["-p", "--password", "--skip-password"],
     },
     BinaryValuelessOption {
         binaries: &["docker", "podman"],
@@ -653,8 +672,54 @@ fn binary_lookup_name(binary: &str) -> String {
         .to_string()
 }
 
-fn container_subcommand(args: &[String]) -> Option<(usize, &str)> {
-    const VALUE_OPTIONS: &[&str] = &["--config", "-c", "--context", "--host", "-H", "--log-level"];
+fn container_subcommand<'a>(binary: &str, args: &'a [String]) -> Option<(usize, &'a str)> {
+    const DOCKER_VALUE_OPTIONS: &[&str] = &[
+        "--config",
+        "-c",
+        "--context",
+        "-H",
+        "--host",
+        "-l",
+        "--log-level",
+        "--tlscacert",
+        "--tlscert",
+        "--tlskey",
+    ];
+    const PODMAN_VALUE_OPTIONS: &[&str] = &[
+        "--cdi-spec-dir",
+        "--cgroup-manager",
+        "--config",
+        "--conmon",
+        "-c",
+        "--connection",
+        "--events-backend",
+        "--hooks-dir",
+        "--identity",
+        "--imagestore",
+        "--log-level",
+        "--module",
+        "--network-config-dir",
+        "--out",
+        "--root",
+        "--runroot",
+        "--runtime",
+        "--runtime-flag",
+        "--ssh",
+        "--storage-driver",
+        "--storage-opt",
+        "--tls-ca",
+        "--tls-cert",
+        "--tls-details",
+        "--tls-key",
+        "--tmpdir",
+        "--url",
+        "--volumepath",
+    ];
+    let value_options = match binary {
+        "docker" => DOCKER_VALUE_OPTIONS,
+        "podman" => PODMAN_VALUE_OPTIONS,
+        _ => return None,
+    };
     let mut consumes_next = false;
     for (index, argument) in args.iter().enumerate() {
         if consumes_next {
@@ -667,14 +732,18 @@ fn container_subcommand(args: &[String]) -> Option<(usize, &str)> {
         if !argument.starts_with('-') {
             return Some((index, argument));
         }
-        if VALUE_OPTIONS.contains(&argument.as_str()) {
+        if value_options.contains(&argument.as_str()) {
             consumes_next = true;
             continue;
         }
-        if VALUE_OPTIONS.iter().any(|option| {
-            argument
-                .strip_prefix(option)
-                .is_some_and(|suffix| !suffix.is_empty())
+        if value_options.iter().any(|option| {
+            argument.strip_prefix(option).is_some_and(|suffix| {
+                !suffix.is_empty()
+                    && (option.len() == 2
+                        || suffix.starts_with('=')
+                        || suffix.starts_with(':')
+                        || suffix.starts_with(char::is_control))
+            })
         }) {
             continue;
         }
@@ -684,7 +753,7 @@ fn container_subcommand(args: &[String]) -> Option<(usize, &str)> {
 
 fn parsed_subcommand<'a>(binary: &str, args: &'a [String]) -> Option<(usize, &'a str)> {
     match binary_lookup_name(binary).as_str() {
-        "docker" | "podman" => container_subcommand(args),
+        "docker" | "podman" => container_subcommand(&binary_lookup_name(binary), args),
         _ => args
             .iter()
             .enumerate()
@@ -713,7 +782,7 @@ fn parse_binary_alias_option<'a>(
     args: &[String],
     option_index: usize,
     argument: &'a str,
-) -> Option<(ParsedOption<'a>, OptionValueKind)> {
+) -> Option<(ParsedOption<'a>, OptionValueKind, OptionArity)> {
     for alias in BINARY_OPTION_ALIASES {
         if !alias_context_matches(
             binary,
@@ -732,6 +801,7 @@ fn parse_binary_alias_option<'a>(
                         value_start: None,
                     },
                     alias.value_kind,
+                    alias.arity,
                 ));
             }
             let Some(suffix) = argument.strip_prefix(option) else {
@@ -749,6 +819,7 @@ fn parse_binary_alias_option<'a>(
                         value_start: Some(option.len()),
                     },
                     alias.value_kind,
+                    alias.arity,
                 ));
             }
         }
@@ -814,7 +885,7 @@ fn classify_command(binary: &str, args: &[String]) -> ClassifiedCommand {
         let parsed_alias = parse_binary_alias_option(binary, args, index, argument);
         let parsed_option = parsed_alias
             .as_ref()
-            .map(|(option, _)| ParsedOption {
+            .map(|(option, _, _)| ParsedOption {
                 name: option.name,
                 value_start: option.value_start,
             })
@@ -822,7 +893,7 @@ fn classify_command(binary: &str, args: &[String]) -> ClassifiedCommand {
         if let Some(option) = parsed_option {
             let value_kind = parsed_alias
                 .as_ref()
-                .map(|(_, value_kind)| *value_kind)
+                .map(|(_, value_kind, _)| *value_kind)
                 .or_else(|| {
                     strict_cli_secret_name(option.name).then_some(OptionValueKind::Credential)
                 });
@@ -854,7 +925,11 @@ fn classify_command(binary: &str, args: &[String]) -> ClassifiedCommand {
                         redacted_args.push(redact_suffix(argument, value_start));
                         continue;
                     }
-                } else if index + 1 < args.len() {
+                } else if parsed_alias
+                    .as_ref()
+                    .is_none_or(|(_, _, arity)| *arity == OptionArity::Required)
+                    && index + 1 < args.len()
+                {
                     pending_value_kind = Some(value_kind);
                 }
             }
@@ -883,6 +958,38 @@ fn classify_command(binary: &str, args: &[String]) -> ClassifiedCommand {
 /// and embedded control characters remain available to the classifier.
 pub fn command_contains_sensitive_literals(binary: &str, args: &[String]) -> bool {
     classify_command(binary, args).sensitive
+}
+
+/// Conservatively classify a legacy space-joined argv tail. Both shell-style
+/// and whitespace tokenization are checked because historical records did not
+/// retain enough information to recover authoritative argv boundaries.
+pub fn flattened_args_contain_sensitive_literals(binary: &str, flattened_args: &str) -> bool {
+    let whitespace = flattened_args
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if command_contains_sensitive_literals(binary, &whitespace) {
+        return true;
+    }
+    shell_words::split(flattened_args)
+        .ok()
+        .is_some_and(|args| command_contains_sensitive_literals(binary, &args))
+}
+
+/// Conservatively classify a legacy flattened command. This is for purging
+/// historical evidence only and never reconstructs matcher authority.
+pub fn flattened_command_contains_sensitive_literals(command: &str) -> bool {
+    fn classify(tokens: Vec<String>) -> bool {
+        tokens
+            .split_first()
+            .is_some_and(|(binary, args)| command_contains_sensitive_literals(binary, args))
+    }
+
+    let whitespace = command
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    classify(whitespace) || shell_words::split(command).ok().is_some_and(classify)
 }
 
 /// Redact one structured command without discarding executable or argv
@@ -1015,11 +1122,13 @@ mod tests {
                             .map(str::to_string)
                             .collect::<Vec<_>>();
                         let mut spellings = vec![
-                            vec![option.to_string(), credential.clone()],
                             vec![format!("{option}={credential}")],
                             vec![format!("{option}:{credential}")],
                             vec![format!("{option}\n{credential}")],
                         ];
+                        if alias.arity == OptionArity::Required {
+                            spellings.push(vec![option.to_string(), credential.clone()]);
+                        }
                         if option.len() == 2 {
                             spellings.push(vec![format!("{option}{credential}")]);
                         }
@@ -1078,9 +1187,119 @@ mod tests {
                     "registry.example".to_string(),
                 ],
             ),
+            (
+                "mysql",
+                vec!["-p".to_string(), "ordinary_database".to_string()],
+            ),
+            (
+                "mariadb",
+                vec!["--password".to_string(), "ordinary_database".to_string()],
+            ),
+            (
+                "mysqldump",
+                vec![
+                    "--skip-password".to_string(),
+                    "ordinary_database".to_string(),
+                ],
+            ),
         ] {
             assert!(!command_contains_sensitive_literals(binary, &args));
         }
+
+        for (binary, argument) in [
+            ("mysql", format!("-p{}", ["q", "7"].concat())),
+            ("mariadb.exe", format!("--password={}", ["q", "7"].concat())),
+            (
+                "mysqldump.com",
+                format!("--password:{}", ["q", "7"].concat()),
+            ),
+        ] {
+            assert!(command_contains_sensitive_literals(binary, &[argument]));
+        }
+    }
+
+    #[test]
+    fn container_global_value_options_preserve_login_subcommand() {
+        const DOCKER_OPTIONS: &[&str] = &[
+            "--config",
+            "-c",
+            "--context",
+            "-H",
+            "--host",
+            "-l",
+            "--log-level",
+            "--tlscacert",
+            "--tlscert",
+            "--tlskey",
+        ];
+        const PODMAN_OPTIONS: &[&str] = &[
+            "--cdi-spec-dir",
+            "--cgroup-manager",
+            "--config",
+            "--conmon",
+            "-c",
+            "--connection",
+            "--events-backend",
+            "--hooks-dir",
+            "--identity",
+            "--imagestore",
+            "--log-level",
+            "--module",
+            "--network-config-dir",
+            "--out",
+            "--root",
+            "--runroot",
+            "--runtime",
+            "--runtime-flag",
+            "--ssh",
+            "--storage-driver",
+            "--storage-opt",
+            "--tls-ca",
+            "--tls-cert",
+            "--tls-details",
+            "--tls-key",
+            "--tmpdir",
+            "--url",
+            "--volumepath",
+        ];
+
+        for (binary, options) in [("docker", DOCKER_OPTIONS), ("podman", PODMAN_OPTIONS)] {
+            for option in options {
+                let separate = vec![
+                    option.to_string(),
+                    "ordinary-setting".to_string(),
+                    "login".to_string(),
+                ];
+                assert_eq!(container_subcommand(binary, &separate), Some((2, "login")));
+
+                let attached = if option.len() == 2 {
+                    format!("{option}ordinary-setting")
+                } else {
+                    format!("{option}=ordinary-setting")
+                };
+                let attached_args = vec![attached, "login".to_string()];
+                assert_eq!(
+                    container_subcommand(binary, &attached_args),
+                    Some((1, "login"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_flattened_classification_is_conservative() {
+        let value = ["q", "7"].concat();
+        let split = format!("curl -u {value}");
+        let malformed = format!("curl --user='{value}");
+        assert!(flattened_command_contains_sensitive_literals(&split));
+        assert!(flattened_command_contains_sensitive_literals(&malformed));
+        assert!(flattened_args_contain_sensitive_literals(
+            "docker",
+            &format!("login -p {value}")
+        ));
+        assert!(!flattened_command_contains_sensitive_literals(
+            "ssh -p 2222 host"
+        ));
     }
 
     #[test]

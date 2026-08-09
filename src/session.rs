@@ -15,7 +15,7 @@ use crate::grant_profile::{EvaluationMode, GrantRequestDelta};
 use guard::env::now_unix;
 use guard::policy::{Decision, PolicyRule};
 use guard::principal::PrincipalKey;
-use guard::redact::{command_line, redact_output_text};
+use guard::redact::{command_contains_sensitive_literals, command_line, redact_output_text};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1509,6 +1509,9 @@ impl SessionRegistry {
         args: Vec<String>,
         cwd: Option<PathBuf>,
     ) -> Option<bool> {
+        if command_contains_sensitive_literals(&binary, &args) {
+            return None;
+        }
         if self
             .grants
             .get(token)

@@ -466,7 +466,8 @@ pub struct RenderedVerb {
     pub prompt_context: Option<String>,
     pub baseline: bool,
     pub credential_plan: Option<String>,
-    /// Validated params, recorded into the approval snapshot for the binding.
+    /// Validated params used while rendering and resolving coverage. Approval
+    /// snapshots bind the resulting immutable argv and do not persist values.
     pub params: BTreeMap<String, String>,
     /// Mirrors `Verb::auto_promoted` / `Verb::promotion_stamp`. The caller
     /// (`server::execute_command_inner`) downgrades `trusted` to `false` when
@@ -2350,6 +2351,9 @@ pub fn validate_auto_promoted_verb_safety(verb: &Verb, evidence: &[Vec<String>])
         );
     }
     validate_binary_not_shell(&verb.binary, "auto-promoted verb")?;
+    if command_contains_sensitive_literals(&verb.binary, &verb.args) {
+        bail!("an auto-promoted verb may not contain literal credential argv");
+    }
     for (pname, spec) in &verb.params {
         validate_param_not_overbroad(pname, spec, "auto-promoted verb")?;
     }
@@ -2359,6 +2363,9 @@ pub fn validate_auto_promoted_verb_safety(verb: &Verb, evidence: &[Vec<String>])
                 bail!("a recoverable verb may not be auto-promoted without a validated revert");
             };
             validate_binary_not_shell(&revert.binary, "auto-promoted verb revert")?;
+            if command_contains_sensitive_literals(&revert.binary, &revert.args) {
+                bail!("an auto-promoted verb revert may not contain literal credential argv");
+            }
         }
         Reversibility::Reversible => {}
         Reversibility::Irreversible => unreachable!("rejected above"),
@@ -2368,6 +2375,9 @@ pub fn validate_auto_promoted_verb_safety(verb: &Verb, evidence: &[Vec<String>])
     // caller-supplied template and params actually correspond to the
     // evidence they were derived from.
     for sample in evidence {
+        if command_contains_sensitive_literals(&verb.binary, sample) {
+            bail!("auto-promotion evidence may not contain literal credential argv");
+        }
         let rendered = render_args(&verb.args, &render_map_for(verb, sample)?, &verb.name)?;
         if &rendered != sample {
             bail!(
@@ -2404,6 +2414,24 @@ fn validate_verb(verb: &Verb) -> Result<()> {
     }
     if verb.credential_plan.as_deref().is_some_and(str::is_empty) {
         bail!("verb '{}' has an empty credential_plan", verb.name);
+    }
+    if verb.auto_promoted {
+        if command_contains_sensitive_literals(&verb.binary, &verb.args) {
+            bail!(
+                "auto-promoted verb '{}' contains literal credential argv",
+                verb.name
+            );
+        }
+        if verb
+            .revert
+            .as_ref()
+            .is_some_and(|revert| command_contains_sensitive_literals(&revert.binary, &revert.args))
+        {
+            bail!(
+                "auto-promoted verb '{}' revert contains literal credential argv",
+                verb.name
+            );
+        }
     }
     if !verb.coverage.is_empty() && verb.args.is_empty() && !verb.params.is_empty() {
         bail!(
@@ -4376,6 +4404,24 @@ verbs:
         assert!(error
             .to_string()
             .contains("may not authorize caller environment bindings"));
+    }
+
+    #[test]
+    fn auto_promoted_verb_rejects_literal_sensitive_authority() {
+        let value = ["q", "7"].concat();
+        let yaml = format!(
+            r#"
+verbs:
+  - name: generated-auth
+    binary: redis-cli
+    args: ["-a", "{value}"]
+    consequence: reversible
+    trusted: true
+    auto_promoted: true
+"#
+        );
+        let error = VerbCatalog::from_yaml(&yaml).unwrap_err();
+        assert!(error.to_string().contains("literal credential argv"));
     }
 
     #[test]
