@@ -8,7 +8,7 @@ use anyhow::bail;
 use anyhow::{Context, Result};
 use guard::audit::{AuditEvent, AuditKind};
 use guard::evaluate::Evaluator;
-use guard::gating::approval::{ApprovalRegistry, ApprovalStatus};
+use guard::gating::approval::{ApprovalRegistry, ApprovalStatus, WaiterLease};
 use guard::gating::provisional::{Provisional, ProvisionalRegistry, ProvisionalStatus};
 #[cfg(unix)]
 use guard::gating::read_grant::{GrantReadRegistry, ReadGrantStatus};
@@ -30,7 +30,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command;
 use tokio::sync::RwLock;
 
-use super::admin::handle_admin_request;
+use super::admin::handle_admin_request_owned;
 use super::execute::{execute_command, execute_command_streaming, record_live_session_interaction};
 #[cfg(unix)]
 use super::gate_runtime::revert_dir_is_owner_only;
@@ -40,7 +40,7 @@ use super::grants::{delete_read_grant_row, revoke_read_grant_acls};
 use super::runtime::NotifyEvent;
 use super::wire::{
     AdminRequest, AdminResponse, CallerIdentity, ExecOutcome, ExecuteRequest, ExecuteResponse,
-    ExecuteResult, ExecuteStreamMessage, IncomingMessage,
+    ExecuteResult, ExecuteStreamMessage, IncomingMessage, OwnedAdminResponse,
 };
 use super::{
     ServerConfig, ServerContext, ServerState, DEFAULT_CONFIRM_WITHIN_SECS, MAX_REQUEST_BYTES,
@@ -51,6 +51,181 @@ use crate::session::{SessionDecisionSource, SessionExecStatus, SessionInteractio
 #[derive(Clone)]
 struct DaemonApiSessionSink {
     server: ServerContext,
+}
+
+struct ReplyWaiterGuard(Option<WaiterLease>);
+
+impl ReplyWaiterGuard {
+    fn new(lease: Option<WaiterLease>) -> Self {
+        Self(lease)
+    }
+}
+
+impl Drop for ReplyWaiterGuard {
+    fn drop(&mut self) {
+        if let Some(mut lease) = self.0.take() {
+            lease.release_once();
+        }
+    }
+}
+
+async fn write_admin_response<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    owned: OwnedAdminResponse,
+) -> Result<()> {
+    let OwnedAdminResponse {
+        response,
+        waiter_lease,
+    } = owned;
+    let _reply_guard = ReplyWaiterGuard::new(waiter_lease);
+    let bytes = serde_json::to_vec(&response)?;
+    writer.write_all(&bytes).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod admin_response_lease_tests {
+    use super::*;
+    use guard::gating::approval::{Approval, ApprovalSnapshot};
+    use guard::gating::Reversibility;
+    use std::collections::BTreeMap;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    fn approval() -> Approval {
+        Approval {
+            handle: "lease-test".to_string(),
+            snapshot: ApprovalSnapshot {
+                binary: "true".to_string(),
+                args: Vec::new(),
+                cwd: None,
+                env: BTreeMap::new(),
+                secret_keys: BTreeMap::new(),
+                session_fingerprint: None,
+                session_revision: None,
+                secret_entitlements: None,
+                secret_file_keys: BTreeMap::new(),
+                verb_name: None,
+                verb_params: BTreeMap::new(),
+                catalog_version: None,
+                verb_digest: None,
+                access_verbs: Vec::new(),
+                access_requests: Vec::new(),
+                principal: None,
+                secret_binding: None,
+            },
+            reason: "test".to_string(),
+            risk: Some(8),
+            reversibility: Some(Reversibility::Irreversible),
+            decision_trace: None,
+            created_unix: 1,
+            ttl_secs: 3600,
+            status: ApprovalStatus::Pending,
+            decided_unix: None,
+            decided_reason: None,
+            result_exit: None,
+            result_stdout: None,
+            result_stderr: None,
+            notes: Vec::new(),
+        }
+    }
+
+    fn owned_response(registry: &mut ApprovalRegistry) -> OwnedAdminResponse {
+        registry.enqueue(approval());
+        let (_, lease) = registry
+            .register_waiter("lease-test")
+            .expect("waiter registered");
+        OwnedAdminResponse {
+            response: AdminResponse::Ok,
+            waiter_lease: Some(lease),
+        }
+    }
+
+    struct FailedWriter;
+
+    impl AsyncWrite for FailedWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "connection closed",
+            )))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct PendingWriter;
+
+    impl AsyncWrite for PendingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn response_lease_spans_serialization_and_successful_flush() {
+        let mut registry = ApprovalRegistry::new();
+        let owned = owned_response(&mut registry);
+        assert_eq!(registry.active_waiters("lease-test"), 1);
+        let (mut writer, mut reader) = tokio::io::duplex(128);
+
+        write_admin_response(&mut writer, owned).await.unwrap();
+        assert_eq!(registry.active_waiters("lease-test"), 0);
+        drop(writer);
+        let mut frame = String::new();
+        reader.read_to_string(&mut frame).await.unwrap();
+        assert!(matches!(
+            serde_json::from_str::<AdminResponse>(frame.trim()).unwrap(),
+            AdminResponse::Ok
+        ));
+    }
+
+    #[tokio::test]
+    async fn response_lease_releases_on_write_failure() {
+        let mut registry = ApprovalRegistry::new();
+        let owned = owned_response(&mut registry);
+        assert!(write_admin_response(&mut FailedWriter, owned)
+            .await
+            .is_err());
+        assert_eq!(registry.active_waiters("lease-test"), 0);
+    }
+
+    #[tokio::test]
+    async fn response_lease_releases_when_write_is_cancelled() {
+        let mut registry = ApprovalRegistry::new();
+        let owned = owned_response(&mut registry);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            write_admin_response(&mut PendingWriter, owned),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(registry.active_waiters("lease-test"), 0);
+    }
 }
 
 fn api_session_exec_status(allowed: bool, held: bool) -> SessionExecStatus {
@@ -655,6 +830,7 @@ impl Server {
                                 at_unix: now_unix(),
                                 handle: Some(handle.clone()),
                                 session_fingerprint: p.session_fingerprint.clone(),
+                                requester_principal: None,
                                 reason: Some(reason.clone()),
                                 status: Some("needs_operator_decision".to_string()),
                                 behavior: None,
@@ -1692,11 +1868,8 @@ where
                         caller.clone()
                     }
                 };
-                let resp = handle_admin_request(server, &caller, *admin).await;
-                writer
-                    .write_all(serde_json::to_string(&resp)?.as_bytes())
-                    .await?;
-                writer.write_all(b"\n").await?;
+                let owned = handle_admin_request_owned(server, &caller, *admin).await;
+                write_admin_response(&mut writer, owned).await?;
                 continue;
             }
             IncomingMessage::Execute {
@@ -2051,11 +2224,8 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, server: &ServerContext
                         token: admin_token.unwrap_or_else(|| "<missing>".to_string()),
                     }
                 };
-                let resp = handle_admin_request(server, &caller, *admin).await;
-                writer
-                    .write_all(serde_json::to_string(&resp)?.as_bytes())
-                    .await?;
-                writer.write_all(b"\n").await?;
+                let owned = handle_admin_request_owned(server, &caller, *admin).await;
+                write_admin_response(&mut writer, owned).await?;
                 continue;
             }
             IncomingMessage::Execute {

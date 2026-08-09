@@ -28,6 +28,8 @@ const APPROVAL_LIST_TOOL_NAME: &str = "guard_access_list";
 const EVALUATE_BATCH_TOOL_NAME: &str = "guard_evaluate_batch";
 const ACCESS_SHOW_TOOL_NAME: &str = "guard_access_show";
 const ACCESS_STATUS_TOOL_NAME: &str = "guard_access_status";
+const APPROVAL_SHOW_TOOL_NAME: &str = "guard_approval_show";
+const APPROVAL_RESUME_TOOL_NAME: &str = "guard_approval_resume";
 const BUILT_IN_TOOL_NAMES: &[&str] = &[
     DEFAULT_TOOL_NAME,
     VERB_LIST_TOOL_NAME,
@@ -36,6 +38,8 @@ const BUILT_IN_TOOL_NAMES: &[&str] = &[
     EVALUATE_BATCH_TOOL_NAME,
     ACCESS_SHOW_TOOL_NAME,
     ACCESS_STATUS_TOOL_NAME,
+    APPROVAL_SHOW_TOOL_NAME,
+    APPROVAL_RESUME_TOOL_NAME,
 ];
 const TOOL_SCHEMA_VERSION: u64 = 1;
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-03-26", "2024-11-05"];
@@ -47,6 +51,7 @@ const MAX_HTTP_BODY: usize = 1024 * 1024;
 const MAX_HTTP_SESSIONS: usize = 1024;
 const MAX_MCP_REQUEST_IDS: usize = 16 * 1024;
 const HTTP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const MCP_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 pub struct McpConfig {
@@ -67,6 +72,10 @@ impl McpConfig {
     pub fn validate(&self) -> Result<()> {
         if self.socket_path.is_none() && self.tcp_port.is_none() {
             bail!("no guard server configured for MCP (set a socket or TCP port)");
+        }
+
+        if self.socket_path.is_some() && self.tcp_port.is_some() {
+            bail!("configure exactly one MCP daemon endpoint (socket or TCP port)");
         }
 
         if self.tool_name.trim().is_empty() {
@@ -125,8 +134,8 @@ impl Default for McpConfig {
 // arguments) live in the library crate (`guard::wire::mcp`) so their parsing
 // surface can be fuzzed.
 use guard::wire::mcp::{
-    parse_jsonrpc_envelope, AccessShowArgs, EvaluateBatchArgs, GuardToolArgs, JsonRpcEnvelopeError,
-    ToolCallParams, WaitApproval,
+    parse_jsonrpc_envelope, AccessShowArgs, ApprovalArgs, EvaluateBatchArgs, GuardToolArgs,
+    JsonRpcEnvelopeError, ToolCallParams, WaitApproval,
 };
 
 #[derive(Debug, Clone)]
@@ -203,6 +212,10 @@ trait GuardExecutor: Send + Sync {
 #[async_trait]
 trait GuardAdmin: Send + Sync {
     async fn send_admin(&self, request: server::AdminRequest) -> Result<server::AdminResponse>;
+
+    async fn probe_endpoint(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -234,6 +247,10 @@ impl GuardAdmin for ClientExecutor {
             .send_admin(request)
             .await
             .context("failed to query guard daemon")
+    }
+
+    async fn probe_endpoint(&self) -> Result<()> {
+        daemon_client::probe_endpoint(self.socket_path.as_deref(), self.tcp_port).await
     }
 }
 
@@ -348,16 +365,22 @@ struct JsonRpcError {
 pub async fn serve(config: McpConfig) -> Result<()> {
     config.validate()?;
 
-    let expose_admin_tools = config.socket_path.is_some() && config.tcp_port.is_none();
     let executor = Arc::new(ClientExecutor {
         socket_path: config.socket_path.clone(),
         tcp_port: config.tcp_port,
         auth_token: config.auth_token.clone(),
         session_token: config.session_token.clone(),
     });
+    let surface = probe_mcp_surface(executor.as_ref(), &config).await;
     let server = McpServer::new(executor.clone(), executor, config.tool_name)
         .with_caller_token(config.session_token)
-        .with_admin_tools(expose_admin_tools);
+        .with_endpoint_available(surface.endpoint_available)
+        .with_admin_tools(surface.admin_tools)
+        .with_execute_admin_tools(surface.execute_admin_tools)
+        .with_approval_consequence_tools(surface.approval_consequence_tools)
+        .with_http_transport(config.http_addr.is_some())
+        .with_tcp_backend(config.tcp_port.is_some())
+        .with_diagnostics(surface.diagnostics);
 
     match config.http_addr {
         Some(addr) => {
@@ -368,6 +391,218 @@ pub async fn serve(config: McpConfig) -> Result<()> {
             serve_http(server, addr, token).await
         }
         None => serve_stdio(server).await,
+    }
+}
+
+const APPROVAL_CONSEQUENCES_CAPABILITY: &str = "approval-consequences-v1";
+
+#[derive(Clone)]
+struct McpSurface {
+    endpoint_available: bool,
+    admin_tools: bool,
+    execute_admin_tools: bool,
+    approval_consequence_tools: bool,
+    diagnostics: McpDiagnostics,
+}
+
+#[derive(Clone)]
+struct McpDiagnostics {
+    capability_membership: &'static str,
+    capability_state: &'static str,
+    detected_version: Option<String>,
+    detected_capabilities: Vec<String>,
+    endpoint_state: &'static str,
+    endpoint_reason: &'static str,
+    admin_state: &'static str,
+    admin_reason: &'static str,
+}
+
+impl McpDiagnostics {
+    fn record(&self) {
+        tracing::debug!(
+            capability_membership = self.capability_membership,
+            capability_state = self.capability_state,
+            detected_version = self.detected_version.as_deref().unwrap_or("null"),
+            detected_capabilities = ?self.detected_capabilities,
+            endpoint_state = self.endpoint_state,
+            endpoint_reason = self.endpoint_reason,
+            admin_state = self.admin_state,
+            admin_reason = self.admin_reason,
+            "cached MCP daemon probe"
+        );
+    }
+}
+
+async fn probe_mcp_surface<A: GuardAdmin>(executor: &A, config: &McpConfig) -> McpSurface {
+    let endpoint_malformed = config
+        .socket_path
+        .as_ref()
+        .is_some_and(|path| path.as_os_str().is_empty())
+        || config.tcp_port == Some(0);
+    if endpoint_malformed {
+        let diagnostics = McpDiagnostics {
+            capability_membership: "unknown",
+            capability_state: "not_observed",
+            detected_version: None,
+            detected_capabilities: Vec::new(),
+            endpoint_state: "malformed",
+            endpoint_reason: "sole_endpoint_malformed",
+            admin_state: "endpoint_unavailable",
+            admin_reason: "endpoint_unavailable",
+        };
+        diagnostics.record();
+        return McpSurface {
+            endpoint_available: false,
+            admin_tools: false,
+            execute_admin_tools: false,
+            approval_consequence_tools: false,
+            diagnostics,
+        };
+    }
+
+    if !matches!(
+        tokio::time::timeout(MCP_PROBE_TIMEOUT, executor.probe_endpoint()).await,
+        Ok(Ok(()))
+    ) {
+        let diagnostics = McpDiagnostics {
+            capability_membership: "unknown",
+            capability_state: "not_observed",
+            detected_version: None,
+            detected_capabilities: Vec::new(),
+            endpoint_state: "unavailable",
+            endpoint_reason: "sole_endpoint_unavailable",
+            admin_state: "endpoint_unavailable",
+            admin_reason: "endpoint_unavailable",
+        };
+        diagnostics.record();
+        return McpSurface {
+            endpoint_available: false,
+            admin_tools: false,
+            execute_admin_tools: false,
+            approval_consequence_tools: false,
+            diagnostics,
+        };
+    }
+
+    let ping = tokio::time::timeout(
+        MCP_PROBE_TIMEOUT,
+        executor.send_admin(server::AdminRequest::Ping),
+    )
+    .await;
+    let (capability, mut diagnostics) = match ping {
+        Ok(Ok(server::AdminResponse::Ping {
+            version,
+            capabilities,
+            ..
+        })) => {
+            let capability = capabilities
+                .iter()
+                .any(|value| value == APPROVAL_CONSEQUENCES_CAPABILITY);
+            (
+                capability,
+                McpDiagnostics {
+                    capability_membership: if capability { "member" } else { "absent" },
+                    capability_state: if capability {
+                        "capable"
+                    } else {
+                        "capability_absent"
+                    },
+                    detected_version: Some(version),
+                    detected_capabilities: capabilities,
+                    endpoint_state: "reachable",
+                    endpoint_reason: "endpoint_reachable",
+                    admin_state: "unsupported_tcp",
+                    admin_reason: "tcp_mcp_admin_unsupported",
+                },
+            )
+        }
+        Ok(Ok(_)) => (
+            false,
+            McpDiagnostics {
+                capability_membership: "unknown",
+                capability_state: "ping_malformed",
+                detected_version: Some("unknown".to_string()),
+                detected_capabilities: Vec::new(),
+                endpoint_state: "reachable",
+                endpoint_reason: "endpoint_reachable",
+                admin_state: "unsupported_tcp",
+                admin_reason: "tcp_mcp_admin_unsupported",
+            },
+        ),
+        Ok(Err(_)) => (
+            false,
+            McpDiagnostics {
+                capability_membership: "unknown",
+                capability_state: "ping_unavailable",
+                detected_version: None,
+                detected_capabilities: Vec::new(),
+                endpoint_state: "reachable",
+                endpoint_reason: "endpoint_reachable",
+                admin_state: "unsupported_tcp",
+                admin_reason: "tcp_mcp_admin_unsupported",
+            },
+        ),
+        Err(_) => (
+            false,
+            McpDiagnostics {
+                capability_membership: "unknown",
+                capability_state: "ping_unavailable",
+                detected_version: None,
+                detected_capabilities: Vec::new(),
+                endpoint_state: "reachable",
+                endpoint_reason: "endpoint_reachable",
+                admin_state: "unsupported_tcp",
+                admin_reason: "tcp_mcp_admin_unsupported",
+            },
+        ),
+    };
+
+    if config.tcp_port.is_some() {
+        diagnostics.record();
+        return McpSurface {
+            endpoint_available: true,
+            admin_tools: false,
+            execute_admin_tools: false,
+            approval_consequence_tools: false,
+            diagnostics,
+        };
+    }
+
+    let admin_probe = tokio::time::timeout(
+        MCP_PROBE_TIMEOUT,
+        executor.send_admin(server::AdminRequest::AccessList),
+    )
+    .await;
+    let admin_tools = matches!(
+        admin_probe,
+        Ok(Ok(server::AdminResponse::AccessItems { .. }))
+    );
+
+    diagnostics.admin_state = if admin_tools {
+        "reachable"
+    } else {
+        "endpoint_unavailable"
+    };
+    diagnostics.admin_reason = if admin_tools {
+        "unix_admin_handshake"
+    } else {
+        "unix_admin_probe_failed"
+    };
+    diagnostics.record();
+
+    McpSurface {
+        // A failed Unix self-scoped probe produces an empty surface even when
+        // the preceding Ping reached the socket. Keep the endpoint and admin
+        // failure indistinguishable to callers, as required by the MCP
+        // contract.
+        endpoint_available: admin_tools,
+        admin_tools,
+        // Resuming a hold executes an operator-approved snapshot. The daemon
+        // authenticates this MCP process's peer credentials, not the HTTP
+        // caller's bearer, so this remains stdio-only.
+        execute_admin_tools: admin_tools && config.http_addr.is_none() && capability,
+        approval_consequence_tools: admin_tools && capability,
+        diagnostics,
     }
 }
 
@@ -835,6 +1070,12 @@ struct McpServer<E: GuardExecutor, A: GuardAdmin> {
     admin: Arc<A>,
     tool_name: String,
     admin_tools: bool,
+    execute_admin_tools: bool,
+    approval_consequence_tools: bool,
+    endpoint_available: bool,
+    http_transport: bool,
+    tcp_backend: bool,
+    diagnostics: McpDiagnostics,
     initialize_seen: bool,
     seen_request_ids: HashSet<String>,
     caller_token: Option<String>,
@@ -847,6 +1088,21 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
             admin,
             tool_name,
             admin_tools: true,
+            execute_admin_tools: true,
+            approval_consequence_tools: true,
+            endpoint_available: true,
+            http_transport: false,
+            tcp_backend: false,
+            diagnostics: McpDiagnostics {
+                capability_membership: "member",
+                capability_state: "capable",
+                detected_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                detected_capabilities: vec![APPROVAL_CONSEQUENCES_CAPABILITY.to_string()],
+                endpoint_state: "reachable",
+                endpoint_reason: "endpoint_reachable",
+                admin_state: "reachable",
+                admin_reason: "unix_admin_handshake",
+            },
             initialize_seen: false,
             seen_request_ids: HashSet::new(),
             caller_token: None,
@@ -863,12 +1119,48 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
         self
     }
 
+    fn with_execute_admin_tools(mut self, execute_admin_tools: bool) -> Self {
+        self.execute_admin_tools = execute_admin_tools;
+        self
+    }
+
+    fn with_approval_consequence_tools(mut self, enabled: bool) -> Self {
+        self.approval_consequence_tools = enabled;
+        self
+    }
+
+    fn with_endpoint_available(mut self, available: bool) -> Self {
+        self.endpoint_available = available;
+        self
+    }
+
+    fn with_http_transport(mut self, http_transport: bool) -> Self {
+        self.http_transport = http_transport;
+        self
+    }
+
+    fn with_tcp_backend(mut self, tcp_backend: bool) -> Self {
+        self.tcp_backend = tcp_backend;
+        self
+    }
+
+    fn with_diagnostics(mut self, diagnostics: McpDiagnostics) -> Self {
+        self.diagnostics = diagnostics;
+        self
+    }
+
     fn fresh_connection(&self) -> Self {
         Self {
             executor: self.executor.clone(),
             admin: self.admin.clone(),
             tool_name: self.tool_name.clone(),
             admin_tools: self.admin_tools,
+            execute_admin_tools: self.execute_admin_tools,
+            approval_consequence_tools: self.approval_consequence_tools,
+            endpoint_available: self.endpoint_available,
+            http_transport: self.http_transport,
+            tcp_backend: self.tcp_backend,
+            diagnostics: self.diagnostics.clone(),
             initialize_seen: false,
             seen_request_ids: HashSet::new(),
             caller_token: self.caller_token.clone(),
@@ -962,7 +1254,7 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                         ));
                     }
                 };
-                if tool_call.name == self.tool_name {
+                if self.endpoint_available && tool_call.name == self.tool_name {
                     let result = self.call_tool(tool_call.arguments).await;
                     jsonrpc_result_response(id, result)
                 } else if self.admin_tools && tool_call.name == VERB_LIST_TOOL_NAME {
@@ -980,16 +1272,28 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                 } else if self.admin_tools && tool_call.name == ACCESS_SHOW_TOOL_NAME {
                     let result = self.call_access_show(tool_call.arguments).await;
                     jsonrpc_result_response(id, result)
-                } else if self.admin_tools && tool_call.name == ACCESS_STATUS_TOOL_NAME {
+                } else if self.admin_tools
+                    && !self.http_transport
+                    && tool_call.name == ACCESS_STATUS_TOOL_NAME
+                {
                     let result = self.call_session_status(tool_call.arguments).await;
                     jsonrpc_result_response(id, result)
+                } else if self.admin_tools
+                    && self.approval_consequence_tools
+                    && !self.http_transport
+                    && tool_call.name == APPROVAL_SHOW_TOOL_NAME
+                {
+                    let result = self.call_approval_show(tool_call.arguments).await;
+                    jsonrpc_result_response(id, result)
+                } else if self.execute_admin_tools
+                    && self.admin_tools
+                    && self.approval_consequence_tools
+                    && tool_call.name == APPROVAL_RESUME_TOOL_NAME
+                {
+                    let result = self.call_approval_resume(tool_call.arguments).await;
+                    jsonrpc_result_response(id, result)
                 } else {
-                    jsonrpc_error_response(
-                        id,
-                        -32601,
-                        format!("unknown tool '{}'", tool_call.name),
-                        None,
-                    )
+                    self.unavailable_tool_response(id, &tool_call.name)
                 }
             }
             _ => jsonrpc_error_response(id, -32601, format!("method not found: {method}"), None),
@@ -1002,6 +1306,84 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
         if method == "notifications/initialized" && !self.initialize_seen {
             tracing::warn!("received initialized notification before initialize request");
         }
+    }
+
+    fn unavailable_tool_response(&self, id: Value, tool_name: &str) -> Value {
+        let (code, diagnostic, fallback) = if !self.endpoint_available {
+            let diagnostic = if self.diagnostics.endpoint_state == "reachable"
+                && self.diagnostics.admin_state == "endpoint_unavailable"
+                && self.diagnostics.admin_reason == "unix_admin_probe_failed"
+            {
+                "unix_admin_probe_failed"
+            } else {
+                "endpoint_unavailable"
+            };
+            (
+                "endpoint_unavailable",
+                diagnostic,
+                json!({
+                    "mode": "cli_only",
+                    "limitations": ["no MCP tools"]
+                }),
+            )
+        } else if self.tcp_backend && !self.admin_tools && tool_name != self.tool_name {
+            (
+                "feature_unavailable",
+                self.diagnostics.admin_reason,
+                json!({
+                    "mode": "cli_only",
+                    "command": "guard approval show <handle>",
+                    "limitations": ["no MCP status tool", "no MCP transcript", "no MCP wait", "no MCP resume"]
+                }),
+            )
+        } else if self.http_transport
+            && matches!(
+                tool_name,
+                ACCESS_STATUS_TOOL_NAME | APPROVAL_SHOW_TOOL_NAME | APPROVAL_RESUME_TOOL_NAME
+            )
+        {
+            (
+                "feature_unavailable",
+                "tool_not_available_for_transport",
+                json!({
+                    "mode": "cli_only",
+                    "limitations": ["no MCP status tool", "no MCP transcript", "no MCP resume"]
+                }),
+            )
+        } else if matches!(
+            tool_name,
+            APPROVAL_SHOW_TOOL_NAME | APPROVAL_RESUME_TOOL_NAME
+        ) && !self.approval_consequence_tools
+        {
+            (
+                "feature_unavailable",
+                self.diagnostics.capability_state,
+                json!({
+                    "mode": "cli_only",
+                    "command": "guard approval show <handle>",
+                    "limitations": ["no MCP wait", "no MCP resume"]
+                }),
+            )
+        } else {
+            (
+                "feature_unavailable",
+                "tool_not_available_for_transport",
+                json!({
+                    "mode": "cli_only",
+                    "limitations": ["tool is not listed on this MCP surface"]
+                }),
+            )
+        };
+        jsonrpc_error_response(
+            id,
+            -32601,
+            "requested MCP tool is unavailable".to_string(),
+            Some(json!({
+                "code": code,
+                "diagnostic": diagnostic,
+                "fallback": fallback,
+            })),
+        )
     }
 
     fn initialize_result(&self, params: &Value) -> Value {
@@ -1032,6 +1414,9 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
     }
 
     fn list_tools_result(&self) -> Value {
+        if !self.endpoint_available {
+            return json!({ "tools": [] });
+        }
         let containment_failure_schema = json!({
             "type": ["object", "null"],
             "description": "Typed failure detail when containment could not truthfully report an armed timer.",
@@ -1047,7 +1432,7 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                 {
                     "name": self.tool_name,
                     "title": "Run Command Through Guard",
-                    "description": "Execute a command through the guard daemon. Provide binary (with optional args) for a raw command, or verb for a catalog verb invocation; one of the two is required. The command is evaluated against security policy before execution. Plain environment overrides and named secret references are optional; secret values are resolved by the daemon and never exposed to the client.",
+                    "description": "Execute a command through the guard daemon. Provide binary (with optional args) for a raw command, or verb for a catalog verb invocation; one of the two is required. The command is evaluated against security policy before execution. Plain environment overrides and named secret references are optional; secret values are resolved by the daemon and never exposed to the client. Branch on `status`, not on `allowed`: `held` and `provisional` are both `allowed: true` because the request was authorized, and `held` means it has not executed. A held command waits for an operator; retrieve its outcome with guard_approval_show.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -1370,11 +1755,29 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                 json!("auto_revert_durable"),
                 json!("containment_failure"),
             ]);
+        let tools = result["tools"]
+            .as_array_mut()
+            .expect("tools result is an array");
+        tools.push(approval_show_tool());
+        tools.push(approval_resume_tool());
         if !self.admin_tools {
-            result["tools"]
-                .as_array_mut()
-                .expect("tools result is an array")
-                .truncate(1);
+            tools.truncate(1);
+        } else {
+            if !self.approval_consequence_tools {
+                tools.retain(|tool| {
+                    tool["name"] != APPROVAL_SHOW_TOOL_NAME
+                        && tool["name"] != APPROVAL_RESUME_TOOL_NAME
+                });
+            }
+            if !self.execute_admin_tools || self.http_transport {
+                tools.retain(|tool| tool["name"] != APPROVAL_RESUME_TOOL_NAME);
+            }
+            if self.http_transport {
+                tools.retain(|tool| {
+                    tool["name"] != ACCESS_STATUS_TOOL_NAME
+                        && tool["name"] != APPROVAL_SHOW_TOOL_NAME
+                });
+            }
         }
         result
     }
@@ -1526,6 +1929,93 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
         }
     }
 
+    /// Proxy `ApprovalShow`, or `ApprovalWait` when the caller asked to block.
+    /// This is the path by which an agent retrieves the outcome of a command it
+    /// did not hold a connection open for. The daemon scopes it to the hold's
+    /// owner (or the operator) and returns the same not-found for anyone else,
+    /// so this tool grants no read authority the caller did not already have.
+    async fn call_approval_show(&self, arguments: Value) -> Value {
+        let args: ApprovalArgs = match serde_json::from_value(arguments) {
+            Ok(args) => args,
+            Err(error) => return tool_error_result(format!("invalid tool arguments: {error}")),
+        };
+        let request = match args.wait {
+            Some(timeout_secs) => server::AdminRequest::ApprovalWait {
+                handle: args.reference,
+                timeout_secs,
+            },
+            None => server::AdminRequest::ApprovalShow {
+                handle: args.reference,
+            },
+        };
+        match self.admin.send_admin(request).await {
+            Ok(server::AdminResponse::ApprovalShow { item }) => admin_tool_result(
+                "approval_show",
+                render_approval_text(&item),
+                json!({ "item": item }),
+            ),
+            Ok(server::AdminResponse::ApprovalWait { wait }) => {
+                let text = format!(
+                    "{}\nwait outcome: {}",
+                    render_approval_text(&wait.item),
+                    wait.outcome
+                );
+                admin_tool_result(
+                    "approval_show",
+                    text,
+                    json!({ "item": wait.item, "outcome": wait.outcome }),
+                )
+            }
+            Ok(server::AdminResponse::Error { message }) => tool_error_result(message),
+            Ok(_) => tool_error_result("unexpected response from guard daemon".to_string()),
+            Err(error) => tool_error_result(format!("{error:#}")),
+        }
+    }
+
+    /// Proxy `AdminRequest::Resume`. This is an execute verb, exposed only over
+    /// stdio; see `expose_execute_admin_tools`.
+    async fn call_approval_resume(&self, arguments: Value) -> Value {
+        let args: AccessShowArgs = match serde_json::from_value(arguments) {
+            Ok(args) => args,
+            Err(error) => return tool_error_result(format!("invalid tool arguments: {error}")),
+        };
+        match self
+            .admin
+            .send_admin(server::AdminRequest::Resume {
+                handle: args.reference,
+            })
+            .await
+        {
+            Ok(server::AdminResponse::GateAction {
+                message,
+                exit_code,
+                stdout,
+                stderr,
+            }) => {
+                let text = format!(
+                    "{message}\n{}{}",
+                    stdout.as_deref().unwrap_or_default(),
+                    stderr.as_deref().unwrap_or_default()
+                );
+                admin_tool_result(
+                    "approval_resume",
+                    text,
+                    json!({
+                        "result": {
+                            "message": message,
+                            "exit_code": exit_code,
+                            "stdout": stdout,
+                            "stderr": stderr,
+                        }
+                    }),
+                )
+            }
+            Ok(server::AdminResponse::Error { message }) => tool_error_result(message),
+            Ok(_) => tool_error_result("unexpected response from guard daemon".to_string()),
+            Err(error) => tool_error_result(format!("{error:#}")),
+        }
+    }
+
     async fn call_session_status(&self, arguments: Value) -> Value {
         let args: AccessShowArgs = match serde_json::from_value(arguments) {
             Ok(args) => args,
@@ -1590,6 +2080,91 @@ fn render_verbs_text(items: &[server::VerbSummary]) -> String {
     lines.join("\n")
 }
 
+/// The read tool by which an agent retrieves its own held command's outcome.
+fn approval_show_tool() -> Value {
+    json!({
+        "name": APPROVAL_SHOW_TOOL_NAME,
+        "title": "Show a Held Command",
+        "description": "Show one held command owned by the caller, including its persisted transcript and exit code once it has run. With `wait`, block until an operator arms it or it reaches a terminal state, up to that many seconds. Read-only: it never approves and never executes. `status` is `pending` while it awaits a decision, `armed` once an operator approved it and it is waiting to be resumed, and a terminal value once it is finished.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "reference": { "type": "string" },
+                "wait": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional: seconds to block for the hold to be armed or decided. Omit to read the current state and return immediately."
+                }
+            },
+            "required": ["reference"]
+        },
+        "outputSchema": admin_output_schema("approval_show", "item", json!({ "type": "object" })),
+        "annotations": {
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false
+        }
+    })
+}
+
+/// The execute verb for an armed hold. Listed only over stdio.
+fn approval_resume_tool() -> Value {
+    json!({
+        "name": APPROVAL_RESUME_TOOL_NAME,
+        "title": "Resume an Armed Held Command",
+        "description": "Run one held command that an operator armed, as its original requester. The daemon accepts a single durable execution claim, so a hold runs at most once. Use guard_approval_show first to confirm the hold is armed.",
+        "inputSchema": {
+            "type": "object",
+            "properties": { "reference": { "type": "string" } },
+            "required": ["reference"]
+        },
+        "outputSchema": admin_output_schema("approval_resume", "result", json!({ "type": "object" })),
+        "annotations": {
+            "readOnlyHint": false,
+            "destructiveHint": true,
+            "idempotentHint": false,
+            "openWorldHint": true
+        }
+    })
+}
+
+/// One held command as text an agent can act on. `status` is the field to
+/// branch on; the transcript is present once the hold has run.
+fn render_approval_text(item: &server::ApprovalSummary) -> String {
+    let mut line = format!(
+        "{} status={} command={} deadline={}",
+        item.handle, item.status, item.command, item.deadline_unix
+    );
+    if let Some(reason) = item.decided_reason.as_deref() {
+        line.push_str(&format!("\nreason: {reason}"));
+    }
+    match item.status.as_str() {
+        "pending" => line.push_str("\nno operator decision yet; nothing has executed"),
+        "armed" => line.push_str(&format!(
+            "\napproved and armed; run it with guard_approval_resume {}",
+            item.handle
+        )),
+        _ => {}
+    }
+    if let Some(exit_code) = item.exit_code {
+        line.push_str(&format!("\nexit_code: {exit_code}"));
+    }
+    if let Some(stdout) = item.stdout.as_deref() {
+        line.push_str(&format!("\nstdout:\n{stdout}"));
+        if item.stdout_truncated {
+            line.push_str("\n[guard stdout transcript truncated]");
+        }
+    }
+    if let Some(stderr) = item.stderr.as_deref() {
+        line.push_str(&format!("\nstderr:\n{stderr}"));
+        if item.stderr_truncated {
+            line.push_str("\n[guard stderr transcript truncated]");
+        }
+    }
+    line
+}
+
 fn render_access_text(items: &[server::AccessItem]) -> String {
     if items.is_empty() {
         return "(no access requests or sessions)".to_string();
@@ -1597,9 +2172,25 @@ fn render_access_text(items: &[server::AccessItem]) -> String {
     items
         .iter()
         .map(|item| {
+            let uses = match item.use_policy.as_str() {
+                "bounded" => format!(
+                    " uses={}",
+                    item.remaining_uses
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "0".to_string())
+                ),
+                other => format!(" uses={other}"),
+            };
+            let consequence = if item.consequence.is_empty() {
+                if item.reference.starts_with("gr-") { "grant" } else { "arm" }
+            } else {
+                item.consequence.as_str()
+            };
             let mut line = format!(
-                "{} requester={} target={} scope={} expiry={} uses={} state={} next={}",
+                "{} kind={} consequence={} requester={} target={} scope={} expiry={}{} state={} next={}",
                 item.reference,
+                item.kind,
+                consequence,
                 item.requester,
                 item.target,
                 if item.effective_scope.is_empty() {
@@ -1610,13 +2201,7 @@ fn render_access_text(items: &[server::AccessItem]) -> String {
                 item.expires_unix
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "none".to_string()),
-                match item.use_policy.as_str() {
-                    "bounded" => item
-                        .remaining_uses
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "0".to_string()),
-                    other => other.to_string(),
-                },
+                uses,
                 item.state,
                 item.next_action
             );
@@ -2077,6 +2662,7 @@ mod tests {
     use super::*;
     use anyhow::anyhow;
     use guard::wire::mcp::McpSshHostKeyMode;
+    use std::collections::VecDeque;
     use tokio::io::{AsyncRead, AsyncReadExt};
     use tokio::net::TcpStream;
 
@@ -2115,6 +2701,418 @@ mod tests {
         Arc::new(FakeAdmin {
             response: server::AdminResponse::Ok,
         })
+    }
+
+    enum ScriptedReply {
+        Response(Box<server::AdminResponse>),
+        Failure,
+    }
+
+    #[derive(Clone)]
+    struct ScriptedAdmin {
+        replies: Arc<std::sync::Mutex<VecDeque<ScriptedReply>>>,
+        requests: Arc<std::sync::Mutex<Vec<server::AdminRequest>>>,
+        endpoint_probes: Arc<std::sync::Mutex<usize>>,
+        endpoint_reachable: bool,
+    }
+
+    impl ScriptedAdmin {
+        fn new(replies: Vec<ScriptedReply>) -> Self {
+            Self {
+                replies: Arc::new(std::sync::Mutex::new(replies.into())),
+                requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+                endpoint_probes: Arc::new(std::sync::Mutex::new(0)),
+                endpoint_reachable: true,
+            }
+        }
+
+        fn unreachable() -> Self {
+            Self {
+                endpoint_reachable: false,
+                ..Self::new(Vec::new())
+            }
+        }
+    }
+
+    #[async_trait]
+    impl GuardAdmin for ScriptedAdmin {
+        async fn send_admin(&self, request: server::AdminRequest) -> Result<server::AdminResponse> {
+            self.requests.lock().unwrap().push(request);
+            match self.replies.lock().unwrap().pop_front() {
+                Some(ScriptedReply::Response(response)) => Ok(*response),
+                Some(ScriptedReply::Failure) => Err(anyhow!("probe failed")),
+                None => panic!("unexpected probe request"),
+            }
+        }
+
+        async fn probe_endpoint(&self) -> Result<()> {
+            *self.endpoint_probes.lock().unwrap() += 1;
+            if self.endpoint_reachable {
+                Ok(())
+            } else {
+                Err(anyhow!("endpoint unavailable"))
+            }
+        }
+    }
+
+    fn ping(capable: bool) -> server::AdminResponse {
+        server::AdminResponse::Ping {
+            version: "0.7.1".to_string(),
+            uptime_secs: 1,
+            mode: "enforce".to_string(),
+            dry_run: false,
+            capabilities: capable
+                .then(|| APPROVAL_CONSEQUENCES_CAPABILITY.to_string())
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    fn probe_config(tcp: bool, http: bool) -> McpConfig {
+        McpConfig {
+            socket_path: (!tcp).then(|| PathBuf::from("/run/guard/guard.sock")),
+            tcp_port: tcp.then_some(9555),
+            http_addr: http.then(|| "127.0.0.1:9556".parse().unwrap()),
+            http_token: http.then(|| "fixture-token".to_string()),
+            ..McpConfig::default()
+        }
+    }
+
+    fn server_for_surface(
+        surface: McpSurface,
+        http: bool,
+        tcp: bool,
+    ) -> McpServer<FakeExecutor, FakeAdmin> {
+        let executor = Arc::new(FakeExecutor {
+            response: Err("unused".to_string()),
+        });
+        McpServer::new(executor, empty_admin(), DEFAULT_TOOL_NAME.to_string())
+            .with_endpoint_available(surface.endpoint_available)
+            .with_admin_tools(surface.admin_tools)
+            .with_execute_admin_tools(surface.execute_admin_tools)
+            .with_approval_consequence_tools(surface.approval_consequence_tools)
+            .with_http_transport(http)
+            .with_tcp_backend(tcp)
+            .with_diagnostics(surface.diagnostics)
+    }
+
+    fn listed_names(surface: McpSurface, http: bool, tcp: bool) -> Vec<String> {
+        let server = server_for_surface(surface, http, tcp);
+        server.list_tools_result()["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum PingCase {
+        Capable,
+        Absent,
+        Unavailable,
+        Malformed,
+    }
+
+    impl PingCase {
+        fn reply(self) -> ScriptedReply {
+            match self {
+                Self::Capable => ScriptedReply::Response(Box::new(ping(true))),
+                Self::Absent => ScriptedReply::Response(Box::new(ping(false))),
+                Self::Unavailable => ScriptedReply::Failure,
+                Self::Malformed => ScriptedReply::Response(Box::new(server::AdminResponse::Ok)),
+            }
+        }
+
+        fn capability_state(self) -> &'static str {
+            match self {
+                Self::Capable => "capable",
+                Self::Absent => "capability_absent",
+                Self::Unavailable => "ping_unavailable",
+                Self::Malformed => "ping_malformed",
+            }
+        }
+    }
+
+    fn baseline_names(http: bool) -> Vec<String> {
+        let mut names = vec![
+            DEFAULT_TOOL_NAME,
+            VERB_LIST_TOOL_NAME,
+            ACCESS_REQUEST_TOOL_NAME,
+            APPROVAL_LIST_TOOL_NAME,
+            EVALUATE_BATCH_TOOL_NAME,
+            ACCESS_SHOW_TOOL_NAME,
+        ];
+        if !http {
+            names.push(ACCESS_STATUS_TOOL_NAME);
+        }
+        names.into_iter().map(str::to_string).collect()
+    }
+
+    fn assert_unavailable(
+        surface: McpSurface,
+        http: bool,
+        tcp: bool,
+        tool_name: &str,
+        code: &str,
+        diagnostic: &str,
+    ) {
+        let server = server_for_surface(surface, http, tcp);
+        let response = server.unavailable_tool_response(json!(1), tool_name);
+        assert_eq!(response["error"]["data"]["code"], code);
+        assert_eq!(response["error"]["data"]["diagnostic"], diagnostic);
+    }
+
+    fn approval_summary(status: &str) -> server::ApprovalSummary {
+        server::ApprovalSummary {
+            handle: "approval-example".to_string(),
+            status: status.to_string(),
+            command: "approved-command".to_string(),
+            reason: "operator review".to_string(),
+            risk: None,
+            reversibility: None,
+            fingerprint: "fingerprint".to_string(),
+            created_unix: 1,
+            deadline_unix: 2,
+            principal: Some("1001".to_string()),
+            exit_code: None,
+            stdout: None,
+            stderr: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
+            decided_reason: None,
+            notes: Vec::new(),
+            decision_trace: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn stdio_approval_show_wait_renders_armed_terminal_and_timeout_outcomes() {
+        for (status, outcome) in [
+            ("armed", "armed"),
+            ("approved", "approved"),
+            ("pending", "timed_out"),
+        ] {
+            let admin = Arc::new(FakeAdmin {
+                response: server::AdminResponse::ApprovalWait {
+                    wait: serde_json::from_value(json!({
+                        "item": approval_summary(status),
+                        "outcome": outcome,
+                    }))
+                    .unwrap(),
+                },
+            });
+            let server = McpServer::new(
+                Arc::new(FakeExecutor {
+                    response: Err("unused".to_string()),
+                }),
+                admin,
+                DEFAULT_TOOL_NAME.to_string(),
+            );
+            let result = server
+                .call_approval_show(json!({"reference": "approval-example", "wait": 30}))
+                .await;
+            assert_eq!(result["structuredContent"]["item"]["status"], status);
+            assert_eq!(result["structuredContent"]["outcome"], outcome);
+            assert!(result["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains(&format!("wait outcome: {outcome}"))));
+        }
+    }
+
+    #[tokio::test]
+    async fn unix_probe_matrix_keeps_reachable_baseline_independent_of_ping() {
+        for ping_case in [
+            PingCase::Capable,
+            PingCase::Absent,
+            PingCase::Unavailable,
+            PingCase::Malformed,
+        ] {
+            for http in [false, true] {
+                let admin = ScriptedAdmin::new(vec![
+                    ping_case.reply(),
+                    ScriptedReply::Response(Box::new(server::AdminResponse::AccessItems {
+                        items: Vec::new(),
+                    })),
+                ]);
+                let surface = probe_mcp_surface(&admin, &probe_config(false, http)).await;
+                assert_eq!(surface.diagnostics.endpoint_state, "reachable");
+                assert_eq!(
+                    surface.diagnostics.capability_state,
+                    ping_case.capability_state()
+                );
+                assert_eq!(surface.diagnostics.admin_state, "reachable");
+                let mut expected = baseline_names(http);
+                if matches!(ping_case, PingCase::Capable) && !http {
+                    expected.extend([
+                        APPROVAL_SHOW_TOOL_NAME.to_string(),
+                        APPROVAL_RESUME_TOOL_NAME.to_string(),
+                    ]);
+                }
+                assert_eq!(listed_names(surface.clone(), http, false), expected);
+                for tool in [APPROVAL_SHOW_TOOL_NAME, APPROVAL_RESUME_TOOL_NAME] {
+                    if http {
+                        assert_unavailable(
+                            surface.clone(),
+                            http,
+                            false,
+                            tool,
+                            "feature_unavailable",
+                            "tool_not_available_for_transport",
+                        );
+                    } else if !matches!(ping_case, PingCase::Capable) {
+                        assert_unavailable(
+                            surface.clone(),
+                            http,
+                            false,
+                            tool,
+                            "feature_unavailable",
+                            ping_case.capability_state(),
+                        );
+                    }
+                }
+                if http {
+                    assert_unavailable(
+                        surface,
+                        http,
+                        false,
+                        ACCESS_STATUS_TOOL_NAME,
+                        "feature_unavailable",
+                        "tool_not_available_for_transport",
+                    );
+                }
+                let requests = admin.requests.lock().unwrap();
+                assert!(matches!(
+                    requests.as_slice(),
+                    [server::AdminRequest::Ping, server::AdminRequest::AccessList]
+                ));
+                assert_eq!(*admin.endpoint_probes.lock().unwrap(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_probe_matrix_lists_only_guard_run_and_rejects_admin_tools() {
+        for ping_case in [
+            PingCase::Capable,
+            PingCase::Absent,
+            PingCase::Unavailable,
+            PingCase::Malformed,
+        ] {
+            for http in [false, true] {
+                let admin = ScriptedAdmin::new(vec![ping_case.reply()]);
+                let surface = probe_mcp_surface(&admin, &probe_config(true, http)).await;
+                assert_eq!(surface.diagnostics.endpoint_state, "reachable");
+                assert_eq!(
+                    surface.diagnostics.capability_state,
+                    ping_case.capability_state()
+                );
+                assert_eq!(
+                    listed_names(surface.clone(), http, true),
+                    [DEFAULT_TOOL_NAME]
+                );
+                for tool in [
+                    VERB_LIST_TOOL_NAME,
+                    ACCESS_REQUEST_TOOL_NAME,
+                    APPROVAL_LIST_TOOL_NAME,
+                    EVALUATE_BATCH_TOOL_NAME,
+                    ACCESS_SHOW_TOOL_NAME,
+                    ACCESS_STATUS_TOOL_NAME,
+                    APPROVAL_SHOW_TOOL_NAME,
+                    APPROVAL_RESUME_TOOL_NAME,
+                ] {
+                    assert_unavailable(
+                        surface.clone(),
+                        http,
+                        true,
+                        tool,
+                        "feature_unavailable",
+                        "tcp_mcp_admin_unsupported",
+                    );
+                }
+                assert!(matches!(
+                    admin.requests.lock().unwrap().as_slice(),
+                    [server::AdminRequest::Ping]
+                ));
+                assert_eq!(*admin.endpoint_probes.lock().unwrap(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_unix_admin_probe_has_an_empty_surface_for_every_ping_state() {
+        for ping_case in [
+            PingCase::Capable,
+            PingCase::Absent,
+            PingCase::Unavailable,
+            PingCase::Malformed,
+        ] {
+            for http in [false, true] {
+                let admin = ScriptedAdmin::new(vec![ping_case.reply(), ScriptedReply::Failure]);
+                let surface = probe_mcp_surface(&admin, &probe_config(false, http)).await;
+                assert_eq!(surface.diagnostics.endpoint_state, "reachable");
+                assert_eq!(surface.diagnostics.admin_reason, "unix_admin_probe_failed");
+                assert!(listed_names(surface.clone(), http, false).is_empty());
+                for tool in BUILT_IN_TOOL_NAMES {
+                    assert_unavailable(
+                        surface.clone(),
+                        http,
+                        false,
+                        tool,
+                        "endpoint_unavailable",
+                        "unix_admin_probe_failed",
+                    );
+                }
+                assert!(matches!(
+                    admin.requests.lock().unwrap().as_slice(),
+                    [server::AdminRequest::Ping, server::AdminRequest::AccessList]
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_and_malformed_sole_endpoints_never_send_admin_rpcs() {
+        for tcp in [false, true] {
+            for http in [false, true] {
+                let admin = ScriptedAdmin::unreachable();
+                let surface = probe_mcp_surface(&admin, &probe_config(tcp, http)).await;
+                assert!(listed_names(surface.clone(), http, tcp).is_empty());
+                assert_unavailable(
+                    surface,
+                    http,
+                    tcp,
+                    DEFAULT_TOOL_NAME,
+                    "endpoint_unavailable",
+                    "endpoint_unavailable",
+                );
+                assert!(admin.requests.lock().unwrap().is_empty());
+                assert_eq!(*admin.endpoint_probes.lock().unwrap(), 1);
+
+                let mut config = probe_config(tcp, http);
+                if tcp {
+                    config.tcp_port = Some(0);
+                } else {
+                    config.socket_path = Some(PathBuf::new());
+                }
+                let malformed = ScriptedAdmin::new(Vec::new());
+                let surface = probe_mcp_surface(&malformed, &config).await;
+                assert_eq!(surface.diagnostics.endpoint_state, "malformed");
+                assert!(listed_names(surface.clone(), http, tcp).is_empty());
+                for tool in BUILT_IN_TOOL_NAMES {
+                    assert_unavailable(
+                        surface.clone(),
+                        http,
+                        tcp,
+                        tool,
+                        "endpoint_unavailable",
+                        "endpoint_unavailable",
+                    );
+                }
+                assert!(malformed.requests.lock().unwrap().is_empty());
+                assert_eq!(*malformed.endpoint_probes.lock().unwrap(), 0);
+            }
+        }
     }
 
     #[test]
@@ -3174,6 +4172,8 @@ mod tests {
                 EVALUATE_BATCH_TOOL_NAME,
                 ACCESS_SHOW_TOOL_NAME,
                 ACCESS_STATUS_TOOL_NAME,
+                APPROVAL_SHOW_TOOL_NAME,
+                APPROVAL_RESUME_TOOL_NAME,
             ]
         );
         let access_request = &response["result"]["tools"][2];

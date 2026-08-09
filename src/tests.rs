@@ -728,6 +728,7 @@ fn resume_and_verb_amend_parse_their_requester_and_cas_inputs() {
             handle,
             socket,
             json,
+            ..
         }) => {
             assert_eq!(handle, "0123456789abcdef");
             assert_eq!(socket.as_deref(), Some("/run/guard.sock"));

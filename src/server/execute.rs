@@ -743,6 +743,7 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
                         at_unix: guard::env::now_unix(),
                         handle: Some(request.handle.clone()),
                         session_fingerprint: Some(audit_session_fingerprint(Some(token))),
+                        requester_principal: None,
                         reason: Some(
                             "session command denied; grant expansion requested".to_string(),
                         ),
@@ -2094,6 +2095,7 @@ pub(super) async fn record_live_session_interaction(
             at_unix: guard::env::now_unix(),
             handle: None,
             session_fingerprint: Some(audit_session_fingerprint(Some(token))),
+            requester_principal: None,
             reason: behavior
                 .get("suspension_reason")
                 .and_then(serde_json::Value::as_str)

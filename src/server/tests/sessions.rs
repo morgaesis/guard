@@ -1,7 +1,7 @@
 use crate::grant_profile::{EvaluationMode, GrantRequestStatus, SavedGrantCatalog};
 use crate::server::admin::{
-    handle_admin_request, prune_grant_requests, validate_durable_access_provenance,
-    MAX_GRANT_REQUESTS,
+    handle_admin_request_for_test, handle_admin_request_owned, prune_grant_requests,
+    validate_durable_access_provenance, MAX_GRANT_REQUESTS,
 };
 use crate::server::execute::{
     admit_access_use, evaluation_cache_scope, execute_command, session_source_from_eval,
@@ -80,7 +80,7 @@ async fn synthesized_verbs_default_to_session_scope() {
         uid: cfg.config.daemon_uid,
     };
 
-    let response = handle_admin_request(
+    let response = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::VerbCreate {
@@ -122,7 +122,7 @@ async fn approved_synthesized_access_executes_deterministically_without_catalog_
     let initial_catalog_version = cfg.state.verbs.read().await.version();
     let worker = CallerIdentity::Unix { uid: 1001 };
     let daemon = CallerIdentity::UnixAdmin { uid: 777 };
-    let AdminResponse::AccessItem { item } = handle_admin_request(
+    let AdminResponse::AccessItem { item } = handle_admin_request_for_test(
         &cfg,
         &worker,
         AdminRequest::AccessRequest {
@@ -144,12 +144,39 @@ async fn approved_synthesized_access_executes_deterministically_without_catalog_
             == 1
     );
 
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let grant_reference = item.reference.clone();
+    let grant_target = item.target.clone();
+    let refused = handle_admin_request_owned(
+        &cfg,
+        &daemon,
+        AdminRequest::AccessApprove {
+            handles: vec![grant_reference.clone()],
+            uses: Some(1),
+            wait_secs: Some(30),
+        },
+    )
+    .await;
+    assert!(matches!(
+        refused.response,
+        AdminResponse::Error { ref message }
+            if message == &crate::server::grant_class_wait_refusal(
+                &grant_reference,
+                &grant_target
+            )
+    ));
+    assert!(refused.waiter_lease.is_none());
+    assert_eq!(
+        cfg.state.grant_requests.read().await[&grant_reference].status,
+        GrantRequestStatus::Pending
+    );
+
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::AccessApprove {
             handles: vec![item.reference],
             uses: Some(1),
+            wait_secs: None,
         },
     )
     .await
@@ -261,7 +288,7 @@ async fn synthesized_access_capability_description(
         )
         .unwrap(),
     );
-    let AdminResponse::AccessItem { item } = handle_admin_request(
+    let AdminResponse::AccessItem { item } = handle_admin_request_for_test(
         &cfg,
         &CallerIdentity::Unix { uid: 1001 },
         AdminRequest::AccessRequest {
@@ -338,7 +365,7 @@ async fn equivalent_synthesized_access_converges_across_principals() {
     let first_principal = CallerIdentity::Unix { uid: 1001 };
     let second_principal = CallerIdentity::Unix { uid: 1002 };
 
-    let AdminResponse::AccessItem { item: first } = handle_admin_request(
+    let AdminResponse::AccessItem { item: first } = handle_admin_request_for_test(
         &cfg,
         &first_principal,
         AdminRequest::AccessRequest {
@@ -349,7 +376,7 @@ async fn equivalent_synthesized_access_converges_across_principals() {
     else {
         panic!("expected first generated request")
     };
-    let AdminResponse::AccessItem { item: second } = handle_admin_request(
+    let AdminResponse::AccessItem { item: second } = handle_admin_request_for_test(
         &cfg,
         &second_principal,
         AdminRequest::AccessRequest {
@@ -378,12 +405,13 @@ async fn equivalent_synthesized_access_converges_across_principals() {
         "request-specific prose must not alter canonical generated authority"
     );
 
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::AccessApprove {
             handles: vec![first.reference, second.reference],
             uses: Some(1),
+            wait_secs: None,
         },
     )
     .await
@@ -422,7 +450,7 @@ async fn pending_reused_generated_access_survives_revoke_and_restart() {
     let daemon = CallerIdentity::UnixAdmin { uid: 777 };
     let worker = CallerIdentity::Unix { uid: 1001 };
 
-    let AdminResponse::AccessItem { item: initial } = handle_admin_request(
+    let AdminResponse::AccessItem { item: initial } = handle_admin_request_for_test(
         &cfg,
         &worker,
         AdminRequest::AccessRequest {
@@ -434,12 +462,13 @@ async fn pending_reused_generated_access_survives_revoke_and_restart() {
         panic!("expected initial generated request")
     };
     let generated_name = initial.capabilities[0].verb.clone();
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::AccessApprove {
             handles: vec![initial.reference],
             uses: None,
+            wait_secs: None,
         },
     )
     .await
@@ -448,14 +477,14 @@ async fn pending_reused_generated_access_survives_revoke_and_restart() {
     };
     assert!(items[0].success, "initial approval failed: {items:?}");
     let target = items[0].target.clone().unwrap();
-    let AdminResponse::AccessDecisions { items } =
-        handle_admin_request(&cfg, &daemon, AdminRequest::AccessRevoke { target }).await
+    let AdminResponse::AccessDecisions { items, .. } =
+        handle_admin_request_for_test(&cfg, &daemon, AdminRequest::AccessRevoke { target }).await
     else {
         panic!("expected generated access revoke")
     };
     assert!(items[0].success);
 
-    let response = handle_admin_request(
+    let response = handle_admin_request_for_test(
         &cfg,
         &worker,
         AdminRequest::AccessRequest {
@@ -500,12 +529,13 @@ async fn pending_reused_generated_access_survives_revoke_and_restart() {
         .get(&generated_name)
         .is_none());
 
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
         &restarted,
         &daemon,
         AdminRequest::AccessApprove {
             handles: vec![pending.reference],
             uses: Some(1),
+            wait_secs: None,
         },
     )
     .await
@@ -552,7 +582,7 @@ async fn full_access_queue_rejects_before_synthesis_or_catalog_change() {
             .insert(request.handle.clone(), request);
     }
     let before = cfg.state.verbs.read().await.version();
-    let response = handle_admin_request(
+    let response = handle_admin_request_for_test(
         &cfg,
         &CallerIdentity::Unix { uid: 1001 },
         AdminRequest::AccessRequest {
@@ -609,17 +639,17 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
         intent: "Inspect fixture".to_string(),
     };
     let AdminResponse::AccessItem { item: first } =
-        handle_admin_request(&cfg, &worker, request()).await
+        handle_admin_request_for_test(&cfg, &worker, request()).await
     else {
         panic!("expected access request")
     };
     let AdminResponse::AccessItem { item: retry } =
-        handle_admin_request(&cfg, &worker, request()).await
+        handle_admin_request_for_test(&cfg, &worker, request()).await
     else {
         panic!("expected coalesced access request")
     };
     let AdminResponse::AccessItem { item: isolated } =
-        handle_admin_request(&cfg, &other, request()).await
+        handle_admin_request_for_test(&cfg, &other, request()).await
     else {
         panic!("expected isolated access request")
     };
@@ -634,12 +664,13 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
         .approval_options
         .contains(&format!("guard access approve {} --once", first.reference)));
 
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::AccessApprove {
             handles: vec![first.reference.clone(), "missing-request".to_string()],
             uses: Some(1),
+            wait_secs: None,
         },
     )
     .await
@@ -651,14 +682,14 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
     assert_eq!(items[0].remaining_uses, Some(1));
     let AdminResponse::AccessItem {
         item: approved_retry,
-    } = handle_admin_request(&cfg, &worker, request()).await
+    } = handle_admin_request_for_test(&cfg, &worker, request()).await
     else {
         panic!("expected approved request retry")
     };
     assert_eq!(approved_retry.reference, first.reference);
     assert_eq!(approved_retry.state, "approved");
 
-    let worker_items = handle_admin_request(&cfg, &worker, AdminRequest::AccessList).await;
+    let worker_items = handle_admin_request_for_test(&cfg, &worker, AdminRequest::AccessList).await;
     let AdminResponse::AccessItems {
         items: worker_items,
     } = worker_items
@@ -727,7 +758,7 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
 
     let AdminResponse::AccessItem {
         item: ordinary_request,
-    } = handle_admin_request(
+    } = handle_admin_request_for_test(
         &cfg,
         &worker,
         AdminRequest::AccessRequest {
@@ -738,12 +769,13 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
     else {
         panic!("expected independent ordinary access request")
     };
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::AccessApprove {
             handles: vec![ordinary_request.reference],
             uses: None,
+            wait_secs: None,
         },
     )
     .await
@@ -792,12 +824,13 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
             .effective_revision_key(&live_token),
         "the denial request must bind the post-admission authority revision"
     );
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::AccessApprove {
             handles: vec![followup],
             uses: Some(1),
+            wait_secs: None,
         },
     )
     .await
@@ -836,7 +869,7 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
 
     let AdminResponse::AccessItem {
         item: spawn_request,
-    } = handle_admin_request(
+    } = handle_admin_request_for_test(
         &cfg,
         &other,
         AdminRequest::AccessRequest {
@@ -847,12 +880,13 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
     else {
         panic!("expected spawn-failure access request")
     };
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::AccessApprove {
             handles: vec![spawn_request.reference.clone()],
             uses: Some(1),
+            wait_secs: None,
         },
     )
     .await
@@ -898,15 +932,16 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
         intent: "Inspect fixture".to_string(),
         uses: Some(2),
     };
-    let AdminResponse::AccessDecisions { items: extended } =
-        handle_admin_request(&cfg, &daemon, extension.clone()).await
+    let AdminResponse::AccessDecisions {
+        items: extended, ..
+    } = handle_admin_request_for_test(&cfg, &daemon, extension.clone()).await
     else {
         panic!("expected access extension")
     };
     assert!(extended[0].success);
     assert_eq!(extended[0].remaining_uses, Some(2));
-    let AdminResponse::AccessDecisions { items: retried } =
-        handle_admin_request(&cfg, &daemon, extension.clone()).await
+    let AdminResponse::AccessDecisions { items: retried, .. } =
+        handle_admin_request_for_test(&cfg, &daemon, extension.clone()).await
     else {
         panic!("expected idempotent access extension")
     };
@@ -921,14 +956,15 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
         .policy_allowed());
     let AdminResponse::AccessDecisions {
         items: retry_after_use,
-    } = handle_admin_request(&cfg, &daemon, extension).await
+        ..
+    } = handle_admin_request_for_test(&cfg, &daemon, extension).await
     else {
         panic!("expected converged access extension")
     };
     assert_eq!(retry_after_use[0].remaining_uses, Some(1));
 
     assert!(matches!(
-        handle_admin_request(
+        handle_admin_request_for_test(
             &cfg,
             &worker,
             AdminRequest::AccessRevoke {
@@ -938,8 +974,8 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
         .await,
         AdminResponse::Error { .. }
     ));
-    let AdminResponse::AccessDecisions { items } =
-        handle_admin_request(&cfg, &daemon, AdminRequest::AccessRevoke { target }).await
+    let AdminResponse::AccessDecisions { items, .. } =
+        handle_admin_request_for_test(&cfg, &daemon, AdminRequest::AccessRevoke { target }).await
     else {
         panic!("expected access revoke result")
     };
@@ -973,7 +1009,7 @@ async fn access_request_can_name_multiple_catalog_verbs() {
     let worker = CallerIdentity::Unix { uid: 1001 };
     let daemon = CallerIdentity::UnixAdmin { uid: 777 };
 
-    let AdminResponse::AccessItem { item } = handle_admin_request(
+    let AdminResponse::AccessItem { item } = handle_admin_request_for_test(
         &cfg,
         &worker,
         AdminRequest::AccessRequest {
@@ -986,7 +1022,7 @@ async fn access_request_can_name_multiple_catalog_verbs() {
     };
     assert_eq!(item.effective_scope, vec!["inspect-a", "inspect-b"]);
     let mixed_worker = CallerIdentity::Unix { uid: 1002 };
-    let AdminResponse::AccessItem { item: mixed } = handle_admin_request(
+    let AdminResponse::AccessItem { item: mixed } = handle_admin_request_for_test(
         &cfg,
         &mixed_worker,
         AdminRequest::AccessRequest {
@@ -998,7 +1034,7 @@ async fn access_request_can_name_multiple_catalog_verbs() {
         panic!("expected mixed explicit and semantic access request")
     };
     assert_eq!(mixed.effective_scope, vec!["inspect-a", "inspect-b"]);
-    let AdminResponse::AccessItem { item: semantic } = handle_admin_request(
+    let AdminResponse::AccessItem { item: semantic } = handle_admin_request_for_test(
         &cfg,
         &CallerIdentity::Unix { uid: 1003 },
         AdminRequest::AccessRequest {
@@ -1010,7 +1046,7 @@ async fn access_request_can_name_multiple_catalog_verbs() {
         panic!("expected ordinary one-word verb to resolve from its full description")
     };
     assert_eq!(semantic.effective_scope, vec!["inspect-a", "run"]);
-    let AdminResponse::AccessItem { item: exact_clause } = handle_admin_request(
+    let AdminResponse::AccessItem { item: exact_clause } = handle_admin_request_for_test(
         &cfg,
         &CallerIdentity::Unix { uid: 1004 },
         AdminRequest::AccessRequest {
@@ -1024,7 +1060,7 @@ async fn access_request_can_name_multiple_catalog_verbs() {
     assert_eq!(exact_clause.effective_scope, vec!["inspect-a", "run"]);
     let AdminResponse::AccessItem {
         item: ordinary_names,
-    } = handle_admin_request(
+    } = handle_admin_request_for_test(
         &cfg,
         &CallerIdentity::Unix { uid: 1006 },
         AdminRequest::AccessRequest {
@@ -1036,7 +1072,7 @@ async fn access_request_can_name_multiple_catalog_verbs() {
         panic!("expected two ordinary one-word verb clauses to be selected")
     };
     assert_eq!(ordinary_names.effective_scope, vec!["run", "stop"]);
-    let AdminResponse::AccessItem { item: sequenced } = handle_admin_request(
+    let AdminResponse::AccessItem { item: sequenced } = handle_admin_request_for_test(
         &cfg,
         &CallerIdentity::Unix { uid: 1007 },
         AdminRequest::AccessRequest {
@@ -1048,7 +1084,7 @@ async fn access_request_can_name_multiple_catalog_verbs() {
         panic!("expected sequencing prose between explicit verb names")
     };
     assert_eq!(sequenced.effective_scope, vec!["inspect-a", "inspect-b"]);
-    let AdminResponse::AccessItem { item: combined } = handle_admin_request(
+    let AdminResponse::AccessItem { item: combined } = handle_admin_request_for_test(
         &cfg,
         &CallerIdentity::Unix { uid: 1008 },
         AdminRequest::AccessRequest {
@@ -1060,7 +1096,7 @@ async fn access_request_can_name_multiple_catalog_verbs() {
         panic!("expected an ordinary verb joined to a distinctive verb with prose")
     };
     assert_eq!(combined.effective_scope, vec!["inspect-a", "run"]);
-    let AdminResponse::AccessItem { item: suffixed } = handle_admin_request(
+    let AdminResponse::AccessItem { item: suffixed } = handle_admin_request_for_test(
         &cfg,
         &CallerIdentity::Unix { uid: 1009 },
         AdminRequest::AccessRequest {
@@ -1072,7 +1108,7 @@ async fn access_request_can_name_multiple_catalog_verbs() {
         panic!("expected request prose after an ordinary verb name")
     };
     assert_eq!(suffixed.effective_scope, vec!["inspect-a", "run"]);
-    let AdminResponse::AccessItem { item: collision } = handle_admin_request(
+    let AdminResponse::AccessItem { item: collision } = handle_admin_request_for_test(
         &cfg,
         &CallerIdentity::Unix { uid: 1005 },
         AdminRequest::AccessRequest {
@@ -1085,12 +1121,13 @@ async fn access_request_can_name_multiple_catalog_verbs() {
     };
     assert_eq!(collision.effective_scope, vec!["inspect-a"]);
     let request_reference = mixed.reference.clone();
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::AccessApprove {
             handles: vec![mixed.reference],
             uses: Some(2),
+            wait_secs: None,
         },
     )
     .await
@@ -1209,7 +1246,7 @@ verbs:
     assert_eq!(durable_requests.len(), 1);
     assert_eq!(durable_requests[0].handle, initial_reference);
 
-    let AdminResponse::AccessItem { item: initial } = handle_admin_request(
+    let AdminResponse::AccessItem { item: initial } = handle_admin_request_for_test(
         &cfg,
         &worker,
         AdminRequest::AccessShow {
@@ -1223,12 +1260,13 @@ verbs:
     assert_eq!(initial.state, "pending");
     assert_eq!(initial.effective_scope, vec!["inspect-limited"]);
 
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::AccessApprove {
             handles: vec![initial_reference.clone()],
             uses: Some(4),
+            wait_secs: None,
         },
     )
     .await
@@ -1279,7 +1317,7 @@ verbs:
         Some((Some(4), Some(2)))
     );
 
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::AccessExtend {
@@ -1378,7 +1416,7 @@ verbs:
         .map(|request| (request.handle.clone(), request))
         .collect();
     let AdminResponse::AccessItems { items } =
-        handle_admin_request(&cfg, &worker, AdminRequest::AccessList).await
+        handle_admin_request_for_test(&cfg, &worker, AdminRequest::AccessList).await
     else {
         panic!("expected access list")
     };
@@ -1455,7 +1493,7 @@ async fn approved_request_without_live_session_projects_as_orphaned() {
     ));
     let worker = CallerIdentity::Unix { uid: 1001 };
     let daemon = CallerIdentity::UnixAdmin { uid: 777 };
-    let AdminResponse::AccessItem { item: pending } = handle_admin_request(
+    let AdminResponse::AccessItem { item: pending } = handle_admin_request_for_test(
         &cfg,
         &worker,
         AdminRequest::AccessRequest {
@@ -1467,12 +1505,13 @@ async fn approved_request_without_live_session_projects_as_orphaned() {
         panic!("expected access request")
     };
     let request_reference = pending.reference.clone();
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::AccessApprove {
             handles: vec![pending.reference],
             uses: Some(1),
+            wait_secs: None,
         },
     )
     .await
@@ -1480,14 +1519,14 @@ async fn approved_request_without_live_session_projects_as_orphaned() {
         panic!("expected access approval")
     };
     let target = items[0].target.clone().unwrap();
-    let AdminResponse::AccessDecisions { items } =
-        handle_admin_request(&cfg, &daemon, AdminRequest::AccessRevoke { target }).await
+    let AdminResponse::AccessDecisions { items, .. } =
+        handle_admin_request_for_test(&cfg, &daemon, AdminRequest::AccessRevoke { target }).await
     else {
         panic!("expected access revoke")
     };
     assert!(items[0].success);
 
-    let AdminResponse::AccessItem { item: orphaned } = handle_admin_request(
+    let AdminResponse::AccessItem { item: orphaned } = handle_admin_request_for_test(
         &cfg,
         &worker,
         AdminRequest::AccessShow {
@@ -1522,7 +1561,7 @@ async fn request_pruning_preserves_live_access_provenance() {
     ));
     let worker = CallerIdentity::Unix { uid: 1001 };
     let daemon = CallerIdentity::UnixAdmin { uid: 777 };
-    let AdminResponse::AccessItem { item } = handle_admin_request(
+    let AdminResponse::AccessItem { item } = handle_admin_request_for_test(
         &cfg,
         &worker,
         AdminRequest::AccessRequest {
@@ -1534,12 +1573,13 @@ async fn request_pruning_preserves_live_access_provenance() {
         panic!("expected access request")
     };
     let active_handle = item.reference.clone();
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::AccessApprove {
             handles: vec![item.reference],
             uses: Some(1),
+            wait_secs: None,
         },
     )
     .await
@@ -1629,7 +1669,7 @@ async fn request_pruning_preserves_live_access_provenance() {
         .map(|request| (request.handle.clone(), request))
         .collect();
     assert!(validate_durable_access_provenance(&cfg).await.is_ok());
-    let AdminResponse::AccessItem { item } = handle_admin_request(
+    let AdminResponse::AccessItem { item } = handle_admin_request_for_test(
         &cfg,
         &worker,
         AdminRequest::AccessShow {
@@ -1665,7 +1705,7 @@ async fn sequential_approval_keeps_fresh_sibling_extensions_valid() {
     ));
     let worker = CallerIdentity::Unix { uid: 1001 };
     let daemon = CallerIdentity::UnixAdmin { uid: 777 };
-    let AdminResponse::AccessItem { item: initial } = handle_admin_request(
+    let AdminResponse::AccessItem { item: initial } = handle_admin_request_for_test(
         &cfg,
         &worker,
         AdminRequest::AccessRequest {
@@ -1676,12 +1716,13 @@ async fn sequential_approval_keeps_fresh_sibling_extensions_valid() {
     else {
         panic!("expected initial access request")
     };
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::AccessApprove {
             handles: vec![initial.reference],
             uses: None,
+            wait_secs: None,
         },
     )
     .await
@@ -1692,7 +1733,7 @@ async fn sequential_approval_keeps_fresh_sibling_extensions_valid() {
 
     let mut pending = Vec::new();
     for intent in ["Inspect system B", "Inspect system C"] {
-        let AdminResponse::AccessItem { item } = handle_admin_request(
+        let AdminResponse::AccessItem { item } = handle_admin_request_for_test(
             &cfg,
             &worker,
             AdminRequest::AccessRequest {
@@ -1715,12 +1756,13 @@ async fn sequential_approval_keeps_fresh_sibling_extensions_valid() {
     assert_eq!(issued_revisions[0], issued_revisions[1]);
 
     for handle in pending.clone() {
-        let AdminResponse::AccessDecisions { items } = handle_admin_request(
+        let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
             &cfg,
             &daemon,
             AdminRequest::AccessApprove {
                 handles: vec![handle],
                 uses: Some(2),
+                wait_secs: None,
             },
         )
         .await
@@ -1762,7 +1804,7 @@ async fn access_approval_and_revoke_retry_one_registry_generation_conflict() {
     ));
     let worker = CallerIdentity::Unix { uid: 1001 };
     let daemon = CallerIdentity::UnixAdmin { uid: 777 };
-    let AdminResponse::AccessItem { item: pending } = handle_admin_request(
+    let AdminResponse::AccessItem { item: pending } = handle_admin_request_for_test(
         &cfg,
         &worker,
         AdminRequest::AccessRequest {
@@ -1782,12 +1824,13 @@ async fn access_approval_and_revoke_retry_one_registry_generation_conflict() {
     );
     competing.persist_registry(&advanced).await.unwrap();
 
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::AccessApprove {
             handles: vec![pending.reference],
             uses: None,
+            wait_secs: None,
         },
     )
     .await
@@ -1811,8 +1854,8 @@ async fn access_approval_and_revoke_retry_one_registry_generation_conflict() {
     );
     competing.persist_registry(&advanced).await.unwrap();
 
-    let AdminResponse::AccessDecisions { items } =
-        handle_admin_request(&cfg, &daemon, AdminRequest::AccessRevoke { target }).await
+    let AdminResponse::AccessDecisions { items, .. } =
+        handle_admin_request_for_test(&cfg, &daemon, AdminRequest::AccessRevoke { target }).await
     else {
         panic!("expected access revoke")
     };
@@ -1909,7 +1952,7 @@ async fn access_list_and_show_project_expiry_without_mutating_durable_requests()
             .unwrap(),
     );
     let worker = CallerIdentity::Unix { uid: 1001 };
-    let AdminResponse::AccessItem { item } = handle_admin_request(
+    let AdminResponse::AccessItem { item } = handle_admin_request_for_test(
         &cfg,
         &worker,
         AdminRequest::AccessRequest {
@@ -1936,7 +1979,7 @@ async fn access_list_and_show_project_expiry_without_mutating_durable_requests()
         .unwrap();
 
     let AdminResponse::AccessItems { items } =
-        handle_admin_request(&cfg, &worker, AdminRequest::AccessList).await
+        handle_admin_request_for_test(&cfg, &worker, AdminRequest::AccessList).await
     else {
         panic!("expected access list")
     };
@@ -1947,7 +1990,7 @@ async fn access_list_and_show_project_expiry_without_mutating_durable_requests()
     assert_eq!(listed.state, "expired");
     assert!(listed.approval_options.is_empty());
 
-    let AdminResponse::AccessItem { item: shown } = handle_admin_request(
+    let AdminResponse::AccessItem { item: shown } = handle_admin_request_for_test(
         &cfg,
         &worker,
         AdminRequest::AccessShow {
@@ -1986,7 +2029,7 @@ async fn access_extend_rejects_legacy_session_authority() {
         "legacy-session".to_string(),
         granted_session_owned(1001, Vec::new(), Vec::new()),
     );
-    let response = handle_admin_request(
+    let response = handle_admin_request_for_test(
         &cfg,
         &CallerIdentity::UnixAdmin { uid: 777 },
         AdminRequest::AccessExtend {
@@ -2021,7 +2064,7 @@ async fn revoked_access_session_cannot_be_resurrected_by_pending_extension() {
     ));
     let worker = CallerIdentity::Unix { uid: 1001 };
     let daemon = CallerIdentity::UnixAdmin { uid: 777 };
-    let AdminResponse::AccessItem { item: initial } = handle_admin_request(
+    let AdminResponse::AccessItem { item: initial } = handle_admin_request_for_test(
         &cfg,
         &worker,
         AdminRequest::AccessRequest {
@@ -2032,12 +2075,13 @@ async fn revoked_access_session_cannot_be_resurrected_by_pending_extension() {
     else {
         panic!("expected initial access request")
     };
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::AccessApprove {
             handles: vec![initial.reference],
             uses: None,
+            wait_secs: None,
         },
     )
     .await
@@ -2047,7 +2091,7 @@ async fn revoked_access_session_cannot_be_resurrected_by_pending_extension() {
     assert!(items[0].success);
     let target = items[0].target.clone().unwrap();
 
-    let AdminResponse::AccessItem { item: extension } = handle_admin_request(
+    let AdminResponse::AccessItem { item: extension } = handle_admin_request_for_test(
         &cfg,
         &worker,
         AdminRequest::AccessRequest {
@@ -2060,7 +2104,7 @@ async fn revoked_access_session_cannot_be_resurrected_by_pending_extension() {
     };
     assert_eq!(extension.state, "pending");
     assert!(matches!(
-        handle_admin_request(&cfg, &daemon, AdminRequest::AccessRevoke { target },).await,
+        handle_admin_request_for_test(&cfg, &daemon, AdminRequest::AccessRevoke { target },).await,
         AdminResponse::AccessDecisions { .. }
     ));
     assert_eq!(
@@ -2080,12 +2124,13 @@ async fn revoked_access_session_cannot_be_resurrected_by_pending_extension() {
         durable_extension.status,
         crate::grant_profile::GrantRequestStatus::Withdrawn
     );
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::AccessApprove {
             handles: vec![extension.reference],
             uses: Some(1),
+            wait_secs: None,
         },
     )
     .await
@@ -2320,7 +2365,7 @@ async fn kubeconfig_issuance_is_local_live_session_scoped_and_secret_free() {
     // The owning principal (uid 1001) issues successfully.
     let (response, logs) = capture_async(
         &audit,
-        handle_admin_request(&cfg, &CallerIdentity::Unix { uid: 1_001 }, request()),
+        handle_admin_request_for_test(&cfg, &CallerIdentity::Unix { uid: 1_001 }, request()),
     )
     .await;
     let AdminResponse::KubeconfigIssued { yaml, expires_at } = response else {
@@ -2338,7 +2383,8 @@ async fn kubeconfig_issuance_is_local_live_session_scoped_and_secret_free() {
     // A different local principal that merely knows the handle is denied with
     // the greppable principal-mismatch reason: this is the bearer-replay hole
     // the ownership binding closes.
-    match handle_admin_request(&cfg, &CallerIdentity::Unix { uid: 1_002 }, request()).await {
+    match handle_admin_request_for_test(&cfg, &CallerIdentity::Unix { uid: 1_002 }, request()).await
+    {
         AdminResponse::Error { message } => {
             assert!(
                 message.contains("session principal mismatch"),
@@ -2349,7 +2395,8 @@ async fn kubeconfig_issuance_is_local_live_session_scoped_and_secret_free() {
     }
     // An authenticated operator retains cross-session authority.
     assert!(matches!(
-        handle_admin_request(&cfg, &CallerIdentity::UnixAdmin { uid: 777 }, request()).await,
+        handle_admin_request_for_test(&cfg, &CallerIdentity::UnixAdmin { uid: 777 }, request())
+            .await,
         AdminResponse::KubeconfigIssued { .. }
     ));
 
@@ -2359,7 +2406,7 @@ async fn kubeconfig_issuance_is_local_live_session_scoped_and_secret_free() {
         access_managed.scope.access_managed = true;
         sessions.grant("access-managed-kube".to_string(), access_managed);
     }
-    match handle_admin_request(
+    match handle_admin_request_for_test(
         &cfg,
         &CallerIdentity::Unix { uid: 1_001 },
         AdminRequest::KubeconfigIssue {
@@ -2373,7 +2420,7 @@ async fn kubeconfig_issuance_is_local_live_session_scoped_and_secret_free() {
         other => panic!("access-managed session minted a kubeconfig: {other:?}"),
     }
     assert!(matches!(
-        handle_admin_request(
+        handle_admin_request_for_test(
             &cfg,
             &CallerIdentity::Tcp {
                 token: "tcp-auth".to_string()
@@ -2386,7 +2433,7 @@ async fn kubeconfig_issuance_is_local_live_session_scoped_and_secret_free() {
 
     cfg.state.sessions.write().await.revoke(token);
     assert!(matches!(
-        handle_admin_request(&cfg, &CallerIdentity::Unix { uid: 1_001 }, request()).await,
+        handle_admin_request_for_test(&cfg, &CallerIdentity::Unix { uid: 1_001 }, request()).await,
         AdminResponse::Error { .. }
     ));
 
@@ -2399,7 +2446,7 @@ async fn kubeconfig_issuance_is_local_live_session_scoped_and_secret_free() {
         .await
         .grant(expired.to_string(), expired_grant);
     assert!(matches!(
-        handle_admin_request(
+        handle_admin_request_for_test(
             &cfg,
             &CallerIdentity::Unix { uid: 1_001 },
             AdminRequest::KubeconfigIssue {
@@ -2445,7 +2492,7 @@ verbs:
     ));
     let daemon = CallerIdentity::UnixAdmin { uid: 777 };
 
-    let valid = handle_admin_request(
+    let valid = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::SessionGrant {
@@ -2468,7 +2515,7 @@ verbs:
     .await;
     assert!(matches!(valid, AdminResponse::Ok));
 
-    let unknown_verb = handle_admin_request(
+    let unknown_verb = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::SessionGrant {
@@ -2494,7 +2541,7 @@ verbs:
         AdminResponse::Error { message } if message.contains("unknown session verb")
     ));
 
-    let unknown_marker = handle_admin_request(
+    let unknown_marker = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::SessionGrant {
@@ -2879,7 +2926,7 @@ async fn session_inspection_surfaces_redact_credentials_in_text_and_json() {
     );
     *cfg.state.sessions.write().await = registry;
 
-    let show = handle_admin_request(
+    let show = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::SessionShow {
@@ -2915,7 +2962,7 @@ async fn session_inspection_surfaces_redact_credentials_in_text_and_json() {
             || report.recent[0].command.contains("kubectl")
     );
 
-    let status = handle_admin_request(
+    let status = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::SessionStatus {
@@ -2935,7 +2982,7 @@ async fn session_inspection_surfaces_redact_credentials_in_text_and_json() {
     );
     assert!(status_json.contains("[REDACTED]"), "{status_json}");
 
-    let list = handle_admin_request(
+    let list = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::SessionList {
@@ -3042,7 +3089,7 @@ async fn session_list_omits_foreign_sessions() {
     let user = CallerIdentity::Unix { uid: 20_002 };
     let token = format!("session-{}", std::process::id());
 
-    let grant = handle_admin_request(
+    let grant = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::SessionGrant {
@@ -3065,7 +3112,7 @@ async fn session_list_omits_foreign_sessions() {
     .await;
     assert!(matches!(grant, AdminResponse::Ok));
 
-    let listed = handle_admin_request(
+    let listed = handle_admin_request_for_test(
         &cfg,
         &user,
         AdminRequest::SessionList {
@@ -3094,7 +3141,7 @@ async fn session_list_shows_current_session_details_without_raw_token_for_user()
     let user = CallerIdentity::Unix { uid: 20_002 };
     let token = format!("session-visible-{}", std::process::id());
 
-    let grant = handle_admin_request(
+    let grant = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::SessionGrant {
@@ -3117,7 +3164,7 @@ async fn session_list_shows_current_session_details_without_raw_token_for_user()
     .await;
     assert!(matches!(grant, AdminResponse::Ok));
 
-    let listed = handle_admin_request(
+    let listed = handle_admin_request_for_test(
         &cfg,
         &user,
         AdminRequest::SessionList {
@@ -3194,7 +3241,7 @@ async fn non_owner_session_list_omits_active_and_historical_rows() {
         assert!(sessions.revoke("private-history"));
     }
 
-    let AdminResponse::SessionList { grants, history } = handle_admin_request(
+    let AdminResponse::SessionList { grants, history } = handle_admin_request_for_test(
         &cfg,
         &CallerIdentity::Unix { uid: 2002 },
         AdminRequest::SessionList {
@@ -3245,11 +3292,11 @@ async fn archived_session_token_cannot_be_reissued_to_another_principal() {
         owner: Some(owner.to_string()),
     };
     assert!(matches!(
-        handle_admin_request(&cfg, &daemon, grant_for("1001")).await,
+        handle_admin_request_for_test(&cfg, &daemon, grant_for("1001")).await,
         AdminResponse::Ok
     ));
     assert!(matches!(
-        handle_admin_request(
+        handle_admin_request_for_test(
             &cfg,
             &daemon,
             AdminRequest::SessionRevoke {
@@ -3260,12 +3307,12 @@ async fn archived_session_token_cannot_be_reissued_to_another_principal() {
         AdminResponse::Ok
     ));
     assert!(matches!(
-        handle_admin_request(&cfg, &daemon, grant_for("2002")).await,
+        handle_admin_request_for_test(&cfg, &daemon, grant_for("2002")).await,
         AdminResponse::Error { message }
             if message.contains("already issued")
     ));
     assert!(matches!(
-        handle_admin_request(
+        handle_admin_request_for_test(
             &cfg,
             &CallerIdentity::Unix { uid: 2002 },
             AdminRequest::SessionShow {
@@ -3288,7 +3335,7 @@ async fn session_show_reports_recent_stats() {
     let daemon = CallerIdentity::UnixAdmin { uid: 777 };
     let token = format!("session-show-{}", std::process::id());
 
-    let grant = handle_admin_request(
+    let grant = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::SessionGrant {
@@ -3350,7 +3397,7 @@ async fn session_show_reports_recent_stats() {
         );
     }
 
-    let show = handle_admin_request(
+    let show = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::SessionShow {
@@ -3387,7 +3434,7 @@ async fn session_show_self_token_sees_full_grant() {
     let user = CallerIdentity::Unix { uid: 20_003 };
     let token = format!("session-self-{}", std::process::id());
 
-    let grant = handle_admin_request(
+    let grant = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::SessionGrant {
@@ -3411,7 +3458,7 @@ async fn session_show_self_token_sees_full_grant() {
     assert!(matches!(grant, AdminResponse::Ok));
 
     // The owning principal inspects its own session.
-    let show = handle_admin_request(
+    let show = handle_admin_request_for_test(
         &cfg,
         &user,
         AdminRequest::SessionShow {
@@ -3467,7 +3514,7 @@ async fn session_status_self_view_redacts_bearer_and_keeps_decision_trace() {
         },
     );
 
-    let response = handle_admin_request(
+    let response = handle_admin_request_for_test(
         &cfg,
         &CallerIdentity::Unix { uid: 1000 },
         AdminRequest::SessionStatus {
@@ -3504,7 +3551,7 @@ async fn session_show_other_token_denied_for_non_admin() {
     let token_b = format!("session-b-{}", std::process::id());
 
     for token in [&token_a, &token_b] {
-        let grant = handle_admin_request(
+        let grant = handle_admin_request_for_test(
             &cfg,
             &daemon,
             AdminRequest::SessionGrant {
@@ -3529,7 +3576,7 @@ async fn session_show_other_token_denied_for_non_admin() {
     }
 
     // Holder of A tries to inspect B's grant by naming B as the target.
-    let show = handle_admin_request(
+    let show = handle_admin_request_for_test(
         &cfg,
         &attacker,
         AdminRequest::SessionShow {
@@ -3570,7 +3617,7 @@ async fn session_new_from_profile_mints_expected_grant() {
     let token = format!("session-profile-{}", std::process::id());
 
     // Profile-only: no explicit allow/deny/ttl/prompt on the request.
-    let resp = handle_admin_request(
+    let resp = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::SessionGrant {
@@ -3625,7 +3672,7 @@ async fn session_new_unknown_profile_fails_clearly() {
 
     let daemon = CallerIdentity::UnixAdmin { uid: 777 };
     let token = format!("session-badprofile-{}", std::process::id());
-    let resp = handle_admin_request(
+    let resp = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::SessionGrant {
@@ -3677,7 +3724,7 @@ async fn profile_grant_still_deny_short_circuits_and_falls_through() {
 
     let daemon = CallerIdentity::UnixAdmin { uid: 777 };
     let token = format!("session-profcheck-{}", std::process::id());
-    let resp = handle_admin_request(
+    let resp = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::SessionGrant {
@@ -3725,7 +3772,7 @@ async fn grant_requests_use_the_issued_ceiling_and_redact_session_tokens() {
     let worker = CallerIdentity::Unix { uid: 778 };
     let token = "bounded-session".to_string();
     assert!(matches!(
-        handle_admin_request(
+        handle_admin_request_for_test(
             &cfg,
             &daemon,
             AdminRequest::SessionGrant {
@@ -3749,7 +3796,7 @@ async fn grant_requests_use_the_issued_ceiling_and_redact_session_tokens() {
         AdminResponse::Ok
     ));
 
-    let mismatched = handle_admin_request(
+    let mismatched = handle_admin_request_for_test(
         &cfg,
         &worker,
         AdminRequest::GrantRequestSubmit {
@@ -3769,7 +3816,7 @@ async fn grant_requests_use_the_issued_ceiling_and_redact_session_tokens() {
         AdminResponse::Error { message } if message.contains("does not match")
     ));
 
-    let approved = handle_admin_request(
+    let approved = handle_admin_request_for_test(
         &cfg,
         &worker,
         AdminRequest::GrantRequestSubmit {
@@ -3795,7 +3842,7 @@ async fn grant_requests_use_the_issued_ceiling_and_redact_session_tokens() {
         granted_session(Vec::new(), Vec::new()),
     );
 
-    let unscoped = handle_admin_request(
+    let unscoped = handle_admin_request_for_test(
         &cfg,
         &worker,
         AdminRequest::GrantRequestList {
@@ -3805,7 +3852,7 @@ async fn grant_requests_use_the_issued_ceiling_and_redact_session_tokens() {
     )
     .await;
     assert!(matches!(unscoped, AdminResponse::Error { .. }));
-    let scoped = handle_admin_request(
+    let scoped = handle_admin_request_for_test(
         &cfg,
         &worker,
         AdminRequest::GrantRequestList {
@@ -3820,7 +3867,7 @@ async fn grant_requests_use_the_issued_ceiling_and_redact_session_tokens() {
             if items.len() == 1 && items[0].session_token.starts_with("sha256:")
     ));
 
-    let replayed_caller_bearer = handle_admin_request(
+    let replayed_caller_bearer = handle_admin_request_for_test(
         &cfg,
         &worker,
         AdminRequest::GrantRequestList {
@@ -3834,7 +3881,7 @@ async fn grant_requests_use_the_issued_ceiling_and_redact_session_tokens() {
         AdminResponse::GrantRequests { items } if items.len() == 1
     ));
 
-    let admin = handle_admin_request(
+    let admin = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::GrantRequestList {
@@ -3889,7 +3936,7 @@ async fn grant_request_submit_enforces_suspension_quota_and_aggregate_size() {
             },
         };
     assert!(matches!(
-        handle_admin_request(
+        handle_admin_request_for_test(
             &cfg,
             &worker,
             submit("suspended-request", "request".to_string(), "scope".to_string()),
@@ -3916,7 +3963,7 @@ async fn grant_request_submit_enforces_suspension_quota_and_aggregate_size() {
             .insert(request.handle.clone(), request);
     }
     assert!(matches!(
-        handle_admin_request(
+        handle_admin_request_for_test(
             &cfg,
             &worker,
             submit("quota-request", "one more".to_string(), "scope".to_string()),
@@ -3927,7 +3974,7 @@ async fn grant_request_submit_enforces_suspension_quota_and_aggregate_size() {
 
     let half = "x".repeat(crate::server::admin::MAX_GRANT_REQUEST_PAYLOAD_BYTES / 2 + 1);
     assert!(matches!(
-        handle_admin_request(
+        handle_admin_request_for_test(
             &cfg,
             &worker,
             submit("large-request", half.clone(), half),
@@ -3961,7 +4008,7 @@ async fn auto_and_operator_approval_fail_without_partial_session_authority() {
         ("operator-approval", "reviewed"),
     ] {
         assert!(matches!(
-            handle_admin_request(
+            handle_admin_request_for_test(
                 &cfg,
                 &daemon,
                 AdminRequest::SessionGrant {
@@ -4008,7 +4055,7 @@ async fn auto_and_operator_approval_fail_without_partial_session_authority() {
         .unwrap()
         .fail_next_approval_for_test();
     assert!(matches!(
-        handle_admin_request(&cfg, &worker, submit("automatic-approval")).await,
+        handle_admin_request_for_test(&cfg, &worker, submit("automatic-approval")).await,
         AdminResponse::Error { message } if message.contains("approval transaction failure")
     ));
     assert_eq!(
@@ -4026,7 +4073,7 @@ async fn auto_and_operator_approval_fail_without_partial_session_authority() {
         .read()
         .await
         .effective_revision_key("operator-approval");
-    let response = handle_admin_request(&cfg, &worker, submit("operator-approval")).await;
+    let response = handle_admin_request_for_test(&cfg, &worker, submit("operator-approval")).await;
     let AdminResponse::GrantRequest { request } = response else {
         panic!("expected pending request")
     };
@@ -4036,7 +4083,7 @@ async fn auto_and_operator_approval_fail_without_partial_session_authority() {
         .unwrap()
         .fail_next_approval_for_test();
     assert!(matches!(
-        handle_admin_request(
+        handle_admin_request_for_test(
             &cfg,
             &daemon,
             AdminRequest::GrantRequestApprove {
@@ -4085,7 +4132,7 @@ async fn terminal_grant_request_races_have_one_durable_authority_outcome() {
         let daemon = CallerIdentity::UnixAdmin { uid: 777 };
         let worker = CallerIdentity::Unix { uid: 778 };
         assert!(matches!(
-            handle_admin_request(
+            handle_admin_request_for_test(
                 &cfg,
                 &daemon,
                 AdminRequest::SessionGrant {
@@ -4114,7 +4161,7 @@ async fn terminal_grant_request_races_have_one_durable_authority_outcome() {
             .read()
             .await
             .effective_revision_key(&token);
-        let submitted = handle_admin_request(
+        let submitted = handle_admin_request_for_test(
             &cfg,
             &worker,
             AdminRequest::GrantRequestSubmit {
@@ -4139,7 +4186,7 @@ async fn terminal_grant_request_races_have_one_durable_authority_outcome() {
         let approve_barrier = barrier.clone();
         let approve = tokio::spawn(async move {
             approve_barrier.wait().await;
-            handle_admin_request(
+            handle_admin_request_for_test(
                 &approve_cfg,
                 &CallerIdentity::UnixAdmin { uid: 777 },
                 AdminRequest::GrantRequestApprove {
@@ -4169,7 +4216,7 @@ async fn terminal_grant_request_races_have_one_durable_authority_outcome() {
                 }
                 _ => unreachable!(),
             };
-            handle_admin_request(
+            handle_admin_request_for_test(
                 &competing_cfg,
                 &CallerIdentity::UnixAdmin { uid: 777 },
                 request,
@@ -4243,11 +4290,11 @@ async fn saved_grant_edit_uses_explicit_clear_and_tristate_operations() {
     .unwrap();
     let grant = source.get("editable").unwrap().clone();
     assert!(matches!(
-        handle_admin_request(&cfg, &daemon, AdminRequest::SavedGrantSave { grant }).await,
+        handle_admin_request_for_test(&cfg, &daemon, AdminRequest::SavedGrantSave { grant }).await,
         AdminResponse::SavedGrant { .. }
     ));
 
-    let edited = handle_admin_request(
+    let edited = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::SavedGrantEdit {
@@ -4289,7 +4336,7 @@ async fn saved_grant_edit_uses_explicit_clear_and_tristate_operations() {
     assert!(!grant.auto_approve_requests);
     assert_eq!(grant.revision, 2);
 
-    let cleared_prompt = handle_admin_request(
+    let cleared_prompt = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::SavedGrantEdit {
@@ -4389,7 +4436,7 @@ async fn saved_grant_regeneration_previews_exact_apply_and_enforces_both_cas_key
         auto_approve_requests: None,
     };
 
-    let response = handle_admin_request(&cfg, &daemon, preview()).await;
+    let response = handle_admin_request_for_test(&cfg, &daemon, preview()).await;
     let AdminResponse::SavedGrantRegenerationProposal {
         proposal_id,
         candidate,
@@ -4411,7 +4458,7 @@ async fn saved_grant_regeneration_previews_exact_apply_and_enforces_both_cas_key
         .unwrap()
         .generated_verbs
         .is_empty());
-    let applied = handle_admin_request(&cfg, &daemon, apply(proposal_id)).await;
+    let applied = handle_admin_request_for_test(&cfg, &daemon, apply(proposal_id)).await;
     let AdminResponse::SavedGrantRegenerated { grant, .. } = applied else {
         panic!("expected exact regeneration apply, got {applied:?}");
     };
@@ -4422,7 +4469,7 @@ async fn saved_grant_regeneration_previews_exact_apply_and_enforces_both_cas_key
         "apply must install the exact previewed candidate"
     );
 
-    let revision_preview = handle_admin_request(&cfg, &daemon, preview()).await;
+    let revision_preview = handle_admin_request_for_test(&cfg, &daemon, preview()).await;
     let AdminResponse::SavedGrantRegenerationProposal {
         proposal_id: stale_revision,
         ..
@@ -4431,15 +4478,15 @@ async fn saved_grant_regeneration_previews_exact_apply_and_enforces_both_cas_key
         panic!()
     };
     assert!(matches!(
-        handle_admin_request(&cfg, &daemon, edit_description()).await,
+        handle_admin_request_for_test(&cfg, &daemon, edit_description()).await,
         AdminResponse::SavedGrant { .. }
     ));
     assert!(matches!(
-        handle_admin_request(&cfg, &daemon, apply(stale_revision)).await,
+        handle_admin_request_for_test(&cfg, &daemon, apply(stale_revision)).await,
         AdminResponse::Error { message } if message.contains("revision changed")
     ));
 
-    let regime_preview = handle_admin_request(&cfg, &daemon, preview()).await;
+    let regime_preview = handle_admin_request_for_test(&cfg, &daemon, preview()).await;
     let AdminResponse::SavedGrantRegenerationProposal {
         proposal_id: stale_regime,
         ..
@@ -4449,7 +4496,7 @@ async fn saved_grant_regeneration_previews_exact_apply_and_enforces_both_cas_key
     };
     cfg.state.evaluator = Arc::new(evaluator("regime-b"));
     assert!(matches!(
-        handle_admin_request(&cfg, &daemon, apply(stale_regime)).await,
+        handle_admin_request_for_test(&cfg, &daemon, apply(stale_regime)).await,
         AdminResponse::Error { message } if message.contains("evaluator regime changed")
     ));
 }
@@ -4469,7 +4516,7 @@ async fn grant_request_show_and_withdraw_require_the_issuing_session() {
         "victim-session".to_string(),
         granted_session_owned(779, Vec::new(), Vec::new()),
     );
-    let cross_session = handle_admin_request(
+    let cross_session = handle_admin_request_for_test(
         &cfg,
         &worker,
         AdminRequest::GrantRequestSubmit {
@@ -4489,7 +4536,7 @@ async fn grant_request_show_and_withdraw_require_the_issuing_session() {
         AdminResponse::Error { message } if message.contains("session principal mismatch")
     ));
     assert!(matches!(
-        handle_admin_request(
+        handle_admin_request_for_test(
             &cfg,
             &daemon,
             AdminRequest::GrantRequestSubmit {
@@ -4506,7 +4553,7 @@ async fn grant_request_show_and_withdraw_require_the_issuing_session() {
         .await,
         AdminResponse::GrantRequest { .. }
     ));
-    let submitted = handle_admin_request(
+    let submitted = handle_admin_request_for_test(
         &cfg,
         &worker,
         AdminRequest::GrantRequestSubmit {
@@ -4527,7 +4574,7 @@ async fn grant_request_show_and_withdraw_require_the_issuing_session() {
     let handle = request.handle;
 
     for response in [
-        handle_admin_request(
+        handle_admin_request_for_test(
             &cfg,
             &worker,
             AdminRequest::GrantRequestShow {
@@ -4536,7 +4583,7 @@ async fn grant_request_show_and_withdraw_require_the_issuing_session() {
             },
         )
         .await,
-        handle_admin_request(
+        handle_admin_request_for_test(
             &cfg,
             &worker,
             AdminRequest::GrantRequestWithdraw {
@@ -4551,7 +4598,7 @@ async fn grant_request_show_and_withdraw_require_the_issuing_session() {
         );
     }
     assert!(matches!(
-        handle_admin_request(
+        handle_admin_request_for_test(
             &cfg,
             &daemon,
             AdminRequest::GrantRequestShow {
@@ -4563,7 +4610,7 @@ async fn grant_request_show_and_withdraw_require_the_issuing_session() {
         AdminResponse::GrantRequest { .. }
     ));
     assert!(matches!(
-        handle_admin_request(
+        handle_admin_request_for_test(
             &cfg,
             &worker,
             AdminRequest::GrantRequestWithdraw {
@@ -4613,7 +4660,7 @@ async fn withdraw_and_prune_keep_memory_when_persistence_fails() {
     store.save_grant_request(request.clone()).await.unwrap();
     store.fail_next_write_for_test();
 
-    let response = handle_admin_request(
+    let response = handle_admin_request_for_test(
         &cfg,
         &CallerIdentity::Unix { uid: 778 },
         AdminRequest::GrantRequestWithdraw {
@@ -4683,11 +4730,11 @@ async fn evaluate_batch_requires_owned_live_unsuspended_session_or_admin() {
         commands: commands.clone(),
     };
     assert!(matches!(
-        handle_admin_request(&cfg, &worker, evaluate(None, None)).await,
+        handle_admin_request_for_test(&cfg, &worker, evaluate(None, None)).await,
         AdminResponse::Error { message } if message.contains("caller-owned session")
     ));
     assert!(matches!(
-        handle_admin_request(
+        handle_admin_request_for_test(
             &cfg,
             &worker,
             evaluate(Some("batch-victim".to_string()), Some("batch-owner".to_string())),
@@ -4709,7 +4756,7 @@ async fn evaluate_batch_requires_owned_live_unsuspended_session_or_admin() {
             .len(),
     );
     assert!(matches!(
-        handle_admin_request(
+        handle_admin_request_for_test(
             &cfg,
             &worker,
             evaluate(
@@ -4738,7 +4785,7 @@ async fn evaluate_batch_requires_owned_live_unsuspended_session_or_admin() {
         "batch preview must have no durable side effects"
     );
     assert!(matches!(
-        handle_admin_request(&cfg, &daemon, evaluate(None, None)).await,
+        handle_admin_request_for_test(&cfg, &daemon, evaluate(None, None)).await,
         AdminResponse::EvaluationBatch { .. }
     ));
 
@@ -4758,7 +4805,7 @@ async fn evaluate_batch_requires_owned_live_unsuspended_session_or_admin() {
         },
     );
     assert!(matches!(
-        handle_admin_request(
+        handle_admin_request_for_test(
             &cfg,
             &worker,
             evaluate(Some("batch-owner".to_string()), Some("batch-owner".to_string())),
@@ -4799,7 +4846,7 @@ async fn evaluate_batch_seeds_the_identical_real_run_cache_key() {
     };
     let worker = CallerIdentity::Unix { uid: 1000 };
 
-    let response = handle_admin_request(
+    let response = handle_admin_request_for_test(
         &cfg,
         &worker,
         AdminRequest::EvaluateBatch {
@@ -4890,7 +4937,7 @@ async fn grant_request_approval_rejects_expiry_and_stale_saved_revision() {
     let worker = CallerIdentity::Unix { uid: 778 };
     let token = "revision-session".to_string();
     assert!(matches!(
-        handle_admin_request(
+        handle_admin_request_for_test(
             &cfg,
             &daemon,
             AdminRequest::SessionGrant {
@@ -4923,7 +4970,7 @@ async fn grant_request_approval_rejects_expiry_and_stale_saved_revision() {
             ..Default::default()
         },
     };
-    let first = handle_admin_request(&cfg, &worker, submit("expired")).await;
+    let first = handle_admin_request_for_test(&cfg, &worker, submit("expired")).await;
     let AdminResponse::GrantRequest { request } = first else {
         panic!()
     };
@@ -4935,16 +4982,16 @@ async fn grant_request_approval_rejects_expiry_and_stale_saved_revision() {
         .unwrap()
         .expires_unix = 1;
     assert!(matches!(
-        handle_admin_request(&cfg, &daemon, AdminRequest::GrantRequestApprove { handle: request.handle }).await,
+        handle_admin_request_for_test(&cfg, &daemon, AdminRequest::GrantRequestApprove { handle: request.handle }).await,
         AdminResponse::Error { message } if message.contains("expired")
     ));
 
-    let second = handle_admin_request(&cfg, &worker, submit("stale")).await;
+    let second = handle_admin_request_for_test(&cfg, &worker, submit("stale")).await;
     let AdminResponse::GrantRequest { request } = second else {
         panic!()
     };
     assert!(matches!(
-        handle_admin_request(
+        handle_admin_request_for_test(
             &cfg,
             &daemon,
             AdminRequest::SavedGrantEdit {
@@ -4976,7 +5023,7 @@ async fn grant_request_approval_rejects_expiry_and_stale_saved_revision() {
         AdminResponse::SavedGrant { .. }
     ));
     assert!(matches!(
-        handle_admin_request(&cfg, &daemon, AdminRequest::GrantRequestApprove { handle: request.handle }).await,
+        handle_admin_request_for_test(&cfg, &daemon, AdminRequest::GrantRequestApprove { handle: request.handle }).await,
         AdminResponse::Error { message } if message.contains("changed after request issuance")
     ));
 }
@@ -5010,7 +5057,7 @@ async fn grant_request_binds_unsaved_session_revision_and_prunes_expired_rows() 
         },
     };
 
-    let stale = handle_admin_request(&cfg, &worker, submit("stale")).await;
+    let stale = handle_admin_request_for_test(&cfg, &worker, submit("stale")).await;
     let AdminResponse::GrantRequest { request } = stale else {
         panic!()
     };
@@ -5020,7 +5067,7 @@ async fn grant_request_binds_unsaved_session_revision_and_prunes_expired_rows() 
         .await
         .set_label(&token, Some("changed".to_string()));
     assert!(matches!(
-        handle_admin_request(
+        handle_admin_request_for_test(
             &cfg,
             &daemon,
             AdminRequest::GrantRequestApprove { handle: request.handle },
@@ -5029,7 +5076,7 @@ async fn grant_request_binds_unsaved_session_revision_and_prunes_expired_rows() 
         AdminResponse::Error { message } if message.contains("session revision")
     ));
 
-    let expired = handle_admin_request(&cfg, &worker, submit("expire")).await;
+    let expired = handle_admin_request_for_test(&cfg, &worker, submit("expire")).await;
     let AdminResponse::GrantRequest { request } = expired else {
         panic!()
     };
@@ -5054,7 +5101,7 @@ async fn grant_request_binds_unsaved_session_revision_and_prunes_expired_rows() 
         .save_grant_request(expired_row)
         .await
         .unwrap();
-    let _ = handle_admin_request(
+    let _ = handle_admin_request_for_test(
         &cfg,
         &worker,
         AdminRequest::GrantRequestList {
@@ -5120,7 +5167,7 @@ async fn grant_request_queue_is_bounded_and_recovers_capacity_from_expiry() {
         },
     };
     assert!(matches!(
-        handle_admin_request(&cfg, &worker, submit()).await,
+        handle_admin_request_for_test(&cfg, &worker, submit()).await,
         AdminResponse::Error { message } if message.contains("queue is full")
     ));
     cfg.state
@@ -5132,7 +5179,7 @@ async fn grant_request_queue_is_bounded_and_recovers_capacity_from_expiry() {
         .unwrap()
         .expires_unix = 1;
     assert!(matches!(
-        handle_admin_request(&cfg, &worker, submit()).await,
+        handle_admin_request_for_test(&cfg, &worker, submit()).await,
         AdminResponse::GrantRequest { .. }
     ));
     assert_eq!(cfg.state.grant_requests.read().await.len(), 1024);
@@ -5329,7 +5376,7 @@ async fn principal_binding_show_and_status_two_uid() {
         .grant(token.clone(), session_owned_by(1001));
 
     async fn show_as(cfg: &crate::server::ServerContext, uid: u32, token: &str) -> AdminResponse {
-        handle_admin_request(
+        handle_admin_request_for_test(
             cfg,
             &CallerIdentity::Unix { uid },
             AdminRequest::SessionShow {
@@ -5341,7 +5388,7 @@ async fn principal_binding_show_and_status_two_uid() {
         .await
     }
     async fn status_as(cfg: &crate::server::ServerContext, uid: u32, token: &str) -> AdminResponse {
-        handle_admin_request(
+        handle_admin_request_for_test(
             cfg,
             &CallerIdentity::Unix { uid },
             AdminRequest::SessionStatus {
@@ -5397,7 +5444,7 @@ async fn principal_binding_hold_confirm_is_operator_only() {
     let (mut cfg, _) = make_test_config();
     cfg.config.daemon_uid = 777;
     cfg.config.daemon_principal = PrincipalKey::from_uid(777);
-    let refused = handle_admin_request(
+    let refused = handle_admin_request_for_test(
         &cfg,
         &CallerIdentity::Unix { uid: 1002 },
         AdminRequest::Confirm {
@@ -5421,7 +5468,7 @@ async fn principal_binding_appeal_refuses_unowned_session() {
     grant.owner = crate::session::SessionOwner::Unowned;
     cfg.state.sessions.write().await.grant(token.clone(), grant);
 
-    let appeal = handle_admin_request(
+    let appeal = handle_admin_request_for_test(
         &cfg,
         &CallerIdentity::UnixAdmin { uid: 777 },
         AdminRequest::SessionAppeal {

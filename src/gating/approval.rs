@@ -17,7 +17,8 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::Notify;
 
 use super::{DecisionTrace, GateError, Reversibility};
@@ -237,6 +238,103 @@ impl Approval {
 pub struct ApprovalRegistry {
     items: HashMap<String, Approval>,
     notifiers: HashMap<String, Arc<Notify>>,
+    leases: Arc<WaiterLeaseState>,
+}
+
+pub const APPROVAL_TRANSCRIPT_SERIALIZED_BYTES: usize = 262_144;
+pub const APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX: &str = "\n[guard persisted transcript truncated]\n";
+
+fn json_payload_bytes(character: char) -> usize {
+    match character {
+        '"' | '\\' | '\u{0008}' | '\u{0009}' | '\u{000a}' | '\u{000c}' | '\u{000d}' => 2,
+        '\u{0000}'..='\u{001f}' => 6,
+        _ => character.len_utf8(),
+    }
+}
+
+/// Redact and bound one transcript using the bytes occupied by its serialized
+/// JSON string field, including quotes and escapes. The same projection is
+/// used for persistence, restart loading, and wire responses.
+pub fn bound_approval_transcript(value: Option<String>) -> (Option<String>, bool) {
+    let Some(value) = value else {
+        return (None, false);
+    };
+    let exposed = crate::redact::redact_output_text(&value);
+    let already_truncated = exposed.ends_with(APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX);
+    if serde_json::to_vec(&exposed)
+        .expect("serializing a string cannot fail")
+        .len()
+        <= APPROVAL_TRANSCRIPT_SERIALIZED_BYTES
+    {
+        return (Some(exposed), already_truncated);
+    }
+
+    let source = exposed
+        .strip_suffix(APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX)
+        .unwrap_or(&exposed);
+    let suffix_payload = APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX
+        .chars()
+        .map(json_payload_bytes)
+        .sum::<usize>();
+    let mut available = APPROVAL_TRANSCRIPT_SERIALIZED_BYTES
+        .saturating_sub(2)
+        .saturating_sub(suffix_payload);
+    let mut boundary = 0;
+    for (offset, character) in source.char_indices() {
+        let bytes = json_payload_bytes(character);
+        if bytes > available {
+            break;
+        }
+        available -= bytes;
+        boundary = offset + character.len_utf8();
+    }
+    let mut bounded = source[..boundary].to_string();
+    bounded.push_str(APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX);
+    debug_assert!(
+        serde_json::to_vec(&bounded)
+            .expect("serializing a string cannot fail")
+            .len()
+            <= APPROVAL_TRANSCRIPT_SERIALIZED_BYTES
+    );
+    (Some(bounded), true)
+}
+
+#[derive(Default)]
+struct WaiterLeaseState {
+    next_id: AtomicU64,
+    active: Mutex<HashMap<String, HashMap<u64, ()>>>,
+}
+
+/// A transport-owned hold observation lease. Dropping it is idempotent and
+/// only releases the exact token that created it.
+pub struct WaiterLease {
+    handle: String,
+    lease_id: u64,
+    state: Weak<WaiterLeaseState>,
+}
+
+impl WaiterLease {
+    pub fn release_once(&mut self) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        let Ok(mut active) = state.active.lock() else {
+            return;
+        };
+        if let Some(tokens) = active.get_mut(&self.handle) {
+            tokens.remove(&self.lease_id);
+            if tokens.is_empty() {
+                active.remove(&self.handle);
+            }
+        }
+        self.state = Weak::new();
+    }
+}
+
+impl Drop for WaiterLease {
+    fn drop(&mut self) {
+        self.release_once();
+    }
 }
 
 impl ApprovalRegistry {
@@ -252,6 +350,8 @@ impl ApprovalRegistry {
         let mut items = HashMap::new();
         let mut recovered = Vec::new();
         for mut row in rows {
+            row.result_stdout = bound_approval_transcript(row.result_stdout).0;
+            row.result_stderr = bound_approval_transcript(row.result_stderr).0;
             if row.status == ApprovalStatus::Approving {
                 row.status = ApprovalStatus::ExecFailed;
                 row.decided_unix = Some(now);
@@ -266,6 +366,7 @@ impl ApprovalRegistry {
             Self {
                 items,
                 notifiers: HashMap::new(),
+                leases: Arc::new(WaiterLeaseState::default()),
             },
             recovered,
         )
@@ -280,6 +381,43 @@ impl ApprovalRegistry {
         notify
     }
 
+    /// Register a waiter before an approval mutation. The notifier and lease
+    /// are created under the same registry lock, so retention cannot remove a
+    /// row between authorization and observation.
+    pub fn register_waiter(&mut self, handle: &str) -> Option<(Arc<Notify>, WaiterLease)> {
+        if !self.items.contains_key(handle) {
+            return None;
+        }
+        let notify = self
+            .notifiers
+            .entry(handle.to_string())
+            .or_insert_with(|| Arc::new(Notify::new()))
+            .clone();
+        let lease_id = self.leases.next_id.fetch_add(1, Ordering::Relaxed);
+        let mut active = self.leases.active.lock().ok()?;
+        active
+            .entry(handle.to_string())
+            .or_default()
+            .insert(lease_id, ());
+        Some((
+            notify,
+            WaiterLease {
+                handle: handle.to_string(),
+                lease_id,
+                state: Arc::downgrade(&self.leases),
+            },
+        ))
+    }
+
+    pub fn active_waiters(&self, handle: &str) -> usize {
+        self.leases
+            .active
+            .lock()
+            .ok()
+            .and_then(|active| active.get(handle).map(HashMap::len))
+            .unwrap_or(0)
+    }
+
     pub fn get(&self, handle: &str) -> Option<&Approval> {
         self.items.get(handle)
     }
@@ -292,6 +430,23 @@ impl ApprovalRegistry {
 
     pub fn notifier(&self, handle: &str) -> Option<Arc<Notify>> {
         self.notifiers.get(handle).cloned()
+    }
+
+    /// Obtain the notifier for an existing hold, creating it when the row has
+    /// none. `from_rows` rebuilds the registry without notifiers, so every hold
+    /// recovered across a restart needs one minted on first wait; without this
+    /// a waiter parks on a notifier nobody wakes. Returns `None` for an unknown
+    /// handle so a caller cannot mint state for a row that does not exist.
+    pub fn notifier_or_create(&mut self, handle: &str) -> Option<Arc<Notify>> {
+        if !self.items.contains_key(handle) {
+            return None;
+        }
+        Some(
+            self.notifiers
+                .entry(handle.to_string())
+                .or_insert_with(|| Arc::new(Notify::new()))
+                .clone(),
+        )
     }
 
     /// All holds, newest first.
@@ -497,6 +652,7 @@ impl ApprovalRegistry {
             .filter(|a| {
                 a.status.is_decided()
                     && now.saturating_sub(a.decided_unix.unwrap_or(a.created_unix)) > retention_secs
+                    && self.active_waiters(&a.handle) == 0
             })
             .map(|a| a.handle.clone())
             .collect();
@@ -644,6 +800,55 @@ mod tests {
         let (reg, recovered) = ApprovalRegistry::from_rows(vec![a], 500);
         assert_eq!(recovered, vec!["h1".to_string()]);
         assert_eq!(reg.get("h1").unwrap().status, ApprovalStatus::ExecFailed);
+    }
+
+    #[test]
+    fn restarted_hold_registers_and_releases_a_new_waiter() {
+        let (mut registry, recovered) =
+            ApprovalRegistry::from_rows(vec![held("h1", 100, 3600)], 500);
+        assert!(recovered.is_empty());
+        assert!(registry.notifier("h1").is_none());
+
+        let (notifier, lease) = registry.register_waiter("h1").expect("known hold");
+        assert!(Arc::ptr_eq(
+            &notifier,
+            &registry.notifier("h1").expect("notifier re-registered")
+        ));
+        assert_eq!(registry.active_waiters("h1"), 1);
+        drop(lease);
+        assert_eq!(registry.active_waiters("h1"), 0);
+    }
+
+    #[test]
+    fn transcript_bound_counts_json_escapes_and_utf8_after_redaction() {
+        let pattern = "\"\\\n\u{0001}é界";
+        let input = pattern.repeat(APPROVAL_TRANSCRIPT_SERIALIZED_BYTES / pattern.len() + 1);
+        let (bounded, truncated) = bound_approval_transcript(Some(input));
+        let bounded = bounded.expect("transcript remains present");
+
+        assert!(truncated);
+        assert_eq!(
+            bounded
+                .matches(APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX)
+                .count(),
+            1
+        );
+        assert!(bounded.ends_with(APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX));
+        assert!(
+            serde_json::to_vec(&bounded).unwrap().len() <= APPROVAL_TRANSCRIPT_SERIALIZED_BYTES
+        );
+        assert!(std::str::from_utf8(bounded.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn transcript_bound_is_stable_when_loaded_again() {
+        let input = "\\\"\n".repeat(APPROVAL_TRANSCRIPT_SERIALIZED_BYTES);
+        let (first, first_truncated) = bound_approval_transcript(Some(input));
+        let (second, second_truncated) = bound_approval_transcript(first.clone());
+
+        assert!(first_truncated);
+        assert!(second_truncated);
+        assert_eq!(second, first);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::server::admin::handle_admin_request;
+use crate::server::admin::handle_admin_request_for_test;
 use crate::server::execute::execute_command;
 use crate::server::wire::{
     AdminRequest, AdminResponse, CallerIdentity, ExecuteRequest, GateStatus, VerbInvocation,
@@ -654,7 +654,7 @@ async fn verb_list_reports_staleness_corrected_trust_and_provenance() {
     .unwrap();
     cfg.state.verbs = Arc::new(RwLock::new(catalog));
 
-    let response = handle_admin_request(
+    let response = handle_admin_request_for_test(
         &cfg,
         &CallerIdentity::UnixAdmin { uid: 777 },
         AdminRequest::VerbList,
@@ -706,7 +706,7 @@ verbs:
         .unwrap(),
     ));
 
-    let response = handle_admin_request(
+    let response = handle_admin_request_for_test(
         &cfg,
         &CallerIdentity::Unix { uid: 1001 },
         AdminRequest::VerbList,
@@ -735,7 +735,7 @@ verbs:
     }
     .requires_admin_token());
     assert!(matches!(
-        handle_admin_request(
+        handle_admin_request_for_test(
             &cfg,
             &CallerIdentity::UnixAdmin { uid: 777 },
             AdminRequest::VerbList,
@@ -836,7 +836,7 @@ async fn verb_amend_replaces_the_expected_definition_and_preserves_the_catalog()
     cfg.state.verbs = Arc::new(RwLock::new(catalog));
     let operator = CallerIdentity::UnixAdmin { uid: 777 };
 
-    let response = handle_admin_request(
+    let response = handle_admin_request_for_test(
         &cfg,
         &operator,
         AdminRequest::VerbAmend {
@@ -875,7 +875,7 @@ async fn verb_amend_rejects_a_stale_digest_without_writing() {
     replacement.description = "Stale replacement".to_string();
     cfg.state.verbs = Arc::new(RwLock::new(catalog));
 
-    let response = handle_admin_request(
+    let response = handle_admin_request_for_test(
         &cfg,
         &CallerIdentity::UnixAdmin { uid: 777 },
         AdminRequest::VerbAmend {
@@ -904,7 +904,7 @@ async fn verb_amend_rejects_invalid_or_generated_candidates_without_writing() {
 
     let mut invalid = current.clone();
     invalid.params.get_mut("target").unwrap().pattern = "[a-z]+".to_string();
-    let response = handle_admin_request(
+    let response = handle_admin_request_for_test(
         &cfg,
         &operator,
         AdminRequest::VerbAmend {
@@ -919,7 +919,7 @@ async fn verb_amend_rejects_invalid_or_generated_candidates_without_writing() {
 
     let mut generated = current;
     generated.auto_promoted = true;
-    let response = handle_admin_request(
+    let response = handle_admin_request_for_test(
         &cfg,
         &operator,
         AdminRequest::VerbAmend {
@@ -992,7 +992,7 @@ async fn preview_digest_round_trip_installs_the_exact_reviewed_candidate() {
     let (_dir, catalog) = file_backed_catalog();
     cfg.state.verbs = Arc::new(RwLock::new(catalog));
 
-    let response = handle_admin_request(
+    let response = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::VerbCreate {
@@ -1017,7 +1017,7 @@ async fn preview_digest_round_trip_installs_the_exact_reviewed_candidate() {
 
     let _policy = install_static_synthesis_policy(&mut cfg, "allow");
 
-    let response = handle_admin_request(
+    let response = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::VerbCreateFromPreview {
@@ -1057,7 +1057,7 @@ async fn from_preview_rejects_unknown_and_malformed_digests() {
         uid: cfg.config.daemon_uid,
     };
 
-    let response = handle_admin_request(
+    let response = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::VerbCreateFromPreview {
@@ -1073,7 +1073,7 @@ async fn from_preview_rejects_unknown_and_malformed_digests() {
         "unhelpful unknown-digest error: {message}"
     );
 
-    let response = handle_admin_request(
+    let response = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::VerbCreateFromPreview {
@@ -1099,7 +1099,7 @@ async fn evaluator_admission_denial_prevents_preview_installation() {
     let (_dir, catalog) = file_backed_catalog();
     cfg.state.verbs = Arc::new(RwLock::new(catalog));
 
-    let preview = handle_admin_request(
+    let preview = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::VerbCreate {
@@ -1119,7 +1119,7 @@ async fn evaluator_admission_denial_prevents_preview_installation() {
     };
 
     let _policy = install_static_synthesis_policy(&mut cfg, "deny");
-    let response = handle_admin_request(
+    let response = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::VerbCreateFromPreview { digest },
@@ -1147,7 +1147,7 @@ async fn nonfinite_synthesis_preflight_fails_explicitly_before_storage() {
     let (_dir, catalog) = file_backed_catalog();
     cfg.state.verbs = Arc::new(RwLock::new(catalog));
 
-    let preview = handle_admin_request(
+    let preview = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::VerbCreate {
@@ -1165,7 +1165,7 @@ async fn nonfinite_synthesis_preflight_fails_explicitly_before_storage() {
     else {
         panic!("expected preview candidate, got {preview:?}");
     };
-    let response = handle_admin_request(
+    let response = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::VerbCreateFromPreview { digest },
@@ -1222,7 +1222,7 @@ async fn rejected_direct_create_leaves_a_pending_hold_and_catalog_unchanged() {
     let handle = held.handle.expect("irreversible verb creates a hold");
     assert_eq!(held.status, Some(GateStatus::Held));
 
-    let response = handle_admin_request(
+    let response = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::VerbCreate {
@@ -1263,7 +1263,7 @@ async fn gate_feedback_threads_into_the_next_synthesis_request() {
 
     // First attempt: the model proposes an overbroad pattern and the safety
     // gate rejects it before anything touches the catalog.
-    let response = handle_admin_request(
+    let response = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::VerbCreate {
@@ -1288,7 +1288,7 @@ async fn gate_feedback_threads_into_the_next_synthesis_request() {
 
     // Retry with the complaint threaded: the stub only corrects the shape when
     // the complaint reaches the synthesis request body.
-    let response = handle_admin_request(
+    let response = handle_admin_request_for_test(
         &cfg,
         &daemon,
         AdminRequest::VerbCreate {

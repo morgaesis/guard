@@ -2,7 +2,7 @@ use super::{
     color_enabled_for_stderr, color_enabled_for_stdout, format_timestamp, paint, print_json,
     AccessCommands, AnsiColor, ApiCommands, ApprovalCommands, ConfigCommands, McpCommands,
     VerbCommands, VerbCoverageCommands, EXIT_GUARD_ACCESS_DECISION_FAILED, EXIT_GUARD_DENIED,
-    EXIT_GUARD_ERROR, EXIT_GUARD_HELD, JSON_SCHEMA_VERSION,
+    EXIT_GUARD_ERROR, EXIT_GUARD_HELD, EXIT_GUARD_INVALID_USAGE, JSON_SCHEMA_VERSION,
 };
 use crate::{client_config, daemon_client, defaults, mcp, server};
 use anyhow::{Context, Result};
@@ -304,6 +304,25 @@ fn print_access_request_guidance(response: &server::ExecuteResponse) {
     }
 }
 
+/// The held banner, rendered identically wherever a command comes back held.
+/// It says what did not happen (nothing ran), what an approval does (arms the
+/// snapshot), and the one command that then runs it, so a caller reading the
+/// banner never has to infer the second step.
+fn print_held_banner(response: &server::ExecuteResponse) {
+    let color = color_enabled_for_stderr();
+    let handle = response.handle.clone().unwrap_or_default();
+    eprintln!(
+        "{} for operator approval: {}",
+        paint("HELD", AnsiColor::Yellow, color),
+        response.reason
+    );
+    eprintln!("  handle:  {}", handle);
+    print_access_request_guidance(response);
+    print_verb_guidance(response);
+    eprintln!("  result:  not executed; approval arms it, you then resume it");
+    eprintln!("  resume:  guard approval resume {}", handle);
+}
+
 /// The authority behind a denial, as the caller needs to act on it. This is a
 /// narrowing of the daemon's decision source: the evaluator's two spellings (a
 /// fresh model call and a cached verdict from one) are the same authority, and
@@ -367,7 +386,6 @@ fn print_deny_source(response: &server::ExecuteResponse) {
         eprintln!("  {line}");
     }
 }
-
 pub(crate) async fn run_exec(
     binary: String,
     args: Vec<String>,
@@ -468,18 +486,8 @@ pub(crate) async fn run_exec(
     }
     match resp.status {
         Some(server::GateStatus::Held) => {
-            let color = color_enabled_for_stderr();
-            let handle = resp.handle.clone().unwrap_or_default();
-            eprintln!(
-                "{} for operator approval: {}",
-                paint("HELD", AnsiColor::Yellow, color),
-                resp.reason
-            );
-            eprintln!("  handle:  {}", handle);
-            print_access_request_guidance(&resp);
-            eprintln!("  result:  not executed until approved");
+            print_held_banner(&resp);
             print_coverage(&resp.coverage);
-            print_verb_guidance(&resp);
             // Not executed; exit non-zero so callers do not treat it as success.
             std::process::exit(EXIT_GUARD_HELD);
         }
@@ -737,13 +745,106 @@ fn render_approval(item: &server::ApprovalSummary, include_transcript: bool) {
     }
 }
 
+/// Refuse consequence waits when the daemon does not advertise the exact
+/// capability token. Older daemons may still serve ordinary access reads; the
+/// caller gets an explicit polling fallback and this command sends no wait RPC.
+async fn ensure_approval_wait_supported(
+    client: &daemon_client::Client,
+    source: EndpointSource,
+    handle: &str,
+) -> Result<()> {
+    let response = client
+        .send_admin(server::AdminRequest::Ping)
+        .await
+        .map_err(|error| describe_connect_failure(error, client, source))?;
+    if matches!(
+        response,
+        server::AdminResponse::Ping { capabilities, .. }
+            if capabilities.iter().any(|capability| capability == "approval-consequences-v1")
+    ) {
+        return Ok(());
+    }
+    eprintln!(
+        "--wait is unavailable on this daemon; poll with 'guard approval show {handle}' instead."
+    );
+    std::process::exit(EXIT_GUARD_ERROR);
+}
+
+/// Block on the daemon until the hold is armed, decided, or the wait elapses,
+/// then return the summary. Arming is not terminal, so the caller reads
+/// `status` to tell "armed, yours to resume" from "already finished".
+async fn wait_for_approval(
+    client: &daemon_client::Client,
+    source: EndpointSource,
+    handle: &str,
+    wait_secs: u64,
+) -> Result<server::ApprovalSummary> {
+    ensure_approval_wait_supported(client, source, handle).await?;
+    match client
+        .send_admin(server::AdminRequest::ApprovalWait {
+            handle: handle.to_string(),
+            timeout_secs: wait_secs,
+        })
+        .await
+        .map_err(|error| describe_connect_failure(error, client, source))?
+    {
+        server::AdminResponse::ApprovalWait { wait } => Ok(wait.item),
+        server::AdminResponse::Error { message } => Err(anyhow::anyhow!(message)),
+        other => Err(anyhow::anyhow!("unexpected admin response: {other:?}")),
+    }
+}
+
+/// Report what a wait found without executing anything, and exit accordingly:
+/// a hold that reached a terminal state has an answer (`0`), while armed and
+/// still-pending both mean the command has not executed (`127`).
+fn report_wait_outcome(item: &server::ApprovalSummary, json: bool) -> Result<()> {
+    if json {
+        print_json(&serde_json::json!({
+            "schema_version": JSON_SCHEMA_VERSION,
+            "type": "approval",
+            "item": item,
+        }))?;
+    } else {
+        render_approval(item, true);
+        if item.status == "armed" {
+            eprintln!(
+                "armed; the requester runs `guard approval resume {}`",
+                item.handle
+            );
+        } else if item.status == "pending" {
+            eprintln!("still held; no operator decision yet");
+        }
+    }
+    if item.status == "armed" || item.status == "pending" {
+        std::process::exit(EXIT_GUARD_HELD);
+    }
+    Ok(())
+}
+
 pub(crate) async fn handle_approval(command: ApprovalCommands) -> Result<()> {
     let (socket, request, json, include_transcript) = match command {
         ApprovalCommands::List { socket, json } => {
             (socket, server::AdminRequest::ApprovalList, json, false)
         }
+        ApprovalCommands::Resume {
+            handle,
+            wait,
+            socket,
+            json,
+        } => return handle_resume(socket, handle, wait, json).await,
         ApprovalCommands::Show {
             handle,
+            wait: Some(wait_secs),
+            socket,
+            json,
+        } => {
+            let (client, source) = gate_client(socket, json)?;
+            let item = wait_for_approval(&client, source, &handle, wait_secs).await?;
+            return report_wait_outcome(&item, json);
+        }
+        ApprovalCommands::Show {
+            handle,
+            wait: None,
             socket,
             json,
         } => (
@@ -841,11 +942,23 @@ fn resume_json_response(
     })
 }
 
+/// `guard resume` predates `guard approval resume` and still works. The notice
+/// goes only to a terminal: a script that pipes the output is not the audience
+/// for a spelling change, and mixing it into captured output would be noise.
+pub(crate) fn warn_resume_alias_deprecated() {
+    if std::io::stderr().is_terminal() {
+        eprintln!("note: `guard resume` is now `guard approval resume`");
+    }
+}
+
 /// Resume one held command as the kernel-authenticated requester and render its
-/// captured output and exit status.
+/// captured output and exit status. With `--wait`, block for the operator to
+/// arm it first; this is the verb that runs the command, so the blocking form
+/// says so in its name.
 pub(crate) async fn handle_resume(
     socket: Option<String>,
     handle: String,
+    wait: Option<u64>,
     json: bool,
 ) -> Result<()> {
     let config = load_client_config(json)?;
@@ -853,6 +966,19 @@ pub(crate) async fn handle_resume(
     let mut client = daemon_client::Client::new(socket_path, tcp_port);
     if let Some(token) = config.auth_token {
         client = client.with_auth(token);
+    }
+    if let Some(wait_secs) = wait {
+        let item = wait_for_approval(&client, source, &handle, wait_secs).await?;
+        if item.status != "armed" {
+            // Nothing to resume: either no decision landed inside the wait, or
+            // the hold reached a terminal state without this invocation
+            // running it. Both mean the command did not execute here.
+            report_wait_outcome(&item, json)?;
+            if !json {
+                eprintln!("nothing to resume: the hold is {}", item.status);
+            }
+            std::process::exit(EXIT_GUARD_HELD);
+        }
     }
     let response = client
         .send_admin(server::AdminRequest::Resume {
@@ -1605,18 +1731,27 @@ pub(crate) async fn handle_access(command: AccessCommands) -> Result<()> {
             yes,
             once,
             uses,
+            wait,
+            dry_run,
             socket,
             json,
         } => {
             let uses = if once { Some(1) } else { uses };
+            if dry_run {
+                return handle_access_approve_dry_run(requests, uses, socket, json).await;
+            }
             if !json && !yes && access_review_is_interactive() {
-                return handle_access_approve_interactive(requests, uses, socket).await;
+                return handle_access_approve_interactive(requests, uses, wait, socket).await;
+            }
+            if let Some(wait_secs) = wait {
+                return handle_access_approve_wait(requests, uses, wait_secs, socket, json).await;
             }
             (
                 socket,
                 server::AdminRequest::AccessApprove {
                     handles: requests,
                     uses,
+                    wait_secs: None,
                 },
                 json,
             )
@@ -1707,8 +1842,10 @@ pub(crate) async fn handle_access(command: AccessCommands) -> Result<()> {
             }
             for item in items {
                 println!(
-                    "{} requester={} target={} scope={} expiry={} uses={} state={} next={}",
+                    "{} kind={} consequence={} requester={} target={} scope={} expiry={} uses={} state={} next={}",
                     item.reference,
+                    item.kind,
+                    consequence_text(&item.consequence, &item.reference),
                     item.requester,
                     item.target,
                     if item.effective_scope.is_empty() {
@@ -1734,7 +1871,7 @@ pub(crate) async fn handle_access(command: AccessCommands) -> Result<()> {
         server::AdminResponse::AccessItem { item } => {
             println!("{}", access_item_human(&item, raw_matcher));
         }
-        server::AdminResponse::AccessDecisions { items } => {
+        server::AdminResponse::AccessDecisions { items, .. } => {
             print_access_decision_lines(&items);
         }
         server::AdminResponse::SessionStatus {
@@ -1771,11 +1908,13 @@ fn access_json_response(response: &server::AdminResponse) -> Result<serde_json::
         server::AdminResponse::Error { message } => return Err(message.clone()),
         other => return Err(format!("unexpected access response: {other:?}")),
     };
-    Ok(serde_json::json!({
+    let mut document = serde_json::json!({
         "schema_version": JSON_SCHEMA_VERSION,
         "type": kind,
         "response": response,
-    }))
+    });
+    normalize_legacy_consequence_json(&mut document);
+    Ok(document)
 }
 
 fn render_access_status(
@@ -1856,7 +1995,7 @@ fn any_decision_failed(items: &[server::AccessDecisionResult]) -> bool {
 fn access_decision_failed(response: &server::AdminResponse) -> bool {
     matches!(
         response,
-        server::AdminResponse::AccessDecisions { items } if any_decision_failed(items)
+        server::AdminResponse::AccessDecisions { items, .. } if any_decision_failed(items)
     )
 }
 
@@ -1889,8 +2028,12 @@ fn access_item_human(item: &server::AccessItem, raw: bool) -> String {
         format!("target: {}", card_text(&item.target)),
         format!("scope: {}", card_text(&scope)),
         format!("expiry: {expiry}"),
-        format!("uses: {}", pending_use_display(item)),
     ];
+    lines.push(format!("uses: {}", pending_use_display(item)));
+    lines.push(format!(
+        "consequence: {}",
+        card_text(consequence_text(&item.consequence, &item.reference))
+    ));
     if let Some(intent) = &item.intent {
         lines.push(format!("intent: {}", card_text(intent)));
     }
@@ -1922,7 +2065,9 @@ fn access_item_human(item: &server::AccessItem, raw: bool) -> String {
     lines.join("\n")
 }
 
-fn use_budget_display(use_policy: &str, remaining_uses: Option<u64>) -> String {
+/// The machine-facing use-budget field. Always carries a value so the decision
+/// line keeps its fixed shape for parsers.
+fn use_budget_field(use_policy: &str, remaining_uses: Option<u64>) -> String {
     if use_policy == "bounded" {
         remaining_uses
             .map(|value| value.to_string())
@@ -1932,6 +2077,9 @@ fn use_budget_display(use_policy: &str, remaining_uses: Option<u64>) -> String {
     }
 }
 
+fn use_budget_display(use_policy: &str, remaining_uses: Option<u64>) -> String {
+    use_budget_field(use_policy, remaining_uses)
+}
 /// Use budget for a detail view. `unselected` names the state of the record but
 /// answers none of the question an operator is actually asking, so a pending
 /// item shows the budget a bare `guard access approve` would apply and how to
@@ -2160,13 +2308,16 @@ fn coverage_cell_display(cell: &serde_json::Value) -> Option<String> {
 
 fn print_access_decision_lines(items: &[server::AccessDecisionResult]) {
     for item in items {
+        // `uses=` keeps its existing shape for parsers: this line is the
+        // machine-readable decision record, so the field is always present.
         println!(
-            "{} success={} state={} target={} uses={} message={}",
+            "{} success={} state={} target={} uses={} consequence={} message={}",
             item.request,
             item.success,
             item.state,
             item.target.as_deref().unwrap_or("none"),
-            use_budget_display(&item.use_policy, item.remaining_uses),
+            use_budget_field(&item.use_policy, item.remaining_uses),
+            consequence_text(&item.consequence, &item.request),
             item.message,
         );
     }
@@ -2233,6 +2384,144 @@ fn consequence_color(consequence: &str) -> AnsiColor {
     }
 }
 
+/// What approving one reference does. The operator never chooses this: it is a
+/// property of the object, derived by the daemon and stated by the CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsequenceClass {
+    /// Adds authority to a live access session. Nothing executes.
+    Grant,
+    /// Arms one frozen snapshot. Nothing executes until the requester resumes.
+    Arm,
+    /// Releases a request already parked and waiting. It proceeds immediately.
+    Release,
+}
+
+const LEGACY_CONSEQUENCE_SOURCE: &str = "legacy_prefix_fallback";
+
+fn legacy_consequence(reference: &str) -> &'static str {
+    if reference.starts_with("gr-") {
+        server::CONSEQUENCE_GRANT
+    } else {
+        server::CONSEQUENCE_ARM
+    }
+}
+
+fn consequence_text<'a>(consequence: &'a str, reference: &str) -> &'a str {
+    if consequence.is_empty() {
+        legacy_consequence(reference)
+    } else {
+        consequence
+    }
+}
+
+fn normalize_legacy_consequence_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                normalize_legacy_consequence_json(value);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            let reference = object
+                .get("reference")
+                .or_else(|| object.get("request"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let needs_fallback = object
+                .get("consequence")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(str::is_empty);
+            if let Some(reference) = reference.filter(|_| needs_fallback) {
+                object.insert(
+                    "consequence".to_string(),
+                    serde_json::Value::String(legacy_consequence(&reference).to_string()),
+                );
+                object.insert(
+                    "consequence_source".to_string(),
+                    serde_json::Value::String(LEGACY_CONSEQUENCE_SOURCE.to_string()),
+                );
+            }
+            for value in object.values_mut() {
+                normalize_legacy_consequence_json(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The class the daemon stated, or the best available derivation when it stated
+/// none. A daemon that predates the field leaves it empty, and the reference
+/// prefix is then the only signal: `gr-` marks a grant request, and everything
+/// else is a hold. Release-class is not derivable from a reference, so an
+/// API-proxy hold from such a daemon renders as arm-class, which understates
+/// what approving it does.
+fn consequence_class(consequence: &str, reference: &str) -> ConsequenceClass {
+    match consequence_text(consequence, reference) {
+        server::CONSEQUENCE_GRANT => ConsequenceClass::Grant,
+        server::CONSEQUENCE_ARM => ConsequenceClass::Arm,
+        server::CONSEQUENCE_RELEASE => ConsequenceClass::Release,
+        _ => ConsequenceClass::Arm,
+    }
+}
+
+/// State what approving this reference does, immediately above the prompt that
+/// asks. The card above it describes the request; these lines describe the
+/// decision: what changes, who acts next, where the output lands, and when the
+/// opportunity lapses. Every server-supplied substring passes through
+/// `card_text`, as the card's own lines do.
+fn consequence_block(
+    item: &server::AccessItem,
+    effective_uses: Option<u64>,
+    class: ConsequenceClass,
+) -> Vec<String> {
+    let reference = card_text(&item.reference);
+    match class {
+        ConsequenceClass::Grant => {
+            let budget = match effective_uses {
+                None => "unlimited uses".to_string(),
+                Some(1) => "1 use".to_string(),
+                Some(count) => format!("{count} uses"),
+            };
+            vec![
+                format!(
+                    "  approve:   grants {budget} to {}; nothing runs now",
+                    card_text(&item.target)
+                ),
+                format!(
+                    "  then:      {} re-runs its own command",
+                    card_text(&item.requester)
+                ),
+            ]
+        }
+        ConsequenceClass::Arm => {
+            let mut lines = vec![
+                "  approve:   arms this frozen snapshot; nothing runs now".to_string(),
+                format!(
+                    "  then:      {} runs `guard approval resume {reference}`",
+                    card_text(&item.requester)
+                ),
+                format!(
+                    "  output:    `guard approval show {reference} --wait` prints its transcript"
+                ),
+            ];
+            // The hold's deadline is its own creation time plus its TTL and is
+            // unaffected by arming, so the line says the hold expires, not that
+            // it expires only if never resumed.
+            if let Some(expiry) = item.expires_unix {
+                lines.push(format!(
+                    "  deadline:  {}; unresumed after that, the hold expires",
+                    format_timestamp(expiry)
+                ));
+            }
+            lines
+        }
+        ConsequenceClass::Release => vec![
+            "  approve:   releases the parked API request; it proceeds immediately".to_string(),
+            "  then:      the waiting proxy client receives the response".to_string(),
+        ],
+    }
+}
+
 /// One reviewable card for the interactive approve prompt. Same facts as
 /// `access_item_human`, arranged for a person deciding rather than a script
 /// parsing: consequence classes are colored, timestamps are readable, and the
@@ -2248,7 +2537,6 @@ fn access_item_card(item: &server::AccessItem, colors: bool) -> Vec<String> {
         .expires_unix
         .map(format_timestamp)
         .unwrap_or_else(|| "none".to_string());
-    let uses = pending_use_display(item);
     let mut lines = vec![
         format!(
             "{} {}",
@@ -2277,7 +2565,11 @@ fn access_item_card(item: &server::AccessItem, colors: bool) -> Vec<String> {
         ));
     }
     lines.push(format!("  scope:     {}", card_text(&scope)));
-    lines.push(format!("  uses:      {uses}"));
+    lines.push(format!("  uses:      {}", pending_use_display(item)));
+    lines.push(format!(
+        "  consequence: {}",
+        card_text(consequence_text(&item.consequence, &item.reference))
+    ));
     lines.push(format!("  expiry:    {expiry}"));
     if let Some(reason) = &item.decided_reason {
         lines.push(format!("  reason:    {}", card_text(reason)));
@@ -2346,12 +2638,16 @@ fn prompt_access_deny_reason() -> Result<Option<String>> {
 async fn handle_access_approve_interactive(
     requests: Vec<String>,
     uses: Option<u64>,
+    wait: Option<u64>,
     socket: Option<String>,
 ) -> Result<()> {
     let config = load_client_config(false)?;
     let (socket_path, tcp_port, source) = resolve_client_endpoint_with_source(socket, &config);
     let client = admin_client(socket_path, tcp_port, &config);
     let colors = color_enabled_for_stderr();
+    if let (Some(_), Some(reference)) = (wait, requests.first()) {
+        ensure_approval_wait_supported(&client, source, reference).await?;
+    }
     let mut any_failed = false;
     let mut skipped: Vec<String> = Vec::new();
     let mut queue = requests.into_iter();
@@ -2385,33 +2681,25 @@ async fn handle_access_approve_interactive(
             skipped.push(reference);
             continue;
         }
-        // A consequence hold executes one immutable snapshot and accepts only a
-        // one-time approval; the daemon offers exactly that form.
-        let hold_only_once = item
-            .approval_options
-            .iter()
-            .all(|option| option.ends_with("--once"));
-        // Without an explicit budget the daemon applies whatever the request
-        // itself asked for, so the prompt announces that rather than assuming
-        // an unbounded approval.
-        let effective_uses = if hold_only_once {
-            Some(1)
-        } else {
-            uses.or(item.default_uses)
+        let class = consequence_class(&item.consequence, &item.reference);
+        if wait.is_some() && class == ConsequenceClass::Grant {
+            eprintln!("{}", grant_class_wait_refusal(&item));
+            std::process::exit(EXIT_GUARD_INVALID_USAGE);
+        }
+        // A hold executes one immutable snapshot, so one use is its only legal
+        // budget regardless of what the batch asked for.
+        let effective_uses = match class {
+            ConsequenceClass::Grant => uses,
+            ConsequenceClass::Arm | ConsequenceClass::Release => Some(1),
         };
-        eprintln!(
-            "an approve grants: {}",
-            match effective_uses {
-                None => "unlimited uses".to_string(),
-                Some(1) if hold_only_once => "1 use (held snapshot, one-time only)".to_string(),
-                Some(1) => "1 use".to_string(),
-                Some(n) => format!("{n} uses"),
-            }
-        );
+        for line in consequence_block(&item, effective_uses, class) {
+            eprintln!("{line}");
+        }
         let decision = match prompt_access_review_choice(&reference, colors)? {
             AccessReviewChoice::Approve => Some(server::AdminRequest::AccessApprove {
                 handles: vec![reference.clone()],
                 uses: effective_uses,
+                wait_secs: wait,
             }),
             AccessReviewChoice::Deny => Some(server::AdminRequest::AccessDeny {
                 handles: vec![reference.clone()],
@@ -2428,12 +2716,25 @@ async fn handle_access_approve_interactive(
             skipped.push(reference);
             continue;
         };
-        match client
-            .send_admin(decision)
-            .await
-            .map_err(|error| describe_connect_failure(error, &client, source))?
-        {
-            server::AdminResponse::AccessDecisions { items } => {
+        let expects_wait = matches!(
+            decision,
+            server::AdminRequest::AccessApprove {
+                wait_secs: Some(_),
+                ..
+            }
+        );
+        let response = client.send_admin(decision).await.map_err(|error| {
+            if expects_wait {
+                approval_wait_mutation_transport_error(error, &client, source, &reference)
+            } else {
+                describe_connect_failure(error, &client, source)
+            }
+        })?;
+        match response {
+            server::AdminResponse::AccessDecisions {
+                items,
+                wait: waited,
+            } => {
                 if any_decision_failed(&items) {
                     any_failed = true;
                     skipped.extend(
@@ -2444,6 +2745,17 @@ async fn handle_access_approve_interactive(
                     );
                 }
                 print_access_decision_lines(&items);
+                if expects_wait {
+                    let Some(waited) = waited else {
+                        anyhow::bail!("guard daemon returned no approval wait result");
+                    };
+                    render_approval(&waited.item, true);
+                    eprintln!("wait outcome: {}", waited.outcome);
+                    let exit = access_wait_exit_code(&waited.outcome);
+                    if exit != 0 {
+                        std::process::exit(exit);
+                    }
+                }
             }
             server::AdminResponse::Error { message } => {
                 any_failed = true;
@@ -2462,6 +2774,166 @@ async fn handle_access_approve_interactive(
     Ok(())
 }
 
+/// Print what approving each reference would do and decide nothing. The review
+/// card and the consequence block are the whole point, so they render even
+/// where the interactive review would not engage.
+async fn handle_access_approve_dry_run(
+    requests: Vec<String>,
+    uses: Option<u64>,
+    socket: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let config = load_client_config(json)?;
+    let (socket_path, tcp_port, source) = resolve_client_endpoint_with_source(socket, &config);
+    let client = admin_client(socket_path, tcp_port, &config);
+    let colors = color_enabled_for_stderr();
+    let mut items = Vec::with_capacity(requests.len());
+    for reference in requests {
+        let item = match client
+            .send_admin(server::AdminRequest::AccessShow {
+                reference: reference.clone(),
+            })
+            .await
+            .map_err(|error| describe_connect_failure(error, &client, source))?
+        {
+            server::AdminResponse::AccessItem { item } => item,
+            server::AdminResponse::Error { message } if json => {
+                exit_access_json_error(message);
+            }
+            server::AdminResponse::Error { message } => {
+                eprintln!("{reference}: {message}");
+                std::process::exit(EXIT_GUARD_ACCESS_DECISION_FAILED);
+            }
+            other => anyhow::bail!("unexpected access response: {other:?}"),
+        };
+        let class = consequence_class(&item.consequence, &item.reference);
+        let effective_uses = match class {
+            ConsequenceClass::Grant => uses,
+            ConsequenceClass::Arm | ConsequenceClass::Release => Some(1),
+        };
+        if json {
+            items.push(serde_json::json!({
+                "item": item,
+                "consequence_lines": consequence_block(&item, effective_uses, class),
+            }));
+            continue;
+        }
+        eprintln!();
+        for line in access_item_card(&item, colors) {
+            eprintln!("{line}");
+        }
+        for line in consequence_block(&item, effective_uses, class) {
+            eprintln!("{line}");
+        }
+    }
+    if json {
+        let mut document = serde_json::json!({
+            "schema_version": JSON_SCHEMA_VERSION,
+            "type": "access_approve_dry_run",
+            "items": items,
+        });
+        normalize_legacy_consequence_json(&mut document);
+        print_json(&document)?;
+    } else {
+        eprintln!();
+        eprintln!("dry run: nothing was decided");
+    }
+    Ok(())
+}
+
+/// Approve one reference and consume the one-RPC wait result. The response
+/// contains both the decision and the owned post-decision observation.
+async fn handle_access_approve_wait(
+    requests: Vec<String>,
+    uses: Option<u64>,
+    wait_secs: u64,
+    socket: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let config = load_client_config(json)?;
+    let (socket_path, tcp_port, source) =
+        resolve_client_endpoint_with_source(socket.clone(), &config);
+    let client = admin_client(socket_path, tcp_port, &config);
+    // Parse-time rules keep this to one reference.
+    let Some(reference) = requests.into_iter().next() else {
+        anyhow::bail!("no access request named");
+    };
+    ensure_approval_wait_supported(&client, source, &reference).await?;
+    let decision = client
+        .send_admin(server::AdminRequest::AccessApprove {
+            handles: vec![reference.clone()],
+            uses: uses.or(Some(1)),
+            wait_secs: Some(wait_secs),
+        })
+        .await
+        .map_err(|error| {
+            approval_wait_mutation_transport_error(error, &client, source, &reference)
+        })?;
+    let server::AdminResponse::AccessDecisions {
+        wait: Some(waited), ..
+    } = &decision
+    else {
+        if let server::AdminResponse::Error { message } = &decision {
+            if json {
+                exit_access_json_error(message.clone());
+            }
+            anyhow::bail!(message.clone());
+        }
+        anyhow::bail!("guard daemon returned no approval wait result");
+    };
+    if json {
+        let mut document = serde_json::json!({
+            "schema_version": JSON_SCHEMA_VERSION,
+            "type": "access_approval_wait",
+            "response": decision,
+        });
+        normalize_legacy_consequence_json(&mut document);
+        print_json(&document)?;
+    } else {
+        if let server::AdminResponse::AccessDecisions { items, .. } = &decision {
+            print_access_decision_lines(items);
+        }
+        render_approval(&waited.item, true);
+        eprintln!("wait outcome: {}", waited.outcome);
+    }
+    let exit = access_wait_exit_code(&waited.outcome);
+    if exit != 0 {
+        std::process::exit(exit);
+    }
+    Ok(())
+}
+
+fn access_wait_exit_code(outcome: &str) -> i32 {
+    match outcome {
+        "approved" => 0,
+        "denied" | "expired" => EXIT_GUARD_DENIED,
+        "exec_failed" => EXIT_GUARD_ERROR,
+        "armed" | "timed_out" => EXIT_GUARD_HELD,
+        _ => EXIT_GUARD_ERROR,
+    }
+}
+
+fn approval_wait_mutation_transport_error(
+    error: anyhow::Error,
+    client: &daemon_client::Client,
+    source: EndpointSource,
+    handle: &str,
+) -> anyhow::Error {
+    let error = describe_connect_failure(error, client, source);
+    anyhow::anyhow!(
+        "approval outcome unknown for {handle}: {error}. Do not retry this approval automatically; inspect `guard approval show {handle}` before taking further action."
+    )
+}
+
+/// The client's own statement that a grant cannot be waited on, quoting the
+/// daemon's wording so an operator reads one sentence either way.
+fn grant_class_wait_refusal(item: &server::AccessItem) -> String {
+    card_text(&server::grant_class_wait_refusal(
+        &item.reference,
+        &item.target,
+    ))
+}
+
 fn render_gated_response(
     resp: &server::ExecuteResponse,
     streamed: bool,
@@ -2473,17 +2945,7 @@ fn render_gated_response(
     }
     match resp.status {
         Some(server::GateStatus::Held) => {
-            let color = color_enabled_for_stderr();
-            let handle = resp.handle.clone().unwrap_or_default();
-            eprintln!(
-                "{} for operator approval: {}",
-                paint("HELD", AnsiColor::Yellow, color),
-                resp.reason
-            );
-            eprintln!("  handle:  {}", handle);
-            print_access_request_guidance(resp);
-            print_verb_guidance(resp);
-            eprintln!("  result:  not executed until approved");
+            print_held_banner(resp);
             print_coverage(&resp.coverage);
             std::process::exit(EXIT_GUARD_HELD);
         }
@@ -2878,6 +3340,7 @@ pub(crate) async fn handle_status(socket: Option<String>, json: bool) -> Result<
             uptime_secs,
             mode,
             dry_run,
+            ..
         }) => (version, uptime_secs, mode, dry_run),
         Ok(server::AdminResponse::Error { message }) => {
             eprintln!("Server: ping refused - {}", message);
@@ -3570,18 +4033,21 @@ mod tests {
                     target: Some("session:one".to_string()),
                     remaining_uses: Some(1),
                     use_policy: "bounded".to_string(),
+                    consequence: server::CONSEQUENCE_GRANT.to_string(),
                     message: "approved".to_string(),
                 },
                 server::AccessDecisionResult {
-                    request: "request-failed".to_string(),
+                    request: "hold-failed".to_string(),
                     success: false,
                     state: "failed".to_string(),
                     target: None,
                     remaining_uses: None,
                     use_policy: "unavailable".to_string(),
+                    consequence: String::new(),
                     message: "not found".to_string(),
                 },
             ],
+            wait: None,
         };
         let document = access_json_response(&response).unwrap();
         assert_eq!(document["schema_version"], JSON_SCHEMA_VERSION);
@@ -3589,6 +4055,11 @@ mod tests {
         assert_eq!(
             document["response"]["items"].as_array().map(Vec::len),
             Some(2)
+        );
+        assert_eq!(document["response"]["items"][1]["consequence"], "arm");
+        assert_eq!(
+            document["response"]["items"][1]["consequence_source"],
+            LEGACY_CONSEQUENCE_SOURCE
         );
         assert!(access_decision_failed(&response));
 
@@ -3600,8 +4071,10 @@ mod tests {
                 target: None,
                 remaining_uses: None,
                 use_policy: "unavailable".to_string(),
+                consequence: String::new(),
                 message: "not found".to_string(),
             }],
+            wait: None,
         };
         assert!(access_decision_failed(&all_failed));
 
@@ -3613,10 +4086,34 @@ mod tests {
                 target: Some("session:one".to_string()),
                 remaining_uses: None,
                 use_policy: "unlimited".to_string(),
+                consequence: server::CONSEQUENCE_GRANT.to_string(),
                 message: "approved".to_string(),
             }],
+            wait: None,
         };
         assert!(!access_decision_failed(&all_succeeded));
+    }
+
+    #[test]
+    fn legacy_consequence_fallback_never_infers_release() {
+        for (reference, expected) in [("gr-legacy", "grant"), ("hold-legacy", "arm")] {
+            let mut value = serde_json::json!({
+                "reference": reference,
+                "consequence": ""
+            });
+            normalize_legacy_consequence_json(&mut value);
+            assert_eq!(value["consequence"], expected);
+            assert_eq!(value["consequence_source"], LEGACY_CONSEQUENCE_SOURCE);
+            assert_ne!(value["consequence"], "release");
+        }
+
+        let mut explicit = serde_json::json!({
+            "reference": "hold-explicit",
+            "consequence": "release"
+        });
+        normalize_legacy_consequence_json(&mut explicit);
+        assert_eq!(explicit["consequence"], "release");
+        assert!(explicit.get("consequence_source").is_none());
     }
 
     #[test]
@@ -3734,6 +4231,7 @@ mod tests {
             expires_unix: Some(1_753_000_000),
             remaining_uses: None,
             use_policy: "unselected".to_string(),
+            consequence: server::CONSEQUENCE_GRANT.to_string(),
             default_use_policy: Some("unlimited".to_string()),
             default_uses: None,
             state: "pending".to_string(),
@@ -3944,6 +4442,7 @@ mod tests {
             expires_unix: None,
             remaining_uses: None,
             use_policy: "unselected".to_string(),
+            consequence: server::CONSEQUENCE_GRANT.to_string(),
             default_use_policy: None,
             default_uses: None,
             state: "pending".to_string(),

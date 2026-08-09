@@ -1,4 +1,4 @@
-use crate::server::admin::handle_admin_request;
+use crate::server::admin::handle_admin_request_for_test;
 #[cfg(windows)]
 use crate::server::binary_path_candidates;
 #[cfg(unix)]
@@ -1365,7 +1365,7 @@ async fn deterministic_safe_allow_uses_no_evaluator_admission() {
     let counters = cfg.state.command_admission.snapshot();
     assert_eq!(counters.handler_admitted, 1);
     assert_eq!(counters.evaluator_attempted, 0);
-    let status = handle_admin_request(
+    let status = handle_admin_request_for_test(
         &cfg,
         &CallerIdentity::UnixAdmin {
             uid: cfg.config.daemon_uid,
@@ -1493,14 +1493,15 @@ async fn audit_verify_and_tail_admin_rpcs() {
     let admin = CallerIdentity::UnixAdmin {
         uid: cfg.config.daemon_uid,
     };
-    match handle_admin_request(&cfg, &admin, AdminRequest::AuditVerify).await {
+    match handle_admin_request_for_test(&cfg, &admin, AdminRequest::AuditVerify).await {
         AdminResponse::AuditVerification { verification, .. } => {
             assert!(verification.intact, "{verification:?}");
             assert_eq!(verification.records, 1);
         }
         other => panic!("expected AuditVerification, got {other:?}"),
     }
-    match handle_admin_request(&cfg, &admin, AdminRequest::AuditTail { limit: None }).await {
+    match handle_admin_request_for_test(&cfg, &admin, AdminRequest::AuditTail { limit: None }).await
+    {
         AdminResponse::AuditRecords { items, .. } => {
             assert_eq!(items.len(), 1);
             assert_eq!(items[0]["kind"], "ALLOWED");
@@ -1512,7 +1513,7 @@ async fn audit_verify_and_tail_admin_rpcs() {
     let outsider = CallerIdentity::Unix {
         uid: cfg.config.daemon_uid.wrapping_add(1),
     };
-    match handle_admin_request(&cfg, &outsider, AdminRequest::AuditVerify).await {
+    match handle_admin_request_for_test(&cfg, &outsider, AdminRequest::AuditVerify).await {
         AdminResponse::Error { message } => {
             assert!(message.contains("lacks operator authority"), "{message}")
         }
@@ -1658,7 +1659,7 @@ async fn secret_list_is_per_user_namespaced() {
     let daemon = CallerIdentity::UnixAdmin { uid: 777 };
 
     // Both users store the SAME key name with different values.
-    let set_a = handle_admin_request(
+    let set_a = handle_admin_request_for_test(
         &cfg,
         &user_a,
         AdminRequest::SecretSet {
@@ -1669,7 +1670,7 @@ async fn secret_list_is_per_user_namespaced() {
     .await;
     assert!(matches!(set_a, AdminResponse::Ok));
 
-    let set_b = handle_admin_request(
+    let set_b = handle_admin_request_for_test(
         &cfg,
         &user_b,
         AdminRequest::SecretSet {
@@ -1681,7 +1682,7 @@ async fn secret_list_is_per_user_namespaced() {
     assert!(matches!(set_b, AdminResponse::Ok));
 
     // Each user sees only their own namespace.
-    let list_a = handle_admin_request(&cfg, &user_a, AdminRequest::SecretList).await;
+    let list_a = handle_admin_request_for_test(&cfg, &user_a, AdminRequest::SecretList).await;
     match list_a {
         AdminResponse::SecretList { keys } => {
             let ours: Vec<_> = keys.iter().filter(|k| *k == &key).collect();
@@ -1691,7 +1692,7 @@ async fn secret_list_is_per_user_namespaced() {
     }
 
     // Daemon aggregate view includes both entries, annotated with uid.
-    let list_daemon = handle_admin_request(&cfg, &daemon, AdminRequest::SecretList).await;
+    let list_daemon = handle_admin_request_for_test(&cfg, &daemon, AdminRequest::SecretList).await;
     match list_daemon {
         AdminResponse::SecretList { keys } => {
             let ours: Vec<_> = keys.iter().filter(|k| *k == &key).collect();
@@ -1701,7 +1702,7 @@ async fn secret_list_is_per_user_namespaced() {
     }
 
     // user B's delete touches only their own namespace.
-    let del_b = handle_admin_request(
+    let del_b = handle_admin_request_for_test(
         &cfg,
         &user_b,
         AdminRequest::SecretDelete { key: key.clone() },
@@ -1730,7 +1731,7 @@ async fn secret_list_is_per_user_namespaced() {
     );
 
     // Cleanup.
-    let _ = handle_admin_request(
+    let _ = handle_admin_request_for_test(
         &cfg,
         &user_a,
         AdminRequest::SecretDelete { key: key.clone() },

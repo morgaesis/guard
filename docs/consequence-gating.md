@@ -86,14 +86,16 @@ swap, or caller environment change from rewriting what the operator reviews.
 guard access list
 guard access show <request>
 guard access approve <request> --once
-guard resume <request>
+guard access approve <request> --once --wait=300
+guard approval resume <request>
 guard approval show <request>
+guard approval show <request> --wait=300
 guard access deny <request> --reason 'outside the approved task'
 ```
 
 A consequence hold accepts only `--once`. Approval arms its immutable snapshot
 without executing it as the operator. The kernel-authenticated requester runs
-the snapshot with `guard resume <request>`, which returns its stdout, stderr,
+the snapshot with `guard approval resume <request>`, which returns its stdout, stderr,
 and exit status. Each hold can be resumed once. Bounded copies of stdout and
 stderr remain in durable approval state and identify truncation in their stored
 text. `guard approval show <request>` retrieves that terminal transcript if the
@@ -101,6 +103,24 @@ resume response is lost. The requester can add context with `guard approval
 note` or cancel an unexecuted hold with `guard approval withdraw`. Ordinary and
 N-use approval apply to authority requests created from denied or proactive
 access intent, not to held execution snapshots.
+
+`guard access approve --wait=<seconds> <request>` accepts one hold and a bound
+from 1 through 3600 seconds. It checks daemon capability before mutation, then
+sends one approval RPC that registers the waiter before changing the hold.
+Ordinary holds return `armed` for requester resume; API-proxy holds normally
+return `approved` after release. Other outcomes are `denied`, `expired`,
+`exec_failed`, and `timed_out`. Armed or unresolved waits exit 127, denial or
+expiry exits 126, execution failure exits 125, and approval exits 0. Grant
+requests cannot use this wait because approval grants authority rather than
+executing a held operation.
+
+`guard approval show --wait=<seconds>` and `guard approval resume
+--wait=<seconds>` use the same bounds and outcome vocabulary. They remain separate
+read and requester-resume operations; `guard access approve --wait` does not
+send a follow-up wait RPC. Daemons without the consequence capability require
+polling with `guard approval show`. Their missing consequence field is rendered
+as `grant` for `gr-` references and `arm` for other references; JSON marks this
+as `consequence_source: legacy_prefix_fallback` and never infers `release`.
 
 Only an authenticated operator can approve or deny. The original requester may
 add notes to its hold but cannot decide it. Discussion freezes when the hold is
@@ -111,7 +131,7 @@ the same requester connection after approval. `--wait-approval <seconds>` adds
 a client bound. `--approval-ttl unbounded` keeps a durable hold until a
 decision, while a numeric TTL fails closed on expiry. Disconnecting a waiting
 client does not grant authority; the requester can reconnect with `guard
-resume` after approval.
+approval resume` after approval.
 
 ## Restart and failure behavior
 

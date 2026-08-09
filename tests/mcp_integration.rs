@@ -595,6 +595,34 @@ async fn mcp_threads_execution_and_session_tokens_without_operator_authority() {
     .unwrap();
 
     let daemon = tokio::spawn(async move {
+        for expected_attempt in ["endpoint probe", "capability Ping"] {
+            let (admin_stream, _) = listener.accept().await.unwrap();
+            let (admin_reader, mut admin_writer) = tokio::io::split(admin_stream);
+            let mut admin_lines = BufReader::new(admin_reader).lines();
+            let admin: Value = serde_json::from_str(
+                &admin_lines
+                    .next_line()
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{expected_attempt} request")),
+            )
+            .unwrap();
+            assert_eq!(admin["admin"]["op"], "ping");
+            assert!(admin.get("admin_token").is_none());
+            let response = json!({
+                "result": "ping",
+                "version": "fixture",
+                "uptime_secs": 1,
+                "mode": "enforce",
+                "dry_run": false,
+                "capabilities": []
+            })
+            .to_string();
+            admin_writer.write_all(response.as_bytes()).await.unwrap();
+            admin_writer.write_all(b"\n").await.unwrap();
+            admin_writer.flush().await.unwrap();
+        }
+
         let (execute_stream, _) = listener.accept().await.unwrap();
         let (execute_reader, mut execute_writer) = tokio::io::split(execute_stream);
         let mut execute_lines = BufReader::new(execute_reader).lines();
@@ -700,6 +728,8 @@ async fn mcp_end_to_end_initialize_list_call() {
             "guard_evaluate_batch",
             "guard_access_show",
             "guard_access_status",
+            "guard_approval_show",
+            "guard_approval_resume",
         ],
         "MCP must advertise the complete intentional tool contract"
     );
@@ -1077,7 +1107,7 @@ async fn mcp_http_transport_keepalive_pair_on_one_connection() {
         .iter()
         .filter_map(|t| t["name"].as_str())
         .collect();
-    assert!(names.contains(&"guard_run"));
+    assert!(names.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
