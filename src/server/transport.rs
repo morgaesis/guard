@@ -53,6 +53,51 @@ struct DaemonApiSessionSink {
     server: ServerContext,
 }
 
+impl DaemonApiSessionSink {
+    fn context_from_registry(
+        &self,
+        registry: &SessionRegistry,
+        token: &str,
+    ) -> Option<guard::proxy::ApiSessionContext> {
+        if registry
+            .suspension_reason(token, &self.server.config.behavior_limits)
+            .is_some()
+            || matches!(
+                registry.owner_for(token),
+                Some(crate::session::SessionOwner::Unowned)
+            )
+            || registry.is_access_managed(token)
+        {
+            return None;
+        }
+        let (fingerprint, intent) = registry.api_authority_for(token)?;
+        let (revision, secret_entitlements) = registry.authority_snapshot(token)?;
+        let evaluation_mode = registry.evaluation_mode_for(token).unwrap_or_default();
+        Some(guard::proxy::ApiSessionContext {
+            fingerprint,
+            revision,
+            secret_entitlements,
+            can_evaluate_api_override: evaluation_mode
+                == crate::grant_profile::EvaluationMode::Evaluator
+                && intent
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty()),
+            evaluation_mode: match evaluation_mode {
+                crate::grant_profile::EvaluationMode::Evaluator => {
+                    guard::proxy::ApiEvaluationMode::Evaluator
+                }
+                crate::grant_profile::EvaluationMode::PolicyOnly => {
+                    guard::proxy::ApiEvaluationMode::PolicyOnly
+                }
+                crate::grant_profile::EvaluationMode::ReadOnly => {
+                    guard::proxy::ApiEvaluationMode::ReadOnly
+                }
+            },
+            intent,
+        })
+    }
+}
+
 struct ReplyWaiterGuard(Option<WaiterLease>);
 
 impl ReplyWaiterGuard {
@@ -245,12 +290,6 @@ fn api_session_exec_status(allowed: bool, held: bool) -> SessionExecStatus {
 impl guard::proxy::ApiSessionSink for DaemonApiSessionSink {
     async fn resolve(&self, token: &str) -> Option<guard::proxy::ApiSessionContext> {
         let registry = self.server.state.sessions.read().await;
-        if registry
-            .suspension_reason(token, &self.server.config.behavior_limits)
-            .is_some()
-        {
-            return None;
-        }
         // The API proxy is a loopback TLS listener that carries a session bearer
         // but no kernel-authenticated local principal, so owner==caller cannot be
         // re-verified per request (see the security model's TCP/principal note);
@@ -258,43 +297,27 @@ impl guard::proxy::ApiSessionSink for DaemonApiSessionSink {
         // owning local peer. A session that predates principal binding has no
         // verifiable owner and is refused fail-closed here, matching the execute
         // path, so a legacy bearer cannot be replayed through the proxy.
-        if matches!(
-            registry.owner_for(token),
-            Some(crate::session::SessionOwner::Unowned)
-        ) {
-            return None;
-        }
         // Public access approvals authorize brokered command verbs. They never
         // mint a reusable API bearer, which would bypass per-request admission
         // and bounded-use accounting at the command spawn boundary.
-        if registry.is_access_managed(token) {
-            return None;
+        self.context_from_registry(&registry, token)
+    }
+
+    async fn authorize_forward(
+        &self,
+        token: &str,
+        expected: &guard::proxy::ApiSessionContext,
+    ) -> std::result::Result<guard::proxy::ApiSessionAuthorization, String> {
+        let registry = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.server.state.sessions.clone().read_owned(),
+        )
+        .await
+        .map_err(|_| "timed out acquiring session authority coordination".to_string())?;
+        if self.context_from_registry(&registry, token).as_ref() != Some(expected) {
+            return Err("session expired, was revoked, or changed".to_string());
         }
-        let (fingerprint, intent) = registry.api_authority_for(token)?;
-        let (revision, secret_entitlements) = registry.authority_snapshot(token)?;
-        let evaluation_mode = registry.evaluation_mode_for(token).unwrap_or_default();
-        Some(guard::proxy::ApiSessionContext {
-            fingerprint,
-            revision,
-            secret_entitlements,
-            can_evaluate_api_override: evaluation_mode
-                == crate::grant_profile::EvaluationMode::Evaluator
-                && intent
-                    .as_deref()
-                    .is_some_and(|value| !value.trim().is_empty()),
-            evaluation_mode: match evaluation_mode {
-                crate::grant_profile::EvaluationMode::Evaluator => {
-                    guard::proxy::ApiEvaluationMode::Evaluator
-                }
-                crate::grant_profile::EvaluationMode::PolicyOnly => {
-                    guard::proxy::ApiEvaluationMode::PolicyOnly
-                }
-                crate::grant_profile::EvaluationMode::ReadOnly => {
-                    guard::proxy::ApiEvaluationMode::ReadOnly
-                }
-            },
-            intent,
-        })
+        Ok(guard::proxy::ApiSessionAuthorization::new(registry))
     }
 
     async fn record(&self, token: &str, event: guard::proxy::ApiSessionEvent) {

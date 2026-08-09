@@ -56,6 +56,7 @@ use crate::gating::{decide_gate, GateOutcome};
 /// rejecting an oversized request body.
 const MAX_REQ_BODY: usize = 16 * 1024 * 1024;
 const REQUEST_BODY_READ_TIMEOUT: Duration = Duration::from_secs(15);
+const UPSTREAM_HANDOFF_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How often the policy file is checked for changes (the operator "slow
 /// clock"). The default for [`ApiProxy::with_policy_reload_interval`].
@@ -211,6 +212,9 @@ pub struct ApiProxy {
     session_sink: OnceLock<Arc<dyn ApiSessionSink>>,
     listener_mode: ApiListenerMode,
     request_body_timeout: Duration,
+    /// Maximum time authority coordination can be retained while waiting for
+    /// the upstream to accept a request and return response headers.
+    upstream_handoff_timeout: Duration,
     /// How often `policy_path` is checked for changes. Production keeps the
     /// [`POLICY_RELOAD_SECS`] default; tests inject a short interval so they
     /// can observe a reload without a multi-second wait.
@@ -459,6 +463,7 @@ impl ApiProxy {
             session_sink: OnceLock::new(),
             listener_mode: ApiListenerMode::default(),
             request_body_timeout: REQUEST_BODY_READ_TIMEOUT,
+            upstream_handoff_timeout: UPSTREAM_HANDOFF_TIMEOUT,
             policy_reload_interval: Duration::from_secs(POLICY_RELOAD_SECS),
         }
     }
@@ -482,6 +487,14 @@ impl ApiProxy {
     /// any evaluator or operator authorization. The default is 15 seconds.
     pub fn with_request_body_timeout(mut self, timeout: Duration) -> Self {
         self.request_body_timeout = timeout;
+        self
+    }
+
+    /// Bound the finite upstream request handoff. Authority leases are released
+    /// when this deadline expires and never span response-body streaming.
+    #[doc(hidden)]
+    pub fn with_upstream_handoff_timeout(mut self, timeout: Duration) -> Self {
+        self.upstream_handoff_timeout = timeout;
         self
     }
 
@@ -1705,23 +1718,35 @@ impl ApiProxy {
         {
             return response;
         }
-        match self
-            .forward_inner(
-                parts,
-                body,
-                path,
-                query,
-                redact,
-                op,
-                conn_id,
-                prepared_snapshot,
-                session_context,
-                created_cleanup,
-                route_authority,
-                authorization,
-            )
-            .await
-        {
+        let forwarding = self.forward_inner(
+            parts,
+            body,
+            path,
+            query,
+            redact,
+            op,
+            conn_id,
+            prepared_snapshot,
+            session_context,
+            created_cleanup,
+            route_authority,
+            authorization,
+        );
+        let forwarding = if kubernetes_mutation {
+            match tokio::time::timeout(self.upstream_handoff_timeout, forwarding).await {
+                Ok(result) => result,
+                Err(_) => {
+                    return self.status_resp(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "guard api-proxy: mutation authority handoff timed out",
+                        "Timeout",
+                    );
+                }
+            }
+        } else {
+            forwarding.await
+        };
+        match forwarding {
             Ok(resp) => resp,
             Err(e) => {
                 tracing::warn!(target: "guard::apiproxy", "upstream error for {path}: {e:#}");
@@ -1833,13 +1858,23 @@ impl ApiProxy {
                     .field("name", operation.name.as_deref().unwrap_or("(collection)")),
             );
         }
+        // Revocable durable authority is acquired in one order: evaluator or
+        // coverage authority, then session authority. The bundle lives only
+        // through the bounded response-header handoff.
         let forward_authority = if let Some(pending) = authorization {
             match pending
                 .judge
                 .authorize_forward(&pending.summary, pending.requirement)
                 .await
             {
-                Ok(authority) => Some(authority),
+                Ok(authority) if authority.satisfies(pending.requirement) => Some(authority),
+                Ok(_) => {
+                    return Ok(self.status_resp(
+                        StatusCode::FORBIDDEN,
+                        "guard api-proxy authority capability does not match the forwarding decision",
+                        "Forbidden",
+                    ));
+                }
                 Err(reason) => {
                     return Ok(self.status_resp(
                         StatusCode::FORBIDDEN,
@@ -1851,9 +1886,53 @@ impl ApiProxy {
         } else {
             None
         };
-        let upstream_resp = rb.send().await;
+        let session_authority = match (
+            parts.extensions.get::<SessionAuth>(),
+            session_context.as_ref(),
+        ) {
+            (Some(auth), Some(context)) => {
+                let Some(sink) = self.session_sink.get() else {
+                    return Ok(self.status_resp(
+                        StatusCode::FORBIDDEN,
+                        "guard api-proxy: session attribution is unavailable",
+                        "Forbidden",
+                    ));
+                };
+                match sink.authorize_forward(&auth.token, context).await {
+                    Ok(authority) => Some(authority),
+                    Err(reason) => {
+                        return Ok(self.status_resp(
+                            StatusCode::FORBIDDEN,
+                            &format!(
+                                "guard api-proxy session authority changed before forwarding: {reason}"
+                            ),
+                            "Forbidden",
+                        ));
+                    }
+                }
+            }
+            (None, None) => None,
+            _ => {
+                return Ok(self.status_resp(
+                    StatusCode::FORBIDDEN,
+                    "guard api-proxy: session authority context is incomplete",
+                    "Forbidden",
+                ));
+            }
+        };
+        let upstream_resp = tokio::time::timeout(self.upstream_handoff_timeout, rb.send()).await;
+        drop(session_authority);
         drop(forward_authority);
-        let upstream_resp = upstream_resp.context("forward to apiserver")?;
+        let upstream_resp = match upstream_resp {
+            Ok(response) => response.context("forward to apiserver")?,
+            Err(_) => {
+                return Ok(self.status_resp(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "guard api-proxy: upstream request handoff timed out",
+                    "Timeout",
+                ));
+            }
+        };
         let status = upstream_resp.status();
         let upstream_headers = upstream_resp.headers().clone();
         let response_secrets = self.upstream.response_secret_values();

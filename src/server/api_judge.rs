@@ -384,7 +384,7 @@ async fn authorize_api_forward(
 ) -> Result<ApiForwardAuthorization, String> {
     let Some(store) = store else {
         return match requirement {
-            ApiForwardRequirement::Evaluated => Ok(ApiForwardAuthorization::none()),
+            ApiForwardRequirement::Evaluated => Ok(ApiForwardAuthorization::evaluated(())),
             ApiForwardRequirement::Coverage { .. } => {
                 Err("API coverage authority is unavailable".to_string())
             }
@@ -423,7 +423,10 @@ async fn authorize_api_forward(
             return Err("API coverage authority changed before upstream forwarding".to_string());
         }
     }
-    Ok(ApiForwardAuthorization::new(lease))
+    Ok(match requirement {
+        ApiForwardRequirement::Evaluated => ApiForwardAuthorization::evaluated(lease),
+        ApiForwardRequirement::Coverage { .. } => ApiForwardAuthorization::coverage(lease),
+    })
 }
 
 pub(super) async fn lease_api_coverage_for_decision(

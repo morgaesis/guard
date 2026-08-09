@@ -938,20 +938,29 @@ impl VerbAuthorityExpectation {
 pub(super) struct CommandAuthorization {
     check_learned_deny: bool,
     verb: Option<VerbAuthorityExpectation>,
+    session: Option<SessionAuthoritySnapshot>,
 }
 
 impl CommandAuthorization {
-    pub(super) fn routed(verb: Option<&VerbContext>) -> Self {
+    pub(super) fn routed(
+        verb: Option<&VerbContext>,
+        session: Option<&SessionAuthoritySnapshot>,
+    ) -> Self {
         Self {
             check_learned_deny: true,
             verb: verb.map(VerbAuthorityExpectation::from_context),
+            session: session.cloned(),
         }
     }
 
-    pub(super) fn replay(verb: Option<VerbAuthorityExpectation>) -> Self {
+    pub(super) fn replay(
+        verb: Option<VerbAuthorityExpectation>,
+        session: Option<SessionAuthoritySnapshot>,
+    ) -> Self {
         Self {
             check_learned_deny: true,
             verb,
+            session,
         }
     }
 }
@@ -1039,11 +1048,29 @@ async fn acquire_command_initiation_lease(
     };
 
     let session = if let Some(token) = request.session_token.as_deref() {
-        let guard = server.state.sessions.clone().read_owned().await;
+        let guard = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            server.state.sessions.clone().read_owned(),
+        )
+        .await
+        .map_err(|_| "timed out acquiring session authority coordination".to_string())?;
         if !guard.has(token) {
             return Err("session was revoked before process start".to_string());
         }
+        if let Some(expected) = authorization.and_then(|authority| authority.session.as_ref()) {
+            let current = guard
+                .authority_snapshot(token)
+                .map(SessionAuthoritySnapshot::from);
+            if current.as_ref() != Some(expected) {
+                return Err("session authority changed before process start".to_string());
+            }
+        }
         Some(guard)
+    } else if authorization
+        .and_then(|authority| authority.session.as_ref())
+        .is_some()
+    {
+        return Err("session authority is missing before process start".to_string());
     } else {
         None
     };

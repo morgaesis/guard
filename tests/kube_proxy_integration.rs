@@ -26,9 +26,21 @@ use guard::gating::Reversibility;
 use guard::proxy::{
     ApiAuthorizationKind, ApiCoverageVerdict, ApiEvaluationMode, ApiForwardAuthorization,
     ApiForwardRequirement, ApiHoldSnapshot, ApiJudge, ApiJudgeVerdict, ApiListenerMode, ApiPolicy,
-    ApiProxy, ApiRequestSummary, ApiSessionContext, ApiSessionEvent, ApiSessionSink, GateSink,
-    ProxyTls, Upstream,
+    ApiProxy, ApiRequestSummary, ApiSessionAuthorization, ApiSessionContext, ApiSessionEvent,
+    ApiSessionSink, GateSink, ProxyTls, Upstream,
 };
+
+async fn authorize_test_session(
+    sink: &(impl ApiSessionSink + ?Sized),
+    token: &str,
+    expected: &ApiSessionContext,
+) -> Result<ApiSessionAuthorization, String> {
+    if sink.resolve(token).await.as_ref() == Some(expected) {
+        Ok(ApiSessionAuthorization::new(()))
+    } else {
+        Err("session authority changed".to_string())
+    }
+}
 
 struct LiveSessionSink;
 
@@ -43,6 +55,14 @@ impl ApiSessionSink for LiveSessionSink {
             evaluation_mode: ApiEvaluationMode::Evaluator,
             can_evaluate_api_override: true,
         })
+    }
+
+    async fn authorize_forward(
+        &self,
+        token: &str,
+        expected: &ApiSessionContext,
+    ) -> Result<ApiSessionAuthorization, String> {
+        authorize_test_session(self, token, expected).await
     }
 
     async fn record(&self, _token: &str, _event: ApiSessionEvent) {}
@@ -63,6 +83,14 @@ impl ApiSessionSink for RestrictedCredentialSessionSink {
         })
     }
 
+    async fn authorize_forward(
+        &self,
+        token: &str,
+        expected: &ApiSessionContext,
+    ) -> Result<ApiSessionAuthorization, String> {
+        authorize_test_session(self, token, expected).await
+    }
+
     async fn record(&self, _token: &str, _event: ApiSessionEvent) {}
 }
 
@@ -79,6 +107,14 @@ impl ApiSessionSink for H2SessionSink {
             evaluation_mode: ApiEvaluationMode::Evaluator,
             can_evaluate_api_override: true,
         })
+    }
+
+    async fn authorize_forward(
+        &self,
+        token: &str,
+        expected: &ApiSessionContext,
+    ) -> Result<ApiSessionAuthorization, String> {
+        authorize_test_session(self, token, expected).await
     }
 
     async fn record(&self, _token: &str, _event: ApiSessionEvent) {}
@@ -107,6 +143,14 @@ impl ApiSessionSink for RecordingSessionSink {
         })
     }
 
+    async fn authorize_forward(
+        &self,
+        token: &str,
+        expected: &ApiSessionContext,
+    ) -> Result<ApiSessionAuthorization, String> {
+        authorize_test_session(self, token, expected).await
+    }
+
     async fn record(&self, _token: &str, event: ApiSessionEvent) {
         self.events.lock().unwrap().push(event);
     }
@@ -114,6 +158,70 @@ impl ApiSessionSink for RecordingSessionSink {
 
 struct ChangingSessionSink {
     resolutions: AtomicUsize,
+}
+
+#[derive(Clone)]
+struct LinearizedSessionSink {
+    context: ApiSessionContext,
+    live: Arc<tokio::sync::RwLock<Option<ApiSessionContext>>>,
+    reached_handoff: Arc<tokio::sync::Semaphore>,
+    release_handoff: Arc<tokio::sync::Semaphore>,
+    pause_handoff: bool,
+}
+
+impl LinearizedSessionSink {
+    fn new(pause_handoff: bool) -> Self {
+        let context = ApiSessionContext {
+            fingerprint: "linearized-session".to_string(),
+            revision: "linearized-revision".to_string(),
+            secret_entitlements: None,
+            intent: Some("inspect development resources".to_string()),
+            evaluation_mode: ApiEvaluationMode::Evaluator,
+            can_evaluate_api_override: true,
+        };
+        Self {
+            live: Arc::new(tokio::sync::RwLock::new(Some(context.clone()))),
+            context,
+            reached_handoff: Arc::new(tokio::sync::Semaphore::new(0)),
+            release_handoff: Arc::new(tokio::sync::Semaphore::new(0)),
+            pause_handoff,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ApiSessionSink for LinearizedSessionSink {
+    async fn resolve(&self, token: &str) -> Option<ApiSessionContext> {
+        if token != "live-session" {
+            return None;
+        }
+        self.live.read().await.clone()
+    }
+
+    async fn authorize_forward(
+        &self,
+        token: &str,
+        expected: &ApiSessionContext,
+    ) -> Result<ApiSessionAuthorization, String> {
+        if token != "live-session" {
+            return Err("unknown session".to_string());
+        }
+        let guard = self.live.clone().read_owned().await;
+        if guard.as_ref() != Some(expected) {
+            return Err("session authority changed".to_string());
+        }
+        self.reached_handoff.add_permits(1);
+        if self.pause_handoff {
+            self.release_handoff
+                .acquire()
+                .await
+                .map_err(|_| "session handoff closed".to_string())?
+                .forget();
+        }
+        Ok(ApiSessionAuthorization::new(guard))
+    }
+
+    async fn record(&self, _token: &str, _event: ApiSessionEvent) {}
 }
 
 struct PrincipalSessionSink;
@@ -134,6 +242,14 @@ impl ApiSessionSink for PrincipalSessionSink {
             evaluation_mode: ApiEvaluationMode::Evaluator,
             can_evaluate_api_override: false,
         })
+    }
+
+    async fn authorize_forward(
+        &self,
+        token: &str,
+        expected: &ApiSessionContext,
+    ) -> Result<ApiSessionAuthorization, String> {
+        authorize_test_session(self, token, expected).await
     }
 
     async fn record(&self, _token: &str, _event: ApiSessionEvent) {}
@@ -166,6 +282,18 @@ impl ApiSessionSink for BudgetSessionSink {
         })
     }
 
+    async fn authorize_forward(
+        &self,
+        token: &str,
+        expected: &ApiSessionContext,
+    ) -> Result<ApiSessionAuthorization, String> {
+        if token == "budget-session" && expected.revision == "budget-session-revision" {
+            Ok(ApiSessionAuthorization::new(()))
+        } else {
+            Err("session authority changed".to_string())
+        }
+    }
+
     async fn record(&self, _token: &str, _event: ApiSessionEvent) {}
 }
 
@@ -175,7 +303,7 @@ impl ApiSessionSink for ChangingSessionSink {
         let attempt = self.resolutions.fetch_add(1, Ordering::SeqCst);
         (token == "live-then-edited").then(|| ApiSessionContext {
             fingerprint: "stable-audit-fingerprint".to_string(),
-            revision: if attempt < 3 {
+            revision: if attempt < 5 {
                 "original-session-revision"
             } else {
                 "edited-session-revision"
@@ -186,6 +314,14 @@ impl ApiSessionSink for ChangingSessionSink {
             evaluation_mode: ApiEvaluationMode::Evaluator,
             can_evaluate_api_override: true,
         })
+    }
+
+    async fn authorize_forward(
+        &self,
+        token: &str,
+        expected: &ApiSessionContext,
+    ) -> Result<ApiSessionAuthorization, String> {
+        authorize_test_session(self, token, expected).await
     }
 
     async fn record(&self, _token: &str, _event: ApiSessionEvent) {}
@@ -281,6 +417,35 @@ async fn spawn_counting_upstream() -> (String, Arc<AtomicUsize>) {
         }
     });
     (format!("http://{addr}"), count)
+}
+
+async fn spawn_stalled_upstream() -> (String, Arc<tokio::sync::Semaphore>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let reached = Arc::new(tokio::sync::Semaphore::new(0));
+    let observed = reached.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => continue,
+            };
+            let reached = observed.clone();
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        io,
+                        service_fn(move |_request| {
+                            reached.add_permits(1);
+                            std::future::pending::<Result<Response<Full<Bytes>>, Infallible>>()
+                        }),
+                    )
+                    .await;
+            });
+        }
+    });
+    (format!("http://{addr}"), reached)
 }
 
 #[derive(Clone)]
@@ -798,6 +963,28 @@ async fn start_proxy_with_session_sink(
     rarity_threshold: u64,
     session_sink: Arc<dyn ApiSessionSink>,
 ) -> (String, reqwest::Client) {
+    start_proxy_with_session_sink_and_timeout(
+        mock_base,
+        policy_yaml,
+        judge,
+        gate,
+        rarity_threshold,
+        session_sink,
+        Duration::from_secs(30),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_proxy_with_session_sink_and_timeout(
+    mock_base: String,
+    policy_yaml: &str,
+    judge: Option<Arc<dyn ApiJudge>>,
+    gate: Option<Arc<dyn GateSink>>,
+    rarity_threshold: u64,
+    session_sink: Arc<dyn ApiSessionSink>,
+    handoff_timeout: Duration,
+) -> (String, reqwest::Client) {
     let kubeconfig = kubeconfig_for(&mock_base);
     let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
     let tls = ProxyTls::generate().expect("tls");
@@ -805,7 +992,8 @@ async fn start_proxy_with_session_sink(
     let policy = ApiPolicy::from_yaml(policy_yaml).expect("policy");
     let (listener, listen) = reserve_listener().await;
     let mut proxy = ApiProxy::new(listen, tls, upstream, policy, None)
-        .with_listener_mode(ApiListenerMode::Policy);
+        .with_listener_mode(ApiListenerMode::Policy)
+        .with_upstream_handoff_timeout(handoff_timeout);
     if rarity_threshold > 0 {
         proxy = proxy.with_rarity_escalation(rarity_threshold);
     }
@@ -845,6 +1033,17 @@ struct BlockingJudge {
 
 #[async_trait::async_trait]
 impl ApiJudge for BlockingJudge {
+    async fn authorize_forward(
+        &self,
+        _summary: &ApiRequestSummary,
+        requirement: ApiForwardRequirement,
+    ) -> Result<ApiForwardAuthorization, String> {
+        Ok(match requirement {
+            ApiForwardRequirement::Evaluated => ApiForwardAuthorization::evaluated(()),
+            ApiForwardRequirement::Coverage { .. } => ApiForwardAuthorization::coverage(()),
+        })
+    }
+
     async fn judge(&self, _summary: &ApiRequestSummary) -> ApiJudgeVerdict {
         self.started.notify_one();
         self.release.notified().await;
@@ -863,6 +1062,17 @@ impl RecordingJudge {
 
 #[async_trait::async_trait]
 impl ApiJudge for RecordingJudge {
+    async fn authorize_forward(
+        &self,
+        _summary: &ApiRequestSummary,
+        requirement: ApiForwardRequirement,
+    ) -> Result<ApiForwardAuthorization, String> {
+        Ok(match requirement {
+            ApiForwardRequirement::Evaluated => ApiForwardAuthorization::evaluated(()),
+            ApiForwardRequirement::Coverage { .. } => ApiForwardAuthorization::coverage(()),
+        })
+    }
+
     async fn judge(&self, summary: &ApiRequestSummary) -> ApiJudgeVerdict {
         self.summaries.lock().unwrap().push(summary.clone());
         self.verdicts
@@ -876,6 +1086,30 @@ impl ApiJudge for RecordingJudge {
 #[derive(Clone, Default)]
 struct ModeCoverageJudge {
     judge_calls: Arc<AtomicUsize>,
+}
+
+struct MismatchedCoverageJudge;
+
+#[async_trait::async_trait]
+impl ApiJudge for MismatchedCoverageJudge {
+    async fn coverage(&self, _summary: &ApiRequestSummary) -> ApiCoverageVerdict {
+        ApiCoverageVerdict::Allow {
+            risk: 1,
+            reversibility: Reversibility::Reversible,
+        }
+    }
+
+    async fn authorize_forward(
+        &self,
+        _summary: &ApiRequestSummary,
+        _requirement: ApiForwardRequirement,
+    ) -> Result<ApiForwardAuthorization, String> {
+        Ok(ApiForwardAuthorization::evaluated(()))
+    }
+
+    async fn judge(&self, _summary: &ApiRequestSummary) -> ApiJudgeVerdict {
+        ApiJudgeVerdict::Error("unexpected evaluator call".to_string())
+    }
 }
 
 #[async_trait::async_trait]
@@ -894,6 +1128,17 @@ impl ApiJudge for ModeCoverageJudge {
         } else {
             ApiCoverageVerdict::None
         }
+    }
+
+    async fn authorize_forward(
+        &self,
+        _summary: &ApiRequestSummary,
+        requirement: ApiForwardRequirement,
+    ) -> Result<ApiForwardAuthorization, String> {
+        Ok(match requirement {
+            ApiForwardRequirement::Evaluated => ApiForwardAuthorization::evaluated(()),
+            ApiForwardRequirement::Coverage { .. } => ApiForwardAuthorization::coverage(()),
+        })
     }
 
     async fn judge(&self, _summary: &ApiRequestSummary) -> ApiJudgeVerdict {
@@ -948,7 +1193,7 @@ impl ApiJudge for LinearizedJudge {
     async fn authorize_forward(
         &self,
         _summary: &ApiRequestSummary,
-        _requirement: ApiForwardRequirement,
+        requirement: ApiForwardRequirement,
     ) -> Result<ApiForwardAuthorization, String> {
         let guard = self.coordination.clone().read_owned().await;
         if !self.active.load(Ordering::SeqCst) {
@@ -960,7 +1205,10 @@ impl ApiJudge for LinearizedJudge {
             .await
             .map_err(|_| "handoff closed".to_string())?
             .forget();
-        Ok(ApiForwardAuthorization::new(guard))
+        Ok(match requirement {
+            ApiForwardRequirement::Evaluated => ApiForwardAuthorization::evaluated(guard),
+            ApiForwardRequirement::Coverage { .. } => ApiForwardAuthorization::coverage(guard),
+        })
     }
 
     async fn judge(&self, _summary: &ApiRequestSummary) -> ApiJudgeVerdict {
@@ -1026,6 +1274,14 @@ impl ApiSessionSink for ModeSessionSink {
             evaluation_mode,
             can_evaluate_api_override,
         })
+    }
+
+    async fn authorize_forward(
+        &self,
+        token: &str,
+        expected: &ApiSessionContext,
+    ) -> Result<ApiSessionAuthorization, String> {
+        authorize_test_session(self, token, expected).await
     }
 
     async fn record(&self, _token: &str, _event: ApiSessionEvent) {}
@@ -1109,6 +1365,159 @@ rules:
         .unwrap();
     assert_eq!(response.status(), 403);
     assert_eq!(forwarded.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coverage_capability_must_match_the_coverage_verdict() {
+    let policy = r#"
+default: deny
+rules:
+  - verbs: [create]
+    resources: [pods]
+    namespaces: [dev]
+    action: evaluate
+"#;
+    let (upstream, forwarded) = spawn_counting_upstream().await;
+    let (base, client) = start_proxy_with_session_sink(
+        upstream,
+        policy,
+        Some(Arc::new(MismatchedCoverageJudge)),
+        None,
+        0,
+        Arc::new(ModeSessionSink),
+    )
+    .await;
+    let response = client
+        .post(format!("{base}/api/v1/namespaces/dev/pods"))
+        .bearer_auth("readonly-authorized")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+    assert_eq!(forwarded.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_revocation_or_amendment_before_handoff_prevents_upstream_forwarding() {
+    let policy = r#"
+default: deny
+rules:
+  - verbs: [get]
+    resources: [configmaps]
+    namespaces: [dev]
+    action: evaluate
+"#;
+    for revoke in [false, true] {
+        let (upstream, forwarded) = spawn_counting_upstream().await;
+        let judge = Arc::new(LinearizedJudge::new(false));
+        let session = Arc::new(LinearizedSessionSink::new(false));
+        let (base, client) = start_proxy_with_session_sink(
+            upstream,
+            policy,
+            Some(judge.clone()),
+            None,
+            0,
+            session.clone(),
+        )
+        .await;
+        let request = tokio::spawn(async move {
+            client
+                .get(format!("{base}/api/v1/namespaces/dev/configmaps/cm"))
+                .send()
+                .await
+                .unwrap()
+        });
+        judge.reached_handoff.acquire().await.unwrap().forget();
+        let replacement = if revoke {
+            None
+        } else {
+            let mut amended = session.context.clone();
+            amended.revision = "amended-revision".to_string();
+            Some(amended)
+        };
+        *session.live.write().await = replacement;
+        judge.release_handoff.add_permits(1);
+
+        assert_eq!(request.await.unwrap().status(), 403);
+        assert_eq!(forwarded.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_lease_linearizes_at_the_finite_upstream_handoff() {
+    let (upstream, forwarded) = spawn_counting_upstream().await;
+    let session = Arc::new(LinearizedSessionSink::new(true));
+    let (base, client) =
+        start_proxy_with_session_sink(upstream, "default: allow\n", None, None, 0, session.clone())
+            .await;
+    let request = tokio::spawn(async move {
+        client
+            .get(format!("{base}/api/v1/namespaces/dev/configmaps/cm"))
+            .send()
+            .await
+            .unwrap()
+    });
+    session.reached_handoff.acquire().await.unwrap().forget();
+    let live = session.live.clone();
+    let revoke = tokio::spawn(async move {
+        *live.write().await = None;
+    });
+    tokio::task::yield_now().await;
+    assert!(!revoke.is_finished());
+    session.release_handoff.add_permits(1);
+
+    assert_eq!(request.await.unwrap().status(), 200);
+    revoke.await.unwrap();
+    assert_eq!(forwarded.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stalled_upstream_handoff_times_out_and_releases_authority() {
+    let (upstream, reached_upstream) = spawn_stalled_upstream().await;
+    let session = Arc::new(LinearizedSessionSink::new(false));
+    let judge = Arc::new(LinearizedJudge::new(false));
+    judge.release_handoff.add_permits(1);
+    let (base, client) = start_proxy_with_session_sink_and_timeout(
+        upstream,
+        "default: deny\nrules:\n  - verbs: [get]\n    resources: [configmaps]\n    namespaces: [dev]\n    action: evaluate\n",
+        Some(judge.clone()),
+        None,
+        0,
+        session.clone(),
+        Duration::from_millis(200),
+    )
+    .await;
+    let request = tokio::spawn(async move {
+        client
+            .get(format!("{base}/api/v1/namespaces/dev/configmaps/cm"))
+            .send()
+            .await
+            .unwrap()
+    });
+    reached_upstream.acquire().await.unwrap().forget();
+    let live = session.live.clone();
+    let revoke = tokio::spawn(async move {
+        *live.write().await = None;
+    });
+    let judge_for_revoke = judge.clone();
+    let coverage_revoke = tokio::spawn(async move {
+        let _guard = judge_for_revoke.coordination.write().await;
+        judge_for_revoke.active.store(false, Ordering::SeqCst);
+    });
+    tokio::task::yield_now().await;
+    assert!(!revoke.is_finished());
+    assert!(!coverage_revoke.is_finished());
+
+    assert_eq!(request.await.unwrap().status(), 504);
+    tokio::time::timeout(Duration::from_secs(2), revoke)
+        .await
+        .expect("session authority lease is released after handoff timeout")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), coverage_revoke)
+        .await
+        .expect("evaluator authority lease is released after handoff timeout")
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1991,7 +2400,11 @@ async fn session_expansion_is_revalidated_immediately_before_forward() {
         .unwrap();
 
     assert_eq!(response.status(), 403);
-    assert!(response.text().await.unwrap().contains("revoked"));
+    assert!(response
+        .text()
+        .await
+        .unwrap()
+        .contains("session authority changed"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

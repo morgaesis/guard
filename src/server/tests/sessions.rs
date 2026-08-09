@@ -8,14 +8,14 @@ use crate::server::execute::{
 };
 use crate::server::gate_runtime::SessionAuthoritySnapshot;
 use crate::server::learning::{
-    allow_session_auto_amend_candidate, deny_session_auto_amend_candidate,
+    allow_session_auto_amend_candidate, amend_session_exact_rule, deny_session_auto_amend_candidate,
 };
 use crate::server::transport::{claim_session_maintenance, session_maintenance_once};
 use crate::server::wire::ExecOutcome;
 use crate::server::wire::{AdminRequest, AdminResponse, CallerIdentity, ExecuteRequest};
 use crate::session::{
-    session_reference, AccessUseGrant, IssuedGrantScope, SessionDecisionSource, SessionExactRule,
-    SessionExecStatus, SessionGrant, SessionInteraction,
+    session_reference, AccessUseGrant, IssuedGrantScope, SessionAmendment, SessionDecisionSource,
+    SessionExactRule, SessionExecStatus, SessionGrant, SessionInteraction,
 };
 use crate::session_store::SessionStore;
 use guard::evaluate::{EvalConfig, Evaluator};
@@ -3712,6 +3712,95 @@ fn session_auto_amend_deny_candidates_are_high_risk_exact_rules() {
     assert!(
         deny_session_auto_amend_candidate("kubectl", &["delete\npod/x".into()], Some(9)).is_err()
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn exact_amendment_publishes_only_after_persistence_and_preserves_concurrent_state() {
+    let (mut cfg, _) = make_test_config();
+    let tmp = tempfile::tempdir().unwrap();
+    let store = SessionStore::open(tmp.path().join("amendments.db"), 3600)
+        .await
+        .unwrap();
+    cfg.state.session_store = Some(store.clone());
+    let token = "exact-amendment-session";
+    assert!(cfg.state.sessions.write().await.grant(
+        token.to_string(),
+        granted_session_owned(1000, Vec::new(), Vec::new()),
+    ));
+    store
+        .persist_registry(&cfg.state.sessions.read().await.clone())
+        .await
+        .unwrap();
+
+    store.fail_next_write_for_test();
+    assert!(amend_session_exact_rule(
+        &cfg,
+        token,
+        SessionAmendment::Allow,
+        "echo".to_string(),
+        vec!["failed".to_string()],
+        None,
+    )
+    .await
+    .is_err());
+    assert!(cfg
+        .state
+        .sessions
+        .read()
+        .await
+        .check(token, "echo", &["failed".to_string()], None)
+        .is_none());
+
+    let (committed, release) = store.pause_registry_commit_for_test("session store persist");
+    let first_server = cfg.clone();
+    let first = tokio::spawn(async move {
+        amend_session_exact_rule(
+            &first_server,
+            token,
+            SessionAmendment::Allow,
+            "echo".to_string(),
+            vec!["first".to_string()],
+            None,
+        )
+        .await
+    });
+    committed.acquire().await.unwrap().forget();
+    first.abort();
+    let second_server = cfg.clone();
+    let second = tokio::spawn(async move {
+        amend_session_exact_rule(
+            &second_server,
+            token,
+            SessionAmendment::Deny,
+            "echo".to_string(),
+            vec!["second".to_string()],
+            None,
+        )
+        .await
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !second.is_finished(),
+        "a successor amendment overtook detached durable publication"
+    );
+    release.add_permits(1);
+    assert!(second.await.unwrap().unwrap());
+
+    let live = cfg.state.sessions.read().await;
+    assert!(live
+        .check(token, "echo", &["first".to_string()], None)
+        .is_some_and(|(decision, _)| decision == crate::session::SessionDecision::Allow));
+    assert!(live
+        .check(token, "echo", &["second".to_string()], None)
+        .is_some_and(|(decision, _)| decision == crate::session::SessionDecision::Deny));
+    drop(live);
+    let durable = store.load_registry().await.unwrap();
+    assert!(durable
+        .check(token, "echo", &["first".to_string()], None)
+        .is_some_and(|(decision, _)| decision == crate::session::SessionDecision::Allow));
+    assert!(durable
+        .check(token, "echo", &["second".to_string()], None)
+        .is_some_and(|(decision, _)| decision == crate::session::SessionDecision::Deny));
 }
 
 // Synthetic test-fixture credential shapes (never real secrets): a

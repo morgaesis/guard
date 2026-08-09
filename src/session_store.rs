@@ -318,14 +318,23 @@ impl SessionStore {
     pub async fn load_registry(&self) -> Result<SessionRegistry> {
         let path = self.path.clone();
         let retention = self.history_retention_secs;
-        let mut write_state = self.registry_write_gate.lock().await;
-        let (registry, generation) =
-            tokio::task::spawn_blocking(move || Self::load_registry_sync(&path, retention))
-                .await
-                .context("session store load task failed")??;
-        write_state.database_generation = generation;
-        write_state.last_written_revision = registry.revision();
-        Ok(registry)
+        let gate = self.registry_write_gate.clone();
+        #[cfg(test)]
+        let gate_identity = std::sync::Arc::as_ptr(&gate) as usize;
+        tokio::spawn(async move {
+            let mut write_state = gate.lock().await;
+            let (registry, generation) =
+                tokio::task::spawn_blocking(move || Self::load_registry_sync(&path, retention))
+                    .await
+                    .context("session store load task failed")??;
+            #[cfg(test)]
+            pause_registry_write_after_commit(gate_identity, "session store load").await;
+            write_state.database_generation = generation;
+            write_state.last_written_revision = registry.revision();
+            Ok(registry)
+        })
+        .await
+        .context("session store load coordination task failed")?
     }
 
     /// Acquire the single-daemon lease for this state database. Daemon startup
@@ -486,6 +495,23 @@ impl SessionStore {
     }
 
     pub async fn persist_registry(&self, registry: &SessionRegistry) -> Result<()> {
+        self.persist_registry_with_stale_policy(registry, StaleRegistryWrite::Ignore)
+            .await
+    }
+
+    pub(crate) async fn persist_registry_strict(&self, registry: &SessionRegistry) -> Result<()> {
+        self.persist_registry_with_stale_policy(
+            registry,
+            StaleRegistryWrite::Reject("session amendment snapshot is stale"),
+        )
+        .await
+    }
+
+    async fn persist_registry_with_stale_policy(
+        &self,
+        registry: &SessionRegistry,
+        stale: StaleRegistryWrite,
+    ) -> Result<()> {
         #[cfg(test)]
         if self
             .fail_next_write
@@ -501,7 +527,7 @@ impl SessionStore {
         self.run_registry_write(
             "session store persist",
             revision,
-            StaleRegistryWrite::Ignore,
+            stale,
             move |expected_generation| {
                 Self::persist_registry_sync(&path, retention, &snapshot, expected_generation)
             },
@@ -5190,6 +5216,54 @@ mod tests {
             .await
             .unwrap()
             .has(&token));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn aborted_registry_load_retains_coordination_through_generation_adoption() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("load-cancellation.db");
+        let stale_store = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let mut initial = SessionRegistry::new();
+        assert!(initial.grant("initial".to_string(), exact_rule_grant(Vec::new())));
+        stale_store.persist_registry(&initial).await.unwrap();
+
+        let competing = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let mut advanced = competing.load_registry().await.unwrap();
+        assert!(advanced.grant("advanced".to_string(), exact_rule_grant(Vec::new())));
+        competing.persist_registry_strict(&advanced).await.unwrap();
+        let mut successor_snapshot = advanced.clone();
+        assert!(successor_snapshot.grant("successor".to_string(), exact_rule_grant(Vec::new())));
+
+        let (loaded, release) = stale_store.pause_registry_commit_for_test("session store load");
+        let detached_store = stale_store.clone();
+        let detached = tokio::spawn(async move { detached_store.load_registry().await });
+        loaded.acquire().await.unwrap().forget();
+        detached.abort();
+
+        let successor_store = stale_store.clone();
+        let successor = tokio::spawn(async move {
+            successor_store
+                .persist_registry_strict(&successor_snapshot)
+                .await
+        });
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(
+            !successor.is_finished(),
+            "a successor overtook detached load generation adoption"
+        );
+        release.add_permits(1);
+        successor.await.unwrap().unwrap();
+
+        let durable = SessionStore::open(path, 3600)
+            .await
+            .unwrap()
+            .load_registry()
+            .await
+            .unwrap();
+        assert!(durable.has("initial"));
+        assert!(durable.has("advanced"));
+        assert!(durable.has("successor"));
     }
 
     /// A stale snapshot (cloned before a later mutation) must never clobber a

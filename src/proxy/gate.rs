@@ -276,7 +276,30 @@ pub struct ApiSessionEvent {
 #[async_trait]
 pub trait ApiSessionSink: Send + Sync {
     async fn resolve(&self, token: &str) -> Option<ApiSessionContext>;
+    /// Revalidate an exact session context and retain compatible session
+    /// coordination through one finite upstream request handoff.
+    async fn authorize_forward(
+        &self,
+        _token: &str,
+        _expected: &ApiSessionContext,
+    ) -> Result<ApiSessionAuthorization, String> {
+        Err("session authority handoff is unavailable".to_string())
+    }
     async fn record(&self, token: &str, event: ApiSessionEvent);
+}
+
+/// Opaque session authority retained through one upstream request handoff.
+pub struct ApiSessionAuthorization {
+    _authority: Box<dyn Send>,
+}
+
+impl ApiSessionAuthorization {
+    #[doc(hidden)]
+    pub fn new(authority: impl Send + 'static) -> Self {
+        Self {
+            _authority: Box::new(authority),
+        }
+    }
 }
 
 /// API evaluator verdict. An allow is still routed through `decide_gate`; it is
@@ -313,20 +336,38 @@ pub enum ApiForwardRequirement {
 /// Opaque authority retained through one upstream request handoff. The proxy
 /// drops it as soon as the request has been sent and response streaming begins.
 pub struct ApiForwardAuthorization {
-    _authority: Option<Box<dyn Send>>,
+    kind: ApiAuthorizationKind,
+    _authority: Box<dyn Send>,
 }
 
 impl ApiForwardAuthorization {
     #[doc(hidden)]
-    pub fn none() -> Self {
-        Self { _authority: None }
+    pub fn evaluated(authority: impl Send + 'static) -> Self {
+        Self {
+            kind: ApiAuthorizationKind::Evaluated,
+            _authority: Box::new(authority),
+        }
     }
 
     #[doc(hidden)]
-    pub fn new(authority: impl Send + 'static) -> Self {
+    pub fn coverage(authority: impl Send + 'static) -> Self {
         Self {
-            _authority: Some(Box::new(authority)),
+            kind: ApiAuthorizationKind::Coverage,
+            _authority: Box::new(authority),
         }
+    }
+
+    pub(crate) fn satisfies(&self, requirement: ApiForwardRequirement) -> bool {
+        matches!(
+            (self.kind, requirement),
+            (
+                ApiAuthorizationKind::Evaluated,
+                ApiForwardRequirement::Evaluated
+            ) | (
+                ApiAuthorizationKind::Coverage,
+                ApiForwardRequirement::Coverage { .. }
+            )
+        )
     }
 }
 
@@ -360,11 +401,9 @@ pub trait ApiJudge: Send + Sync {
     /// send and retain it through that finite handoff.
     async fn authorize_forward(
         &self,
-        _summary: &ApiRequestSummary,
-        _requirement: ApiForwardRequirement,
-    ) -> Result<ApiForwardAuthorization, String> {
-        Ok(ApiForwardAuthorization::none())
-    }
+        summary: &ApiRequestSummary,
+        requirement: ApiForwardRequirement,
+    ) -> Result<ApiForwardAuthorization, String>;
 
     async fn judge(&self, summary: &ApiRequestSummary) -> ApiJudgeVerdict;
 }

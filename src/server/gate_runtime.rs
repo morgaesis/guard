@@ -1090,7 +1090,10 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
             );
         }
     }
-    let command_authority = Some(CommandAuthorization::routed(inputs.verb.as_ref()));
+    let command_authority = Some(CommandAuthorization::routed(
+        inputs.verb.as_ref(),
+        inputs.authority.as_ref(),
+    ));
     let secret_authority = inputs
         .authority
         .as_ref()
@@ -2666,12 +2669,23 @@ async fn execute_snapshot_request(
             definition_digest: snapshot.verb_digest.clone(),
             composition_digest: snapshot.verb_composition_digest.clone(),
         });
+    let session_authority =
+        snapshot
+            .session_revision
+            .as_ref()
+            .map(|revision| SessionAuthoritySnapshot {
+                revision: revision.clone(),
+                secret_entitlements: snapshot.secret_entitlements.clone(),
+            });
     exec_after_approval_with_command_authority(
         &mut context,
         request,
         reason.to_string(),
         Some(snapshot.secret_entitlements.clone()),
-        Some(CommandAuthorization::replay(verb_authority)),
+        Some(CommandAuthorization::replay(
+            verb_authority,
+            session_authority,
+        )),
     )
     .await
 }

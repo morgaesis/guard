@@ -64,6 +64,29 @@ fn raw_request(binary: &str, args: &[&str], session_token: Option<&str>) -> Exec
     }
 }
 
+#[cfg(unix)]
+fn revision_bound_session() -> SessionGrant {
+    let mut grant = SessionGrant {
+        allow: Vec::new(),
+        deny: Vec::new(),
+        allow_exact: Vec::new(),
+        deny_exact: Vec::new(),
+        activated_verbs: Vec::new(),
+        override_markers: Vec::new(),
+        scope: Default::default(),
+        expires_at: None,
+        prompt_append: None,
+        generated_notes: Vec::new(),
+        static_only: false,
+        auto_amend: false,
+        granted_at: 0,
+        owner: crate::session::SessionOwner::Principal(PrincipalKey::from_uid(1000)),
+    };
+    grant.scope.saved_grant = Some("scoped".to_string());
+    grant.scope.secret_names = vec!["first-binding".to_string()];
+    grant
+}
+
 #[tokio::test]
 async fn raw_command_collects_all_typed_matches_and_executes_selected_cell() {
     let (mut cfg, _buf) = make_test_config();
@@ -274,6 +297,125 @@ async fn learned_deny_committed_after_initial_allow_prevents_process_start() {
     let response = execution.await.unwrap();
     assert!(!response.allowed);
     assert!(response.exit_code.is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_entitlement_amendment_before_process_start_denies_execution() {
+    let (mut server, _buffer) = make_test_config();
+    server.config.gate = GateMode::Consequence;
+    server.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            "verbs:\n  - name: session-check\n    binary: true\n    args: [\"--check\"]\n    consequence: reversible\n    trusted: true\n",
+        )
+        .unwrap(),
+    ));
+    let token = "revision-bound-command";
+    assert!(server
+        .state
+        .sessions
+        .write()
+        .await
+        .grant(token.to_string(), revision_bound_session()));
+    let (reached, release) = pause_command_initiation_for_test(&server);
+    let executing_server = server.clone();
+    let execution = tokio::spawn(async move {
+        execute_command(
+            raw_request("true", &["--check"], Some(token)),
+            &executing_server,
+            &CallerIdentity::Unix { uid: 1000 },
+        )
+        .await
+        .into_response()
+    });
+    reached.acquire().await.unwrap().forget();
+    server.state.sessions.write().await.apply_delta(
+        token,
+        &crate::grant_profile::GrantRequestDelta {
+            secret_names: vec!["second-binding".to_string()],
+            ..Default::default()
+        },
+    );
+    release.add_permits(1);
+
+    let response = execution.await.unwrap();
+    assert!(!response.allowed);
+    assert!(response.exit_code.is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn held_replay_rejects_session_revision_amendment_before_process_start() {
+    let (mut server, _buffer) = make_test_config();
+    server.config.gate = GateMode::Consequence;
+    server.config.daemon_uid = 777;
+    server.config.daemon_principal = PrincipalKey::from_uid(777);
+    server.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            "verbs:\n  - name: held-session-check\n    binary: true\n    args: [\"--check\"]\n    consequence: irreversible\n    trusted: true\n",
+        )
+        .unwrap(),
+    ));
+    let token = "revision-bound-held-command";
+    assert!(server
+        .state
+        .sessions
+        .write()
+        .await
+        .grant(token.to_string(), revision_bound_session()));
+    let mut request = raw_request("true", &["--check"], Some(token));
+    request.require_approval = Some(true);
+    let held = execute_command(request, &server, &CallerIdentity::Unix { uid: 1000 })
+        .await
+        .into_response();
+    let handle = held.handle.expect("held command has an approval handle");
+    assert!(matches!(
+        handle_admin_request_for_test(
+            &server,
+            &CallerIdentity::UnixAdmin { uid: 777 },
+            AdminRequest::Approve {
+                handle: handle.clone(),
+            },
+        )
+        .await,
+        AdminResponse::GateAction { .. }
+    ));
+    let (reached, release) = pause_command_initiation_for_test(&server);
+    let resuming = server.clone();
+    let resuming_handle = handle.clone();
+    let replay = tokio::spawn(async move {
+        resume_approval(
+            &resuming,
+            &CallerIdentity::Unix { uid: 1000 },
+            &resuming_handle,
+        )
+        .await
+    });
+    reached.acquire().await.unwrap().forget();
+    server.state.sessions.write().await.apply_delta(
+        token,
+        &crate::grant_profile::GrantRequestDelta {
+            secret_names: vec!["second-binding".to_string()],
+            ..Default::default()
+        },
+    );
+    release.add_permits(1);
+
+    assert!(!matches!(
+        replay.await.unwrap().exec,
+        crate::server::wire::ExecOutcome::Completed { .. }
+    ));
+    assert_eq!(
+        server
+            .state
+            .approvals
+            .read()
+            .await
+            .get(&handle)
+            .unwrap()
+            .status,
+        ApprovalStatus::ExecFailed
+    );
 }
 
 #[cfg(unix)]

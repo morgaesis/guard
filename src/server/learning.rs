@@ -25,7 +25,6 @@ use guard::learned_rules::{AutoShimMode, LearningOutcome};
 use guard::redact::{command_contains_sensitive_literals, command_line};
 use std::path::PathBuf;
 
-use super::execute::persist_session_snapshot;
 use super::{deterministic_credential_deny_reason, ServerContext};
 
 const SESSION_AUTO_AMEND_MAX_ALLOW_RISK: i32 = 2;
@@ -138,19 +137,26 @@ pub(super) async fn amend_session_exact_rule(
     args: Vec<String>,
     cwd: Option<PathBuf>,
 ) -> Result<bool> {
-    let (amended, before, after) = {
-        let mut reg = server.state.sessions.write().await;
-        let before = reg.clone();
-        let amended = reg
-            .amend_exact(token, decision, binary, args, cwd)
+    let sessions = server.state.sessions.clone();
+    let session_store = server.state.session_store.clone();
+    let token = token.to_string();
+    tokio::spawn(async move {
+        // The detached task owns live coordination through staging, durable
+        // commit, and publication. Cancellation cannot expose an uncommitted
+        // rule or let a successor overtake a committed amendment.
+        let mut live = sessions.write_owned().await;
+        let mut staged = live.clone();
+        let amended = staged
+            .amend_exact(&token, decision, binary, args, cwd)
             .ok_or_else(|| anyhow::anyhow!("session token is revoked, expired, or unknown"))?;
-        (amended, before, reg.clone())
-    };
-    if let Err(err) = persist_session_snapshot(server.state.session_store.clone(), after).await {
-        *server.state.sessions.write().await = before;
-        return Err(err);
-    }
-    Ok(amended)
+        if let Some(store) = session_store {
+            store.persist_registry_strict(&staged).await?;
+        }
+        *live = staged;
+        Ok(amended)
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("session amendment coordination task failed: {error}"))?
 }
 
 pub(super) async fn maybe_auto_amend_session_after_llm(
