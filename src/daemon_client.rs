@@ -598,6 +598,12 @@ where
     bail!("server closed connection without response")
 }
 
+#[cfg(test)]
+pub(crate) async fn read_streaming_response_for_test(input: &str) -> Result<ExecuteResponse> {
+    let mut lines = BufReader::new(input.as_bytes()).lines();
+    read_streaming_response(&mut lines, &mut |_, _| {}).await
+}
+
 /// Connect to the local guard daemon: UNIX domain socket on Unix, named pipe on
 /// Windows. Returns a stream that implements `AsyncRead + AsyncWrite`.
 #[cfg(unix)]

@@ -87,6 +87,8 @@ pub struct SessionStore {
     fail_next_write: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     fail_next_approval: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    fail_next_provisional_delete: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Process-lifetime ownership of one state database. The operating system
@@ -430,6 +432,10 @@ impl SessionStore {
             fail_next_write: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             fail_next_approval: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_next_provisional_delete: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
         };
         Ok(store)
     }
@@ -1779,6 +1785,12 @@ impl SessionStore {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    #[cfg(all(test, unix))]
+    pub(crate) fn fail_next_provisional_delete_for_test(&self) {
+        self.fail_next_provisional_delete
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     // --- Consequence-gating runtime state (provisional executions and operator
     // approvals). These are high-churn, handle-keyed rows, so unlike the session
     // registry they persist incrementally (per-row upsert/delete) rather than by
@@ -1920,6 +1932,13 @@ impl SessionStore {
     }
 
     pub async fn delete_provisional(&self, handle: String) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_provisional_delete
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("simulated provisional-delete failure");
+        }
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
             let conn = Self::open_connection(&path)?;
@@ -2336,10 +2355,15 @@ fn valid_approval_transition(previous: &Approval, next: &Approval) -> Result<boo
 fn provisional_identity(provisional: &Provisional) -> Provisional {
     let mut identity = provisional.clone();
     identity.decision_trace = None;
-    // The confirmation deadline is assigned only after the forward command
-    // completes successfully. It is lifecycle state, not immutable identity.
+    // The confirmation deadline, the window behind it, and the automatic
+    // rollback stamp are all assigned after the forward command completes.
+    // They are lifecycle state, not immutable identity.
     identity.deadline_unix = 0;
+    identity.window_secs = 0;
+    identity.auto_reverted_unix = None;
     identity.forward_done = false;
+    identity.forward_exit = None;
+    identity.forward_persistence_failed = false;
     identity.status = ProvisionalStatus::Armed;
     identity.revert_exit = None;
     identity.revert_detail = None;
@@ -2353,7 +2377,10 @@ fn valid_provisional_transition(previous: &Provisional, next: &Provisional) -> R
     {
         return Ok(false);
     }
-    if previous.forward_done && previous.deadline_unix != next.deadline_unix {
+    if previous.forward_done
+        && (previous.deadline_unix != next.deadline_unix
+            || previous.window_secs != next.window_secs)
+    {
         return Ok(false);
     }
     if !previous.forward_done && next.forward_done {
@@ -2364,7 +2391,7 @@ fn valid_provisional_transition(previous: &Provisional, next: &Provisional) -> R
         if !successful_completion && !failed_completion {
             return Ok(false);
         }
-    } else if !next.forward_done && next.deadline_unix != 0 {
+    } else if !next.forward_done && (next.deadline_unix != 0 || next.window_secs != 0) {
         return Ok(false);
     }
     let legal_status = matches!(
@@ -3265,7 +3292,11 @@ mod tests {
                 decision_trace: Some(trace.clone()),
                 created_unix: 1,
                 deadline_unix: u64::MAX,
+                window_secs: 0,
+                auto_reverted_unix: None,
                 forward_done: true,
+                forward_exit: Some(0),
+                forward_persistence_failed: false,
                 status: ProvisionalStatus::Armed,
                 revert_exit: None,
                 revert_detail: None,
@@ -3529,7 +3560,11 @@ mod tests {
             decision_trace: None,
             created_unix: 1,
             deadline_unix: 2,
+            window_secs: 0,
+            auto_reverted_unix: None,
             forward_done: true,
+            forward_exit: Some(0),
+            forward_persistence_failed: false,
             status: ProvisionalStatus::Armed,
             revert_exit: None,
             revert_detail: None,
@@ -4119,7 +4154,11 @@ mod tests {
             decision_trace: None,
             created_unix: 1,
             deadline_unix: u64::MAX,
+            window_secs: 0,
+            auto_reverted_unix: None,
             forward_done: true,
+            forward_exit: Some(0),
+            forward_persistence_failed: false,
             status: ProvisionalStatus::Reverting,
             revert_exit: None,
             revert_detail: None,

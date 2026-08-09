@@ -102,9 +102,9 @@ pub use transport::Server;
 pub use wire::{
     grant_class_wait_refusal, parse_approval_wait_secs, AccessCapability, AccessDecisionResult,
     AccessItem, AccessRequestGuidance, AdminRequest, AdminResponse, ApprovalSummary, CommandSpec,
-    ExecuteRequest, ExecuteResponse, GateStatus, OutputStream, ProvisionalSummary, RevertSpec,
-    SshHostKeyMode, VerbInvocation, VerbMatchInfo, VerbSummary, CONSEQUENCE_ARM, CONSEQUENCE_GRANT,
-    CONSEQUENCE_RELEASE,
+    ContainmentFailure, ContainmentFailureKind, ExecuteRequest, ExecuteResponse, GateStatus,
+    OutputStream, ProvisionalSummary, RevertSpec, SshHostKeyMode, VerbInvocation, VerbMatchInfo,
+    VerbSummary, CONSEQUENCE_ARM, CONSEQUENCE_GRANT, CONSEQUENCE_RELEASE,
 };
 pub(crate) use wire::{
     ExecuteStreamMessage, IncomingMessage, EXECUTE_FEATURE_LOCAL_CWD, EXECUTE_FEATURE_TCP_NO_CWD,

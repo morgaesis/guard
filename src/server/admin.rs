@@ -27,8 +27,9 @@ use super::execute::{
     session_source_from_eval,
 };
 use super::gate_runtime::{
-    bound_persisted_transcript, finish_revert, forget_proxy_provenance, is_api_proxy_sentinel,
-    now_unix, persist_approval, remove_revert_body, resume_approval,
+    bound_persisted_transcript, converge_forward_persistence_failure, finish_revert,
+    forget_proxy_provenance, is_api_proxy_sentinel, now_unix, persist_approval, remove_revert_body,
+    resume_approval,
 };
 #[cfg(test)]
 use super::learning::{
@@ -6115,13 +6116,23 @@ async fn handle_confirm(
             }
         }
     };
+    if !converge_forward_persistence_failure(server, &expected).await {
+        return AdminResponse::Error {
+            message: "cannot confirm provisional because its durable state is unavailable; no decision was applied; retry the command".to_string(),
+        };
+    }
     if let Some(store) = &server.state.session_store {
         if let Err(error) = store
             .compare_and_swap_provisional(expected, next.clone())
             .await
         {
+            tracing::warn!(
+                "failed to persist provisional confirmation for {}: {}",
+                handle,
+                error
+            );
             return AdminResponse::Error {
-                message: format!("failed to persist provisional confirmation: {error}"),
+                message: "cannot confirm provisional because its durable state is unavailable; no decision was applied; retry the command".to_string(),
             };
         }
     }
@@ -6299,13 +6310,19 @@ async fn handle_manual_revert(
             }
         }
     };
+    if !converge_forward_persistence_failure(server, &expected).await {
+        return AdminResponse::Error {
+            message: "cannot revert provisional because its durable state is unavailable; no rollback was started; retry the command".to_string(),
+        };
+    }
     if let Some(store) = &server.state.session_store {
         if let Err(error) = store
             .compare_and_swap_provisional(expected, claimed.clone())
             .await
         {
+            tracing::warn!("failed to persist rollback claim for {}: {}", handle, error);
             return AdminResponse::Error {
-                message: format!("failed to persist rollback claim: {error}"),
+                message: "cannot revert provisional because its durable state is unavailable; no rollback was started; retry the command".to_string(),
             };
         }
     }

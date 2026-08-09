@@ -21,8 +21,8 @@ use super::grants::{delete_read_grant_row, finish_read_grant_revert, persist_rea
 use super::runtime::NotifyEvent;
 use super::transport::write_stream_message;
 use super::wire::{
-    approval_is_armed, CallerIdentity, ExecOutcome, ExecuteRequest, ExecuteResult,
-    ExecuteStreamMessage, RevertSpec, VerbContext,
+    approval_is_armed, CallerIdentity, ContainmentOutcome, ExecOutcome, ExecuteRequest,
+    ExecuteResult, ExecuteStreamMessage, RevertSpec, VerbContext,
 };
 use super::{
     RequestContext, ServerContext, DEFAULT_CONFIRM_WITHIN_SECS, GATING_RETENTION_SECS,
@@ -160,18 +160,42 @@ async fn gate_capacity_reason(
 }
 
 async fn try_persist_provisional(server: &ServerContext, p: &Provisional) -> Result<(), String> {
-    if let Some(store) = &server.state.session_store {
-        store
-            .save_provisional(p.clone())
-            .await
-            .map_err(|error| format!("failed to persist provisional {}: {error}", p.handle))?;
-    }
-    Ok(())
+    let Some(store) = &server.state.session_store else {
+        return Err("durable provisional state is unavailable".to_string());
+    };
+    store
+        .save_provisional(p.clone())
+        .await
+        .map_err(|error| format!("failed to persist provisional {}: {error}", p.handle))
 }
 
-pub(super) async fn persist_provisional(server: &ServerContext, p: &Provisional) {
-    if let Err(error) = try_persist_provisional(server, p).await {
-        tracing::warn!("{error}");
+/// Complete the safe transition from the live post-forward persistence-loss
+/// row to durable state before an operator decision is applied. The detailed
+/// store error is kept in local diagnostics only.
+pub(super) async fn converge_forward_persistence_failure(
+    server: &ServerContext,
+    provisional: &Provisional,
+) -> bool {
+    if !provisional.forward_persistence_failed {
+        return true;
+    }
+    let Some(store) = &server.state.session_store else {
+        tracing::error!(
+            "cannot converge provisional {}: durable state store is unavailable",
+            provisional.handle
+        );
+        return false;
+    };
+    match store.save_provisional(provisional.clone()).await {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::error!(
+                "cannot converge provisional {} after forward persistence failure: {}",
+                provisional.handle,
+                error
+            );
+            false
+        }
     }
 }
 
@@ -373,6 +397,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
         // promised, so it holds rather than forward an uncontainable write.
         let principal = Some(self.server.config.daemon_principal.clone());
         self.snapshot_dir_safe
+            && self.server.state.session_store.is_some()
             && gate_capacity_reason(&self.server, principal.as_ref())
                 .await
                 .is_none()
@@ -440,7 +465,11 @@ impl guard::proxy::GateSink for DaemonGateSink {
             decision_trace: Some(guard::gating::DecisionTrace::source("api_proxy")),
             created_unix: now,
             deadline_unix: now.saturating_add(self.window_secs),
+            window_secs: self.window_secs,
+            auto_reverted_unix: None,
             forward_done: true,
+            forward_exit: Some(0),
+            forward_persistence_failed: false,
             status: ProvisionalStatus::Armed,
             revert_exit: None,
             revert_detail: None,
@@ -724,6 +753,61 @@ async fn try_delete_provisional_row(server: &ServerContext, handle: &str) -> Res
 async fn delete_provisional_row(server: &ServerContext, handle: &str) {
     if let Err(error) = try_delete_provisional_row(server, handle).await {
         tracing::warn!("{error}");
+    }
+}
+
+/// Retire a staging row for a forward command that never ran. The terminal
+/// row is installed in memory first and persisted before deletion, so a failed
+/// delete cannot leave an actionable `Armed` record or consume capacity.
+async fn retire_non_executed_provisional(
+    server: &ServerContext,
+    provisional: &Provisional,
+    detail: String,
+) -> Result<(), String> {
+    let mut terminal = provisional.clone();
+    terminal.status = ProvisionalStatus::Reverted;
+    terminal.revert_detail = Some(detail);
+    server
+        .state
+        .provisional
+        .write()
+        .await
+        .insert(terminal.clone());
+
+    match try_persist_provisional(server, &terminal).await {
+        Ok(()) => match try_delete_provisional_row(server, &terminal.handle).await {
+            Ok(()) => {
+                server
+                    .state
+                    .provisional
+                    .write()
+                    .await
+                    .remove(&terminal.handle);
+                Ok(())
+            }
+            Err(delete_error) => {
+                tracing::warn!(
+                    "{delete_error}; retained terminal non-executed provisional {}",
+                    terminal.handle
+                );
+                Ok(())
+            }
+        },
+        Err(save_error) => match try_delete_provisional_row(server, &terminal.handle).await {
+            Ok(()) => {
+                server
+                    .state
+                    .provisional
+                    .write()
+                    .await
+                    .remove(&terminal.handle);
+                Ok(())
+            }
+            Err(delete_error) => Err(format!(
+                "failed to retire non-executed provisional {}: {save_error}; {delete_error}",
+                terminal.handle
+            )),
+        },
     }
 }
 
@@ -1131,6 +1215,27 @@ pub(super) async fn arm_containment_with_authority<W: AsyncWrite + Unpin>(
     .await
 }
 
+#[cfg(all(test, unix))]
+pub(super) async fn arm_containment_with_access_use_for_test<W: AsyncWrite + Unpin>(
+    context: &mut RequestContext<'_, W>,
+    request: ExecuteRequest,
+    caller_principal: Option<PrincipalKey>,
+    reason: String,
+    authority: Option<SessionAuthoritySnapshot>,
+    consume_access_verbs: Vec<String>,
+) -> ExecuteResult {
+    arm_containment_with_access_use(
+        context,
+        request,
+        caller_principal,
+        reason,
+        authority,
+        consume_access_verbs,
+        None,
+    )
+    .await
+}
+
 async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
     context: &mut RequestContext<'_, W>,
     request: ExecuteRequest,
@@ -1223,9 +1328,6 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
             "session expired, was revoked, or changed before containment could be armed",
         );
     }
-    if let Err(reason) = admit_access_use(server, &request, &consume_access_verbs, None).await {
-        return access_admission_denial(server, caller, &consume_access_verbs, reason).await;
-    }
     let (session_revision, secret_entitlements) = match request.session_token.as_deref() {
         Some(_) => match authority {
             Some(snapshot) => (snapshot.revision, snapshot.secret_entitlements),
@@ -1283,7 +1385,11 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
         // No confirmation deadline exists until the forward command exits
         // successfully. Zero is a persisted sentinel for "not started".
         deadline_unix: 0,
+        window_secs: 0,
+        auto_reverted_unix: None,
         forward_done: false,
+        forward_exit: None,
+        forward_persistence_failed: false,
         status: ProvisionalStatus::Armed,
         revert_exit: None,
         revert_detail: None,
@@ -1292,9 +1398,26 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
     // Commit BEFORE exec so a crash between exec and arm still leaves a
     // recoverable revert (startup recovery routes it to needs_operator_decision).
     if let Err(detail) = try_persist_provisional(server, &provisional).await {
+        tracing::error!(
+            "containment provisional {} was not durable before forward execution: {}",
+            handle,
+            detail
+        );
         return ExecuteResult::exec_failed(
-            reason,
-            format!("command was not run because its rollback state was not durable: {detail}"),
+            reason.clone(),
+            "command was not run because durable rollback state is unavailable".to_string(),
+        )
+        .containment_failed(
+            "command was not run because durable rollback state is unavailable",
+            None,
+            Coverage::contain(),
+            ContainmentOutcome::PersistenceFailure {
+                command_started: false,
+                forward_exit_code: None,
+            },
+            None,
+            None,
+            None,
         );
     }
     server
@@ -1303,6 +1426,27 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
         .write()
         .await
         .insert(provisional.clone());
+
+    // The containment row is durable before bounded access is consumed. If
+    // admission rejects the request, remove the unused row and leave the
+    // authority budget untouched.
+    if let Err(admission_reason) =
+        admit_access_use(server, &request, &consume_access_verbs, None).await
+    {
+        if let Err(cleanup_error) = retire_non_executed_provisional(
+            server,
+            &provisional,
+            "forward command was not admitted; no rollback is required".to_string(),
+        )
+        .await
+        {
+            tracing::error!(
+                "failed to retire unstarted provisional {handle} after access admission denial: {cleanup_error}"
+            );
+        }
+        return access_admission_denial(server, caller, &consume_access_verbs, admission_reason)
+            .await;
+    }
 
     let session_fingerprint = audit_session_fingerprint(request.session_token.as_deref());
     let result = exec_after_approval_with_secret_authority(
@@ -1317,18 +1461,125 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
     match result.exec {
         ExecOutcome::Completed {
             exit_code,
-            stdout,
-            stderr,
+            ref stdout,
+            ref stderr,
         } => {
+            let stdout = stdout.clone();
+            let stderr = stderr.clone();
             let finished_unix = now_unix();
             let updated = {
                 let mut reg = server.state.provisional.write().await;
                 reg.mark_forward_done(&handle, exit_code, finished_unix, window)
             };
-            if let Some(u) = updated {
-                persist_provisional(server, &u).await;
+            // Zero on a forward command that did not exit cleanly: no timer was
+            // armed, so the response must not advertise a deadline.
+            let Some(updated) = updated else {
+                let response_reason =
+                    "command executed, but its durable containment row was lost; operator decision required";
+                return result
+                    .containment_failed(
+                        response_reason,
+                        None,
+                        Coverage::contain(),
+                        ContainmentOutcome::PersistenceFailure {
+                            command_started: true,
+                            forward_exit_code: exit_code,
+                        },
+                        exit_code,
+                        stdout,
+                        stderr,
+                    )
+                    .with_exposed_secret_refs(exposed_secret_refs);
+            };
+            if let Err(detail) = try_persist_provisional(server, &updated).await {
+                tracing::error!("post-forward provisional persistence failed: {detail}");
+                let _ = server
+                    .state
+                    .provisional
+                    .write()
+                    .await
+                    .mark_forward_persistence_failed(&handle, exit_code);
+                let response_reason = match exit_code {
+                    Some(0) => "command executed, but its durable auto-revert state could not be recorded; operator decision required".to_string(),
+                    Some(exit_code) => format!(
+                        "forward command exited with code {exit_code}, but its durable outcome could not be recorded; operator decision required"
+                    ),
+                    None => "forward command ended without an exit code, but its durable outcome could not be recorded; operator decision required".to_string(),
+                };
+                server.emit_audit_ungated(
+                    AuditEvent::new(AuditKind::ProvisionalInterrupted)
+                        .handle(&handle)
+                        .caller(caller)
+                        .session_fingerprint(&session_fingerprint)
+                        .reason(&response_reason)
+                        .field("exit", format!("{exit_code:?}")),
+                );
+                return result
+                    .containment_failed(
+                        response_reason,
+                        Some(handle),
+                        Coverage::contain(),
+                        ContainmentOutcome::PersistenceFailure {
+                            command_started: true,
+                            forward_exit_code: exit_code,
+                        },
+                        exit_code,
+                        stdout,
+                        stderr,
+                    )
+                    .with_exposed_secret_refs(exposed_secret_refs);
             }
-            if exit_code == Some(0) {
+            if exit_code.is_none() {
+                let response_reason = format!(
+                    "{reason}; forward command ended without an exit code; auto-revert was not armed; operator decision required"
+                );
+                server.emit_audit_ungated(
+                    AuditEvent::new(AuditKind::ProvisionalInterrupted)
+                        .handle(&handle)
+                        .caller(caller)
+                        .session_fingerprint(&session_fingerprint)
+                        .reason(&response_reason),
+                );
+                return result
+                    .containment_failed(
+                        response_reason,
+                        Some(handle),
+                        Coverage::contain(),
+                        ContainmentOutcome::ForwardNoExitCode,
+                        None,
+                        stdout,
+                        stderr,
+                    )
+                    .with_exposed_secret_refs(exposed_secret_refs);
+            }
+            if exit_code != Some(0) {
+                let exit_code = exit_code.expect("nonzero containment exit has a code");
+                let response_reason = format!(
+                    "{reason}; forward command exited with code {exit_code}; auto-revert was not armed; operator decision required"
+                );
+                server.emit_audit_ungated(
+                    AuditEvent::new(AuditKind::ProvisionalInterrupted)
+                        .handle(&handle)
+                        .caller(caller)
+                        .session_fingerprint(&session_fingerprint)
+                        .reason(&response_reason)
+                        .field("exit", exit_code),
+                );
+                return result
+                    .containment_failed(
+                        response_reason,
+                        Some(handle),
+                        Coverage::contain(),
+                        ContainmentOutcome::ForwardNonzeroExit { exit_code },
+                        Some(exit_code),
+                        stdout,
+                        stderr,
+                    )
+                    .with_exposed_secret_refs(exposed_secret_refs);
+            }
+            let armed_deadline = updated.deadline_unix;
+            let armed_window = updated.window_secs;
+            {
                 server.emit_audit_ungated(
                     AuditEvent::new(AuditKind::Provisional)
                         .handle(&handle)
@@ -1348,17 +1599,6 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
                     status: Some("armed".to_string()),
                     behavior: None,
                 });
-            } else {
-                server.emit_audit_ungated(
-                    AuditEvent::new(AuditKind::ProvisionalInterrupted)
-                        .handle(&handle)
-                        .caller(caller)
-                        .session_fingerprint(&session_fingerprint)
-                        .reason(
-                            "forward command completed unsuccessfully; operator decision required",
-                        )
-                        .field("exit", format!("{exit_code:?}")),
-                );
             }
             ExecuteResult::provisional(
                 reason,
@@ -1367,6 +1607,8 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
                 exit_code,
                 stdout,
                 stderr,
+                armed_deadline,
+                armed_window,
             )
             .with_exposed_secret_refs(exposed_secret_refs)
         }
@@ -1385,9 +1627,41 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
                 let mut reg = server.state.provisional.write().await;
                 reg.mark_forward_interrupted(&handle, detail.clone())
             };
-            if let Some(u) = updated {
-                persist_provisional(server, &u).await;
-            }
+            let (response_reason, recovery_handle, outcome) = match updated {
+                Some(updated) => match try_persist_provisional(server, &updated).await {
+                    Ok(()) => (
+                        "forward command ended without an exit code; auto-revert was not armed; operator decision required",
+                        Some(handle.clone()),
+                        ContainmentOutcome::ForwardNoExitCode,
+                    ),
+                    Err(error) => {
+                        tracing::warn!("{error}");
+                        let actionable = server
+                            .state
+                            .provisional
+                            .write()
+                            .await
+                            .mark_forward_interrupted_persistence_failed(&handle)
+                            .is_some();
+                        (
+                            "forward command ended without an exit code, and its interrupted state was not recorded durably; operator decision required",
+                            actionable.then(|| handle.clone()),
+                            ContainmentOutcome::PersistenceFailure {
+                                command_started: true,
+                                forward_exit_code: None,
+                            },
+                        )
+                    }
+                },
+                None => (
+                    "forward command ended without an exit code, but its containment row is unavailable; operator decision required",
+                    None,
+                    ContainmentOutcome::PersistenceFailure {
+                        command_started: true,
+                        forward_exit_code: None,
+                    },
+                ),
+            };
             server.emit_audit_ungated(
                 AuditEvent::new(AuditKind::ProvisionalInterrupted)
                     .handle(&handle)
@@ -1396,6 +1670,16 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
                     .reason(&detail),
             );
             result
+                .containment_failed(
+                    response_reason,
+                    recovery_handle,
+                    Coverage::contain(),
+                    outcome,
+                    None,
+                    None,
+                    None,
+                )
+                .with_exposed_secret_refs(exposed_secret_refs)
         }
         ExecOutcome::Failed {
             started: false,
@@ -1405,47 +1689,18 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
             // deleting the staging row. If deletion fails, restart recovery
             // sees a non-rollbackable terminal record rather than interpreting
             // an armed, unstarted row as an ambiguous mutation.
-            let terminal = {
-                let mut terminal = provisional.clone();
-                terminal.status = ProvisionalStatus::Reverted;
-                terminal.revert_detail = Some(format!(
-                    "forward command did not start; no rollback is required: {spawn_detail}"
-                ));
-                server
-                    .state
-                    .provisional
-                    .write()
-                    .await
-                    .insert(terminal.clone());
-                terminal
-            };
-            match try_persist_provisional(server, &terminal).await {
-                Ok(()) => match try_delete_provisional_row(server, &handle).await {
-                    Ok(()) => {
-                        server.state.provisional.write().await.remove(&handle);
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            "{error}; retained terminal non-executed provisional {handle}"
-                        );
-                    }
-                },
-                Err(save_error) => match try_delete_provisional_row(server, &handle).await {
-                    Ok(()) => {
-                        server.state.provisional.write().await.remove(&handle);
-                    }
-                    Err(delete_error) => {
-                        tracing::error!(
-                            "failed to retire non-executed provisional {handle}: {save_error}; {delete_error}"
-                        );
-                        return ExecuteResult::exec_failed(
-                            reason,
-                            format!(
-                                "{spawn_detail}; rollback state could not be retired safely: {save_error}; {delete_error}"
-                            ),
-                        );
-                    }
-                },
+            if let Err(retire_error) = retire_non_executed_provisional(
+                server,
+                &provisional,
+                format!("forward command did not start; no rollback is required: {spawn_detail}"),
+            )
+            .await
+            {
+                tracing::error!("{retire_error}");
+                return ExecuteResult::exec_failed(
+                    reason,
+                    format!("{spawn_detail}; rollback state could not be retired safely"),
+                );
             }
             result
         }
@@ -2872,8 +3127,8 @@ async fn defer_revert(
             );
             return (
                 format!(
-                    "provisional {} revert was deferred but persistence failed: {}",
-                    p.handle, error
+                    "provisional {} revert was deferred but its durable state could not be recorded; retry the operator action",
+                    p.handle
                 ),
                 None,
             );
@@ -2975,10 +3230,15 @@ pub(super) async fn finish_revert(
             ),
         }
     };
+    // `kind` names who drove this rollback ("auto"/"auto-check-failed" for the
+    // deadline sweeper, "manual" for `guard revert`). Only the sweeper's own
+    // rollback stamps the row, so a later `guard confirm` can say the timer
+    // fired rather than only that the handle is spent.
+    let auto_reverted_unix = kind.starts_with("auto").then(now_unix);
     let updated = {
         let mut reg = server.state.provisional.write().await;
         if status_ok {
-            reg.set_reverted(&p.handle, exit);
+            reg.set_reverted(&p.handle, exit, auto_reverted_unix);
         } else {
             reg.set_revert_failed(
                 &p.handle,
@@ -2999,8 +3259,8 @@ pub(super) async fn finish_revert(
             );
             return (
                 format!(
-                    "provisional {} rollback completed but terminal persistence failed: {}",
-                    p.handle, error
+                    "provisional {} rollback completed but its terminal state could not be recorded",
+                    p.handle
                 ),
                 exit,
             );
