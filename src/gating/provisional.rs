@@ -156,9 +156,9 @@ pub struct Provisional {
     /// process was interrupted before a normal exit was observed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forward_exit: Option<i32>,
-    /// The forward command completed, but the completed outcome could not be
-    /// committed after execution. Operator action first converges this live
-    /// row with the durable pre-forward row.
+    /// The live forward outcome could not be committed after execution.
+    /// Operator action first converges this row with the durable pre-forward
+    /// record.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub forward_persistence_failed: bool,
     pub status: ProvisionalStatus,
@@ -381,6 +381,24 @@ impl ProvisionalRegistry {
         p.deadline_unix = 0;
         p.status = ProvisionalStatus::NeedsOperatorDecision;
         p.revert_detail = Some(detail);
+        Some(p.clone())
+    }
+
+    /// Mark an interrupted live row whose durable interruption update failed.
+    /// Operator action converges this row with the durable pre-forward record
+    /// before applying the requested decision.
+    pub fn mark_forward_interrupted_persistence_failed(
+        &mut self,
+        handle: &str,
+    ) -> Option<Provisional> {
+        let p = self.items.get_mut(handle)?;
+        if p.status != ProvisionalStatus::NeedsOperatorDecision || p.forward_done {
+            return None;
+        }
+        p.forward_exit = None;
+        p.forward_persistence_failed = true;
+        p.deadline_unix = 0;
+        p.window_secs = 0;
         Some(p.clone())
     }
 

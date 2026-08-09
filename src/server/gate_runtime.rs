@@ -1609,9 +1609,41 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
                 let mut reg = server.state.provisional.write().await;
                 reg.mark_forward_interrupted(&handle, detail.clone())
             };
-            if let Some(u) = updated {
-                persist_provisional(server, &u).await;
-            }
+            let (response_reason, recovery_handle, outcome) = match updated {
+                Some(updated) => match try_persist_provisional(server, &updated).await {
+                    Ok(()) => (
+                        "forward command ended without an exit code; auto-revert was not armed; operator decision required",
+                        Some(handle.clone()),
+                        ContainmentOutcome::ForwardNoExitCode,
+                    ),
+                    Err(error) => {
+                        tracing::warn!("{error}");
+                        let actionable = server
+                            .state
+                            .provisional
+                            .write()
+                            .await
+                            .mark_forward_interrupted_persistence_failed(&handle)
+                            .is_some();
+                        (
+                            "forward command ended without an exit code, and its interrupted state was not recorded durably; operator decision required",
+                            actionable.then(|| handle.clone()),
+                            ContainmentOutcome::PersistenceFailure {
+                                command_started: true,
+                                forward_exit_code: None,
+                            },
+                        )
+                    }
+                },
+                None => (
+                    "forward command ended without an exit code, but its containment row is unavailable; operator decision required",
+                    None,
+                    ContainmentOutcome::PersistenceFailure {
+                        command_started: true,
+                        forward_exit_code: None,
+                    },
+                ),
+            };
             server.emit_audit_ungated(
                 AuditEvent::new(AuditKind::ProvisionalInterrupted)
                     .handle(&handle)
@@ -1621,10 +1653,10 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
             );
             result
                 .containment_failed(
-                    "forward command ended without an exit code; auto-revert was not armed; operator decision required",
-                    Some(handle),
+                    response_reason,
+                    recovery_handle,
                     Coverage::contain(),
-                    ContainmentOutcome::ForwardNoExitCode,
+                    outcome,
                     None,
                     None,
                     None,

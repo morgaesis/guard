@@ -1751,7 +1751,8 @@ fn jsonrpc_error_response(id: Value, code: i64, message: String, data: Option<Va
 }
 
 fn tool_result(result: GuardToolResponse) -> Value {
-    let is_error = result.containment_failure.is_some();
+    let is_error = result.containment_failure.is_some()
+        || (result.auto_revert_durable == Some(false) && result.containment_failure.is_none());
     let structured = json!({
         "schema_version": TOOL_SCHEMA_VERSION,
         "type": "execution_result",
@@ -1878,10 +1879,12 @@ fn render_tool_text(result: &Value) -> String {
         .unwrap_or_default();
     let decision = decision_text(result);
 
-    if result
+    let typed_containment_failure = result
         .get("containment_failure")
-        .is_some_and(|failure| !failure.is_null())
-    {
+        .is_some_and(|failure| !failure.is_null());
+    let legacy_containment_failure = !typed_containment_failure
+        && result.get("auto_revert_durable").and_then(Value::as_bool) == Some(false);
+    if typed_containment_failure || legacy_containment_failure {
         let action = if handle.is_empty() {
             "Operator action required: inspect `guard provisionals`; no recovery handle is available."
                 .to_string()
@@ -1890,10 +1893,25 @@ fn render_tool_text(result: &Value) -> String {
                 "Operator action required for handle {handle}: inspect `guard provisionals`, then run `guard confirm {handle}` or `guard revert {handle}`."
             )
         };
-        return format!(
-            "CONTAINMENT FAILED: {reason}\n{action}{}",
+        let mut out = String::new();
+        if !stdout.is_empty() {
+            out.push_str(stdout);
+            if !stdout.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        if !stderr.is_empty() {
+            out.push_str("stderr:\n");
+            out.push_str(stderr);
+            if !stderr.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        out.push_str(&format!(
+            "CONTAINMENT FAILED: {reason}\nNo auto-revert timer is armed.\n{action}{}",
             coverage_text(result)
-        );
+        ));
+        return out;
     }
 
     // Consequence-gate outcomes are not denials: surface the handle, the next
@@ -2990,6 +3008,80 @@ mod tests {
         assert!(text.contains("guard confirm pv-recovery"));
         assert!(text.contains("guard revert pv-recovery"));
         assert!(text.contains("durable outcome unavailable"));
+    }
+
+    fn prior_v1_durability_failure_fixture() -> server::ExecuteResponse {
+        let mut response = execute_response_fixture();
+        response.allowed = true;
+        response.reason =
+            "durable auto-revert state could not be recorded; operator decision required"
+                .to_string();
+        response.status = Some(server::GateStatus::Provisional);
+        response.handle = Some("legacy-recovery".to_string());
+        response.confirm_deadline_unix = None;
+        response.confirm_window_secs = None;
+        response.auto_revert_durable = Some(false);
+        response.containment_failure = None;
+        response
+    }
+
+    fn assert_prior_v1_durability_failure(value: &Value, stdout: &str, stderr: &str) {
+        let structured = &value["structuredContent"];
+        assert_eq!(structured["allowed"], true);
+        assert_eq!(structured["status"], "provisional");
+        assert_eq!(structured["auto_revert_durable"], false);
+        assert!(structured["containment_failure"].is_null());
+        assert_eq!(value["isError"], true);
+        let text = value["content"][0]["text"].as_str().expect("tool text");
+        assert!(text.contains(stdout));
+        assert!(text.contains(stderr));
+        assert!(text.contains("CONTAINMENT FAILED"));
+        assert!(text.contains("No auto-revert timer is armed"));
+        assert!(text.contains("Operator action required"));
+        assert!(text.contains("legacy-recovery"));
+        assert!(text.contains("guard confirm legacy-recovery"));
+        assert!(text.contains("guard revert legacy-recovery"));
+        assert!(!text.contains("applied behind an auto-revert envelope"));
+    }
+
+    #[test]
+    fn mcp_prior_v1_nonstreaming_durability_failure_is_actionable_error() {
+        let mut response = prior_v1_durability_failure_fixture();
+        response.stdout = Some("forward output".to_string());
+        response.stderr = Some("forward warning".to_string());
+        let wire = serde_json::to_string(&response).expect("serialize prior v1 response");
+        let parsed: server::ExecuteResponse =
+            serde_json::from_str(&wire).expect("parse prior v1 response");
+
+        let value = tool_result(parsed.into());
+        assert_prior_v1_durability_failure(&value, "forward output", "forward warning");
+    }
+
+    #[tokio::test]
+    async fn mcp_prior_v1_streaming_durability_failure_is_actionable_error() {
+        let mut response = prior_v1_durability_failure_fixture();
+        response.stdout = None;
+        response.stderr = None;
+        let messages = [
+            serde_json::to_string(&server::ExecuteStreamMessage::Stdout {
+                data: "streamed output".to_string(),
+            })
+            .expect("serialize stdout"),
+            serde_json::to_string(&server::ExecuteStreamMessage::Stderr {
+                data: "streamed warning".to_string(),
+            })
+            .expect("serialize stderr"),
+            serde_json::to_string(&server::ExecuteStreamMessage::Result { response })
+                .expect("serialize result"),
+        ]
+        .join("\n")
+            + "\n";
+        let parsed = crate::daemon_client::read_streaming_response_for_test(&messages)
+            .await
+            .expect("parse streaming prior v1 response");
+
+        let value = tool_result(parsed.into());
+        assert_prior_v1_durability_failure(&value, "streamed output", "streamed warning");
     }
 
     #[tokio::test]
