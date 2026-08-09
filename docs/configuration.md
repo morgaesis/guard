@@ -264,7 +264,12 @@ Each record carries `seq` and `prev_hash` (SHA-256 of the previous serialized
 record; a fixed genesis constant for the first), so any truncation, edit, or
 reorder breaks the chain. `guard audit verify` walks the chain and reports
 intact or the first broken sequence; `guard audit tail [-n N]` reads the most
-recent records. Both require operator authority and support `--json`.
+recent records. Tail results are read projections: historical `SECRET_EXPOSED`
+records retain sequence, timestamp, kind, field keys, and stored hash metadata
+while replacing command, reason, and field values with redaction markers and
+adding `read_projection: "secret_exposure_detail_redacted"`. The projection
+does not represent the serialized bytes used by the hash chain. Both commands
+require operator authority and support `--json`.
 
 If an allow decision, an operator approval, or a confirm cannot be durably
 appended (disk full, permission failure), the action is denied: guard fails

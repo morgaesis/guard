@@ -331,7 +331,10 @@ async fn secret_exposure_is_audited_only_after_successful_spawn() {
     );
     let logs = String::from_utf8_lossy(&audit.0.lock().unwrap()).to_string();
     assert!(logs.contains("[AUDIT] SECRET_EXPOSED"), "logs={logs}");
-    assert!(logs.contains("test/secret-exposure-success"), "logs={logs}");
+    assert!(
+        logs.contains("secret=") && logs.contains("[redacted]"),
+        "logs={logs}"
+    );
     assert!(
         logs.contains(&audit_session_fingerprint(Some(token))),
         "logs={logs}"
@@ -624,8 +627,7 @@ async fn streaming_secret_exposure_is_recorded_even_on_nonzero_exit() {
         2,
         "logs={logs}"
     );
-    assert!(logs.contains("service/primary"), "logs={logs}");
-    assert!(logs.contains("service/secondary"), "logs={logs}");
+    assert_eq!(logs.matches("secret=").count(), 2, "logs={logs}");
     assert!(!logs.contains("streaming-session-token-never-logged"));
     assert!(!logs.contains("primary-value-never-logged"));
     assert!(!logs.contains("secondary-value-never-logged"));
