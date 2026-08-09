@@ -1286,6 +1286,11 @@ pub struct ExecuteResponse {
     pub confirm_deadline_unix: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirm_window_secs: Option<u64>,
+    /// Explicitly reports whether the current daemon committed the auto-revert
+    /// outcome. `None` is reserved for older daemons that do not send this
+    /// field, so clients retain their compatibility fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_revert_durable: Option<bool>,
     /// Stable source label for the admission decision.
     #[serde(default = "default_decision_source")]
     pub decision_source: String,
@@ -1415,7 +1420,8 @@ pub(super) enum ExecOutcome {
     DryRun { coverage: Option<Coverage> },
     /// Approved and routed to the operator gate; not executed. Awaits approval.
     Held { handle: String, coverage: Coverage },
-    /// Approved and executed inside a containment envelope; auto-revert armed.
+    /// Approved and executed inside a containment envelope; the durability
+    /// field states whether its auto-revert outcome is armed.
     Provisional {
         handle: String,
         coverage: Coverage,
@@ -1425,6 +1431,8 @@ pub(super) enum ExecOutcome {
         /// Armed auto-revert deadline and the window behind it.
         deadline_unix: u64,
         window_secs: u64,
+        /// Whether the current daemon durably committed the armed outcome.
+        auto_revert_durable: bool,
     },
 }
 
@@ -1591,6 +1599,7 @@ impl ExecuteResult {
         stderr: Option<String>,
         deadline_unix: u64,
         window_secs: u64,
+        auto_revert_durable: bool,
     ) -> Self {
         Self {
             policy: PolicyOutcome::Allowed {
@@ -1604,6 +1613,7 @@ impl ExecuteResult {
                 stderr,
                 deadline_unix,
                 window_secs,
+                auto_revert_durable,
             },
             request_handle: None,
             access_requests: Vec::new(),
@@ -1761,6 +1771,7 @@ impl ExecuteResult {
                 verb_guidance,
                 confirm_deadline_unix: None,
                 confirm_window_secs: None,
+                auto_revert_durable: None,
                 decision_source,
                 decision_trace,
             },
@@ -1786,6 +1797,7 @@ impl ExecuteResult {
                 verb_guidance,
                 confirm_deadline_unix: None,
                 confirm_window_secs: None,
+                auto_revert_durable: None,
                 decision_source,
                 decision_trace,
             },
@@ -1806,6 +1818,7 @@ impl ExecuteResult {
                 verb_guidance,
                 confirm_deadline_unix: None,
                 confirm_window_secs: None,
+                auto_revert_durable: None,
                 decision_source,
                 decision_trace,
             },
@@ -1824,6 +1837,7 @@ impl ExecuteResult {
                 verb_guidance,
                 confirm_deadline_unix: None,
                 confirm_window_secs: None,
+                auto_revert_durable: None,
                 decision_source,
                 decision_trace,
             },
@@ -1849,6 +1863,7 @@ impl ExecuteResult {
                     verb_guidance,
                     confirm_deadline_unix: None,
                     confirm_window_secs: None,
+                    auto_revert_durable: None,
                     decision_source,
                     decision_trace,
                 }
@@ -1861,6 +1876,7 @@ impl ExecuteResult {
                 stderr,
                 deadline_unix,
                 window_secs,
+                auto_revert_durable,
             } => ExecuteResponse {
                 allowed: true,
                 reason: policy_reason,
@@ -1874,8 +1890,13 @@ impl ExecuteResult {
                 coverage: Some(coverage),
                 verb_matches,
                 verb_guidance,
-                confirm_deadline_unix: (deadline_unix > 0).then_some(deadline_unix),
-                confirm_window_secs: (window_secs > 0).then_some(window_secs),
+                confirm_deadline_unix: (auto_revert_durable
+                    && deadline_unix > 0
+                    && window_secs > 0)
+                    .then_some(deadline_unix),
+                confirm_window_secs: (auto_revert_durable && deadline_unix > 0 && window_secs > 0)
+                    .then_some(window_secs),
+                auto_revert_durable: Some(auto_revert_durable),
                 decision_source,
                 decision_trace,
             },

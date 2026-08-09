@@ -1307,14 +1307,50 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
             };
             // Zero on a forward command that did not exit cleanly: no timer was
             // armed, so the response must not advertise a deadline.
-            let (armed_deadline, armed_window) = updated
-                .as_ref()
-                .map(|u| (u.deadline_unix, u.window_secs))
-                .unwrap_or((0, 0));
-            if let Some(u) = updated {
-                persist_provisional(server, &u).await;
-            }
-            if exit_code == Some(0) {
+            let (armed_deadline, armed_window, auto_revert_durable, response_reason) =
+                match updated {
+                    Some(u) => match try_persist_provisional(server, &u).await {
+                        Ok(()) => (
+                            if exit_code == Some(0) {
+                                u.deadline_unix
+                            } else {
+                                0
+                            },
+                            if exit_code == Some(0) {
+                                u.window_secs
+                            } else {
+                                0
+                            },
+                            exit_code == Some(0),
+                            reason.clone(),
+                        ),
+                        Err(detail) => {
+                            tracing::error!("post-forward provisional persistence failed: {detail}");
+                            let response_reason = format!(
+                                "{reason}; command executed without a durable auto-revert; operator decision required"
+                            );
+                            let _ = server
+                                .state
+                                .provisional
+                                .write()
+                                .await
+                                .mark_forward_persistence_failed(
+                                    &handle,
+                                    response_reason.clone(),
+                                );
+                            (0, 0, false, response_reason)
+                        }
+                    },
+                    None => (
+                        0,
+                        0,
+                        false,
+                        format!(
+                            "{reason}; command executed without a durable auto-revert; operator decision required"
+                        ),
+                    ),
+                };
+            if exit_code == Some(0) && auto_revert_durable {
                 server.emit_audit_ungated(
                     AuditEvent::new(AuditKind::Provisional)
                         .handle(&handle)
@@ -1339,14 +1375,12 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
                         .handle(&handle)
                         .caller(caller)
                         .session_fingerprint(&session_fingerprint)
-                        .reason(
-                            "forward command completed unsuccessfully; operator decision required",
-                        )
+                        .reason(&response_reason)
                         .field("exit", format!("{exit_code:?}")),
                 );
             }
             ExecuteResult::provisional(
-                reason,
+                response_reason,
                 handle,
                 Coverage::contain(),
                 exit_code,
@@ -1354,6 +1388,7 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
                 stderr,
                 armed_deadline,
                 armed_window,
+                auto_revert_durable,
             )
             .with_exposed_secret_refs(exposed_secret_refs)
         }

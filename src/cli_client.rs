@@ -161,6 +161,20 @@ fn print_verb_guidance(response: &server::ExecuteResponse) {
 /// malfunction. A daemon that does not report the window falls back to the
 /// deadline-free wording rather than inventing one.
 fn provisional_window_lines(response: &server::ExecuteResponse) -> Vec<String> {
+    if response.auto_revert_durable == Some(false) {
+        return vec![
+            "result:  executed without a durable auto-revert; operator decision required"
+                .to_string(),
+        ];
+    }
+    if response.auto_revert_durable == Some(true)
+        && (response.confirm_deadline_unix.is_none() || response.confirm_window_secs.is_none())
+    {
+        return vec![
+            "result:  executed; durable auto-revert details unavailable; inspect guard provisionals"
+                .to_string(),
+        ];
+    }
     let (Some(deadline), Some(window)) =
         (response.confirm_deadline_unix, response.confirm_window_secs)
     else {
@@ -3109,6 +3123,7 @@ mod tests {
             verb_guidance: Some("request access".to_string()),
             confirm_deadline_unix: None,
             confirm_window_secs: None,
+            auto_revert_durable: None,
             decision_source: "access_gate".to_string(),
             decision_trace: None,
         };
@@ -3146,6 +3161,7 @@ mod tests {
             verb_guidance: None,
             confirm_deadline_unix,
             confirm_window_secs,
+            auto_revert_durable: None,
             decision_source: "llm".to_string(),
             decision_trace: None,
         }
@@ -3180,6 +3196,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_current_daemon_reports_execution_without_durable_auto_revert() {
+        let mut response = provisional_response(None, None);
+        response.auto_revert_durable = Some(false);
+        assert_eq!(
+            provisional_window_lines(&response),
+            vec![
+                "result:  executed without a durable auto-revert; operator decision required"
+                    .to_string()
+            ]
+        );
+    }
+
     fn denied_response(decision_source: &str) -> server::ExecuteResponse {
         server::ExecuteResponse {
             allowed: false,
@@ -3196,6 +3225,7 @@ mod tests {
             verb_guidance: None,
             confirm_deadline_unix: None,
             confirm_window_secs: None,
+            auto_revert_durable: None,
             decision_source: decision_source.to_string(),
             decision_trace: None,
         }
@@ -3941,6 +3971,7 @@ mod tests {
             verb_guidance: None,
             confirm_deadline_unix: None,
             confirm_window_secs: None,
+            auto_revert_durable: None,
             decision_source: "static_policy".to_string(),
             decision_trace: Some(guard::gating::DecisionTrace::source("static_policy")),
         };

@@ -452,6 +452,113 @@ async fn containment_dropped_when_forward_fails_to_spawn() {
     );
 }
 
+/// A failure to persist the completed forward outcome must not expose the
+/// in-memory deadline as an armed auto-revert. The pre-forward row remains the
+/// durable recovery authority, so a restarted daemon escalates it for an
+/// operator decision.
+#[cfg(unix)]
+#[tokio::test]
+async fn post_forward_persistence_failure_reports_no_durable_auto_revert_and_recovers_on_restart() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let database = temp.path().join("state.db");
+    let store = SessionStore::open(database, 3_600)
+        .await
+        .expect("open store");
+    let (mut cfg, _operator, agent) = gating_config(7_042, 1_000);
+    cfg.state.session_store = Some(store.clone());
+
+    let mut request = contain_request(
+        "sh",
+        &["-c", "sleep 1"],
+        RevertSpec::new("true", Vec::new()),
+    );
+    request.confirm_within_secs = Some(4);
+    let cfg_for_run = cfg.clone();
+    let agent_for_run = agent.clone();
+    let run = tokio::spawn(async move {
+        let mut sink = tokio::io::sink();
+        arm_containment_with_authority(
+            &mut RequestContext {
+                server: &cfg_for_run,
+                caller: &agent_for_run,
+                depth: 0,
+                stream_output: false,
+                stream_writer: &mut sink,
+            },
+            request,
+            agent_for_run.principal(),
+            "recoverable change".to_string(),
+            None,
+        )
+        .await
+    });
+
+    let handle = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let Some(row) = cfg.state.provisional.read().await.list().into_iter().next() {
+                if row.forward_outcome() == "running" {
+                    break row.handle;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("forward row should be durable before execution");
+    store.fail_next_write_for_test();
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(4), run)
+        .await
+        .expect("forward execution should finish")
+        .expect("forward task should not panic");
+    let response = result.into_response();
+    assert_eq!(response.handle.as_deref(), Some(handle.as_str()));
+    assert_eq!(response.auto_revert_durable, Some(false));
+    assert!(response.confirm_deadline_unix.is_none());
+    assert!(response.confirm_window_secs.is_none());
+    assert!(response.reason.contains("without a durable auto-revert"));
+
+    let live = cfg
+        .state
+        .provisional
+        .read()
+        .await
+        .get(&handle)
+        .cloned()
+        .expect("live provisional");
+    assert_eq!(live.status, ProvisionalStatus::NeedsOperatorDecision);
+    assert_eq!(live.deadline_unix, 0);
+    assert_eq!(live.window_secs, 0);
+    assert!(cfg
+        .state
+        .provisional
+        .read()
+        .await
+        .due_handles(now_unix().saturating_add(10_000))
+        .is_empty());
+
+    let durable = store
+        .load_provisionals()
+        .await
+        .expect("load pre-forward durable row");
+    assert_eq!(durable.len(), 1);
+    assert!(!durable[0].forward_done);
+    assert_eq!(durable[0].deadline_unix, 0);
+
+    let (mut restarted, moved) =
+        guard::gating::provisional::ProvisionalRegistry::from_rows(durable);
+    assert_eq!(moved, vec![handle]);
+    let recovered = restarted.list();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(
+        recovered[0].status,
+        ProvisionalStatus::NeedsOperatorDecision
+    );
+    assert!(restarted
+        .take_due(now_unix().saturating_add(10_000))
+        .is_empty());
+}
+
 /// The rollback record is the containment envelope's crash-recovery authority.
 /// If its initial write fails, the forward command must never start.
 #[cfg(unix)]
@@ -4790,6 +4897,7 @@ fn provisional_result_carries_contain_coverage() {
         None,
         1_700_000_300,
         300,
+        true,
     );
     match &r.exec {
         ExecOutcome::Provisional {
@@ -4801,6 +4909,7 @@ fn provisional_result_carries_contain_coverage() {
         other => panic!("expected Provisional, got {:?}", other),
     }
     let response = r.into_response();
+    assert_eq!(response.auto_revert_durable, Some(true));
     assert_eq!(response.confirm_deadline_unix, Some(1_700_000_300));
     assert_eq!(response.confirm_window_secs, Some(300));
 }

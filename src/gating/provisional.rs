@@ -361,6 +361,24 @@ impl ProvisionalRegistry {
         Some(p.clone())
     }
 
+    /// Record that the forward command completed but its durable outcome could
+    /// not be committed. The pre-forward row remains the restart recovery
+    /// authority, while the live registry must not leave a timer eligible for
+    /// automatic rollback.
+    pub fn mark_forward_persistence_failed(
+        &mut self,
+        handle: &str,
+        detail: String,
+    ) -> Option<Provisional> {
+        let p = self.items.get_mut(handle)?;
+        p.forward_done = true;
+        p.deadline_unix = 0;
+        p.window_secs = 0;
+        p.status = ProvisionalStatus::NeedsOperatorDecision;
+        p.revert_detail = Some(detail);
+        Some(p.clone())
+    }
+
     /// Operator confirms: keep the change, cancel the timer. Allowed from
     /// `Armed` and `NeedsOperatorDecision`.
     pub fn confirm(&mut self, handle: &str) -> Result<Provisional, GateError> {

@@ -1568,6 +1568,7 @@ fn validation_error_response(reason: String) -> ExecuteResponse {
         verb_guidance: None,
         confirm_deadline_unix: None,
         confirm_window_secs: None,
+        auto_revert_durable: None,
         decision_source: "validation".to_string(),
         decision_trace: Some(guard::gating::DecisionTrace::source("validation")),
     }
