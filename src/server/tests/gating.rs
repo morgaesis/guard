@@ -5208,12 +5208,20 @@ fn held_verb_approval(
 #[tokio::test]
 async fn one_rpc_approval_wait_returns_owned_armed_outcome() {
     let (cfg, operator, agent) = gating_config(7007, 1000);
+    let catalog = VerbCatalog::from_yaml(HELD_VERB_YAML).unwrap();
+    let catalog_version = catalog.version();
+    *cfg.state.verbs.write().await = catalog;
     let handle = "one-rpc-arm";
     cfg.state
         .approvals
         .write()
         .await
-        .enqueue(held_verb_approval(handle, None, None, agent.principal()));
+        .enqueue(held_verb_approval(
+            handle,
+            Some(catalog_version),
+            None,
+            agent.principal(),
+        ));
 
     let owned = handle_admin_request_owned(
         &cfg,
@@ -5380,12 +5388,20 @@ async fn access_audience_controls_hold_visibility_and_next_action() {
 #[tokio::test]
 async fn lost_one_rpc_response_leaves_one_durable_mutation() {
     let (cfg, operator, agent) = gating_config(7007, 1000);
+    let catalog = VerbCatalog::from_yaml(HELD_VERB_YAML).unwrap();
+    let catalog_version = catalog.version();
+    *cfg.state.verbs.write().await = catalog;
     let handle = "lost-one-rpc-response";
     cfg.state
         .approvals
         .write()
         .await
-        .enqueue(held_verb_approval(handle, None, None, agent.principal()));
+        .enqueue(held_verb_approval(
+            handle,
+            Some(catalog_version),
+            None,
+            agent.principal(),
+        ));
 
     let owned = handle_admin_request_owned(
         &cfg,
@@ -5393,10 +5409,20 @@ async fn lost_one_rpc_response_leaves_one_durable_mutation() {
         AdminRequest::AccessApprove {
             handles: vec![handle.to_string()],
             uses: Some(1),
-            wait_secs: Some(30),
+            wait_secs: Some(1),
         },
     )
     .await;
+    let AdminResponse::AccessDecisions {
+        items,
+        wait: Some(wait),
+    } = &owned.response
+    else {
+        panic!("lost response simulation requires the one-RPC wait envelope");
+    };
+    assert!(items[0].success);
+    assert_eq!(wait.outcome, "armed");
+    assert_eq!(wait.item.status, "armed");
     drop(owned);
     assert!(approval_is_armed(
         cfg.state.approvals.read().await.get(handle).unwrap()
