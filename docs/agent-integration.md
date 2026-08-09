@@ -148,8 +148,8 @@ exact access approval commands. It does not create a parallel policy path.
 Normal client configuration supplies the execution token for a TCP daemon. MCP does
 not receive or forward the configured admin bearer.
 
-Local-socket stdio MCP exposes the following tools after a successful daemon
-Ping and self-scoped admin probe:
+Local-socket stdio MCP exposes the following tools after a successful framed
+endpoint probe and self-scoped admin probe:
 
 | Tool | Purpose | Key arguments | CLI equivalent |
 | ---- | ------- | ------------- | -------------- |
@@ -164,11 +164,13 @@ Ping and self-scoped admin probe:
 | `guard_approval_resume` | Resume one operator-armed hold as its original requester | `handle` (string, required), `wait` (1-3600 seconds, optional) | `guard approval resume` |
 
 The daemon must advertise `approval-consequences-v1` for the two
-`guard_approval_*` tools. A capability-free daemon retains the seven baseline
-local-socket tools. Failed, malformed, or non-Ping probe responses fail closed
-and expose no tools; a failed Unix admin probe also exposes no tools. Direct
-calls report `endpoint_unavailable` for endpoint or Unix admin-probe failures
-and `feature_unavailable` for capability or transport exclusions.
+`guard_approval_*` tools. A separate cached Ping determines only that
+capability membership. A capability-free, unavailable-Ping, or malformed-Ping
+daemon retains the seven baseline local-socket tools when the framed endpoint
+probe and independent Unix admin probe succeed. An unavailable or malformed
+endpoint, or a failed Unix admin probe, exposes no tools. Direct calls report
+`endpoint_unavailable` for endpoint or Unix admin-probe failures and
+`feature_unavailable` for capability or transport exclusions.
 
 `guard_run` is the default name for the execution tool; `guard mcp serve
 --tool-name` renames it to a name that is not reserved by another built-in
@@ -179,9 +181,10 @@ bound, and `false` or omission returns the held handle immediately.
 revision cache context and returns per-command verdicts without running,
 holding, or reverting anything.
 
-TCP MCP exposes only `guard_run` after a successful Ping. Administrative MCP tools require the
-kernel-authenticated principal available on a local socket and are not
-advertised over bearer-authenticated TCP.
+TCP MCP exposes only `guard_run` after a successful framed endpoint probe,
+including when its separate Ping is unavailable or malformed. Administrative
+MCP tools require the kernel-authenticated principal available on a local
+socket and are not advertised over bearer-authenticated TCP.
 
 HTTP MCP is available for a local single-tenant runtime and requires a bearer:
 

@@ -131,7 +131,7 @@ the same requester connection after approval. `--wait-approval <seconds>` adds
 a client bound. `--approval-ttl unbounded` keeps a durable hold until a
 decision, while a numeric TTL fails closed on expiry. Disconnecting a waiting
 client does not grant authority; the requester can reconnect with `guard
-resume` after approval.
+approval resume` after approval.
 
 ## Restart and failure behavior
 

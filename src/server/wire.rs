@@ -938,7 +938,7 @@ pub struct AccessDecisionResult {
     pub target: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remaining_uses: Option<u64>,
-    /// `none`, `unlimited`, `bounded`, or `unavailable`.
+    /// `unlimited`, `bounded`, or `unavailable`.
     pub use_policy: String,
     /// Consequence class of the decided reference: `grant`, `arm`, or
     /// `release`. Absent from a daemon that predates the field.

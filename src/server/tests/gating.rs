@@ -3266,9 +3266,8 @@ async fn held_access_projection_expires_before_the_sweeper_and_hides_approval_op
         .expect("held access request remains visible before the sweeper");
     assert_eq!(listed.state, "expired");
     assert!(listed.approval_options.is_empty());
-    // A hold replays one immutable snapshot, so it reports no use budget in
-    // any state and renderers omit the line.
-    assert_eq!(listed.use_policy, "none");
+    // An expired hold has no active grant budget.
+    assert_eq!(listed.use_policy, "unavailable");
     assert_eq!(listed.kind, "hold");
     assert_eq!(listed.consequence, CONSEQUENCE_ARM);
 

@@ -10,7 +10,7 @@ use crate::server::{
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 pub struct Client {
     socket_path: Option<PathBuf>,
@@ -496,17 +496,50 @@ pub(crate) async fn probe_endpoint(
     socket_path: Option<&Path>,
     tcp_port: Option<u16>,
 ) -> Result<()> {
-    if let Some(socket_path) = socket_path {
-        let _stream = connect_local(socket_path).await?;
-        return Ok(());
+    match (socket_path, tcp_port) {
+        (Some(socket_path), None) if !socket_path.as_os_str().is_empty() => {
+            probe_connected_endpoint(connect_local(socket_path).await?).await
+        }
+        (None, Some(port)) if port != 0 => {
+            let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .context("failed to connect to guard server")?;
+            probe_connected_endpoint(stream).await
+        }
+        _ => bail!("exactly one valid Guard socket path or TCP port must be configured"),
     }
-    if let Some(port) = tcp_port {
-        let _stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .context("failed to connect to guard server")?;
-        return Ok(());
+}
+
+/// Prove that an opened transport speaks Guard's newline-framed protocol.
+/// This Ping-shaped exchange establishes endpoint reachability only. MCP sends
+/// its separate cached Ping afterwards and derives capability membership only
+/// from that independent response.
+async fn probe_connected_endpoint<S>(stream: S) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let frame = serde_json::to_string(&IncomingMessage::Admin {
+        admin: Box::new(AdminRequest::Ping),
+        admin_token: None,
+    })
+    .context("serialize Guard endpoint probe")?;
+    let (reader, writer) = tokio::io::split(stream);
+    let mut writer = tokio::io::BufWriter::new(writer);
+    writer.write_all(frame.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+
+    let mut lines = BufReader::new(reader).lines();
+    let response_line = lines
+        .next_line()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Guard endpoint closed without a framed response"))?;
+    match serde_json::from_str::<AdminResponse>(&response_line)
+        .context("invalid Guard endpoint probe response")?
+    {
+        AdminResponse::Ping { .. } => Ok(()),
+        _ => bail!("Guard endpoint returned the wrong response to the framed probe"),
     }
-    bail!("no socket path or TCP port configured")
 }
 
 fn execute_envelope_json(request: &ExecuteRequest, feature: &str) -> Result<String> {
@@ -649,10 +682,61 @@ async fn connect_local(path: &Path) -> Result<tokio::net::windows::named_pipe::N
 #[cfg(test)]
 mod tests {
     use super::{
-        execute_envelope_json, parse_admin_response_line, AdminResponse, Client,
-        EXECUTE_FEATURE_TCP_NO_CWD, EXECUTE_PROTOCOL_VERSION,
+        execute_envelope_json, parse_admin_response_line, probe_endpoint, AdminRequest,
+        AdminResponse, Client, IncomingMessage, EXECUTE_FEATURE_TCP_NO_CWD,
+        EXECUTE_PROTOCOL_VERSION,
     };
     use std::collections::HashMap;
+    use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+
+    fn endpoint_probe_response() -> String {
+        serde_json::to_string(&AdminResponse::Ping {
+            version: "probe-version".to_string(),
+            uptime_secs: 1,
+            mode: "probe-mode".to_string(),
+            dry_run: false,
+            capabilities: vec!["probe-capability-is-discarded".to_string()],
+        })
+        .unwrap()
+    }
+
+    async fn serve_endpoint_probe<S>(stream: S, response: Option<&str>)
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let (reader, mut writer) = tokio::io::split(stream);
+        let mut lines = BufReader::new(reader).lines();
+        let line = lines
+            .next_line()
+            .await
+            .unwrap()
+            .expect("framed endpoint probe request");
+        let request: IncomingMessage = serde_json::from_str(&line).unwrap();
+        assert!(matches!(
+            request,
+            IncomingMessage::Admin {
+                admin,
+                admin_token: None,
+            } if matches!(*admin, AdminRequest::Ping)
+        ));
+        if let Some(response) = response {
+            writer.write_all(response.as_bytes()).await.unwrap();
+            writer.write_all(b"\n").await.unwrap();
+            writer.flush().await.unwrap();
+        }
+    }
+
+    async fn tcp_probe_with_response(response: Option<String>) -> anyhow::Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_endpoint_probe(stream, response.as_deref()).await;
+        });
+        let result = probe_endpoint(None, Some(port)).await;
+        server.await.unwrap();
+        result
+    }
 
     #[test]
     fn parse_admin_response_line_accepts_admin_response() {
@@ -668,8 +752,10 @@ mod tests {
         let line = r#"{"allowed":false,"reason":"invalid request: data did not match any variant of untagged enum IncomingMessage"}"#;
         match parse_admin_response_line(line, "secret_set").unwrap() {
             AdminResponse::Error { message } => {
-                assert!(message.contains("secret_set"));
-                assert!(message.contains("needs restart"));
+                assert_eq!(
+                    message,
+                    "legacy_rejection: guard daemon rejected admin RPC 'secret_set'; use the CLI fallback or restart the daemon onto the current binary."
+                );
             }
             other => panic!("expected admin error, got {:?}", other),
         }
@@ -720,5 +806,67 @@ mod tests {
         assert_eq!(value["protocol_version"], EXECUTE_PROTOCOL_VERSION);
         assert_eq!(value["features"][0], EXECUTE_FEATURE_TCP_NO_CWD);
         assert_eq!(value["execute"]["binary"], "id");
+    }
+
+    #[tokio::test]
+    async fn tcp_framed_endpoint_probe_distinguishes_guard_and_non_guard_listeners() {
+        assert!(tcp_probe_with_response(Some(endpoint_probe_response()))
+            .await
+            .is_ok());
+        assert!(
+            tcp_probe_with_response(Some("unrelated listener response".to_string()))
+                .await
+                .is_err()
+        );
+        assert!(tcp_probe_with_response(None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn tcp_framed_endpoint_probe_rejects_unavailable_and_malformed_endpoints() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        assert!(probe_endpoint(None, Some(port)).await.is_err());
+        assert!(probe_endpoint(None, Some(0)).await.is_err());
+        assert!(probe_endpoint(None, None).await.is_err());
+    }
+
+    #[cfg(unix)]
+    async fn unix_probe_with_response(response: Option<String>) -> anyhow::Result<()> {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("guard.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_endpoint_probe(stream, response.as_deref()).await;
+        });
+        let result = probe_endpoint(Some(&socket), None).await;
+        server.await.unwrap();
+        result
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_framed_endpoint_probe_distinguishes_guard_and_non_guard_listeners() {
+        assert!(unix_probe_with_response(Some(endpoint_probe_response()))
+            .await
+            .is_ok());
+        assert!(
+            unix_probe_with_response(Some("unrelated listener response".to_string()))
+                .await
+                .is_err()
+        );
+        assert!(unix_probe_with_response(None).await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_framed_endpoint_probe_rejects_unavailable_and_malformed_endpoints() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing.sock");
+        assert!(probe_endpoint(Some(&missing), None).await.is_err());
+        assert!(probe_endpoint(Some(std::path::Path::new("")), None)
+            .await
+            .is_err());
     }
 }
