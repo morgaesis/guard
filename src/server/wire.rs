@@ -5,7 +5,7 @@ use crate::session::{
     HistoricalGrant, SessionDecisionSource, SessionExecStatus, SessionGrantSummary, SessionOwner,
     SessionReport,
 };
-use guard::gating::approval::Approval;
+use guard::gating::approval::{Approval, WaiterLease};
 use guard::gating::provisional::Provisional;
 use guard::gating::{Coverage, DecisionTrace, DecisionVerbMatch};
 use guard::principal::PrincipalKey;
@@ -402,11 +402,10 @@ pub enum AdminRequest {
     /// Block until one approval is armed or terminal, then return the same
     /// summary `ApprovalShow` returns. Scoped by handle ownership, with the
     /// same non-leaking NotFound for any other caller. The wait is bounded by
-    /// `timeout_secs`, clamped by the daemon.
+    /// `timeout_secs`, validated by the daemon in the inclusive 1..=3600 range.
     ApprovalWait {
         handle: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        timeout_secs: Option<u64>,
+        timeout_secs: u64,
     },
     /// Append a note to a held command's discussion thread. Allowed for the
     /// operator (any hold) or the hold's original requester (its own hold).
@@ -578,6 +577,8 @@ pub enum AdminRequest {
         handles: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         uses: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wait_secs: Option<u64>,
     },
     AccessDeny {
         handles: Vec<String>,
@@ -729,6 +730,8 @@ pub enum AdminResponse {
         /// commands. Useful for callers to know whether their command
         /// will actually run.
         dry_run: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<String>,
     },
     // --- Consequence gating ---
     /// A gate action ran (confirm/revert/approve/deny). Carries a human message
@@ -813,6 +816,11 @@ pub enum AdminResponse {
     },
     AccessDecisions {
         items: Vec<AccessDecisionResult>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wait: Option<AccessWaitResult>,
+    },
+    ApprovalWait {
+        wait: AccessWaitResult,
     },
     SessionBulkRevoked {
         count: usize,
@@ -859,6 +867,17 @@ pub const CONSEQUENCE_ARM: &str = "arm";
 /// Approving releases a request already parked and waiting; it proceeds
 /// immediately.
 pub const CONSEQUENCE_RELEASE: &str = "release";
+
+pub fn parse_approval_wait_secs(value: &str) -> Result<u64, String> {
+    let seconds = value
+        .parse::<u64>()
+        .map_err(|_| "approval wait must be an integer from 1 to 3600 seconds".to_string())?;
+    if (1..=3600).contains(&seconds) {
+        Ok(seconds)
+    } else {
+        Err("approval wait must be an integer from 1 to 3600 seconds".to_string())
+    }
+}
 
 /// One wording for "you cannot wait on a grant". The daemon returns it when a
 /// wait names a grant request; the client quotes it verbatim from its own
@@ -925,6 +944,19 @@ pub struct AccessDecisionResult {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub consequence: String,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccessWaitResult {
+    pub item: ApprovalSummary,
+    pub outcome: String,
+}
+
+/// An admin response plus any observation lease that must remain alive until
+/// the transport has serialized and written the response.
+pub struct OwnedAdminResponse {
+    pub response: AdminResponse,
+    pub waiter_lease: Option<WaiterLease>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1062,6 +1094,27 @@ pub struct ApprovalSummary {
 pub(super) const APPROVAL_ARMED_REASON: &str = "operator approved; awaiting requester-bound resume";
 pub(super) const APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX: &str =
     "\n[guard persisted transcript truncated]\n";
+const APPROVAL_TRANSCRIPT_BYTES: usize = 262_144;
+
+fn exposed_transcript(value: Option<&str>) -> (Option<String>, bool) {
+    let Some(value) = value else {
+        return (None, false);
+    };
+    let mut exposed = redact_output_text(value);
+    let mut truncated = exposed.ends_with(APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX);
+    if exposed.len() > APPROVAL_TRANSCRIPT_BYTES {
+        let end =
+            APPROVAL_TRANSCRIPT_BYTES.saturating_sub(APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX.len());
+        let mut boundary = end.min(exposed.len());
+        while boundary > 0 && !exposed.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        exposed.truncate(boundary);
+        exposed.push_str(APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX);
+        truncated = true;
+    }
+    (Some(exposed), truncated)
+}
 
 pub(super) fn approval_is_armed(approval: &Approval) -> bool {
     approval.status == guard::gating::approval::ApprovalStatus::Pending
@@ -1122,6 +1175,8 @@ impl ApprovalSummary {
     pub(super) fn from_row(a: &Approval) -> Self {
         // See `ProvisionalSummary::from_row`: display boundary, argv may
         // carry inline credentials.
+        let (stdout, stdout_truncated) = exposed_transcript(a.result_stdout.as_deref());
+        let (stderr, stderr_truncated) = exposed_transcript(a.result_stderr.as_deref());
         Self {
             handle: a.handle.clone(),
             status: if approval_is_armed(a) {
@@ -1142,16 +1197,10 @@ impl ApprovalSummary {
                 .as_ref()
                 .map(|p| p.as_str().to_string()),
             exit_code: a.result_exit,
-            stdout: a.result_stdout.as_deref().map(redact_output_text),
-            stderr: a.result_stderr.as_deref().map(redact_output_text),
-            stdout_truncated: a
-                .result_stdout
-                .as_deref()
-                .is_some_and(|text| text.ends_with(APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX)),
-            stderr_truncated: a
-                .result_stderr
-                .as_deref()
-                .is_some_and(|text| text.ends_with(APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX)),
+            stdout,
+            stderr,
+            stdout_truncated,
+            stderr_truncated,
             decided_reason: a.decided_reason.as_deref().map(redact_output_text),
             notes: a
                 .notes

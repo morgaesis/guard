@@ -348,6 +348,8 @@ pub(super) struct NotifyEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_fingerprint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub requester_principal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
@@ -446,6 +448,10 @@ fn bounded_notify_text(value: Option<String>, max_chars: usize) -> Option<String
 fn bounded_notify_event(mut event: NotifyEvent) -> NotifyEvent {
     event.handle = bounded_notify_text(event.handle, 128);
     event.session_fingerprint = bounded_notify_text(event.session_fingerprint, 96);
+    event.requester_principal = event
+        .requester_principal
+        .map(|principal| guard::redact::audit_escape(&principal).into_owned());
+    event.requester_principal = bounded_notify_text(event.requester_principal, 128);
     event.reason = bounded_notify_text(event.reason, 1024);
     event.status = bounded_notify_text(event.status, 64);
     event
@@ -570,6 +576,7 @@ mod tests {
             at_unix: 42,
             handle: Some("handle-1".into()),
             session_fingerprint: Some("session:abcd".into()),
+            requester_principal: None,
             reason: Some("operator review".into()),
             status: Some("pending".into()),
             behavior: None,
@@ -586,6 +593,7 @@ mod tests {
             at_unix: 43,
             handle: Some("recovery-1".into()),
             session_fingerprint: Some("sha256:abcd".into()),
+            requester_principal: None,
             reason: Some("persisted rollback authority is unavailable".into()),
             status: Some("needs_operator_decision".into()),
             behavior: None,
@@ -601,6 +609,7 @@ mod tests {
             at_unix: 44,
             handle: Some("h".repeat(1_000)),
             session_fingerprint: None,
+            requester_principal: None,
             reason: Some("r".repeat(100_000)),
             status: Some("needs_operator_decision".into()),
             behavior: None,
@@ -630,6 +639,7 @@ mod tests {
             at_unix: 7,
             handle: Some("p1".into()),
             session_fingerprint: None,
+            requester_principal: None,
             reason: None,
             status: Some("reverting".into()),
             behavior: None,

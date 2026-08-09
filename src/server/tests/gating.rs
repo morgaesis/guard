@@ -1737,10 +1737,11 @@ async fn hold_approval_arms_then_requester_resumes_once_with_output() {
         AdminRequest::AccessApprove {
             handles: vec![handle.clone()],
             uses: Some(3),
+            wait_secs: None,
         },
     )
     .await;
-    let AdminResponse::AccessDecisions { items } = response else {
+    let AdminResponse::AccessDecisions { items, .. } = response else {
         panic!("expected held access decision")
     };
     assert!(!items[0].success);
@@ -1763,11 +1764,12 @@ async fn hold_approval_arms_then_requester_resumes_once_with_output() {
         AdminRequest::AccessApprove {
             handles: vec![handle.clone()],
             uses: Some(1),
+            wait_secs: None,
         },
     )
     .await;
     match ok {
-        AdminResponse::AccessDecisions { items } => {
+        AdminResponse::AccessDecisions { items, .. } => {
             assert!(items[0].success);
             assert_eq!(items[0].state, "armed");
             assert_eq!(items[0].remaining_uses, None);
@@ -1925,6 +1927,7 @@ async fn armed_hold_survives_restart_and_persists_bounded_transcript() {
         AdminRequest::AccessApprove {
             handles: vec![handle.clone()],
             uses: Some(1),
+            wait_secs: None,
         },
     )
     .await;
@@ -2022,6 +2025,7 @@ async fn armed_hold_expires_across_restart_without_execution() {
         AdminRequest::AccessApprove {
             handles: vec![handle.clone()],
             uses: Some(1),
+            wait_secs: None,
         },
     )
     .await;
@@ -2320,12 +2324,13 @@ async fn held_snapshot_consumes_its_originating_once_authority() {
         vec!["gr-origin".to_string()]
     );
 
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request(
         &cfg,
         &operator,
         AdminRequest::AccessApprove {
             handles: vec![handle.clone()],
             uses: Some(1),
+            wait_secs: None,
         },
     )
     .await
@@ -2337,12 +2342,13 @@ async fn held_snapshot_consumes_its_originating_once_authority() {
     assert_eq!(items[0].remaining_uses, Some(1));
     let resumed = resume_approval(&cfg, &agent, &handle).await;
     assert!(matches!(resumed.exec, ExecOutcome::Completed { .. }));
-    let AdminResponse::AccessDecisions { items: replay } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items: replay, .. } = handle_admin_request(
         &cfg,
         &operator,
         AdminRequest::AccessApprove {
             handles: vec![handle.clone()],
             uses: Some(1),
+            wait_secs: None,
         },
     )
     .await
@@ -2485,12 +2491,13 @@ async fn held_snapshot_does_not_fall_through_to_overlapping_authority() {
         .await
         .consume_access_use("access-token", &selected_verbs, Some(&origin))
         .expect("consume the bound origin before approval");
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request(
         &cfg,
         &operator,
         AdminRequest::AccessApprove {
             handles: vec![handle.clone()],
             uses: Some(1),
+            wait_secs: None,
         },
     )
     .await
@@ -2616,12 +2623,13 @@ async fn held_snapshot_binds_and_consumes_multiple_originating_requests() {
         vec!["request-a".to_string(), "request-b".to_string()]
     );
 
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request(
         &cfg,
         &operator,
         AdminRequest::AccessApprove {
             handles: vec![handle.clone()],
             uses: Some(1),
+            wait_secs: None,
         },
     )
     .await
@@ -2936,10 +2944,11 @@ async fn approval_rejects_tool_secret_rotated_after_hold() {
         AdminRequest::AccessApprove {
             handles: vec![handle.clone()],
             uses: Some(1),
+            wait_secs: None,
         },
     )
     .await;
-    let AdminResponse::AccessDecisions { items } = response else {
+    let AdminResponse::AccessDecisions { items, .. } = response else {
         panic!("expected access decision result")
     };
     assert!(items[0].success);
@@ -3110,12 +3119,13 @@ async fn approval_state_must_be_durable_before_a_held_snapshot_executes() {
         .as_ref()
         .unwrap()
         .fail_next_write_for_test();
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request(
         &cfg,
         &operator,
         AdminRequest::AccessApprove {
             handles: vec![handle.clone()],
             uses: Some(1),
+            wait_secs: None,
         },
     )
     .await
@@ -3242,11 +3252,12 @@ async fn kube_proxy_hold_routes_through_approval_queue() {
         AdminRequest::AccessApprove {
             handles: vec![handle.clone()],
             uses: Some(1),
+            wait_secs: None,
         },
     )
     .await;
     match resp {
-        AdminResponse::AccessDecisions { items } => {
+        AdminResponse::AccessDecisions { items, .. } => {
             assert!(items[0].success, "got: {:?}", items[0]);
             assert!(items[0].message.contains("forwarding"));
             assert_eq!(items[0].remaining_uses, None);
@@ -3497,10 +3508,11 @@ async fn waiting_requester_resumes_armed_hold_and_receives_terminal_output() {
         AdminRequest::AccessApprove {
             handles: vec![handle.clone()],
             uses: Some(1),
+            wait_secs: None,
         },
     )
     .await;
-    let AdminResponse::AccessDecisions { items } = approval else {
+    let AdminResponse::AccessDecisions { items, .. } = approval else {
         panic!("operator approval should return an access decision")
     };
     assert_eq!(items[0].state, "armed");

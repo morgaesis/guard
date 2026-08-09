@@ -8,7 +8,7 @@ use anyhow::bail;
 use anyhow::{Context, Result};
 use guard::audit::{AuditEvent, AuditKind};
 use guard::evaluate::Evaluator;
-use guard::gating::approval::{ApprovalRegistry, ApprovalStatus};
+use guard::gating::approval::{ApprovalRegistry, ApprovalStatus, WaiterLease};
 use guard::gating::provisional::{Provisional, ProvisionalRegistry, ProvisionalStatus};
 #[cfg(unix)]
 use guard::gating::read_grant::{GrantReadRegistry, ReadGrantStatus};
@@ -30,7 +30,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command;
 use tokio::sync::RwLock;
 
-use super::admin::handle_admin_request;
+use super::admin::handle_admin_request_owned;
 use super::execute::{execute_command, execute_command_streaming, record_live_session_interaction};
 #[cfg(unix)]
 use super::gate_runtime::revert_dir_is_owner_only;
@@ -40,7 +40,7 @@ use super::grants::{delete_read_grant_row, revoke_read_grant_acls};
 use super::runtime::NotifyEvent;
 use super::wire::{
     AdminRequest, AdminResponse, CallerIdentity, ExecOutcome, ExecuteRequest, ExecuteResponse,
-    ExecuteResult, ExecuteStreamMessage, IncomingMessage,
+    ExecuteResult, ExecuteStreamMessage, IncomingMessage, OwnedAdminResponse,
 };
 use super::{
     ServerConfig, ServerContext, ServerState, DEFAULT_CONFIRM_WITHIN_SECS, MAX_REQUEST_BYTES,
@@ -51,6 +51,38 @@ use crate::session::{SessionDecisionSource, SessionExecStatus, SessionInteractio
 #[derive(Clone)]
 struct DaemonApiSessionSink {
     server: ServerContext,
+}
+
+struct ReplyWaiterGuard(Option<WaiterLease>);
+
+impl ReplyWaiterGuard {
+    fn new(lease: Option<WaiterLease>) -> Self {
+        Self(lease)
+    }
+}
+
+impl Drop for ReplyWaiterGuard {
+    fn drop(&mut self) {
+        if let Some(mut lease) = self.0.take() {
+            lease.release_once();
+        }
+    }
+}
+
+async fn write_admin_response<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    owned: OwnedAdminResponse,
+) -> Result<()> {
+    let OwnedAdminResponse {
+        response,
+        waiter_lease,
+    } = owned;
+    let _reply_guard = ReplyWaiterGuard::new(waiter_lease);
+    let bytes = serde_json::to_vec(&response)?;
+    writer.write_all(&bytes).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+    Ok(())
 }
 
 fn api_session_exec_status(allowed: bool, held: bool) -> SessionExecStatus {
@@ -271,6 +303,7 @@ mod api_session_event_tests {
             confirm_check_args: Vec::new(),
             control_path: Some("local".to_string()),
             session_fingerprint: None,
+            requester_principal: None,
             session_revision: None,
             secret_entitlements: None,
             api_revert: None,
@@ -651,6 +684,7 @@ impl Server {
                                 at_unix: now_unix(),
                                 handle: Some(handle.clone()),
                                 session_fingerprint: p.session_fingerprint.clone(),
+                                requester_principal: None,
                                 reason: Some(reason.clone()),
                                 status: Some("needs_operator_decision".to_string()),
                                 behavior: None,
@@ -1684,11 +1718,8 @@ where
                         caller.clone()
                     }
                 };
-                let resp = handle_admin_request(server, &caller, *admin).await;
-                writer
-                    .write_all(serde_json::to_string(&resp)?.as_bytes())
-                    .await?;
-                writer.write_all(b"\n").await?;
+                let owned = handle_admin_request_owned(server, &caller, *admin).await;
+                write_admin_response(&mut writer, owned).await?;
                 continue;
             }
             IncomingMessage::Execute {
@@ -2043,11 +2074,8 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, server: &ServerContext
                         token: admin_token.unwrap_or_else(|| "<missing>".to_string()),
                     }
                 };
-                let resp = handle_admin_request(server, &caller, *admin).await;
-                writer
-                    .write_all(serde_json::to_string(&resp)?.as_bytes())
-                    .await?;
-                writer.write_all(b"\n").await?;
+                let owned = handle_admin_request_owned(server, &caller, *admin).await;
+                write_admin_response(&mut writer, owned).await?;
                 continue;
             }
             IncomingMessage::Execute {

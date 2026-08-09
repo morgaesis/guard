@@ -38,11 +38,11 @@ use super::learning::{
 use super::runtime::NotifyEvent;
 use super::wire::{
     approval_is_armed, authorize_session_use, grant_class_wait_refusal, verb_effective_trust,
-    AccessCapability, AccessDecisionResult, AccessItem, AdminRequest, AdminResponse,
-    ApprovalSummary, CallerIdentity, ExecOutcome, ExecuteRequest, ProvisionalSummary, SecretDetail,
-    ServerStatus, SessionAuthz, VerbInvocation, VerbMenuItem, VerbSummary, APPROVAL_ARMED_REASON,
-    CONSEQUENCE_ARM, CONSEQUENCE_GRANT, CONSEQUENCE_RELEASE, SESSION_PRINCIPAL_MISMATCH,
-    SESSION_UNOWNED_REFUSED,
+    AccessCapability, AccessDecisionResult, AccessItem, AccessWaitResult, AdminRequest,
+    AdminResponse, ApprovalSummary, CallerIdentity, ExecOutcome, ExecuteRequest,
+    OwnedAdminResponse, ProvisionalSummary, SecretDetail, ServerStatus, SessionAuthz,
+    VerbInvocation, VerbMenuItem, VerbSummary, APPROVAL_ARMED_REASON, CONSEQUENCE_ARM,
+    CONSEQUENCE_GRANT, CONSEQUENCE_RELEASE, SESSION_PRINCIPAL_MISMATCH, SESSION_UNOWNED_REFUSED,
 };
 use super::{is_valid_secret_key, ServerContext};
 use guard::gating::approval::{Approval, ApprovalSnapshot, ApprovalStatus};
@@ -1464,19 +1464,20 @@ async fn access_item_for_approval(
         effective_scope: scope.clone(),
         expires_unix,
         remaining_uses,
-        // A hold replays one immutable snapshot, so it has no use budget in any
-        // state; renderers omit the line entirely rather than print a number
-        // that does not govern it.
-        use_policy: "none".to_string(),
+        // Preserve the baseline budget contract. A pending hold is
+        // unselected with a bounded one-use default; the consequence explains
+        // that approval arms the snapshot rather than replacing the budget.
+        use_policy: if awaiting_decision {
+            "unselected"
+        } else {
+            access_use_policy(grant_uses)
+        }
+        .to_string(),
         consequence: approval_consequence(server, approval).to_string(),
-        default_use_policy: None,
-        default_uses: None,
+        default_use_policy: awaiting_decision.then(|| "bounded".to_string()),
+        default_uses: awaiting_decision.then_some(1),
         state: projected_state.to_string(),
         next_action: hold_next_action(&approval.handle, projected_state, is_operator),
-        approval_options: if approval.status == ApprovalStatus::Pending
-            && !projected_expired
-            && !approval_is_armed(approval)
-        {
         approval_options: if awaiting_decision {
             vec![format!("guard access approve {} --once", approval.handle)]
         } else {
@@ -1552,11 +1553,8 @@ async fn access_item_for_request(
         effective_scope: request.authority_verbs.clone(),
         expires_unix,
         remaining_uses,
-        // A pending request has no budget yet: the operator selects one when
-        // approving. `not-yet-granted` says that, where `unselected` read as a
-        // budget the requester had failed to pick.
         use_policy: if awaiting_decision {
-            "not-yet-granted"
+            "unselected"
         } else {
             access_use_policy(grant_uses)
         }
@@ -1580,7 +1578,6 @@ async fn access_item_for_request(
         } else {
             format!("guard access show {}", request.handle)
         },
-        approval_options: if request.status == GrantRequestStatus::Pending && !expired {
         approval_options: if awaiting_decision {
             approval_options(&request.handle)
         } else {
@@ -4177,6 +4174,7 @@ pub(super) async fn handle_admin_request(
                 uptime_secs: now.saturating_sub(server.config.started_at_unix),
                 mode,
                 dry_run: server.config.dry_run,
+                capabilities: vec!["approval-consequences-v1".to_string()],
             }
         }
         AdminRequest::AuditVerify => {
@@ -5221,7 +5219,16 @@ pub(super) async fn handle_admin_request(
                 Err(message) => AdminResponse::Error { message },
             }
         }
-        AdminRequest::AccessApprove { handles, uses } => {
+        AdminRequest::AccessApprove {
+            handles,
+            uses,
+            wait_secs,
+        } => {
+            if wait_secs.is_some() {
+                return AdminResponse::Error {
+                    message: "approval wait must use the one-RPC admin path".to_string(),
+                };
+            }
             let mut items = Vec::with_capacity(handles.len());
             for handle in handles {
                 // Resolve the class before deciding: approving a release-class
@@ -5242,7 +5249,7 @@ pub(super) async fn handle_admin_request(
                 item.consequence = consequence;
                 items.push(item);
             }
-            AdminResponse::AccessDecisions { items }
+            AdminResponse::AccessDecisions { items, wait: None }
         }
         AdminRequest::AccessDeny { handles, reason } => {
             let reason = match reason {
@@ -5270,7 +5277,7 @@ pub(super) async fn handle_admin_request(
                 item.consequence = consequence;
                 items.push(item);
             }
-            AdminResponse::AccessDecisions { items }
+            AdminResponse::AccessDecisions { items, wait: None }
         }
         AdminRequest::AccessRevoke { target } => {
             let _transition = server.state.grant_request_transition_gate.lock().await;
@@ -5376,6 +5383,7 @@ pub(super) async fn handle_admin_request(
                         message: "access revoked".to_string(),
                         consequence: String::new(),
                     }],
+                    wait: None,
                 };
             }
         }
@@ -5386,6 +5394,7 @@ pub(super) async fn handle_admin_request(
         } => match submit_access_request(server, caller, Some(&target), &intent, uses).await {
             Ok(item) if item.kind == "request" => AdminResponse::AccessDecisions {
                 items: vec![approve_access_request(server, &item.reference, uses).await],
+                wait: None,
             },
             Ok(item) => AdminResponse::AccessDecisions {
                 items: vec![AccessDecisionResult {
@@ -5398,6 +5407,7 @@ pub(super) async fn handle_admin_request(
                     message: "equivalent authority is already active; no change made".to_string(),
                     consequence: String::new(),
                 }],
+                wait: None,
             },
             Err(message) => AdminResponse::Error { message },
         },
@@ -6056,6 +6066,7 @@ fn emit_grant_request_event(server: &ServerContext, request: &GrantRequest, even
         at_unix: now_unix(),
         handle: Some(request.handle.clone()),
         session_fingerprint: Some(audit_session_fingerprint(Some(&request.session_token))),
+        requester_principal: None,
         reason: request.decided_reason.clone(),
         status: Some(request.status.as_str().to_string()),
         behavior: None,
@@ -6124,6 +6135,7 @@ async fn handle_confirm(
         at_unix: now_unix(),
         handle: Some(handle.to_string()),
         session_fingerprint: next.session_fingerprint.clone(),
+        requester_principal: None,
         reason: Some("operator confirmed provisional".to_string()),
         status: Some("confirmed".to_string()),
         behavior: None,
@@ -6566,6 +6578,7 @@ async fn arm_held_command(
         at_unix: now,
         handle: Some(handle.clone()),
         session_fingerprint: armed.snapshot.session_fingerprint.clone(),
+        requester_principal: armed.snapshot.principal.as_ref().map(ToString::to_string),
         reason: Some(APPROVAL_ARMED_REASON.to_string()),
         status: Some("armed".to_string()),
         behavior: None,
@@ -6637,6 +6650,7 @@ async fn handle_approve_claimed(
             at_unix: now,
             handle: Some(handle.to_string()),
             session_fingerprint: snapshot.session_fingerprint.clone(),
+            requester_principal: snapshot.principal.as_ref().map(ToString::to_string),
             reason: Some("operator approved held API request".to_string()),
             status: Some("approved".to_string()),
             behavior: None,
@@ -6688,6 +6702,7 @@ async fn handle_approve_claimed(
                 at_unix: now,
                 handle: Some(handle.to_string()),
                 session_fingerprint: snapshot.session_fingerprint.clone(),
+                requester_principal: snapshot.principal.as_ref().map(ToString::to_string),
                 reason: Some(detail.clone()),
                 status: Some("voided".to_string()),
                 behavior: None,
@@ -6809,6 +6824,7 @@ async fn handle_approve_claimed(
         at_unix: now,
         handle: Some(handle.to_string()),
         session_fingerprint: snapshot.session_fingerprint.clone(),
+        requester_principal: snapshot.principal.as_ref().map(ToString::to_string),
         reason: Some(message.clone()),
         status: Some(terminal_status),
         behavior: None,
@@ -6848,8 +6864,6 @@ async fn handle_approve(
     handle_approve_claimed(server, caller, handle, snapshot).await
 }
 
-/// Default bound on one `ApprovalWait` park, in seconds.
-const APPROVAL_WAIT_DEFAULT_SECS: u64 = 300;
 /// Hard ceiling on one `ApprovalWait` park, in seconds.
 const APPROVAL_WAIT_MAX_SECS: u64 = 3600;
 
@@ -6890,12 +6904,17 @@ async fn handle_approval_wait(
     server: &ServerContext,
     caller: &CallerIdentity,
     handle: &str,
-    timeout_secs: Option<u64>,
+    timeout_secs: u64,
 ) -> AdminResponse {
+    if !(1..=APPROVAL_WAIT_MAX_SECS).contains(&timeout_secs) {
+        return AdminResponse::Error {
+            message: "approval wait timeout must be between 1 and 3600 seconds".to_string(),
+        };
+    }
     // Authorize before parking. A caller that does not own the handle must not
     // be able to hold a connection open at all, so the refusal is immediate.
-    let approval = match approval_scope_check(server, caller, handle).await {
-        Ok((approval, _is_operator)) => approval,
+    match approval_scope_check(server, caller, handle).await {
+        Ok((_approval, _is_operator)) => {}
         Err(_) => {
             // A grant request never executes, so waiting on one has no
             // meaning. Say so where the caller can act on it, but only to a
@@ -6906,26 +6925,14 @@ async fn handle_approval_wait(
             return approval_not_found(handle);
         }
     };
-    if approval_is_armed(&approval) || approval.status.is_decided() {
-        return AdminResponse::ApprovalShow {
-            item: ApprovalSummary::from_row(&approval),
-        };
-    }
     // Obtain-or-create under the write lock, then release it before parking:
     // `ApprovalRegistry::from_rows` rebuilds without notifiers, so a hold
     // recovered across a restart has none until the first waiter mints it.
-    let Some(notify) = server
-        .state
-        .approvals
-        .write()
-        .await
-        .notifier_or_create(handle)
+    let Some((notify, _lease)) = server.state.approvals.write().await.register_waiter(handle)
     else {
         return approval_not_found(handle);
     };
-    let timeout = timeout_secs
-        .unwrap_or(APPROVAL_WAIT_DEFAULT_SECS)
-        .clamp(1, APPROVAL_WAIT_MAX_SECS);
+    let timeout = timeout_secs;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout);
     loop {
         // Register with the notifier BEFORE re-reading the row: notify_waiters
@@ -7157,6 +7164,7 @@ async fn handle_deny(
         at_unix: now,
         handle: Some(handle.to_string()),
         session_fingerprint,
+        requester_principal: next.snapshot.principal.as_ref().map(ToString::to_string),
         reason: Some(reason.to_string()),
         status: Some("denied".to_string()),
         behavior: None,
@@ -7166,5 +7174,205 @@ async fn handle_deny(
         exit_code: None,
         stdout: None,
         stderr: None,
+    }
+}
+
+fn approval_wait_outcome(approval: &Approval) -> Option<&'static str> {
+    if approval_is_armed(approval) {
+        return Some("armed");
+    }
+    match approval.status {
+        ApprovalStatus::Approved => Some("approved"),
+        ApprovalStatus::Denied => Some("denied"),
+        ApprovalStatus::Expired => Some("expired"),
+        ApprovalStatus::ExecFailed => Some("exec_failed"),
+        ApprovalStatus::Pending | ApprovalStatus::Approving => None,
+    }
+}
+
+async fn observe_approval_with_lease(
+    server: &ServerContext,
+    handle: &str,
+    notify: std::sync::Arc<tokio::sync::Notify>,
+    timeout_secs: u64,
+) -> Result<(ApprovalSummary, String), AdminResponse> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let current = server.state.approvals.read().await.get(handle).cloned();
+        let Some(current) = current else {
+            return Err(approval_not_found(handle));
+        };
+        if let Some(outcome) = approval_wait_outcome(&current) {
+            return Ok((ApprovalSummary::from_row(&current), outcome.to_string()));
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok((ApprovalSummary::from_row(&current), "timed_out".to_string()));
+        }
+        tokio::select! {
+            _ = &mut notified => {}
+            _ = tokio::time::sleep(remaining) => {}
+        }
+    }
+}
+
+/// Transport-facing admin entry point. Side-effecting approval waits are
+/// registered before mutation and return an owned response plus the lease that
+/// the response writer must hold through framing and flush.
+pub(super) async fn handle_admin_request_owned(
+    server: &ServerContext,
+    caller: &CallerIdentity,
+    request: AdminRequest,
+) -> OwnedAdminResponse {
+    if let AdminRequest::ApprovalWait {
+        handle,
+        timeout_secs,
+    } = request
+    {
+        if !(1..=APPROVAL_WAIT_MAX_SECS).contains(&timeout_secs) {
+            return OwnedAdminResponse {
+                response: AdminResponse::Error {
+                    message: "approval wait timeout must be between 1 and 3600 seconds".to_string(),
+                },
+                waiter_lease: None,
+            };
+        }
+        if let Err(response) = approval_scope_check(server, caller, &handle).await {
+            let response =
+                if let Some(message) = grant_request_wait_refusal(server, caller, &handle).await {
+                    AdminResponse::Error { message }
+                } else {
+                    response
+                };
+            return OwnedAdminResponse {
+                response,
+                waiter_lease: None,
+            };
+        }
+        let Some((notify, lease)) = server
+            .state
+            .approvals
+            .write()
+            .await
+            .register_waiter(&handle)
+        else {
+            return OwnedAdminResponse {
+                response: approval_not_found(&handle),
+                waiter_lease: None,
+            };
+        };
+        return match observe_approval_with_lease(server, &handle, notify, timeout_secs).await {
+            Ok((item, _outcome)) => OwnedAdminResponse {
+                response: AdminResponse::ApprovalWait {
+                    wait: AccessWaitResult {
+                        item,
+                        outcome: _outcome,
+                    },
+                },
+                waiter_lease: Some(lease),
+            },
+            Err(response) => OwnedAdminResponse {
+                response,
+                waiter_lease: Some(lease),
+            },
+        };
+    }
+
+    let AdminRequest::AccessApprove {
+        handles,
+        uses,
+        wait_secs: Some(timeout_secs),
+    } = request
+    else {
+        return OwnedAdminResponse {
+            response: handle_admin_request(server, caller, request).await,
+            waiter_lease: None,
+        };
+    };
+
+    if !(1..=APPROVAL_WAIT_MAX_SECS).contains(&timeout_secs) {
+        return OwnedAdminResponse {
+            response: AdminResponse::Error {
+                message: "approval wait timeout must be between 1 and 3600 seconds".to_string(),
+            },
+            waiter_lease: None,
+        };
+    }
+    if handles.len() != 1 {
+        return OwnedAdminResponse {
+            response: AdminResponse::Error {
+                message: "approval wait accepts exactly one request reference".to_string(),
+            },
+            waiter_lease: None,
+        };
+    }
+    let handle = handles.into_iter().next().expect("checked one handle");
+
+    if let Err(response) = approval_scope_check(server, caller, &handle).await {
+        let response =
+            if let Some(message) = grant_request_wait_refusal(server, caller, &handle).await {
+                AdminResponse::Error { message }
+            } else {
+                response
+            };
+        return OwnedAdminResponse {
+            response,
+            waiter_lease: None,
+        };
+    }
+
+    let Some((notify, lease)) = server
+        .state
+        .approvals
+        .write()
+        .await
+        .register_waiter(&handle)
+    else {
+        return OwnedAdminResponse {
+            response: AdminResponse::Error {
+                message: "unknown access request".to_string(),
+            },
+            waiter_lease: None,
+        };
+    };
+
+    let decision = handle_admin_request(
+        server,
+        caller,
+        AdminRequest::AccessApprove {
+            handles: vec![handle.clone()],
+            uses,
+            wait_secs: None,
+        },
+    )
+    .await;
+    let AdminResponse::AccessDecisions { items, .. } = &decision else {
+        return OwnedAdminResponse {
+            response: decision,
+            waiter_lease: Some(lease),
+        };
+    };
+    if items.first().is_none_or(|item| !item.success) {
+        return OwnedAdminResponse {
+            response: decision,
+            waiter_lease: Some(lease),
+        };
+    }
+    let observed = observe_approval_with_lease(server, &handle, notify, timeout_secs).await;
+    match observed {
+        Ok((item, outcome)) => OwnedAdminResponse {
+            response: AdminResponse::AccessDecisions {
+                items: items.clone(),
+                wait: Some(AccessWaitResult { item, outcome }),
+            },
+            waiter_lease: Some(lease),
+        },
+        Err(response) => OwnedAdminResponse {
+            response,
+            waiter_lease: Some(lease),
+        },
     }
 }

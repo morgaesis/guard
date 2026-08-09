@@ -17,7 +17,8 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::Notify;
 
 use super::{DecisionTrace, GateError, Reversibility};
@@ -237,6 +238,62 @@ impl Approval {
 pub struct ApprovalRegistry {
     items: HashMap<String, Approval>,
     notifiers: HashMap<String, Arc<Notify>>,
+    leases: Arc<WaiterLeaseState>,
+}
+
+const TRANSCRIPT_BYTES: usize = 262_144;
+const TRANSCRIPT_TRUNCATED_SUFFIX: &str = "\n[guard persisted transcript truncated]\n";
+
+fn bound_transcript(value: Option<String>) -> Option<String> {
+    let mut value = value?;
+    if value.len() <= TRANSCRIPT_BYTES {
+        return Some(value);
+    }
+    let mut end = TRANSCRIPT_BYTES.saturating_sub(TRANSCRIPT_TRUNCATED_SUFFIX.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    value.push_str(TRANSCRIPT_TRUNCATED_SUFFIX);
+    Some(value)
+}
+
+#[derive(Default)]
+struct WaiterLeaseState {
+    next_id: AtomicU64,
+    active: Mutex<HashMap<String, HashMap<u64, ()>>>,
+}
+
+/// A transport-owned hold observation lease. Dropping it is idempotent and
+/// only releases the exact token that created it.
+pub struct WaiterLease {
+    handle: String,
+    lease_id: u64,
+    state: Weak<WaiterLeaseState>,
+}
+
+impl WaiterLease {
+    pub fn release_once(&mut self) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        let Ok(mut active) = state.active.lock() else {
+            return;
+        };
+        if let Some(tokens) = active.get_mut(&self.handle) {
+            tokens.remove(&self.lease_id);
+            if tokens.is_empty() {
+                active.remove(&self.handle);
+            }
+        }
+        self.state = Weak::new();
+    }
+}
+
+impl Drop for WaiterLease {
+    fn drop(&mut self) {
+        self.release_once();
+    }
 }
 
 impl ApprovalRegistry {
@@ -252,6 +309,8 @@ impl ApprovalRegistry {
         let mut items = HashMap::new();
         let mut recovered = Vec::new();
         for mut row in rows {
+            row.result_stdout = bound_transcript(row.result_stdout);
+            row.result_stderr = bound_transcript(row.result_stderr);
             if row.status == ApprovalStatus::Approving {
                 row.status = ApprovalStatus::ExecFailed;
                 row.decided_unix = Some(now);
@@ -266,6 +325,7 @@ impl ApprovalRegistry {
             Self {
                 items,
                 notifiers: HashMap::new(),
+                leases: Arc::new(WaiterLeaseState::default()),
             },
             recovered,
         )
@@ -278,6 +338,43 @@ impl ApprovalRegistry {
             .insert(approval.handle.clone(), notify.clone());
         self.items.insert(approval.handle.clone(), approval);
         notify
+    }
+
+    /// Register a waiter before an approval mutation. The notifier and lease
+    /// are created under the same registry lock, so retention cannot remove a
+    /// row between authorization and observation.
+    pub fn register_waiter(&mut self, handle: &str) -> Option<(Arc<Notify>, WaiterLease)> {
+        if !self.items.contains_key(handle) {
+            return None;
+        }
+        let notify = self
+            .notifiers
+            .entry(handle.to_string())
+            .or_insert_with(|| Arc::new(Notify::new()))
+            .clone();
+        let lease_id = self.leases.next_id.fetch_add(1, Ordering::Relaxed);
+        let mut active = self.leases.active.lock().ok()?;
+        active
+            .entry(handle.to_string())
+            .or_default()
+            .insert(lease_id, ());
+        Some((
+            notify,
+            WaiterLease {
+                handle: handle.to_string(),
+                lease_id,
+                state: Arc::downgrade(&self.leases),
+            },
+        ))
+    }
+
+    pub fn active_waiters(&self, handle: &str) -> usize {
+        self.leases
+            .active
+            .lock()
+            .ok()
+            .and_then(|active| active.get(handle).map(HashMap::len))
+            .unwrap_or(0)
     }
 
     pub fn get(&self, handle: &str) -> Option<&Approval> {
@@ -514,6 +611,7 @@ impl ApprovalRegistry {
             .filter(|a| {
                 a.status.is_decided()
                     && now.saturating_sub(a.decided_unix.unwrap_or(a.created_unix)) > retention_secs
+                    && self.active_waiters(&a.handle) == 0
             })
             .map(|a| a.handle.clone())
             .collect();

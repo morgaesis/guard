@@ -144,12 +144,13 @@ async fn approved_synthesized_access_executes_deterministically_without_catalog_
             == 1
     );
 
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request(
         &cfg,
         &daemon,
         AdminRequest::AccessApprove {
             handles: vec![item.reference],
             uses: Some(1),
+            wait_secs: None,
         },
     )
     .await
@@ -378,12 +379,13 @@ async fn equivalent_synthesized_access_converges_across_principals() {
         "request-specific prose must not alter canonical generated authority"
     );
 
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request(
         &cfg,
         &daemon,
         AdminRequest::AccessApprove {
             handles: vec![first.reference, second.reference],
             uses: Some(1),
+            wait_secs: None,
         },
     )
     .await
@@ -434,12 +436,13 @@ async fn pending_reused_generated_access_survives_revoke_and_restart() {
         panic!("expected initial generated request")
     };
     let generated_name = initial.capabilities[0].verb.clone();
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request(
         &cfg,
         &daemon,
         AdminRequest::AccessApprove {
             handles: vec![initial.reference],
             uses: None,
+            wait_secs: None,
         },
     )
     .await
@@ -448,7 +451,7 @@ async fn pending_reused_generated_access_survives_revoke_and_restart() {
     };
     assert!(items[0].success, "initial approval failed: {items:?}");
     let target = items[0].target.clone().unwrap();
-    let AdminResponse::AccessDecisions { items } =
+    let AdminResponse::AccessDecisions { items, .. } =
         handle_admin_request(&cfg, &daemon, AdminRequest::AccessRevoke { target }).await
     else {
         panic!("expected generated access revoke")
@@ -500,12 +503,13 @@ async fn pending_reused_generated_access_survives_revoke_and_restart() {
         .get(&generated_name)
         .is_none());
 
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request(
         &restarted,
         &daemon,
         AdminRequest::AccessApprove {
             handles: vec![pending.reference],
             uses: Some(1),
+            wait_secs: None,
         },
     )
     .await
@@ -634,12 +638,13 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
         .approval_options
         .contains(&format!("guard access approve {} --once", first.reference)));
 
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request(
         &cfg,
         &daemon,
         AdminRequest::AccessApprove {
             handles: vec![first.reference.clone(), "missing-request".to_string()],
             uses: Some(1),
+            wait_secs: None,
         },
     )
     .await
@@ -738,12 +743,13 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
     else {
         panic!("expected independent ordinary access request")
     };
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request(
         &cfg,
         &daemon,
         AdminRequest::AccessApprove {
             handles: vec![ordinary_request.reference],
             uses: None,
+            wait_secs: None,
         },
     )
     .await
@@ -792,12 +798,13 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
             .effective_revision_key(&live_token),
         "the denial request must bind the post-admission authority revision"
     );
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request(
         &cfg,
         &daemon,
         AdminRequest::AccessApprove {
             handles: vec![followup],
             uses: Some(1),
+            wait_secs: None,
         },
     )
     .await
@@ -847,12 +854,13 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
     else {
         panic!("expected spawn-failure access request")
     };
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request(
         &cfg,
         &daemon,
         AdminRequest::AccessApprove {
             handles: vec![spawn_request.reference.clone()],
             uses: Some(1),
+            wait_secs: None,
         },
     )
     .await
@@ -898,14 +906,15 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
         intent: "Inspect fixture".to_string(),
         uses: Some(2),
     };
-    let AdminResponse::AccessDecisions { items: extended } =
-        handle_admin_request(&cfg, &daemon, extension.clone()).await
+    let AdminResponse::AccessDecisions {
+        items: extended, ..
+    } = handle_admin_request(&cfg, &daemon, extension.clone()).await
     else {
         panic!("expected access extension")
     };
     assert!(extended[0].success);
     assert_eq!(extended[0].remaining_uses, Some(2));
-    let AdminResponse::AccessDecisions { items: retried } =
+    let AdminResponse::AccessDecisions { items: retried, .. } =
         handle_admin_request(&cfg, &daemon, extension.clone()).await
     else {
         panic!("expected idempotent access extension")
@@ -921,6 +930,7 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
         .policy_allowed());
     let AdminResponse::AccessDecisions {
         items: retry_after_use,
+        ..
     } = handle_admin_request(&cfg, &daemon, extension).await
     else {
         panic!("expected converged access extension")
@@ -938,7 +948,7 @@ async fn access_request_is_principal_bound_coalesced_batched_and_bounded_body() 
         .await,
         AdminResponse::Error { .. }
     ));
-    let AdminResponse::AccessDecisions { items } =
+    let AdminResponse::AccessDecisions { items, .. } =
         handle_admin_request(&cfg, &daemon, AdminRequest::AccessRevoke { target }).await
     else {
         panic!("expected access revoke result")
@@ -1085,12 +1095,13 @@ async fn access_request_can_name_multiple_catalog_verbs() {
     };
     assert_eq!(collision.effective_scope, vec!["inspect-a"]);
     let request_reference = mixed.reference.clone();
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request(
         &cfg,
         &daemon,
         AdminRequest::AccessApprove {
             handles: vec![mixed.reference],
             uses: Some(2),
+            wait_secs: None,
         },
     )
     .await
@@ -1223,12 +1234,13 @@ verbs:
     assert_eq!(initial.state, "pending");
     assert_eq!(initial.effective_scope, vec!["inspect-limited"]);
 
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request(
         &cfg,
         &daemon,
         AdminRequest::AccessApprove {
             handles: vec![initial_reference.clone()],
             uses: Some(4),
+            wait_secs: None,
         },
     )
     .await
@@ -1279,7 +1291,7 @@ verbs:
         Some((Some(4), Some(2)))
     );
 
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request(
         &cfg,
         &daemon,
         AdminRequest::AccessExtend {
@@ -1467,12 +1479,13 @@ async fn approved_request_without_live_session_projects_as_orphaned() {
         panic!("expected access request")
     };
     let request_reference = pending.reference.clone();
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request(
         &cfg,
         &daemon,
         AdminRequest::AccessApprove {
             handles: vec![pending.reference],
             uses: Some(1),
+            wait_secs: None,
         },
     )
     .await
@@ -1480,7 +1493,7 @@ async fn approved_request_without_live_session_projects_as_orphaned() {
         panic!("expected access approval")
     };
     let target = items[0].target.clone().unwrap();
-    let AdminResponse::AccessDecisions { items } =
+    let AdminResponse::AccessDecisions { items, .. } =
         handle_admin_request(&cfg, &daemon, AdminRequest::AccessRevoke { target }).await
     else {
         panic!("expected access revoke")
@@ -1534,12 +1547,13 @@ async fn request_pruning_preserves_live_access_provenance() {
         panic!("expected access request")
     };
     let active_handle = item.reference.clone();
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request(
         &cfg,
         &daemon,
         AdminRequest::AccessApprove {
             handles: vec![item.reference],
             uses: Some(1),
+            wait_secs: None,
         },
     )
     .await
@@ -1676,12 +1690,13 @@ async fn sequential_approval_keeps_fresh_sibling_extensions_valid() {
     else {
         panic!("expected initial access request")
     };
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request(
         &cfg,
         &daemon,
         AdminRequest::AccessApprove {
             handles: vec![initial.reference],
             uses: None,
+            wait_secs: None,
         },
     )
     .await
@@ -1715,12 +1730,13 @@ async fn sequential_approval_keeps_fresh_sibling_extensions_valid() {
     assert_eq!(issued_revisions[0], issued_revisions[1]);
 
     for handle in pending.clone() {
-        let AdminResponse::AccessDecisions { items } = handle_admin_request(
+        let AdminResponse::AccessDecisions { items, .. } = handle_admin_request(
             &cfg,
             &daemon,
             AdminRequest::AccessApprove {
                 handles: vec![handle],
                 uses: Some(2),
+                wait_secs: None,
             },
         )
         .await
@@ -1782,12 +1798,13 @@ async fn access_approval_and_revoke_retry_one_registry_generation_conflict() {
     );
     competing.persist_registry(&advanced).await.unwrap();
 
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request(
         &cfg,
         &daemon,
         AdminRequest::AccessApprove {
             handles: vec![pending.reference],
             uses: None,
+            wait_secs: None,
         },
     )
     .await
@@ -1811,7 +1828,7 @@ async fn access_approval_and_revoke_retry_one_registry_generation_conflict() {
     );
     competing.persist_registry(&advanced).await.unwrap();
 
-    let AdminResponse::AccessDecisions { items } =
+    let AdminResponse::AccessDecisions { items, .. } =
         handle_admin_request(&cfg, &daemon, AdminRequest::AccessRevoke { target }).await
     else {
         panic!("expected access revoke")
@@ -2032,12 +2049,13 @@ async fn revoked_access_session_cannot_be_resurrected_by_pending_extension() {
     else {
         panic!("expected initial access request")
     };
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request(
         &cfg,
         &daemon,
         AdminRequest::AccessApprove {
             handles: vec![initial.reference],
             uses: None,
+            wait_secs: None,
         },
     )
     .await
@@ -2080,12 +2098,13 @@ async fn revoked_access_session_cannot_be_resurrected_by_pending_extension() {
         durable_extension.status,
         crate::grant_profile::GrantRequestStatus::Withdrawn
     );
-    let AdminResponse::AccessDecisions { items } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request(
         &cfg,
         &daemon,
         AdminRequest::AccessApprove {
             handles: vec![extension.reference],
             uses: Some(1),
+            wait_secs: None,
         },
     )
     .await

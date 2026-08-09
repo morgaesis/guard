@@ -293,6 +293,20 @@ impl Drop for ProxyHoldOrphanGuard {
                 } else {
                     None
                 };
+            let requester_principal =
+                server
+                    .state
+                    .approvals
+                    .read()
+                    .await
+                    .get(&handle)
+                    .and_then(|approval| {
+                        approval
+                            .snapshot
+                            .principal
+                            .as_ref()
+                            .map(ToString::to_string)
+                    });
             server.emit_audit_ungated(
                 AuditEvent::new(AuditKind::HoldOrphaned)
                     .handle(&handle)
@@ -303,6 +317,7 @@ impl Drop for ProxyHoldOrphanGuard {
                 at_unix: now,
                 handle: Some(handle),
                 session_fingerprint,
+                requester_principal,
                 reason: Some("requester disconnected before a held API decision".to_string()),
                 status: Some("orphaned".to_string()),
                 behavior: None,
@@ -445,6 +460,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
             at_unix: now,
             handle: Some(handle.clone()),
             session_fingerprint: mutation.session_fingerprint,
+            requester_principal: None,
             reason: Some(provisional.reason.clone()),
             status: Some("armed".to_string()),
             behavior: None,
@@ -560,6 +576,11 @@ impl guard::proxy::GateSink for DaemonGateSink {
             at_unix: now,
             handle: Some(handle.clone()),
             session_fingerprint: session_context.map(|context| context.fingerprint.clone()),
+            requester_principal: approval
+                .snapshot
+                .principal
+                .as_ref()
+                .map(ToString::to_string),
             reason: Some(reason.to_string()),
             status: Some("pending".to_string()),
             behavior: None,
@@ -674,6 +695,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
                     at_unix: now_unix(),
                     handle: Some(handle.to_string()),
                     session_fingerprint: p.session_fingerprint.clone(),
+                    requester_principal: None,
                     reason: Some("workload removed its contained created object".to_string()),
                     status: Some("confirmed".to_string()),
                     behavior: None,
@@ -1319,6 +1341,7 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
                     at_unix: finished_unix,
                     handle: Some(handle.clone()),
                     session_fingerprint: Some(session_fingerprint),
+                    requester_principal: None,
                     reason: Some(reason.clone()),
                     status: Some("armed".to_string()),
                     behavior: None,
@@ -1654,6 +1677,11 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
             .session_token
             .as_deref()
             .map(|token| audit_session_fingerprint(Some(token))),
+        requester_principal: approval
+            .snapshot
+            .principal
+            .as_ref()
+            .map(ToString::to_string),
         reason: Some(reason.clone()),
         status: Some("pending".to_string()),
         behavior: None,
@@ -1948,6 +1976,7 @@ pub(super) async fn resume_approval(
         at_unix: completed_unix,
         handle: Some(handle.to_string()),
         session_fingerprint: claimed.snapshot.session_fingerprint.clone(),
+        requester_principal: claimed.snapshot.principal.as_ref().map(ToString::to_string),
         reason: terminal.decided_reason.clone(),
         status: Some(terminal.status.as_str().to_string()),
         behavior: None,
@@ -2372,6 +2401,7 @@ pub(super) async fn gating_sweeper(server: ServerContext) {
                     at_unix: now,
                     handle: Some(h.clone()),
                     session_fingerprint: a.snapshot.session_fingerprint.clone(),
+                    requester_principal: a.snapshot.principal.as_ref().map(ToString::to_string),
                     reason: Some("held action expired without approval".to_string()),
                     status: Some("expired".to_string()),
                     behavior: None,
@@ -2419,6 +2449,7 @@ pub(super) async fn gating_sweeper(server: ServerContext) {
                 at_unix: now,
                 handle: Some(claimed.handle.clone()),
                 session_fingerprint: claimed.session_fingerprint.clone(),
+                requester_principal: None,
                 reason: Some(claimed.reason.clone()),
                 status: Some("reverting".to_string()),
                 behavior: None,
@@ -2668,6 +2699,7 @@ pub(super) async fn finish_due_provisional(
                             at_unix: now_unix(),
                             handle: Some(p.handle.clone()),
                             session_fingerprint: p.session_fingerprint.clone(),
+                            requester_principal: None,
                             reason: Some("independent confirmation check succeeded".to_string()),
                             status: Some("confirmed".to_string()),
                             behavior: None,
@@ -2870,6 +2902,7 @@ async fn defer_revert(
         at_unix: now_unix(),
         handle: Some(p.handle.clone()),
         session_fingerprint: p.session_fingerprint.clone(),
+        requester_principal: None,
         reason: Some(detail.clone()),
         status: Some("needs_operator_decision".to_string()),
         behavior: None,
@@ -3003,6 +3036,7 @@ pub(super) async fn finish_revert(
             at_unix: now_unix(),
             handle: Some(p.handle.clone()),
             session_fingerprint: p.session_fingerprint.clone(),
+            requester_principal: None,
             reason: Some(format!("rollback completed ({kind})")),
             status: Some("reverted".to_string()),
             behavior: None,
@@ -3025,6 +3059,7 @@ pub(super) async fn finish_revert(
             at_unix: now_unix(),
             handle: Some(p.handle.clone()),
             session_fingerprint: p.session_fingerprint.clone(),
+            requester_principal: None,
             reason: detail.clone(),
             status: Some("revert_failed".to_string()),
             behavior: None,
@@ -3073,6 +3108,7 @@ mod transactional_tests {
                     body: None,
                 },
                 session_fingerprint: None,
+                requester_principal: None,
                 session_revision: None,
                 secret_entitlements: None,
                 upstream_target: "https://fixture.invalid".to_string(),
