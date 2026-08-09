@@ -12,9 +12,12 @@ use crate::session::{
     SessionInteraction,
 };
 use guard::audit::{AuditEvent, AuditKind};
+use guard::gating::verb::{
+    generated_access_matcher_digest, generated_access_matcher_shape, generated_access_verb_name,
+    Verb, VerbCatalog,
+};
 #[cfg(test)]
 use guard::gating::verb::{CoverageAction, CoverageProbe, CoverageProvenance, VerbCoverageCell};
-use guard::gating::verb::{Verb, VerbCatalog};
 use guard::principal::{scope_eq, PrincipalKey};
 #[cfg(test)]
 use guard::redact::redact_output;
@@ -646,24 +649,6 @@ fn validate_access_denial_reason(reason: &str) -> Result<String, String> {
     Ok(normalized)
 }
 
-fn access_verb_shape(verb: &Verb) -> serde_json::Value {
-    serde_json::json!({
-        "binary": verb.binary,
-        "args": verb.args,
-        "coverage": verb.coverage,
-        "credential_plan": verb.credential_plan,
-        "params": verb.params,
-    })
-}
-
-fn access_matcher_digest(matcher: &serde_json::Value) -> String {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(serde_json::to_vec(matcher).expect("access matcher serializes"))
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
 fn intent_matches_verb(intent: &str, verb: &Verb) -> bool {
     if intent.trim().eq_ignore_ascii_case(&verb.name) {
         return true;
@@ -898,6 +883,28 @@ async fn reduce_access_intent(
             })
             .collect::<Result<Vec<_>, String>>()?
     };
+    if let Some((binary, args)) = observed_argv {
+        let candidate = guard::gating::verb::Verb {
+            name: "access-generated-pending".to_string(),
+            description: String::new(),
+            binary: binary.to_string(),
+            args: args.to_vec(),
+            baseline: false,
+            coverage: Vec::new(),
+            credential_plan: None,
+            params: std::collections::BTreeMap::new(),
+            consequence: guard::gating::Reversibility::Irreversible,
+            revert: None,
+            trusted: false,
+            prompt_context: None,
+            source_prose: None,
+            evidence: None,
+            auto_promoted: false,
+            promotion_stamp: None,
+        };
+        return reduce_generated_access_candidate(server, intent, candidate, &existing).await;
+    }
+
     let clauses = access_intent_clauses(intent);
     let named_by_clause = clauses
         .iter()
@@ -963,58 +970,42 @@ async fn reduce_access_intent(
         return access_reduction(vec![best.clone()]);
     }
 
-    let mut candidate = if let Some((binary, args)) = observed_argv {
-        guard::gating::verb::Verb {
-            name: "access-generated-pending".to_string(),
-            description: String::new(),
-            binary: binary.to_string(),
-            args: args.to_vec(),
-            baseline: false,
-            coverage: Vec::new(),
-            credential_plan: None,
-            params: std::collections::BTreeMap::new(),
-            consequence: guard::gating::Reversibility::Irreversible,
-            revert: None,
-            trusted: false,
-            prompt_context: None,
-            source_prose: None,
-            evidence: None,
-            auto_promoted: false,
-            promotion_stamp: None,
-        }
-    } else {
-        server
-            .state
-            .evaluator
-            .synthesize_verb(intent, None, &[])
-            .await
-            .map_err(|error| {
-                format!("access intent could not be reduced to typed coverage: {error}")
-            })?
-    };
+    let candidate = server
+        .state
+        .evaluator
+        .synthesize_verb(intent, None, &[])
+        .await
+        .map_err(|error| {
+            format!("access intent could not be reduced to typed coverage: {error}")
+        })?;
+    reduce_generated_access_candidate(server, intent, candidate, &existing).await
+}
+
+async fn reduce_generated_access_candidate(
+    server: &ServerContext,
+    intent: &str,
+    mut candidate: Verb,
+    existing: &[Verb],
+) -> Result<(Vec<Verb>, Vec<Verb>), String> {
     candidate.source_prose = Some(intent.to_string());
     candidate.baseline = false;
     candidate.trusted = false;
     candidate = guard::gating::verb::normalize_generated_access_verb(candidate)
         .map_err(|error| format!("synthesized access coverage was rejected: {error}"))?;
 
-    if let Some(reused) = existing
-        .iter()
-        .find(|verb| access_verb_shape(verb) == access_verb_shape(&candidate))
-    {
+    if let Some(reused) = existing.iter().find(|verb| {
+        generated_access_matcher_shape(verb) == generated_access_matcher_shape(&candidate)
+    }) {
         return access_reduction(vec![reused.clone()]);
     }
 
     let catalog = server.state.verbs.read().await;
-    if let Some(reused) = catalog
-        .list()
-        .into_iter()
-        .find(|verb| access_verb_shape(verb) == access_verb_shape(&candidate))
-    {
+    if let Some(reused) = catalog.list().into_iter().find(|verb| {
+        generated_access_matcher_shape(verb) == generated_access_matcher_shape(&candidate)
+    }) {
         return access_reduction(vec![reused]);
     }
-    let digest = access_matcher_digest(&access_verb_shape(&candidate));
-    candidate.name = format!("access-generated-{}", &digest[..16]);
+    candidate.name = generated_access_verb_name(&candidate);
     candidate.description = access_grant_description(&candidate);
     candidate.source_prose = None;
     candidate.evidence = None;
@@ -1115,11 +1106,11 @@ fn derived_access_description(verb: &Verb) -> String {
 }
 
 fn access_capability(verb: &Verb) -> AccessCapability {
-    let matcher = access_verb_shape(verb);
+    let matcher = generated_access_matcher_shape(verb);
     AccessCapability {
         verb: verb.name.clone(),
         description: redact_output_text(&verb.description),
-        matcher_digest: access_matcher_digest(&matcher),
+        matcher_digest: generated_access_matcher_digest(&matcher),
         matcher,
         consequence: verb.consequence.as_str().to_string(),
         credential_plan: verb.credential_plan.clone(),
@@ -1837,8 +1828,8 @@ pub(super) async fn submit_access_request(
             session_revision = snapshot.revision;
             session_expiry = snapshot.expires_at;
         }
-        let requests = server.state.grant_requests.read().await;
         if observed_argv.is_none() {
+            let requests = server.state.grant_requests.read().await;
             if let Some(existing) = requests
                 .values()
                 .find(|existing| {
@@ -1858,22 +1849,22 @@ pub(super) async fn submit_access_request(
                 drop(requests);
                 return Ok(access_item_for_request(server, &existing, &audience).await);
             }
-        }
-        if requests.len() >= MAX_GRANT_REQUESTS {
-            return Err("access request queue is full".to_string());
-        }
-        let pending = requests
-            .values()
-            .filter(|existing| {
-                existing
-                    .requester
-                    .as_ref()
-                    .is_some_and(|principal| principal.eq_ci(&requester))
-                    && existing.status == GrantRequestStatus::Pending
-            })
-            .count();
-        if pending >= MAX_PENDING_GRANT_REQUESTS_PER_SESSION {
-            return Err("access request queue is full for this principal".to_string());
+            if requests.len() >= MAX_GRANT_REQUESTS {
+                return Err("access request queue is full".to_string());
+            }
+            let pending = requests
+                .values()
+                .filter(|existing| {
+                    existing
+                        .requester
+                        .as_ref()
+                        .is_some_and(|principal| principal.eq_ci(&requester))
+                        && existing.status == GrantRequestStatus::Pending
+                })
+                .count();
+            if pending >= MAX_PENDING_GRANT_REQUESTS_PER_SESSION {
+                return Err("access request queue is full for this principal".to_string());
+            }
         }
     }
 

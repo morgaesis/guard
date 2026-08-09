@@ -14,7 +14,7 @@ use guard::gating::coverage::{
 use guard::gating::verb::CoverageAction;
 use guard::gating::{Coverage, DecisionTrace};
 use guard::redact::{
-    command_line, redact_exact_secrets, redact_output, redact_output_text,
+    command_line, redact_command_line, redact_exact_secrets, redact_output, redact_output_text,
     redact_output_with_state, RedactionState,
 };
 use sha2::{Digest, Sha256};
@@ -559,7 +559,7 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
     mut reason: String,
 ) -> ExecuteResult {
     let mut access_request_handle = None;
-    let durable_command = redact_output_text(&command);
+    let durable_command = redact_command_line(&request.binary, &request.args);
     let hard_verb_deny = phase.verb_matches.iter().any(|matched| {
         matched.selected
             && !matched.overridden

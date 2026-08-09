@@ -151,6 +151,11 @@ fn redact_bare_long_tokens(text: &str) -> String {
 /// `token:` in kubeconfigs) that redaction wins the trade.
 const SECRET_NAME_SUBPATTERN: &str = r"(?:[A-Za-z0-9_.-]*(?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIALS?|CREDS?|AUTHORIZATION|AUTH|BEARER)|[A-Za-z0-9_.-]+(?:KEY|PASS))";
 
+fn secret_name_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| Regex::new(&format!(r"(?i)^(?:{SECRET_NAME_SUBPATTERN})$")).unwrap())
+}
+
 /// Value shape consumed after a secret-bearing name, in preference order: a
 /// full double-quoted string (backslash escapes included), a full
 /// single-quoted string (YAML `''` doubling included), an UNTERMINATED
@@ -203,6 +208,13 @@ const NAMED_SECRET_STOPLIST: &[&str] = &[
     "sacred",
 ];
 
+fn is_secret_bearing_name(name: &str) -> bool {
+    secret_name_pattern().is_match(name)
+        && !NAMED_SECRET_STOPLIST
+            .iter()
+            .any(|stop| name.eq_ignore_ascii_case(stop))
+}
+
 /// Replacement for a consumed value, preserving the value's quote style so
 /// redacted JSON/YAML stays parseable (`"apikey": "[REDACTED]"`).
 fn redacted_value_like(value: &str) -> &'static str {
@@ -222,10 +234,7 @@ fn redact_named_secrets(text: &str) -> String {
     named_secret_pattern()
         .replace_all(text, |caps: &regex::Captures| {
             let name = &caps[2];
-            if NAMED_SECRET_STOPLIST
-                .iter()
-                .any(|stop| name.eq_ignore_ascii_case(stop))
-            {
+            if !is_secret_bearing_name(name) {
                 caps[0].to_string()
             } else {
                 format!(
@@ -317,10 +326,7 @@ fn redact_flow_with(pattern: &Regex, text: &str, name_group: usize, value_group:
     pattern
         .replace_all(text, |caps: &regex::Captures| {
             let name = &caps[name_group];
-            if NAMED_SECRET_STOPLIST
-                .iter()
-                .any(|stop| name.eq_ignore_ascii_case(stop))
-            {
+            if !is_secret_bearing_name(name) {
                 return caps[0].to_string();
             }
             let mut out = String::new();
@@ -504,6 +510,48 @@ pub fn redact_output_text(text: &str) -> String {
     redacted
 }
 
+/// Whether an executable or literal argv vector contains credential material
+/// according to the output redactor. Separate option/value arguments retain
+/// their adjacency here, so a low-entropy value following a secret-bearing
+/// option is classified even when neither element is sensitive in isolation.
+pub fn command_contains_sensitive_literals(binary: &str, args: &[String]) -> bool {
+    if redact_output_text(binary) != binary
+        || args
+            .iter()
+            .any(|argument| redact_output_text(argument) != *argument)
+    {
+        return true;
+    }
+
+    args.windows(2).any(|pair| is_split_secret_option(&pair[0]))
+}
+
+fn is_split_secret_option(argument: &str) -> bool {
+    let option = argument.trim_start_matches('-');
+    argument.starts_with('-')
+        && !option.is_empty()
+        && !option.contains(['=', ':'])
+        && is_secret_bearing_name(option)
+}
+
+/// Render one command for display while retaining argv context during
+/// redaction. This is display-only and never feeds matcher authority.
+pub fn redact_command_line(binary: &str, args: &[String]) -> String {
+    let binary = redact_output_text(binary);
+    let args = args
+        .iter()
+        .enumerate()
+        .map(|(index, argument)| {
+            if index > 0 && is_split_secret_option(&args[index - 1]) {
+                "[REDACTED]".to_string()
+            } else {
+                redact_output_text(argument)
+            }
+        })
+        .collect::<Vec<_>>();
+    command_line(&binary, &args)
+}
+
 /// Redact exact secret values from output. This catches cases the regex patterns miss,
 /// like bare `env` output or `echo $VAR` where there's no `KEY=` prefix.
 pub fn redact_exact_secrets(text: &str, secrets: &[&str]) -> String {
@@ -535,6 +583,23 @@ mod tests {
         assert_eq!(escaped, "x\\n[AUDIT] ALLOWED forged");
         assert!(!escaped.contains('\n'));
         assert!(!escaped.contains('\r'));
+    }
+
+    #[test]
+    fn command_literal_classifier_retains_argv_secret_context() {
+        let value = ["low", "entropy"].concat();
+        assert!(command_contains_sensitive_literals(
+            "fixturectl",
+            &["--api-token".to_string(), value.clone()]
+        ));
+        assert!(command_contains_sensitive_literals(
+            "fixturectl",
+            &[format!("--api-token={value}")]
+        ));
+        assert!(!command_contains_sensitive_literals(
+            "fixturectl",
+            &["--output".to_string(), value]
+        ));
     }
 
     #[test]

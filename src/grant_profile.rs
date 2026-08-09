@@ -409,8 +409,8 @@ impl GrantRequest {
             .collect()
     }
 
-    /// Whether this row carries the access-specific projection introduced for
-    /// principal-owned access sessions. Legacy grant requests can also have an
+    /// Whether this row carries the access-specific projection for a
+    /// principal-owned access session. Legacy grant requests can also have an
     /// authenticated requester, but do not carry any of these fields.
     pub fn is_principal_access_request(&self) -> bool {
         self.requester.is_some()

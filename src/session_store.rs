@@ -3176,7 +3176,7 @@ mod tests {
     }
 
     fn generated_access_request() -> GrantRequest {
-        let verb = Verb {
+        let mut verb = Verb {
             name: "access-generated-fixture".to_string(),
             description: "fixture coverage".to_string(),
             binary: "fixturectl".to_string(),
@@ -3194,6 +3194,7 @@ mod tests {
             auto_promoted: false,
             promotion_stamp: None,
         };
+        verb.name = guard::gating::verb::generated_access_verb_name(&verb);
         let mut request = GrantRequest::new_access(
             guard::principal::PrincipalKey::from_uid(1001),
             None,
@@ -3370,6 +3371,7 @@ mod tests {
                 "--overwrite={overwrite}".to_string(),
             ],
         });
+        verb.name = guard::gating::verb::generated_access_verb_name(&verb);
         let mut request = crate::grant_profile::GrantRequest::new_access(
             guard::principal::PrincipalKey::from_uid(1001),
             None,

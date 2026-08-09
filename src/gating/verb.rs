@@ -15,7 +15,7 @@
 
 use super::coverage::reversibility_rank;
 use super::Reversibility;
-use crate::redact::redact_output_text;
+use crate::redact::command_contains_sensitive_literals;
 use anyhow::{bail, Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -1015,11 +1015,8 @@ impl VerbCatalog {
         if verb.baseline {
             bail!("generated access coverage must not be baseline");
         }
-        if !verb.name.starts_with("access-generated-") {
-            bail!(
-                "generated access verb '{}' must use the reserved 'access-generated-' prefix",
-                verb.name
-            );
+        if verb.name != generated_access_verb_name(&verb) {
+            bail!("generated access coverage name does not match its matcher digest");
         }
         // Synthesis proposes the matcher, not its safety class. Promotion may
         // make the exact matcher deterministic, but consequence routing is
@@ -2211,6 +2208,30 @@ pub fn validate_synthesized_safety(verb: &Verb) -> Result<()> {
     Ok(())
 }
 
+/// Canonical authority-bearing fields for generated access coverage. This
+/// stable shape identifies the matcher shown to an operator.
+pub fn generated_access_matcher_shape(verb: &Verb) -> serde_json::Value {
+    serde_json::json!({
+        "binary": verb.binary,
+        "args": verb.args,
+        "coverage": verb.coverage,
+        "credential_plan": verb.credential_plan,
+        "params": verb.params,
+    })
+}
+
+pub fn generated_access_matcher_digest(matcher: &serde_json::Value) -> String {
+    Sha256::digest(serde_json::to_vec(matcher).expect("access matcher serializes"))
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+pub fn generated_access_verb_name(verb: &Verb) -> String {
+    let digest = generated_access_matcher_digest(&generated_access_matcher_shape(verb));
+    format!("access-generated-{}", &digest[..16])
+}
+
 /// Normalize and validate a matcher proposed for a principal-bound access
 /// request. Model-authored rollback commands are never part of generated
 /// access authority, so remove that untrusted envelope before any structural
@@ -2219,12 +2240,7 @@ pub fn validate_synthesized_safety(verb: &Verb) -> Result<()> {
 /// rollback semantics.
 pub fn normalize_generated_access_verb(mut verb: Verb) -> Result<Verb> {
     verb.revert = None;
-    if redact_output_text(&verb.binary) != verb.binary
-        || verb
-            .args
-            .iter()
-            .any(|argument| redact_output_text(argument) != *argument)
-    {
+    if command_contains_sensitive_literals(&verb.binary, &verb.args) {
         bail!(
             "generated access coverage contains a sensitive binary or literal argument and cannot be persisted"
         );
@@ -2244,11 +2260,8 @@ pub fn parse_normalized_generated_access_verb(value: &serde_json::Value) -> Resu
     if normalized.baseline {
         bail!("generated access coverage must not be baseline");
     }
-    if !normalized.name.starts_with("access-generated-") {
-        bail!(
-            "generated access verb '{}' must use the reserved 'access-generated-' prefix",
-            normalized.name
-        );
+    if normalized.name != generated_access_verb_name(&normalized) {
+        bail!("generated access coverage name does not match its matcher digest");
     }
     if serde_json::to_value(&normalized).context("encode normalized proposed access coverage")?
         != *value
@@ -3628,64 +3641,59 @@ verbs:
         let mut catalog = VerbCatalog::default();
         let candidate = |name: &str, binary: &str, args: &[&str], consequence| {
             let mut verb = synth_verb(binary, None, false, name);
-            verb.name = format!("access-generated-{name}");
             verb.args = args
                 .iter()
                 .map(|argument| (*argument).to_string())
                 .collect();
             verb.baseline = false;
             verb.consequence = consequence;
-            verb
+            canonical_generated_access_verb(verb)
         };
 
-        catalog
-            .upsert_access_verb(candidate(
-                "kubectl-delete",
-                "kubectl",
-                &["delete", "pod", "fixture"],
-                Reversibility::Reversible,
-            ))
-            .unwrap();
-        catalog
-            .upsert_access_verb(candidate(
-                "systemctl-stop",
-                "systemctl",
-                &["stop", "fixture.service"],
-                Reversibility::Reversible,
-            ))
-            .unwrap();
-        catalog
-            .upsert_access_verb(candidate(
-                "kubectl-get",
-                "kubectl",
-                &["get", "pods"],
+        let cases = [
+            (
+                candidate(
+                    "kubectl-delete",
+                    "kubectl",
+                    &["delete", "pod", "fixture"],
+                    Reversibility::Reversible,
+                ),
                 Reversibility::Irreversible,
-            ))
-            .unwrap();
-        catalog
-            .upsert_access_verb(candidate(
-                "rustc-version",
-                "rustc",
-                &["--version"],
+            ),
+            (
+                candidate(
+                    "systemctl-stop",
+                    "systemctl",
+                    &["stop", "fixture.service"],
+                    Reversibility::Reversible,
+                ),
                 Reversibility::Irreversible,
-            ))
-            .unwrap();
-
-        for name in [
-            "access-generated-kubectl-delete",
-            "access-generated-systemctl-stop",
-        ] {
-            let installed = catalog.get(name).unwrap();
+            ),
+            (
+                candidate(
+                    "kubectl-get",
+                    "kubectl",
+                    &["get", "pods"],
+                    Reversibility::Irreversible,
+                ),
+                Reversibility::Reversible,
+            ),
+            (
+                candidate(
+                    "rustc-version",
+                    "rustc",
+                    &["--version"],
+                    Reversibility::Irreversible,
+                ),
+                Reversibility::Reversible,
+            ),
+        ];
+        for (candidate, expected) in cases {
+            let name = candidate.name.clone();
+            catalog.upsert_access_verb(candidate).unwrap();
+            let installed = catalog.get(&name).unwrap();
             assert!(installed.trusted);
-            assert_eq!(installed.consequence, Reversibility::Irreversible);
-        }
-        for name in [
-            "access-generated-kubectl-get",
-            "access-generated-rustc-version",
-        ] {
-            let diagnostic = catalog.get(name).unwrap();
-            assert!(diagnostic.trusted);
-            assert_eq!(diagnostic.consequence, Reversibility::Reversible);
+            assert_eq!(installed.consequence, expected);
         }
     }
 
@@ -3722,20 +3730,17 @@ verbs:
             },
         );
         wrapper.consequence = Reversibility::Irreversible;
-        wrapper
+        canonical_generated_access_verb(wrapper)
     }
 
     #[test]
     fn generated_access_matcher_wrapping_catalog_verb_inherits_its_consequence() {
         let mut catalog = VerbCatalog::from_yaml(TOOLBOX_CATALOG_YAML).unwrap();
-        catalog
-            .upsert_access_verb(toolbox_wrapper("^(status|df)$"))
-            .unwrap();
+        let wrapper = toolbox_wrapper("^(status|df)$");
+        let name = wrapper.name.clone();
+        catalog.upsert_access_verb(wrapper).unwrap();
         assert_eq!(
-            catalog
-                .get("access-generated-ceph-read")
-                .unwrap()
-                .consequence,
+            catalog.get(&name).unwrap().consequence,
             Reversibility::Reversible,
             "every admitted command reverse-matches the reversible catalog verb"
         );
@@ -3747,28 +3752,22 @@ verbs:
         // matcher is broader than the operator-reviewed coverage and keeps
         // the fail-closed default.
         let mut catalog = VerbCatalog::from_yaml(TOOLBOX_CATALOG_YAML).unwrap();
-        catalog
-            .upsert_access_verb(toolbox_wrapper("^(status|osd-purge)$"))
-            .unwrap();
+        let wrapper = toolbox_wrapper("^(status|osd-purge)$");
+        let name = wrapper.name.clone();
+        catalog.upsert_access_verb(wrapper).unwrap();
         assert_eq!(
-            catalog
-                .get("access-generated-ceph-read")
-                .unwrap()
-                .consequence,
+            catalog.get(&name).unwrap().consequence,
             Reversibility::Irreversible
         );
 
         // A free-text parameter is not enumerable, so nothing is inherited
         // even though every actually-valid value would match the catalog verb.
         let mut catalog = VerbCatalog::from_yaml(TOOLBOX_CATALOG_YAML).unwrap();
-        catalog
-            .upsert_access_verb(toolbox_wrapper("^[a-z]+$"))
-            .unwrap();
+        let wrapper = toolbox_wrapper("^[a-z]+$");
+        let name = wrapper.name.clone();
+        catalog.upsert_access_verb(wrapper).unwrap();
         assert_eq!(
-            catalog
-                .get("access-generated-ceph-read")
-                .unwrap()
-                .consequence,
+            catalog.get(&name).unwrap().consequence,
             Reversibility::Irreversible
         );
     }
@@ -4535,6 +4534,8 @@ verbs:
         );
         access.name = "access-generated-live".to_string();
         access.baseline = false;
+        access = canonical_generated_access_verb(access);
+        let access_name = access.name.clone();
         catalog.upsert_access_verb(access).unwrap();
 
         std::fs::write(
@@ -4548,8 +4549,13 @@ verbs:
         assert!(catalog.get("operator-two").is_some());
         assert!(catalog.get("grant-live").is_some());
         assert!(catalog
-            .get("access-generated-live")
+            .get(&access_name)
             .is_some_and(|verb| verb.trusted && !verb.baseline));
+    }
+
+    fn canonical_generated_access_verb(mut verb: Verb) -> Verb {
+        verb.name = generated_access_verb_name(&verb);
+        verb
     }
 
     fn args_vec(v: &[&str]) -> Vec<String> {
@@ -4649,7 +4655,8 @@ verbs:
             "-a".to_string(),
             "echo one \"two\" \\ three, UTF-8 π".to_string(),
         ];
-        let normalized = normalize_generated_access_verb(verb).unwrap();
+        let normalized =
+            canonical_generated_access_verb(normalize_generated_access_verb(verb).unwrap());
         let mut catalog = VerbCatalog::empty();
         catalog.upsert_access_verb(normalized).unwrap();
         let original = vec![

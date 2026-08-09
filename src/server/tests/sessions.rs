@@ -2252,18 +2252,6 @@ async fn sessionless_novel_denial_returns_exact_typed_request_guidance() {
     .unwrap();
     let generated_name = proposed_verb.name.clone();
     let proposed_digest = proposed_verb.definition_digest();
-    let AdminResponse::AccessItem { item: pending_item } = handle_admin_request_for_test(
-        &cfg,
-        &daemon,
-        AdminRequest::AccessShow {
-            reference: handle.to_string(),
-        },
-    )
-    .await
-    else {
-        panic!("expected pending typed access detail");
-    };
-    let matcher_digest = pending_item.capabilities[0].matcher_digest.clone();
     let guidance = response
         .verb_guidance
         .as_deref()
@@ -2272,8 +2260,56 @@ async fn sessionless_novel_denial_returns_exact_typed_request_guidance() {
         guidance.contains(&format!("guard access approve {handle}")),
         "{guidance}"
     );
+    let original = request.args.clone();
+    let split = original
+        .iter()
+        .flat_map(|arg| arg.split_whitespace().map(str::to_string))
+        .collect::<Vec<_>>();
+
+    let (mut approving, _) = make_test_config();
+    approving.config.daemon_uid = 777;
+    approving.config.daemon_principal = PrincipalKey::from_uid(777);
+    approving.state.verbs = Arc::new(RwLock::new(VerbCatalog::empty()));
+    let approving_store = SessionStore::open(state_db.clone(), 3_600).await.unwrap();
+    approving.state.session_store = Some(approving_store.clone());
+    *approving.state.sessions.write().await = approving_store.load_registry().await.unwrap();
+    let pending_requests = approving_store.load_grant_requests().await.unwrap();
+    let pending_request = pending_requests
+        .iter()
+        .find(|request| request.handle == handle)
+        .expect("pending typed request survives restart");
+    assert_eq!(pending_request.status, GrantRequestStatus::Pending);
+    let pending_verb = guard::gating::verb::parse_normalized_generated_access_verb(
+        pending_request
+            .proposed_verbs
+            .first()
+            .expect("pending typed request keeps one proposal"),
+    )
+    .unwrap();
+    assert_eq!(pending_verb.name, generated_name);
+    assert_eq!(pending_verb.definition_digest(), proposed_digest);
+    *approving.state.grant_requests.write().await = pending_requests
+        .into_iter()
+        .map(|request| (request.handle.clone(), request))
+        .collect();
+    validate_durable_access_provenance(&approving)
+        .await
+        .unwrap();
+    install_approved_access_verbs(&approving).await.unwrap();
+    let AdminResponse::AccessItem { item: pending_item } = handle_admin_request_for_test(
+        &approving,
+        &daemon,
+        AdminRequest::AccessShow {
+            reference: handle.to_string(),
+        },
+    )
+    .await
+    else {
+        panic!("expected restarted pending typed access detail");
+    };
+    let matcher_digest = pending_item.capabilities[0].matcher_digest.clone();
     let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
-        &cfg,
+        &approving,
         &daemon,
         AdminRequest::AccessApprove {
             handles: vec![handle.to_string()],
@@ -2290,9 +2326,9 @@ async fn sessionless_novel_denial_returns_exact_typed_request_guidance() {
         "typed access approval failed: {:?}",
         items[0]
     );
-    let original = request.args.clone();
     assert_eq!(
-        cfg.state
+        approving
+            .state
             .verbs
             .read()
             .await
@@ -2301,12 +2337,9 @@ async fn sessionless_novel_denial_returns_exact_typed_request_guidance() {
         1,
         "approved generated access must select the exact argv"
     );
-    let split = original
-        .iter()
-        .flat_map(|arg| arg.split_whitespace().map(str::to_string))
-        .collect::<Vec<_>>();
     assert!(
-        cfg.state
+        approving
+            .state
             .verbs
             .read()
             .await
@@ -2327,6 +2360,7 @@ async fn sessionless_novel_denial_returns_exact_typed_request_guidance() {
         .iter()
         .find(|request| request.handle == handle)
         .expect("approved typed request survives restart");
+    assert_eq!(durable_request.status, GrantRequestStatus::Approved);
     let durable_verb = guard::gating::verb::parse_normalized_generated_access_verb(
         durable_request
             .proposed_verbs
@@ -2393,7 +2427,92 @@ async fn sessionless_novel_denial_returns_exact_typed_request_guidance() {
 }
 
 #[tokio::test]
-async fn sensitive_argv_does_not_create_or_expose_generated_access() {
+async fn approved_matcher_name_tamper_fails_closed_across_restart_boundaries() {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.state.verbs = Arc::new(RwLock::new(VerbCatalog::empty()));
+    let temporary = tempfile::tempdir().unwrap();
+    let state_db = temporary.path().join("state.db");
+    let store = SessionStore::open(state_db.clone(), 3_600).await.unwrap();
+    cfg.state.session_store = Some(store.clone());
+    let worker = CallerIdentity::Unix { uid: 1001 };
+    let daemon = CallerIdentity::UnixAdmin { uid: 777 };
+    let mut execute = request_with_session(
+        "novel-fixture",
+        vec!["inspect".to_string(), "resource/example".to_string()],
+        "unused".to_string(),
+    );
+    execute.session_token = None;
+    let denied = execute_command(execute, &cfg, &worker)
+        .await
+        .into_response();
+    let handle = denied.handle.expect("typed request is created");
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
+        &cfg,
+        &daemon,
+        AdminRequest::AccessApprove {
+            handles: vec![handle.clone()],
+            uses: None,
+            wait_secs: None,
+        },
+    )
+    .await
+    else {
+        panic!("expected typed access approval");
+    };
+    assert!(items[0].success);
+    let durable_registry = store.load_registry().await.unwrap();
+
+    let mut tampered = cfg.state.grant_requests.read().await[&handle].clone();
+    assert_eq!(tampered.status, GrantRequestStatus::Approved);
+    let mut proposal = serde_json::from_value::<guard::gating::verb::Verb>(
+        tampered
+            .proposed_verbs
+            .first()
+            .expect("approved request keeps generated coverage")
+            .clone(),
+    )
+    .unwrap();
+    let approved_name = proposal.name.clone();
+    proposal
+        .args
+        .last_mut()
+        .expect("fixture matcher has literal arguments")
+        .push_str("-changed");
+    assert_eq!(proposal.name, approved_name);
+    tampered.proposed_verbs = vec![serde_json::to_value(proposal).unwrap()];
+    assert!(tampered.validated_generated_access_proposals().is_err());
+
+    let connection = rusqlite::Connection::open(&state_db).unwrap();
+    connection
+        .execute(
+            "UPDATE grant_requests SET json = ?1 WHERE handle = ?2",
+            rusqlite::params![serde_json::to_string(&tampered).unwrap(), handle],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(store.load_grant_requests().await.is_err());
+    assert!(store.load_registry().await.is_err());
+
+    let (mut restarted, _) = make_test_config();
+    restarted.config.daemon_uid = 777;
+    restarted.config.daemon_principal = PrincipalKey::from_uid(777);
+    restarted.state.verbs = Arc::new(RwLock::new(VerbCatalog::empty()));
+    *restarted.state.sessions.write().await = durable_registry;
+    restarted
+        .state
+        .grant_requests
+        .write()
+        .await
+        .insert(tampered.handle.clone(), tampered);
+    assert!(validate_durable_access_provenance(&restarted)
+        .await
+        .is_err());
+    assert!(install_approved_access_verbs(&restarted).await.is_err());
+}
+
+async fn assert_sensitive_argv_rejected(args: Vec<String>, sensitive: &str) {
     let (mut cfg, _) = make_test_config();
     cfg.config.daemon_uid = 777;
     cfg.config.daemon_principal = PrincipalKey::from_uid(777);
@@ -2405,13 +2524,7 @@ async fn sensitive_argv_does_not_create_or_expose_generated_access() {
     cfg.state.session_store = Some(store.clone());
     let worker = CallerIdentity::Unix { uid: 1001 };
     let daemon = CallerIdentity::UnixAdmin { uid: 777 };
-    let sensitive = [["s", "k"].concat(), "-".to_string(), "Ab1".repeat(8)].concat();
-    assert_ne!(guard::redact::redact_output_text(&sensitive), sensitive);
-    let mut request = request_with_session(
-        "novel-fixture",
-        vec!["--credential".to_string(), sensitive.clone()],
-        "unused".to_string(),
-    );
+    let mut request = request_with_session("novel-fixture", args, "unused".to_string());
     request.session_token = None;
 
     let response = execute_command(request, &cfg, &worker)
@@ -2422,15 +2535,38 @@ async fn sensitive_argv_does_not_create_or_expose_generated_access() {
     assert!(cfg.state.grant_requests.read().await.is_empty());
     assert!(store.load_grant_requests().await.unwrap().is_empty());
     let response_json = serde_json::to_string(&response).unwrap();
-    assert!(!response_json.contains(&sensitive));
+    assert!(!response_json.contains(sensitive));
 
     let access_list = handle_admin_request_for_test(&cfg, &daemon, AdminRequest::AccessList).await;
     let access_json = serde_json::to_string(&access_list).unwrap();
-    assert!(!access_json.contains(&sensitive));
+    assert!(!access_json.contains(sensitive));
     assert!(matches!(
         access_list,
         AdminResponse::AccessItems { items } if items.is_empty()
     ));
+}
+
+#[tokio::test]
+async fn independently_sensitive_argv_does_not_create_or_expose_generated_access() {
+    let sensitive = [["s", "k"].concat(), "-".to_string(), "Ab1".repeat(8)].concat();
+    assert_ne!(guard::redact::redact_output_text(&sensitive), sensitive);
+    assert_sensitive_argv_rejected(
+        vec!["--credential".to_string(), sensitive.clone()],
+        &sensitive,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn split_and_inline_sensitive_argv_do_not_create_or_expose_generated_access() {
+    let sensitive = ["low", "entropy"].concat();
+    assert_eq!(guard::redact::redact_output_text(&sensitive), sensitive);
+    assert_sensitive_argv_rejected(
+        vec!["--api-token".to_string(), sensitive.clone()],
+        &sensitive,
+    )
+    .await;
+    assert_sensitive_argv_rejected(vec![format!("--api-token={sensitive}")], &sensitive).await;
 }
 
 #[tokio::test]
@@ -2496,6 +2632,149 @@ async fn display_colliding_argv_create_distinct_convergent_requests() {
         deny(second_args).await.handle.as_deref(),
         Some(second_handle.as_str())
     );
+}
+
+#[tokio::test]
+async fn structured_argv_retries_converge_before_capacity_rejection() {
+    let worker = CallerIdentity::Unix { uid: 1001 };
+    let original = vec!["inspect".to_string(), "original".to_string()];
+    let changed = vec!["inspect".to_string(), "changed".to_string()];
+
+    let (mut global, _) = make_test_config();
+    global.config.daemon_principal = PrincipalKey::from_uid(global.config.daemon_uid);
+    global.state.verbs = Arc::new(RwLock::new(VerbCatalog::empty()));
+    let deny_global = |args: Vec<String>| {
+        let global = &global;
+        let worker = &worker;
+        async move {
+            let mut request = request_with_session("novel-fixture", args, "unused".to_string());
+            request.session_token = None;
+            execute_command(request, global, worker)
+                .await
+                .into_response()
+        }
+    };
+    let first = deny_global(original.clone()).await;
+    let first_handle = first.handle.expect("initial exact request is created");
+    let template = global.state.grant_requests.read().await[&first_handle].clone();
+    {
+        let mut requests = global.state.grant_requests.write().await;
+        for index in 1..crate::server::admin::MAX_GRANT_REQUESTS {
+            let mut filler = template.clone();
+            filler.handle = format!("global-capacity-{index:04}");
+            filler.requester = Some(PrincipalKey::from_uid(2000 + index as u32));
+            filler.session_token = format!("global-capacity-session-{index:04}");
+            filler.request_key = filler.canonical_access_key().unwrap();
+            requests.insert(filler.handle.clone(), filler);
+        }
+        assert_eq!(requests.len(), crate::server::admin::MAX_GRANT_REQUESTS);
+    }
+    assert_eq!(
+        deny_global(original.clone()).await.handle.as_deref(),
+        Some(first_handle.as_str())
+    );
+    let rejected = deny_global(changed.clone()).await;
+    assert!(rejected.handle.is_none());
+    assert!(rejected
+        .verb_guidance
+        .as_deref()
+        .is_some_and(|guidance| guidance.contains("queue is full")));
+
+    let (mut principal, _) = make_test_config();
+    principal.config.daemon_principal = PrincipalKey::from_uid(principal.config.daemon_uid);
+    principal.state.verbs = Arc::new(RwLock::new(VerbCatalog::empty()));
+    let deny_principal = |args: Vec<String>| {
+        let principal = &principal;
+        let worker = &worker;
+        async move {
+            let mut request = request_with_session("novel-fixture", args, "unused".to_string());
+            request.session_token = None;
+            execute_command(request, principal, worker)
+                .await
+                .into_response()
+        }
+    };
+    let first = deny_principal(original.clone()).await;
+    let first_handle = first.handle.expect("initial principal request is created");
+    let template = principal.state.grant_requests.read().await[&first_handle].clone();
+    {
+        let mut requests = principal.state.grant_requests.write().await;
+        for index in 1..crate::server::admin::MAX_PENDING_GRANT_REQUESTS_PER_SESSION {
+            let mut filler = template.clone();
+            filler.handle = format!("principal-capacity-{index:04}");
+            filler.session_token = format!("principal-capacity-session-{index:04}");
+            filler.request_key = filler.canonical_access_key().unwrap();
+            requests.insert(filler.handle.clone(), filler);
+        }
+        assert_eq!(
+            requests
+                .values()
+                .filter(|request| {
+                    request
+                        .requester
+                        .as_ref()
+                        .is_some_and(|requester| requester.eq_ci(&PrincipalKey::from_uid(1001)))
+                        && request.status == GrantRequestStatus::Pending
+                })
+                .count(),
+            crate::server::admin::MAX_PENDING_GRANT_REQUESTS_PER_SESSION
+        );
+    }
+    assert_eq!(
+        deny_principal(original).await.handle.as_deref(),
+        Some(first_handle.as_str())
+    );
+    let rejected = deny_principal(changed).await;
+    assert!(rejected.handle.is_none());
+    assert!(rejected
+        .verb_guidance
+        .as_deref()
+        .is_some_and(|guidance| guidance.contains("queue is full")));
+}
+
+#[tokio::test]
+async fn observed_argv_is_not_replaced_by_a_similar_authored_verb() {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            r#"
+verbs:
+  - name: inspect-similar-resource
+    description: novel-fixture inspect target
+    binary: novel-fixture
+    args: ["inspect", "different-target"]
+    consequence: reversible
+"#,
+        )
+        .unwrap(),
+    ));
+    let worker = CallerIdentity::Unix { uid: 1001 };
+    let expected = vec!["inspect".to_string(), "target".to_string()];
+    let mut request = request_with_session("novel-fixture", expected.clone(), "unused".to_string());
+    request.session_token = None;
+
+    let response = execute_command(request, &cfg, &worker)
+        .await
+        .into_response();
+    let handle = response
+        .handle
+        .expect("observed argv creates exact generated coverage");
+    let requests = cfg.state.grant_requests.read().await;
+    let request = &requests[&handle];
+    assert!(!request
+        .authority_verbs
+        .iter()
+        .any(|name| name == "inspect-similar-resource"));
+    let proposal = guard::gating::verb::parse_normalized_generated_access_verb(
+        request
+            .proposed_verbs
+            .first()
+            .expect("observed argv has generated coverage"),
+    )
+    .unwrap();
+    assert_eq!(proposal.args, expected);
 }
 
 #[tokio::test]
