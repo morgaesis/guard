@@ -518,6 +518,14 @@ pub fn text_contains_sensitive_literals(text: &str) -> bool {
     redact_output_text(text) != text
 }
 
+/// Whether a value becomes sensitive when interpreted under a field or
+/// parameter name. This preserves the shared free-text classifier semantics
+/// for low-entropy literals whose meaning comes from their named context.
+pub fn named_value_contains_sensitive_literals(name: &str, value: &str) -> bool {
+    let projection = format!("{name}={value}");
+    redact_output_text(&projection) != projection
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OptionValueKind {
     Credential,
@@ -544,30 +552,13 @@ struct BinaryValuelessOption {
     options: &'static [&'static str],
 }
 
-/// Client programs in the MySQL and MariaDB families that accept the shared
-/// connection password grammar. The optional password arguments are attached
-/// only; bare forms prompt and therefore do not consume the next operand.
-const MYSQL_FAMILY_CLIENTS: &[&str] = &[
-    "mysql",
-    "mysqladmin",
-    "mysqlbinlog",
-    "mysqlcheck",
-    "mysqldump",
-    "mysqlimport",
-    "mysqlpump",
-    "mysqlshow",
-    "mysqlslap",
-    "mariadb",
-    "mariadb-admin",
-    "mariadb-binlog",
-    "mariadb-check",
-    "mariadb-dump",
-    "mariadb-import",
-    "mariadb-show",
-    "mariadb-slap",
-];
+struct DatabaseClientPasswordGrammar {
+    binary: &'static str,
+    attached_options: &'static [&'static str],
+    valueless_options: &'static [&'static str],
+}
 
-const MYSQL_PASSWORD_OPTIONS: &[&str] = &[
+const MYSQL_MFA_PASSWORD_OPTIONS: &[&str] = &[
     "-p",
     "--password",
     "--password1",
@@ -575,7 +566,7 @@ const MYSQL_PASSWORD_OPTIONS: &[&str] = &[
     "--password3",
 ];
 
-const MYSQL_VALUELESS_PASSWORD_OPTIONS: &[&str] = &[
+const MYSQL_MFA_VALUELESS_PASSWORD_OPTIONS: &[&str] = &[
     "-p",
     "--password",
     "--password1",
@@ -585,6 +576,123 @@ const MYSQL_VALUELESS_PASSWORD_OPTIONS: &[&str] = &[
     "--skip-password1",
     "--skip-password2",
     "--skip-password3",
+];
+
+const BASE_PASSWORD_OPTIONS: &[&str] = &["-p", "--password"];
+const BASE_VALUELESS_PASSWORD_OPTIONS: &[&str] = &["-p", "--password", "--skip-password"];
+const MYSQLSH_VALUELESS_PASSWORD_OPTIONS: &[&str] = &[
+    "-p",
+    "--password",
+    "--password1",
+    "--password2",
+    "--password3",
+    "--no-password",
+];
+const ACCESS_VALUELESS_PASSWORD_OPTIONS: &[&str] = &["-p", "--password"];
+
+/// Official client password grammars. Optional password values use attached
+/// syntax; a bare spelling prompts and never consumes the next operand.
+const DATABASE_CLIENT_PASSWORD_GRAMMARS: &[DatabaseClientPasswordGrammar] = &[
+    DatabaseClientPasswordGrammar {
+        binary: "mysql",
+        attached_options: MYSQL_MFA_PASSWORD_OPTIONS,
+        valueless_options: MYSQL_MFA_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mysqladmin",
+        attached_options: MYSQL_MFA_PASSWORD_OPTIONS,
+        valueless_options: MYSQL_MFA_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mysqlcheck",
+        attached_options: MYSQL_MFA_PASSWORD_OPTIONS,
+        valueless_options: MYSQL_MFA_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mysqldump",
+        attached_options: MYSQL_MFA_PASSWORD_OPTIONS,
+        valueless_options: MYSQL_MFA_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mysqlimport",
+        attached_options: MYSQL_MFA_PASSWORD_OPTIONS,
+        valueless_options: MYSQL_MFA_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mysqlpump",
+        attached_options: MYSQL_MFA_PASSWORD_OPTIONS,
+        valueless_options: MYSQL_MFA_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mysqlshow",
+        attached_options: MYSQL_MFA_PASSWORD_OPTIONS,
+        valueless_options: MYSQL_MFA_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mysqlslap",
+        attached_options: MYSQL_MFA_PASSWORD_OPTIONS,
+        valueless_options: MYSQL_MFA_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mysqlsh",
+        attached_options: MYSQL_MFA_PASSWORD_OPTIONS,
+        valueless_options: MYSQLSH_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mysqlbinlog",
+        attached_options: BASE_PASSWORD_OPTIONS,
+        valueless_options: BASE_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mariadb",
+        attached_options: BASE_PASSWORD_OPTIONS,
+        valueless_options: BASE_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mariadb-admin",
+        attached_options: BASE_PASSWORD_OPTIONS,
+        valueless_options: BASE_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mariadb-binlog",
+        attached_options: BASE_PASSWORD_OPTIONS,
+        valueless_options: BASE_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mariadb-check",
+        attached_options: BASE_PASSWORD_OPTIONS,
+        valueless_options: BASE_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mariadb-dump",
+        attached_options: BASE_PASSWORD_OPTIONS,
+        valueless_options: BASE_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mariadb-import",
+        attached_options: BASE_PASSWORD_OPTIONS,
+        valueless_options: BASE_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mariadb-show",
+        attached_options: BASE_PASSWORD_OPTIONS,
+        valueless_options: BASE_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mariadb-slap",
+        attached_options: BASE_PASSWORD_OPTIONS,
+        valueless_options: BASE_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mariadb-access",
+        attached_options: BASE_PASSWORD_OPTIONS,
+        valueless_options: ACCESS_VALUELESS_PASSWORD_OPTIONS,
+    },
+    DatabaseClientPasswordGrammar {
+        binary: "mysqlaccess",
+        attached_options: BASE_PASSWORD_OPTIONS,
+        valueless_options: ACCESS_VALUELESS_PASSWORD_OPTIONS,
+    },
 ];
 
 /// Opaque credential-taking options whose spelling does not carry enough
@@ -615,11 +723,11 @@ const BINARY_OPTION_ALIASES: &[BinaryOptionAlias] = &[
         arity: OptionArity::Required,
     },
     BinaryOptionAlias {
-        binaries: MYSQL_FAMILY_CLIENTS,
+        binaries: &["mariadb-access", "mysqlaccess"],
         required_subcommand: None,
-        options: MYSQL_PASSWORD_OPTIONS,
+        options: &["-P", "--spassword"],
         value_kind: OptionValueKind::Credential,
-        arity: OptionArity::AttachedOnly,
+        arity: OptionArity::Required,
     },
     BinaryOptionAlias {
         binaries: &["redis-cli"],
@@ -657,11 +765,6 @@ const BINARY_VALUELESS_OPTIONS: &[BinaryValuelessOption] = &[
             "--ask-become-pass",
             "--ask-vault-pass",
         ],
-    },
-    BinaryValuelessOption {
-        binaries: MYSQL_FAMILY_CLIENTS,
-        required_subcommand: None,
-        options: MYSQL_VALUELESS_PASSWORD_OPTIONS,
     },
     BinaryValuelessOption {
         binaries: &["docker", "podman"],
@@ -828,12 +931,58 @@ fn alias_context_matches(
         })
 }
 
+fn database_client_password_grammar(
+    binary: &str,
+) -> Option<&'static DatabaseClientPasswordGrammar> {
+    let binary = binary_lookup_name(binary);
+    DATABASE_CLIENT_PASSWORD_GRAMMARS
+        .iter()
+        .find(|grammar| grammar.binary == binary.as_str())
+}
+
+fn parse_database_client_password_option<'a>(
+    binary: &str,
+    argument: &'a str,
+) -> Option<ParsedOption<'a>> {
+    let grammar = database_client_password_grammar(binary)?;
+    for option in grammar.attached_options {
+        if argument == *option {
+            return Some(ParsedOption {
+                name: argument,
+                value_start: None,
+            });
+        }
+        let Some(suffix) = argument.strip_prefix(option) else {
+            continue;
+        };
+        let short_option = option.len() == 2 && option.starts_with('-');
+        let separated_long = suffix
+            .chars()
+            .next()
+            .is_some_and(|character| matches!(character, '=' | ':') || character.is_control());
+        if !suffix.is_empty() && (short_option || separated_long) {
+            return Some(ParsedOption {
+                name: option,
+                value_start: Some(option.len()),
+            });
+        }
+    }
+    None
+}
+
 fn parse_binary_alias_option<'a>(
     binary: &str,
     args: &[String],
     option_index: usize,
     argument: &'a str,
 ) -> Option<(ParsedOption<'a>, OptionValueKind, OptionArity)> {
+    if let Some(option) = parse_database_client_password_option(binary, argument) {
+        return Some((
+            option,
+            OptionValueKind::Credential,
+            OptionArity::AttachedOnly,
+        ));
+    }
     for alias in BINARY_OPTION_ALIASES {
         if !alias_context_matches(
             binary,
@@ -885,15 +1034,17 @@ fn is_known_valueless_option(
     option: &ParsedOption<'_>,
 ) -> bool {
     option.value_start.is_none()
-        && BINARY_VALUELESS_OPTIONS.iter().any(|rule| {
-            alias_context_matches(
-                binary,
-                args,
-                option_index,
-                rule.binaries,
-                rule.required_subcommand,
-            ) && rule.options.contains(&option.name)
-        })
+        && (database_client_password_grammar(binary)
+            .is_some_and(|grammar| grammar.valueless_options.contains(&option.name))
+            || BINARY_VALUELESS_OPTIONS.iter().any(|rule| {
+                alias_context_matches(
+                    binary,
+                    args,
+                    option_index,
+                    rule.binaries,
+                    rule.required_subcommand,
+                ) && rule.options.contains(&option.name)
+            }))
 }
 
 fn named_secret_value_start(argument: &str) -> Option<usize> {
@@ -1270,44 +1421,71 @@ mod tests {
     }
 
     #[test]
-    fn mysql_family_password_grammar_preserves_prompt_operands() {
+    fn database_client_password_grammar_matches_each_binary_and_platform_spelling() {
         let value = ["q", "7"].concat();
-        let clients = [
-            "mysqlcheck",
-            "MYSQLADMIN.EXE",
-            "mariadb-dump.cmd",
-            "MariaDB-Import.COM",
-        ];
-        for binary in clients {
-            for option in [
-                "-p",
-                "--password",
-                "--password1",
-                "--password2",
-                "--password3",
-            ] {
-                assert!(!command_contains_sensitive_literals(
-                    binary,
-                    &[option.to_string(), "ordinary_database".to_string()]
-                ));
-                let attached = if option == "-p" {
-                    format!("{option}{value}")
+        for grammar in DATABASE_CLIENT_PASSWORD_GRAMMARS {
+            for suffix in ["", ".EXE", ".cmd", ".Bat", ".cOm"] {
+                let binary = if suffix.is_empty() {
+                    grammar.binary.to_string()
                 } else {
-                    format!("{option}={value}")
+                    format!(
+                        "C:\\Tools\\{}{}",
+                        grammar.binary.to_ascii_uppercase(),
+                        suffix
+                    )
                 };
-                assert!(command_contains_sensitive_literals(binary, &[attached]));
+                for option in grammar.valueless_options {
+                    assert!(!command_contains_sensitive_literals(
+                        &binary,
+                        &[option.to_string(), "ordinary_database".to_string()]
+                    ));
+                }
+                for option in grammar.attached_options {
+                    assert!(!command_contains_sensitive_literals(
+                        &binary,
+                        &[option.to_string(), "ordinary_database".to_string()]
+                    ));
+                    let mut forms = vec![
+                        format!("{option}={value}"),
+                        format!("{option}:{value}"),
+                        format!("{option}\n{value}"),
+                    ];
+                    if option.len() == 2 {
+                        forms.push(format!("{option}{value}"));
+                    }
+                    for form in forms {
+                        assert!(command_contains_sensitive_literals(&binary, &[form]));
+                    }
+                }
             }
-            for option in [
-                "--skip-password",
-                "--skip-password1",
-                "--skip-password2",
-                "--skip-password3",
-            ] {
-                assert!(!command_contains_sensitive_literals(
+        }
+    }
+
+    #[test]
+    fn mariadb_access_superuser_password_aliases_have_required_arity() {
+        let value = ["q", "7"].concat();
+        for binary in ["mariadb-access", "MYSQLACCESS.EXE"] {
+            for option in ["-P", "--spassword"] {
+                assert!(command_contains_sensitive_literals(
                     binary,
-                    &[option.to_string(), "ordinary_database".to_string()]
+                    &[option.to_string(), value.clone()]
                 ));
+                let mut forms = vec![
+                    format!("{option}={value}"),
+                    format!("{option}:{value}"),
+                    format!("{option}\n{value}"),
+                ];
+                if option.len() == 2 {
+                    forms.push(format!("{option}{value}"));
+                }
+                for form in forms {
+                    assert!(command_contains_sensitive_literals(binary, &[form]));
+                }
             }
+            assert!(!command_contains_sensitive_literals(
+                binary,
+                &["-p".to_string(), "ordinary_database".to_string()]
+            ));
         }
     }
 

@@ -41,7 +41,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 /// provisional rows. Version 11 removes literal-sensitive session exact
 /// authority instead of redacting it into a different matcher, clears legacy
 /// approval parameter maps, and preserves every terminal provisional status.
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 const VACUUM_MIN_PAGES: u64 = 512;
 const VACUUM_MIN_FREE_PAGES: u64 = 128;
 const REGISTRY_GENERATION_KEY: &str = "registry_generation";
@@ -3824,6 +3824,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sensitive_generated_parameter_authority_fails_new_and_restart_loads() {
+        let value = ["q", "7"].concat();
+        let mut request = generated_access_request();
+        let mut verb: Verb = serde_json::from_value(request.proposed_verbs[0].clone()).unwrap();
+        verb.args.push("{password}".to_string());
+        verb.params.insert(
+            "password".to_string(),
+            guard::gating::verb::ParamSpec {
+                pattern: "^[a-z0-9]+$".to_string(),
+                required: false,
+                default: Some(value.clone()),
+                allow_dash: false,
+            },
+        );
+        verb.name = guard::gating::verb::generated_access_verb_name(&verb);
+        request.authority_verbs = vec![verb.name.clone()];
+        request.delta.activated_verbs = vec![verb.name.clone()];
+        request.proposed_verbs = vec![serde_json::to_value(&verb).unwrap()];
+
+        for version in [SCHEMA_VERSION, SCHEMA_VERSION - 1] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("state.db");
+            let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+            let error = store.save_grant_request(request.clone()).await.unwrap_err();
+            assert!(!error.to_string().contains(&value));
+
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO grant_requests (handle, json, status, created_unix)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    request.handle,
+                    serde_json::to_string(&request).unwrap(),
+                    request.status.as_str(),
+                    encode_u64(request.created_unix).unwrap()
+                ],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            drop(conn);
+            drop(store);
+
+            let error = SessionStore::open(path.clone(), 3600).await.unwrap_err();
+            assert!(!error.to_string().contains(&value));
+
+            let error = SessionStore::open(path, 3600).await.unwrap_err();
+            assert!(!error.to_string().contains(&value));
+        }
+    }
+
+    #[tokio::test]
     async fn access_request_persistence_rejects_invalid_scope_and_convergence_key() {
         let mut invalid_scope = generated_access_request();
         invalid_scope.authority_verbs = vec!["access-generated-other".to_string()];
@@ -6134,6 +6185,78 @@ mod tests {
             history[0].override_markers,
             vec!["operator:historical-read"]
         );
+    }
+
+    #[tokio::test]
+    async fn schema_v11_nested_trace_cleanup_is_transactional_and_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let safe_rule = SessionExactRule::new("fixturectl", vec!["status".to_string()]);
+        let mut registry = SessionRegistry::new();
+        registry.grant(
+            "safe".to_string(),
+            exact_rule_grant(vec![safe_rule.clone()]),
+        );
+        registry.record_interaction(
+            "safe",
+            SessionInteraction {
+                at_unix: guard::env::now_unix(),
+                command: "fixturectl status".to_string(),
+                allowed: true,
+                source: SessionDecisionSource::Llm,
+                reason: "safe rationale".to_string(),
+                risk: Some(1),
+                exec_status: SessionExecStatus::Completed,
+                exit_code: Some(0),
+                exposed_secret_refs: Vec::new(),
+                decision_trace: Some(guard::gating::DecisionTrace::source("llm")),
+            },
+        );
+        store.persist_registry(&registry).await.unwrap();
+
+        let value = ["q", "7"].concat();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE session_interactions SET decision_trace_json = ?1",
+            params![serde_json::to_string(&contaminated_trace(&value)).unwrap()],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 11).unwrap();
+        drop(conn);
+        drop(store);
+
+        for _ in 0..2 {
+            let restarted = SessionStore::open(path.clone(), 3600).await.unwrap();
+            let loaded = restarted.load_registry().await.unwrap();
+            assert!(loaded.has("safe"));
+            assert!(matches!(
+                loaded
+                    .check("safe", "fixturectl", &["status".to_string()], None)
+                    .map(|decision| decision.0),
+                Some(crate::session::SessionDecision::Allow)
+            ));
+            let report = loaded.show("safe", 10).unwrap();
+            assert_eq!(report.recent.len(), 1);
+            assert!(!serde_json::to_string(&report.recent[0])
+                .unwrap()
+                .contains(&value));
+            drop(restarted);
+
+            let conn = Connection::open(&path).unwrap();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            let durable: String = conn
+                .query_row(
+                    "SELECT decision_trace_json FROM session_interactions",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(version, SCHEMA_VERSION);
+            assert!(!durable.contains(&value));
+        }
     }
 
     #[tokio::test]

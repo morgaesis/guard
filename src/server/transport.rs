@@ -2324,12 +2324,10 @@ pub(super) async fn write_policy_decision<W: AsyncWrite + Unpin>(
     reason: &str,
 ) -> Result<()> {
     if stream_output {
+        let reason = guard::gating::sanitize_gate_text(reason);
         write_stream_message(
             writer,
-            &ExecuteStreamMessage::PolicyDecision {
-                allowed,
-                reason: reason.to_string(),
-            },
+            &ExecuteStreamMessage::PolicyDecision { allowed, reason },
         )
         .await?;
     }
@@ -2342,6 +2340,19 @@ mod line_limit_tests {
     use std::time::Duration;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+    #[tokio::test]
+    async fn policy_stream_sanitizes_reason_before_serialization() {
+        let value = ["sk-", &"Ab1".repeat(8)].concat();
+        let mut output = Vec::new();
+        write_policy_decision(true, &mut output, false, &format!("rationale {value}"))
+            .await
+            .unwrap();
+        assert!(!output
+            .windows(value.len())
+            .any(|part| part == value.as_bytes()));
+        assert!(String::from_utf8(output).unwrap().contains("[REDACTED]"));
+    }
 
     #[tokio::test]
     async fn malformed_durable_provisional_prevents_listener_startup() {

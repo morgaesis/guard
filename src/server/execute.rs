@@ -1099,8 +1099,9 @@ async fn resolve_verb_context<W: AsyncWrite + Unpin>(
 
 /// Static request validation before any policy decision: recursion depth,
 /// binary-name shape, and injection validation. Returns the recursion depth
-/// and the reconstructed command line, which the session short-circuit and
-/// the evaluator must share.
+/// and the reconstructed command line used by local policy, cache identity,
+/// and learning. Provider projection separately retains structured argv long
+/// enough to apply binary-specific redaction.
 async fn validate_exec_request<W: AsyncWrite + Unpin>(
     phase: &mut ExecPhase<'_, W>,
     request: &ExecuteRequest,
@@ -1148,8 +1149,8 @@ async fn validate_exec_request<W: AsyncWrite + Unpin>(
         .await);
     }
 
-    // Reconstruct full command line early so session short-circuit and
-    // evaluator share the same command text.
+    // Reconstruct the local-policy command line. The provider path receives
+    // the structured binary and argv separately.
     let command_line = command_line(&request.binary, &request.args);
 
     if let Err(reason) =
@@ -1663,14 +1664,16 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
     let eval_result = server
         .state
         .evaluator
-        .evaluate_scoped(
-            &command_line,
+        .evaluate_scoped_argv(
+            &request.binary,
+            &request.args,
             evaluation_prompt.as_deref(),
             request.reevaluate,
             evaluation_prompt.is_some(),
             Some(cache_scope.as_str()),
         )
         .await;
+    let eval_result = sanitize_evaluator_result(eval_result);
     let provider_spend = matches!(
         &eval_result,
         guard::evaluate::EvalResult::Allow {
@@ -1866,6 +1869,34 @@ pub(super) fn session_source_from_eval(
         guard::evaluate::EvalSource::Cache => SessionDecisionSource::Cache,
         guard::evaluate::EvalSource::StaticPolicy => SessionDecisionSource::StaticPolicy,
         guard::evaluate::EvalSource::LearnedDeny => SessionDecisionSource::LearnedDeny,
+    }
+}
+
+fn sanitize_evaluator_result(result: guard::evaluate::EvalResult) -> guard::evaluate::EvalResult {
+    match result {
+        guard::evaluate::EvalResult::Allow {
+            reason,
+            source,
+            risk,
+            reversibility,
+        } => guard::evaluate::EvalResult::Allow {
+            reason: guard::gating::sanitize_gate_text(&reason),
+            source,
+            risk,
+            reversibility,
+        },
+        guard::evaluate::EvalResult::Deny {
+            reason,
+            source,
+            risk,
+        } => guard::evaluate::EvalResult::Deny {
+            reason: guard::gating::sanitize_gate_text(&reason),
+            source,
+            risk,
+        },
+        guard::evaluate::EvalResult::Error(error) => {
+            guard::evaluate::EvalResult::Error(guard::gating::sanitize_gate_text(&error))
+        }
     }
 }
 
@@ -2530,9 +2561,8 @@ pub(super) async fn exec_after_approval_with_secret_authority<W: AsyncWrite + Un
     let caller = context.caller;
     if server.config.dry_run {
         tracing::info!(
-            "Dry-run: not executing {} {:?} ({})",
-            request.binary,
-            request.args,
+            "Dry-run: not executing {} ({})",
+            redact_command_line(&request.binary, &request.args),
             caller
         );
         // Under gating, even the execute-now (reversible) path reports honest
@@ -2781,9 +2811,8 @@ pub(super) async fn exec_after_approval_with_secret_authority<W: AsyncWrite + Un
     }
 
     tracing::info!(
-        "Executing: {} {:?} ({}) cwd={}",
-        request.binary,
-        request.args,
+        "Executing: {} ({}) cwd={}",
+        redact_command_line(&request.binary, &request.args),
         caller,
         request
             .cwd
@@ -3273,7 +3302,7 @@ pub(super) fn merge_envelope_context(
     let check = revert
         .confirm_check
         .as_ref()
-        .map(|check| command_line(&check.binary, &check.args))
+        .map(|check| redact_command_line(&check.binary, &check.args))
         .unwrap_or_else(|| "none; deadline always rolls back".to_string());
     let control_path = revert.control_path.as_deref().unwrap_or(
         "daemon-inferred from the forward, check, rollback, credential, and transport commands",
@@ -3284,8 +3313,8 @@ pub(super) fn merge_envelope_context(
         .clamp(1, MAX_CONFIRM_WITHIN_SECS);
     let envelope = format!(
         "{REVERT_AVAILABLE_CONTEXT}\nForward: {}\nRollback: {}\nConfirmation check: {}\nDeadline: {} seconds\nRequired control path: {}\nTreat the entire forward, check, rollback, and control-path chain as one safety decision. HOLD by denying when the forward action can plausibly sever the SSH, API, socket, credential, daemon, or local authority needed to verify or roll back.",
-        command_line(&request.binary, &request.args),
-        command_line(&revert.binary, &revert.args),
+        redact_command_line(&request.binary, &request.args),
+        redact_command_line(&revert.binary, &revert.args),
         check,
         window,
         control_path
@@ -3323,6 +3352,27 @@ mod decision_trace_feature_tests {
         assert!(!serde_json::to_string(&persisted)
             .unwrap()
             .contains(fixture_value));
+    }
+
+    #[test]
+    fn evaluator_rationale_is_sanitized_before_policy_consumers() {
+        let value = ["sk-", &"Ab1".repeat(8)].concat();
+        for result in [
+            guard::evaluate::EvalResult::Allow {
+                reason: format!("allow rationale {value}"),
+                source: guard::evaluate::EvalSource::Llm,
+                risk: Some(1),
+                reversibility: None,
+            },
+            guard::evaluate::EvalResult::Deny {
+                reason: format!("deny rationale {value}"),
+                source: guard::evaluate::EvalSource::Llm,
+                risk: Some(1),
+            },
+        ] {
+            let sanitized = sanitize_evaluator_result(result);
+            assert!(!sanitized.reason().contains(&value));
+        }
     }
 }
 

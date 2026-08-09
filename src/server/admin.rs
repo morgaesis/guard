@@ -1104,9 +1104,15 @@ fn derived_access_description(verb: &Verb) -> String {
     text
 }
 
-fn access_capability(verb: &Verb) -> AccessCapability {
+fn access_capability(verb: &Verb) -> Option<AccessCapability> {
+    if verb.name.starts_with("access-generated-") {
+        let mut proposal = verb.clone();
+        proposal.trusted = false;
+        let serialized = serde_json::to_value(proposal).ok()?;
+        guard::gating::verb::parse_normalized_generated_access_verb(&serialized).ok()?;
+    }
     let matcher = generated_access_matcher_shape(verb);
-    AccessCapability {
+    Some(AccessCapability {
         verb: verb.name.clone(),
         description: redact_output_text(&verb.description),
         matcher_digest: generated_access_matcher_digest(&matcher),
@@ -1117,6 +1123,45 @@ fn access_capability(verb: &Verb) -> AccessCapability {
         trusted: verb.trusted,
         has_revert: verb.revert.is_some(),
         evidence: verb.evidence.as_deref().map(redact_output_text),
+    })
+}
+
+#[cfg(test)]
+mod access_capability_tests {
+    use super::*;
+    use guard::gating::verb::ParamSpec;
+
+    #[test]
+    fn generated_capability_projection_omits_sensitive_parameter_authority() {
+        let value = ["q", "7"].concat();
+        let mut verb = Verb {
+            name: "access-generated-fixture".to_string(),
+            description: "fixture".to_string(),
+            binary: "fixturectl".to_string(),
+            args: vec!["inspect".to_string(), "{password}".to_string()],
+            baseline: false,
+            coverage: Vec::new(),
+            credential_plan: None,
+            params: std::collections::BTreeMap::from([(
+                "password".to_string(),
+                ParamSpec {
+                    pattern: "^[a-z0-9]+$".to_string(),
+                    required: false,
+                    default: Some(value.clone()),
+                    allow_dash: false,
+                },
+            )]),
+            consequence: guard::gating::Reversibility::Irreversible,
+            revert: None,
+            trusted: false,
+            prompt_context: None,
+            source_prose: None,
+            evidence: None,
+            auto_promoted: false,
+            promotion_stamp: None,
+        };
+        verb.name = generated_access_verb_name(&verb);
+        assert!(access_capability(&verb).is_none());
     }
 }
 
@@ -1125,7 +1170,7 @@ async fn capabilities_for(server: &ServerContext, names: &[String]) -> Vec<Acces
     names
         .iter()
         .filter_map(|name| catalog.get(name))
-        .map(access_capability)
+        .filter_map(access_capability)
         .collect()
 }
 
@@ -1146,7 +1191,7 @@ async fn capabilities_for_request(
         .authority_verbs
         .iter()
         .filter_map(|name| catalog.get(name).or_else(|| proposed.get(name)))
-        .map(access_capability)
+        .filter_map(access_capability)
         .collect()
 }
 
@@ -1943,7 +1988,7 @@ pub(super) async fn submit_access_request(
             next_action: "guard access list".to_string(),
             approval_options: Vec::new(),
             intent: Some(intent),
-            capabilities: reduced.iter().map(access_capability).collect(),
+            capabilities: reduced.iter().filter_map(access_capability).collect(),
             decided_reason: None,
         });
     }

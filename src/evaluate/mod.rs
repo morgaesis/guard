@@ -412,7 +412,7 @@ impl Evaluator {
         prompt_append: Option<&str>,
         reevaluate: bool,
     ) -> EvalResult {
-        self.evaluate_with_reevaluate_inner(command, prompt_append, reevaluate, false, None)
+        self.evaluate_with_reevaluate_inner(command, None, prompt_append, reevaluate, false, None)
             .await
     }
 
@@ -439,6 +439,31 @@ impl Evaluator {
     ) -> EvalResult {
         self.evaluate_with_reevaluate_inner(
             command,
+            None,
+            prompt_append,
+            reevaluate,
+            cache_prompt_context,
+            cache_scope,
+        )
+        .await
+    }
+
+    /// Evaluate a structured command while retaining the original flattened
+    /// form for local policy and cache identity. The provider projection is
+    /// redacted while executable and argv boundaries are still available.
+    pub async fn evaluate_scoped_argv(
+        &self,
+        binary: &str,
+        args: &[String],
+        prompt_append: Option<&str>,
+        reevaluate: bool,
+        cache_prompt_context: bool,
+        cache_scope: Option<&str>,
+    ) -> EvalResult {
+        let command = crate::redact::command_line(binary, args);
+        self.evaluate_with_reevaluate_inner(
+            &command,
+            Some((binary, args)),
             prompt_append,
             reevaluate,
             cache_prompt_context,
@@ -450,6 +475,7 @@ impl Evaluator {
     async fn evaluate_with_reevaluate_inner(
         &self,
         command: &str,
+        structured_command: Option<(&str, &[String])>,
         prompt_append: Option<&str>,
         reevaluate: bool,
         cache_prompt_context: bool,
@@ -526,7 +552,9 @@ impl Evaluator {
                 }
             }
 
-            let result = self.evaluate_llm(command, prompt_append).await;
+            let result = self
+                .evaluate_llm_with_argv(command, structured_command, prompt_append)
+                .await;
 
             // Only insert into cache when the verdict was made under the
             // base prompt. Decisions reached with a session-specific prompt

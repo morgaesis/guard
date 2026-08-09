@@ -118,10 +118,11 @@ the coverage cells, credential plan, consequence class, trusted flag, and revert
 availability. The matcher digest stays on its own line because held approvals
 bind to it. `--raw` adds the exact matcher JSON beneath that rendering.
 
-A catalog verb shows its operator-authored description. A generated matcher is
-described by the same synthesis call that produces it, and when that call returns
-no usable description the daemon derives one from the matcher itself, so a
-request is never blocked or delayed on describing it.
+A catalog verb shows its operator-authored description. A matcher synthesized
+from a prose request uses the synthesis response's description, with a
+matcher-derived description as the fallback. A denied command with structured
+argv produces an exact matcher directly from that argv and always uses a
+matcher-derived description. Description generation does not delay a request.
 
 A pending request reports the budget a bare `guard access approve` would apply
 rather than the internal `unselected` state: `unlimited` unless the request asked

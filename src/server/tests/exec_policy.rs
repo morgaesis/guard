@@ -3,6 +3,8 @@ use crate::server::admin::handle_admin_request_for_test;
 use crate::server::binary_path_candidates;
 #[cfg(unix)]
 use crate::server::execute::exec_after_approval_with_secret_authority;
+#[cfg(unix)]
+use crate::server::execute::execute_command_streaming;
 use crate::server::execute::{
     audit_command_line, audit_session_fingerprint, evaluation_context_prompt, execute_command,
     log_audit_policy_for_request, AnsibleInventoryDiagnostics,
@@ -36,6 +38,8 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 
+#[cfg(unix)]
+use super::attach_test_audit_log;
 use super::capture_async;
 #[cfg(unix)]
 use super::production_audit_buffer;
@@ -1039,6 +1043,137 @@ pub(super) async fn run_denying_llm(listener: tokio::net::TcpListener) {
     }
 }
 
+#[cfg(unix)]
+async fn run_policy_llm_once(
+    listener: tokio::net::TcpListener,
+    decision: &'static str,
+    reason: String,
+) {
+    let (mut stream, _) = listener.accept().await.unwrap();
+    let mut request = Vec::new();
+    let mut chunk = [0u8; 2048];
+    while let Ok(read) = stream.read(&mut chunk).await {
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&chunk[..read]);
+        if let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .split("\r\n")
+                .find_map(|line| {
+                    line.strip_prefix("Content-Length: ")
+                        .or_else(|| line.strip_prefix("content-length: "))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            if request.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+    }
+    let arguments = serde_json::json!({
+        "decision": decision,
+        "reason": reason,
+        "risk": 1,
+    })
+    .to_string();
+    let body = serde_json::json!({
+        "choices": [{"message": {"tool_calls": [{
+            "id": "c1",
+            "type": "function",
+            "function": {"name": "decide", "arguments": arguments}
+        }]}}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    })
+    .to_string();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream.write_all(response.as_bytes()).await.unwrap();
+    stream.shutdown().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn evaluator_rationale_cannot_reach_policy_audit_or_stream() {
+    let _env_guard = TEST_ENV_LOCK.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let bin_dir = temp.path().join("bin");
+    std::fs::create_dir(&bin_dir).unwrap();
+    for binary in ["curl", "mysqlsh"] {
+        let path = bin_dir.join(binary);
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+    let _path_restore = EnvRestore::capture("PATH");
+    std::env::set_var("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()));
+
+    for (decision, binary, args, value) in [
+        (
+            "DENY",
+            "curl",
+            vec!["-u".to_string(), ["q", "7"].concat()],
+            ["q", "7"].concat(),
+        ),
+        (
+            "APPROVE",
+            "mysqlsh",
+            vec![format!("-p{}", ["r", "8"].concat())],
+            ["r", "8"].concat(),
+        ),
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let mock = tokio::spawn(run_policy_llm_once(
+            listener,
+            decision,
+            format!("policy rationale password={value}"),
+        ));
+        let (mut cfg, logs) = make_test_config();
+        cfg.state.evaluator = Arc::new(
+            Evaluator::new(
+                EvalConfig::default()
+                    .cache_enabled(false)
+                    .llm_api_key("test-key".to_string())
+                    .llm_api_url(url)
+                    .llm_retries(0),
+            )
+            .unwrap(),
+        );
+        let (_audit_dir, audit) = attach_test_audit_log(&mut cfg);
+        let mut stream = Vec::new();
+        let request = basic_request(binary, args);
+        let (result, captured_logs) = capture_async(
+            &logs,
+            execute_command_streaming(
+                request,
+                &cfg,
+                &CallerIdentity::Unix { uid: 1000 },
+                &mut stream,
+            ),
+        )
+        .await;
+        mock.await.unwrap();
+
+        assert!(!result.policy_reason().contains(&value));
+        assert!(!stream
+            .windows(value.len())
+            .any(|part| part == value.as_bytes()));
+        assert!(
+            !captured_logs.contains(&value),
+            "{decision} rationale leaked for {binary}"
+        );
+        let durable = std::fs::read_to_string(audit.path()).unwrap();
+        assert!(!durable.contains(&value));
+    }
+}
+
 fn basic_request(binary: &str, args: Vec<String>) -> ExecuteRequest {
     ExecuteRequest {
         binary: binary.to_string(),
@@ -1454,7 +1589,7 @@ async fn audit_line_injection_via_argv_is_escaped() {
     );
     assert_eq!(
         record.event.reason.as_deref(),
-        Some("denied\r\n[AUDIT] ALLOWED forged-via-reason")
+        Some("denied\n[AUDIT] ALLOWED forged-via-reason")
     );
     assert!(
         !jsonl
@@ -1482,7 +1617,7 @@ async fn audit_line_injection_via_argv_is_escaped() {
         "argv injection must appear escaped on the original line: {output}"
     );
     assert!(
-        output.contains("denied\\r\\n[AUDIT] ALLOWED forged-via-reason"),
+        output.contains("denied\\n[AUDIT] ALLOWED forged-via-reason"),
         "reason injection must appear escaped on the original line: {output}"
     );
     assert!(
@@ -2605,6 +2740,29 @@ fn containment_context_presents_the_complete_chain_to_the_evaluator() {
     ] {
         assert!(prompt.contains(required), "missing {required:?}: {prompt}");
     }
+}
+
+#[test]
+fn containment_context_redacts_each_structured_command_before_flattening() {
+    use crate::server::execute::merge_envelope_context;
+    use crate::server::{CommandSpec, RevertSpec};
+
+    let forward_value = ["q", "7"].concat();
+    let rollback_value = ["r", "8"].concat();
+    let check_value = ["s", "9"].concat();
+    let mut request = basic_request("curl", vec!["-u".into(), forward_value.clone()]);
+    let mut revert = RevertSpec::new("mysqlsh.exe", vec![format!("-p{rollback_value}")]);
+    revert.confirm_check = Some(CommandSpec {
+        binary: "mariadb-access".into(),
+        args: vec!["-P".into(), check_value.clone()],
+    });
+    request.revert = Some(revert);
+
+    let prompt = merge_envelope_context(None, &request).unwrap();
+    for value in [forward_value, rollback_value, check_value] {
+        assert!(!prompt.contains(&value));
+    }
+    assert_eq!(prompt.matches("[REDACTED]").count(), 3);
 }
 
 #[cfg(unix)]

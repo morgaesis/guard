@@ -29,10 +29,22 @@ use crate::redact::{
     redact_output_text,
 };
 
+#[cfg(unix)]
 pub(crate) fn write_learning_file_atomically(path: &Path, content: &str) -> Result<()> {
     write_learning_file_atomically_with_sync(path, content, sync_parent_directory)
 }
 
+#[cfg(windows)]
+pub(crate) fn write_learning_file_atomically(path: &Path, content: &str) -> Result<()> {
+    write_learning_file_atomically_windows(path, content)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn write_learning_file_atomically(_path: &Path, _content: &str) -> Result<()> {
+    anyhow::bail!("atomic learning-file durability is unsupported on this platform")
+}
+
+#[cfg(any(unix, test))]
 fn write_learning_file_atomically_with_sync<F>(
     path: &Path,
     content: &str,
@@ -74,8 +86,58 @@ fn sync_parent_directory(parent: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn sync_parent_directory(_parent: &Path) -> Result<()> {
+#[cfg(windows)]
+fn write_learning_file_atomically_windows(path: &Path, content: &str) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("failed to create temporary file in {}", parent.display()))?;
+    if let Ok(metadata) = std::fs::metadata(path) {
+        temporary
+            .as_file()
+            .set_permissions(metadata.permissions())
+            .with_context(|| format!("failed to preserve permissions for {}", path.display()))?;
+    }
+    temporary
+        .write_all(content.as_bytes())
+        .with_context(|| format!("failed to write temporary file for {}", path.display()))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("failed to sync temporary file for {}", path.display()))?;
+
+    let temporary = temporary.into_temp_path();
+    let source = temporary
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // Windows has no directory-fsync equivalent. MOVEFILE_WRITE_THROUGH is
+    // the strongest documented replacement primitive here: it waits for the
+    // move and guarantees a copy-and-delete move is flushed before returning.
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to durably replace {}", path.display()));
+    }
+    let _ = temporary.keep();
     Ok(())
 }
 
@@ -701,6 +763,16 @@ mod tests {
         assert!(error
             .to_string()
             .contains("failed to sync parent directory"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "new");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_atomic_writer_replaces_existing_file_with_write_through() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("learned.yaml");
+        std::fs::write(&path, "old").unwrap();
+        write_learning_file_atomically(&path, "new").unwrap();
         assert_eq!(std::fs::read_to_string(path).unwrap(), "new");
     }
 

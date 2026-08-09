@@ -15,7 +15,10 @@
 
 use super::coverage::reversibility_rank;
 use super::Reversibility;
-use crate::redact::command_contains_sensitive_literals;
+use crate::redact::{
+    command_contains_sensitive_literals, named_value_contains_sensitive_literals,
+    text_contains_sensitive_literals,
+};
 use anyhow::{bail, Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -2233,6 +2236,94 @@ pub fn generated_access_verb_name(verb: &Verb) -> String {
     format!("access-generated-{}", &digest[..16])
 }
 
+fn value_constraint_contains_sensitive_literal(constraint: &ValueConstraint) -> bool {
+    constraint
+        .options
+        .iter()
+        .any(|option| text_contains_sensitive_literals(option))
+        || constraint.values.iter().any(|value| {
+            text_contains_sensitive_literals(value)
+                || constraint.options.iter().any(|option| {
+                    command_contains_sensitive_literals(
+                        "generated-access-parameter",
+                        &[option.clone(), value.clone()],
+                    )
+                })
+        })
+}
+
+fn generated_access_authority_contains_sensitive_literal(verb: &Verb) -> bool {
+    if command_contains_sensitive_literals(&verb.binary, &verb.args)
+        || verb
+            .credential_plan
+            .as_deref()
+            .is_some_and(text_contains_sensitive_literals)
+    {
+        return true;
+    }
+    for (name, specification) in &verb.params {
+        if named_value_contains_sensitive_literals(name, specification.pattern_text())
+            || specification.default.as_deref().is_some_and(|value| {
+                named_value_contains_sensitive_literals(name, value)
+                    || text_contains_sensitive_literals(value)
+            })
+        {
+            return true;
+        }
+    }
+    verb.coverage.iter().any(|cell| {
+        text_contains_sensitive_literals(&cell.name)
+            || command_contains_sensitive_literals(&verb.binary, &cell.required_args)
+            || command_contains_sensitive_literals(&verb.binary, &cell.forbidden_args)
+            || cell
+                .options
+                .iter()
+                .any(value_constraint_contains_sensitive_literal)
+            || cell
+                .target
+                .as_ref()
+                .is_some_and(value_constraint_contains_sensitive_literal)
+            || cell
+                .inventory
+                .as_ref()
+                .is_some_and(value_constraint_contains_sensitive_literal)
+            || cell
+                .namespace
+                .as_ref()
+                .is_some_and(value_constraint_contains_sensitive_literal)
+            || cell.fanout.as_ref().is_some_and(|fanout| {
+                text_contains_sensitive_literals(&fanout.separator)
+                    || value_constraint_contains_sensitive_literal(&fanout.selector)
+            })
+            || cell
+                .cwd
+                .as_ref()
+                .is_some_and(|cwd| text_contains_sensitive_literals(&cwd.to_string_lossy()))
+            || cell.environment.iter().any(|environment| {
+                text_contains_sensitive_literals(&environment.name)
+                    || environment.values.iter().any(|value| {
+                        text_contains_sensitive_literals(value)
+                            || named_value_contains_sensitive_literals(&environment.name, value)
+                    })
+                    || environment.pattern.as_deref().is_some_and(|pattern| {
+                        text_contains_sensitive_literals(pattern)
+                            || named_value_contains_sensitive_literals(&environment.name, pattern)
+                    })
+            })
+            || cell.provenance.as_ref().is_some_and(|provenance| {
+                text_contains_sensitive_literals(&provenance.source)
+                    || provenance
+                        .evidence
+                        .iter()
+                        .any(|evidence| text_contains_sensitive_literals(evidence))
+                    || provenance.probes.iter().any(|probe| {
+                        text_contains_sensitive_literals(&probe.dimension)
+                            || command_contains_sensitive_literals(&verb.binary, &probe.args)
+                    })
+            })
+    })
+}
+
 /// Normalize and validate a matcher proposed for a principal-bound access
 /// request. Model-authored rollback commands are never part of generated
 /// access authority, so remove that untrusted envelope before any structural
@@ -2241,9 +2332,9 @@ pub fn generated_access_verb_name(verb: &Verb) -> String {
 /// rollback semantics.
 pub fn normalize_generated_access_verb(mut verb: Verb) -> Result<Verb> {
     verb.revert = None;
-    if command_contains_sensitive_literals(&verb.binary, &verb.args) {
+    if generated_access_authority_contains_sensitive_literal(&verb) {
         bail!(
-            "generated access coverage contains a sensitive binary or literal argument and cannot be persisted"
+            "generated access coverage contains sensitive authority metadata or literal argv and cannot be persisted"
         );
     }
     validate_synthesized_safety(&verb)?;
@@ -4687,6 +4778,102 @@ verbs:
         binary.binary = sensitive.clone();
         let binary_error = normalize_generated_access_verb(binary).unwrap_err();
         assert!(!binary_error.to_string().contains(&sensitive));
+    }
+
+    #[test]
+    fn generated_access_normalization_rejects_sensitive_parameter_authority() {
+        let value = ["q", "7"].concat();
+
+        let mut default = synth_verb("fixturectl", None, false, "access-generated-fixture");
+        default.baseline = false;
+        default.args = vec!["inspect".to_string(), "{password}".to_string()];
+        default.params.insert(
+            "password".to_string(),
+            ParamSpec {
+                pattern: "^[a-z0-9]+$".to_string(),
+                required: false,
+                default: Some(value.clone()),
+                allow_dash: false,
+            },
+        );
+        let error = normalize_generated_access_verb(default).unwrap_err();
+        assert!(error.to_string().contains("sensitive authority metadata"));
+        assert!(!error.to_string().contains(&value));
+
+        let mut pattern = synth_verb("fixturectl", None, false, "access-generated-fixture");
+        pattern.baseline = false;
+        pattern.args = vec!["inspect".to_string(), "{target}".to_string()];
+        pattern.params.insert(
+            "target".to_string(),
+            ParamSpec {
+                pattern: format!("^--password={value}$"),
+                required: true,
+                default: None,
+                allow_dash: true,
+            },
+        );
+        let error = normalize_generated_access_verb(pattern).unwrap_err();
+        assert!(error.to_string().contains("sensitive authority metadata"));
+        assert!(!error.to_string().contains(&value));
+    }
+
+    #[test]
+    fn generated_access_normalization_rejects_sensitive_constraint_values() {
+        let value = ["q", "7"].concat();
+        let mut verb = synth_verb("fixturectl", None, false, "access-generated-fixture");
+        verb.baseline = false;
+        verb.args = vec!["inspect".to_string()];
+        verb.coverage.push(VerbCoverageCell {
+            name: "bounded".to_string(),
+            action: CoverageAction::Evaluate,
+            required_args: Vec::new(),
+            forbidden_args: Vec::new(),
+            min_args: None,
+            max_args: None,
+            options: vec![ValueConstraint {
+                options: vec!["--password".to_string()],
+                position: None,
+                values: vec![value.clone()],
+                allow_dash: false,
+                required: true,
+                allow_multiple: false,
+            }],
+            target: None,
+            inventory: None,
+            namespace: None,
+            fanout: None,
+            cwd: None,
+            environment: Vec::new(),
+            override_marker: None,
+            sticky: false,
+            provenance: None,
+        });
+        let error = normalize_generated_access_verb(verb).unwrap_err();
+        assert!(error.to_string().contains("sensitive authority metadata"));
+        assert!(!error.to_string().contains(&value));
+    }
+
+    #[test]
+    fn sensitive_generated_defaults_cannot_install_or_render() {
+        let value = ["q", "7"].concat();
+        let mut verb = synth_verb("fixturectl", None, false, "access-generated-fixture");
+        verb.baseline = false;
+        verb.args = vec!["inspect".to_string(), "{password}".to_string()];
+        verb.params.insert(
+            "password".to_string(),
+            ParamSpec {
+                pattern: "^[a-z0-9]+$".to_string(),
+                required: false,
+                default: Some(value.clone()),
+                allow_dash: false,
+            },
+        );
+        verb.name = generated_access_verb_name(&verb);
+        let name = verb.name.clone();
+        let mut catalog = VerbCatalog::empty();
+        let error = catalog.upsert_access_verb(verb).unwrap_err();
+        assert!(!error.to_string().contains(&value));
+        assert!(catalog.render(&name, &BTreeMap::new()).is_err());
     }
 
     #[test]

@@ -121,12 +121,23 @@ impl Evaluator {
     }
 
     /// Top-level LLM evaluation: walks the model-fallback chain and, per model,
-    /// runs the retry loop. The LLM NEVER sees the unredacted command; only the
-    /// caller's audit log does.
+    /// runs the retry loop. Structured command callers apply argv-aware
+    /// redaction before any provider request body is built.
     #[tracing::instrument(skip(self, command, prompt_append), fields(command_len = command.len()))]
+    #[cfg(test)]
     pub(super) async fn evaluate_llm(
         &self,
         command: &str,
+        prompt_append: Option<&str>,
+    ) -> EvalResult {
+        self.evaluate_llm_with_argv(command, None, prompt_append)
+            .await
+    }
+
+    pub(super) async fn evaluate_llm_with_argv(
+        &self,
+        command: &str,
+        structured_command: Option<(&str, &[String])>,
         prompt_append: Option<&str>,
     ) -> EvalResult {
         let api_key = match &self.llm_config.api_key {
@@ -139,10 +150,11 @@ impl Evaluator {
             }
         };
 
-        // Redact secret-shaped substrings BEFORE the command text enters any LLM
-        // payload. The audit log, on the other hand, sees the original - that
-        // happens in the caller's layer, not here.
-        let redacted_command = redact_for_llm(command);
+        // Preserve argv boundaries for binary-specific option classification
+        // before applying the free-text model-boundary redactor.
+        let structured_redacted = structured_command
+            .map(|(binary, args)| crate::redact::redact_command_line(binary, args));
+        let redacted_command = redact_for_llm(structured_redacted.as_deref().unwrap_or(command));
         if redacted_command != command {
             // debug, not info: with the broadened redaction surface this
             // fires on most commands carrying any high-entropy argument and
@@ -541,6 +553,45 @@ mod tests {
         }
     }
 
+    async fn run_mock_capture(
+        listener: tokio::net::TcpListener,
+        response_body: String,
+        captured: tokio::sync::oneshot::Sender<Vec<u8>>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 2048];
+        while let Ok(read) = stream.read(&mut chunk).await {
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+            if let Some(header_end) = find_subslice(&request, b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .split("\r\n")
+                    .find_map(|line| {
+                        line.strip_prefix("Content-Length: ")
+                            .or_else(|| line.strip_prefix("content-length: "))
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+        }
+        let _ = captured.send(request);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.shutdown().await;
+    }
+
     fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         haystack.windows(needle.len()).position(|w| w == needle)
     }
@@ -564,6 +615,42 @@ mod tests {
             }}"#,
             decision
         )
+    }
+
+    #[tokio::test]
+    async fn structured_argv_is_redacted_before_provider_payload_construction() {
+        for (binary, args, sensitive) in [
+            (
+                "curl",
+                vec!["-u".to_string(), ["q", "7"].concat()],
+                ["q", "7"].concat(),
+            ),
+            (
+                "mysqlsh.exe",
+                vec![format!("-p{}", ["r", "8"].concat())],
+                ["r", "8"].concat(),
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            let mock = tokio::spawn(run_mock_capture(
+                listener,
+                tool_call_body("APPROVE"),
+                sender,
+            ));
+            let evaluator = mock_server_evaluator(port, 0, vec![]).await;
+            let result = evaluator
+                .evaluate_scoped_argv(binary, &args, None, false, false, Some("fixture"))
+                .await;
+            assert!(result.is_allow());
+            let payload = receiver.await.unwrap();
+            assert!(!payload
+                .windows(sensitive.len())
+                .any(|part| part == sensitive.as_bytes()));
+            assert!(String::from_utf8_lossy(&payload).contains("[REDACTED]"));
+            mock.await.unwrap();
+        }
     }
 
     #[tokio::test]

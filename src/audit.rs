@@ -351,7 +351,7 @@ fn redact_secret_exposure(event: &AuditEvent) -> AuditEvent {
             .into_iter()
             .map(|(key, _)| (key, "[redacted]".to_string()))
             .collect();
-    } else if audit_kind_contains_gate_prose(event.kind) {
+    } else if audit_kind_contains_untrusted_prose(event.kind) {
         redacted.cwd = redacted
             .cwd
             .map(|value| crate::redact::redact_output_text(&value));
@@ -370,10 +370,12 @@ fn redact_secret_exposure(event: &AuditEvent) -> AuditEvent {
     redacted
 }
 
-fn audit_kind_contains_gate_prose(kind: AuditKind) -> bool {
+fn audit_kind_contains_untrusted_prose(kind: AuditKind) -> bool {
     matches!(
         kind,
-        AuditKind::Held
+        AuditKind::Allowed
+            | AuditKind::Denied
+            | AuditKind::Held
             | AuditKind::HoldOrphaned
             | AuditKind::Provisional
             | AuditKind::ProvisionalInterrupted
@@ -993,6 +995,22 @@ mod tests {
             line,
             "ALLOWED caller=uid=1000 session_fingerprint=none cmd=\"echo hi\" reason=\"static allow\""
         );
+    }
+
+    #[test]
+    fn ordinary_policy_events_sanitize_evaluator_prose() {
+        for kind in [AuditKind::Allowed, AuditKind::Denied] {
+            let value = ["sk-", &"Ab1".repeat(8)].concat();
+            let event = AuditEvent::new(kind).reason(format!("model rationale {value}"));
+            let rendered = event.render_line();
+            assert!(!rendered.contains(&value));
+
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("audit.jsonl");
+            AuditLog::open(&path).unwrap().append(&event).unwrap();
+            let durable = std::fs::read_to_string(path).unwrap();
+            assert!(!durable.contains(&value));
+        }
     }
 
     #[test]
