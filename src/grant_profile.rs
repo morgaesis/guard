@@ -8,7 +8,8 @@
 use anyhow::{bail, Context, Result};
 use guard::env::now_unix;
 use guard::gating::verb::{
-    CoverageAction, CoverageProbe, CoverageProvenance, ValueConstraint, Verb, VerbCoverageCell,
+    parse_normalized_generated_access_verb, CoverageAction, CoverageProbe, CoverageProvenance,
+    ValueConstraint, Verb, VerbCoverageCell,
 };
 use guard::gating::Reversibility;
 use guard::principal::PrincipalKey;
@@ -397,6 +398,80 @@ impl GrantRequest {
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>()
         ))
+    }
+
+    /// Decode durable generated-access proposals through the single canonical
+    /// proposal gate. This does not consult the live catalog.
+    pub fn validated_generated_access_proposals(&self) -> Result<Vec<Verb>> {
+        self.proposed_verbs
+            .iter()
+            .map(parse_normalized_generated_access_verb)
+            .collect()
+    }
+
+    /// Whether this row carries the access-specific projection introduced for
+    /// principal-owned access sessions. Legacy grant requests can also have an
+    /// authenticated requester, but do not carry any of these fields.
+    pub fn is_principal_access_request(&self) -> bool {
+        self.requester.is_some()
+            && (self.target.is_some()
+                || !self.request_key.is_empty()
+                || self.requested_uses.is_some()
+                || !self.authority_verbs.is_empty()
+                || !self.proposed_verbs.is_empty())
+    }
+
+    /// Validate the pure shape of a principal-bound access request. Catalog
+    /// existence and operator-authored verb properties are checked separately
+    /// by the server because they depend on live state.
+    pub fn validate_principal_access_shape(&self) -> Result<Vec<Verb>> {
+        if self.requester.is_none()
+            || self.target.as_deref().is_none_or(str::is_empty)
+            || self.request_key.is_empty()
+        {
+            bail!("request is not a canonical principal-bound access request");
+        }
+        if self.saved_grant.is_some()
+            || self.issued_saved_revision.is_some()
+            || !self.delta.override_markers.is_empty()
+            || !self.delta.secret_names.is_empty()
+            || self.delta.ttl_secs.is_some()
+            || self.delta.prompt_append.is_some()
+            || self.delta.evaluation_mode.is_some()
+        {
+            bail!("access request contains authority outside its displayed verb scope");
+        }
+        if self.authority_verbs.is_empty()
+            || self
+                .delta
+                .activated_verbs
+                .iter()
+                .any(|verb| !self.authority_verbs.contains(verb))
+        {
+            bail!("access request verb scope is incomplete or inconsistent");
+        }
+
+        let proposed = self.validated_generated_access_proposals()?;
+        let mut proposal_names = std::collections::BTreeSet::new();
+        for verb in &proposed {
+            if !proposal_names.insert(verb.name.clone()) {
+                bail!("access request contains duplicate proposed coverage");
+            }
+            if !self.authority_verbs.contains(&verb.name)
+                || !self.delta.activated_verbs.contains(&verb.name)
+            {
+                bail!("access request contains unreferenced proposed coverage");
+            }
+        }
+        if self.status == GrantRequestStatus::Pending {
+            let expected = self
+                .canonical_access_key()
+                .context("invalid access request convergence key")?;
+            if expected != self.request_key {
+                bail!("access request convergence key does not match its displayed scope");
+            }
+        }
+        Ok(proposed)
     }
 }
 

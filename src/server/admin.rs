@@ -1143,28 +1143,14 @@ async fn capabilities_for_request(
     server: &ServerContext,
     request: &GrantRequest,
 ) -> Vec<AccessCapability> {
-    let mut proposed = std::collections::BTreeMap::new();
-    for value in &request.proposed_verbs {
-        let Ok(verb) = serde_json::from_value::<Verb>(value.clone()) else {
-            tracing::warn!("invalid proposed access coverage; omitting request capabilities");
-            return Vec::new();
-        };
-        let Ok(normalized) = guard::gating::verb::normalize_generated_access_verb(verb) else {
-            tracing::warn!("unsafe proposed access coverage; omitting request capabilities");
-            return Vec::new();
-        };
-        let Ok(normalized_value) = serde_json::to_value(&normalized) else {
-            tracing::warn!(
-                "unserializable proposed access coverage; omitting request capabilities"
-            );
-            return Vec::new();
-        };
-        if normalized_value != *value {
-            tracing::warn!("non-canonical proposed access coverage; omitting request capabilities");
-            return Vec::new();
-        }
-        proposed.insert(normalized.name.clone(), normalized);
-    }
+    let Ok(proposed) = proposed_access_verbs(request) else {
+        tracing::warn!("invalid proposed access coverage; omitting request capabilities");
+        return Vec::new();
+    };
+    let proposed = proposed
+        .into_iter()
+        .map(|verb| (verb.name.clone(), verb))
+        .collect::<std::collections::BTreeMap<_, _>>();
     let catalog = server.state.verbs.read().await;
     request
         .authority_verbs
@@ -1808,7 +1794,7 @@ pub(super) async fn submit_access_request(
         }
     };
 
-    if requested_uses.is_some() {
+    if observed_argv.is_none() && requested_uses.is_some() {
         if let Some(existing) = server
             .state
             .grant_requests
@@ -1852,24 +1838,26 @@ pub(super) async fn submit_access_request(
             session_expiry = snapshot.expires_at;
         }
         let requests = server.state.grant_requests.read().await;
-        if let Some(existing) = requests
-            .values()
-            .find(|existing| {
-                existing
-                    .requester
-                    .as_ref()
-                    .is_some_and(|principal| principal.eq_ci(&requester))
-                    && existing.session_token == session_token.as_deref().unwrap_or_default()
-                    && normalize_access_intent(&existing.justification)
-                        == normalize_access_intent(&intent)
-                    && existing.requested_uses == requested_uses
-                    && existing.issued_session_revision == session_revision
-                    && existing.status == GrantRequestStatus::Pending
-            })
-            .cloned()
-        {
-            drop(requests);
-            return Ok(access_item_for_request(server, &existing, &audience).await);
+        if observed_argv.is_none() {
+            if let Some(existing) = requests
+                .values()
+                .find(|existing| {
+                    existing
+                        .requester
+                        .as_ref()
+                        .is_some_and(|principal| principal.eq_ci(&requester))
+                        && existing.session_token == session_token.as_deref().unwrap_or_default()
+                        && normalize_access_intent(&existing.justification)
+                            == normalize_access_intent(&intent)
+                        && existing.requested_uses == requested_uses
+                        && existing.issued_session_revision == session_revision
+                        && existing.status == GrantRequestStatus::Pending
+                })
+                .cloned()
+            {
+                drop(requests);
+                return Ok(access_item_for_request(server, &existing, &audience).await);
+            }
         }
         if requests.len() >= MAX_GRANT_REQUESTS {
             return Err("access request queue is full".to_string());
@@ -2079,30 +2067,15 @@ fn new_access_session(requester: PrincipalKey, label: String, expires_at: u64) -
 }
 
 fn proposed_access_verbs(request: &GrantRequest) -> Result<Vec<Verb>, String> {
-    request
-        .proposed_verbs
-        .iter()
-        .map(|value| {
-            let verb = serde_json::from_value::<Verb>(value.clone())
-                .map_err(|error| format!("invalid proposed access coverage: {error}"))?;
-            let normalized = guard::gating::verb::normalize_generated_access_verb(verb)
-                .map_err(|error| format!("invalid proposed access coverage: {error}"))?;
-            let normalized_value = serde_json::to_value(&normalized)
-                .map_err(|error| format!("invalid proposed access coverage: {error}"))?;
-            if normalized_value != *value {
-                return Err(
-                    "proposed access coverage is not normalized before persistence".to_string(),
-                );
-            }
-            if normalized.baseline || !normalized.name.starts_with("access-generated-") {
-                return Err(format!(
-                    "invalid generated access coverage name or baseline state: '{}'",
-                    normalized.name
-                ));
-            }
-            Ok(normalized)
-        })
-        .collect()
+    if request.is_principal_access_request() {
+        request
+            .validate_principal_access_shape()
+            .map_err(|error| error.to_string())
+    } else {
+        request
+            .validated_generated_access_proposals()
+            .map_err(|error| error.to_string())
+    }
 }
 
 async fn validate_access_verbs(
@@ -2111,21 +2084,6 @@ async fn validate_access_verbs(
     proposed: &[Verb],
 ) -> Result<(), String> {
     let catalog = server.state.verbs.read().await;
-    for verb in proposed {
-        let normalized = guard::gating::verb::normalize_generated_access_verb(verb.clone())
-            .map_err(|error| format!("access request contains unsafe proposed verb: {error}"))?;
-        if serde_json::to_value(&normalized).map_err(|error| error.to_string())?
-            != serde_json::to_value(verb).map_err(|error| error.to_string())?
-        {
-            return Err("access request contains non-canonical proposed coverage".to_string());
-        }
-        if normalized.baseline || !normalized.name.starts_with("access-generated-") {
-            return Err(format!(
-                "access request contains invalid generated coverage '{}': baseline or name policy violation",
-                normalized.name
-            ));
-        }
-    }
     for name in names {
         let proposal = proposed.iter().find(|verb| &verb.name == name);
         let verb = proposal
@@ -2136,18 +2094,6 @@ async fn validate_access_verbs(
                 "access request may not activate baseline verb: '{name}'"
             ));
         }
-        if proposal.is_some() && !verb.name.starts_with("access-generated-") {
-            return Err(format!(
-                "access request proposal '{}' is outside the generated-access namespace",
-                verb.name
-            ));
-        }
-    }
-    if proposed
-        .iter()
-        .any(|verb| !names.iter().any(|name| name == &verb.name))
-    {
-        return Err("access request contains unreferenced proposed coverage".to_string());
     }
     Ok(())
 }
@@ -2187,47 +2133,10 @@ async fn reload_sessions_after_registry_conflict(
 }
 
 fn validate_access_request_shape(request: &GrantRequest) -> Result<(), String> {
-    if request.requester.is_some() {
-        proposed_access_verbs(request)?;
-    }
-    if request.requester.is_none()
-        || request.target.as_deref().is_none_or(str::is_empty)
-        || request.request_key.is_empty()
-    {
-        return Err("request is not a canonical principal-bound access request".to_string());
-    }
-    if request.saved_grant.is_some()
-        || request.issued_saved_revision.is_some()
-        || !request.delta.override_markers.is_empty()
-        || !request.delta.secret_names.is_empty()
-        || request.delta.ttl_secs.is_some()
-        || request.delta.prompt_append.is_some()
-        || request.delta.evaluation_mode.is_some()
-    {
-        return Err(
-            "access request contains authority outside its displayed verb scope".to_string(),
-        );
-    }
-    if request.authority_verbs.is_empty()
-        || request
-            .delta
-            .activated_verbs
-            .iter()
-            .any(|verb| !request.authority_verbs.contains(verb))
-    {
-        return Err("access request verb scope is incomplete or inconsistent".to_string());
-    }
-    if request.status == GrantRequestStatus::Pending {
-        let expected = request
-            .canonical_access_key()
-            .map_err(|error| format!("invalid access request convergence key: {error}"))?;
-        if expected != request.request_key {
-            return Err(
-                "access request convergence key does not match its displayed scope".to_string(),
-            );
-        }
-    }
-    Ok(())
+    request
+        .validate_principal_access_shape()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 async fn approve_access_request(

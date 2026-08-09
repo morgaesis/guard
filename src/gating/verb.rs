@@ -15,6 +15,7 @@
 
 use super::coverage::reversibility_rank;
 use super::Reversibility;
+use crate::redact::redact_output_text;
 use anyhow::{bail, Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -1006,7 +1007,7 @@ impl VerbCatalog {
         Ok(())
     }
 
-    /// Install approved prose-generated access coverage without writing the
+    /// Install approved generated access coverage without writing the
     /// operator-authored catalog. The exact candidate remains durable in its
     /// approved access request and is restored from SQLite at startup.
     pub fn upsert_access_verb(&mut self, mut verb: Verb) -> Result<()> {
@@ -2218,8 +2219,43 @@ pub fn validate_synthesized_safety(verb: &Verb) -> Result<()> {
 /// rollback semantics.
 pub fn normalize_generated_access_verb(mut verb: Verb) -> Result<Verb> {
     verb.revert = None;
+    if redact_output_text(&verb.binary) != verb.binary
+        || verb
+            .args
+            .iter()
+            .any(|argument| redact_output_text(argument) != *argument)
+    {
+        bail!(
+            "generated access coverage contains a sensitive binary or literal argument and cannot be persisted"
+        );
+    }
     validate_synthesized_safety(&verb)?;
     Ok(verb)
+}
+
+/// Parse one durable generated-access proposal and prove that its serialized
+/// form already satisfies every normalization and namespace invariant. Durable
+/// state is rejected rather than rewritten because normalization can change
+/// authority.
+pub fn parse_normalized_generated_access_verb(value: &serde_json::Value) -> Result<Verb> {
+    let verb =
+        serde_json::from_value::<Verb>(value.clone()).context("decode proposed access coverage")?;
+    let normalized = normalize_generated_access_verb(verb)?;
+    if normalized.baseline {
+        bail!("generated access coverage must not be baseline");
+    }
+    if !normalized.name.starts_with("access-generated-") {
+        bail!(
+            "generated access verb '{}' must use the reserved 'access-generated-' prefix",
+            normalized.name
+        );
+    }
+    if serde_json::to_value(&normalized).context("encode normalized proposed access coverage")?
+        != *value
+    {
+        bail!("proposed access coverage is not in normalized form");
+    }
+    Ok(normalized)
 }
 
 /// One sentence of operator guidance for a terminal synthesis-gate rejection.
@@ -4583,6 +4619,22 @@ verbs:
         verb.baseline = false;
         verb.args = args_vec(&["apply", "-f", "{manifest}"]);
         assert!(normalize_generated_access_verb(verb).is_err());
+    }
+
+    #[test]
+    fn generated_access_normalization_rejects_sensitive_literals_without_echoing_them() {
+        let sensitive = ["sk-", &"Ab1".repeat(8)].concat();
+        let mut argument = synth_verb("fixturectl", None, false, "access-generated-fixture");
+        argument.baseline = false;
+        argument.args = vec![sensitive.clone()];
+        let argument_error = normalize_generated_access_verb(argument).unwrap_err();
+        assert!(!argument_error.to_string().contains(&sensitive));
+
+        let mut binary = synth_verb("fixturectl", None, false, "access-generated-fixture");
+        binary.baseline = false;
+        binary.binary = sensitive.clone();
+        let binary_error = normalize_generated_access_verb(binary).unwrap_err();
+        assert!(!binary_error.to_string().contains(&sensitive));
     }
 
     #[test]

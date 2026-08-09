@@ -8,7 +8,6 @@ use anyhow::{Context, Result};
 use guard::gating::approval::{Approval, ApprovalStatus};
 use guard::gating::provisional::{Provisional, ProvisionalStatus};
 use guard::gating::read_grant::ReadGrant;
-use guard::gating::verb::{normalize_generated_access_verb, Verb};
 use guard::redact::redact_output_text;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use std::collections::HashMap;
@@ -2476,23 +2475,12 @@ fn valid_provisional_transition(previous: &Provisional, next: &Provisional) -> R
 }
 
 fn validate_persisted_access_request(request: &GrantRequest) -> Result<()> {
-    if request.requester.is_none() {
+    if !request.is_principal_access_request() {
         return Ok(());
     }
-    for value in &request.proposed_verbs {
-        let verb = serde_json::from_value::<Verb>(value.clone())
-            .context("decode proposed access coverage")?;
-        let normalized =
-            normalize_generated_access_verb(verb).context("validate proposed access coverage")?;
-        if normalized.baseline || !normalized.name.starts_with("access-generated-") {
-            anyhow::bail!("proposed access coverage is outside the generated-access namespace");
-        }
-        let normalized_value = serde_json::to_value(normalized)
-            .context("encode normalized proposed access coverage")?;
-        if normalized_value != *value {
-            anyhow::bail!("proposed access coverage is not in normalized form");
-        }
-    }
+    request
+        .validate_principal_access_shape()
+        .context("validate principal-bound access request")?;
     Ok(())
 }
 
@@ -3144,6 +3132,7 @@ fn decode_exec_status(value: &str) -> rusqlite::Result<SessionExecStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use guard::gating::verb::Verb;
 
     #[cfg(unix)]
     use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
@@ -3184,6 +3173,42 @@ mod tests {
             result_stderr: None,
             notes: Vec::new(),
         }
+    }
+
+    fn generated_access_request() -> GrantRequest {
+        let verb = Verb {
+            name: "access-generated-fixture".to_string(),
+            description: "fixture coverage".to_string(),
+            binary: "fixturectl".to_string(),
+            args: vec!["status".to_string(), "resource/example".to_string()],
+            baseline: false,
+            coverage: Vec::new(),
+            credential_plan: None,
+            params: std::collections::BTreeMap::new(),
+            consequence: guard::gating::Reversibility::Irreversible,
+            revert: None,
+            trusted: false,
+            prompt_context: None,
+            source_prose: None,
+            evidence: None,
+            auto_promoted: false,
+            promotion_stamp: None,
+        };
+        let mut request = GrantRequest::new_access(
+            guard::principal::PrincipalKey::from_uid(1001),
+            None,
+            "agent:fixture".to_string(),
+            crate::grant_profile::GrantRequestDelta {
+                activated_verbs: vec![verb.name.clone()],
+                ..Default::default()
+            },
+            "request fixture coverage".to_string(),
+        )
+        .unwrap();
+        request.authority_verbs = vec![verb.name.clone()];
+        request.proposed_verbs = vec![serde_json::to_value(verb).unwrap()];
+        request.request_key = request.canonical_access_key().unwrap();
+        request
     }
 
     #[cfg(unix)]
@@ -3379,6 +3404,38 @@ mod tests {
         .unwrap();
         drop(conn);
         assert!(store.load_grant_requests().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn access_request_persistence_rejects_invalid_scope_and_convergence_key() {
+        let mut invalid_scope = generated_access_request();
+        invalid_scope.authority_verbs = vec!["access-generated-other".to_string()];
+        invalid_scope.request_key = invalid_scope.canonical_access_key().unwrap();
+
+        let mut invalid_key = generated_access_request();
+        invalid_key.request_key = "ar-invalid".to_string();
+
+        for request in [invalid_scope, invalid_key] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("state.db");
+            let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+            assert!(store.save_grant_request(request.clone()).await.is_err());
+
+            let conn = Connection::open(path).unwrap();
+            conn.execute(
+                "INSERT INTO grant_requests (handle, json, status, created_unix)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    request.handle,
+                    serde_json::to_string(&request).unwrap(),
+                    request.status.as_str(),
+                    encode_u64(request.created_unix).unwrap()
+                ],
+            )
+            .unwrap();
+            drop(conn);
+            assert!(store.load_grant_requests().await.is_err());
+        }
     }
 
     #[tokio::test]
