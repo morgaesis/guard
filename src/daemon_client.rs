@@ -506,22 +506,24 @@ fn parse_admin_response_line(response_line: &str, request_name: &str) -> Result<
         Ok(resp) => Ok(resp),
         Err(admin_err) => {
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(response_line) {
-                if let Some(result_name) = value.get("result").and_then(|v| v.as_str()) {
+                if value.get("result").and_then(|v| v.as_str()).is_some() {
                     return Ok(AdminResponse::Error {
                         message: format!(
-                            "guard daemon returned malformed admin response for '{}': result '{}' did not match the current schema ({admin_err}). Restart the daemon onto the current binary.",
-                            request_name, result_name
+                            "legacy_rejection: guard daemon returned an unsupported admin result for '{}'; use the CLI fallback or restart the daemon onto the current binary.",
+                            request_name
                         ),
                     });
                 }
             }
             if let Ok(exec_resp) = serde_json::from_str::<ExecuteResponse>(response_line) {
-                let message = if exec_resp.reason.contains("invalid request")
-                    && exec_resp.reason.contains("IncomingMessage")
+                let reason = exec_resp.reason.to_ascii_lowercase();
+                let message = if reason.contains("invalid request")
+                    || reason.contains("unknown request")
+                    || reason.contains("unsupported request")
                 {
                     format!(
-                        "guard daemon rejected admin RPC '{}'. The running daemon likely predates this client or needs restart onto the current binary.",
-                        request_name
+                        "legacy_rejection: guard daemon rejected admin RPC '{}'; use the CLI fallback or restart the daemon onto the current binary.",
+                        request_name,
                     )
                 } else {
                     exec_resp.reason
@@ -656,8 +658,8 @@ mod tests {
         match parse_admin_response_line(line, "secret_list").unwrap() {
             AdminResponse::Error { message } => {
                 assert!(message.contains("secret_list"));
-                assert!(message.contains("malformed admin response"));
-                assert!(message.contains("Restart the daemon"));
+                assert!(message.contains("legacy_rejection"));
+                assert!(message.contains("restart the daemon"));
             }
             other => panic!("expected admin error, got {:?}", other),
         }

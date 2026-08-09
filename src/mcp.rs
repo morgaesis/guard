@@ -51,6 +51,7 @@ const MAX_HTTP_BODY: usize = 1024 * 1024;
 const MAX_HTTP_SESSIONS: usize = 1024;
 const MAX_MCP_REQUEST_IDS: usize = 16 * 1024;
 const HTTP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const MCP_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 pub struct McpConfig {
@@ -71,6 +72,22 @@ impl McpConfig {
     pub fn validate(&self) -> Result<()> {
         if self.socket_path.is_none() && self.tcp_port.is_none() {
             bail!("no guard server configured for MCP (set a socket or TCP port)");
+        }
+
+        if self.socket_path.is_some() && self.tcp_port.is_some() {
+            bail!("configure exactly one MCP daemon endpoint (socket or TCP port)");
+        }
+
+        if self
+            .socket_path
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            bail!("MCP socket path cannot be empty");
+        }
+
+        if self.tcp_port == Some(0) {
+            bail!("MCP TCP port must be non-zero");
         }
 
         if self.tool_name.trim().is_empty() {
@@ -344,22 +361,22 @@ struct JsonRpcError {
 pub async fn serve(config: McpConfig) -> Result<()> {
     config.validate()?;
 
-    let expose_admin_tools = config.socket_path.is_some() && config.tcp_port.is_none();
-    // Resuming a hold executes an operator-approved snapshot. The daemon
-    // authenticates this MCP process's peer credentials, not the HTTP caller's,
-    // so over HTTP any holder of the bearer could run a snapshot belonging to a
-    // different logical agent. The execute verb is therefore stdio-only.
-    let expose_execute_admin_tools = expose_admin_tools && config.http_addr.is_none();
     let executor = Arc::new(ClientExecutor {
         socket_path: config.socket_path.clone(),
         tcp_port: config.tcp_port,
         auth_token: config.auth_token.clone(),
         session_token: config.session_token.clone(),
     });
+    let surface = probe_mcp_surface(&executor, &config).await;
     let server = McpServer::new(executor.clone(), executor, config.tool_name)
         .with_caller_token(config.session_token)
-        .with_admin_tools(expose_admin_tools)
-        .with_execute_admin_tools(expose_execute_admin_tools);
+        .with_endpoint_available(surface.endpoint_available)
+        .with_admin_tools(surface.admin_tools)
+        .with_execute_admin_tools(surface.execute_admin_tools)
+        .with_approval_consequence_tools(surface.approval_consequence_tools)
+        .with_http_transport(config.http_addr.is_some())
+        .with_tcp_backend(config.tcp_port.is_some())
+        .with_diagnostics(surface.diagnostics);
 
     match config.http_addr {
         Some(addr) => {
@@ -370,6 +387,147 @@ pub async fn serve(config: McpConfig) -> Result<()> {
             serve_http(server, addr, token).await
         }
         None => serve_stdio(server).await,
+    }
+}
+
+const APPROVAL_CONSEQUENCES_CAPABILITY: &str = "approval-consequences-v1";
+
+#[derive(Clone, Copy)]
+struct McpSurface {
+    endpoint_available: bool,
+    admin_tools: bool,
+    execute_admin_tools: bool,
+    approval_consequence_tools: bool,
+    diagnostics: McpDiagnostics,
+}
+
+#[derive(Clone, Copy)]
+struct McpDiagnostics {
+    capability_membership: &'static str,
+    capability_state: &'static str,
+    endpoint_state: &'static str,
+    endpoint_reason: &'static str,
+    admin_state: &'static str,
+    admin_reason: &'static str,
+}
+
+async fn probe_mcp_surface(executor: &ClientExecutor, config: &McpConfig) -> McpSurface {
+    let ping = tokio::time::timeout(
+        MCP_PROBE_TIMEOUT,
+        executor.send_admin(server::AdminRequest::Ping),
+    )
+    .await;
+    let endpoint_available = ping.is_ok();
+    let (capability, diagnostics) = match ping {
+        Ok(Ok(server::AdminResponse::Ping { capabilities, .. })) => {
+            let capability = capabilities
+                .iter()
+                .any(|value| value == APPROVAL_CONSEQUENCES_CAPABILITY);
+            (
+                capability,
+                McpDiagnostics {
+                    capability_membership: if capability { "member" } else { "absent" },
+                    capability_state: if capability {
+                        "capable"
+                    } else {
+                        "capability_absent"
+                    },
+                    endpoint_state: "reachable",
+                    endpoint_reason: "endpoint_reachable",
+                    admin_state: "unsupported_tcp",
+                    admin_reason: "tcp_mcp_admin_unsupported",
+                },
+            )
+        }
+        Ok(Ok(_)) => (
+            false,
+            McpDiagnostics {
+                capability_membership: "unknown",
+                capability_state: "ping_malformed",
+                endpoint_state: "reachable",
+                endpoint_reason: "endpoint_reachable",
+                admin_state: "unsupported_tcp",
+                admin_reason: "tcp_mcp_admin_unsupported",
+            },
+        ),
+        Ok(Err(_)) => (
+            false,
+            McpDiagnostics {
+                capability_membership: "unknown",
+                capability_state: "ping_unavailable",
+                endpoint_state: "reachable",
+                endpoint_reason: "endpoint_reachable",
+                admin_state: "unsupported_tcp",
+                admin_reason: "tcp_mcp_admin_unsupported",
+            },
+        ),
+        Err(_) => (
+            false,
+            McpDiagnostics {
+                capability_membership: "unknown",
+                capability_state: "not_observed",
+                endpoint_state: "unavailable",
+                endpoint_reason: "sole_endpoint_unavailable",
+                admin_state: "endpoint_unavailable",
+                admin_reason: "endpoint_unavailable",
+            },
+        ),
+    };
+
+    if config.tcp_port.is_some() {
+        return McpSurface {
+            endpoint_available,
+            admin_tools: false,
+            execute_admin_tools: false,
+            approval_consequence_tools: false,
+            diagnostics,
+        };
+    }
+
+    let admin_probe = tokio::time::timeout(
+        MCP_PROBE_TIMEOUT,
+        executor.send_admin(server::AdminRequest::AccessList),
+    )
+    .await;
+    let admin_tools = matches!(
+        admin_probe,
+        Ok(Ok(server::AdminResponse::AccessItems { .. }))
+    );
+
+    let diagnostics = McpDiagnostics {
+        capability_membership: diagnostics.capability_membership,
+        capability_state: diagnostics.capability_state,
+        endpoint_state: if admin_tools {
+            "reachable"
+        } else {
+            "reachable"
+        },
+        endpoint_reason: "endpoint_reachable",
+        admin_state: if admin_tools {
+            "reachable"
+        } else {
+            "endpoint_unavailable"
+        },
+        admin_reason: if admin_tools {
+            "unix_admin_handshake"
+        } else {
+            "unix_admin_probe_failed"
+        },
+    };
+
+    McpSurface {
+        // A failed Unix self-scoped probe produces an empty surface even when
+        // the preceding Ping reached the socket. Keep the endpoint and admin
+        // failure indistinguishable to callers, as required by the MCP
+        // contract.
+        endpoint_available: admin_tools,
+        admin_tools,
+        // Resuming a hold executes an operator-approved snapshot. The daemon
+        // authenticates this MCP process's peer credentials, not the HTTP
+        // caller's bearer, so this remains stdio-only.
+        execute_admin_tools: admin_tools && config.http_addr.is_none() && capability,
+        approval_consequence_tools: admin_tools && capability,
+        diagnostics,
     }
 }
 
@@ -838,6 +996,11 @@ struct McpServer<E: GuardExecutor, A: GuardAdmin> {
     tool_name: String,
     admin_tools: bool,
     execute_admin_tools: bool,
+    approval_consequence_tools: bool,
+    endpoint_available: bool,
+    http_transport: bool,
+    tcp_backend: bool,
+    diagnostics: McpDiagnostics,
     initialize_seen: bool,
     seen_request_ids: HashSet<String>,
     caller_token: Option<String>,
@@ -851,6 +1014,18 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
             tool_name,
             admin_tools: true,
             execute_admin_tools: true,
+            approval_consequence_tools: true,
+            endpoint_available: true,
+            http_transport: false,
+            tcp_backend: false,
+            diagnostics: McpDiagnostics {
+                capability_membership: "member",
+                capability_state: "capable",
+                endpoint_state: "reachable",
+                endpoint_reason: "endpoint_reachable",
+                admin_state: "reachable",
+                admin_reason: "unix_admin_handshake",
+            },
             initialize_seen: false,
             seen_request_ids: HashSet::new(),
             caller_token: None,
@@ -872,6 +1047,31 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
         self
     }
 
+    fn with_approval_consequence_tools(mut self, enabled: bool) -> Self {
+        self.approval_consequence_tools = enabled;
+        self
+    }
+
+    fn with_endpoint_available(mut self, available: bool) -> Self {
+        self.endpoint_available = available;
+        self
+    }
+
+    fn with_http_transport(mut self, http_transport: bool) -> Self {
+        self.http_transport = http_transport;
+        self
+    }
+
+    fn with_tcp_backend(mut self, tcp_backend: bool) -> Self {
+        self.tcp_backend = tcp_backend;
+        self
+    }
+
+    fn with_diagnostics(mut self, diagnostics: McpDiagnostics) -> Self {
+        self.diagnostics = diagnostics;
+        self
+    }
+
     fn fresh_connection(&self) -> Self {
         Self {
             executor: self.executor.clone(),
@@ -879,6 +1079,11 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
             tool_name: self.tool_name.clone(),
             admin_tools: self.admin_tools,
             execute_admin_tools: self.execute_admin_tools,
+            approval_consequence_tools: self.approval_consequence_tools,
+            endpoint_available: self.endpoint_available,
+            http_transport: self.http_transport,
+            tcp_backend: self.tcp_backend,
+            diagnostics: self.diagnostics,
             initialize_seen: false,
             seen_request_ids: HashSet::new(),
             caller_token: self.caller_token.clone(),
@@ -972,7 +1177,7 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                         ));
                     }
                 };
-                if tool_call.name == self.tool_name {
+                if self.endpoint_available && tool_call.name == self.tool_name {
                     let result = self.call_tool(tool_call.arguments).await;
                     jsonrpc_result_response(id, result)
                 } else if self.admin_tools && tool_call.name == VERB_LIST_TOOL_NAME {
@@ -990,25 +1195,28 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                 } else if self.admin_tools && tool_call.name == ACCESS_SHOW_TOOL_NAME {
                     let result = self.call_access_show(tool_call.arguments).await;
                     jsonrpc_result_response(id, result)
-                } else if self.admin_tools && tool_call.name == ACCESS_STATUS_TOOL_NAME {
+                } else if self.admin_tools
+                    && !self.http_transport
+                    && tool_call.name == ACCESS_STATUS_TOOL_NAME
+                {
                     let result = self.call_session_status(tool_call.arguments).await;
                     jsonrpc_result_response(id, result)
-                } else if self.admin_tools && tool_call.name == APPROVAL_SHOW_TOOL_NAME {
+                } else if self.admin_tools
+                    && self.approval_consequence_tools
+                    && !self.http_transport
+                    && tool_call.name == APPROVAL_SHOW_TOOL_NAME
+                {
                     let result = self.call_approval_show(tool_call.arguments).await;
                     jsonrpc_result_response(id, result)
                 } else if self.execute_admin_tools
                     && self.admin_tools
+                    && self.approval_consequence_tools
                     && tool_call.name == APPROVAL_RESUME_TOOL_NAME
                 {
                     let result = self.call_approval_resume(tool_call.arguments).await;
                     jsonrpc_result_response(id, result)
                 } else {
-                    jsonrpc_error_response(
-                        id,
-                        -32601,
-                        format!("unknown tool '{}'", tool_call.name),
-                        None,
-                    )
+                    self.unavailable_tool_response(id, &tool_call.name)
                 }
             }
             _ => jsonrpc_error_response(id, -32601, format!("method not found: {method}"), None),
@@ -1021,6 +1229,76 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
         if method == "notifications/initialized" && !self.initialize_seen {
             tracing::warn!("received initialized notification before initialize request");
         }
+    }
+
+    fn unavailable_tool_response(&self, id: Value, tool_name: &str) -> Value {
+        let (diagnostic, fallback) = if !self.endpoint_available {
+            let diagnostic = if self.diagnostics.admin_reason == "unix_admin_probe_failed" {
+                "unix_admin_probe_failed"
+            } else {
+                "endpoint_unavailable"
+            };
+            (
+                diagnostic,
+                json!({
+                    "mode": "cli_only",
+                    "limitations": ["no MCP tools"]
+                }),
+            )
+        } else if self.tcp_backend && !self.admin_tools && tool_name != self.tool_name {
+            (
+                self.diagnostics.admin_reason,
+                json!({
+                    "mode": "cli_only",
+                    "command": "guard approval show <handle>",
+                    "limitations": ["no MCP status tool", "no MCP transcript", "no MCP wait", "no MCP resume"]
+                }),
+            )
+        } else if self.http_transport
+            && matches!(
+                tool_name,
+                ACCESS_STATUS_TOOL_NAME | APPROVAL_SHOW_TOOL_NAME | APPROVAL_RESUME_TOOL_NAME
+            )
+        {
+            (
+                "tool_not_available_for_transport",
+                json!({
+                    "mode": "cli_only",
+                    "limitations": ["no MCP status tool", "no MCP transcript", "no MCP resume"]
+                }),
+            )
+        } else if matches!(
+            tool_name,
+            APPROVAL_SHOW_TOOL_NAME | APPROVAL_RESUME_TOOL_NAME
+        ) && !self.approval_consequence_tools
+        {
+            (
+                self.diagnostics.capability_state,
+                json!({
+                    "mode": "cli_only",
+                    "command": "guard approval show <handle>",
+                    "limitations": ["no MCP wait", "no MCP resume"]
+                }),
+            )
+        } else {
+            (
+                "tool_not_available_for_transport",
+                json!({
+                    "mode": "cli_only",
+                    "limitations": ["tool is not listed on this MCP surface"]
+                }),
+            )
+        };
+        jsonrpc_error_response(
+            id,
+            -32601,
+            "requested MCP tool is unavailable".to_string(),
+            Some(json!({
+                "code": "feature_unavailable",
+                "diagnostic": diagnostic,
+                "fallback": fallback,
+            })),
+        )
     }
 
     fn initialize_result(&self, params: &Value) -> Value {
@@ -1051,6 +1329,9 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
     }
 
     fn list_tools_result(&self) -> Value {
+        if !self.endpoint_available {
+            return json!({ "tools": [] });
+        }
         let mut result = json!({
             "tools": [
                 {
@@ -1348,8 +1629,19 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
         tools.push(approval_resume_tool());
         if !self.admin_tools {
             tools.truncate(1);
-        } else if !self.execute_admin_tools {
-            tools.retain(|tool| tool["name"] != APPROVAL_RESUME_TOOL_NAME);
+        } else {
+            if !self.approval_consequence_tools {
+                tools.retain(|tool| {
+                    tool["name"] != APPROVAL_SHOW_TOOL_NAME
+                        && tool["name"] != APPROVAL_RESUME_TOOL_NAME
+                });
+            }
+            if !self.execute_admin_tools || self.http_transport {
+                tools.retain(|tool| tool["name"] != APPROVAL_RESUME_TOOL_NAME);
+            }
+            if self.http_transport {
+                tools.retain(|tool| tool["name"] != ACCESS_STATUS_TOOL_NAME);
+            }
         }
         result
     }
@@ -1514,7 +1806,7 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
         let request = match args.wait {
             Some(timeout_secs) => server::AdminRequest::ApprovalWait {
                 handle: args.reference,
-                timeout_secs: Some(timeout_secs),
+                timeout_secs,
             },
             None => server::AdminRequest::ApprovalShow {
                 handle: args.reference,
@@ -1732,10 +2024,7 @@ fn render_access_text(items: &[server::AccessItem]) -> String {
     items
         .iter()
         .map(|item| {
-            // A hold has no use budget, so the segment is omitted rather than
-            // carrying a value that governs nothing.
             let uses = match item.use_policy.as_str() {
-                "none" => String::new(),
                 "bounded" => format!(
                     " uses={}",
                     item.remaining_uses
@@ -1744,9 +2033,16 @@ fn render_access_text(items: &[server::AccessItem]) -> String {
                 ),
                 other => format!(" uses={other}"),
             };
+            let consequence = if item.consequence.is_empty() {
+                if item.reference.starts_with("gr-") { "grant" } else { "arm" }
+            } else {
+                item.consequence.as_str()
+            };
             let mut line = format!(
-                "{} requester={} target={} scope={} expiry={}{} state={} next={}",
+                "{} kind={} consequence={} requester={} target={} scope={} expiry={}{} state={} next={}",
                 item.reference,
+                item.kind,
+                consequence,
                 item.requester,
                 item.target,
                 if item.effective_scope.is_empty() {

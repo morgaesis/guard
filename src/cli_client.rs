@@ -629,29 +629,9 @@ fn render_approval(item: &server::ApprovalSummary, include_transcript: bool) {
     }
 }
 
-/// First daemon release that answers `AdminRequest::ApprovalWait`. An older
-/// daemon cannot deserialize the variant at all, so the client refuses before
-/// sending and names the polling alternative.
-const APPROVAL_WAIT_MIN_DAEMON_VERSION: &str = "0.8.0";
-
-fn parse_semver(version: &str) -> Option<(u64, u64, u64)> {
-    let core = version
-        .split(['-', '+'])
-        .next()
-        .unwrap_or_default()
-        .to_string();
-    let mut parts = core.split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    let patch = parts.next().unwrap_or("0").parse().ok()?;
-    Some((major, minor, patch))
-}
-
-/// Refuse `--wait` against a daemon that cannot answer it. A new request
-/// variant is not a defaultable field: an older daemon fails to deserialize the
-/// whole envelope and reports a generic protocol error, so the client probes
-/// the version first and says what to do instead. An unparseable version is
-/// treated as new enough; the send then reports its own failure.
+/// Refuse consequence waits when the daemon does not advertise the exact
+/// capability token. Older daemons may still serve ordinary access reads; the
+/// caller gets an explicit polling fallback and this command sends no wait RPC.
 async fn ensure_approval_wait_supported(
     client: &daemon_client::Client,
     source: EndpointSource,
@@ -661,20 +641,15 @@ async fn ensure_approval_wait_supported(
         .send_admin(server::AdminRequest::Ping)
         .await
         .map_err(|error| describe_connect_failure(error, client, source))?;
-    let server::AdminResponse::Ping { version, .. } = response else {
-        return Ok(());
-    };
-    let (Some(daemon), Some(required)) = (
-        parse_semver(&version),
-        parse_semver(APPROVAL_WAIT_MIN_DAEMON_VERSION),
-    ) else {
-        return Ok(());
-    };
-    if daemon >= required {
+    if matches!(
+        response,
+        server::AdminResponse::Ping { capabilities, .. }
+            if capabilities.iter().any(|capability| capability == "approval-consequences-v1")
+    ) {
         return Ok(());
     }
     eprintln!(
-        "--wait requires guard daemon >= {APPROVAL_WAIT_MIN_DAEMON_VERSION}; this daemon is {version}. Poll with 'guard approval show {handle}' instead."
+        "--wait is unavailable on this daemon; poll with 'guard approval show {handle}' instead."
     );
     std::process::exit(EXIT_GUARD_ERROR);
 }
@@ -692,12 +667,12 @@ async fn wait_for_approval(
     match client
         .send_admin(server::AdminRequest::ApprovalWait {
             handle: handle.to_string(),
-            timeout_secs: Some(wait_secs),
+            timeout_secs: wait_secs,
         })
         .await
         .map_err(|error| describe_connect_failure(error, client, source))?
     {
-        server::AdminResponse::ApprovalShow { item } => Ok(item),
+        server::AdminResponse::ApprovalWait { wait } => Ok(wait.item),
         server::AdminResponse::Error { message } => Err(anyhow::anyhow!(message)),
         other => Err(anyhow::anyhow!("unexpected admin response: {other:?}")),
     }
@@ -1660,6 +1635,7 @@ pub(crate) async fn handle_access(command: AccessCommands) -> Result<()> {
                 server::AdminRequest::AccessApprove {
                     handles: requests,
                     uses,
+                    wait_secs: None,
                 },
                 json,
             )
@@ -1750,8 +1726,14 @@ pub(crate) async fn handle_access(command: AccessCommands) -> Result<()> {
             }
             for item in items {
                 println!(
-                    "{} requester={} target={} scope={} expiry={} uses={} state={} next={}",
+                    "{} kind={} consequence={} requester={} target={} scope={} expiry={} uses={} state={} next={}",
                     item.reference,
+                    item.kind,
+                    if item.consequence.is_empty() {
+                        if item.reference.starts_with("gr-") { "grant" } else { "arm" }
+                    } else {
+                        item.consequence.as_str()
+                    },
                     item.requester,
                     item.target,
                     if item.effective_scope.is_empty() {
@@ -1777,7 +1759,7 @@ pub(crate) async fn handle_access(command: AccessCommands) -> Result<()> {
         server::AdminResponse::AccessItem { item } => {
             println!("{}", access_item_human(&item, raw_matcher));
         }
-        server::AdminResponse::AccessDecisions { items } => {
+        server::AdminResponse::AccessDecisions { items, .. } => {
             print_access_decision_lines(&items);
         }
         server::AdminResponse::SessionStatus {
@@ -1899,7 +1881,7 @@ fn any_decision_failed(items: &[server::AccessDecisionResult]) -> bool {
 fn access_decision_failed(response: &server::AdminResponse) -> bool {
     matches!(
         response,
-        server::AdminResponse::AccessDecisions { items } if any_decision_failed(items)
+        server::AdminResponse::AccessDecisions { items, .. } if any_decision_failed(items)
     )
 }
 
@@ -1933,9 +1915,19 @@ fn access_item_human(item: &server::AccessItem, raw: bool) -> String {
         format!("scope: {}", card_text(&scope)),
         format!("expiry: {expiry}"),
     ];
-    if let Some(uses) = pending_use_display(item) {
-        lines.push(format!("uses: {uses}"));
-    }
+    lines.push(format!("uses: {}", pending_use_display(item)));
+    lines.push(format!(
+        "consequence: {}",
+        card_text(if item.consequence.is_empty() {
+            if item.reference.starts_with("gr-") {
+                "grant"
+            } else {
+                "arm"
+            }
+        } else {
+            item.consequence.as_str()
+        })
+    ));
     if let Some(intent) = &item.intent {
         lines.push(format!("intent: {}", card_text(intent)));
     }
@@ -1979,31 +1971,28 @@ fn use_budget_field(use_policy: &str, remaining_uses: Option<u64>) -> String {
     }
 }
 
-/// The human-facing use budget, or `None` when the reference has none. A hold
-/// replays one immutable snapshot, so any budget printed against it names a
-/// number that governs nothing; renderers omit the line instead.
-fn use_budget_display(use_policy: &str, remaining_uses: Option<u64>) -> Option<String> {
-    (use_policy != "none").then(|| use_budget_field(use_policy, remaining_uses))
+fn use_budget_display(use_policy: &str, remaining_uses: Option<u64>) -> String {
+    use_budget_field(use_policy, remaining_uses)
 }
 /// Use budget for a detail view. `unselected` names the state of the record but
 /// answers none of the question an operator is actually asking, so a pending
 /// item shows the budget a bare `guard access approve` would apply and how to
 /// choose another one.
-fn pending_use_display(item: &server::AccessItem) -> Option<String> {
+fn pending_use_display(item: &server::AccessItem) -> String {
     if item.use_policy != "unselected" {
         return use_budget_display(&item.use_policy, item.remaining_uses);
     }
     match (item.default_use_policy.as_deref(), item.default_uses) {
         (Some("bounded"), Some(1)) => {
-            Some("1 (default; the only budget this request accepts)".to_string())
+            "1 (default; the only budget this request accepts)".to_string()
         }
         (Some("bounded"), Some(uses)) => {
-            Some(format!("{uses} (default; --once or --uses N to change)"))
+            format!("{uses} (default; --once or --uses N to change)")
         }
         (Some("unlimited"), _) => {
-            Some("unlimited (default; --once or --uses N to bound the approval)".to_string())
+            "unlimited (default; --once or --uses N to bound the approval)".to_string()
         }
-        _ => Some("not selected until approval".to_string()),
+        _ => "not selected until approval".to_string(),
     }
 }
 
@@ -2422,9 +2411,19 @@ fn access_item_card(item: &server::AccessItem, colors: bool) -> Vec<String> {
         ));
     }
     lines.push(format!("  scope:     {}", card_text(&scope)));
-    if let Some(uses) = pending_use_display(item) {
-        lines.push(format!("  uses:      {uses}"));
-    }
+    lines.push(format!("  uses:      {}", pending_use_display(item)));
+    lines.push(format!(
+        "  consequence: {}",
+        card_text(if item.consequence.is_empty() {
+            if item.reference.starts_with("gr-") {
+                "grant"
+            } else {
+                "arm"
+            }
+        } else {
+            item.consequence.as_str()
+        })
+    ));
     lines.push(format!("  expiry:    {expiry}"));
     if let Some(reason) = &item.decided_reason {
         lines.push(format!("  reason:    {}", card_text(reason)));
@@ -2554,6 +2553,7 @@ async fn handle_access_approve_interactive(
                 Some(server::AdminRequest::AccessApprove {
                     handles: vec![reference.clone()],
                     uses: effective_uses,
+                    wait_secs: None,
                 })
             }
             AccessReviewChoice::Deny => Some(server::AdminRequest::AccessDeny {
@@ -2576,7 +2576,7 @@ async fn handle_access_approve_interactive(
             .await
             .map_err(|error| describe_connect_failure(error, &client, source))?
         {
-            server::AdminResponse::AccessDecisions { items } => {
+            server::AdminResponse::AccessDecisions { items, .. } => {
                 if any_decision_failed(&items) {
                     any_failed = true;
                     skipped.extend(
@@ -2676,8 +2676,8 @@ async fn handle_access_approve_dry_run(
     Ok(())
 }
 
-/// Approve one reference without the review, then block until the daemon
-/// reports what became of it.
+/// Approve one reference and consume the one-RPC wait result. The response
+/// contains both the decision and the owned post-decision observation.
 async fn handle_access_approve_wait(
     requests: Vec<String>,
     uses: Option<u64>,
@@ -2693,52 +2693,51 @@ async fn handle_access_approve_wait(
     let Some(reference) = requests.into_iter().next() else {
         anyhow::bail!("no access request named");
     };
-    // Fetch first: the class decides whether waiting means anything, and the
-    // refusal must read the same as the daemon's own.
-    let item = match client
-        .send_admin(server::AdminRequest::AccessShow {
-            reference: reference.clone(),
-        })
-        .await
-        .map_err(|error| describe_connect_failure(error, &client, source))?
-    {
-        server::AdminResponse::AccessItem { item } => item,
-        server::AdminResponse::Error { message } if json => exit_access_json_error(message),
-        server::AdminResponse::Error { message } => {
-            eprintln!("{reference}: {message}");
-            std::process::exit(EXIT_GUARD_ACCESS_DECISION_FAILED);
-        }
-        other => anyhow::bail!("unexpected access response: {other:?}"),
-    };
-    if consequence_class(&item.consequence, &item.reference) == ConsequenceClass::Grant {
-        eprintln!("{}", grant_class_wait_refusal(&item));
-        std::process::exit(EXIT_GUARD_INVALID_USAGE);
-    }
+    ensure_approval_wait_supported(&client, source, &reference).await?;
     let decision = client
         .send_admin(server::AdminRequest::AccessApprove {
             handles: vec![reference.clone()],
-            uses,
+            uses: uses.or(Some(1)),
+            wait_secs: Some(wait_secs),
         })
         .await
         .map_err(|error| describe_connect_failure(error, &client, source))?;
-    let decision_failed = access_decision_failed(&decision);
+    let server::AdminResponse::AccessDecisions {
+        wait: Some(waited), ..
+    } = &decision
+    else {
+        if let server::AdminResponse::Error { message } = &decision {
+            if json {
+                exit_access_json_error(message.clone());
+            }
+            anyhow::bail!(message.clone());
+        }
+        anyhow::bail!("guard daemon returned no approval wait result");
+    };
     if json {
-        match access_json_response(&decision) {
-            Ok(document) => print_json(&document)?,
-            Err(message) => exit_access_json_error(message),
-        }
+        print_json(&serde_json::json!({
+            "schema_version": JSON_SCHEMA_VERSION,
+            "type": "access_approval_wait",
+            "response": decision,
+        }))?;
     } else {
-        match &decision {
-            server::AdminResponse::AccessDecisions { items } => print_access_decision_lines(items),
-            server::AdminResponse::Error { message } => anyhow::bail!(message.clone()),
-            other => anyhow::bail!("unexpected access response: {other:?}"),
+        if let server::AdminResponse::AccessDecisions { items, .. } = &decision {
+            print_access_decision_lines(items);
         }
+        render_approval(&waited.item, true);
+        eprintln!("wait outcome: {}", waited.outcome);
     }
-    if decision_failed {
-        std::process::exit(EXIT_GUARD_ACCESS_DECISION_FAILED);
+    let exit = match waited.outcome.as_str() {
+        "approved" => 0,
+        "denied" | "expired" => EXIT_GUARD_DENIED,
+        "exec_failed" => EXIT_GUARD_ERROR,
+        "armed" | "timed_out" => EXIT_GUARD_HELD,
+        _ => EXIT_GUARD_ERROR,
+    };
+    if exit != 0 {
+        std::process::exit(exit);
     }
-    let waited = wait_for_approval(&client, source, &reference, wait_secs).await?;
-    report_wait_outcome(&waited, json)
+    Ok(())
 }
 
 /// The client's own statement that a grant cannot be waited on, quoting the
@@ -3153,6 +3152,7 @@ pub(crate) async fn handle_status(socket: Option<String>, json: bool) -> Result<
             uptime_secs,
             mode,
             dry_run,
+            ..
         }) => (version, uptime_secs, mode, dry_run),
         Ok(server::AdminResponse::Error { message }) => {
             eprintln!("Server: ping refused - {}", message);
@@ -3709,6 +3709,7 @@ mod tests {
                     message: "not found".to_string(),
                 },
             ],
+            wait: None,
         };
         let document = access_json_response(&response).unwrap();
         assert_eq!(document["schema_version"], JSON_SCHEMA_VERSION);
@@ -3730,6 +3731,7 @@ mod tests {
                 consequence: String::new(),
                 message: "not found".to_string(),
             }],
+            wait: None,
         };
         assert!(access_decision_failed(&all_failed));
 
@@ -3744,6 +3746,7 @@ mod tests {
                 consequence: server::CONSEQUENCE_GRANT.to_string(),
                 message: "approved".to_string(),
             }],
+            wait: None,
         };
         assert!(!access_decision_failed(&all_succeeded));
     }

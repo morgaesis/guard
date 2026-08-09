@@ -286,6 +286,8 @@ enum MainArgs {
     #[clap(hide = true)]
     Resume {
         handle: String,
+        #[arg(long, require_equals = true, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "300", value_parser = server::parse_approval_wait_secs)]
+        wait: Option<u64>,
         #[arg(long)]
         socket: Option<String>,
         /// Emit the persisted execution result as one JSON document.
@@ -317,7 +319,7 @@ enum ApprovalCommands {
         handle: String,
         /// Block for SECONDS until the hold is armed or decided, then report.
         /// A bare flag waits 300 seconds. This is a read: it never executes.
-        #[arg(long, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "300", value_parser = clap::value_parser!(u64).range(1..))]
+        #[arg(long, require_equals = true, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "300", value_parser = server::parse_approval_wait_secs)]
         wait: Option<u64>,
         #[arg(long)]
         socket: Option<String>,
@@ -329,7 +331,7 @@ enum ApprovalCommands {
         handle: String,
         /// Block for SECONDS until the hold is armed, then run it. A bare flag
         /// waits 300 seconds.
-        #[arg(long, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "300", value_parser = clap::value_parser!(u64).range(1..))]
+        #[arg(long, require_equals = true, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "300", value_parser = server::parse_approval_wait_secs)]
         wait: Option<u64>,
         #[arg(long)]
         socket: Option<String>,
@@ -406,11 +408,11 @@ enum AccessCommands {
         uses: Option<u64>,
         /// Block for SECONDS after approving a held command, until it is armed
         /// or decided. A bare flag waits 300 seconds. Single request only.
-        #[arg(long, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "300", value_parser = clap::value_parser!(u64).range(1..))]
+        #[arg(long, conflicts_with = "dry_run", require_equals = true, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "300", value_parser = server::parse_approval_wait_secs)]
         wait: Option<u64>,
         /// Print what approving each request would do, then exit without
         /// deciding anything.
-        #[arg(long = "dry-run", action = ArgAction::SetTrue)]
+        #[arg(long = "dry-run", conflicts_with_all = ["wait", "yes"], action = ArgAction::SetTrue)]
         dry_run: bool,
         #[arg(long)]
         socket: Option<String>,
@@ -653,31 +655,18 @@ fn parse_env_bool(value: &str) -> bool {
     )
 }
 
-/// Usage rules clap's grammar cannot express. `--wait` and `--dry-run` each
-/// report one reference's consequence, and a batch has no single outcome to
-/// report, so both take exactly one request.
+/// Usage rules clap's grammar cannot express. A wait has one outcome, so it
+/// accepts exactly one reference; dry-run is intentionally batch-capable.
 fn access_usage_error(command: &AccessCommands) -> Option<String> {
-    let AccessCommands::Approve {
-        requests,
-        wait,
-        dry_run,
-        ..
-    } = command
-    else {
+    let AccessCommands::Approve { requests, wait, .. } = command else {
         return None;
     };
-    if requests.len() <= 1 {
+    if wait.is_none() || requests.len() == 1 {
         return None;
     }
-    let flag = if wait.is_some() {
-        "--wait"
-    } else if *dry_run {
-        "--dry-run"
-    } else {
-        return None;
-    };
     Some(format!(
-        "{flag} takes a single request; a batch cannot report one outcome."
+        "--wait accepts exactly one request reference; received {}",
+        requests.len()
     ))
 }
 
@@ -1493,11 +1482,12 @@ async fn run_main() -> Result<()> {
         }
         Ok(MainArgs::Resume {
             handle,
+            wait,
             socket,
             json,
         }) => {
             warn_resume_alias_deprecated();
-            handle_resume(socket, handle, None, json).await
+            handle_resume(socket, handle, wait, json).await
         }
         Ok(MainArgs::Approval(subcommand)) => handle_approval(subcommand).await,
         Ok(MainArgs::Verb(subcommand)) => handle_verb(subcommand).await,
