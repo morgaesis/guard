@@ -876,13 +876,27 @@ mod semantic_intent_tests {
 async fn reduce_access_intent(
     server: &ServerContext,
     intent: &str,
+    observed_argv: Option<(&str, &[String])>,
 ) -> Result<(Vec<Verb>, Vec<Verb>), String> {
     let existing = {
         let mut catalog = server.state.verbs.write().await;
         if let Err(error) = catalog.reload_if_stale() {
             tracing::warn!("verb catalog reload failed, using previous: {error}");
         }
-        catalog.list()
+        catalog
+            .list()
+            .into_iter()
+            .map(|verb| {
+                if !verb.name.starts_with("access-generated-") {
+                    return Ok(verb);
+                }
+                let mut proposal = verb;
+                proposal.trusted = false;
+                guard::gating::verb::normalize_generated_access_verb(proposal).map_err(|error| {
+                    format!("stored generated access coverage was rejected: {error}")
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?
     };
     let clauses = access_intent_clauses(intent);
     let named_by_clause = clauses
@@ -930,12 +944,12 @@ async fn reduce_access_intent(
                     .to_string(),
             );
         }
-        return Ok(access_reduction(
+        return access_reduction(
             existing
                 .into_iter()
                 .filter(|verb| selected.contains(&verb.name))
                 .collect(),
-        ));
+        );
     }
     let matched = existing
         .iter()
@@ -943,35 +957,52 @@ async fn reduce_access_intent(
         .cloned()
         .collect::<Vec<_>>();
     if !matched.is_empty() {
-        return Ok(access_reduction(matched));
+        return access_reduction(matched);
     }
     if let Some(best) = unique_semantic_intent_match(intent, &existing) {
-        return Ok(access_reduction(vec![best.clone()]));
+        return access_reduction(vec![best.clone()]);
     }
 
-    let mut candidate = server
-        .state
-        .evaluator
-        .synthesize_verb(intent, None, &[])
-        .await
-        .map_err(|error| {
-            format!("access intent could not be reduced to typed coverage: {error}")
-        })?;
+    let mut candidate = if let Some((binary, args)) = observed_argv {
+        guard::gating::verb::Verb {
+            name: "access-generated-pending".to_string(),
+            description: String::new(),
+            binary: binary.to_string(),
+            args: args.to_vec(),
+            baseline: false,
+            coverage: Vec::new(),
+            credential_plan: None,
+            params: std::collections::BTreeMap::new(),
+            consequence: guard::gating::Reversibility::Irreversible,
+            revert: None,
+            trusted: false,
+            prompt_context: None,
+            source_prose: None,
+            evidence: None,
+            auto_promoted: false,
+            promotion_stamp: None,
+        }
+    } else {
+        server
+            .state
+            .evaluator
+            .synthesize_verb(intent, None, &[])
+            .await
+            .map_err(|error| {
+                format!("access intent could not be reduced to typed coverage: {error}")
+            })?
+    };
     candidate.source_prose = Some(intent.to_string());
     candidate.baseline = false;
     candidate.trusted = false;
-    // A model-authored rollback is evidence, not a verified rollback envelope.
-    // Removing it preserves the consequence gate, which holds recoverable work
-    // until an operator-authored verb supplies a reviewed revert.
-    candidate.revert = None;
-    guard::gating::verb::validate_synthesized_safety(&candidate)
+    candidate = guard::gating::verb::normalize_generated_access_verb(candidate)
         .map_err(|error| format!("synthesized access coverage was rejected: {error}"))?;
 
     if let Some(reused) = existing
         .iter()
         .find(|verb| access_verb_shape(verb) == access_verb_shape(&candidate))
     {
-        return Ok(access_reduction(vec![reused.clone()]));
+        return access_reduction(vec![reused.clone()]);
     }
 
     let catalog = server.state.verbs.read().await;
@@ -980,7 +1011,7 @@ async fn reduce_access_intent(
         .into_iter()
         .find(|verb| access_verb_shape(verb) == access_verb_shape(&candidate))
     {
-        return Ok(access_reduction(vec![reused]));
+        return access_reduction(vec![reused]);
     }
     let digest = access_matcher_digest(&access_verb_shape(&candidate));
     candidate.name = format!("access-generated-{}", &digest[..16]);
@@ -1001,21 +1032,22 @@ async fn reduce_access_intent(
 /// catalog, is never operator-authored, and loses its trust on restart, so an
 /// intent that resolves to one re-proposes it however the reduction found it:
 /// by explicit name, by matching prose, or by an identical matcher shape.
-fn access_reduction(matched: Vec<Verb>) -> (Vec<Verb>, Vec<Verb>) {
+fn access_reduction(matched: Vec<Verb>) -> Result<(Vec<Verb>, Vec<Verb>), String> {
     let mut proposed = Vec::new();
-    let reduced = matched
-        .into_iter()
-        .map(|verb| {
-            if !verb.name.starts_with("access-generated-") {
-                return verb;
-            }
-            let mut proposal = verb;
-            proposal.trusted = false;
-            proposed.push(proposal.clone());
-            proposal
-        })
-        .collect();
-    (reduced, proposed)
+    let mut reduced = Vec::with_capacity(matched.len());
+    for verb in matched {
+        if !verb.name.starts_with("access-generated-") {
+            reduced.push(verb);
+            continue;
+        }
+        let mut proposal = verb;
+        proposal.trusted = false;
+        let proposal = guard::gating::verb::normalize_generated_access_verb(proposal)
+            .map_err(|error| format!("stored generated access coverage was rejected: {error}"))?;
+        proposed.push(proposal.clone());
+        reduced.push(proposal);
+    }
+    Ok((reduced, proposed))
 }
 
 /// Bounds on a grant description the daemon renders. A model can answer with a
@@ -1111,12 +1143,28 @@ async fn capabilities_for_request(
     server: &ServerContext,
     request: &GrantRequest,
 ) -> Vec<AccessCapability> {
-    let proposed = request
-        .proposed_verbs
-        .iter()
-        .filter_map(|value| serde_json::from_value::<Verb>(value.clone()).ok())
-        .map(|verb| (verb.name.clone(), verb))
-        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut proposed = std::collections::BTreeMap::new();
+    for value in &request.proposed_verbs {
+        let Ok(verb) = serde_json::from_value::<Verb>(value.clone()) else {
+            tracing::warn!("invalid proposed access coverage; omitting request capabilities");
+            return Vec::new();
+        };
+        let Ok(normalized) = guard::gating::verb::normalize_generated_access_verb(verb) else {
+            tracing::warn!("unsafe proposed access coverage; omitting request capabilities");
+            return Vec::new();
+        };
+        let Ok(normalized_value) = serde_json::to_value(&normalized) else {
+            tracing::warn!(
+                "unserializable proposed access coverage; omitting request capabilities"
+            );
+            return Vec::new();
+        };
+        if normalized_value != *value {
+            tracing::warn!("non-canonical proposed access coverage; omitting request capabilities");
+            return Vec::new();
+        }
+        proposed.insert(normalized.name.clone(), normalized);
+    }
     let catalog = server.state.verbs.read().await;
     request
         .authority_verbs
@@ -1696,6 +1744,7 @@ pub(super) async fn submit_access_request(
     explicit_target: Option<&str>,
     intent: &str,
     requested_uses: Option<u64>,
+    observed_argv: Option<(&str, &[String])>,
 ) -> Result<AccessItem, String> {
     let audience = AccessAudience::from_caller(server, caller);
     let intent = redact_output_text(&validate_access_intent(intent)?);
@@ -1840,7 +1889,7 @@ pub(super) async fn submit_access_request(
         }
     }
 
-    let (reduced, proposed_verbs) = reduce_access_intent(server, &intent).await?;
+    let (reduced, proposed_verbs) = reduce_access_intent(server, &intent, observed_argv).await?;
     let _transition = server.state.grant_request_transition_gate.lock().await;
     if let Some(token) = session_token.as_deref() {
         let sessions = server.state.sessions.read().await;
@@ -2034,8 +2083,24 @@ fn proposed_access_verbs(request: &GrantRequest) -> Result<Vec<Verb>, String> {
         .proposed_verbs
         .iter()
         .map(|value| {
-            serde_json::from_value::<Verb>(value.clone())
-                .map_err(|error| format!("invalid proposed access coverage: {error}"))
+            let verb = serde_json::from_value::<Verb>(value.clone())
+                .map_err(|error| format!("invalid proposed access coverage: {error}"))?;
+            let normalized = guard::gating::verb::normalize_generated_access_verb(verb)
+                .map_err(|error| format!("invalid proposed access coverage: {error}"))?;
+            let normalized_value = serde_json::to_value(&normalized)
+                .map_err(|error| format!("invalid proposed access coverage: {error}"))?;
+            if normalized_value != *value {
+                return Err(
+                    "proposed access coverage is not normalized before persistence".to_string(),
+                );
+            }
+            if normalized.baseline || !normalized.name.starts_with("access-generated-") {
+                return Err(format!(
+                    "invalid generated access coverage name or baseline state: '{}'",
+                    normalized.name
+                ));
+            }
+            Ok(normalized)
         })
         .collect()
 }
@@ -2046,6 +2111,21 @@ async fn validate_access_verbs(
     proposed: &[Verb],
 ) -> Result<(), String> {
     let catalog = server.state.verbs.read().await;
+    for verb in proposed {
+        let normalized = guard::gating::verb::normalize_generated_access_verb(verb.clone())
+            .map_err(|error| format!("access request contains unsafe proposed verb: {error}"))?;
+        if serde_json::to_value(&normalized).map_err(|error| error.to_string())?
+            != serde_json::to_value(verb).map_err(|error| error.to_string())?
+        {
+            return Err("access request contains non-canonical proposed coverage".to_string());
+        }
+        if normalized.baseline || !normalized.name.starts_with("access-generated-") {
+            return Err(format!(
+                "access request contains invalid generated coverage '{}': baseline or name policy violation",
+                normalized.name
+            ));
+        }
+    }
     for name in names {
         let proposal = proposed.iter().find(|verb| &verb.name == name);
         let verb = proposal
@@ -2056,10 +2136,11 @@ async fn validate_access_verbs(
                 "access request may not activate baseline verb: '{name}'"
             ));
         }
-        if proposal.is_some() {
-            guard::gating::verb::validate_synthesized_safety(verb).map_err(|error| {
-                format!("access request references unsafe verb '{name}': {error}")
-            })?;
+        if proposal.is_some() && !verb.name.starts_with("access-generated-") {
+            return Err(format!(
+                "access request proposal '{}' is outside the generated-access namespace",
+                verb.name
+            ));
         }
     }
     if proposed
@@ -2106,6 +2187,9 @@ async fn reload_sessions_after_registry_conflict(
 }
 
 fn validate_access_request_shape(request: &GrantRequest) -> Result<(), String> {
+    if request.requester.is_some() {
+        proposed_access_verbs(request)?;
+    }
     if request.requester.is_none()
         || request.target.as_deref().is_none_or(str::is_empty)
         || request.request_key.is_empty()
@@ -5225,7 +5309,7 @@ async fn dispatch_admin_request(
             }
         }
         AdminRequest::AccessRequest { intent } => {
-            match submit_access_request(server, caller, None, &intent, None).await {
+            match submit_access_request(server, caller, None, &intent, None, None).await {
                 Ok(item) => AdminResponse::AccessItem { item },
                 Err(message) => AdminResponse::Error { message },
             }
@@ -5403,34 +5487,37 @@ async fn dispatch_admin_request(
             target,
             intent,
             uses,
-        } => match submit_access_request(server, caller, Some(&target), &intent, uses).await {
-            Ok(item) if item.kind == "request" => AdminResponse::AccessDecisions {
-                items: vec![
-                    approve_access_request(
-                        server,
-                        &item.reference,
-                        uses,
-                        &AccessAudience::from_caller(server, caller),
-                    )
-                    .await,
-                ],
-                wait: None,
-            },
-            Ok(item) => AdminResponse::AccessDecisions {
-                items: vec![AccessDecisionResult {
-                    request: item.reference,
-                    success: true,
-                    state: item.state,
-                    target: Some(item.target),
-                    remaining_uses: item.remaining_uses,
-                    use_policy: item.use_policy,
-                    message: "equivalent authority is already active; no change made".to_string(),
-                    consequence: String::new(),
-                }],
-                wait: None,
-            },
-            Err(message) => AdminResponse::Error { message },
-        },
+        } => {
+            match submit_access_request(server, caller, Some(&target), &intent, uses, None).await {
+                Ok(item) if item.kind == "request" => AdminResponse::AccessDecisions {
+                    items: vec![
+                        approve_access_request(
+                            server,
+                            &item.reference,
+                            uses,
+                            &AccessAudience::from_caller(server, caller),
+                        )
+                        .await,
+                    ],
+                    wait: None,
+                },
+                Ok(item) => AdminResponse::AccessDecisions {
+                    items: vec![AccessDecisionResult {
+                        request: item.reference,
+                        success: true,
+                        state: item.state,
+                        target: Some(item.target),
+                        remaining_uses: item.remaining_uses,
+                        use_policy: item.use_policy,
+                        message: "equivalent authority is already active; no change made"
+                            .to_string(),
+                        consequence: String::new(),
+                    }],
+                    wait: None,
+                },
+                Err(message) => AdminResponse::Error { message },
+            }
+        }
         AdminRequest::AccessList => Box::pin(list_access_items(server, caller)).await,
         AdminRequest::AccessShow { reference } => {
             Box::pin(show_access_item(server, caller, &reference)).await

@@ -1010,7 +1010,7 @@ impl VerbCatalog {
     /// operator-authored catalog. The exact candidate remains durable in its
     /// approved access request and is restored from SQLite at startup.
     pub fn upsert_access_verb(&mut self, mut verb: Verb) -> Result<()> {
-        validate_synthesized_safety(&verb)?;
+        verb = normalize_generated_access_verb(verb)?;
         if verb.baseline {
             bail!("generated access coverage must not be baseline");
         }
@@ -1032,7 +1032,6 @@ impl VerbCatalog {
             self.wrapped_operator_consequence(&verb)
                 .unwrap_or(Reversibility::Irreversible)
         };
-        verb.revert = None;
         verb.trusted = true;
         if let Some(existing) = self.verbs.get(&verb.name) {
             if serde_json::to_value(existing)? == serde_json::to_value(&verb)? {
@@ -2209,6 +2208,18 @@ pub fn validate_synthesized_safety(verb: &Verb) -> Result<()> {
         bail!("a synthesized verb may not mint override markers");
     }
     Ok(())
+}
+
+/// Normalize and validate a matcher proposed for a principal-bound access
+/// request. Model-authored rollback commands are never part of generated
+/// access authority, so remove that untrusted envelope before any structural
+/// validation, canonicalization, persistence, or installation. Ordinary
+/// operator-authored verbs continue to use `validate_verb` and retain their
+/// rollback semantics.
+pub fn normalize_generated_access_verb(mut verb: Verb) -> Result<Verb> {
+    verb.revert = None;
+    validate_synthesized_safety(&verb)?;
+    Ok(verb)
 }
 
 /// One sentence of operator guidance for a terminal synthesis-gate rejection.
@@ -4543,6 +4554,69 @@ verbs:
     revert: { binary: systemctl, args: ["disable", "--{scope}", "{unit}"] }
 "#;
         assert!(VerbCatalog::from_yaml(yaml).is_ok());
+    }
+
+    #[test]
+    fn generated_access_normalization_rejects_rollback_only_parameters() {
+        let mut verb = synth_verb("kubectl", None, false, "access-generated-fixture");
+        verb.baseline = false;
+        verb.args = args_vec(&["annotate", "pod/example"]);
+        verb.params.insert(
+            "overwrite".to_string(),
+            ParamSpec {
+                pattern: "^(true|false)$".to_string(),
+                required: false,
+                default: Some("true".to_string()),
+                allow_dash: false,
+            },
+        );
+        verb.revert = Some(VerbCommand {
+            binary: "kubectl".to_string(),
+            args: args_vec(&["annotate", "pod/example", "--overwrite={overwrite}"]),
+        });
+        assert!(normalize_generated_access_verb(verb).is_err());
+    }
+
+    #[test]
+    fn generated_access_normalization_rejects_unknown_forward_placeholders() {
+        let mut verb = synth_verb("kubectl", None, false, "access-generated-fixture");
+        verb.baseline = false;
+        verb.args = args_vec(&["apply", "-f", "{manifest}"]);
+        assert!(normalize_generated_access_verb(verb).is_err());
+    }
+
+    #[test]
+    fn generated_access_normalization_preserves_argv_elements_exactly() {
+        let mut verb = synth_verb("ansible", None, false, "access-generated-fixture");
+        verb.baseline = false;
+        verb.consequence = Reversibility::Irreversible;
+        verb.args = vec![
+            "host".to_string(),
+            "-m".to_string(),
+            "shell".to_string(),
+            "-a".to_string(),
+            "echo one \"two\" \\ three, UTF-8 π".to_string(),
+        ];
+        let normalized = normalize_generated_access_verb(verb).unwrap();
+        let mut catalog = VerbCatalog::empty();
+        catalog.upsert_access_verb(normalized).unwrap();
+        let original = vec![
+            "host".to_string(),
+            "-m".to_string(),
+            "shell".to_string(),
+            "-a".to_string(),
+            "echo one \"two\" \\ three, UTF-8 π".to_string(),
+        ];
+        assert_eq!(catalog.match_command_all("ansible", &original).len(), 1);
+        assert!(catalog
+            .match_command_all(
+                "ansible",
+                &original
+                    .iter()
+                    .flat_map(|arg| arg.split_whitespace().map(str::to_string))
+                    .collect::<Vec<_>>(),
+            )
+            .is_empty());
     }
 
     #[test]

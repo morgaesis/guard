@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use guard::gating::approval::{Approval, ApprovalStatus};
 use guard::gating::provisional::{Provisional, ProvisionalStatus};
 use guard::gating::read_grant::ReadGrant;
+use guard::gating::verb::{normalize_generated_access_verb, Verb};
 use guard::redact::redact_output_text;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use std::collections::HashMap;
@@ -1087,6 +1088,9 @@ impl SessionStore {
                 let request = serde_json::from_str::<GrantRequest>(&json).with_context(|| {
                     format!("decode durable grant request {handle} with status {status}")
                 })?;
+                validate_persisted_access_request(&request).with_context(|| {
+                    format!("validate durable access coverage for request {handle}")
+                })?;
                 if request.handle != handle
                     || request.status.as_str() != status
                     || request.created_unix != decode_u64(created_unix)?
@@ -1311,6 +1315,7 @@ impl SessionStore {
         {
             anyhow::bail!("simulated session-store write failure");
         }
+        validate_persisted_access_request(&request)?;
         let path = self.path.clone();
         let request = sanitize_grant_request(request);
         tokio::task::spawn_blocking(move || {
@@ -1341,6 +1346,8 @@ impl SessionStore {
         {
             anyhow::bail!("simulated session-store write failure");
         }
+        validate_persisted_access_request(&pending)?;
+        validate_persisted_access_request(&terminal)?;
         let path = self.path.clone();
         let pending = sanitize_grant_request(pending);
         let terminal = sanitize_grant_request(terminal);
@@ -1388,6 +1395,7 @@ impl SessionStore {
             .context("durable pending grant request is missing")?;
         let durable: GrantRequest =
             serde_json::from_str(&durable_json).context("decode durable pending grant request")?;
+        validate_persisted_access_request(&durable)?;
         if durable != *pending {
             anyhow::bail!("durable grant request already has a terminal outcome");
         }
@@ -1418,8 +1426,13 @@ impl SessionStore {
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?;
-            json.map(|json| serde_json::from_str(&json).context("decode grant request"))
-                .transpose()
+            json.map(|json| {
+                let request =
+                    serde_json::from_str::<GrantRequest>(&json).context("decode grant request")?;
+                validate_persisted_access_request(&request)?;
+                Ok(request)
+            })
+            .transpose()
         })
         .await
         .context("load grant request task failed")?
@@ -1448,6 +1461,12 @@ impl SessionStore {
             .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
             anyhow::bail!("simulated session-store write failure");
+        }
+        validate_persisted_access_request(&pending)?;
+        validate_persisted_access_request(&approved)?;
+        for (previous, next) in &rebased_pending {
+            validate_persisted_access_request(previous)?;
+            validate_persisted_access_request(next)?;
         }
         let pending = sanitize_grant_request(pending);
         let approved = sanitize_grant_request(approved);
@@ -1526,6 +1545,7 @@ impl SessionStore {
             .context("durable pending grant request is missing")?;
         let durable: GrantRequest =
             serde_json::from_str(&durable_json).context("decode durable pending grant request")?;
+        validate_persisted_access_request(&durable)?;
         if durable != *pending {
             anyhow::bail!("durable grant request changed after approval began");
         }
@@ -1621,6 +1641,10 @@ impl SessionStore {
         {
             anyhow::bail!("simulated session-store write failure");
         }
+        for (previous, next) in &withdrawals {
+            validate_persisted_access_request(previous)?;
+            validate_persisted_access_request(next)?;
+        }
         let withdrawals = withdrawals
             .into_iter()
             .map(|(previous, next)| {
@@ -1673,6 +1697,7 @@ impl SessionStore {
                     .context("durable pending access request is missing")?;
                 let durable: GrantRequest = serde_json::from_str(&durable_json)
                     .context("decode durable pending access request")?;
+                validate_persisted_access_request(&durable)?;
                 if durable != *pending {
                     anyhow::bail!("durable access request changed before revoke");
                 }
@@ -1726,6 +1751,9 @@ impl SessionStore {
                 let (handle, status, created_unix, json) = row?;
                 let request = serde_json::from_str::<GrantRequest>(&json).with_context(|| {
                     format!("decode durable grant request {handle} with status {status}")
+                })?;
+                validate_persisted_access_request(&request).with_context(|| {
+                    format!("validate durable access coverage for request {handle}")
                 })?;
                 let created_unix = decode_u64(created_unix)?;
                 if request.handle != handle
@@ -2445,6 +2473,27 @@ fn valid_provisional_transition(previous: &Provisional, next: &Provisional) -> R
         return serialized_eq(previous, next);
     }
     Ok(true)
+}
+
+fn validate_persisted_access_request(request: &GrantRequest) -> Result<()> {
+    if request.requester.is_none() {
+        return Ok(());
+    }
+    for value in &request.proposed_verbs {
+        let verb = serde_json::from_value::<Verb>(value.clone())
+            .context("decode proposed access coverage")?;
+        let normalized =
+            normalize_generated_access_verb(verb).context("validate proposed access coverage")?;
+        if normalized.baseline || !normalized.name.starts_with("access-generated-") {
+            anyhow::bail!("proposed access coverage is outside the generated-access namespace");
+        }
+        let normalized_value = serde_json::to_value(normalized)
+            .context("encode normalized proposed access coverage")?;
+        if normalized_value != *value {
+            anyhow::bail!("proposed access coverage is not in normalized form");
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn sanitize_grant_request(mut request: GrantRequest) -> GrantRequest {
@@ -3258,6 +3307,78 @@ mod tests {
         assert_eq!(trace_columns, 1);
         assert_eq!(mode(&parent), 0o700);
         assert_eq!(mode(&path), 0o600);
+    }
+
+    #[tokio::test]
+    async fn access_request_persistence_rejects_noncanonical_generated_matchers() {
+        let mut verb = Verb {
+            name: "access-generated-fixture".to_string(),
+            description: "fixture coverage".to_string(),
+            binary: "kubectl".to_string(),
+            args: vec!["annotate".to_string(), "pod/example".to_string()],
+            baseline: false,
+            coverage: Vec::new(),
+            credential_plan: None,
+            params: std::collections::BTreeMap::new(),
+            consequence: guard::gating::Reversibility::Irreversible,
+            revert: None,
+            trusted: false,
+            prompt_context: None,
+            source_prose: None,
+            evidence: None,
+            auto_promoted: false,
+            promotion_stamp: None,
+        };
+        verb.params.insert(
+            "overwrite".to_string(),
+            guard::gating::verb::ParamSpec {
+                pattern: "^(true|false)$".to_string(),
+                required: false,
+                default: Some("true".to_string()),
+                allow_dash: false,
+            },
+        );
+        verb.revert = Some(guard::gating::verb::VerbCommand {
+            binary: "kubectl".to_string(),
+            args: vec![
+                "annotate".to_string(),
+                "--overwrite={overwrite}".to_string(),
+            ],
+        });
+        let mut request = crate::grant_profile::GrantRequest::new_access(
+            guard::principal::PrincipalKey::from_uid(1001),
+            None,
+            "agent:fixture".to_string(),
+            crate::grant_profile::GrantRequestDelta {
+                activated_verbs: vec![verb.name.clone()],
+                ..Default::default()
+            },
+            "request fixture coverage".to_string(),
+        )
+        .unwrap();
+        request.authority_verbs = vec![verb.name.clone()];
+        request.proposed_verbs = vec![serde_json::to_value(&verb).unwrap()];
+        request.request_key = request.canonical_access_key().unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+        assert!(store.save_grant_request(request.clone()).await.is_err());
+
+        let conn = Connection::open(path).unwrap();
+        conn.execute(
+            "INSERT INTO grant_requests (handle, json, status, created_unix)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                request.handle,
+                serde_json::to_string(&request).unwrap(),
+                request.status.as_str(),
+                encode_u64(request.created_unix).unwrap()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(store.load_grant_requests().await.is_err());
     }
 
     #[tokio::test]

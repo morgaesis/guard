@@ -2207,27 +2207,89 @@ async fn sessionless_novel_denial_returns_exact_typed_request_guidance() {
     cfg.config.daemon_principal = PrincipalKey::from_uid(777);
     cfg.state.verbs = Arc::new(RwLock::new(VerbCatalog::empty()));
     let worker = CallerIdentity::Unix { uid: 1001 };
+    let daemon = CallerIdentity::UnixAdmin { uid: 777 };
     let mut request = request_with_session(
         "novel-fixture",
-        vec!["inspect".to_string()],
+        vec![
+            "--extra".to_string(),
+            "value one".to_string(),
+            "--extra".to_string(),
+            "quoted \"value\" \\ π".to_string(),
+        ],
         "unused".to_string(),
     );
     request.session_token = None;
 
-    let response = execute_command(request, &cfg, &worker)
+    let response = execute_command(request.clone(), &cfg, &worker)
         .await
         .into_response();
     assert!(!response.allowed);
-    assert!(response.handle.is_none());
+    let handle = response
+        .handle
+        .as_deref()
+        .expect("novel denial preserves its authoritative argv in a typed request");
+    let proposed = cfg.state.grant_requests.read().await[handle]
+        .proposed_verbs
+        .clone();
+    let proposed = proposed
+        .first()
+        .and_then(|value| value.get("args"))
+        .expect("typed request stores generated argv");
+    assert_eq!(
+        proposed,
+        &serde_json::json!(["--extra", "value one", "--extra", "quoted \"value\" \\ π"]),
+        "generated access coverage must preserve argv element boundaries"
+    );
     let guidance = response
         .verb_guidance
         .as_deref()
         .expect("novel denial explains how to request typed access");
     assert!(
-        guidance.contains("guard access request 'novel-fixture inspect'"),
+        guidance.contains(&format!("guard access approve {handle}")),
         "{guidance}"
     );
-    assert!(guidance.contains("no durable access request was created"));
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
+        &cfg,
+        &daemon,
+        AdminRequest::AccessApprove {
+            handles: vec![handle.to_string()],
+            uses: None,
+            wait_secs: None,
+        },
+    )
+    .await
+    else {
+        panic!("expected typed access approval");
+    };
+    assert!(
+        items[0].success,
+        "typed access approval failed: {:?}",
+        items[0]
+    );
+    let original = request.args.clone();
+    assert_eq!(
+        cfg.state
+            .verbs
+            .read()
+            .await
+            .match_command_all("novel-fixture", &original)
+            .len(),
+        1,
+        "approved generated access must select the exact argv"
+    );
+    let split = original
+        .iter()
+        .flat_map(|arg| arg.split_whitespace().map(str::to_string))
+        .collect::<Vec<_>>();
+    assert!(
+        cfg.state
+            .verbs
+            .read()
+            .await
+            .match_command_all("novel-fixture", &split)
+            .is_empty(),
+        "whitespace-split argv must not select exact generated access"
+    );
 }
 
 #[tokio::test]

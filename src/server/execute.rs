@@ -764,6 +764,9 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
                     .find(|matched| !matched.rendered.baseline)
                     .map(|matched| matched.rendered.name)
             };
+            let observed_argv = matching_intent
+                .is_none()
+                .then_some((request.binary.as_str(), request.args.as_slice()));
             let intent = matching_intent.unwrap_or_else(|| durable_command.clone());
             match super::admin::submit_access_request(
                 phase.server,
@@ -771,6 +774,7 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
                 None,
                 &intent,
                 None,
+                observed_argv,
             )
             .await
             {
