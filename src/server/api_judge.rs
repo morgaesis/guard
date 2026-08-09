@@ -324,7 +324,13 @@ async fn lookup_api_coverage(
     summary: &ApiRequestSummary,
 ) -> ApiCoverageVerdict {
     let request_stamp = request_stamp(stamp, summary);
-    let guard = store.read().await;
+    let mut guard = store.write().await;
+    if guard.refresh_for_decision().is_err() {
+        return ApiCoverageVerdict::Deny {
+            reason: "API coverage authority is unavailable".to_string(),
+            operator: false,
+        };
+    }
     if let Some(hit) = guard.learned_deny(summary, &request_stamp) {
         return ApiCoverageVerdict::Deny {
             reason: hit.reason,
@@ -425,7 +431,12 @@ impl ApiJudge for DaemonApiJudge {
         let request_stamp = self.request_stamp(summary);
         if let Some(store) = &self.api_promotion {
             let hit = {
-                let guard = store.read().await;
+                let mut guard = store.write().await;
+                if guard.refresh_for_decision().is_err() {
+                    return sanitize_api_judge_verdict(ApiJudgeVerdict::Deny {
+                        reason: "API coverage authority is unavailable".to_string(),
+                    });
+                }
                 guard.learned_deny(summary, &request_stamp)
             };
             if let Some(hit) = hit {
@@ -452,7 +463,12 @@ impl ApiJudge for DaemonApiJudge {
 
             if !summary.rarity {
                 let hit = {
-                    let guard = store.read().await;
+                    let mut guard = store.write().await;
+                    if guard.refresh_for_decision().is_err() {
+                        return sanitize_api_judge_verdict(ApiJudgeVerdict::Deny {
+                            reason: "API coverage authority is unavailable".to_string(),
+                        });
+                    }
                     guard.learned_allow(summary, &request_stamp)
                 };
                 if let Some(hit) = hit {
@@ -491,7 +507,12 @@ impl ApiJudge for DaemonApiJudge {
                 baseline.session_revision = None;
                 baseline.session_intent = None;
                 let deny = {
-                    let guard = store.read().await;
+                    let mut guard = store.write().await;
+                    if guard.refresh_for_decision().is_err() {
+                        return sanitize_api_judge_verdict(ApiJudgeVerdict::Deny {
+                            reason: "API coverage authority is unavailable".to_string(),
+                        });
+                    }
                     guard.learned_deny(&baseline, &self.stamp)
                 };
                 if let Some(hit) = deny {
@@ -985,6 +1006,43 @@ mod tests {
             session_intent: None,
             credential_ref: "upstream".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn coverage_lookup_observes_a_deny_committed_by_another_instance() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("api.yaml");
+        let summary = api_summary("freshness", false);
+        let store = promotion_store(path.clone(), 2, 1);
+        {
+            let mut stale = store.write().await;
+            for _ in 0..2 {
+                stale
+                    .record_allow(
+                        &summary,
+                        Some(1),
+                        Some(guard::gating::Reversibility::Reversible),
+                        "safe",
+                        "",
+                    )
+                    .unwrap();
+            }
+        }
+        assert!(matches!(
+            lookup_api_coverage(&store, "", &summary).await,
+            ApiCoverageVerdict::Allow { .. }
+        ));
+
+        let mut config = guard::gating::api_promotion::ApiPromotionConfig::new(path);
+        config.min_approvals = 2;
+        config.min_denials = 1;
+        let mut writer = ApiPromotionStore::load(config).unwrap();
+        writer.record_deny(&summary, "deny", "").unwrap();
+
+        assert!(matches!(
+            lookup_api_coverage(&store, "", &summary).await,
+            ApiCoverageVerdict::Deny { .. }
+        ));
     }
 
     #[tokio::test]

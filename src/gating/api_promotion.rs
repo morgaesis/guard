@@ -17,9 +17,9 @@ use std::path::{Path, PathBuf};
 use super::{Reversibility, EXECUTE_NOW_MAX_RISK, HOLD_RISK_THRESHOLD};
 use crate::env::now_unix;
 use crate::learned_rules::{
-    is_learning_snapshot_conflict, preserve_corrupt_learning_file,
-    recover_learning_file_transaction, sanitize_learning_text,
-    write_learning_file_atomically_for_snapshot, LearningWriteOutcome,
+    load_expected_learning_file_snapshot, load_learning_file_snapshot,
+    preserve_corrupt_learning_file, retry_learning_snapshot_conflicts, sanitize_learning_text,
+    write_learning_file_atomically_for_locked_snapshot, LearningFileSnapshot, LearningWriteOutcome,
 };
 use crate::proxy::ApiRequestSummary;
 use crate::redact::{named_value_contains_sensitive_literals, text_contains_sensitive_literals};
@@ -364,23 +364,19 @@ pub enum ApiPromotionOutcome {
 pub struct ApiPromotionStore {
     config: ApiPromotionConfig,
     data: ApiPromotionFile,
-    snapshot: Option<Vec<u8>>,
+    snapshot: LearningFileSnapshot,
     #[cfg(test)]
     fail_writes: bool,
 }
 
 impl ApiPromotionStore {
     pub fn load(config: ApiPromotionConfig) -> Result<Self> {
-        recover_learning_file_transaction(&config.path)?;
-        let snapshot = if config.path.exists() {
-            Some(
-                std::fs::read(&config.path)
-                    .with_context(|| format!("failed to read {}", config.path.display()))?,
-            )
-        } else {
-            None
-        };
-        let mut data = if let Some(content) = snapshot.as_deref() {
+        retry_learning_snapshot_conflicts(|| Self::load_once(config.clone()))
+    }
+
+    fn load_once(config: ApiPromotionConfig) -> Result<Self> {
+        let snapshot = load_learning_file_snapshot(&config.path)?;
+        let mut data = if let Some(content) = snapshot.content() {
             if content.iter().all(u8::is_ascii_whitespace) {
                 ApiPromotionFile::default()
             } else {
@@ -468,12 +464,13 @@ impl ApiPromotionStore {
         };
         if changed {
             let content = store.canonical_content(&store.data)?;
-            let outcome = write_learning_file_atomically_for_snapshot(
+            let outcome = write_learning_file_atomically_for_locked_snapshot(
                 &store.config.path,
-                store.snapshot.as_deref(),
+                &store.snapshot,
                 &content,
             )?;
-            store.snapshot = Some(content.into_bytes());
+            store.snapshot =
+                load_expected_learning_file_snapshot(&store.config.path, content.as_bytes())?;
             if let Some(error) = outcome.warning() {
                 tracing::warn!(
                     "API coverage migration committed with a durability warning: {}",
@@ -502,6 +499,18 @@ impl ApiPromotionStore {
 
     pub fn bucket_count(&self) -> usize {
         self.data.buckets.len()
+    }
+
+    /// Refresh durable API authority before a fast-path decision. Any load or
+    /// recovery failure is returned so callers can deny instead of using a
+    /// stale allow.
+    pub fn refresh_for_decision(&mut self) -> Result<()> {
+        let current = load_learning_file_snapshot(&self.config.path)?;
+        if current.same_authority(&self.snapshot) {
+            return Ok(());
+        }
+        *self = Self::load(self.config.clone())?;
+        Ok(())
     }
 
     pub fn coverage(&self) -> Vec<ApiCoverageEntry> {
@@ -621,22 +630,21 @@ impl ApiPromotionStore {
         reason: &str,
         stamp: &str,
     ) -> Result<Option<ApiPromotionOutcome>> {
-        let mut candidate = self.clone();
-        let outcome =
-            candidate.record_allow_in_memory(summary, risk, reversibility, reason, stamp)?;
-        match self.commit_candidate(candidate.data) {
-            Ok(()) => Ok(outcome),
-            Err(error) if is_learning_snapshot_conflict(&error) => {
-                let mut current = Self::load(self.config.clone())?;
-                let mut retry = current.clone();
-                let outcome =
-                    retry.record_allow_in_memory(summary, risk, reversibility, reason, stamp)?;
-                current.commit_candidate(retry.data)?;
-                *self = current;
-                Ok(outcome)
-            }
-            Err(error) => Err(error),
-        }
+        let config = self.config.clone();
+        let mut first = Some(self.clone());
+        let (current, outcome) = retry_learning_snapshot_conflicts(|| {
+            let mut current = match first.take() {
+                Some(current) => current,
+                None => Self::load(config.clone())?,
+            };
+            let mut candidate = current.clone();
+            let outcome =
+                candidate.record_allow_in_memory(summary, risk, reversibility, reason, stamp)?;
+            current.commit_candidate(candidate.data)?;
+            Ok((current, outcome))
+        })?;
+        *self = current;
+        Ok(outcome)
     }
 
     fn record_allow_in_memory(
@@ -736,20 +744,20 @@ impl ApiPromotionStore {
         reason: &str,
         stamp: &str,
     ) -> Result<Option<ApiPromotionOutcome>> {
-        let mut candidate = self.clone();
-        let outcome = candidate.record_deny_in_memory(summary, reason, stamp)?;
-        match self.commit_candidate(candidate.data) {
-            Ok(()) => Ok(outcome),
-            Err(error) if is_learning_snapshot_conflict(&error) => {
-                let mut current = Self::load(self.config.clone())?;
-                let mut retry = current.clone();
-                let outcome = retry.record_deny_in_memory(summary, reason, stamp)?;
-                current.commit_candidate(retry.data)?;
-                *self = current;
-                Ok(outcome)
-            }
-            Err(error) => Err(error),
-        }
+        let config = self.config.clone();
+        let mut first = Some(self.clone());
+        let (current, outcome) = retry_learning_snapshot_conflicts(|| {
+            let mut current = match first.take() {
+                Some(current) => current,
+                None => Self::load(config.clone())?,
+            };
+            let mut candidate = current.clone();
+            let outcome = candidate.record_deny_in_memory(summary, reason, stamp)?;
+            current.commit_candidate(candidate.data)?;
+            Ok((current, outcome))
+        })?;
+        *self = current;
+        Ok(outcome)
     }
 
     fn record_deny_in_memory(
@@ -885,9 +893,12 @@ impl ApiPromotionStore {
         if candidate == self.data {
             return Ok(());
         }
+        let content = self.canonical_content(&candidate)?;
         let outcome = self.save_data(&candidate)?;
+        let committed =
+            load_expected_learning_file_snapshot(&self.config.path, content.as_bytes())?;
         self.data = candidate;
-        self.snapshot = Some(self.canonical_content(&self.data)?.into_bytes());
+        self.snapshot = committed;
         if let Some(error) = outcome.warning() {
             tracing::warn!(
                 "API coverage replacement committed with a durability warning: {}",
@@ -903,9 +914,9 @@ impl ApiPromotionStore {
             anyhow::bail!("simulated API coverage write failure");
         }
         let content = self.canonical_content(data)?;
-        write_learning_file_atomically_for_snapshot(
+        write_learning_file_atomically_for_locked_snapshot(
             &self.config.path,
-            self.snapshot.as_deref(),
+            &self.snapshot,
             &content,
         )
     }
@@ -1772,5 +1783,32 @@ buckets:
         let loaded = ApiPromotionStore::load(config).unwrap();
         assert!(loaded.learned_allow(&request, "regime").is_none());
         assert!(loaded.learned_deny(&request, "regime").is_some());
+    }
+
+    #[test]
+    fn stale_api_fast_path_refreshes_a_concurrent_deny_before_allowing() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config(temp.path().join("api.yaml"), 2, 1);
+        let request = summary("api");
+        let mut stale = ApiPromotionStore::load(config.clone()).unwrap();
+        for _ in 0..2 {
+            stale
+                .record_allow(
+                    &request,
+                    Some(1),
+                    Some(Reversibility::Reversible),
+                    "safe",
+                    "regime",
+                )
+                .unwrap();
+        }
+        assert!(stale.learned_allow(&request, "regime").is_some());
+
+        let mut writer = ApiPromotionStore::load(config).unwrap();
+        writer.record_deny(&request, "deny", "regime").unwrap();
+
+        stale.refresh_for_decision().unwrap();
+        assert!(stale.learned_allow(&request, "regime").is_none());
+        assert!(stale.learned_deny(&request, "regime").is_some());
     }
 }

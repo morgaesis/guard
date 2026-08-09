@@ -15,6 +15,11 @@
 
 use super::coverage::reversibility_rank;
 use super::Reversibility;
+use crate::learned_rules::{
+    load_expected_learning_file_snapshot, load_learning_file_snapshot,
+    rewrite_learning_file_bounded, write_learning_file_atomically_for_locked_snapshot,
+    LearningFileSnapshot,
+};
 use crate::redact::{
     command_contains_sensitive_literals, named_value_contains_sensitive_literals,
     text_contains_sensitive_literals, SENSITIVE_ARGV_REPLAY_GUIDANCE,
@@ -543,6 +548,7 @@ pub struct VerbCatalog {
     version: u64,
     path: Option<PathBuf>,
     mtime: Option<SystemTime>,
+    snapshot: Option<LearningFileSnapshot>,
 }
 
 impl VerbCatalog {
@@ -571,6 +577,7 @@ impl VerbCatalog {
             version: u64::from_be_bytes(version_bytes),
             path: None,
             mtime: None,
+            snapshot: None,
         })
     }
 
@@ -666,6 +673,7 @@ impl VerbCatalog {
                 version: u64::from_be_bytes(version_bytes),
                 path: None,
                 mtime: None,
+                snapshot: None,
             },
             canonical,
         ))
@@ -673,22 +681,19 @@ impl VerbCatalog {
 
     /// Load a catalog from a file, recording its path and mtime for reloads.
     pub fn load(path: &Path) -> Result<Self> {
-        crate::learned_rules::recover_learning_file_transaction(path)?;
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read verb catalog {}", path.display()))?;
-        let (mut catalog, repair) = Self::from_yaml_with_repair(&text)?;
-        if let Some(canonical) = repair {
-            let outcome = crate::learned_rules::write_learning_file_atomically_if_unchanged(
-                path,
-                text.as_bytes(),
-                &canonical,
-            )?;
-            if let Some(error) = catalog_repair_warning(path, &canonical, outcome)? {
-                tracing::warn!("catalog repair committed with a durability warning: {error}");
-            }
+        let (mut catalog, snapshot, warning) = rewrite_learning_file_bounded(path, |snapshot| {
+            let bytes = snapshot.content().context("verb catalog does not exist")?;
+            let text = std::str::from_utf8(bytes)
+                .with_context(|| format!("verb catalog {} is not UTF-8", path.display()))?;
+            let (catalog, repair) = Self::from_yaml_with_repair(text)?;
+            Ok((repair, catalog))
+        })?;
+        if let Some(error) = warning {
+            tracing::warn!("catalog repair committed with a durability warning: {error}");
         }
         catalog.path = Some(path.to_path_buf());
-        catalog.mtime = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
+        catalog.mtime = snapshot.modified();
+        catalog.snapshot = Some(snapshot);
         Ok(catalog)
     }
 
@@ -698,10 +703,12 @@ impl VerbCatalog {
         let Some(path) = self.path.clone() else {
             return Ok(false);
         };
-        let current = std::fs::metadata(&path)
-            .ok()
-            .and_then(|m| m.modified().ok());
-        if current == self.mtime {
+        let current = load_learning_file_snapshot(&path)?;
+        if self
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| current.same_authority(snapshot))
+        {
             return Ok(false);
         }
         let runtime_verbs = self
@@ -990,27 +997,31 @@ impl VerbCatalog {
         let path = self.path.clone().ok_or_else(|| {
             anyhow::anyhow!("verb catalog is not backed by a file; cannot persist a new verb")
         })?;
-        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let snapshot = load_learning_file_snapshot(&path)?;
+        let existing = snapshot
+            .content()
+            .map(std::str::from_utf8)
+            .transpose()
+            .context("verb catalog is not UTF-8")?
+            .unwrap_or_default()
+            .to_string();
         let new_content = compose_appended_catalog(&existing, verb)?;
         // Validate the COMBINED catalog in memory BEFORE touching the file, so a
         // bad or duplicate verb can never corrupt the catalog on disk.
         let (validated, canonical) = Self::from_yaml_with_repair(&new_content)
             .context("appending this verb would make the catalog invalid")?;
         let durable_content = canonical.as_deref().unwrap_or(&new_content);
-        let outcome = crate::learned_rules::write_learning_file_atomically_if_unchanged(
-            &path,
-            existing.as_bytes(),
-            durable_content,
-        )?;
+        let outcome =
+            write_learning_file_atomically_for_locked_snapshot(&path, &snapshot, durable_content)?;
         let warning = outcome.warning();
         // Adopt the already-validated content rather than re-reading the file: a
         // post-write reload failure would otherwise report an error to the
         // operator even though the write landed, desyncing memory from disk.
         self.verbs = validated.verbs;
         self.version = validated.version;
-        self.mtime = std::fs::metadata(&path)
-            .ok()
-            .and_then(|m| m.modified().ok());
+        let committed = load_expected_learning_file_snapshot(&path, durable_content.as_bytes())?;
+        self.mtime = committed.modified();
+        self.snapshot = Some(committed);
         if let Some(error) = warning {
             tracing::warn!("catalog append committed with a durability warning: {error}");
         }
@@ -1051,8 +1062,11 @@ impl VerbCatalog {
         let path = self.path.clone().ok_or_else(|| {
             anyhow::anyhow!("verb catalog is not backed by a file; cannot amend a verb")
         })?;
-        let existing = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read verb catalog {}", path.display()))?;
+        let snapshot = load_learning_file_snapshot(&path)?;
+        let existing =
+            std::str::from_utf8(snapshot.content().context("verb catalog does not exist")?)
+                .with_context(|| format!("verb catalog {} is not UTF-8", path.display()))?
+                .to_string();
         let disk_catalog = Self::from_yaml(&existing)?;
         let current = disk_catalog
             .get(name)
@@ -1093,11 +1107,11 @@ impl VerbCatalog {
         // Every fallible catalog adoption step completes before the durable
         // rewrite. After this point, success requires only the atomic file
         // replacement and assigning the already validated state.
-        atomic_replace_if_unchanged(&path, existing.as_bytes(), durable_content.as_bytes())?;
+        atomic_replace_if_unchanged(&path, &snapshot, durable_content.as_bytes())?;
         validated.path = Some(path.clone());
-        validated.mtime = std::fs::metadata(&path)
-            .ok()
-            .and_then(|metadata| metadata.modified().ok());
+        let committed = load_expected_learning_file_snapshot(&path, durable_content.as_bytes())?;
+        validated.mtime = committed.modified();
+        validated.snapshot = Some(committed);
         *self = validated;
         Ok(current)
     }
@@ -1194,22 +1208,26 @@ impl VerbCatalog {
         let path = self.path.clone().ok_or_else(|| {
             anyhow::anyhow!("verb catalog is not backed by a file; cannot delete a verb")
         })?;
-        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let snapshot = load_learning_file_snapshot(&path)?;
+        let existing = snapshot
+            .content()
+            .map(std::str::from_utf8)
+            .transpose()
+            .context("verb catalog is not UTF-8")?
+            .unwrap_or_default()
+            .to_string();
         let new_content = compose_removed_catalog(&existing, name)?;
         let (validated, canonical) = Self::from_yaml_with_repair(&new_content)
             .context("deleting this verb would make the catalog invalid")?;
         let durable_content = canonical.as_deref().unwrap_or(&new_content);
-        let outcome = crate::learned_rules::write_learning_file_atomically_if_unchanged(
-            &path,
-            existing.as_bytes(),
-            durable_content,
-        )?;
+        let outcome =
+            write_learning_file_atomically_for_locked_snapshot(&path, &snapshot, durable_content)?;
         let warning = outcome.warning();
         self.verbs = validated.verbs;
         self.version = validated.version;
-        self.mtime = std::fs::metadata(&path)
-            .ok()
-            .and_then(|m| m.modified().ok());
+        let committed = load_expected_learning_file_snapshot(&path, durable_content.as_bytes())?;
+        self.mtime = committed.modified();
+        self.snapshot = Some(committed);
         if let Some(error) = warning {
             tracing::warn!("catalog deletion committed with a durability warning: {error}");
         }
@@ -1266,6 +1284,7 @@ impl VerbCatalog {
     }
 }
 
+#[cfg(test)]
 fn catalog_repair_warning(
     path: &Path,
     canonical: &str,
@@ -1274,13 +1293,8 @@ fn catalog_repair_warning(
     let Some(error) = outcome.warning() else {
         return Ok(None);
     };
-    let committed = std::fs::read_to_string(path).with_context(|| {
-        format!(
-            "failed to verify committed catalog repair {}",
-            path.display()
-        )
-    })?;
-    if committed != canonical {
+    let committed = load_learning_file_snapshot(path)?;
+    if committed.content() != Some(canonical.as_bytes()) {
         bail!("committed catalog repair does not match its canonical candidate");
     }
     Ok(Some(error))
@@ -1408,19 +1422,14 @@ fn reserved_verb_name(name: &str) -> bool {
     name.starts_with("grant-") || name.starts_with("access-generated-")
 }
 
-fn atomic_replace_if_unchanged(path: &Path, expected: &[u8], replacement: &[u8]) -> Result<()> {
-    let current = std::fs::read(path)
-        .with_context(|| format!("failed to reread verb catalog {}", path.display()))?;
-    if current != expected {
-        bail!("verb catalog changed before the atomic rewrite; retry the amend");
-    }
+fn atomic_replace_if_unchanged(
+    path: &Path,
+    expected: &LearningFileSnapshot,
+    replacement: &[u8],
+) -> Result<()> {
     let replacement =
         std::str::from_utf8(replacement).context("catalog replacement is not UTF-8")?;
-    let outcome = crate::learned_rules::write_learning_file_atomically_if_unchanged(
-        path,
-        expected,
-        replacement,
-    )?;
+    let outcome = write_learning_file_atomically_for_locked_snapshot(path, expected, replacement)?;
     if let Some(error) = outcome.warning() {
         tracing::warn!("catalog replacement committed with a durability warning: {error}");
     }

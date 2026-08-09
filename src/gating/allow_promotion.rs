@@ -82,8 +82,9 @@ use crate::env::now_unix;
 use crate::learned_rules::write_learning_file_atomically;
 use crate::learned_rules::{infer_service_from_binary, looks_dangerous_for_learned_allow};
 use crate::learned_rules::{
-    is_learning_snapshot_conflict, recover_learning_file_transaction, sanitize_learning_text,
-    write_learning_file_atomically_for_snapshot, LearningWriteOutcome,
+    load_expected_learning_file_snapshot, retry_learning_snapshot_conflicts,
+    rewrite_learning_file_bounded, sanitize_learning_text,
+    write_learning_file_atomically_for_locked_snapshot, LearningFileSnapshot, LearningWriteOutcome,
 };
 use crate::redact::{
     command_contains_sensitive_literals, flattened_command_contains_sensitive_literals,
@@ -195,62 +196,48 @@ pub struct AllowPromotionOutcome {
 pub struct AllowPromotionStore {
     config: AllowPromotionConfig,
     data: AllowPromotionFile,
-    snapshot: Option<Vec<u8>>,
+    snapshot: LearningFileSnapshot,
 }
 
 impl AllowPromotionStore {
     pub fn load(config: AllowPromotionConfig) -> Result<Self> {
-        recover_learning_file_transaction(&config.path)?;
-        let snapshot = if config.path.exists() {
-            Some(
-                std::fs::read(&config.path)
-                    .with_context(|| format!("failed to read {}", config.path.display()))?,
-            )
-        } else {
-            None
-        };
-        let mut data = if let Some(content) = snapshot.as_deref() {
-            let content = std::str::from_utf8(content)
-                .with_context(|| format!("{} is not UTF-8", config.path.display()))?;
-            if content.trim().is_empty() {
-                AllowPromotionFile::default()
+        let path = config.path.clone();
+        let (data, snapshot, warning) = rewrite_learning_file_bounded(&path, |snapshot| {
+            let mut data = if let Some(content) = snapshot.content() {
+                let content = std::str::from_utf8(content)
+                    .with_context(|| format!("{} is not UTF-8", config.path.display()))?;
+                if content.trim().is_empty() {
+                    AllowPromotionFile::default()
+                } else {
+                    serde_yaml_ng::from_str(content)
+                        .with_context(|| format!("failed to parse {}", config.path.display()))?
+                }
             } else {
-                serde_yaml_ng::from_str(content)
-                    .with_context(|| format!("failed to parse {}", config.path.display()))?
+                AllowPromotionFile::default()
+            };
+            let original_len = data.observations.len();
+            data.observations.retain(|_, observation| {
+                !allow_observation_contains_sensitive_literals(observation)
+            });
+            let mut changed = original_len != data.observations.len();
+            for observation in data.observations.values_mut() {
+                let sanitized = sanitize_learning_text(&observation.last_reason);
+                changed |= sanitized != observation.last_reason;
+                observation.last_reason = sanitized;
             }
-        } else {
-            AllowPromotionFile::default()
-        };
-        let original_len = data.observations.len();
-        data.observations
-            .retain(|_, observation| !allow_observation_contains_sensitive_literals(observation));
-        let mut changed = original_len != data.observations.len();
-        for observation in data.observations.values_mut() {
-            let sanitized = sanitize_learning_text(&observation.last_reason);
-            changed |= sanitized != observation.last_reason;
-            observation.last_reason = sanitized;
+            let content = changed
+                .then(|| serde_yaml_ng::to_string(&data))
+                .transpose()?;
+            Ok((content, data))
+        })?;
+        if let Some(error) = warning {
+            tracing::warn!("allow-promotion cleanup committed with a durability warning: {error}");
         }
-        let mut store = Self {
+        Ok(Self {
             config,
             data,
             snapshot,
-        };
-        if changed {
-            let content = store.canonical_content(&store.data)?;
-            let outcome = write_learning_file_atomically_for_snapshot(
-                &store.config.path,
-                store.snapshot.as_deref(),
-                &content,
-            )?;
-            store.snapshot = Some(content.into_bytes());
-            if let Some(error) = outcome.warning() {
-                tracing::warn!(
-                    "allow-promotion cleanup committed with a durability warning: {}",
-                    error
-                );
-            }
-        }
-        Ok(store)
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -286,34 +273,27 @@ impl AllowPromotionStore {
         reversibility: Option<Reversibility>,
         reason: &str,
     ) -> Result<Option<AllowPromotionOutcome>> {
-        let mut candidate = self.clone();
-        let outcome = candidate.record_approval_in_memory(
-            binary,
-            args,
-            command,
-            risk,
-            reversibility,
-            reason,
-        )?;
-        match self.commit_candidate(candidate.data) {
-            Ok(()) => Ok(outcome),
-            Err(error) if is_learning_snapshot_conflict(&error) => {
-                let mut current = Self::load(self.config.clone())?;
-                let mut retry = current.clone();
-                let outcome = retry.record_approval_in_memory(
-                    binary,
-                    args,
-                    command,
-                    risk,
-                    reversibility,
-                    reason,
-                )?;
-                current.commit_candidate(retry.data)?;
-                *self = current;
-                Ok(outcome)
-            }
-            Err(error) => Err(error),
-        }
+        let config = self.config.clone();
+        let mut first = Some(self.clone());
+        let (current, outcome) = retry_learning_snapshot_conflicts(|| {
+            let mut current = match first.take() {
+                Some(current) => current,
+                None => Self::load(config.clone())?,
+            };
+            let mut candidate = current.clone();
+            let outcome = candidate.record_approval_in_memory(
+                binary,
+                args,
+                command,
+                risk,
+                reversibility,
+                reason,
+            )?;
+            current.commit_candidate(candidate.data)?;
+            Ok((current, outcome))
+        })?;
+        *self = current;
+        Ok(outcome)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -480,9 +460,12 @@ impl AllowPromotionStore {
         if candidate == self.data {
             return Ok(());
         }
+        let content = self.canonical_content(&candidate)?;
         let outcome = self.save_data(&candidate)?;
+        let committed =
+            load_expected_learning_file_snapshot(&self.config.path, content.as_bytes())?;
         self.data = candidate;
-        self.snapshot = Some(self.canonical_content(&self.data)?.into_bytes());
+        self.snapshot = committed;
         if let Some(error) = outcome.warning() {
             tracing::warn!(
                 "allow-promotion replacement committed with a durability warning: {}",
@@ -494,9 +477,9 @@ impl AllowPromotionStore {
 
     fn save_data(&self, data: &AllowPromotionFile) -> Result<LearningWriteOutcome> {
         let content = self.canonical_content(data)?;
-        write_learning_file_atomically_for_snapshot(
+        write_learning_file_atomically_for_locked_snapshot(
             &self.config.path,
-            self.snapshot.as_deref(),
+            &self.snapshot,
             &content,
         )
     }

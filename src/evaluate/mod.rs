@@ -582,7 +582,14 @@ impl Evaluator {
             if let Some(ref store) = self.deny_shapes {
                 let (binary, args_joined) = split_command_line(command);
                 let hit = {
-                    let guard = store.read().await;
+                    let mut guard = store.write().await;
+                    if guard.refresh_for_decision().is_err() {
+                        return EvalResult::Deny {
+                            reason: "learned deny authority is unavailable".to_string(),
+                            source: EvalSource::LearnedDeny,
+                            risk: None,
+                        };
+                    }
                     guard
                         .matches(binary, args_joined)
                         .map(|shape| shape.last_reason.clone())

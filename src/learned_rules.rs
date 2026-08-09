@@ -24,6 +24,7 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::env::now_unix;
 use crate::redact::{
@@ -72,19 +73,101 @@ fn snapshot_conflict() -> anyhow::Error {
     anyhow::Error::new(LearningSnapshotConflict)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DirectoryIdentity {
+    #[cfg(unix)]
+    Unix { device: u64, inode: u64 },
+    #[cfg(windows)]
+    Windows { volume: u32, index: u64 },
+}
+
+/// Exact authority bytes and filesystem identity observed while the
+/// destination lock and pinned parent are held.
+#[derive(Debug, Clone)]
+pub(crate) struct LearningFileSnapshot {
+    content: Option<Vec<u8>>,
+    generation: Option<String>,
+    parent_identity: DirectoryIdentity,
+    modified: Option<SystemTime>,
+}
+
+impl LearningFileSnapshot {
+    pub(crate) fn content(&self) -> Option<&[u8]> {
+        self.content.as_deref()
+    }
+
+    pub(crate) fn modified(&self) -> Option<SystemTime> {
+        self.modified
+    }
+
+    pub(crate) fn same_authority(&self, other: &Self) -> bool {
+        self.generation == other.generation && self.parent_identity == other.parent_identity
+    }
+}
+
+const MAX_SNAPSHOT_RETRIES: usize = 8;
+
+pub(crate) fn retry_learning_snapshot_conflicts<T, F>(mut operation: F) -> Result<T>
+where
+    F: FnMut() -> Result<T>,
+{
+    for _ in 0..MAX_SNAPSHOT_RETRIES {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) if is_learning_snapshot_conflict(&error) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(snapshot_conflict()).context("bounded learning-file mutation exhausted its CAS retries")
+}
+
+/// Reapply a commutative mutation to fresh locked snapshots until its CAS
+/// succeeds. The callback returns the canonical replacement and an adoption
+/// value derived from the same snapshot.
+pub(crate) fn rewrite_learning_file_bounded<T, F>(
+    path: &Path,
+    mut reapply: F,
+) -> Result<(T, LearningFileSnapshot, Option<anyhow::Error>)>
+where
+    F: FnMut(&LearningFileSnapshot) -> Result<(Option<String>, T)>,
+{
+    for _ in 0..MAX_SNAPSHOT_RETRIES {
+        let snapshot = load_learning_file_snapshot(path)?;
+        let (content, adoption) = reapply(&snapshot)?;
+        let Some(content) = content else {
+            return Ok((adoption, snapshot, None));
+        };
+        match write_learning_file_atomically_for_locked_snapshot(path, &snapshot, &content) {
+            Ok(outcome) => {
+                let warning = outcome.warning();
+                let committed = load_learning_file_snapshot(path)?;
+                if committed.content() != Some(content.as_bytes()) {
+                    continue;
+                }
+                return Ok((adoption, committed, warning));
+            }
+            Err(error) if is_learning_snapshot_conflict(&error) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(snapshot_conflict()).context("bounded learning-file rewrite exhausted its CAS retries")
+}
+
 /// Create one durable authority file only when its destination is absent.
 /// Parent hardening, restrictive file creation, replacement journaling, and
 /// generation comparison use the same path as subsequent learning writes.
 pub fn create_hardened_file_if_absent(path: &Path, content: &str) -> Result<()> {
-    let outcome = write_learning_file_atomically_for_snapshot(path, None, content)?;
-    if let Some(error) = outcome.warning() {
-        let lock = DestinationLock::acquire(path)?;
-        lock.verify_parent_binding()?;
-        let committed = std::fs::read(lock.destination())
-            .with_context(|| format!("failed to verify committed creation {}", path.display()))?;
-        if committed != content.as_bytes() {
-            anyhow::bail!("committed authority-file creation does not match its candidate")
+    let (_, _, warning) = rewrite_learning_file_bounded(path, |snapshot| {
+        if let Some(existing) = snapshot.content() {
+            if existing != content.as_bytes() {
+                return Err(snapshot_conflict())
+                    .context("authority-file destination already contains different bytes");
+            }
+            return Ok((None, ()));
         }
+        Ok((Some(content.to_string()), ()))
+    })?;
+    if let Some(error) = warning {
         tracing::warn!("authority-file creation committed with a durability warning: {error}");
     }
     Ok(())
@@ -100,6 +183,8 @@ struct LearningTransactionMarker {
     expected_generation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expected_security_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_unix_mode: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -266,6 +351,7 @@ struct DestinationLock {
     parent: File,
     canonical_parent: PathBuf,
     destination: PathBuf,
+    canonical_lock_path: PathBuf,
 }
 
 impl DestinationLock {
@@ -277,19 +363,31 @@ impl DestinationLock {
             .context("learning destination has no canonical parent")?
             .to_path_buf();
         let parent = open_parent_directory(&canonical_parent)?;
+        validate_trusted_parent(&parent, &canonical_parent)?;
         let destination = bind_destination_to_parent(&parent, &destination)?;
         let lock_path = learning_sibling(&destination, "lock", None);
+        let canonical_lock_path = learning_sibling(
+            &canonical_parent.join(
+                destination
+                    .file_name()
+                    .context("learning destination has no file name")?,
+            ),
+            "lock",
+            None,
+        );
         let file = open_owner_only_new_or_existing(&lock_path).with_context(|| {
             format!("failed to open learning-file lock {}", lock_path.display())
         })?;
         ensure_regular_file(&lock_path)?;
         lock_file_exclusive(&file)
             .with_context(|| format!("failed to lock learning destination {}", path.display()))?;
+        validate_lock_file(&file, &canonical_lock_path)?;
         let lock = Self {
             file,
             parent,
             canonical_parent,
             destination,
+            canonical_lock_path,
         };
         lock.verify_parent_binding()?;
         Ok(lock)
@@ -309,8 +407,122 @@ impl DestinationLock {
         if current != self.canonical_parent {
             anyhow::bail!("destination directory binding changed during the transaction")
         }
-        parent_identity_matches(&self.parent, &self.canonical_parent)
+        parent_identity_matches(&self.parent, &self.canonical_parent)?;
+        validate_trusted_parent(&self.parent, &self.canonical_parent)?;
+        validate_lock_file(&self.file, &self.canonical_lock_path)
     }
+
+    fn parent_identity(&self) -> Result<DirectoryIdentity> {
+        directory_identity(&self.parent)
+    }
+}
+
+#[cfg(unix)]
+fn directory_identity(file: &File) -> Result<DirectoryIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    Ok(DirectoryIdentity::Unix {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn directory_identity(file: &File) -> Result<DirectoryIdentity> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to inspect a pinned Windows directory");
+    }
+    Ok(DirectoryIdentity::Windows {
+        volume: information.dwVolumeSerialNumber,
+        index: (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn directory_identity(_file: &File) -> Result<DirectoryIdentity> {
+    anyhow::bail!("destination directory identity checks are unsupported on this platform")
+}
+
+#[cfg(unix)]
+fn validate_trusted_parent(parent: &File, path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = parent.metadata()?;
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        anyhow::bail!("destination directory is not owned by the effective user")
+    }
+    let untrusted_group_write =
+        metadata.mode() & 0o020 != 0 && metadata.gid() != unsafe { libc::getegid() };
+    if metadata.mode() & 0o002 != 0 || untrusted_group_write {
+        anyhow::bail!("destination directory permits untrusted entry replacement")
+    }
+    if !metadata.is_dir() {
+        anyhow::bail!("destination parent is not a directory")
+    }
+    parent_identity_matches(parent, path)
+}
+
+#[cfg(windows)]
+fn validate_trusted_parent(parent: &File, path: &Path) -> Result<()> {
+    // The held directory excludes delete sharing, which prevents another
+    // process from retargeting entries during the transaction. Identity is
+    // checked again before releasing the destination lock.
+    parent_identity_matches(parent, path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn validate_trusted_parent(_parent: &File, _path: &Path) -> Result<()> {
+    anyhow::bail!("trusted destination directories are unsupported on this platform")
+}
+
+#[cfg(unix)]
+fn validate_lock_file(file: &File, path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let held = file.metadata()?;
+    let current = std::fs::symlink_metadata(path)?;
+    if !held.is_file()
+        || held.uid() != unsafe { libc::geteuid() }
+        || held.mode() & 0o077 != 0
+        || held.nlink() != 1
+        || held.dev() != current.dev()
+        || held.ino() != current.ino()
+    {
+        anyhow::bail!("learning-file lock identity or permissions are unsafe")
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_lock_file(file: &File, path: &Path) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    fn identity(file: &File) -> Result<(u32, u64)> {
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+            return Err(std::io::Error::last_os_error()).context("failed to inspect lock handle");
+        }
+        Ok((
+            info.dwVolumeSerialNumber,
+            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        ))
+    }
+    let current = owner_only_options().read(true).write(true).open(path)?;
+    if identity(file)? != identity(&current)? {
+        anyhow::bail!("learning-file lock identity changed while held")
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn validate_lock_file(_file: &File, _path: &Path) -> Result<()> {
+    anyhow::bail!("learning-file lock validation is unsupported on this platform")
 }
 
 #[cfg(unix)]
@@ -611,9 +823,13 @@ fn owner_only_options() -> OpenOptions {
 #[cfg(windows)]
 fn owner_only_options() -> OpenOptions {
     use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
     let mut options = OpenOptions::new();
-    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    options
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     options
 }
 
@@ -666,6 +882,71 @@ fn apply_owner_only_windows_dacl(path: &Path) -> Result<()> {
     if result == 0 {
         return Err(std::io::Error::last_os_error())
             .context("failed to apply an owner-only Windows DACL");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn apply_security_descriptor_to_handle(
+    file: &File,
+    descriptor: &[u8],
+    information: u32,
+) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Security::SetKernelObjectSecurity;
+    let mut descriptor = descriptor.to_vec();
+    if unsafe {
+        SetKernelObjectSecurity(
+            file.as_raw_handle(),
+            information,
+            descriptor.as_mut_ptr().cast(),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to apply a DACL through the held file handle");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn apply_owner_only_windows_dacl_to_handle(file: &File) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{
+        SetKernelObjectSecurity, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    let sddl = "D:P(A;;FA;;;OW)"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut descriptor = std::ptr::null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to create an owner-only Windows DACL");
+    }
+    let applied = unsafe {
+        SetKernelObjectSecurity(
+            file.as_raw_handle(),
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            descriptor,
+        )
+    };
+    unsafe { LocalFree(descriptor.cast()) };
+    if applied == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to apply an owner-only DACL through the held file handle");
     }
     Ok(())
 }
@@ -726,6 +1007,38 @@ fn open_owner_only_new(path: &Path) -> Result<File> {
 }
 
 #[cfg(windows)]
+fn open_windows_recovery_file(path: &Path) -> Result<File> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE | 0x0004_0000,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to open recovery file {}", path.display()));
+    }
+    Ok(unsafe { File::from_raw_handle(handle) })
+}
+
+#[cfg(windows)]
 fn open_owner_only_new(path: &Path) -> Result<File> {
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::FromRawHandle;
@@ -767,7 +1080,8 @@ fn open_owner_only_new(path: &Path) -> Result<File> {
     let handle = unsafe {
         CreateFileW(
             wide.as_ptr(),
-            GENERIC_READ | GENERIC_WRITE,
+            // WRITE_DAC is the standard access right 0x0004_0000.
+            GENERIC_READ | GENERIC_WRITE | 0x0004_0000,
             0,
             &security,
             CREATE_NEW,
@@ -840,31 +1154,44 @@ fn write_transaction_marker(
     if bytes.is_empty() || bytes.len() as u64 > MAX_TRANSACTION_MARKER_BYTES {
         anyhow::bail!("learning transaction marker exceeds its size bound")
     }
-    let mut file = open_owner_only_new(&paths.marker_staging).with_context(|| {
-        format!(
-            "failed to create transaction marker {}",
-            paths.marker_staging.display()
-        )
-    })?;
-    file.write_all(&bytes).with_context(|| {
-        format!(
-            "failed to write transaction marker {}",
-            paths.marker_staging.display()
-        )
-    })?;
-    file.sync_all().with_context(|| {
-        format!(
-            "failed to sync transaction marker {}",
-            paths.marker_staging.display()
-        )
-    })?;
-    drop(file);
-    rename_write_through(&paths.marker_staging, &paths.marker).with_context(|| {
-        format!(
-            "failed to publish transaction marker {}",
-            paths.marker.display()
-        )
-    })
+    let publish = (|| -> Result<()> {
+        let mut file = open_owner_only_new(&paths.marker_staging).with_context(|| {
+            format!(
+                "failed to create transaction marker {}",
+                paths.marker_staging.display()
+            )
+        })?;
+        file.write_all(&bytes).with_context(|| {
+            format!(
+                "failed to write transaction marker {}",
+                paths.marker_staging.display()
+            )
+        })?;
+        file.sync_all().with_context(|| {
+            format!(
+                "failed to sync transaction marker {}",
+                paths.marker_staging.display()
+            )
+        })?;
+        drop(file);
+        rename_write_through(&paths.marker_staging, &paths.marker).with_context(|| {
+            format!(
+                "failed to publish transaction marker {}",
+                paths.marker.display()
+            )
+        })?;
+        Ok(())
+    })();
+    if let Err(error) = publish {
+        if !path_present(&paths.marker)? {
+            remove_if_present(&paths.marker_staging).with_context(|| {
+                format!("failed to clean unpublished transaction marker after: {error}")
+            })?;
+            sync_learning_parent(paths.marker.parent().unwrap_or_else(|| Path::new(".")))?;
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn read_transaction_marker(
@@ -987,6 +1314,7 @@ fn transaction_artifacts(path: &Path) -> Result<Vec<PathBuf>> {
         format!(".{name}.learning-marker-"),
         format!(".{name}.learning-new-"),
         format!(".{name}.learning-old-"),
+        format!(".{name}.learning-old-stage-"),
     ];
     let mut found = Vec::new();
     for entry in std::fs::read_dir(parent)? {
@@ -1003,16 +1331,133 @@ fn transaction_artifacts(path: &Path) -> Result<Vec<PathBuf>> {
 /// Recover a destination-bound learning transaction before loading authority.
 /// A malformed or ambiguous state fails closed instead of guessing which copy
 /// is authoritative.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn recover_learning_file_transaction(path: &Path) -> Result<()> {
     let lock = DestinationLock::acquire(path)?;
     lock.verify_parent_binding()?;
-    recover_learning_file_transaction_locked(lock.destination())
+    recover_learning_file_transaction_locked(lock.destination())?;
+    lock.verify_parent_binding()
+}
+
+/// Recover and read a destination while one lock and pinned parent remain
+/// held. The returned bytes and generation refer to the same opened file.
+pub(crate) fn load_learning_file_snapshot(path: &Path) -> Result<LearningFileSnapshot> {
+    let lock = DestinationLock::acquire(path)?;
+    lock.verify_parent_binding()?;
+    recover_learning_file_transaction_locked(lock.destination())?;
+    read_learning_file_snapshot_locked(&lock)
+}
+
+pub(crate) fn load_expected_learning_file_snapshot(
+    path: &Path,
+    expected: &[u8],
+) -> Result<LearningFileSnapshot> {
+    let snapshot = load_learning_file_snapshot(path)?;
+    if snapshot.content() != Some(expected) {
+        return Err(snapshot_conflict());
+    }
+    Ok(snapshot)
+}
+
+fn read_learning_file_snapshot_locked(lock: &DestinationLock) -> Result<LearningFileSnapshot> {
+    let path = lock.destination();
+    let parent_identity = lock.parent_identity()?;
+    let (content, modified) = if !path_present(path)? {
+        (None, None)
+    } else {
+        ensure_regular_file(path)?;
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            };
+            options
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        let mut file = options
+            .open(path)
+            .with_context(|| format!("failed to open locked snapshot {}", path.display()))?;
+        if !file.metadata()?.is_file() {
+            anyhow::bail!("learning destination is not a regular file")
+        }
+        let modified = file
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .with_context(|| format!("failed to read locked snapshot {}", path.display()))?;
+        verify_open_file_binding(&file, path)?;
+        (Some(bytes), modified)
+    };
+    lock.verify_parent_binding()?;
+    Ok(LearningFileSnapshot {
+        generation: content.as_deref().map(content_digest),
+        content,
+        parent_identity,
+        modified,
+    })
+}
+
+#[cfg(unix)]
+fn verify_open_file_binding(file: &File, path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let held = file.metadata()?;
+    let current = std::fs::symlink_metadata(path)?;
+    if held.dev() != current.dev() || held.ino() != current.ino() || !current.is_file() {
+        anyhow::bail!("learning destination changed during its locked read")
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn verify_open_file_binding(file: &File, path: &Path) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    fn identity(file: &File) -> Result<(u32, u64)> {
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to inspect locked snapshot handle");
+        }
+        Ok((
+            info.dwVolumeSerialNumber,
+            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        ))
+    }
+    let current = owner_only_options().read(true).open(path)?;
+    if identity(file)? != identity(&current)? {
+        anyhow::bail!("learning destination changed during its locked read")
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn verify_open_file_binding(_file: &File, _path: &Path) -> Result<()> {
+    anyhow::bail!("locked snapshot identity checks are unsupported on this platform")
 }
 
 fn recover_learning_file_transaction_locked(path: &Path) -> Result<()> {
     let marker_path = learning_sibling(path, "transaction", None);
     if !path_present(&marker_path)? {
-        if !transaction_artifacts(path)?.is_empty() {
+        let artifacts = transaction_artifacts(path)?;
+        if artifacts.len() == 1 && is_marker_staging_artifact(path, &artifacts[0])? {
+            remove_owned_precommit_artifact(&artifacts[0])?;
+            sync_learning_parent(path.parent().unwrap_or_else(|| Path::new(".")))?;
+            return Ok(());
+        }
+        if !artifacts.is_empty() {
             anyhow::bail!("untracked learning transaction artifacts require operator repair")
         }
         return Ok(());
@@ -1069,6 +1514,52 @@ fn recover_learning_file_transaction_locked(path: &Path) -> Result<()> {
     }
 }
 
+fn is_marker_staging_artifact(destination: &Path, artifact: &Path) -> Result<bool> {
+    ensure_regular_file(artifact)?;
+    let destination_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("learning destination name is not portable")?;
+    let file_name = artifact
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("learning transaction artifact name is not portable")?;
+    let prefix = format!(".{destination_name}.learning-marker-");
+    let Some(identity) = file_name.strip_prefix(&prefix) else {
+        return Ok(false);
+    };
+    validate_transaction_id(identity)?;
+    let paths = transaction_paths(destination, identity)?;
+    if paths.marker_staging != artifact {
+        anyhow::bail!("marker staging artifact is not transaction-owned")
+    }
+    validate_owner_only_artifact(destination, artifact)?;
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn validate_owner_only_artifact(_destination: &Path, path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+        anyhow::bail!("transaction artifact permissions are unsafe")
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_owner_only_artifact(destination: &Path, path: &Path) -> Result<()> {
+    if windows_dacl_digest(path)? != windows_dacl_digest(&destination_lock_path(destination)?)? {
+        anyhow::bail!("transaction artifact DACL is not owner-only")
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn validate_owner_only_artifact(_destination: &Path, _path: &Path) -> Result<()> {
+    anyhow::bail!("transaction artifact validation is unsupported on this platform")
+}
+
 fn destination_matches_expected(actual: Option<&str>, expected: Option<&str>) -> bool {
     actual == expected
 }
@@ -1122,6 +1613,7 @@ fn recover_legacy_transaction(
             candidate_generation: candidate_generation.to_string(),
             expected_generation: expected_generation.map(str::to_string),
             expected_security_generation: None,
+            expected_unix_mode: None,
         };
         persist_transaction_phase(paths, &marker)?;
         return recover_current_transaction(path, paths, &mut marker, Some(candidate_generation));
@@ -1152,6 +1644,7 @@ fn recover_current_transaction(
         }
         LearningTransactionPhase::Replacing => {
             if destination_generation == Some(marker.candidate_generation.as_str()) {
+                restore_replacement_metadata(path, paths, marker)?;
                 sync_replacement(path, parent)?;
                 marker.phase = LearningTransactionPhase::ReplacementDurable;
                 persist_transaction_phase(paths, marker)?;
@@ -1177,6 +1670,7 @@ fn recover_current_transaction(
             if destination_generation != Some(marker.candidate_generation.as_str()) {
                 anyhow::bail!("durable replacement generation is missing or changed")
             }
+            restore_replacement_metadata(path, paths, marker)?;
             sync_replacement(path, parent)?;
             remove_owned_precommit_artifact(&paths.marker_staging)?;
             remove_verified_artifact(&paths.source, Some(&marker.candidate_generation))?;
@@ -1211,7 +1705,63 @@ fn persist_transaction_phase(
     sync_learning_parent(paths.marker.parent().unwrap_or_else(|| Path::new(".")))
 }
 
+#[cfg(unix)]
+fn restore_replacement_metadata(
+    destination: &Path,
+    _paths: &LearningTransactionPaths,
+    marker: &LearningTransactionMarker,
+) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let expected = marker.expected_unix_mode.unwrap_or(0o600);
+    let actual = std::fs::metadata(destination)?.permissions().mode() & 0o7777;
+    if actual != expected {
+        std::fs::set_permissions(destination, std::fs::Permissions::from_mode(expected))?;
+    }
+    let restored = std::fs::metadata(destination)?.permissions().mode() & 0o7777;
+    if restored != expected {
+        anyhow::bail!("replacement file mode does not match its transaction metadata")
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn restore_replacement_metadata(
+    destination: &Path,
+    paths: &LearningTransactionPaths,
+    marker: &LearningTransactionMarker,
+) -> Result<()> {
+    let Some(expected_generation) = marker.expected_security_generation.as_deref() else {
+        return Ok(());
+    };
+    if windows_dacl_digest(destination)? == expected_generation {
+        return Ok(());
+    }
+    if !path_present(&paths.backup)? {
+        anyhow::bail!("replacement metadata backup is unavailable")
+    }
+    let (descriptor, information) = windows_security_descriptor(&paths.backup)?;
+    let destination_file = open_windows_recovery_file(destination)?;
+    apply_security_descriptor_to_handle(&destination_file, &descriptor, information)?;
+    destination_file.sync_all()?;
+    if windows_dacl_digest(destination)? != expected_generation {
+        anyhow::bail!("replacement DACL does not match its transaction metadata")
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn restore_replacement_metadata(
+    _destination: &Path,
+    _paths: &LearningTransactionPaths,
+    _marker: &LearningTransactionMarker,
+) -> Result<()> {
+    anyhow::bail!("replacement metadata recovery is unsupported on this platform")
+}
+
 fn sync_replacement(path: &Path, parent: &Path) -> Result<()> {
+    #[cfg(windows)]
+    open_windows_recovery_file(path)?.sync_all()?;
+    #[cfg(not(windows))]
     File::open(path)?.sync_all()?;
     sync_learning_parent(parent)
 }
@@ -1290,6 +1840,62 @@ fn windows_dacl_digest(path: &Path) -> Result<String> {
         return Err(std::io::Error::last_os_error()).context("failed to read the Windows DACL");
     }
     Ok(content_digest(&descriptor))
+}
+
+#[cfg(windows)]
+fn windows_security_descriptor(path: &Path) -> Result<(Vec<u8>, u32)> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Security::{
+        GetFileSecurityW, GetSecurityDescriptorControl, DACL_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+        UNPROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut needed = 0;
+    unsafe {
+        GetFileSecurityW(
+            wide.as_ptr(),
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        );
+    }
+    if needed == 0 {
+        return Err(std::io::Error::last_os_error()).context("failed to read the Windows DACL");
+    }
+    let mut descriptor = vec![0u8; needed as usize];
+    if unsafe {
+        GetFileSecurityW(
+            wide.as_ptr(),
+            DACL_SECURITY_INFORMATION,
+            descriptor.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error()).context("failed to read the Windows DACL");
+    }
+    let mut control = 0;
+    let mut revision = 0;
+    if unsafe {
+        GetSecurityDescriptorControl(descriptor.as_mut_ptr().cast(), &mut control, &mut revision)
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to inspect Windows DACL controls");
+    }
+    let protection = if control & SE_DACL_PROTECTED != 0 {
+        PROTECTED_DACL_SECURITY_INFORMATION
+    } else {
+        UNPROTECTED_DACL_SECURITY_INFORMATION
+    };
+    Ok((descriptor, DACL_SECURITY_INFORMATION | protection))
 }
 
 fn remove_verified_artifact(path: &Path, expected_digest: Option<&str>) -> Result<()> {
@@ -1382,6 +1988,7 @@ pub(crate) fn write_learning_file_atomically(
 }
 
 #[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn write_learning_file_atomically_if_unchanged(
     path: &Path,
     expected: &[u8],
@@ -1390,20 +1997,7 @@ pub(crate) fn write_learning_file_atomically_if_unchanged(
     write_learning_file_atomically_with_sync_and_expected(
         path,
         Some(Some(expected)),
-        content,
-        sync_parent_directory,
-    )
-}
-
-#[cfg(unix)]
-pub(crate) fn write_learning_file_atomically_for_snapshot(
-    path: &Path,
-    expected: Option<&[u8]>,
-    content: &str,
-) -> Result<LearningWriteOutcome> {
-    write_learning_file_atomically_with_sync_and_expected(
-        path,
-        Some(expected),
+        None,
         content,
         sync_parent_directory,
     )
@@ -1415,25 +2009,46 @@ pub(crate) fn write_learning_file_atomically(
     path: &Path,
     content: &str,
 ) -> Result<LearningWriteOutcome> {
-    write_learning_file_atomically_windows(path, None, content)
+    write_learning_file_atomically_windows(path, None, None, content)
 }
 
 #[cfg(windows)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn write_learning_file_atomically_if_unchanged(
     path: &Path,
     expected: &[u8],
     content: &str,
 ) -> Result<LearningWriteOutcome> {
-    write_learning_file_atomically_windows(path, Some(Some(expected)), content)
+    write_learning_file_atomically_windows(path, Some(Some(expected)), None, content)
+}
+
+#[cfg(unix)]
+pub(crate) fn write_learning_file_atomically_for_locked_snapshot(
+    path: &Path,
+    expected: &LearningFileSnapshot,
+    content: &str,
+) -> Result<LearningWriteOutcome> {
+    write_learning_file_atomically_with_sync_and_expected(
+        path,
+        Some(expected.content()),
+        Some(&expected.parent_identity),
+        content,
+        sync_parent_directory,
+    )
 }
 
 #[cfg(windows)]
-pub(crate) fn write_learning_file_atomically_for_snapshot(
+pub(crate) fn write_learning_file_atomically_for_locked_snapshot(
     path: &Path,
-    expected: Option<&[u8]>,
+    expected: &LearningFileSnapshot,
     content: &str,
 ) -> Result<LearningWriteOutcome> {
-    write_learning_file_atomically_windows(path, Some(expected), content)
+    write_learning_file_atomically_windows(
+        path,
+        Some(expected.content()),
+        Some(&expected.parent_identity),
+        content,
+    )
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1455,9 +2070,9 @@ pub(crate) fn write_learning_file_atomically_if_unchanged(
 }
 
 #[cfg(not(any(unix, windows)))]
-pub(crate) fn write_learning_file_atomically_for_snapshot(
+pub(crate) fn write_learning_file_atomically_for_locked_snapshot(
     _path: &Path,
-    _expected: Option<&[u8]>,
+    _expected: &LearningFileSnapshot,
     _content: &str,
 ) -> Result<LearningWriteOutcome> {
     anyhow::bail!("atomic learning-file durability is unsupported on this platform")
@@ -1473,13 +2088,14 @@ fn write_learning_file_atomically_with_sync<F>(
 where
     F: FnMut(&Path) -> Result<()>,
 {
-    write_learning_file_atomically_with_sync_and_expected(path, None, content, sync_directory)
+    write_learning_file_atomically_with_sync_and_expected(path, None, None, content, sync_directory)
 }
 
 #[cfg(any(unix, test))]
 fn write_learning_file_atomically_with_sync_and_expected<F>(
     path: &Path,
     expected: Option<Option<&[u8]>>,
+    expected_parent: Option<&DirectoryIdentity>,
     content: &str,
     mut sync_directory: F,
 ) -> Result<LearningWriteOutcome>
@@ -1493,28 +2109,27 @@ where
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     lock.verify_parent_binding()?;
     recover_learning_file_transaction_locked(path)?;
+    if let Some(expected_parent) = expected_parent {
+        if lock.parent_identity()? != *expected_parent {
+            return Err(snapshot_conflict());
+        }
+    }
     if let Some(expected) = expected {
-        match (expected, path_present(path)?) {
-            (None, false) => {}
-            (None, true) | (Some(_), false) => return Err(snapshot_conflict()),
-            (Some(expected), true) => {
-                let current = std::fs::read(path).with_context(|| {
-                    format!(
-                        "failed to reread {} under its transaction lock",
-                        path.display()
-                    )
-                })?;
-                if current != expected {
-                    return Err(snapshot_conflict());
-                }
-            }
+        let current = read_learning_file_snapshot_locked(&lock)?;
+        if current.content() != expected {
+            return Err(snapshot_conflict());
         }
     }
     let identity = format!("{:032x}", rand::random::<u128>());
     let paths = transaction_paths(path, &identity)?;
-    let original_permissions = std::fs::metadata(path)
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    let original_mode = std::fs::metadata(path)
         .ok()
-        .map(|metadata| metadata.permissions());
+        .map(|metadata| metadata.permissions().mode() & 0o7777);
+    #[cfg(not(unix))]
+    let original_mode = None;
     let original_sha256 = path.exists().then(|| digest_file(path)).transpose()?;
     let mut marker = LearningTransactionMarker {
         version: LEARNING_TRANSACTION_VERSION,
@@ -1523,6 +2138,7 @@ where
         candidate_generation: content_digest(content.as_bytes()),
         expected_generation: original_sha256.clone(),
         expected_security_generation: None,
+        expected_unix_mode: original_mode,
     };
     lock.verify_parent_binding()?;
     write_transaction_marker(&paths, &marker)?;
@@ -1575,13 +2191,11 @@ where
             ),
         };
     }
-    if let Some(permissions) = original_permissions {
-        if let Err(error) = std::fs::set_permissions(path, permissions)
-            .and_then(|()| std::fs::File::open(path)?.sync_all())
-            .with_context(|| format!("failed to restore metadata for {}", path.display()))
-        {
-            return Ok(LearningWriteOutcome::CommittedWithWarning(error));
-        }
+    if let Err(error) = restore_replacement_metadata(path, &paths, &marker)
+        .and_then(|()| std::fs::File::open(path)?.sync_all().map_err(Into::into))
+        .with_context(|| format!("failed to restore metadata for {}", path.display()))
+    {
+        return Ok(LearningWriteOutcome::CommittedWithWarning(error));
     }
     if let Err(error) = sync_directory(parent)
         .with_context(|| format!("failed to sync parent directory {}", parent.display()))
@@ -1780,6 +2394,7 @@ fn sync_parent_directory(parent: &Path) -> Result<()> {
 fn write_learning_file_atomically_windows(
     path: &Path,
     expected: Option<Option<&[u8]>>,
+    expected_parent: Option<&DirectoryIdentity>,
     content: &str,
 ) -> Result<LearningWriteOutcome> {
     use std::os::windows::ffi::OsStrExt;
@@ -1787,6 +2402,7 @@ fn write_learning_file_atomically_windows(
         GetFileSecurityW, GetSecurityDescriptorControl, SetFileSecurityW,
         DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
         PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+        UNPROTECTED_DACL_SECURITY_INFORMATION,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, ReplaceFileW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
@@ -1845,6 +2461,8 @@ fn write_learning_file_atomically_windows(
         let mut set_information = information;
         if control & SE_DACL_PROTECTED != 0 {
             set_information |= PROTECTED_DACL_SECURITY_INFORMATION;
+        } else {
+            set_information |= UNPROTECTED_DACL_SECURITY_INFORMATION;
         }
         Ok((descriptor, set_information))
     }
@@ -1920,21 +2538,15 @@ fn write_learning_file_atomically_windows(
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     lock.verify_parent_binding()?;
     recover_learning_file_transaction_locked(path)?;
+    if let Some(expected_parent) = expected_parent {
+        if lock.parent_identity()? != *expected_parent {
+            return Err(snapshot_conflict());
+        }
+    }
     if let Some(expected) = expected {
-        match (expected, path_present(path)?) {
-            (None, false) => {}
-            (None, true) | (Some(_), false) => return Err(snapshot_conflict()),
-            (Some(expected), true) => {
-                let current = std::fs::read(path).with_context(|| {
-                    format!(
-                        "failed to reread {} under its transaction lock",
-                        path.display()
-                    )
-                })?;
-                if current != expected {
-                    return Err(snapshot_conflict());
-                }
-            }
+        let current = read_learning_file_snapshot_locked(&lock)?;
+        if current.content() != expected {
+            return Err(snapshot_conflict());
         }
     }
     let destination_exists = path.exists();
@@ -1966,6 +2578,7 @@ fn write_learning_file_atomically_windows(
         expected_security_generation: expected_security
             .as_ref()
             .map(|(descriptor, _)| content_digest(descriptor)),
+        expected_unix_mode: None,
     };
     lock.verify_parent_binding()?;
     write_transaction_marker(&paths, &marker)?;
@@ -1978,13 +2591,15 @@ fn write_learning_file_atomically_windows(
         // the destination metadata; the accessible DACL is verified after the
         // replacement. Owner and group are never set, and SACL access is
         // neither requested nor claimed.
-        apply_security_descriptor(&paths.source, descriptor, *information).with_context(|| {
-            format!(
-                "cannot preserve security for learning file {}",
-                path.display()
-            )
-        })?;
-        apply_owner_only_windows_dacl(&paths.source)?;
+        apply_security_descriptor_to_handle(&temporary, descriptor, *information).with_context(
+            || {
+                format!(
+                    "cannot preserve security for learning file {}",
+                    path.display()
+                )
+            },
+        )?;
+        apply_owner_only_windows_dacl_to_handle(&temporary)?;
     }
     temporary
         .write_all(content.as_bytes())
@@ -2058,19 +2673,20 @@ fn write_learning_file_atomically_windows(
         // ReplaceFileW's write-through flag is unsupported. Flushing a newly
         // opened destination handle provides file-level durability. Windows
         // does not expose a portable directory fsync.
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(path)
-            .with_context(|| format!("failed to reopen replaced file {}", path.display()))?
+        let destination_file = open_windows_recovery_file(path)
+            .with_context(|| format!("failed to reopen replaced file {}", path.display()))?;
+        destination_file
             .sync_all()
             .with_context(|| format!("failed to flush replaced file {}", path.display()))?;
         if let Some((expected, information)) = &expected_security {
             let (actual, _) = read_security_descriptor(path)
                 .with_context(|| format!("failed to verify security for {}", path.display()))?;
             if actual != *expected {
-                apply_security_descriptor(path, expected, *information).with_context(|| {
-                    format!("failed to restore security for {}", path.display())
-                })?;
+                apply_security_descriptor_to_handle(&destination_file, expected, *information)
+                    .with_context(|| {
+                        format!("failed to restore security for {}", path.display())
+                    })?;
+                destination_file.sync_all()?;
                 let (restored, _) = read_security_descriptor(path).with_context(|| {
                     format!("failed to verify restored security for {}", path.display())
                 })?;
@@ -2248,63 +2864,37 @@ impl LearnedShim {
 pub struct LearnedRuleStore {
     config: LearningConfig,
     data: LearnedRulesFile,
-    snapshot: Option<Vec<u8>>,
+    snapshot: LearningFileSnapshot,
 }
 
 impl LearnedRuleStore {
     pub fn load(config: LearningConfig) -> Result<Self> {
-        recover_learning_file_transaction(&config.path)?;
-        let snapshot = if config.path.exists() {
-            Some(
-                std::fs::read(&config.path)
-                    .with_context(|| format!("failed to read {}", config.path.display()))?,
-            )
-        } else {
-            None
-        };
-        let mut data = if let Some(content) = snapshot.as_deref() {
-            let content = std::str::from_utf8(content)
-                .with_context(|| format!("{} is not UTF-8", config.path.display()))?;
-            if content.trim().is_empty() {
-                LearnedRulesFile::default()
-            } else {
-                serde_yaml_ng::from_str(content)
-                    .with_context(|| format!("failed to parse {}", config.path.display()))?
-            }
-        } else {
-            LearnedRulesFile::default()
-        };
-
-        let original_observations = data.observations.len();
-        let original_rules = data.rules.len();
-        data.observations
-            .retain(|_, observation| !learned_observation_contains_sensitive_literals(observation));
-        data.rules
-            .retain(|rule| !learned_rule_contains_sensitive_literals(rule));
-        let mut changed =
-            original_observations != data.observations.len() || original_rules != data.rules.len();
-        changed |= sanitize_learned_rules_prose(&mut data);
-        let mut store = Self {
+        let path = config.path.clone();
+        let (data, snapshot, warning) = rewrite_learning_file_bounded(&path, |snapshot| {
+            let mut data = parse_learned_rules_snapshot(snapshot, &path)?;
+            let original_observations = data.observations.len();
+            let original_rules = data.rules.len();
+            data.observations.retain(|_, observation| {
+                !learned_observation_contains_sensitive_literals(observation)
+            });
+            data.rules
+                .retain(|rule| !learned_rule_contains_sensitive_literals(rule));
+            let mut changed = original_observations != data.observations.len()
+                || original_rules != data.rules.len();
+            changed |= sanitize_learned_rules_prose(&mut data);
+            let content = changed
+                .then(|| serde_yaml_ng::to_string(&data))
+                .transpose()?;
+            Ok((content, data))
+        })?;
+        if let Some(error) = warning {
+            tracing::warn!("learning-file cleanup committed with a durability warning: {error}");
+        }
+        Ok(Self {
             config,
             data,
             snapshot,
-        };
-        if changed {
-            let content = store.canonical_content(&store.data)?;
-            let outcome = write_learning_file_atomically_for_snapshot(
-                &store.config.path,
-                store.snapshot.as_deref(),
-                &content,
-            )?;
-            store.snapshot = Some(content.into_bytes());
-            if let Some(error) = outcome.warning() {
-                tracing::warn!(
-                    "learning-file cleanup committed with a durability warning: {}",
-                    error
-                );
-            }
-        }
-        Ok(store)
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -2335,21 +2925,21 @@ impl LearnedRuleStore {
         risk: Option<i32>,
         reason: &str,
     ) -> Result<Option<LearningOutcome>> {
-        let mut candidate = self.clone();
-        let outcome = candidate.record_approval_in_memory(binary, args, command, risk, reason)?;
-        match self.commit_candidate(candidate.data) {
-            Ok(()) => Ok(outcome),
-            Err(error) if is_learning_snapshot_conflict(&error) => {
-                let mut current = Self::load(self.config.clone())?;
-                let mut retry = current.clone();
-                let outcome =
-                    retry.record_approval_in_memory(binary, args, command, risk, reason)?;
-                current.commit_candidate(retry.data)?;
-                *self = current;
-                Ok(outcome)
-            }
-            Err(error) => Err(error),
-        }
+        let config = self.config.clone();
+        let mut first = Some(self.clone());
+        let (current, outcome) = retry_learning_snapshot_conflicts(|| {
+            let mut current = match first.take() {
+                Some(current) => current,
+                None => Self::load(config.clone())?,
+            };
+            let mut candidate = current.clone();
+            let outcome =
+                candidate.record_approval_in_memory(binary, args, command, risk, reason)?;
+            current.commit_candidate(candidate.data)?;
+            Ok((current, outcome))
+        })?;
+        *self = current;
+        Ok(outcome)
     }
 
     fn record_approval_in_memory(
@@ -2464,9 +3054,12 @@ impl LearnedRuleStore {
         if candidate == self.data {
             return Ok(());
         }
+        let content = self.canonical_content(&candidate)?;
         let outcome = self.save_data(&candidate)?;
+        let committed =
+            load_expected_learning_file_snapshot(&self.config.path, content.as_bytes())?;
         self.data = candidate;
-        self.snapshot = Some(self.canonical_content(&self.data)?.into_bytes());
+        self.snapshot = committed;
         if let Some(error) = outcome.warning() {
             tracing::warn!(
                 "learning-file replacement committed with a durability warning: {}",
@@ -2478,9 +3071,9 @@ impl LearnedRuleStore {
 
     fn save_data(&self, data: &LearnedRulesFile) -> Result<LearningWriteOutcome> {
         let content = self.canonical_content(data)?;
-        write_learning_file_atomically_for_snapshot(
+        write_learning_file_atomically_for_locked_snapshot(
             &self.config.path,
-            self.snapshot.as_deref(),
+            &self.snapshot,
             &content,
         )
     }
@@ -2489,6 +3082,23 @@ impl LearnedRuleStore {
         let mut data = data.clone();
         sanitize_learned_rules_prose(&mut data);
         Ok(serde_yaml_ng::to_string(&data)?)
+    }
+}
+
+fn parse_learned_rules_snapshot(
+    snapshot: &LearningFileSnapshot,
+    path: &Path,
+) -> Result<LearnedRulesFile> {
+    let Some(content) = snapshot.content() else {
+        return Ok(LearnedRulesFile::default());
+    };
+    let content =
+        std::str::from_utf8(content).with_context(|| format!("{} is not UTF-8", path.display()))?;
+    if content.trim().is_empty() {
+        Ok(LearnedRulesFile::default())
+    } else {
+        serde_yaml_ng::from_str(content)
+            .with_context(|| format!("failed to parse {}", path.display()))
     }
 }
 
@@ -2880,6 +3490,7 @@ mod tests {
                 .flatten()
                 .map(|bytes| content_digest(&bytes)),
             expected_security_generation: None,
+            expected_unix_mode: None,
         };
         write_transaction_marker(&paths, &marker).unwrap();
         paths
@@ -2931,6 +3542,7 @@ mod tests {
                 candidate_generation: content_digest(candidate),
                 expected_generation: expected.map(content_digest),
                 expected_security_generation: None,
+                expected_unix_mode: None,
             },
         )
         .unwrap();
@@ -3440,6 +4052,7 @@ mod tests {
                 candidate_generation: content_digest(b"candidate"),
                 expected_generation: Some(content_digest(b"expected original")),
                 expected_security_generation: None,
+                expected_unix_mode: None,
             },
         )
         .unwrap();
@@ -3467,6 +4080,7 @@ mod tests {
                 candidate_generation: content_digest(b"candidate"),
                 expected_generation: None,
                 expected_security_generation: None,
+                expected_unix_mode: None,
             },
         )
         .unwrap();
@@ -3716,6 +4330,7 @@ mod tests {
                 candidate_generation: content_digest(b"candidate"),
                 expected_generation: Some(content_digest(b"original")),
                 expected_security_generation: Some(security_generation.clone()),
+                expected_unix_mode: None,
             },
         )
         .unwrap();
@@ -4040,6 +4655,136 @@ mod tests {
         assert_eq!(
             loaded.data.observations.values().next().unwrap().approvals,
             2
+        );
+    }
+
+    #[test]
+    fn three_stale_learning_instances_preserve_every_commutative_observation() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = LearningConfig {
+            path: temp.path().join("learned.yaml"),
+            min_approvals: 3,
+            max_risk: 3,
+            auto_shim: AutoShimMode::Off,
+        };
+        let mut stores = [
+            LearnedRuleStore::load(config.clone()).unwrap(),
+            LearnedRuleStore::load(config.clone()).unwrap(),
+            LearnedRuleStore::load(config.clone()).unwrap(),
+        ];
+        let args = vec!["status".to_string()];
+        for store in &mut stores {
+            store
+                .record_approval("fixturectl", &args, "fixturectl status", Some(1), "safe")
+                .unwrap();
+        }
+        let loaded = LearnedRuleStore::load(config).unwrap();
+        assert_eq!(
+            loaded.data.observations.values().next().unwrap().approvals,
+            3
+        );
+        assert_eq!(loaded.rule_count(), 1);
+    }
+
+    #[test]
+    fn markerless_staging_is_cleaned_before_authority_is_loaded() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("learned.yaml");
+        std::fs::write(&destination, "safe").unwrap();
+        let paths = transaction_paths(&destination, "000000000000000000000000000000aa").unwrap();
+        let mut staging = open_owner_only_new(&paths.marker_staging).unwrap();
+        staging.write_all(b"{").unwrap();
+        staging.sync_all().unwrap();
+        drop(staging);
+
+        let first = load_learning_file_snapshot(&destination).unwrap();
+        assert_eq!(first.content(), Some(b"safe".as_slice()));
+        assert!(!paths.marker_staging.exists());
+        let second = load_learning_file_snapshot(&destination).unwrap();
+        assert!(first.same_authority(&second));
+    }
+
+    #[test]
+    fn concurrent_equivalent_initialization_converges() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("verbs.yaml");
+        let first_path = destination.clone();
+        let second_path = destination.clone();
+        let first =
+            std::thread::spawn(move || create_hardened_file_if_absent(&first_path, "verbs: []\n"));
+        let second =
+            std::thread::spawn(move || create_hardened_file_if_absent(&second_path, "verbs: []\n"));
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+        let snapshot = load_learning_file_snapshot(&destination).unwrap();
+        assert_eq!(snapshot.content(), Some(b"verbs: []\n".as_slice()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn untrusted_parent_and_replaced_lock_fail_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let unsafe_parent = temp.path().join("unsafe");
+        std::fs::create_dir(&unsafe_parent).unwrap();
+        std::fs::set_permissions(&unsafe_parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(DestinationLock::acquire(&unsafe_parent.join("learned.yaml")).is_err());
+
+        let destination = temp.path().join("safe.yaml");
+        let lock = DestinationLock::acquire(&destination).unwrap();
+        let displaced = temp.path().join("displaced-lock");
+        std::fs::rename(&lock.canonical_lock_path, &displaced).unwrap();
+        std::fs::write(&lock.canonical_lock_path, "replacement").unwrap();
+        assert!(lock.verify_parent_binding().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn locked_snapshot_rejects_parent_retarget_during_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("authority");
+        let moved = temp.path().join("authority-moved");
+        std::fs::create_dir(&parent).unwrap();
+        let destination = parent.join("learned.yaml");
+        std::fs::write(&destination, "safe").unwrap();
+        let lock = DestinationLock::acquire(&destination).unwrap();
+        std::fs::rename(&parent, &moved).unwrap();
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::write(parent.join("learned.yaml"), "other").unwrap();
+        assert!(read_learning_file_snapshot_locked(&lock).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn committed_recovery_restores_journaled_file_mode_before_cleanup() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("learned.yaml");
+        std::fs::write(&destination, "candidate").unwrap();
+        std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let identity = "000000000000000000000000000000bb";
+        let paths = transaction_paths(&destination, identity).unwrap();
+        std::fs::write(&paths.backup, "original").unwrap();
+        write_transaction_marker(
+            &paths,
+            &LearningTransactionMarker {
+                version: LEARNING_TRANSACTION_VERSION,
+                transaction_id: identity.to_string(),
+                phase: LearningTransactionPhase::Replacing,
+                candidate_generation: content_digest(b"candidate"),
+                expected_generation: Some(content_digest(b"original")),
+                expected_security_generation: None,
+                expected_unix_mode: Some(0o640),
+            },
+        )
+        .unwrap();
+
+        recover_learning_file_transaction(&destination).unwrap();
+        assert_eq!(
+            std::fs::metadata(destination).unwrap().permissions().mode() & 0o777,
+            0o640
         );
     }
 }
