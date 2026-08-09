@@ -19,8 +19,9 @@ use super::grants::{delete_read_grant_row, finish_read_grant_revert, persist_rea
 use super::runtime::NotifyEvent;
 use super::transport::write_stream_message;
 use super::wire::{
-    approval_is_armed, CallerIdentity, ExecOutcome, ExecuteRequest, ExecuteResult,
-    ExecuteStreamMessage, RevertSpec, VerbContext, APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX,
+    approval_is_armed, CallerIdentity, ContainmentOutcome, ExecOutcome, ExecuteRequest,
+    ExecuteResult, ExecuteStreamMessage, RevertSpec, VerbContext,
+    APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX,
 };
 use super::{
     RequestContext, ServerContext, DEFAULT_CONFIRM_WITHIN_SECS, GATING_RETENTION_SECS,
@@ -1142,6 +1143,27 @@ pub(super) async fn arm_containment_with_authority<W: AsyncWrite + Unpin>(
     .await
 }
 
+#[cfg(test)]
+pub(super) async fn arm_containment_with_access_use_for_test<W: AsyncWrite + Unpin>(
+    context: &mut RequestContext<'_, W>,
+    request: ExecuteRequest,
+    caller_principal: Option<PrincipalKey>,
+    reason: String,
+    authority: Option<SessionAuthoritySnapshot>,
+    consume_access_verbs: Vec<String>,
+) -> ExecuteResult {
+    arm_containment_with_access_use(
+        context,
+        request,
+        caller_principal,
+        reason,
+        authority,
+        consume_access_verbs,
+        None,
+    )
+    .await
+}
+
 async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
     context: &mut RequestContext<'_, W>,
     request: ExecuteRequest,
@@ -1234,9 +1256,6 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
             "session expired, was revoked, or changed before containment could be armed",
         );
     }
-    if let Err(reason) = admit_access_use(server, &request, &consume_access_verbs, None).await {
-        return access_admission_denial(server, caller, &consume_access_verbs, reason).await;
-    }
     let (session_revision, secret_entitlements) = match request.session_token.as_deref() {
         Some(_) => match authority {
             Some(snapshot) => (snapshot.revision, snapshot.secret_entitlements),
@@ -1313,8 +1332,20 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
             detail
         );
         return ExecuteResult::exec_failed(
-            reason,
+            reason.clone(),
             "command was not run because durable rollback state is unavailable".to_string(),
+        )
+        .containment_failed(
+            "command was not run because durable rollback state is unavailable",
+            None,
+            Coverage::contain(),
+            ContainmentOutcome::PersistenceFailure {
+                command_started: false,
+                forward_exit_code: None,
+            },
+            None,
+            None,
+            None,
         );
     }
     server
@@ -1323,6 +1354,23 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
         .write()
         .await
         .insert(provisional.clone());
+
+    // The containment row is durable before bounded access is consumed. If
+    // admission rejects the request, remove the unused row and leave the
+    // authority budget untouched.
+    if let Err(admission_reason) =
+        admit_access_use(server, &request, &consume_access_verbs, None).await
+    {
+        if let Err(cleanup_error) = try_delete_provisional_row(server, &handle).await {
+            tracing::error!(
+                "failed to retire unstarted provisional {handle} after access admission denial: {cleanup_error}"
+            );
+        } else {
+            server.state.provisional.write().await.remove(&handle);
+        }
+        return access_admission_denial(server, caller, &consume_access_verbs, admission_reason)
+            .await;
+    }
 
     let session_fingerprint = audit_session_fingerprint(request.session_token.as_deref());
     let result = exec_after_approval_with_secret_authority(
@@ -1337,9 +1385,11 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
     match result.exec {
         ExecOutcome::Completed {
             exit_code,
-            stdout,
-            stderr,
+            ref stdout,
+            ref stderr,
         } => {
+            let stdout = stdout.clone();
+            let stderr = stderr.clone();
             let finished_unix = now_unix();
             let updated = {
                 let mut reg = server.state.provisional.write().await;
@@ -1347,62 +1397,114 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
             };
             // Zero on a forward command that did not exit cleanly: no timer was
             // armed, so the response must not advertise a deadline.
-            let (armed_deadline, armed_window, auto_revert_durable, response_reason) =
-                match updated {
-                    Some(u) => match try_persist_provisional(server, &u).await {
-                        Ok(()) => (
-                            if exit_code == Some(0) {
-                                u.deadline_unix
-                            } else {
-                                0
-                            },
-                            if exit_code == Some(0) {
-                                u.window_secs
-                            } else {
-                                0
-                            },
-                            exit_code == Some(0),
-                            if exit_code == Some(0) {
-                                reason.clone()
-                            } else {
-                                format!(
-                                    "{reason}; forward command exited with code {exit_code:?}; auto-revert was not armed; operator decision required"
-                                )
-                            },
-                        ),
-                        Err(detail) => {
-                            tracing::error!("post-forward provisional persistence failed: {detail}");
-                            let response_reason = if exit_code == Some(0) {
-                                format!(
-                                    "{reason}; command executed, but its durable auto-revert state could not be recorded; operator decision required"
-                                )
-                            } else {
-                                format!(
-                                    "{reason}; forward command exited with code {exit_code:?}, and its outcome could not be recorded durably; operator decision required"
-                                )
-                            };
-                            let _ = server
-                                .state
-                                .provisional
-                                .write()
-                                .await
-                                .mark_forward_persistence_failed(
-                                    &handle,
-                                    exit_code,
-                                );
-                            (0, 0, false, response_reason)
-                        }
-                    },
-                    None => (
-                        0,
-                        0,
-                        false,
-                        format!(
-                            "{reason}; command executed without a durable auto-revert; operator decision required"
-                        ),
-                    ),
+            let Some(updated) = updated else {
+                let response_reason =
+                    "command executed, but its durable containment row was lost; operator decision required";
+                return result
+                    .containment_failed(
+                        response_reason,
+                        Some(handle),
+                        Coverage::contain(),
+                        ContainmentOutcome::PersistenceFailure {
+                            command_started: true,
+                            forward_exit_code: exit_code,
+                        },
+                        exit_code,
+                        stdout,
+                        stderr,
+                    )
+                    .with_exposed_secret_refs(exposed_secret_refs);
+            };
+            if let Err(detail) = try_persist_provisional(server, &updated).await {
+                tracing::error!("post-forward provisional persistence failed: {detail}");
+                let _ = server
+                    .state
+                    .provisional
+                    .write()
+                    .await
+                    .mark_forward_persistence_failed(&handle, exit_code);
+                let response_reason = if exit_code == Some(0) {
+                    "command executed, but its durable auto-revert state could not be recorded; operator decision required".to_string()
+                } else {
+                    format!(
+                        "forward command exited with code {}, but its durable outcome could not be recorded; operator decision required",
+                        exit_code.unwrap_or_default()
+                    )
                 };
-            if exit_code == Some(0) && auto_revert_durable {
+                server.emit_audit_ungated(
+                    AuditEvent::new(AuditKind::ProvisionalInterrupted)
+                        .handle(&handle)
+                        .caller(caller)
+                        .session_fingerprint(&session_fingerprint)
+                        .reason(&response_reason)
+                        .field("exit", format!("{exit_code:?}")),
+                );
+                return result
+                    .containment_failed(
+                        response_reason,
+                        Some(handle),
+                        Coverage::contain(),
+                        ContainmentOutcome::PersistenceFailure {
+                            command_started: true,
+                            forward_exit_code: exit_code,
+                        },
+                        exit_code,
+                        stdout,
+                        stderr,
+                    )
+                    .with_exposed_secret_refs(exposed_secret_refs);
+            }
+            if exit_code.is_none() {
+                let response_reason = format!(
+                    "{reason}; forward command ended without an exit code; auto-revert was not armed; operator decision required"
+                );
+                server.emit_audit_ungated(
+                    AuditEvent::new(AuditKind::ProvisionalInterrupted)
+                        .handle(&handle)
+                        .caller(caller)
+                        .session_fingerprint(&session_fingerprint)
+                        .reason(&response_reason),
+                );
+                return result
+                    .containment_failed(
+                        response_reason,
+                        Some(handle),
+                        Coverage::contain(),
+                        ContainmentOutcome::ForwardNoExitCode,
+                        None,
+                        stdout,
+                        stderr,
+                    )
+                    .with_exposed_secret_refs(exposed_secret_refs);
+            }
+            if exit_code != Some(0) {
+                let exit_code = exit_code.expect("nonzero containment exit has a code");
+                let response_reason = format!(
+                    "{reason}; forward command exited with code {exit_code}; auto-revert was not armed; operator decision required"
+                );
+                server.emit_audit_ungated(
+                    AuditEvent::new(AuditKind::ProvisionalInterrupted)
+                        .handle(&handle)
+                        .caller(caller)
+                        .session_fingerprint(&session_fingerprint)
+                        .reason(&response_reason)
+                        .field("exit", exit_code),
+                );
+                return result
+                    .containment_failed(
+                        response_reason,
+                        Some(handle),
+                        Coverage::contain(),
+                        ContainmentOutcome::ForwardNonzeroExit { exit_code },
+                        Some(exit_code),
+                        stdout,
+                        stderr,
+                    )
+                    .with_exposed_secret_refs(exposed_secret_refs);
+            }
+            let armed_deadline = updated.deadline_unix;
+            let armed_window = updated.window_secs;
+            {
                 server.emit_audit_ungated(
                     AuditEvent::new(AuditKind::Provisional)
                         .handle(&handle)
@@ -1421,18 +1523,9 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
                     status: Some("armed".to_string()),
                     behavior: None,
                 });
-            } else {
-                server.emit_audit_ungated(
-                    AuditEvent::new(AuditKind::ProvisionalInterrupted)
-                        .handle(&handle)
-                        .caller(caller)
-                        .session_fingerprint(&session_fingerprint)
-                        .reason(&response_reason)
-                        .field("exit", format!("{exit_code:?}")),
-                );
             }
             ExecuteResult::provisional(
-                response_reason,
+                reason,
                 handle,
                 Coverage::contain(),
                 exit_code,
@@ -1440,7 +1533,6 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
                 stderr,
                 armed_deadline,
                 armed_window,
-                auto_revert_durable,
             )
             .with_exposed_secret_refs(exposed_secret_refs)
         }
@@ -1470,6 +1562,16 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
                     .reason(&detail),
             );
             result
+                .containment_failed(
+                    "forward command ended without an exit code; auto-revert was not armed; operator decision required",
+                    Some(handle),
+                    Coverage::contain(),
+                    ContainmentOutcome::ForwardNoExitCode,
+                    None,
+                    None,
+                    None,
+                )
+                .with_exposed_secret_refs(exposed_secret_refs)
         }
         ExecOutcome::Failed {
             started: false,

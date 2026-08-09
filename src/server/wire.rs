@@ -1253,8 +1253,8 @@ pub struct ExecuteResponse {
     pub stderr: Option<String>,
     /// Consequence-gate outcome. Absent on a legacy (gating-off) response, which
     /// old clients parse as a normal allow/deny. `Held`/`Provisional` mean the
-    /// command was approved but routed to the operator gate / containment
-    /// envelope, not denied.
+    /// command was approved but routed to the operator gate / armed containment
+    /// envelope. `ContainmentFailed` means no armed auto-revert outcome exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<GateStatus>,
     /// Durable request identifier for a held command, or containment handle for
@@ -1289,9 +1289,10 @@ pub struct ExecuteResponse {
     pub confirm_deadline_unix: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirm_window_secs: Option<u64>,
-    /// Explicitly reports whether the current daemon committed the auto-revert
-    /// outcome. `None` is reserved for older daemons that do not send this
-    /// field, so clients retain their compatibility fallback.
+    /// Explicitly reports whether the current daemon committed the armed
+    /// auto-revert outcome. This is `Some(true)` only for an armed
+    /// `Provisional`; containment failures use their typed status instead.
+    /// `None` also covers legacy daemons that do not send this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_revert_durable: Option<bool>,
     /// Stable source label for the admission decision.
@@ -1356,7 +1357,7 @@ fn redact_verb_matches(matches: &mut [VerbMatchInfo]) {
 }
 
 /// Wire-level consequence-gate outcome.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GateStatus {
     /// Executed immediately (reversible, or gating off).
@@ -1369,6 +1370,35 @@ pub enum GateStatus {
     Reverted,
     /// Policy evaluated, not executed (dry-run).
     DryRun,
+    /// Containment could not truthfully report an armed auto-revert outcome.
+    /// The payload distinguishes forward exit, interruption, and durability
+    /// failures without relying on the legacy durability boolean.
+    ContainmentFailed(ContainmentOutcome),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ContainmentOutcome {
+    /// The forward command exited with a numeric nonzero status.
+    ForwardNonzeroExit { exit_code: i32 },
+    /// The forward process was launched, but no normal exit code was observed.
+    ForwardNoExitCode,
+    /// The durable containment outcome could not be recorded.
+    PersistenceFailure {
+        command_started: bool,
+        forward_exit_code: Option<i32>,
+    },
+}
+
+impl ContainmentOutcome {
+    pub(super) fn command_started(&self) -> bool {
+        match self {
+            Self::ForwardNonzeroExit { .. } | Self::ForwardNoExitCode => true,
+            Self::PersistenceFailure {
+                command_started, ..
+            } => *command_started,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1423,8 +1453,8 @@ pub(super) enum ExecOutcome {
     DryRun { coverage: Option<Coverage> },
     /// Approved and routed to the operator gate; not executed. Awaits approval.
     Held { handle: String, coverage: Coverage },
-    /// Approved and executed inside a containment envelope; the durability
-    /// field states whether its auto-revert outcome is armed.
+    /// Approved and executed inside a containment envelope with a durably
+    /// armed auto-revert window.
     Provisional {
         handle: String,
         coverage: Coverage,
@@ -1434,8 +1464,18 @@ pub(super) enum ExecOutcome {
         /// Armed auto-revert deadline and the window behind it.
         deadline_unix: u64,
         window_secs: u64,
-        /// Whether the current daemon durably committed the armed outcome.
-        auto_revert_durable: bool,
+    },
+    /// The containment envelope could not truthfully report an armed
+    /// auto-revert outcome. A command may have run, so the handle and typed
+    /// outcome remain available for operator recovery.
+    ContainmentFailed {
+        reason: String,
+        handle: Option<String>,
+        coverage: Coverage,
+        outcome: ContainmentOutcome,
+        exit_code: Option<i32>,
+        stdout: Option<String>,
+        stderr: Option<String>,
     },
 }
 
@@ -1602,7 +1642,6 @@ impl ExecuteResult {
         stderr: Option<String>,
         deadline_unix: u64,
         window_secs: u64,
-        auto_revert_durable: bool,
     ) -> Self {
         Self {
             policy: PolicyOutcome::Allowed {
@@ -1616,7 +1655,6 @@ impl ExecuteResult {
                 stderr,
                 deadline_unix,
                 window_secs,
-                auto_revert_durable,
             },
             request_handle: None,
             access_requests: Vec::new(),
@@ -1625,6 +1663,32 @@ impl ExecuteResult {
             verb_guidance: None,
             decision_source: SessionDecisionSource::Validation,
         }
+    }
+
+    /// Replace a generic execution failure with a typed containment failure
+    /// while preserving the policy decision, verb resolution, and audit
+    /// metadata already attached to this result.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn containment_failed(
+        mut self,
+        reason: impl Into<String>,
+        handle: Option<String>,
+        coverage: Coverage,
+        outcome: ContainmentOutcome,
+        exit_code: Option<i32>,
+        stdout: Option<String>,
+        stderr: Option<String>,
+    ) -> Self {
+        self.exec = ExecOutcome::ContainmentFailed {
+            reason: reason.into(),
+            handle,
+            coverage,
+            outcome,
+            exit_code,
+            stdout,
+            stderr,
+        };
+        self
     }
 
     pub(super) fn with_exposed_secret_refs(mut self, mut exposed_secret_refs: Vec<String>) -> Self {
@@ -1672,7 +1736,8 @@ impl ExecuteResult {
     pub(super) fn exit_code(&self) -> Option<i32> {
         match &self.exec {
             ExecOutcome::Completed { exit_code, .. }
-            | ExecOutcome::Provisional { exit_code, .. } => *exit_code,
+            | ExecOutcome::Provisional { exit_code, .. }
+            | ExecOutcome::ContainmentFailed { exit_code, .. } => *exit_code,
             _ => None,
         }
     }
@@ -1879,7 +1944,6 @@ impl ExecuteResult {
                 stderr,
                 deadline_unix,
                 window_secs,
-                auto_revert_durable,
             } => ExecuteResponse {
                 allowed: true,
                 reason: policy_reason,
@@ -1893,13 +1957,39 @@ impl ExecuteResult {
                 coverage: Some(coverage),
                 verb_matches,
                 verb_guidance,
-                confirm_deadline_unix: (auto_revert_durable
-                    && deadline_unix > 0
-                    && window_secs > 0)
+                confirm_deadline_unix: (deadline_unix > 0 && window_secs > 0)
                     .then_some(deadline_unix),
-                confirm_window_secs: (auto_revert_durable && deadline_unix > 0 && window_secs > 0)
-                    .then_some(window_secs),
-                auto_revert_durable: Some(auto_revert_durable),
+                confirm_window_secs: (deadline_unix > 0 && window_secs > 0).then_some(window_secs),
+                auto_revert_durable: Some(true),
+                decision_source,
+                decision_trace,
+            },
+            ExecOutcome::ContainmentFailed {
+                reason: containment_reason,
+                handle,
+                coverage,
+                outcome,
+                exit_code,
+                stdout,
+                stderr,
+            } => ExecuteResponse {
+                allowed: outcome.command_started(),
+                reason: containment_reason,
+                exit_code,
+                stdout,
+                stderr,
+                status: Some(GateStatus::ContainmentFailed(outcome)),
+                handle,
+                approval_options: Vec::new(),
+                access_requests: Vec::new(),
+                coverage: Some(coverage),
+                verb_matches,
+                verb_guidance,
+                confirm_deadline_unix: None,
+                confirm_window_secs: None,
+                // A failed containment outcome is never represented by the
+                // legacy durability boolean. Its typed status is authoritative.
+                auto_revert_durable: None,
                 decision_source,
                 decision_trace,
             },
@@ -1914,6 +2004,7 @@ impl ExecuteResult {
             ExecOutcome::NotAttempted => SessionExecStatus::NotAttempted,
             ExecOutcome::Held { .. } => SessionExecStatus::Held,
             ExecOutcome::Provisional { .. } => SessionExecStatus::Provisional,
+            ExecOutcome::ContainmentFailed { .. } => SessionExecStatus::Failed,
         }
     }
 }

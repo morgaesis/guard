@@ -3,8 +3,8 @@ use crate::server::gate_runtime::reconstruct_caller;
 #[cfg(windows)]
 use crate::server::transport::winplat;
 use crate::server::wire::{
-    authorize_session_use, CallerIdentity, ExecOutcome, ExecuteResult, IncomingMessage,
-    SessionAuthz, EXECUTE_FEATURE_LOCAL_CWD, EXECUTE_PROTOCOL_VERSION,
+    authorize_session_use, CallerIdentity, ContainmentOutcome, ExecOutcome, ExecuteResult,
+    GateStatus, IncomingMessage, SessionAuthz, EXECUTE_FEATURE_LOCAL_CWD, EXECUTE_PROTOCOL_VERSION,
 };
 use crate::session::SessionOwner;
 use guard::principal::PrincipalKey;
@@ -317,6 +317,59 @@ fn into_response_for_completed_carries_exit_and_streams() {
     assert!(resp.allowed);
     assert_eq!(resp.exit_code, Some(7));
     assert_eq!(resp.stdout.as_deref(), Some("hi"));
+}
+
+#[test]
+fn containment_failure_wire_status_is_typed_and_breaks_legacy_provisional_parsing() {
+    let response = ExecuteResult::completed("approved", Some(0), None, None)
+        .containment_failed(
+            "command executed, but durable containment state was unavailable",
+            Some("containment-handle".to_string()),
+            guard::gating::Coverage::contain(),
+            ContainmentOutcome::PersistenceFailure {
+                command_started: true,
+                forward_exit_code: Some(0),
+            },
+            Some(0),
+            None,
+            None,
+        )
+        .into_response();
+
+    assert!(matches!(
+        response.status,
+        Some(GateStatus::ContainmentFailed(
+            ContainmentOutcome::PersistenceFailure {
+                command_started: true,
+                forward_exit_code: Some(0),
+            }
+        ))
+    ));
+    assert_eq!(response.auto_revert_durable, None);
+
+    #[allow(dead_code)]
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum LegacyGateStatus {
+        Executed,
+        Provisional,
+        Held,
+        Reverted,
+        DryRun,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug, serde::Deserialize)]
+    struct LegacyResponse {
+        status: Option<LegacyGateStatus>,
+    }
+
+    let json = serde_json::to_value(&response).expect("response serializes");
+    assert_eq!(
+        json["status"]["containment_failed"]["kind"],
+        "persistence_failure"
+    );
+    assert!(serde_json::from_value::<LegacyResponse>(json).is_err());
 }
 
 // ---- Audit emission end-to-end tests ------------------------------------

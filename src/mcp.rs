@@ -170,6 +170,7 @@ impl From<server::ExecuteResponse> for GuardToolResponse {
                     server::GateStatus::Held => "held",
                     server::GateStatus::Reverted => "reverted",
                     server::GateStatus::DryRun => "dry_run",
+                    server::GateStatus::ContainmentFailed(_) => "containment_failed",
                 }
                 .to_string()
             }),

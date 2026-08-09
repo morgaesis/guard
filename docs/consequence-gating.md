@@ -121,9 +121,12 @@ becomes an explicit operator decision rather than firing through an unverified
 environment.
 
 Evaluator errors, missing authority snapshots, unsafe replay checks, malformed
-rollback commands, and unavailable gate infrastructure fail to deny or hold.
-`DENIED` always means the forward operation did not execute. A provisional
-result states that execution occurred and rollback remains armed.
+rollback commands, and unavailable gate infrastructure fail closed before
+forward execution. `DENIED` means the forward operation did not execute.
+`PROVISIONAL` means the forward operation executed and the durable auto-revert
+window is armed. A `CONTAINMENT_FAILED` result identifies whether the forward
+command exited nonzero, ended without an exit code, or ran without a durable
+containment outcome. It never claims that an auto-revert timer is armed.
 
 A denial names the authority that produced it on a `source:` line and the route
 back on an `appeal:` line. `static-policy` is a matched operator-authored deny

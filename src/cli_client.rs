@@ -155,20 +155,45 @@ fn print_verb_guidance(response: &server::ExecuteResponse) {
     }
 }
 
-/// The `result:` and `window:` lines of a PROVISIONAL banner. The armed
-/// deadline is the operative fact: without it the banner reads as an
-/// indefinite hold, and the automatic rollback that follows looks like a
-/// malfunction. A daemon that does not report the window falls back to the
-/// deadline-free wording rather than inventing one.
+/// The `result:` and `window:` lines of a contained execution banner. The
+/// armed deadline is the operative fact for a provisional; a typed containment
+/// failure never receives deadline wording.
 fn provisional_window_lines(response: &server::ExecuteResponse) -> Vec<String> {
-    if response.auto_revert_durable == Some(false) {
-        if let Some(exit_code) = response.exit_code.filter(|code| *code != 0) {
-            return vec![format!(
+    if let Some(server::GateStatus::ContainmentFailed(outcome)) = response.status.as_ref() {
+        return match outcome {
+            server::ContainmentOutcome::ForwardNonzeroExit { exit_code } => vec![format!(
                 "result:  forward command failed with exit code {exit_code}; auto-revert was not armed; operator decision required"
-            )];
-        }
+            )],
+            server::ContainmentOutcome::ForwardNoExitCode => vec![
+                "result:  forward command ended without an exit code; auto-revert was not armed; operator decision required"
+                    .to_string(),
+            ],
+            server::ContainmentOutcome::PersistenceFailure {
+                command_started: false,
+                ..
+            } => vec![
+                "result:  containment failed before forward execution because durable rollback state was unavailable"
+                    .to_string(),
+            ],
+            server::ContainmentOutcome::PersistenceFailure {
+                command_started: true,
+                forward_exit_code,
+            } => match forward_exit_code {
+                Some(exit_code) if *exit_code != 0 => vec![format!(
+                    "result:  forward command exited with code {exit_code}, but its durable outcome could not be recorded; auto-revert was not armed; operator decision required"
+                )],
+                _ => vec![
+                    "result:  executed, but its durable auto-revert state could not be recorded; operator decision required"
+                        .to_string(),
+                ],
+            },
+        };
+    }
+    // Older daemons used this boolean for both forward failures and durability
+    // loss. A new client never turns that ambiguous value into an armed claim.
+    if response.auto_revert_durable == Some(false) {
         return vec![
-            "result:  executed, but its durable auto-revert state could not be recorded; operator decision required"
+            "result:  containment outcome is not durably armed; operator decision required"
                 .to_string(),
         ];
     }
@@ -198,6 +223,47 @@ fn print_provisional_window(response: &server::ExecuteResponse) {
     for line in provisional_window_lines(response) {
         eprintln!("  {line}");
     }
+}
+
+fn containment_failure_exit_code(outcome: &server::ContainmentOutcome) -> i32 {
+    match outcome {
+        server::ContainmentOutcome::ForwardNonzeroExit { exit_code } => *exit_code,
+        server::ContainmentOutcome::ForwardNoExitCode
+        | server::ContainmentOutcome::PersistenceFailure { .. } => EXIT_GUARD_ERROR,
+    }
+}
+
+fn print_containment_failure(response: &server::ExecuteResponse, streamed: bool) -> ! {
+    let color = color_enabled_for_stderr();
+    if !streamed {
+        if let Some(stdout) = &response.stdout {
+            print!("{stdout}");
+        }
+        if let Some(stderr) = &response.stderr {
+            eprint!("{stderr}");
+        }
+    }
+    eprintln!(
+        "{} containment failed: {}",
+        paint("CONTAINMENT FAILED", AnsiColor::Red, color),
+        response.reason
+    );
+    if let Some(handle) = &response.handle {
+        eprintln!("  handle:  {handle}");
+        eprintln!("  confirm: guard confirm {handle}");
+        eprintln!("  revert:  guard revert {handle}");
+        eprintln!("  inspect: guard provisionals");
+    }
+    print_provisional_window(response);
+    print_coverage(&response.coverage);
+    let server::GateStatus::ContainmentFailed(outcome) = response
+        .status
+        .as_ref()
+        .expect("containment failure status")
+    else {
+        unreachable!("containment failure renderer requires its status")
+    };
+    std::process::exit(containment_failure_exit_code(outcome));
 }
 
 fn access_request_guidance_lines(response: &server::ExecuteResponse) -> Vec<String> {
@@ -441,6 +507,9 @@ pub(crate) async fn run_exec(
             }
             return Ok(());
         }
+        Some(server::GateStatus::ContainmentFailed(_)) => {
+            print_containment_failure(&resp, streamed_output);
+        }
         Some(server::GateStatus::DryRun) => {
             let color = color_enabled_for_stdout();
             println!(
@@ -524,6 +593,9 @@ fn execute_response_envelope(
 fn exit_for_execute_response(response: &server::ExecuteResponse) -> ! {
     if response.status == Some(server::GateStatus::Held) {
         std::process::exit(EXIT_GUARD_HELD);
+    }
+    if let Some(server::GateStatus::ContainmentFailed(outcome)) = response.status.as_ref() {
+        std::process::exit(containment_failure_exit_code(outcome));
     }
     if !response.allowed {
         std::process::exit(EXIT_GUARD_DENIED);
@@ -2425,6 +2497,9 @@ fn render_gated_response(
             }
             Ok(())
         }
+        Some(server::GateStatus::ContainmentFailed(_)) => {
+            print_containment_failure(resp, streamed);
+        }
         Some(server::GateStatus::DryRun) => {
             let color = color_enabled_for_stdout();
             println!(
@@ -3202,13 +3277,13 @@ mod tests {
     }
 
     #[test]
-    fn a_current_daemon_reports_execution_without_durable_auto_revert() {
+    fn an_ambiguous_legacy_durability_flag_never_claims_an_armed_timer() {
         let mut response = provisional_response(None, None);
         response.auto_revert_durable = Some(false);
         assert_eq!(
             provisional_window_lines(&response),
             vec![
-                "result:  executed, but its durable auto-revert state could not be recorded; operator decision required"
+                "result:  containment outcome is not durably armed; operator decision required"
                     .to_string()
             ]
         );
@@ -3218,11 +3293,47 @@ mod tests {
     fn a_forward_nonzero_exit_has_failure_wording_separate_from_persistence_loss() {
         let mut response = provisional_response(None, None);
         response.exit_code = Some(17);
-        response.auto_revert_durable = Some(false);
+        response.status = Some(server::GateStatus::ContainmentFailed(
+            server::ContainmentOutcome::ForwardNonzeroExit { exit_code: 17 },
+        ));
         assert_eq!(
             provisional_window_lines(&response),
             vec![
                 "result:  forward command failed with exit code 17; auto-revert was not armed; operator decision required"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_signal_forward_failure_has_no_exit_code_wording() {
+        let mut response = provisional_response(None, None);
+        response.exit_code = None;
+        response.status = Some(server::GateStatus::ContainmentFailed(
+            server::ContainmentOutcome::ForwardNoExitCode,
+        ));
+        assert_eq!(
+            provisional_window_lines(&response),
+            vec![
+                "result:  forward command ended without an exit code; auto-revert was not armed; operator decision required"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_durability_failure_reports_whether_forward_started() {
+        let mut response = provisional_response(None, None);
+        response.status = Some(server::GateStatus::ContainmentFailed(
+            server::ContainmentOutcome::PersistenceFailure {
+                command_started: false,
+                forward_exit_code: None,
+            },
+        ));
+        assert_eq!(
+            provisional_window_lines(&response),
+            vec![
+                "result:  containment failed before forward execution because durable rollback state was unavailable"
                     .to_string()
             ]
         );
