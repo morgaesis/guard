@@ -290,6 +290,22 @@ impl AuditEvent {
     }
 }
 
+fn redact_secret_exposure(event: &AuditEvent) -> AuditEvent {
+    if event.kind != AuditKind::SecretExposed {
+        return event.clone();
+    }
+
+    let mut redacted = event.clone();
+    redacted.cmd = redacted.cmd.map(|_| "[redacted]".to_string());
+    redacted.reason = redacted.reason.map(|_| "[redacted]".to_string());
+    redacted.fields = redacted
+        .fields
+        .into_iter()
+        .map(|(key, _)| (key, "[redacted]".to_string()))
+        .collect();
+    redacted
+}
+
 fn push_field(line: &mut String, key: &str, value: &str, quoted: bool) {
     use std::fmt::Write;
     let escaped = audit_escape(value);
@@ -612,6 +628,7 @@ pub fn install_event_observer(observer: std::sync::Arc<dyn EventObserver>) {
 /// false only when a configured sink failed to append; callers gating
 /// auditable actions must then fail closed.
 pub fn emit(sink: Option<&AuditLog>, event: &AuditEvent) -> bool {
+    let event = redact_secret_exposure(event);
     // Count the event at the same choke point that renders and durably records
     // it. This is a single relaxed atomic increment inside the observer; it
     // never blocks and never sees any free-text field.
@@ -621,7 +638,7 @@ pub fn emit(sink: Option<&AuditLog>, event: &AuditEvent) -> bool {
     tracing::info!(target: "guard::audit", "[AUDIT] {}", event.render_line());
     match sink {
         None => true,
-        Some(log) => match log.append(event) {
+        Some(log) => match log.append(&event) {
             Ok(_) => true,
             Err(error) => {
                 tracing::error!(
@@ -830,5 +847,24 @@ mod tests {
             .render_line();
         assert!(!line.contains('\n'));
         assert!(line.contains("x\\n[AUDIT] ALLOWED forged"));
+    }
+
+    #[test]
+    fn secret_exposure_audit_output_redacts_sensitive_detail() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audit.jsonl");
+        let log = AuditLog::open(&path).unwrap();
+        let marker = "synthetic-sensitive-marker";
+        let event = AuditEvent::new(AuditKind::SecretExposed)
+            .cmd(marker)
+            .reason(marker)
+            .field("secret", marker);
+
+        assert!(emit(Some(&log), &event));
+        let durable = std::fs::read_to_string(path).unwrap();
+        assert!(!durable.contains(marker));
+        assert!(!redact_secret_exposure(&event)
+            .render_line()
+            .contains(marker));
     }
 }
