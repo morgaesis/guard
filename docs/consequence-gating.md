@@ -87,7 +87,7 @@ guard access list
 guard access show <request>
 guard access approve <request> --once
 guard access approve <request> --once --wait=300
-guard resume <request>
+guard approval resume <request>
 guard approval show <request>
 guard approval show <request> --wait=300
 guard access deny <request> --reason 'outside the approved task'
@@ -95,7 +95,7 @@ guard access deny <request> --reason 'outside the approved task'
 
 A consequence hold accepts only `--once`. Approval arms its immutable snapshot
 without executing it as the operator. The kernel-authenticated requester runs
-the snapshot with `guard resume <request>`, which returns its stdout, stderr,
+the snapshot with `guard approval resume <request>`, which returns its stdout, stderr,
 and exit status. Each hold can be resumed once. Bounded copies of stdout and
 stderr remain in durable approval state and identify truncation in their stored
 text. `guard approval show <request>` retrieves that terminal transcript if the

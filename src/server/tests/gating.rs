@@ -1,5 +1,5 @@
 use crate::server::admin::{
-    handle_admin_request, handle_admin_request_owned, handle_approval_note,
+    handle_admin_request_for_test, handle_admin_request_owned, handle_approval_note,
 };
 use crate::server::execute::audit_session_fingerprint;
 use crate::server::gate_runtime::{
@@ -14,7 +14,7 @@ use crate::server::gate_runtime::{
 };
 use crate::server::wire::{
     approval_is_armed, AdminRequest, AdminResponse, CallerIdentity, ExecOutcome, ExecuteRequest,
-    ExecuteResult, RevertSpec, CONSEQUENCE_ARM,
+    ExecuteResult, RevertSpec, CONSEQUENCE_ARM, CONSEQUENCE_RELEASE,
 };
 #[cfg(unix)]
 use crate::server::wire::{
@@ -58,7 +58,7 @@ async fn live_authority(cfg: &ServerContext, token: &str) -> Option<SessionAutho
 // ---- Consequence-gating orchestration tests -----------------------------
 //
 // These drive the daemon orchestration in this file (arm_containment_with_authority,
-// hold_for_approval_with_authority, handle_admin_request -> confirm/approve/deny/revert,
+// hold_for_approval_with_authority, handle_admin_request_for_test -> confirm/approve/deny/revert,
 // and the sweeper's expire/auto-revert steps) directly in-process, so the
 // invariants the Docker CTF (ctf/gating) checks end-to-end are also caught
 // by `cargo test`. Tests that must spawn a real forward/revert child use
@@ -321,7 +321,7 @@ async fn containment_records_interruption_when_client_stream_drops_after_launch(
     drop(reg);
 
     let AdminResponse::Provisionals { items } =
-        handle_admin_request(&cfg, &agent, AdminRequest::Provisionals).await
+        handle_admin_request_for_test(&cfg, &agent, AdminRequest::Provisionals).await
     else {
         panic!("requester should inspect its interrupted provisional");
     };
@@ -424,7 +424,7 @@ async fn interrupted_state_persistence_failure_can_be_confirmed_without_restart(
     let (cfg, operator, store, handle, _reverted, _temp) =
         interrupted_state_persistence_failure_fixture().await;
 
-    let response = handle_admin_request(
+    let response = handle_admin_request_for_test(
         &cfg,
         &operator,
         AdminRequest::Confirm {
@@ -454,7 +454,7 @@ async fn interrupted_state_persistence_failure_can_be_reverted_without_restart()
     let (cfg, operator, store, handle, reverted, _temp) =
         interrupted_state_persistence_failure_fixture().await;
 
-    let response = handle_admin_request(
+    let response = handle_admin_request_for_test(
         &cfg,
         &operator,
         AdminRequest::Revert {
@@ -908,7 +908,7 @@ async fn post_forward_persistence_failure_can_be_confirmed_and_converges_durably
     // A transient failure leaves the live decision actionable and exposes only
     // a stable operator message. The detailed store error stays in diagnostics.
     store.fail_next_write_for_test();
-    let failed = handle_admin_request(
+    let failed = handle_admin_request_for_test(
         &cfg,
         &operator,
         AdminRequest::Confirm {
@@ -935,7 +935,7 @@ async fn post_forward_persistence_failure_can_be_confirmed_and_converges_durably
         ProvisionalStatus::NeedsOperatorDecision
     );
 
-    let confirmed = handle_admin_request(
+    let confirmed = handle_admin_request_for_test(
         &cfg,
         &operator,
         AdminRequest::Confirm {
@@ -964,7 +964,7 @@ async fn post_forward_persistence_failure_can_be_confirmed_and_converges_durably
 async fn post_forward_persistence_failure_can_be_reverted_and_converges_durably() {
     let (cfg, operator, store, handle, _database_path, _temp) =
         post_forward_persistence_failure_fixture().await;
-    let reverted = handle_admin_request(
+    let reverted = handle_admin_request_for_test(
         &cfg,
         &operator,
         AdminRequest::Revert {
@@ -1066,7 +1066,7 @@ async fn running_containment_fixture() -> (
 async fn confirm_is_blocked_until_the_forward_command_finishes() {
     let (cfg, operator, _agent, _temp, release, _reverted, handle, task) =
         running_containment_fixture().await;
-    let blocked = handle_admin_request(
+    let blocked = handle_admin_request_for_test(
         &cfg,
         &operator,
         AdminRequest::Confirm {
@@ -1083,7 +1083,8 @@ async fn confirm_is_blocked_until_the_forward_command_finishes() {
     std::fs::write(release, b"release").expect("release forward");
     let response = task.await.expect("forward task").into_response();
     assert_eq!(response.status, Some(GateStatus::Provisional));
-    let confirmed = handle_admin_request(&cfg, &operator, AdminRequest::Confirm { handle }).await;
+    let confirmed =
+        handle_admin_request_for_test(&cfg, &operator, AdminRequest::Confirm { handle }).await;
     assert!(matches!(confirmed, AdminResponse::GateAction { .. }));
 }
 
@@ -1092,7 +1093,7 @@ async fn confirm_is_blocked_until_the_forward_command_finishes() {
 async fn revert_is_blocked_until_the_forward_command_finishes() {
     let (cfg, operator, _agent, _temp, release, reverted, handle, task) =
         running_containment_fixture().await;
-    let blocked = handle_admin_request(
+    let blocked = handle_admin_request_for_test(
         &cfg,
         &operator,
         AdminRequest::Revert {
@@ -1111,7 +1112,7 @@ async fn revert_is_blocked_until_the_forward_command_finishes() {
     let response = task.await.expect("forward task").into_response();
     assert_eq!(response.status, Some(GateStatus::Provisional));
     let reverted_response =
-        handle_admin_request(&cfg, &operator, AdminRequest::Revert { handle }).await;
+        handle_admin_request_for_test(&cfg, &operator, AdminRequest::Revert { handle }).await;
     assert!(matches!(
         reverted_response,
         AdminResponse::GateAction { .. }
@@ -1275,7 +1276,7 @@ async fn admission_denial_with_cleanup_failure_retains_non_actionable_terminal_s
         },
     ] {
         assert!(matches!(
-            handle_admin_request(&cfg, &operator, request).await,
+            handle_admin_request_for_test(&cfg, &operator, request).await,
             AdminResponse::Error { ref message }
                 if message.contains("forward command did not execute")
         ));
@@ -1394,7 +1395,7 @@ async fn forward_nonzero_exit_is_durable_failure_without_auto_revert() {
     assert_eq!(live[0].forward_outcome(), "failed");
     assert!(!live[0].forward_persistence_failed);
     let AdminResponse::Provisionals { items } =
-        handle_admin_request(&cfg, &agent, AdminRequest::Provisionals).await
+        handle_admin_request_for_test(&cfg, &agent, AdminRequest::Provisionals).await
     else {
         panic!("requester should inspect failed provisional");
     };
@@ -1639,7 +1640,7 @@ async fn contain_then_operator_confirm_keeps_change_nonoperator_refused() {
 
     // A non-operator (uid != daemon_principal) cannot confirm: validate_admin
     // refuses before handle_confirm runs, so the row is untouched.
-    let refused = handle_admin_request(
+    let refused = handle_admin_request_for_test(
         &cfg,
         &agent,
         AdminRequest::Confirm {
@@ -1670,7 +1671,7 @@ async fn contain_then_operator_confirm_keeps_change_nonoperator_refused() {
 
     // The operator confirms: the change is kept and the auto-revert is
     // cancelled.
-    let ok = handle_admin_request(
+    let ok = handle_admin_request_for_test(
         &cfg,
         &operator,
         AdminRequest::Confirm {
@@ -2677,7 +2678,7 @@ async fn session_status_does_not_cross_expose_same_principal_provisionals() {
         });
     }
 
-    let response = handle_admin_request(
+    let response = handle_admin_request_for_test(
         &cfg,
         &agent,
         AdminRequest::SessionStatus {
@@ -2764,7 +2765,7 @@ async fn hold_approval_arms_then_requester_resumes_once_with_output() {
     );
 
     // Non-operator approve is refused; the hold stays pending.
-    let refused = handle_admin_request(
+    let refused = handle_admin_request_for_test(
         &cfg,
         &agent,
         AdminRequest::Approve {
@@ -2795,7 +2796,7 @@ async fn hold_approval_arms_then_requester_resumes_once_with_output() {
 
     // A budget other than one use is the only rejected form: the snapshot
     // cannot honour it. No use flag means the one legal thing.
-    let response = handle_admin_request(
+    let response = handle_admin_request_for_test(
         &cfg,
         &operator,
         AdminRequest::AccessApprove {
@@ -2822,7 +2823,7 @@ async fn hold_approval_arms_then_requester_resumes_once_with_output() {
     );
 
     // Operator approval arms the snapshot and returns without executing it.
-    let ok = handle_admin_request(
+    let ok = handle_admin_request_for_test(
         &cfg,
         &operator,
         AdminRequest::AccessApprove {
@@ -2857,14 +2858,14 @@ async fn hold_approval_arms_then_requester_resumes_once_with_output() {
         ApprovalStatus::Pending
     );
     let AdminResponse::Approvals { items } =
-        handle_admin_request(&cfg, &agent, AdminRequest::ApprovalList).await
+        handle_admin_request_for_test(&cfg, &agent, AdminRequest::ApprovalList).await
     else {
         panic!("requester should list its armed hold")
     };
     assert_eq!(items[0].status, "armed");
 
     let wrong_requester = CallerIdentity::Unix { uid: 1001 };
-    let refused = handle_admin_request(
+    let refused = handle_admin_request_for_test(
         &cfg,
         &wrong_requester,
         AdminRequest::Resume {
@@ -2875,7 +2876,7 @@ async fn hold_approval_arms_then_requester_resumes_once_with_output() {
     assert!(matches!(refused, AdminResponse::Error { .. }));
     assert!(!marker.exists());
 
-    let resumed = handle_admin_request(
+    let resumed = handle_admin_request_for_test(
         &cfg,
         &agent,
         AdminRequest::Resume {
@@ -2907,7 +2908,7 @@ async fn hold_approval_arms_then_requester_resumes_once_with_output() {
             .status,
         ApprovalStatus::Approved
     );
-    let replay = handle_admin_request(
+    let replay = handle_admin_request_for_test(
         &cfg,
         &agent,
         AdminRequest::Resume {
@@ -2917,7 +2918,7 @@ async fn hold_approval_arms_then_requester_resumes_once_with_output() {
     .await;
     assert!(matches!(replay, AdminResponse::Error { .. }));
 
-    let AdminResponse::AccessItem { item } = handle_admin_request(
+    let AdminResponse::AccessItem { item } = handle_admin_request_for_test(
         &cfg,
         &agent,
         AdminRequest::AccessShow {
@@ -2985,7 +2986,7 @@ async fn armed_hold_survives_restart_and_persists_bounded_transcript() {
     let ExecOutcome::Held { handle, .. } = held.exec else {
         panic!("expected held command")
     };
-    let armed = handle_admin_request(
+    let armed = handle_admin_request_for_test(
         &cfg,
         &operator,
         AdminRequest::AccessApprove {
@@ -3009,7 +3010,7 @@ async fn armed_hold_survives_restart_and_persists_bounded_transcript() {
     restarted.state.session_store = Some(store.clone());
     *restarted.state.approvals.write().await = registry;
 
-    let resumed = handle_admin_request(
+    let resumed = handle_admin_request_for_test(
         &restarted,
         &requester,
         AdminRequest::Resume {
@@ -3095,7 +3096,7 @@ async fn armed_hold_expires_across_restart_without_execution() {
     let ExecOutcome::Held { handle, .. } = held.exec else {
         panic!("expected held command")
     };
-    let _ = handle_admin_request(
+    let _ = handle_admin_request_for_test(
         &cfg,
         &operator,
         AdminRequest::AccessApprove {
@@ -3114,7 +3115,7 @@ async fn armed_hold_expires_across_restart_without_execution() {
     let (mut restarted, _operator, requester) = gating_config(7_043, 1_000);
     restarted.state.session_store = Some(store.clone());
     *restarted.state.approvals.write().await = registry;
-    let response = handle_admin_request(
+    let response = handle_admin_request_for_test(
         &restarted,
         &requester,
         AdminRequest::Resume {
@@ -3150,7 +3151,7 @@ async fn access_projection_excludes_and_rejects_legacy_sessions() {
     }
 
     let AdminResponse::AccessItems { items } =
-        handle_admin_request(&cfg, &agent, AdminRequest::AccessList).await
+        handle_admin_request_for_test(&cfg, &agent, AdminRequest::AccessList).await
     else {
         panic!("expected access list")
     };
@@ -3162,7 +3163,7 @@ async fn access_projection_excludes_and_rejects_legacy_sessions() {
     ));
 
     assert!(matches!(
-        handle_admin_request(
+        handle_admin_request_for_test(
             &cfg,
             &operator,
             AdminRequest::AccessShow {
@@ -3172,7 +3173,7 @@ async fn access_projection_excludes_and_rejects_legacy_sessions() {
         .await,
         AdminResponse::Error { .. }
     ));
-    let AdminResponse::AccessItem { item } = handle_admin_request(
+    let AdminResponse::AccessItem { item } = handle_admin_request_for_test(
         &cfg,
         &agent,
         AdminRequest::AccessShow {
@@ -3185,7 +3186,7 @@ async fn access_projection_excludes_and_rejects_legacy_sessions() {
     };
     assert_eq!(item.kind, "session");
 
-    let AdminResponse::SessionStatus { report, .. } = handle_admin_request(
+    let AdminResponse::SessionStatus { report, .. } = handle_admin_request_for_test(
         &cfg,
         &agent,
         AdminRequest::AccessStatus {
@@ -3201,7 +3202,7 @@ async fn access_projection_excludes_and_rejects_legacy_sessions() {
         Some("(current)")
     );
     assert!(matches!(
-        handle_admin_request(
+        handle_admin_request_for_test(
             &cfg,
             &operator,
             AdminRequest::AccessStatus {
@@ -3255,7 +3256,7 @@ async fn held_access_projection_expires_before_the_sweeper_and_hides_approval_op
     });
 
     let AdminResponse::AccessItems { items } =
-        handle_admin_request(&cfg, &agent, AdminRequest::AccessList).await
+        handle_admin_request_for_test(&cfg, &agent, AdminRequest::AccessList).await
     else {
         panic!("expected access list")
     };
@@ -3271,7 +3272,7 @@ async fn held_access_projection_expires_before_the_sweeper_and_hides_approval_op
     assert_eq!(listed.kind, "hold");
     assert_eq!(listed.consequence, CONSEQUENCE_ARM);
 
-    let AdminResponse::AccessItem { item: shown } = handle_admin_request(
+    let AdminResponse::AccessItem { item: shown } = handle_admin_request_for_test(
         &cfg,
         &agent,
         AdminRequest::AccessShow {
@@ -3400,7 +3401,7 @@ async fn held_snapshot_consumes_its_originating_once_authority() {
         vec!["gr-origin".to_string()]
     );
 
-    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
         &cfg,
         &operator,
         AdminRequest::AccessApprove {
@@ -3418,7 +3419,7 @@ async fn held_snapshot_consumes_its_originating_once_authority() {
     assert_eq!(items[0].remaining_uses, Some(1));
     let resumed = resume_approval(&cfg, &agent, &handle).await;
     assert!(matches!(resumed.exec, ExecOutcome::Completed { .. }));
-    let AdminResponse::AccessDecisions { items: replay, .. } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items: replay, .. } = handle_admin_request_for_test(
         &cfg,
         &operator,
         AdminRequest::AccessApprove {
@@ -3567,7 +3568,7 @@ async fn held_snapshot_does_not_fall_through_to_overlapping_authority() {
         .await
         .consume_access_use("access-token", &selected_verbs, Some(&origin))
         .expect("consume the bound origin before approval");
-    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
         &cfg,
         &operator,
         AdminRequest::AccessApprove {
@@ -3699,7 +3700,7 @@ async fn held_snapshot_binds_and_consumes_multiple_originating_requests() {
         vec!["request-a".to_string(), "request-b".to_string()]
     );
 
-    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
         &cfg,
         &operator,
         AdminRequest::AccessApprove {
@@ -4014,7 +4015,7 @@ async fn approval_rejects_tool_secret_rotated_after_hold() {
         .set(&principal, "broker/token", "rotated-value")
         .await
         .unwrap();
-    let response = handle_admin_request(
+    let response = handle_admin_request_for_test(
         &cfg,
         &operator,
         AdminRequest::AccessApprove {
@@ -4195,7 +4196,7 @@ async fn approval_state_must_be_durable_before_a_held_snapshot_executes() {
         .as_ref()
         .unwrap()
         .fail_next_write_for_test();
-    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request(
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
         &cfg,
         &operator,
         AdminRequest::AccessApprove {
@@ -4322,7 +4323,7 @@ async fn kube_proxy_hold_routes_through_approval_queue() {
             .as_deref(),
         Some("session-revision")
     );
-    let resp = handle_admin_request(
+    let resp = handle_admin_request_for_test(
         &cfg,
         &operator,
         AdminRequest::AccessApprove {
@@ -4377,7 +4378,7 @@ async fn kube_proxy_hold_routes_through_approval_queue() {
         guard::proxy::GateSink::hold_request(&*s, &snapshot, "namespace delete", None).await
     });
     let handle = wait_for_pending_hold(&cfg).await;
-    let resp = handle_admin_request(
+    let resp = handle_admin_request_for_test(
         &cfg,
         &operator,
         AdminRequest::Deny {
@@ -4578,7 +4579,7 @@ async fn waiting_requester_resumes_armed_hold_and_receives_terminal_output() {
         .await
     });
     let handle = wait_for_pending_hold(&cfg).await;
-    let approval = handle_admin_request(
+    let approval = handle_admin_request_for_test(
         &cfg,
         &operator,
         AdminRequest::AccessApprove {
@@ -5115,7 +5116,7 @@ async fn approval_note_operator_and_owner_post_others_refused() {
     // Only the requester can withdraw its hold. Withdrawal is a terminal
     // denial, so execution never becomes claimable and the thread freezes.
     assert!(matches!(
-        handle_admin_request(
+        handle_admin_request_for_test(
             &cfg,
             &stranger,
             AdminRequest::ApprovalWithdraw {
@@ -5126,7 +5127,7 @@ async fn approval_note_operator_and_owner_post_others_refused() {
         AdminResponse::Error { .. }
     ));
     assert!(matches!(
-        handle_admin_request(
+        handle_admin_request_for_test(
             &cfg,
             &agent,
             AdminRequest::ApprovalWithdraw {
@@ -5242,6 +5243,232 @@ async fn one_rpc_approval_wait_returns_owned_armed_outcome() {
     assert_eq!(cfg.state.approvals.read().await.active_waiters(handle), 0);
 }
 
+#[tokio::test]
+async fn one_rpc_approval_wait_returns_failed_terminal_and_timeout_outcomes() {
+    for (status, expected) in [
+        (ApprovalStatus::Denied, "denied"),
+        (ApprovalStatus::Expired, "expired"),
+        (ApprovalStatus::ExecFailed, "exec_failed"),
+    ] {
+        let (cfg, operator, agent) = gating_config(7007, 1000);
+        let handle = format!("one-rpc-{expected}");
+        let mut approval = held_verb_approval(&handle, None, None, agent.principal());
+        approval.status = status;
+        approval.decided_unix = Some(now_unix());
+        approval.decided_reason = Some(expected.to_string());
+        cfg.state.approvals.write().await.enqueue(approval);
+
+        let owned = handle_admin_request_owned(
+            &cfg,
+            &operator,
+            AdminRequest::AccessApprove {
+                handles: vec![handle],
+                uses: Some(1),
+                wait_secs: Some(1),
+            },
+        )
+        .await;
+        let AdminResponse::AccessDecisions {
+            items,
+            wait: Some(wait),
+        } = &owned.response
+        else {
+            panic!("expected failed decision with an observed terminal row")
+        };
+        assert!(!items[0].success);
+        assert_eq!(wait.outcome, expected);
+        assert_eq!(wait.item.status, expected);
+    }
+
+    for (status, uses) in [
+        (ApprovalStatus::Pending, Some(2)),
+        (ApprovalStatus::Approving, Some(1)),
+    ] {
+        let (cfg, operator, agent) = gating_config(7007, 1000);
+        let handle = format!("one-rpc-timeout-{}", status.as_str());
+        let mut approval = held_verb_approval(&handle, None, None, agent.principal());
+        approval.status = status;
+        cfg.state.approvals.write().await.enqueue(approval);
+
+        let owned = handle_admin_request_owned(
+            &cfg,
+            &operator,
+            AdminRequest::AccessApprove {
+                handles: vec![handle],
+                uses,
+                wait_secs: Some(1),
+            },
+        )
+        .await;
+        let AdminResponse::AccessDecisions {
+            items,
+            wait: Some(wait),
+        } = &owned.response
+        else {
+            panic!("expected failed decision with a timeout observation")
+        };
+        assert!(!items[0].success);
+        assert_eq!(wait.outcome, "timed_out");
+        assert_eq!(wait.item.status, status.as_str());
+    }
+}
+
+#[tokio::test]
+async fn access_audience_controls_hold_visibility_and_next_action() {
+    let (cfg, operator, owner) = gating_config(7007, 1000);
+    let unrelated = CallerIdentity::Unix { uid: 1001 };
+    let handle = "audience-hold";
+    cfg.state
+        .approvals
+        .write()
+        .await
+        .enqueue(held_verb_approval(handle, None, None, owner.principal()));
+
+    let AdminResponse::AccessItem { item: owner_item } = handle_admin_request_for_test(
+        &cfg,
+        &owner,
+        AdminRequest::AccessShow {
+            reference: handle.to_string(),
+        },
+    )
+    .await
+    else {
+        panic!("owner must see its hold")
+    };
+    assert_eq!(
+        owner_item.next_action,
+        format!("guard approval show {handle} --wait")
+    );
+
+    let AdminResponse::AccessItem {
+        item: operator_item,
+    } = handle_admin_request_for_test(
+        &cfg,
+        &operator,
+        AdminRequest::AccessShow {
+            reference: handle.to_string(),
+        },
+    )
+    .await
+    else {
+        panic!("operator must see the hold")
+    };
+    assert_eq!(
+        operator_item.next_action,
+        format!("guard access approve {handle} --once")
+    );
+
+    assert!(matches!(
+        handle_admin_request_for_test(
+            &cfg,
+            &unrelated,
+            AdminRequest::AccessShow {
+                reference: handle.to_string()
+            }
+        )
+        .await,
+        AdminResponse::Error { .. }
+    ));
+    let AdminResponse::AccessItems { items } =
+        handle_admin_request_for_test(&cfg, &unrelated, AdminRequest::AccessList).await
+    else {
+        panic!("unrelated caller receives a scoped list")
+    };
+    assert!(items.iter().all(|item| item.reference != handle));
+}
+
+#[tokio::test]
+async fn lost_one_rpc_response_leaves_one_durable_mutation() {
+    let (cfg, operator, agent) = gating_config(7007, 1000);
+    let handle = "lost-one-rpc-response";
+    cfg.state
+        .approvals
+        .write()
+        .await
+        .enqueue(held_verb_approval(handle, None, None, agent.principal()));
+
+    let owned = handle_admin_request_owned(
+        &cfg,
+        &operator,
+        AdminRequest::AccessApprove {
+            handles: vec![handle.to_string()],
+            uses: Some(1),
+            wait_secs: Some(30),
+        },
+    )
+    .await;
+    drop(owned);
+    assert!(approval_is_armed(
+        cfg.state.approvals.read().await.get(handle).unwrap()
+    ));
+
+    let AdminResponse::AccessDecisions { items, .. } = handle_admin_request_for_test(
+        &cfg,
+        &operator,
+        AdminRequest::AccessApprove {
+            handles: vec![handle.to_string()],
+            uses: Some(1),
+            wait_secs: None,
+        },
+    )
+    .await
+    else {
+        panic!("repeat observation returns a decision row")
+    };
+    assert!(!items[0].success);
+    assert_eq!(items[0].state, "armed");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn one_rpc_release_wait_returns_approved_outcome() {
+    let (cfg, operator, _agent) = gating_config(7013, 1000);
+    let sink = Arc::new(DaemonGateSink {
+        server: cfg.clone(),
+        endpoint: "default".to_string(),
+        protocol: "kubernetes".to_string(),
+        snapshot_dir: std::env::temp_dir(),
+        snapshot_dir_safe: true,
+        window_secs: 60,
+    });
+    let waiter = tokio::spawn(async move {
+        let snapshot = guard::proxy::ApiHoldSnapshot {
+            label: "release operation".to_string(),
+            body_sha256: "body-digest".to_string(),
+            redacted_body_shape: "(no body)".to_string(),
+            redacted_query: String::new(),
+            authority_selectors: Default::default(),
+        };
+        guard::proxy::GateSink::hold_request(&*sink, &snapshot, "release review", None).await
+    });
+    let handle = wait_for_pending_hold(&cfg).await;
+    let owned = handle_admin_request_owned(
+        &cfg,
+        &operator,
+        AdminRequest::AccessApprove {
+            handles: vec![handle.clone()],
+            uses: Some(1),
+            wait_secs: Some(30),
+        },
+    )
+    .await;
+    let AdminResponse::AccessDecisions {
+        items,
+        wait: Some(wait),
+    } = &owned.response
+    else {
+        panic!("expected release decision and outcome")
+    };
+    assert!(items[0].success);
+    assert_eq!(items[0].consequence, CONSEQUENCE_RELEASE);
+    assert_eq!(wait.outcome, "approved");
+    assert_eq!(wait.item.status, "approved");
+    assert!(matches!(
+        waiter.await.unwrap(),
+        guard::proxy::HoldDecision::Approved { .. }
+    ));
+}
+
 /// approve of a legacy row (no stored verb digest) after the verb catalog
 /// version changed is voided: without a digest the whole-catalog version is
 /// the only binding, so the approved artifact may no longer mean what the
@@ -5264,7 +5491,7 @@ async fn approve_voided_when_verb_catalog_version_changed() {
     );
     cfg.state.approvals.write().await.enqueue(approval);
 
-    let voided = handle_admin_request(
+    let voided = handle_admin_request_for_test(
         &cfg,
         &operator,
         AdminRequest::Approve {
@@ -5334,7 +5561,7 @@ async fn approve_survives_unrelated_verb_append() {
     );
     *cfg.state.verbs.write().await = appended;
 
-    let response = handle_admin_request(
+    let response = handle_admin_request_for_test(
         &cfg,
         &operator,
         AdminRequest::Approve {
@@ -5418,7 +5645,7 @@ async fn approve_voided_when_matched_verb_definition_changed() {
     );
     *cfg.state.verbs.write().await = changed;
 
-    let voided = handle_admin_request(
+    let voided = handle_admin_request_for_test(
         &cfg,
         &operator,
         AdminRequest::Approve {

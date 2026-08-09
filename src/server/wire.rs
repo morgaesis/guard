@@ -9,6 +9,7 @@ use guard::gating::approval::{bound_approval_transcript, Approval, WaiterLease};
 use guard::gating::provisional::{Provisional, ProvisionalStatus};
 use guard::gating::{Coverage, DecisionTrace, DecisionVerbMatch};
 use guard::principal::PrincipalKey;
+use guard::redact::redact_output_text;
 use serde::{Deserialize, Serialize};
 
 use super::execute::audit_session_fingerprint;
@@ -899,8 +900,9 @@ pub struct AccessItem {
     pub expires_unix: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remaining_uses: Option<u64>,
-    /// `none`, `not-yet-granted`, `unlimited`, `bounded`, or `unavailable`.
-    /// A hold has no use budget in any state and reports `none`.
+    /// `unselected`, `unlimited`, `bounded`, or `unavailable`. A pending hold
+    /// is `unselected` with a bounded one-use default; decided holds report
+    /// the budget attached to their resulting access state.
     pub use_policy: String,
     /// Consequence class of approving this reference: `grant`, `arm`, or
     /// `release`. Absent from a daemon that predates the field, where the

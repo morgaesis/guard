@@ -1328,6 +1328,34 @@ fn access_use_policy(uses: Option<(Option<u64>, Option<u64>)>) -> &'static str {
     }
 }
 
+#[derive(Clone)]
+struct AccessAudience {
+    is_operator: bool,
+    principal: Option<PrincipalKey>,
+}
+
+impl AccessAudience {
+    fn from_caller(server: &ServerContext, caller: &CallerIdentity) -> Self {
+        Self {
+            is_operator: caller_is_session_admin(server, caller),
+            principal: caller.principal(),
+        }
+    }
+
+    fn can_view_principal(&self, owner: &Option<PrincipalKey>) -> bool {
+        owner.is_some() && (self.is_operator || scope_eq(owner, &self.principal))
+    }
+
+    fn can_view_session(&self, summary: &SessionGrantSummary) -> bool {
+        self.is_operator
+            || matches!(
+                &summary.owner,
+                SessionOwner::Principal(owner)
+                    if self.principal.as_ref().is_some_and(|caller| owner.eq_ci(caller))
+            )
+    }
+}
+
 async fn approved_access_request_is_usable(server: &ServerContext, request: &GrantRequest) -> bool {
     if request.status != GrantRequestStatus::Approved || request.session_token.is_empty() {
         return false;
@@ -1401,8 +1429,9 @@ fn hold_next_action(handle: &str, state: &str, is_operator: bool) -> String {
 async fn access_item_for_approval(
     server: &ServerContext,
     approval: &Approval,
-    is_operator: bool,
+    audience: &AccessAudience,
 ) -> AccessItem {
+    debug_assert!(audience.can_view_principal(&approval.snapshot.principal));
     let projected_expired =
         approval.status == ApprovalStatus::Pending && now_unix() >= approval.deadline_unix();
     let projected_state = if projected_expired {
@@ -1478,7 +1507,7 @@ async fn access_item_for_approval(
         default_use_policy: awaiting_decision.then(|| "bounded".to_string()),
         default_uses: awaiting_decision.then_some(1),
         state: projected_state.to_string(),
-        next_action: hold_next_action(&approval.handle, projected_state, is_operator),
+        next_action: hold_next_action(&approval.handle, projected_state, audience.is_operator),
         approval_options: if awaiting_decision {
             vec![format!("guard access approve {} --once", approval.handle)]
         } else {
@@ -1493,8 +1522,9 @@ async fn access_item_for_approval(
 async fn access_item_for_request(
     server: &ServerContext,
     request: &GrantRequest,
-    is_operator: bool,
+    audience: &AccessAudience,
 ) -> AccessItem {
+    debug_assert!(audience.can_view_principal(&request.requester));
     let mut target = request
         .target
         .clone()
@@ -1574,7 +1604,10 @@ async fn access_item_for_request(
             .then_some(request.requested_uses)
             .flatten(),
         state: state.to_string(),
-        next_action: if request.status == GrantRequestStatus::Pending && !expired && is_operator {
+        next_action: if request.status == GrantRequestStatus::Pending
+            && !expired
+            && audience.is_operator
+        {
             format!("guard access approve {}", request.handle)
         } else {
             format!("guard access show {}", request.handle)
@@ -1597,7 +1630,9 @@ async fn access_item_for_request(
 async fn access_item_for_session(
     server: &ServerContext,
     summary: &SessionGrantSummary,
+    audience: &AccessAudience,
 ) -> AccessItem {
+    debug_assert!(audience.can_view_session(summary));
     let reference = session_reference(&summary.token);
     let target = summary
         .scope
@@ -1662,6 +1697,7 @@ pub(super) async fn submit_access_request(
     intent: &str,
     requested_uses: Option<u64>,
 ) -> Result<AccessItem, String> {
+    let audience = AccessAudience::from_caller(server, caller);
     let intent = redact_output_text(&validate_access_intent(intent)?);
     let caller_principal = if explicit_target.is_none() {
         Some(authenticated_local_principal(caller)?)
@@ -1746,7 +1782,7 @@ pub(super) async fn submit_access_request(
             if explicit_target.is_some()
                 || approved_access_request_is_usable(server, &existing).await
             {
-                return Ok(access_item_for_request(server, &existing, false).await);
+                return Ok(access_item_for_request(server, &existing, &audience).await);
             }
         }
     }
@@ -1784,7 +1820,7 @@ pub(super) async fn submit_access_request(
             .cloned()
         {
             drop(requests);
-            return Ok(access_item_for_request(server, &existing, false).await);
+            return Ok(access_item_for_request(server, &existing, &audience).await);
         }
         if requests.len() >= MAX_GRANT_REQUESTS {
             return Err("access request queue is full".to_string());
@@ -1850,7 +1886,7 @@ pub(super) async fn submit_access_request(
             })
             .cloned()
         {
-            return Ok(access_item_for_request(server, &existing, false).await);
+            return Ok(access_item_for_request(server, &existing, &audience).await);
         }
         if let Some(token) = session_token {
             let summary = server
@@ -1862,7 +1898,7 @@ pub(super) async fn submit_access_request(
                 .into_iter()
                 .find(|summary| summary.token == token)
                 .ok_or_else(|| "access target expired while resolving".to_string())?;
-            return Ok(access_item_for_session(server, &summary).await);
+            return Ok(access_item_for_session(server, &summary, &audience).await);
         }
         return Ok(AccessItem {
             reference: "baseline".to_string(),
@@ -1931,7 +1967,7 @@ pub(super) async fn submit_access_request(
             && existing.issued_session_revision == session_revision)
             || approved_access_request_is_usable(server, &existing).await;
         if reusable {
-            return Ok(access_item_for_request(server, &existing, false).await);
+            return Ok(access_item_for_request(server, &existing, &audience).await);
         }
     }
     {
@@ -1966,7 +2002,7 @@ pub(super) async fn submit_access_request(
         .await
         .insert(request.handle.clone(), request.clone());
     emit_grant_request_event(server, &request, "access_request_submitted");
-    Ok(access_item_for_request(server, &request, false).await)
+    Ok(access_item_for_request(server, &request, &audience).await)
 }
 
 fn new_access_session(requester: PrincipalKey, label: String, expires_at: u64) -> SessionGrant {
@@ -2114,6 +2150,7 @@ async fn approve_access_request(
     server: &ServerContext,
     handle: &str,
     uses: Option<u64>,
+    audience: &AccessAudience,
 ) -> AccessDecisionResult {
     let _transition = server.state.grant_request_transition_gate.lock().await;
     let Some(pending) = server
@@ -2160,7 +2197,7 @@ async fn approve_access_request(
         };
     }
     if pending.status == GrantRequestStatus::Approved {
-        let item = access_item_for_request(server, &pending, true).await;
+        let item = access_item_for_request(server, &pending, audience).await;
         return AccessDecisionResult {
             request: handle.to_string(),
             success: true,
@@ -2478,6 +2515,7 @@ async fn approve_held_access(
     caller: &CallerIdentity,
     handle: &str,
     uses: Option<u64>,
+    audience: &AccessAudience,
 ) -> AccessDecisionResult {
     let transition = server.state.grant_request_transition_gate.lock().await;
     let Some(approval) = server.state.approvals.read().await.get(handle).cloned() else {
@@ -2493,7 +2531,7 @@ async fn approve_held_access(
         };
     };
     if approval_is_armed(&approval) {
-        let item = access_item_for_approval(server, &approval, true).await;
+        let item = access_item_for_approval(server, &approval, audience).await;
         return AccessDecisionResult {
             request: handle.to_string(),
             success: false,
@@ -2506,7 +2544,7 @@ async fn approve_held_access(
         };
     }
     if approval.status != ApprovalStatus::Pending {
-        let item = access_item_for_approval(server, &approval, true).await;
+        let item = access_item_for_approval(server, &approval, audience).await;
         return AccessDecisionResult {
             request: handle.to_string(),
             success: false,
@@ -3290,17 +3328,14 @@ async fn handle_session_appeal(
 }
 
 async fn list_access_items(server: &ServerContext, caller: &CallerIdentity) -> AdminResponse {
-    let admin = caller_is_session_admin(server, caller);
-    let principal = caller.principal();
+    let audience = AccessAudience::from_caller(server, caller);
     let requests = server
         .state
         .grant_requests
         .read()
         .await
         .values()
-        .filter(|request| {
-            request.requester.is_some() && (admin || scope_eq(&request.requester, &principal))
-        })
+        .filter(|request| audience.can_view_principal(&request.requester))
         .cloned()
         .collect::<Vec<_>>();
     let sessions = server
@@ -3310,15 +3345,7 @@ async fn list_access_items(server: &ServerContext, caller: &CallerIdentity) -> A
         .await
         .list()
         .into_iter()
-        .filter(|summary| {
-            summary.scope.access_managed
-                && (admin
-                    || matches!(
-                        &summary.owner,
-                        SessionOwner::Principal(owner)
-                            if principal.as_ref().is_some_and(|caller| owner.eq_ci(caller))
-                    ))
-        })
+        .filter(|summary| summary.scope.access_managed && audience.can_view_session(summary))
         .collect::<Vec<_>>();
     let approvals = server
         .state
@@ -3327,20 +3354,17 @@ async fn list_access_items(server: &ServerContext, caller: &CallerIdentity) -> A
         .await
         .list()
         .into_iter()
-        .filter(|approval| {
-            approval.snapshot.principal.is_some()
-                && (admin || scope_eq(&approval.snapshot.principal, &principal))
-        })
+        .filter(|approval| audience.can_view_principal(&approval.snapshot.principal))
         .collect::<Vec<_>>();
     let mut items = Vec::with_capacity(requests.len() + sessions.len() + approvals.len());
     for request in requests {
-        items.push(access_item_for_request(server, &request, admin).await);
+        items.push(access_item_for_request(server, &request, &audience).await);
     }
     for approval in approvals {
-        items.push(access_item_for_approval(server, &approval, admin).await);
+        items.push(access_item_for_approval(server, &approval, &audience).await);
     }
     for summary in sessions {
-        items.push(access_item_for_session(server, &summary).await);
+        items.push(access_item_for_session(server, &summary, &audience).await);
     }
     items.sort_by(|left, right| {
         left.requester
@@ -3356,21 +3380,18 @@ async fn show_access_item(
     caller: &CallerIdentity,
     reference: &str,
 ) -> AdminResponse {
-    let admin = caller_is_session_admin(server, caller);
-    let principal = caller.principal();
+    let audience = AccessAudience::from_caller(server, caller);
     if let Some(request) = server
         .state
         .grant_requests
         .read()
         .await
         .get(reference)
-        .filter(|request| {
-            request.requester.is_some() && (admin || scope_eq(&request.requester, &principal))
-        })
+        .filter(|request| audience.can_view_principal(&request.requester))
         .cloned()
     {
         AdminResponse::AccessItem {
-            item: access_item_for_request(server, &request, admin).await,
+            item: access_item_for_request(server, &request, &audience).await,
         }
     } else if let Some(approval) = server
         .state
@@ -3378,14 +3399,11 @@ async fn show_access_item(
         .read()
         .await
         .get(reference)
-        .filter(|approval| {
-            approval.snapshot.principal.is_some()
-                && (admin || scope_eq(&approval.snapshot.principal, &principal))
-        })
+        .filter(|approval| audience.can_view_principal(&approval.snapshot.principal))
         .cloned()
     {
         AdminResponse::AccessItem {
-            item: access_item_for_approval(server, &approval, admin).await,
+            item: access_item_for_approval(server, &approval, &audience).await,
         }
     } else {
         let mut candidates = server
@@ -3395,15 +3413,7 @@ async fn show_access_item(
             .await
             .list()
             .into_iter()
-            .filter(|summary| {
-                summary.scope.access_managed
-                    && (admin
-                        || matches!(
-                            &summary.owner,
-                            SessionOwner::Principal(owner)
-                                if principal.as_ref().is_some_and(|caller| owner.eq_ci(caller))
-                        ))
-            })
+            .filter(|summary| summary.scope.access_managed && audience.can_view_session(summary))
             .filter(|summary| {
                 summary.scope.label.as_deref() == Some(reference)
                     || session_reference(&summary.token) == reference
@@ -3412,7 +3422,7 @@ async fn show_access_item(
         candidates.sort_by(|left, right| left.token.cmp(&right.token));
         match candidates.as_slice() {
             [summary] => AdminResponse::AccessItem {
-                item: access_item_for_session(server, summary).await,
+                item: access_item_for_session(server, summary, &audience).await,
             },
             [] => AdminResponse::Error {
                 message: "unknown or unauthorized access reference".to_string(),
@@ -3526,7 +3536,7 @@ async fn session_status_response(
     }
 }
 
-pub(super) async fn handle_admin_request(
+async fn dispatch_admin_request(
     server: &ServerContext,
     caller: &CallerIdentity,
     request: AdminRequest,
@@ -4340,9 +4350,9 @@ pub(super) async fn handle_admin_request(
             }
         }
         AdminRequest::ApprovalWait {
-            handle,
-            timeout_secs,
-        } => handle_approval_wait(server, caller, &handle, timeout_secs).await,
+            handle: _,
+            timeout_secs: _,
+        } => unreachable!("approval waits use the owned admin entry point"),
         AdminRequest::ApprovalNote { handle, text } => {
             handle_approval_note(server, caller, &handle, &text).await
         }
@@ -5230,6 +5240,7 @@ pub(super) async fn handle_admin_request(
                     message: "approval wait must use the one-RPC admin path".to_string(),
                 };
             }
+            let audience = AccessAudience::from_caller(server, caller);
             let mut items = Vec::with_capacity(handles.len());
             for handle in handles {
                 // Resolve the class before deciding: approving a release-class
@@ -5243,9 +5254,9 @@ pub(super) async fn handle_admin_request(
                     .await
                     .contains_key(&handle)
                 {
-                    approve_access_request(server, &handle, uses).await
+                    approve_access_request(server, &handle, uses, &audience).await
                 } else {
-                    approve_held_access(server, caller, &handle, uses).await
+                    approve_held_access(server, caller, &handle, uses, &audience).await
                 };
                 item.consequence = consequence;
                 items.push(item);
@@ -5394,7 +5405,15 @@ pub(super) async fn handle_admin_request(
             uses,
         } => match submit_access_request(server, caller, Some(&target), &intent, uses).await {
             Ok(item) if item.kind == "request" => AdminResponse::AccessDecisions {
-                items: vec![approve_access_request(server, &item.reference, uses).await],
+                items: vec![
+                    approve_access_request(
+                        server,
+                        &item.reference,
+                        uses,
+                        &AccessAudience::from_caller(server, caller),
+                    )
+                    .await,
+                ],
                 wait: None,
             },
             Ok(item) => AdminResponse::AccessDecisions {
@@ -6865,12 +6884,7 @@ async fn handle_approve(
             message: format!("no approval with handle '{handle}'"),
         };
     };
-    let api_hold = is_api_proxy_sentinel(&approval.snapshot.binary)
-        && matches!(
-            &approval.snapshot.principal,
-            Some(principal) if server.config.daemon_principal.eq_ci(principal)
-        );
-    if !api_hold {
+    if !is_release_class(server, &approval.snapshot) {
         return arm_held_command(server, caller, approval).await;
     }
     let snapshot = match claim_approval(server, handle).await {
@@ -6908,76 +6922,6 @@ async fn approval_scope_check(
             Ok((approval, is_operator))
         }
         _ => Err(approval_not_found(handle)),
-    }
-}
-
-/// Block until one hold is armed or terminal, then return the same summary
-/// `ApprovalShow` returns. Arming is not terminal: the row stays `Pending` with
-/// the durable arm marker until its owner resumes it, so a requester waiting to
-/// run its command and an operator waiting for the transcript both return at
-/// the moment that concerns them, and `ApprovalSummary.status` tells them
-/// which happened. On timeout the current (still pending) summary comes back.
-async fn handle_approval_wait(
-    server: &ServerContext,
-    caller: &CallerIdentity,
-    handle: &str,
-    timeout_secs: u64,
-) -> AdminResponse {
-    if !(1..=APPROVAL_WAIT_MAX_SECS).contains(&timeout_secs) {
-        return AdminResponse::Error {
-            message: "approval wait timeout must be between 1 and 3600 seconds".to_string(),
-        };
-    }
-    // Authorize before parking. A caller that does not own the handle must not
-    // be able to hold a connection open at all, so the refusal is immediate.
-    match approval_scope_check(server, caller, handle).await {
-        Ok((_approval, _is_operator)) => {}
-        Err(_) => {
-            // A grant request never executes, so waiting on one has no
-            // meaning. Say so where the caller can act on it, but only to a
-            // caller already authorized to see the request.
-            if let Some(message) = grant_request_wait_refusal(server, caller, handle).await {
-                return AdminResponse::Error { message };
-            }
-            return approval_not_found(handle);
-        }
-    };
-    // Obtain-or-create under the write lock, then release it before parking:
-    // `ApprovalRegistry::from_rows` rebuilds without notifiers, so a hold
-    // recovered across a restart has none until the first waiter mints it.
-    let Some((notify, _lease)) = server.state.approvals.write().await.register_waiter(handle)
-    else {
-        return approval_not_found(handle);
-    };
-    let timeout = timeout_secs;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout);
-    loop {
-        // Register with the notifier BEFORE re-reading the row: notify_waiters
-        // wakes only already-registered waiters, so a decision landing between
-        // the read and the park would otherwise be missed for the full timeout.
-        let notified = notify.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-
-        let current = server.state.approvals.read().await.get(handle).cloned();
-        let Some(current) = current else {
-            return approval_not_found(handle);
-        };
-        if approval_is_armed(&current) || current.status.is_decided() {
-            return AdminResponse::ApprovalShow {
-                item: ApprovalSummary::from_row(&current),
-            };
-        }
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return AdminResponse::ApprovalShow {
-                item: ApprovalSummary::from_row(&current),
-            };
-        }
-        tokio::select! {
-            _ = &mut notified => {}
-            _ = tokio::time::sleep(remaining) => {}
-        }
     }
 }
 
@@ -7305,7 +7249,7 @@ pub(super) async fn handle_admin_request_owned(
     } = request
     else {
         return OwnedAdminResponse {
-            response: handle_admin_request(server, caller, request).await,
+            response: dispatch_admin_request(server, caller, request).await,
             waiter_lease: None,
         };
     };
@@ -7356,7 +7300,7 @@ pub(super) async fn handle_admin_request_owned(
         };
     };
 
-    let decision = handle_admin_request(
+    let decision = dispatch_admin_request(
         server,
         caller,
         AdminRequest::AccessApprove {
@@ -7372,12 +7316,6 @@ pub(super) async fn handle_admin_request_owned(
             waiter_lease: Some(lease),
         };
     };
-    if items.first().is_none_or(|item| !item.success) {
-        return OwnedAdminResponse {
-            response: decision,
-            waiter_lease: Some(lease),
-        };
-    }
     let observed = observe_approval_with_lease(server, &handle, notify, timeout_secs).await;
     match observed {
         Ok((item, outcome)) => OwnedAdminResponse {
@@ -7392,4 +7330,22 @@ pub(super) async fn handle_admin_request_owned(
             waiter_lease: Some(lease),
         },
     }
+}
+
+/// Test-only adapter for legacy direct handler tests. It serializes while the
+/// waiter lease is alive, then explicitly consumes the lease before returning
+/// the owned response value to the test.
+#[cfg(test)]
+pub(super) async fn handle_admin_request_for_test(
+    server: &ServerContext,
+    caller: &CallerIdentity,
+    request: AdminRequest,
+) -> AdminResponse {
+    let OwnedAdminResponse {
+        response,
+        waiter_lease,
+    } = handle_admin_request_owned(server, caller, request).await;
+    serde_json::to_vec(&response).expect("admin response must serialize");
+    drop(waiter_lease);
+    response
 }

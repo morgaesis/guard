@@ -2723,11 +2723,14 @@ async fn handle_access_approve_interactive(
                 ..
             }
         );
-        match client
-            .send_admin(decision)
-            .await
-            .map_err(|error| describe_connect_failure(error, &client, source))?
-        {
+        let response = client.send_admin(decision).await.map_err(|error| {
+            if expects_wait {
+                approval_wait_mutation_transport_error(error, &client, source, &reference)
+            } else {
+                describe_connect_failure(error, &client, source)
+            }
+        })?;
+        match response {
             server::AdminResponse::AccessDecisions {
                 items,
                 wait: waited,
@@ -2863,7 +2866,9 @@ async fn handle_access_approve_wait(
             wait_secs: Some(wait_secs),
         })
         .await
-        .map_err(|error| describe_connect_failure(error, &client, source))?;
+        .map_err(|error| {
+            approval_wait_mutation_transport_error(error, &client, source, &reference)
+        })?;
     let server::AdminResponse::AccessDecisions {
         wait: Some(waited), ..
     } = &decision
@@ -2906,6 +2911,18 @@ fn access_wait_exit_code(outcome: &str) -> i32 {
         "armed" | "timed_out" => EXIT_GUARD_HELD,
         _ => EXIT_GUARD_ERROR,
     }
+}
+
+fn approval_wait_mutation_transport_error(
+    error: anyhow::Error,
+    client: &daemon_client::Client,
+    source: EndpointSource,
+    handle: &str,
+) -> anyhow::Error {
+    let error = describe_connect_failure(error, client, source);
+    anyhow::anyhow!(
+        "approval outcome unknown for {handle}: {error}. Do not retry this approval automatically; inspect `guard approval show {handle}` before taking further action."
+    )
 }
 
 /// The client's own statement that a grant cannot be waited on, quoting the

@@ -492,6 +492,23 @@ impl Client {
     }
 }
 
+pub(crate) async fn probe_endpoint(
+    socket_path: Option<&Path>,
+    tcp_port: Option<u16>,
+) -> Result<()> {
+    if let Some(socket_path) = socket_path {
+        let _stream = connect_local(socket_path).await?;
+        return Ok(());
+    }
+    if let Some(port) = tcp_port {
+        let _stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .context("failed to connect to guard server")?;
+        return Ok(());
+    }
+    bail!("no socket path or TCP port configured")
+}
+
 fn execute_envelope_json(request: &ExecuteRequest, feature: &str) -> Result<String> {
     serde_json::to_string(&IncomingMessage::Execute {
         protocol_version: EXECUTE_PROTOCOL_VERSION,
