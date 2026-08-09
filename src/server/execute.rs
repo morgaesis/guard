@@ -14,7 +14,7 @@ use guard::gating::coverage::{
 use guard::gating::verb::CoverageAction;
 use guard::gating::{Coverage, DecisionTrace};
 use guard::redact::{
-    command_line, redact_command_line, redact_exact_secrets, redact_output, redact_output_text,
+    command_line, redact_command_line, redact_exact_secrets, redact_output_text,
     redact_output_with_state, RedactionState,
 };
 use sha2::{Digest, Sha256};
@@ -553,7 +553,7 @@ fn selected_session_verbs<W: AsyncWrite + Unpin>(phase: &ExecPhase<'_, W>) -> Ve
 async fn deny_and_record<W: AsyncWrite + Unpin>(
     phase: &mut ExecPhase<'_, W>,
     request: &ExecuteRequest,
-    command: String,
+    _command: String,
     source: SessionDecisionSource,
     risk: Option<i32>,
     mut reason: String,
@@ -816,7 +816,7 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
         phase.session_token.as_deref(),
         SessionInteraction {
             at_unix: 0,
-            command,
+            command: durable_command,
             allowed: false,
             source,
             reason: reason.clone(),
@@ -840,13 +840,14 @@ async fn route_allow_and_record<W: AsyncWrite + Unpin>(
     phase: &mut ExecPhase<'_, W>,
     request: ExecuteRequest,
     inputs: GateInputs,
-    command: String,
+    _command: String,
     source: SessionDecisionSource,
     depth: u32,
 ) -> ExecuteResult {
     let reason = inputs.reason.clone();
     let risk = inputs.risk;
     let trace = decision_trace_for_phase(phase, source, true);
+    let interaction_command = redact_command_line(&request.binary, &request.args);
     let mut context = RequestContext {
         server: phase.server,
         caller: phase.caller,
@@ -860,7 +861,7 @@ async fn route_allow_and_record<W: AsyncWrite + Unpin>(
         phase.session_token.as_deref(),
         SessionInteraction {
             at_unix: 0,
-            command,
+            command: interaction_command,
             allowed: true,
             source,
             reason,
@@ -1973,15 +1974,12 @@ fn caller_environment_subject(request: &ExecuteRequest) -> Option<String> {
     ))
 }
 
-/// Render a command line for an audit event with secret-shaped values
-/// masked. Argv routinely carries inline credentials (`--password=...`,
-/// `Authorization: Bearer <token>`, connection URLs); the audit trail needs
-/// the command shape, not the values, and the daemon log must not become a
-/// secret store. The value is stored raw in the typed event: the JSONL sink
-/// JSON-encodes it (no physical-line forgery is possible), and the stderr
-/// projection applies `audit_escape` at render time.
+/// Render a command line for an audit event with secret-shaped values masked.
+/// Classification runs while argv boundaries are intact, and the typed event
+/// stores only the resulting redacted display line. JSONL encoding and the
+/// stderr projection separately prevent physical-line record forgery.
 pub(super) fn audit_command_line(binary: &str, args: &[String]) -> String {
-    redact_output(&command_line(binary, args))
+    redact_command_line(binary, args)
 }
 
 pub(super) async fn persist_session_snapshot(

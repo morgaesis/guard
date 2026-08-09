@@ -2265,6 +2265,7 @@ async fn sessionless_novel_denial_returns_exact_typed_request_guidance() {
         .iter()
         .flat_map(|arg| arg.split_whitespace().map(str::to_string))
         .collect::<Vec<_>>();
+    let omitted_repeated_pair = original[2..].to_vec();
 
     let (mut approving, _) = make_test_config();
     approving.config.daemon_uid = 777;
@@ -2326,27 +2327,26 @@ async fn sessionless_novel_denial_returns_exact_typed_request_guidance() {
         "typed access approval failed: {:?}",
         items[0]
     );
-    assert_eq!(
-        approving
-            .state
-            .verbs
-            .read()
-            .await
-            .match_command_all("novel-fixture", &original)
-            .len(),
-        1,
-        "approved generated access must select the exact argv"
-    );
-    assert!(
-        approving
-            .state
-            .verbs
-            .read()
-            .await
-            .match_command_all("novel-fixture", &split)
-            .is_empty(),
-        "whitespace-split argv must not select exact generated access"
-    );
+    {
+        let catalog = approving.state.verbs.read().await;
+        let matches = catalog.match_command_all("novel-fixture", &original);
+        assert_eq!(
+            matches.len(),
+            1,
+            "approved generated access must select once"
+        );
+        assert_eq!(matches[0].rendered.binary, "novel-fixture");
+        assert_eq!(matches[0].rendered.args, original);
+        assert!(
+            catalog
+                .match_command_all("novel-fixture", &split)
+                .is_empty(),
+            "whitespace-split argv must not select exact generated access"
+        );
+        assert!(catalog
+            .match_command_all("novel-fixture", &omitted_repeated_pair)
+            .is_empty());
+    }
 
     let (mut restarted, _) = make_test_config();
     restarted.config.daemon_uid = 777;
@@ -2395,23 +2395,19 @@ async fn sessionless_novel_denial_returns_exact_typed_request_guidance() {
         restarted_item.capabilities[0].matcher_digest,
         matcher_digest
     );
-    assert_eq!(
-        restarted
-            .state
-            .verbs
-            .read()
-            .await
-            .match_command_all("novel-fixture", &original)
-            .len(),
-        1
-    );
-    assert!(restarted
-        .state
-        .verbs
-        .read()
-        .await
-        .match_command_all("novel-fixture", &split)
-        .is_empty());
+    {
+        let catalog = restarted.state.verbs.read().await;
+        let matches = catalog.match_command_all("novel-fixture", &original);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].rendered.binary, "novel-fixture");
+        assert_eq!(matches[0].rendered.args, original);
+        assert!(catalog
+            .match_command_all("novel-fixture", &split)
+            .is_empty());
+        assert!(catalog
+            .match_command_all("novel-fixture", &omitted_repeated_pair)
+            .is_empty());
+    }
     let mut changed = original;
     changed
         .last_mut()
@@ -2512,8 +2508,9 @@ async fn approved_matcher_name_tamper_fails_closed_across_restart_boundaries() {
     assert!(install_approved_access_verbs(&restarted).await.is_err());
 }
 
-async fn assert_sensitive_argv_rejected(args: Vec<String>, sensitive: &str) {
+async fn assert_sensitive_argv_rejected(binary: &str, args: Vec<String>, sensitive: &str) {
     let (mut cfg, _) = make_test_config();
+    let (audit_directory, _audit) = super::attach_test_audit_log(&mut cfg);
     cfg.config.daemon_uid = 777;
     cfg.config.daemon_principal = PrincipalKey::from_uid(777);
     cfg.state.verbs = Arc::new(RwLock::new(VerbCatalog::empty()));
@@ -2524,7 +2521,7 @@ async fn assert_sensitive_argv_rejected(args: Vec<String>, sensitive: &str) {
     cfg.state.session_store = Some(store.clone());
     let worker = CallerIdentity::Unix { uid: 1001 };
     let daemon = CallerIdentity::UnixAdmin { uid: 777 };
-    let mut request = request_with_session("novel-fixture", args, "unused".to_string());
+    let mut request = request_with_session(binary, args, "unused".to_string());
     request.session_token = None;
 
     let response = execute_command(request, &cfg, &worker)
@@ -2534,8 +2531,29 @@ async fn assert_sensitive_argv_rejected(args: Vec<String>, sensitive: &str) {
     assert!(response.handle.is_none());
     assert!(cfg.state.grant_requests.read().await.is_empty());
     assert!(store.load_grant_requests().await.unwrap().is_empty());
+    assert!(!response.reason.contains(sensitive));
+    assert!(!response
+        .stdout
+        .as_deref()
+        .is_some_and(|value| value.contains(sensitive)));
+    assert!(!response
+        .stderr
+        .as_deref()
+        .is_some_and(|value| value.contains(sensitive)));
+    assert!(!response
+        .verb_guidance
+        .as_deref()
+        .is_some_and(|value| value.contains(sensitive)));
+    assert!(!serde_json::to_string(&response.verb_matches)
+        .unwrap()
+        .contains(sensitive));
+    assert!(!serde_json::to_string(&response.decision_trace)
+        .unwrap()
+        .contains(sensitive));
     let response_json = serde_json::to_string(&response).unwrap();
     assert!(!response_json.contains(sensitive));
+    let audit_json = std::fs::read_to_string(audit_directory.path().join("audit.jsonl")).unwrap();
+    assert!(!audit_json.contains(sensitive));
 
     let access_list = handle_admin_request_for_test(&cfg, &daemon, AdminRequest::AccessList).await;
     let access_json = serde_json::to_string(&access_list).unwrap();
@@ -2551,6 +2569,7 @@ async fn independently_sensitive_argv_does_not_create_or_expose_generated_access
     let sensitive = [["s", "k"].concat(), "-".to_string(), "Ab1".repeat(8)].concat();
     assert_ne!(guard::redact::redact_output_text(&sensitive), sensitive);
     assert_sensitive_argv_rejected(
+        "novel-fixture",
         vec!["--credential".to_string(), sensitive.clone()],
         &sensitive,
     )
@@ -2562,11 +2581,154 @@ async fn split_and_inline_sensitive_argv_do_not_create_or_expose_generated_acces
     let sensitive = ["low", "entropy"].concat();
     assert_eq!(guard::redact::redact_output_text(&sensitive), sensitive);
     assert_sensitive_argv_rejected(
+        "novel-fixture",
         vec!["--api-token".to_string(), sensitive.clone()],
         &sensitive,
     )
     .await;
-    assert_sensitive_argv_rejected(vec![format!("--api-token={sensitive}")], &sensitive).await;
+    assert_sensitive_argv_rejected(
+        "novel-fixture",
+        vec![format!("--api-token={sensitive}")],
+        &sensitive,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn strict_and_opaque_sensitive_argv_do_not_reach_durable_or_audit_surfaces() {
+    let sensitive = ["q", "7"].concat();
+    for (binary, args) in [
+        (
+            "novel-fixture",
+            vec!["--key".to_string(), sensitive.clone()],
+        ),
+        ("novel-fixture", vec![format!("--pass={sensitive}")]),
+        (
+            "novel-fixture",
+            vec![format!("--passphrase=\n{sensitive}\u{1}")],
+        ),
+        ("curl", vec!["-u".to_string(), sensitive.clone()]),
+        ("curl", vec![format!("--user={sensitive}")]),
+        (
+            "curl",
+            vec!["-H".to_string(), format!("Authorization: {sensitive}")],
+        ),
+    ] {
+        assert_sensitive_argv_rejected(binary, args, &sensitive).await;
+    }
+}
+
+#[tokio::test]
+async fn split_sensitive_argv_is_redacted_in_live_and_durable_session_history() {
+    let (mut cfg, _) = make_test_config();
+    let (audit_directory, _audit) = super::attach_test_audit_log(&mut cfg);
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.config.admission_preview = true;
+    let temporary = tempfile::tempdir().unwrap();
+    let store = SessionStore::open(temporary.path().join("state.db"), 3_600)
+        .await
+        .unwrap();
+    cfg.state.session_store = Some(store.clone());
+    let token = "sensitive-history".to_string();
+    let mut grant = granted_session_owned(1001, Vec::new(), Vec::new());
+    grant.deny = vec!["curl*".to_string()];
+    cfg.state.sessions.write().await.grant(token.clone(), grant);
+    let initial_registry = cfg.state.sessions.read().await.clone();
+    store.persist_registry(&initial_registry).await.unwrap();
+
+    let sensitive = ["q", "7"].concat();
+    let request = request_with_session(
+        "curl",
+        vec!["-u".to_string(), sensitive.clone()],
+        token.clone(),
+    );
+    let response = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1001 })
+        .await
+        .into_response();
+    assert!(!response.allowed);
+    assert!(!serde_json::to_string(&response)
+        .unwrap()
+        .contains(&sensitive));
+
+    let live_report = cfg.state.sessions.read().await.show(&token, 10).unwrap();
+    assert!(!serde_json::to_string(&live_report)
+        .unwrap()
+        .contains(&sensitive));
+    let durable_report = store
+        .load_registry()
+        .await
+        .unwrap()
+        .show(&token, 10)
+        .unwrap();
+    assert!(!serde_json::to_string(&durable_report)
+        .unwrap()
+        .contains(&sensitive));
+
+    let show = handle_admin_request_for_test(
+        &cfg,
+        &CallerIdentity::UnixAdmin { uid: 777 },
+        AdminRequest::SessionShow {
+            token,
+            limit: Some(10),
+            caller_token: None,
+        },
+    )
+    .await;
+    assert!(!serde_json::to_string(&show).unwrap().contains(&sensitive));
+    let audit_json = std::fs::read_to_string(audit_directory.path().join("audit.jsonl")).unwrap();
+    assert!(!audit_json.contains(&sensitive));
+}
+
+#[tokio::test]
+async fn allowed_sensitive_argv_is_redacted_in_live_and_durable_session_history() {
+    let (mut cfg, _) = make_test_config();
+    let (audit_directory, _audit) = super::attach_test_audit_log(&mut cfg);
+    let temporary = tempfile::tempdir().unwrap();
+    let store = SessionStore::open(temporary.path().join("state.db"), 3_600)
+        .await
+        .unwrap();
+    cfg.state.session_store = Some(store.clone());
+    let token = "allowed-sensitive-history".to_string();
+    cfg.state.sessions.write().await.grant(
+        token.clone(),
+        granted_session_owned(1001, vec!["true*".to_string()], Vec::new()),
+    );
+    let initial_registry = cfg.state.sessions.read().await.clone();
+    store.persist_registry(&initial_registry).await.unwrap();
+
+    let sensitive = ["q", "7"].concat();
+    let response = execute_command(
+        request_with_session(
+            "true",
+            vec!["--pass".to_string(), sensitive.clone()],
+            token.clone(),
+        ),
+        &cfg,
+        &CallerIdentity::Unix { uid: 1001 },
+    )
+    .await
+    .into_response();
+    assert!(response.allowed);
+    assert!(!serde_json::to_string(&response)
+        .unwrap()
+        .contains(&sensitive));
+
+    let live_report = cfg.state.sessions.read().await.show(&token, 10).unwrap();
+    assert!(!serde_json::to_string(&live_report)
+        .unwrap()
+        .contains(&sensitive));
+    let durable_report = store
+        .load_registry()
+        .await
+        .unwrap()
+        .show(&token, 10)
+        .unwrap();
+    assert!(!serde_json::to_string(&durable_report)
+        .unwrap()
+        .contains(&sensitive));
+    let audit_json = std::fs::read_to_string(audit_directory.path().join("audit.jsonl")).unwrap();
+    assert!(!audit_json.contains(&sensitive));
 }
 
 #[tokio::test]
@@ -2631,6 +2793,58 @@ async fn display_colliding_argv_create_distinct_convergent_requests() {
     assert_eq!(
         deny(second_args).await.handle.as_deref(),
         Some(second_handle.as_str())
+    );
+}
+
+#[tokio::test]
+async fn structured_argv_converges_to_one_matcher_across_principals() {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    cfg.state.verbs = Arc::new(RwLock::new(VerbCatalog::empty()));
+    let args = vec!["inspect".to_string(), "resource with spaces".to_string()];
+
+    let mut first_request =
+        request_with_session("novel-fixture", args.clone(), "unused".to_string());
+    first_request.session_token = None;
+    let first = execute_command(first_request, &cfg, &CallerIdentity::Unix { uid: 1001 })
+        .await
+        .into_response();
+    let mut second_request = request_with_session("novel-fixture", args, "unused".to_string());
+    second_request.session_token = None;
+    let second = execute_command(second_request, &cfg, &CallerIdentity::Unix { uid: 1002 })
+        .await
+        .into_response();
+    let first_handle = first.handle.expect("first principal receives a request");
+    let second_handle = second.handle.expect("second principal receives a request");
+    assert_ne!(first_handle, second_handle);
+
+    let requests = cfg.state.grant_requests.read().await;
+    assert_ne!(
+        requests[&first_handle].requester,
+        requests[&second_handle].requester
+    );
+    let first_verb = guard::gating::verb::parse_normalized_generated_access_verb(
+        requests[&first_handle]
+            .proposed_verbs
+            .first()
+            .expect("first principal has generated coverage"),
+    )
+    .unwrap();
+    let second_verb = guard::gating::verb::parse_normalized_generated_access_verb(
+        requests[&second_handle]
+            .proposed_verbs
+            .first()
+            .expect("second principal has generated coverage"),
+    )
+    .unwrap();
+    let first_shape = guard::gating::verb::generated_access_matcher_shape(&first_verb);
+    let second_shape = guard::gating::verb::generated_access_matcher_shape(&second_verb);
+    assert_eq!(first_verb.name, second_verb.name);
+    assert_eq!(first_shape, second_shape);
+    assert_eq!(
+        guard::gating::verb::generated_access_matcher_digest(&first_shape),
+        guard::gating::verb::generated_access_matcher_digest(&second_shape)
     );
 }
 

@@ -2475,7 +2475,7 @@ fn valid_provisional_transition(previous: &Provisional, next: &Provisional) -> R
 }
 
 fn validate_persisted_access_request(request: &GrantRequest) -> Result<()> {
-    if !request.is_principal_access_request() {
+    if !request.has_access_projection() {
         return Ok(());
     }
     request
@@ -3418,6 +3418,37 @@ mod tests {
         invalid_key.request_key = "ar-invalid".to_string();
 
         for request in [invalid_scope, invalid_key] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("state.db");
+            let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+            assert!(store.save_grant_request(request.clone()).await.is_err());
+
+            let conn = Connection::open(path).unwrap();
+            conn.execute(
+                "INSERT INTO grant_requests (handle, json, status, created_unix)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    request.handle,
+                    serde_json::to_string(&request).unwrap(),
+                    request.status.as_str(),
+                    encode_u64(request.created_unix).unwrap()
+                ],
+            )
+            .unwrap();
+            drop(conn);
+            assert!(store.load_grant_requests().await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn access_request_persistence_rejects_stripped_projection_fields() {
+        let mut requesterless = generated_access_request();
+        requesterless.requester = None;
+
+        let mut partially_stripped = generated_access_request();
+        partially_stripped.target = None;
+
+        for request in [requesterless, partially_stripped] {
             let tmp = tempfile::tempdir().unwrap();
             let path = tmp.path().join("state.db");
             let store = SessionStore::open(path.clone(), 3600).await.unwrap();

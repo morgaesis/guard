@@ -19,9 +19,9 @@ use guard::gating::verb::{
 #[cfg(test)]
 use guard::gating::verb::{CoverageAction, CoverageProbe, CoverageProvenance, VerbCoverageCell};
 use guard::principal::{scope_eq, PrincipalKey};
-#[cfg(test)]
-use guard::redact::redact_output;
 use guard::redact::{command_line, redact_output_text};
+#[cfg(test)]
+use guard::redact::{redact_command_line, redact_output};
 
 use super::execute::audit_session_fingerprint;
 #[cfg(test)]
@@ -1019,10 +1019,10 @@ async fn reduce_generated_access_candidate(
 }
 
 /// Split a reduction into the coverage it authorizes and the coverage that has
-/// to be reviewed again. A generated access matcher lives only in the running
-/// catalog, is never operator-authored, and loses its trust on restart, so an
-/// intent that resolves to one re-proposes it however the reduction found it:
-/// by explicit name, by matching prose, or by an identical matcher shape.
+/// to be reviewed again. Generated matchers are request-owned authority rather
+/// than operator-authored catalog policy, so an intent that resolves to one
+/// retains it as a proposal however the reduction found it: by explicit name,
+/// by matching prose, or by an identical matcher shape.
 fn access_reduction(matched: Vec<Verb>) -> Result<(Vec<Verb>, Vec<Verb>), String> {
     let mut proposed = Vec::new();
     let mut reduced = Vec::with_capacity(matched.len());
@@ -1050,9 +1050,8 @@ const MAX_ACCESS_DESCRIPTION_CHARS: usize = 400;
 
 /// Plain-language account of the access a synthesized matcher admits, written
 /// for the operator deciding on the request rather than restating the
-/// requester's intent. The synthesis call that produces the matcher also
-/// returns this description, so it costs no extra round trip and can neither
-/// delay nor fail request creation: an unusable description falls back to a
+/// requester's intent. Prose synthesis can return this description with the
+/// matcher. Structured observed argv and unusable model descriptions use a
 /// deterministic template derived from the matcher itself.
 fn access_grant_description(verb: &Verb) -> String {
     synthesized_access_description(verb).unwrap_or_else(|| derived_access_description(verb))
@@ -2058,7 +2057,7 @@ fn new_access_session(requester: PrincipalKey, label: String, expires_at: u64) -
 }
 
 fn proposed_access_verbs(request: &GrantRequest) -> Result<Vec<Verb>, String> {
-    if request.is_principal_access_request() {
+    if request.has_access_projection() {
         request
             .validate_principal_access_shape()
             .map_err(|error| error.to_string())
@@ -3044,7 +3043,7 @@ async fn handle_session_appeal(
             message: "session token must not be empty".to_string(),
         };
     }
-    let command_line = command_line(&binary, &args);
+    let command_line = redact_command_line(&binary, &args);
     if let Err(reason) = validate_session_exact_rule_candidate(&binary, &args) {
         return AdminResponse::SessionAppeal {
             allowed: false,

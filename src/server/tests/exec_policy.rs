@@ -124,28 +124,35 @@ impl Drop for EnvRestore {
 }
 
 #[test]
-fn audit_command_line_masks_inline_credentials() {
+fn audit_command_line_masks_sensitive_original_argv() {
+    let value = ["q", "7"].concat();
     let line = audit_command_line(
         "mysql",
         &[
             "-u".to_string(),
             "root".to_string(),
-            "--password=hunter2sekrit".to_string(),
+            format!("--password={value}"),
         ],
     );
-    assert!(!line.contains("hunter2sekrit"), "got: {line}");
-    assert!(line.contains("mysql"), "command shape survives: {line}");
+    assert!(!line.contains(&value));
+    assert!(line.contains("mysql"));
 
     let line = audit_command_line(
         "curl",
         &[
             "-H".to_string(),
-            "Authorization: Bearer sk-live-abcdef1234567890".to_string(),
+            format!("Authorization:\n{value}"),
             "https://api.example.com".to_string(),
         ],
     );
-    assert!(!line.contains("sk-live-abcdef1234567890"), "got: {line}");
-    assert!(line.contains("curl"), "got: {line}");
+    assert!(!line.contains(&value));
+    assert!(line.contains("curl"));
+
+    let line = audit_command_line("curl", &["-u".to_string(), value.clone()]);
+    assert!(!line.contains(&value));
+
+    let line = audit_command_line("ssh", &["-p".to_string(), "2222".to_string()]);
+    assert!(line.contains("-p 2222"));
 }
 
 /// Audit fingerprints are stable, distinct, 128-bit identifiers that do not
@@ -1420,8 +1427,8 @@ async fn audit_line_injection_via_argv_is_escaped() {
     })
     .await;
 
-    // The durable JSONL record carries the raw injected string as a JSON
-    // field: physical-line forgery is impossible in the structured sink.
+    // The injected string is benign under argv-aware redaction and remains a
+    // JSON field, where physical-line forgery is impossible.
     let jsonl = std::fs::read_to_string(dir.path().join("audit.jsonl")).expect("read audit log");
     assert_eq!(
         jsonl.lines().count(),
@@ -1434,7 +1441,7 @@ async fn audit_line_injection_via_argv_is_escaped() {
     assert_eq!(
         record.event.cmd.as_deref(),
         Some(format!("echo {forged}").as_str()),
-        "the raw argv (newline included) is a JSON field, not a physical line"
+        "the redacted argv display is a JSON field, not a physical line"
     );
     assert_eq!(
         record.event.reason.as_deref(),

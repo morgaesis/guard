@@ -1138,9 +1138,8 @@ impl SessionRegistry {
         if interaction.at_unix == 0 {
             interaction.at_unix = now_unix();
         }
-        // Interactions are persisted to the state database; argv routinely
-        // carries inline credentials (`--password=...`, bearer tokens,
-        // connection strings) that must not outlive the command line.
+        // Execute paths redact while argv boundaries are intact. This second
+        // plain-text pass protects historical and manually constructed rows.
         interaction.redact_credentials();
         self.interactions.push(StoredSessionInteraction {
             token: token.to_string(),

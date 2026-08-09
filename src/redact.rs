@@ -5,8 +5,9 @@ use std::sync::OnceLock;
 /// Render a command as one display line: the binary followed by its arguments,
 /// space-separated. This is the single renderer for operator-facing and audit
 /// surfaces (approval snapshots, session rules, audit records). It performs no
-/// escaping or redaction; those are applied separately at the audit boundary
-/// (see [`audit_escape`] and [`redact_output`]).
+/// escaping or redaction. Callers with structured argv use
+/// [`redact_command_line`] before flattening, and plain-text audit projections
+/// use [`audit_escape`].
 pub fn command_line(binary: &str, args: &[String]) -> String {
     if args.is_empty() {
         binary.to_string()
@@ -510,46 +511,246 @@ pub fn redact_output_text(text: &str) -> String {
     redacted
 }
 
-/// Whether an executable or literal argv vector contains credential material
-/// according to the output redactor. Separate option/value arguments retain
-/// their adjacency here, so a low-entropy value following a secret-bearing
-/// option is classified even when neither element is sensitive in isolation.
-pub fn command_contains_sensitive_literals(binary: &str, args: &[String]) -> bool {
-    if redact_output_text(binary) != binary
-        || args
-            .iter()
-            .any(|argument| redact_output_text(argument) != *argument)
-    {
-        return true;
-    }
-
-    args.windows(2).any(|pair| is_split_secret_option(&pair[0]))
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OptionValueKind {
+    Credential,
+    NamedField,
 }
 
-fn is_split_secret_option(argument: &str) -> bool {
-    let option = argument.trim_start_matches('-');
-    argument.starts_with('-')
-        && !option.is_empty()
-        && !option.contains(['=', ':'])
-        && is_secret_bearing_name(option)
+struct BinaryOptionAlias {
+    binaries: &'static [&'static str],
+    required_argument: Option<&'static str>,
+    options: &'static [&'static str],
+    value_kind: OptionValueKind,
+}
+
+/// Opaque credential-taking options whose spelling does not carry enough
+/// meaning for lexical classification. The table stays deliberately bounded:
+/// aliases are binary-specific, and subcommand-specific where a short option
+/// has a benign meaning elsewhere. SSH `-p` and Ansible `-a` are intentionally
+/// absent because they carry a port and a module payload, respectively.
+const BINARY_OPTION_ALIASES: &[BinaryOptionAlias] = &[
+    BinaryOptionAlias {
+        binaries: &["curl"],
+        required_argument: None,
+        options: &["-u", "--user", "--proxy-user"],
+        value_kind: OptionValueKind::Credential,
+    },
+    BinaryOptionAlias {
+        binaries: &["curl"],
+        required_argument: None,
+        options: &["-H", "--header", "--proxy-header"],
+        value_kind: OptionValueKind::NamedField,
+    },
+    BinaryOptionAlias {
+        binaries: &["http", "https"],
+        required_argument: None,
+        options: &["-a", "--auth"],
+        value_kind: OptionValueKind::Credential,
+    },
+    BinaryOptionAlias {
+        binaries: &["mysql", "mariadb", "mysqldump"],
+        required_argument: None,
+        options: &["-p"],
+        value_kind: OptionValueKind::Credential,
+    },
+    BinaryOptionAlias {
+        binaries: &["redis-cli"],
+        required_argument: None,
+        options: &["-a"],
+        value_kind: OptionValueKind::Credential,
+    },
+    BinaryOptionAlias {
+        binaries: &["sshpass"],
+        required_argument: None,
+        options: &["-p"],
+        value_kind: OptionValueKind::Credential,
+    },
+    BinaryOptionAlias {
+        binaries: &["docker", "podman"],
+        required_argument: Some("login"),
+        options: &["-p"],
+        value_kind: OptionValueKind::Credential,
+    },
+];
+
+struct ParsedOption<'a> {
+    name: &'a str,
+    value_start: Option<usize>,
+}
+
+struct ClassifiedCommand {
+    sensitive: bool,
+    binary: String,
+    args: Vec<String>,
+}
+
+fn parse_leading_option(argument: &str) -> Option<ParsedOption<'_>> {
+    if !argument.starts_with('-') {
+        return None;
+    }
+    let name_start = argument.len() - argument.trim_start_matches('-').len();
+    if name_start == argument.len() {
+        return None;
+    }
+    let suffix = &argument[name_start..];
+    let delimiter = suffix
+        .char_indices()
+        .find(|(_, character)| matches!(character, '=' | ':') || character.is_control())
+        .map(|(offset, _)| name_start + offset);
+    let name_end = delimiter.unwrap_or(argument.len());
+    Some(ParsedOption {
+        name: &argument[..name_end],
+        value_start: delimiter,
+    })
+}
+
+fn strict_cli_secret_name(option: &str) -> bool {
+    let name = option.trim_start_matches('-');
+    is_secret_bearing_name(name)
+        || ["key", "pass", "passphrase"]
+            .iter()
+            .any(|candidate| name.eq_ignore_ascii_case(candidate))
+}
+
+fn binary_name(binary: &str) -> &str {
+    binary.rsplit(['/', '\\']).next().unwrap_or(binary)
+}
+
+fn alias_value_kind(
+    binary: &str,
+    args: &[String],
+    option_index: usize,
+    option: &str,
+) -> Option<OptionValueKind> {
+    let binary = binary_name(binary);
+    BINARY_OPTION_ALIASES.iter().find_map(|alias| {
+        let binary_matches = alias
+            .binaries
+            .iter()
+            .any(|candidate| binary.eq_ignore_ascii_case(candidate));
+        let context_matches = alias.required_argument.is_none_or(|required| {
+            args[..option_index]
+                .iter()
+                .any(|argument| argument.eq_ignore_ascii_case(required))
+        });
+        (binary_matches
+            && context_matches
+            && alias
+                .options
+                .iter()
+                .any(|candidate| option.eq_ignore_ascii_case(candidate)))
+        .then_some(alias.value_kind)
+    })
+}
+
+fn option_value_kind(
+    binary: &str,
+    args: &[String],
+    option_index: usize,
+    option: &str,
+) -> Option<OptionValueKind> {
+    strict_cli_secret_name(option)
+        .then_some(OptionValueKind::Credential)
+        .or_else(|| alias_value_kind(binary, args, option_index, option))
+}
+
+fn named_secret_value_start(argument: &str) -> Option<usize> {
+    let (index, _) = argument
+        .char_indices()
+        .find(|(_, character)| matches!(character, '=' | ':'))?;
+    let name = argument[..index]
+        .trim()
+        .trim_matches(|character| matches!(character, '\'' | '"'));
+    is_secret_bearing_name(name).then_some(index)
+}
+
+fn redact_suffix(argument: &str, value_start: usize) -> String {
+    let separator = argument[value_start..].chars().next();
+    match separator {
+        Some(separator @ ('=' | ':')) => {
+            format!("{}{}[REDACTED]", &argument[..value_start], separator)
+        }
+        _ => format!("{}=[REDACTED]", &argument[..value_start]),
+    }
+}
+
+fn classify_command(binary: &str, args: &[String]) -> ClassifiedCommand {
+    let redacted_binary = redact_output_text(binary);
+    let mut sensitive = redacted_binary != binary;
+    let mut redacted_args = Vec::with_capacity(args.len());
+    let mut pending_value_kind = None;
+
+    for (index, argument) in args.iter().enumerate() {
+        if let Some(value_kind) = pending_value_kind.take() {
+            let value_is_sensitive = value_kind == OptionValueKind::Credential
+                || named_secret_value_start(argument).is_some();
+            if value_is_sensitive {
+                sensitive = true;
+                redacted_args.push("[REDACTED]".to_string());
+                continue;
+            }
+        }
+
+        if let Some(option) = parse_leading_option(argument) {
+            if let Some(value_kind) = option_value_kind(binary, args, index, option.name) {
+                if let Some(value_start) = option.value_start {
+                    let delimiter = argument[value_start..]
+                        .chars()
+                        .next()
+                        .expect("parsed option delimiter exists");
+                    let suffix = &argument[value_start + delimiter.len_utf8()..];
+                    if delimiter.is_control() {
+                        sensitive = true;
+                        redacted_args.push(redact_suffix(argument, value_start));
+                        if index + 1 < args.len() {
+                            pending_value_kind = Some(value_kind);
+                        }
+                        continue;
+                    }
+                    let value_is_sensitive = value_kind == OptionValueKind::Credential
+                        || named_secret_value_start(suffix).is_some();
+                    if value_is_sensitive {
+                        sensitive = true;
+                        redacted_args.push(redact_suffix(argument, value_start));
+                        continue;
+                    }
+                } else if index + 1 < args.len() {
+                    pending_value_kind = Some(value_kind);
+                }
+            }
+        }
+
+        if let Some(value_start) = named_secret_value_start(argument) {
+            sensitive = true;
+            redacted_args.push(redact_suffix(argument, value_start));
+            continue;
+        }
+
+        let redacted = redact_output_text(argument);
+        sensitive |= redacted != *argument;
+        redacted_args.push(redacted);
+    }
+
+    ClassifiedCommand {
+        sensitive,
+        binary: redacted_binary,
+        args: redacted_args,
+    }
+}
+
+/// Whether an executable or literal argv vector contains credential material.
+/// Classification happens on original argv elements so separators, adjacency,
+/// and embedded control characters remain available to the classifier.
+pub fn command_contains_sensitive_literals(binary: &str, args: &[String]) -> bool {
+    classify_command(binary, args).sensitive
 }
 
 /// Render one command for display while retaining argv context during
 /// redaction. This is display-only and never feeds matcher authority.
 pub fn redact_command_line(binary: &str, args: &[String]) -> String {
-    let binary = redact_output_text(binary);
-    let args = args
-        .iter()
-        .enumerate()
-        .map(|(index, argument)| {
-            if index > 0 && is_split_secret_option(&args[index - 1]) {
-                "[REDACTED]".to_string()
-            } else {
-                redact_output_text(argument)
-            }
-        })
-        .collect::<Vec<_>>();
-    command_line(&binary, &args)
+    let command = classify_command(binary, args);
+    command_line(&command.binary, &command.args)
 }
 
 /// Redact exact secret values from output. This catches cases the regex patterns miss,
@@ -587,18 +788,55 @@ mod tests {
 
     #[test]
     fn command_literal_classifier_retains_argv_secret_context() {
-        let value = ["low", "entropy"].concat();
-        assert!(command_contains_sensitive_literals(
+        fn assert_redacted(binary: &str, args: Vec<String>, value: &str) {
+            assert!(command_contains_sensitive_literals(binary, &args));
+            let rendered = redact_command_line(binary, &args);
+            assert!(!rendered.contains(value));
+            assert!(!rendered.chars().any(char::is_control));
+        }
+
+        let value = ["q", "7"].concat();
+        assert_redacted(
             "fixturectl",
-            &["--api-token".to_string(), value.clone()]
-        ));
-        assert!(command_contains_sensitive_literals(
+            vec!["--api-token".to_string(), value.clone()],
+            &value,
+        );
+        assert_redacted("fixturectl", vec![format!("--api-token={value}")], &value);
+        assert_redacted(
             "fixturectl",
-            &[format!("--api-token={value}")]
-        ));
+            vec!["--key".to_string(), value.clone()],
+            &value,
+        );
+        assert_redacted("fixturectl", vec![format!("--pass={value}")], &value);
+        assert_redacted(
+            "fixturectl",
+            vec![format!("--passphrase=\n{value}\u{1}")],
+            &value,
+        );
+        assert_redacted("curl", vec!["-u".to_string(), value.clone()], &value);
+        assert_redacted("curl", vec![format!("--user={value}")], &value);
+        assert_redacted(
+            "curl",
+            vec!["-H".to_string(), format!("Authorization: {value}")],
+            &value,
+        );
+        assert_redacted(
+            "curl",
+            vec![format!("--header=Authorization:\n{value}")],
+            &value,
+        );
+
         assert!(!command_contains_sensitive_literals(
             "fixturectl",
-            &["--output".to_string(), value]
+            &["--output".to_string(), value.clone()]
+        ));
+        assert!(!command_contains_sensitive_literals(
+            "ssh",
+            &["-p".to_string(), "2222".to_string()]
+        ));
+        assert!(!command_contains_sensitive_literals(
+            "ansible",
+            &["-a".to_string(), "echo ordinary payload".to_string()]
         ));
     }
 

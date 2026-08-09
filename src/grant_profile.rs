@@ -409,16 +409,15 @@ impl GrantRequest {
             .collect()
     }
 
-    /// Whether this row carries the access-specific projection for a
-    /// principal-owned access session. Legacy grant requests can also have an
-    /// authenticated requester, but do not carry any of these fields.
-    pub fn is_principal_access_request(&self) -> bool {
-        self.requester.is_some()
-            && (self.target.is_some()
-                || !self.request_key.is_empty()
-                || self.requested_uses.is_some()
-                || !self.authority_verbs.is_empty()
-                || !self.proposed_verbs.is_empty())
+    /// Whether this row carries any access-specific projection. Requester
+    /// presence is intentionally not part of detection: pure shape validation
+    /// requires it, so stripping the principal cannot turn an access row into
+    /// a legacy grant request.
+    pub fn has_access_projection(&self) -> bool {
+        self.target.is_some()
+            || !self.request_key.is_empty()
+            || !self.authority_verbs.is_empty()
+            || !self.proposed_verbs.is_empty()
     }
 
     /// Validate the pure shape of a principal-bound access request. Catalog
