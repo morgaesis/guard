@@ -287,11 +287,47 @@ pub enum ApiJudgeVerdict {
         reason: String,
         risk: Option<i32>,
         reversibility: Option<Reversibility>,
+        authorization: ApiAuthorizationKind,
     },
     Deny {
         reason: String,
     },
     Error(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiAuthorizationKind {
+    Evaluated,
+    Coverage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiForwardRequirement {
+    Evaluated,
+    Coverage {
+        risk: i32,
+        reversibility: Reversibility,
+    },
+}
+
+/// Opaque authority retained through one upstream request handoff. The proxy
+/// drops it as soon as the request has been sent and response streaming begins.
+pub struct ApiForwardAuthorization {
+    _authority: Option<Box<dyn Send>>,
+}
+
+impl ApiForwardAuthorization {
+    #[doc(hidden)]
+    pub fn none() -> Self {
+        Self { _authority: None }
+    }
+
+    #[doc(hidden)]
+    pub fn new(authority: impl Send + 'static) -> Self {
+        Self {
+            _authority: Some(Box::new(authority)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -318,6 +354,16 @@ pub trait ApiJudge: Send + Sync {
     /// Deterministic exact typed coverage lookup. This never invokes the model.
     async fn coverage(&self, _summary: &ApiRequestSummary) -> ApiCoverageVerdict {
         ApiCoverageVerdict::None
+    }
+
+    /// Revalidate revocable durable authority immediately before the upstream
+    /// send and retain it through that finite handoff.
+    async fn authorize_forward(
+        &self,
+        _summary: &ApiRequestSummary,
+        _requirement: ApiForwardRequirement,
+    ) -> Result<ApiForwardAuthorization, String> {
+        Ok(ApiForwardAuthorization::none())
     }
 
     async fn judge(&self, summary: &ApiRequestSummary) -> ApiJudgeVerdict;

@@ -36,7 +36,8 @@ pub mod upstream;
 pub mod vercel_protocol;
 
 pub use gate::{
-    ApiCoverageVerdict, ApiEvaluationMode, ApiHoldSnapshot, ApiJudge, ApiJudgeVerdict, ApiMutation,
+    ApiAuthorizationKind, ApiCoverageVerdict, ApiEvaluationMode, ApiForwardAuthorization,
+    ApiForwardRequirement, ApiHoldSnapshot, ApiJudge, ApiJudgeVerdict, ApiMutation,
     ApiRequestSummary, ApiSessionContext, ApiSessionEvent, ApiSessionSink, GateSink, HoldDecision,
     HttpRevert, RevertConstructible,
 };

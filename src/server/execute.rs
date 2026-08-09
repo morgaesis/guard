@@ -11,7 +11,7 @@ use guard::gating::coverage::{
     baseline_override_applies, resolve_scoped_matches, ScopedCoverageMatch, VerbDecision,
     VerbResolution,
 };
-use guard::gating::verb::CoverageAction;
+use guard::gating::verb::{CoverageAction, VerbCatalog};
 use guard::gating::{Coverage, DecisionTrace};
 use guard::redact::{
     command_line, redact_command_line, redact_exact_secrets, redact_output_text,
@@ -915,6 +915,182 @@ struct EvaluationConstraints {
     typed_evaluation_required: bool,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct VerbAuthorityExpectation {
+    pub(super) name: String,
+    pub(super) catalog_version: Option<u64>,
+    pub(super) definition_digest: Option<String>,
+    pub(super) composition_digest: Option<String>,
+}
+
+impl VerbAuthorityExpectation {
+    pub(super) fn from_context(context: &VerbContext) -> Self {
+        Self {
+            name: context.name.clone(),
+            catalog_version: Some(context.catalog_version),
+            definition_digest: context.verb_digest.clone(),
+            composition_digest: context.composition_digest.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct CommandAuthorization {
+    check_learned_deny: bool,
+    verb: Option<VerbAuthorityExpectation>,
+}
+
+impl CommandAuthorization {
+    pub(super) fn routed(verb: Option<&VerbContext>) -> Self {
+        Self {
+            check_learned_deny: true,
+            verb: verb.map(VerbAuthorityExpectation::from_context),
+        }
+    }
+
+    pub(super) fn replay(verb: Option<VerbAuthorityExpectation>) -> Self {
+        Self {
+            check_learned_deny: true,
+            verb,
+        }
+    }
+}
+
+struct CommandInitiationLease {
+    _learned_deny: Option<guard::evaluate::LearnedDenyUseLease>,
+    _verb: Option<guard::learned_rules::AuthorityUseLease<VerbCatalog>>,
+    _session: Option<tokio::sync::OwnedRwLockReadGuard<SessionRegistry>>,
+}
+
+#[cfg(all(test, unix))]
+type CommandInitiationHook = (
+    std::sync::Arc<tokio::sync::Semaphore>,
+    std::sync::Arc<tokio::sync::Semaphore>,
+);
+
+#[cfg(all(test, unix))]
+fn command_initiation_hooks(
+) -> &'static std::sync::Mutex<std::collections::BTreeMap<usize, CommandInitiationHook>> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<usize, CommandInitiationHook>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+#[cfg(all(test, unix))]
+pub(super) fn pause_command_initiation_for_test(server: &ServerContext) -> CommandInitiationHook {
+    let reached = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    command_initiation_hooks().lock().unwrap().insert(
+        std::sync::Arc::as_ptr(&server.state.verbs) as usize,
+        (reached.clone(), release.clone()),
+    );
+    (reached, release)
+}
+
+async fn acquire_command_initiation_lease(
+    server: &ServerContext,
+    request: &ExecuteRequest,
+    authorization: Option<&CommandAuthorization>,
+) -> Result<CommandInitiationLease, String> {
+    // Revocable command authority is acquired in one order: learned denies,
+    // verb catalog, then session registry. Administrative mutations acquire
+    // the same resources in that order so initiation cannot form a lock cycle.
+    #[cfg(all(test, unix))]
+    let hook = command_initiation_hooks()
+        .lock()
+        .unwrap()
+        .remove(&(std::sync::Arc::as_ptr(&server.state.verbs) as usize));
+    #[cfg(all(test, unix))]
+    if let Some((reached, release)) = hook {
+        reached.add_permits(1);
+        release
+            .acquire()
+            .await
+            .map_err(|_| "command initiation test hook closed".to_string())?
+            .forget();
+    }
+    let learned_deny = if authorization.is_some_and(|authority| authority.check_learned_deny) {
+        let lease = server
+            .state
+            .evaluator
+            .lease_learned_deny_for_use()
+            .await
+            .map_err(|error| format!("learned deny authority is unavailable: {error}"))?;
+        if let Some(reason) = lease.matching_reason(&request.binary, &request.args) {
+            return Err(format!("command denied before process start: {reason}"));
+        }
+        Some(lease)
+    } else {
+        None
+    };
+
+    let verb = if authorization
+        .and_then(|authority| authority.verb.as_ref())
+        .is_some()
+    {
+        let lease = server
+            .refresh_and_lease_verb_catalog_for_use("command process start")
+            .await
+            .map_err(|error| format!("verb catalog authority is unavailable: {error}"))?;
+        Some(lease)
+    } else {
+        None
+    };
+
+    let session = if let Some(token) = request.session_token.as_deref() {
+        let guard = server.state.sessions.clone().read_owned().await;
+        if !guard.has(token) {
+            return Err("session was revoked before process start".to_string());
+        }
+        Some(guard)
+    } else {
+        None
+    };
+
+    if let (Some(expected), Some(lease)) = (
+        authorization.and_then(|authority| authority.verb.as_ref()),
+        verb.as_ref(),
+    ) {
+        let current =
+            compose_verb_authority_with_session(server, request, lease, session.as_deref()).await;
+        let Some(context) = current.context.as_ref() else {
+            return Err("composed verb authority no longer allows this command".to_string());
+        };
+        let unchanged = match expected.composition_digest.as_deref() {
+            Some(digest) => context.composition_digest.as_deref() == Some(digest),
+            None => {
+                let selected = current
+                    .matches
+                    .iter()
+                    .filter(|matched| matched.selected)
+                    .map(|matched| matched.verb.as_str())
+                    .collect::<BTreeSet<_>>();
+                selected.len() == 1
+                    && selected.contains(expected.name.as_str())
+                    && match expected.definition_digest.as_deref() {
+                        Some(digest) => context.verb_digest.as_deref() == Some(digest),
+                        None => {
+                            context.name == expected.name
+                                && expected.catalog_version == Some(lease.version())
+                        }
+                    }
+            }
+        };
+        if !unchanged {
+            return Err(
+                "composed verb authority was removed, amended, or changed before process start"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(CommandInitiationLease {
+        _learned_deny: learned_deny,
+        _verb: verb,
+        _session: session,
+    })
+}
+
 /// Resolve a verb invocation into a concrete command BEFORE any validation or
 /// evaluation. The rendered binary/args then pass through the same checks as a
 /// raw command; the verb's declared consequence class and rollback drive the
@@ -1017,56 +1193,91 @@ async fn resolve_verb_context<W: AsyncWrite + Unpin>(
         return Ok(VerbResolution::none());
     }
 
-    let (raw_matches, version, definition_digests) = {
-        let cat = catalog_lease
+    let resolution = compose_verb_authority(
+        server,
+        request,
+        catalog_lease
             .as_ref()
-            .expect("gated reverse matching holds catalog authority");
-        let plain = request
-            .env
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect::<BTreeMap<_, _>>();
-        let secrets = request
-            .secrets
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect::<BTreeMap<_, _>>();
-        let secret_files = request
-            .secret_files
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect::<BTreeMap<_, _>>();
-        let raw_matches = cat.match_command_all_with_environment_and_cwd(
-            &request.binary,
-            &request.args,
-            &plain,
-            &secrets,
-            &secret_files,
-            request.cwd.as_deref(),
-        );
-        // Captured under the same catalog read as the version, so a held
-        // approval binds to exactly the definition that produced the match.
-        let definition_digests = raw_matches
-            .iter()
-            .filter_map(|matched| {
-                cat.verb_definition_digest(&matched.rendered.name)
-                    .map(|digest| (matched.rendered.name.clone(), digest))
-            })
-            .collect::<BTreeMap<_, _>>();
-        (raw_matches, cat.version(), definition_digests)
-    };
-    if raw_matches.is_empty() {
+            .expect("gated reverse matching holds catalog authority"),
+    )
+    .await;
+    if resolution.matches.is_empty() {
         return Ok(VerbResolution::none());
     }
+    // The composed resolution carries the selected coverage's revert plan
+    // exactly when it produced a verb context; apply it to the pending
+    // request so the gate sees the operator-authored rollback.
+    if resolution.context.is_some() {
+        request.revert = resolution
+            .revert
+            .clone()
+            .map(|(binary, args)| RevertSpec::new(binary, args));
+    }
+    Ok(resolution)
+}
+
+async fn compose_verb_authority(
+    server: &ServerContext,
+    request: &ExecuteRequest,
+    catalog: &VerbCatalog,
+) -> VerbResolution {
+    compose_verb_authority_with_session(server, request, catalog, None).await
+}
+
+async fn compose_verb_authority_with_session(
+    server: &ServerContext,
+    request: &ExecuteRequest,
+    catalog: &VerbCatalog,
+    sessions: Option<&SessionRegistry>,
+) -> VerbResolution {
+    let plain = request
+        .env
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let secrets = request
+        .secrets
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let secret_files = request
+        .secret_files
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let raw_matches = catalog.match_command_all_with_environment_and_cwd(
+        &request.binary,
+        &request.args,
+        &plain,
+        &secrets,
+        &secret_files,
+        request.cwd.as_deref(),
+    );
+    if raw_matches.is_empty() {
+        return VerbResolution::none();
+    }
+
+    let definition_digests = raw_matches
+        .iter()
+        .filter_map(|matched| {
+            catalog
+                .verb_definition_digest(&matched.rendered.name)
+                .map(|digest| (matched.rendered.name.clone(), digest))
+        })
+        .collect::<BTreeMap<_, _>>();
 
     let (activated, override_markers) = if let Some(token) = request.session_token.as_deref() {
-        server
-            .state
-            .sessions
-            .read()
-            .await
-            .verb_scope_for(token)
-            .unwrap_or_default()
+        if let Some(sessions) = sessions {
+            sessions.verb_scope_for(token).unwrap_or_default()
+        } else {
+            server
+                .state
+                .sessions
+                .read()
+                .await
+                .verb_scope_for(token)
+                .unwrap_or_default()
+        }
     } else {
         (Vec::new(), Vec::new())
     };
@@ -1110,20 +1321,37 @@ async fn resolve_verb_context<W: AsyncWrite + Unpin>(
             overridden,
         });
     }
-    let mut resolution = resolve_scoped_matches(scoped, version);
+    let mut resolution = resolve_scoped_matches(scoped, catalog.version());
     if let Some(context) = resolution.context.as_mut() {
         context.verb_digest = definition_digests.get(&context.name).cloned();
+        let selected_definitions = resolution
+            .matches
+            .iter()
+            .filter(|matched| matched.selected)
+            .filter_map(|matched| {
+                definition_digests
+                    .get(&matched.verb)
+                    .map(|digest| (matched.verb.clone(), digest.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let material = serde_json::json!({
+            "decision": resolution.decision,
+            "matches": resolution.matches,
+            "selected_definitions": selected_definitions,
+            "class": context.class,
+            "params": context.params,
+            "revert": resolution.revert,
+            "access_evaluation_override_eligible": context.access_evaluation_override_eligible,
+        });
+        let canonical = serde_json::to_vec(&material).expect("verb authority material serializes");
+        context.composition_digest = Some(
+            Sha256::digest(canonical)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        );
     }
-    // The composed resolution carries the selected coverage's revert plan
-    // exactly when it produced a verb context; apply it to the pending
-    // request so the gate sees the operator-authored rollback.
-    if resolution.context.is_some() {
-        request.revert = resolution
-            .revert
-            .clone()
-            .map(|(binary, args)| RevertSpec::new(binary, args));
-    }
-    Ok(resolution)
+    resolution
 }
 
 /// Static request validation before any policy decision: recursion depth,
@@ -2470,25 +2698,51 @@ pub(super) fn permission_denied_path(output: &str) -> Option<String> {
 /// deny-list, session rules, evaluator, pinned TTL ACL, full audit) and retry
 /// the command. A denied or failed grant returns the original failure
 /// untouched; each round must unblock a new path or the loop stops.
+#[cfg(all(test, unix))]
 pub(super) async fn exec_with_read_grant_retry_with_secret_authority<W: AsyncWrite + Unpin>(
     context: &mut RequestContext<'_, W>,
     request: ExecuteRequest,
     allow_reason: String,
     authority: Option<Option<Vec<String>>>,
 ) -> ExecuteResult {
+    exec_with_read_grant_retry_with_command_authority(
+        context,
+        request,
+        allow_reason,
+        authority,
+        None,
+    )
+    .await
+}
+
+pub(super) async fn exec_with_read_grant_retry_with_command_authority<W: AsyncWrite + Unpin>(
+    context: &mut RequestContext<'_, W>,
+    request: ExecuteRequest,
+    allow_reason: String,
+    authority: Option<Option<Vec<String>>>,
+    command_authority: Option<CommandAuthorization>,
+) -> ExecuteResult {
     #[cfg(not(unix))]
     {
-        exec_after_approval_with_secret_authority(context, request, allow_reason, authority).await
+        exec_after_approval_with_command_authority(
+            context,
+            request,
+            allow_reason,
+            authority,
+            command_authority,
+        )
+        .await
     }
     #[cfg(unix)]
     {
         let server = context.server;
         let caller = context.caller;
-        let mut result = exec_after_approval_with_secret_authority(
+        let mut result = exec_after_approval_with_command_authority(
             context,
             request.clone(),
             allow_reason.clone(),
             authority.clone(),
+            command_authority.clone(),
         )
         .await;
         let mut granted: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -2537,11 +2791,12 @@ pub(super) async fn exec_with_read_grant_retry_with_secret_authority<W: AsyncWri
                     .field("path", &path)
                     .field("ttl", format!("{AUTO_READ_GRANT_TTL_SECS}s")),
             );
-            result = exec_after_approval_with_secret_authority(
+            result = exec_after_approval_with_command_authority(
                 context,
                 request.clone(),
                 allow_reason.clone(),
                 authority.clone(),
+                command_authority.clone(),
             )
             .await;
         }
@@ -2556,6 +2811,17 @@ pub(super) async fn exec_after_approval_with_secret_authority<W: AsyncWrite + Un
     // `None` consults the live session. `Some(None)` is unrestricted and
     // `Some(Some(selectors))` replays the immutable saved-grant entitlement.
     authority: Option<Option<Vec<String>>>,
+) -> ExecuteResult {
+    exec_after_approval_with_command_authority(context, request, allow_reason, authority, None)
+        .await
+}
+
+pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + Unpin>(
+    context: &mut RequestContext<'_, W>,
+    request: ExecuteRequest,
+    allow_reason: String,
+    authority: Option<Option<Vec<String>>>,
+    command_authority: Option<CommandAuthorization>,
 ) -> ExecuteResult {
     let server = context.server;
     let caller = context.caller;
@@ -2940,6 +3206,20 @@ pub(super) async fn exec_after_approval_with_secret_authority<W: AsyncWrite + Un
     #[cfg(unix)]
     cmd.as_std_mut().process_group(0);
 
+    // Learned deny, composed verb authority, and live session state are held
+    // only through the finite process-start handoff. A revocation that commits
+    // first prevents spawn; a revocation after spawn applies to later uses.
+    let initiation_lease = match acquire_command_initiation_lease(
+        server,
+        &request,
+        command_authority.as_ref(),
+    )
+    .await
+    {
+        Ok(lease) => lease,
+        Err(reason) => return ExecuteResult::denied(reason),
+    };
+
     if context.stream_output {
         let result = execute_spawn_streaming(
             cmd,
@@ -2952,6 +3232,7 @@ pub(super) async fn exec_after_approval_with_secret_authority<W: AsyncWrite + Un
                 exposed_secret_refs,
             },
             &mut *context.stream_writer,
+            initiation_lease,
         )
         .await;
         drop(secret_file_lease);
@@ -2969,6 +3250,7 @@ pub(super) async fn exec_after_approval_with_secret_authority<W: AsyncWrite + Un
             );
         }
     };
+    drop(initiation_lease);
     let process_guard = child
         .id()
         .map(|pid| server.state.process_tracker.track(pid));
@@ -3033,6 +3315,7 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
     tool_env: &HashMap<String, String>,
     audit: SpawnAuditContext<'_>,
     writer: &mut W,
+    initiation_lease: CommandInitiationLease,
 ) -> ExecuteResult {
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -3046,6 +3329,7 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
             );
         }
     };
+    drop(initiation_lease);
     let mut process_guard = child
         .id()
         .map(|pid| server.state.process_tracker.track(pid));

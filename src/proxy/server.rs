@@ -39,9 +39,9 @@ use tokio::sync::RwLock;
 use tokio_rustls::TlsAcceptor;
 
 use super::gate::{
-    ApiCoverageVerdict, ApiEvaluationMode, ApiHoldSnapshot, ApiJudge, ApiJudgeVerdict, ApiMutation,
-    ApiRequestSummary, ApiSessionContext, ApiSessionEvent, ApiSessionSink, GateSink, HoldDecision,
-    RevertConstructible,
+    ApiAuthorizationKind, ApiCoverageVerdict, ApiEvaluationMode, ApiForwardRequirement,
+    ApiHoldSnapshot, ApiJudge, ApiJudgeVerdict, ApiMutation, ApiRequestSummary, ApiSessionContext,
+    ApiSessionEvent, ApiSessionSink, GateSink, HoldDecision, RevertConstructible,
 };
 use super::k8s_protocol::KubernetesProtocol;
 use super::k8s_protocol::{bind_mutation_preconditions, object_state, KubernetesObjectState};
@@ -215,6 +215,13 @@ pub struct ApiProxy {
     /// [`POLICY_RELOAD_SECS`] default; tests inject a short interval so they
     /// can observe a reload without a multi-second wait.
     policy_reload_interval: Duration,
+}
+
+#[derive(Clone)]
+struct PendingApiAuthorization {
+    judge: Arc<dyn ApiJudge>,
+    summary: ApiRequestSummary,
+    requirement: ApiForwardRequirement,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1136,6 +1143,7 @@ impl ApiProxy {
                 reason,
                 risk,
                 reversibility,
+                authorization,
             } => {
                 let _ = crate::audit::emit_global(
                     &crate::audit::AuditEvent::new(crate::audit::AuditKind::Evaluate)
@@ -1145,6 +1153,30 @@ impl ApiProxy {
                         .field("reversibility", format!("{reversibility:?}"))
                         .field("label", &label),
                 );
+                let pending_authorization = match authorization {
+                    ApiAuthorizationKind::Evaluated => PendingApiAuthorization {
+                        judge: judge.clone(),
+                        summary: summary.clone(),
+                        requirement: ApiForwardRequirement::Evaluated,
+                    },
+                    ApiAuthorizationKind::Coverage => {
+                        let (Some(risk), Some(reversibility)) = (risk, reversibility) else {
+                            return self.status_resp(
+                                StatusCode::FORBIDDEN,
+                                "guard api-proxy coverage authorization is incomplete",
+                                "Forbidden",
+                            );
+                        };
+                        PendingApiAuthorization {
+                            judge: judge.clone(),
+                            summary: summary.clone(),
+                            requirement: ApiForwardRequirement::Coverage {
+                                risk,
+                                reversibility,
+                            },
+                        }
+                    }
+                };
                 let outcome = decide_gate(reversibility, risk, prepared.is_constructible(), false);
                 match outcome {
                     // Reversible/low-risk: no envelope needed, forward as-is.
@@ -1165,6 +1197,7 @@ impl ApiProxy {
                             Some(op.clone()),
                             conn_id,
                             None,
+                            Some(pending_authorization),
                         )
                         .await
                     }
@@ -1210,6 +1243,7 @@ impl ApiProxy {
                                     op,
                                     "evaluator allowed a contained write but no auto-revert can be armed right now",
                                     conn_id,
+                                    Some(pending_authorization),
                                 )
                                 .await;
                         }
@@ -1229,6 +1263,7 @@ impl ApiProxy {
                                             op,
                                             "evaluator allowed a contained write but its revert could not be re-established at forward time",
                                             conn_id,
+                                            Some(pending_authorization),
                                         )
                                         .await;
                                 }
@@ -1256,6 +1291,7 @@ impl ApiProxy {
                             Some(op.clone()),
                             conn_id,
                             snapshot,
+                            Some(pending_authorization),
                         )
                         .await
                     }
@@ -1268,6 +1304,7 @@ impl ApiProxy {
                             op,
                             &format!("api evaluator allowed but consequence gate held: {reason}"),
                             conn_id,
+                            Some(pending_authorization),
                         )
                         .await
                     }
@@ -1333,6 +1370,14 @@ impl ApiProxy {
                 reversibility,
             } => {
                 let outcome = decide_gate(Some(reversibility), Some(risk), false, false);
+                let pending_authorization = PendingApiAuthorization {
+                    judge: judge.clone(),
+                    summary,
+                    requirement: ApiForwardRequirement::Coverage {
+                        risk,
+                        reversibility,
+                    },
+                };
                 if outcome != GateOutcome::ExecuteNow {
                     return self
                         .route_hold_buffered(
@@ -1343,6 +1388,7 @@ impl ApiProxy {
                             op,
                             "exact typed API coverage requires consequence approval",
                             conn_id,
+                            Some(pending_authorization),
                         )
                         .await;
                 }
@@ -1356,6 +1402,7 @@ impl ApiProxy {
                     Some(op.clone()),
                     conn_id,
                     None,
+                    Some(pending_authorization),
                 )
                 .await
             }
@@ -1421,7 +1468,7 @@ impl ApiProxy {
             Ok(buffered) => buffered,
             Err(error) => return self.request_body_error_response(error),
         };
-        self.route_hold_buffered(parts, body, path, query, op, reason, conn_id)
+        self.route_hold_buffered(parts, body, path, query, op, reason, conn_id, None)
             .await
     }
 
@@ -1435,6 +1482,7 @@ impl ApiProxy {
         op: &ApiOp,
         reason: &str,
         conn_id: u64,
+        authorization: Option<PendingApiAuthorization>,
     ) -> Response<ProxyBody> {
         let label = format!("{} {}", op.verb.as_str(), path);
         let Some(gate) = self.gate.get() else {
@@ -1480,6 +1528,7 @@ impl ApiProxy {
                             Some(op.clone()),
                             conn_id,
                             None,
+                            authorization,
                         )
                         .await;
                     (response, GuardHoldOutcome::Approved)
@@ -1514,7 +1563,7 @@ impl ApiProxy {
             Ok(buffered) => buffered,
             Err(error) => return self.request_body_error_response(error),
         };
-        self.forward_buffered(parts, body, path, query, redact, op, conn_id, None)
+        self.forward_buffered(parts, body, path, query, redact, op, conn_id, None, None)
             .await
     }
 
@@ -1541,6 +1590,7 @@ impl ApiProxy {
             conn_id,
             None,
             Some(created),
+            None,
         )
         .await
     }
@@ -1556,6 +1606,7 @@ impl ApiProxy {
         op: Option<ApiOp>,
         conn_id: u64,
         prepared_snapshot: Option<Option<Vec<u8>>>,
+        authorization: Option<PendingApiAuthorization>,
     ) -> Response<ProxyBody> {
         self.forward_buffered_with_cleanup(
             parts,
@@ -1567,6 +1618,7 @@ impl ApiProxy {
             conn_id,
             prepared_snapshot,
             None,
+            authorization,
         )
         .await
     }
@@ -1583,6 +1635,7 @@ impl ApiProxy {
         conn_id: u64,
         mut prepared_snapshot: Option<Option<Vec<u8>>>,
         created_cleanup: Option<CreatedMatch>,
+        authorization: Option<PendingApiAuthorization>,
     ) -> Response<ProxyBody> {
         let route_authority = match self.route_authority_from_parts(&parts) {
             Some(authority) => authority,
@@ -1665,6 +1718,7 @@ impl ApiProxy {
                 session_context,
                 created_cleanup,
                 route_authority,
+                authorization,
             )
             .await
         {
@@ -1697,6 +1751,7 @@ impl ApiProxy {
         session_context: Option<ApiSessionContext>,
         created_cleanup: Option<CreatedMatch>,
         route_authority: RouteAuthority,
+        authorization: Option<PendingApiAuthorization>,
     ) -> Result<Response<ProxyBody>> {
         // A recoverable write is wrapped in an auto-revert envelope after the
         // upstream succeeds. Snapshot acquisition occurs in the caller before
@@ -1778,7 +1833,27 @@ impl ApiProxy {
                     .field("name", operation.name.as_deref().unwrap_or("(collection)")),
             );
         }
-        let upstream_resp = rb.send().await.context("forward to apiserver")?;
+        let forward_authority = if let Some(pending) = authorization {
+            match pending
+                .judge
+                .authorize_forward(&pending.summary, pending.requirement)
+                .await
+            {
+                Ok(authority) => Some(authority),
+                Err(reason) => {
+                    return Ok(self.status_resp(
+                        StatusCode::FORBIDDEN,
+                        &format!("guard api-proxy authority changed before forwarding: {reason}"),
+                        "Forbidden",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        let upstream_resp = rb.send().await;
+        drop(forward_authority);
+        let upstream_resp = upstream_resp.context("forward to apiserver")?;
         let status = upstream_resp.status();
         let upstream_headers = upstream_resp.headers().clone();
         let response_secrets = self.upstream.response_secret_values();

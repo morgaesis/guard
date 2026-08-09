@@ -9,7 +9,7 @@
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,9 +24,10 @@ use tokio_rustls::rustls::{self, pki_types};
 
 use guard::gating::Reversibility;
 use guard::proxy::{
-    ApiCoverageVerdict, ApiEvaluationMode, ApiHoldSnapshot, ApiJudge, ApiJudgeVerdict,
-    ApiListenerMode, ApiPolicy, ApiProxy, ApiRequestSummary, ApiSessionContext, ApiSessionEvent,
-    ApiSessionSink, GateSink, ProxyTls, Upstream,
+    ApiAuthorizationKind, ApiCoverageVerdict, ApiEvaluationMode, ApiForwardAuthorization,
+    ApiForwardRequirement, ApiHoldSnapshot, ApiJudge, ApiJudgeVerdict, ApiListenerMode, ApiPolicy,
+    ApiProxy, ApiRequestSummary, ApiSessionContext, ApiSessionEvent, ApiSessionSink, GateSink,
+    ProxyTls, Upstream,
 };
 
 struct LiveSessionSink;
@@ -251,6 +252,35 @@ async fn spawn_mock_upstream() -> String {
         }
     });
     format!("http://{addr}")
+}
+
+async fn spawn_counting_upstream() -> (String, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+    let observed = count.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => continue,
+            };
+            let requests = observed.clone();
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        io,
+                        service_fn(move |request| {
+                            requests.fetch_add(1, Ordering::SeqCst);
+                            mock_handler(request)
+                        }),
+                    )
+                    .await;
+            });
+        }
+    });
+    (format!("http://{addr}"), count)
 }
 
 #[derive(Clone)]
@@ -749,6 +779,25 @@ async fn start_proxy_with(
     gate: Option<Arc<dyn GateSink>>,
     rarity_threshold: u64,
 ) -> (String, reqwest::Client) {
+    start_proxy_with_session_sink(
+        mock_base,
+        policy_yaml,
+        judge,
+        gate,
+        rarity_threshold,
+        Arc::new(LiveSessionSink),
+    )
+    .await
+}
+
+async fn start_proxy_with_session_sink(
+    mock_base: String,
+    policy_yaml: &str,
+    judge: Option<Arc<dyn ApiJudge>>,
+    gate: Option<Arc<dyn GateSink>>,
+    rarity_threshold: u64,
+    session_sink: Arc<dyn ApiSessionSink>,
+) -> (String, reqwest::Client) {
     let kubeconfig = kubeconfig_for(&mock_base);
     let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
     let tls = ProxyTls::generate().expect("tls");
@@ -767,7 +816,7 @@ async fn start_proxy_with(
     if let Some(judge) = judge {
         proxy.attach_judge(judge);
     }
-    proxy.attach_session_sink(Arc::new(LiveSessionSink));
+    proxy.attach_session_sink(session_sink);
     tokio::spawn(proxy.clone().serve_on(listener));
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
@@ -853,6 +902,85 @@ impl ApiJudge for ModeCoverageJudge {
     }
 }
 
+#[derive(Clone)]
+struct LinearizedJudge {
+    coverage: bool,
+    hold: bool,
+    active: Arc<AtomicBool>,
+    coordination: Arc<tokio::sync::RwLock<()>>,
+    reached_handoff: Arc<tokio::sync::Semaphore>,
+    release_handoff: Arc<tokio::sync::Semaphore>,
+}
+
+impl LinearizedJudge {
+    fn new(coverage: bool) -> Self {
+        Self {
+            coverage,
+            hold: false,
+            active: Arc::new(AtomicBool::new(true)),
+            coordination: Arc::new(tokio::sync::RwLock::new(())),
+            reached_handoff: Arc::new(tokio::sync::Semaphore::new(0)),
+            release_handoff: Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
+
+    fn held() -> Self {
+        Self {
+            hold: true,
+            ..Self::new(false)
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ApiJudge for LinearizedJudge {
+    async fn coverage(&self, _summary: &ApiRequestSummary) -> ApiCoverageVerdict {
+        if self.coverage {
+            ApiCoverageVerdict::Allow {
+                risk: 1,
+                reversibility: Reversibility::Reversible,
+            }
+        } else {
+            ApiCoverageVerdict::None
+        }
+    }
+
+    async fn authorize_forward(
+        &self,
+        _summary: &ApiRequestSummary,
+        _requirement: ApiForwardRequirement,
+    ) -> Result<ApiForwardAuthorization, String> {
+        let guard = self.coordination.clone().read_owned().await;
+        if !self.active.load(Ordering::SeqCst) {
+            return Err("revoked".to_string());
+        }
+        self.reached_handoff.add_permits(1);
+        self.release_handoff
+            .acquire()
+            .await
+            .map_err(|_| "handoff closed".to_string())?
+            .forget();
+        Ok(ApiForwardAuthorization::new(guard))
+    }
+
+    async fn judge(&self, _summary: &ApiRequestSummary) -> ApiJudgeVerdict {
+        ApiJudgeVerdict::Allow {
+            reason: "mock allow".to_string(),
+            risk: Some(if self.hold { 9 } else { 1 }),
+            reversibility: Some(if self.hold {
+                Reversibility::Irreversible
+            } else {
+                Reversibility::Reversible
+            }),
+            authorization: if self.coverage {
+                ApiAuthorizationKind::Coverage
+            } else {
+                ApiAuthorizationKind::Evaluated
+            },
+        }
+    }
+}
+
 struct ModeSessionSink;
 
 #[async_trait::async_trait]
@@ -908,7 +1036,110 @@ fn judge_allow(risk: Option<i32>, reversibility: Option<Reversibility>) -> ApiJu
         reason: "mock allow".to_string(),
         risk,
         reversibility,
+        authorization: guard::proxy::ApiAuthorizationKind::Evaluated,
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn evaluator_authority_is_linearized_at_upstream_handoff() {
+    let policy = r#"
+default: deny
+rules:
+  - verbs: [get]
+    resources: [configmaps]
+    namespaces: [dev]
+    action: evaluate
+"#;
+    let (upstream, forwarded) = spawn_counting_upstream().await;
+    let judge = Arc::new(LinearizedJudge::new(false));
+    let (base, client) = start_proxy_with(upstream, policy, Some(judge.clone()), None, 0).await;
+    let request = tokio::spawn(async move {
+        client
+            .get(format!("{base}/api/v1/namespaces/dev/configmaps/cm"))
+            .send()
+            .await
+            .unwrap()
+    });
+    judge.reached_handoff.acquire().await.unwrap().forget();
+    let mutation_started = Arc::new(tokio::sync::Semaphore::new(0));
+    let started = mutation_started.clone();
+    let mutation_judge = judge.clone();
+    let revoke = tokio::spawn(async move {
+        started.add_permits(1);
+        let _guard = mutation_judge.coordination.write().await;
+        mutation_judge.active.store(false, Ordering::SeqCst);
+    });
+    mutation_started.acquire().await.unwrap().forget();
+    assert!(!revoke.is_finished());
+    judge.release_handoff.add_permits(1);
+
+    assert_eq!(request.await.unwrap().status(), 200);
+    revoke.await.unwrap();
+    assert_eq!(forwarded.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coverage_revoked_before_upstream_handoff_prevents_forwarding() {
+    let policy = r#"
+default: deny
+rules:
+  - verbs: [create]
+    resources: [pods]
+    namespaces: [dev]
+    action: evaluate
+"#;
+    let (upstream, forwarded) = spawn_counting_upstream().await;
+    let judge = Arc::new(LinearizedJudge::new(true));
+    judge.active.store(false, Ordering::SeqCst);
+    let (base, client) = start_proxy_with_session_sink(
+        upstream,
+        policy,
+        Some(judge),
+        None,
+        0,
+        Arc::new(ModeSessionSink),
+    )
+    .await;
+    let response = client
+        .post(format!("{base}/api/v1/namespaces/dev/pods"))
+        .bearer_auth("readonly-authorized")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+    assert_eq!(forwarded.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn evaluator_authority_revoked_during_an_approved_hold_prevents_forwarding() {
+    let policy = r#"
+default: deny
+rules:
+  - verbs: [create]
+    resources: [configmaps]
+    namespaces: [dev]
+    action: evaluate
+"#;
+    let (upstream, forwarded) = spawn_counting_upstream().await;
+    let judge = Arc::new(LinearizedJudge::held());
+    judge.active.store(false, Ordering::SeqCst);
+    let (base, client) = start_proxy_with(
+        upstream,
+        policy,
+        Some(judge),
+        Some(Arc::new(ApprovingSink)),
+        0,
+    )
+    .await;
+    let response = client
+        .post(format!("{base}/api/v1/namespaces/dev/configmaps"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+    assert_eq!(forwarded.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use crate::server::admin::pause_access_approval_before_verb_lock_for_test;
 use crate::server::admin::{
     handle_admin_request_for_test, handle_admin_request_owned, handle_approval_note,
 };
@@ -2731,6 +2733,7 @@ async fn approval_snapshot_omits_rendered_verb_parameter_values() {
                 params: BTreeMap::from([("rollback_only".to_string(), value.clone())]),
                 catalog_version: 1,
                 verb_digest: None,
+                composition_digest: None,
                 access_evaluation_override_eligible: false,
             }),
             bypass: false,
@@ -3300,6 +3303,7 @@ async fn held_access_projection_expires_before_the_sweeper_and_hides_approval_op
             verb_params: BTreeMap::new(),
             catalog_version: None,
             verb_digest: None,
+            verb_composition_digest: None,
             access_verbs: Vec::new(),
             access_requests: Vec::new(),
             principal: Some(principal),
@@ -3944,6 +3948,7 @@ async fn held_access_replay_fails_if_staged_session_was_revoked() {
         verb_params: std::collections::BTreeMap::new(),
         catalog_version: None,
         verb_digest: None,
+        verb_composition_digest: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
     };
@@ -5217,15 +5222,15 @@ async fn approval_note_operator_and_owner_post_others_refused() {
 const HELD_VERB_YAML: &str = r#"
 verbs:
   - name: restart-service
-    binary: systemctl
-    args: ["restart", "{unit}"]
+    binary: true
+    args: ["{unit}"]
     params:
       unit: { pattern: "^[a-zA-Z0-9@._-]+$", required: true }
     consequence: irreversible
 "#;
 
-/// One pending hold bound to `restart-service`, executing `true` so a false
-/// pass through the void check is detectable.
+/// One pending hold bound to `restart-service` with a harmless executable
+/// rendering so successful replay is observable.
 fn held_verb_approval(
     handle: &str,
     catalog_version: Option<u64>,
@@ -5236,7 +5241,7 @@ fn held_verb_approval(
         handle: handle.to_string(),
         snapshot: ApprovalSnapshot {
             binary: "true".to_string(),
-            args: Vec::new(),
+            args: vec!["fixture".to_string()],
             cwd: None,
             env: BTreeMap::new(),
             secret_keys: BTreeMap::new(),
@@ -5248,6 +5253,7 @@ fn held_verb_approval(
             verb_params: BTreeMap::new(),
             catalog_version,
             verb_digest,
+            verb_composition_digest: None,
             access_verbs: Vec::new(),
             access_requests: Vec::new(),
             principal,
@@ -5837,7 +5843,7 @@ async fn held_approval_catalog_race_is_linearized(replacement: VerbCatalog) {
 async fn held_approval_lease_linearizes_against_deletion_and_amendment() {
     held_approval_catalog_race_is_linearized(VerbCatalog::from_yaml("verbs: []").unwrap()).await;
     let replacement = VerbCatalog::from_yaml(
-        &HELD_VERB_YAML.replace("args: [\"restart\",", "args: [\"reload\","),
+        &HELD_VERB_YAML.replace("^[a-zA-Z0-9@._-]+$", "^(fixture|alternate)$"),
     )
     .unwrap();
     held_approval_catalog_race_is_linearized(replacement).await;
@@ -5847,12 +5853,13 @@ async fn held_approval_lease_linearizes_against_deletion_and_amendment() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn verb_execution_lease_linearizes_against_concurrent_amendment() {
     let (cfg, _operator, agent) = gating_config(7089, 1000);
-    let catalog = VerbCatalog::from_yaml(HELD_VERB_YAML).unwrap();
-    let digest = catalog.verb_definition_digest("restart-service").unwrap();
+    const EXECUTION_VERB: &str =
+        "verbs:\n  - name: runtime-command\n    binary: true\n    consequence: reversible\n    trusted: true\n";
+    let catalog = VerbCatalog::from_yaml(EXECUTION_VERB).unwrap();
+    let digest = catalog.verb_definition_digest("runtime-command").unwrap();
     let version = catalog.version();
     *cfg.state.verbs.write().await = catalog;
-    let (acquired, release) =
-        pause_verb_authority_lease_for_test(&cfg, "verb execution authorization");
+    let (acquired, release) = pause_verb_authority_lease_for_test(&cfg, "command process start");
 
     let execution = cfg.clone();
     let execution_agent = agent.clone();
@@ -5873,15 +5880,16 @@ async fn verb_execution_lease_linearizes_against_concurrent_amendment() {
                 reversibility: Some(Reversibility::Reversible),
                 revert_preauthorized: false,
                 verb: Some(VerbContext {
-                    name: "restart-service".to_string(),
+                    name: "runtime-command".to_string(),
                     class: Reversibility::Reversible,
                     trusted: true,
                     params: BTreeMap::new(),
                     catalog_version: version,
                     verb_digest: Some(digest),
+                    composition_digest: None,
                     access_evaluation_override_eligible: false,
                 }),
-                bypass: false,
+                bypass: true,
                 authority: None,
                 consume_access_verbs: Vec::new(),
             },
@@ -5897,7 +5905,7 @@ async fn verb_execution_lease_linearizes_against_concurrent_amendment() {
     let mutation = tokio::spawn(async move {
         started.add_permits(1);
         let replacement = VerbCatalog::from_yaml(
-            &HELD_VERB_YAML.replace("args: [\"restart\",", "args: [\"reload\","),
+            &EXECUTION_VERB.replace("binary: true", "binary: true\n    description: amended"),
         )
         .unwrap();
         *changing.state.verbs.write().await = replacement;
@@ -5911,6 +5919,155 @@ async fn verb_execution_lease_linearizes_against_concurrent_amendment() {
         ExecOutcome::Completed { .. }
     ));
     mutation.await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn access_approval_and_command_start_follow_one_lock_order() {
+    let (cfg, operator, agent) = gating_config(7090, 1000);
+    let catalog = VerbCatalog::from_yaml(
+        r#"
+verbs:
+  - name: runtime-command
+    binary: true
+    baseline: false
+    consequence: reversible
+    trusted: true
+  - name: approval-scope
+    binary: echo
+    args: ["scope"]
+    baseline: false
+    consequence: reversible
+    trusted: true
+"#,
+    )
+    .unwrap();
+    let version = catalog.version();
+    let digest = catalog.verb_definition_digest("runtime-command").unwrap();
+    *cfg.state.verbs.write().await = catalog;
+    let mut command_session = active_session();
+    command_session.activated_verbs = vec!["runtime-command".to_string()];
+    cfg.state
+        .sessions
+        .write()
+        .await
+        .grant("lock-order-session".to_string(), command_session);
+
+    let mut pending = crate::grant_profile::GrantRequest::new_access(
+        agent.principal().unwrap(),
+        None,
+        "agent-fixture".to_string(),
+        crate::grant_profile::GrantRequestDelta {
+            activated_verbs: vec!["approval-scope".to_string()],
+            ..Default::default()
+        },
+        "bounded scope".to_string(),
+    )
+    .unwrap();
+    pending.authority_verbs = vec!["approval-scope".to_string()];
+    pending.request_key = pending.canonical_access_key().unwrap();
+    let pending_handle = pending.handle.clone();
+    cfg.state
+        .grant_requests
+        .write()
+        .await
+        .insert(pending.handle.clone(), pending);
+
+    let (command_acquired, release_command) =
+        pause_verb_authority_lease_for_test(&cfg, "command process start");
+    let mut request = held_request("true", Vec::new(), None);
+    request.session_token = Some("lock-order-session".to_string());
+    let session_authority = live_authority(&cfg, "lock-order-session").await;
+    let executing = cfg.clone();
+    let executing_agent = agent.clone();
+    let command = tokio::spawn(async move {
+        let mut sink = tokio::io::sink();
+        route_gated_allow(
+            &mut RequestContext {
+                server: &executing,
+                caller: &executing_agent,
+                depth: 0,
+                stream_output: false,
+                stream_writer: &mut sink,
+            },
+            request,
+            GateInputs {
+                reason: "operator verb".to_string(),
+                risk: Some(1),
+                reversibility: Some(Reversibility::Reversible),
+                revert_preauthorized: false,
+                verb: Some(VerbContext {
+                    name: "runtime-command".to_string(),
+                    class: Reversibility::Reversible,
+                    trusted: true,
+                    params: BTreeMap::new(),
+                    catalog_version: version,
+                    verb_digest: Some(digest),
+                    composition_digest: None,
+                    access_evaluation_override_eligible: false,
+                }),
+                bypass: true,
+                authority: session_authority,
+                consume_access_verbs: Vec::new(),
+            },
+            None,
+        )
+        .await
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        command_acquired.acquire(),
+    )
+    .await
+    .expect("command reaches the verb initiation lease")
+    .unwrap()
+    .forget();
+
+    let (approval_reached, release_approval) =
+        pause_access_approval_before_verb_lock_for_test(&cfg);
+    let approving = cfg.clone();
+    let approval = tokio::spawn(async move {
+        handle_admin_request_for_test(
+            &approving,
+            &operator,
+            AdminRequest::AccessApprove {
+                handles: vec![pending_handle],
+                uses: Some(1),
+                wait_secs: None,
+            },
+        )
+        .await
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        approval_reached.acquire(),
+    )
+    .await
+    .expect("approval reaches verb coordination before session coordination")
+    .unwrap()
+    .forget();
+    release_approval.add_permits(1);
+    tokio::task::yield_now().await;
+    assert!(!approval.is_finished());
+
+    release_command.add_permits(1);
+    let (command_result, approval_result) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(command, approval)
+        })
+        .await
+        .expect("opposing flows do not form a lock cycle");
+    let command_result = command_result.unwrap();
+    let command_response = command_result.into_response();
+    assert!(
+        command_response.allowed && command_response.exit_code == Some(0),
+        "command start failed: {}",
+        command_response.reason
+    );
+    let AdminResponse::AccessDecisions { items, .. } = approval_result.unwrap() else {
+        panic!("expected access decision")
+    };
+    assert!(items[0].success, "access approval failed: {:?}", items[0]);
 }
 
 #[tokio::test]
@@ -5931,6 +6088,7 @@ async fn approved_snapshot_rechecks_binary_floor_before_exec() {
         verb_params: BTreeMap::new(),
         catalog_version: None,
         verb_digest: None,
+        verb_composition_digest: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: agent.principal(),
@@ -6213,6 +6371,7 @@ async fn stored_entitlements_cover_tool_secrets_for_approval_check_and_revert() 
         verb_params: BTreeMap::new(),
         catalog_version: None,
         verb_digest: None,
+        verb_composition_digest: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: Some(principal.clone()),
@@ -6355,6 +6514,7 @@ async fn approved_snapshot_rejects_changed_session_revision() {
         verb_params: BTreeMap::new(),
         catalog_version: None,
         verb_digest: None,
+        verb_composition_digest: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: agent.principal(),
@@ -6389,6 +6549,7 @@ async fn approved_snapshot_rejects_dangerous_request_env_before_exec() {
         verb_params: BTreeMap::new(),
         catalog_version: None,
         verb_digest: None,
+        verb_composition_digest: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: agent.principal(),
@@ -6429,6 +6590,7 @@ async fn approved_snapshot_executes_in_snapshotted_cwd() {
         verb_params: BTreeMap::new(),
         catalog_version: None,
         verb_digest: None,
+        verb_composition_digest: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: agent.principal(),
@@ -6470,6 +6632,7 @@ async fn approved_snapshot_rejects_missing_snapshotted_cwd_before_exec() {
         verb_params: BTreeMap::new(),
         catalog_version: None,
         verb_digest: None,
+        verb_composition_digest: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: agent.principal(),
@@ -6519,6 +6682,7 @@ async fn approved_snapshot_rejects_retargeted_snapshotted_cwd_before_exec() {
         verb_params: BTreeMap::new(),
         catalog_version: None,
         verb_digest: None,
+        verb_composition_digest: None,
         access_verbs: Vec::new(),
         access_requests: Vec::new(),
         principal: agent.principal(),

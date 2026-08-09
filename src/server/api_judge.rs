@@ -6,7 +6,10 @@ use guard::gating::GateMode;
 use guard::learned_rules::{
     acquire_async_authority_use_lease, run_async_durable_store_operation, AuthorityUseLease,
 };
-use guard::proxy::{ApiCoverageVerdict, ApiJudge, ApiJudgeVerdict, ApiRequestSummary};
+use guard::proxy::{
+    ApiAuthorizationKind, ApiCoverageVerdict, ApiForwardAuthorization, ApiForwardRequirement,
+    ApiJudge, ApiJudgeVerdict, ApiRequestSummary,
+};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -373,6 +376,56 @@ async fn lookup_api_coverage(
     ApiCoverageVerdict::None
 }
 
+async fn authorize_api_forward(
+    store: Option<&Arc<RwLock<ApiPromotionStore>>>,
+    stamp: &str,
+    summary: &ApiRequestSummary,
+    requirement: ApiForwardRequirement,
+) -> Result<ApiForwardAuthorization, String> {
+    let Some(store) = store else {
+        return match requirement {
+            ApiForwardRequirement::Evaluated => Ok(ApiForwardAuthorization::none()),
+            ApiForwardRequirement::Coverage { .. } => {
+                Err("API coverage authority is unavailable".to_string())
+            }
+        };
+    };
+    refresh_api_coverage_once(store)
+        .await
+        .map_err(|_| "API coverage authority is unavailable".to_string())?;
+    let lease = lease_api_coverage_for_decision(store)
+        .await
+        .map_err(|_| "API coverage authority is unavailable".to_string())?;
+    let request_stamp = request_stamp(stamp, summary);
+    if let Some(hit) = lease.learned_deny(summary, &request_stamp) {
+        return Err(hit.reason);
+    }
+    if summary.session_fingerprint.is_some() {
+        let mut baseline = summary.clone();
+        baseline.session_fingerprint = None;
+        baseline.session_revision = None;
+        baseline.session_intent = None;
+        if let Some(hit) = lease.learned_deny(&baseline, stamp) {
+            if hit.provenance == ApiCoverageProvenance::Operator {
+                return Err(hit.reason);
+            }
+        }
+    }
+    if let ApiForwardRequirement::Coverage {
+        risk,
+        reversibility,
+    } = requirement
+    {
+        let current = (!summary.rarity)
+            .then(|| lease.learned_allow(summary, &request_stamp))
+            .flatten();
+        if !current.is_some_and(|hit| hit.risk == risk && hit.reversibility == reversibility) {
+            return Err("API coverage authority changed before upstream forwarding".to_string());
+        }
+    }
+    Ok(ApiForwardAuthorization::new(lease))
+}
+
 pub(super) async fn lease_api_coverage_for_decision(
     store: &Arc<RwLock<ApiPromotionStore>>,
 ) -> anyhow::Result<AuthorityUseLease<ApiPromotionStore>> {
@@ -453,6 +506,14 @@ impl ApiJudge for DaemonApiCoverageJudge {
         lookup_api_coverage(&self.api_promotion, &self.stamp, summary).await
     }
 
+    async fn authorize_forward(
+        &self,
+        summary: &ApiRequestSummary,
+        requirement: ApiForwardRequirement,
+    ) -> Result<ApiForwardAuthorization, String> {
+        authorize_api_forward(Some(&self.api_promotion), &self.stamp, summary, requirement).await
+    }
+
     async fn judge(&self, _summary: &ApiRequestSummary) -> ApiJudgeVerdict {
         ApiJudgeVerdict::Error("API evaluator is disabled".to_string())
     }
@@ -488,6 +549,20 @@ impl ApiJudge for DaemonApiJudge {
             return ApiCoverageVerdict::None;
         };
         lookup_api_coverage(store, &self.stamp, summary).await
+    }
+
+    async fn authorize_forward(
+        &self,
+        summary: &ApiRequestSummary,
+        requirement: ApiForwardRequirement,
+    ) -> Result<ApiForwardAuthorization, String> {
+        authorize_api_forward(
+            self.api_promotion.as_ref(),
+            &self.stamp,
+            summary,
+            requirement,
+        )
+        .await
     }
 
     async fn judge(&self, summary: &ApiRequestSummary) -> ApiJudgeVerdict {
@@ -552,6 +627,7 @@ impl ApiJudge for DaemonApiJudge {
                         reason: "API evaluator approved request".to_string(),
                         risk: Some(hit.risk),
                         reversibility: Some(hit.reversibility),
+                        authorization: ApiAuthorizationKind::Coverage,
                     });
                 }
             }
@@ -628,6 +704,7 @@ impl ApiJudge for DaemonApiJudge {
                     reason,
                     risk,
                     reversibility,
+                    authorization: ApiAuthorizationKind::Evaluated,
                 }
             }
             EvalResult::Deny { reason, source, .. } => {
@@ -648,10 +725,12 @@ fn sanitize_api_judge_verdict(verdict: ApiJudgeVerdict) -> ApiJudgeVerdict {
             reason,
             risk,
             reversibility,
+            authorization,
         } => ApiJudgeVerdict::Allow {
             reason: guard::gating::sanitize_gate_text(&reason),
             risk,
             reversibility,
+            authorization,
         },
         ApiJudgeVerdict::Deny { reason } => ApiJudgeVerdict::Deny {
             reason: guard::gating::sanitize_gate_text(&reason),

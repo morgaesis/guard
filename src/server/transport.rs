@@ -111,6 +111,7 @@ mod admin_response_lease_tests {
                 verb_params: BTreeMap::new(),
                 catalog_version: None,
                 verb_digest: None,
+                verb_composition_digest: None,
                 access_verbs: Vec::new(),
                 access_requests: Vec::new(),
                 principal: None,

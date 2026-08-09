@@ -107,6 +107,11 @@ pub struct ApprovalSnapshot {
     /// Absent on rows written before the digest existed.
     #[serde(default)]
     pub verb_digest: Option<String>,
+    /// Canonical digest of the complete composed matcher selection. Rows
+    /// without this field use the conservative single-verb compatibility
+    /// check at replay.
+    #[serde(default)]
+    pub verb_composition_digest: Option<String>,
     /// Session-scoped access verbs selected when this immutable hold was
     /// created. Approval consumes their original bounded authority.
     #[serde(default)]
@@ -744,6 +749,7 @@ mod tests {
             verb_params: BTreeMap::new(),
             catalog_version: None,
             verb_digest: None,
+            verb_composition_digest: None,
             access_verbs: Vec::new(),
             access_requests: Vec::new(),
             principal: Some(PrincipalKey::from_uid(1001)),

@@ -115,6 +115,23 @@ pub struct Evaluator {
     verb_promotion_stamp: String,
 }
 
+/// A fresh learned-deny snapshot held through one command-start handoff.
+#[doc(hidden)]
+pub struct LearnedDenyUseLease {
+    lease: Option<crate::learned_rules::AuthorityUseLease<DenyShapeStore>>,
+}
+
+impl LearnedDenyUseLease {
+    #[doc(hidden)]
+    pub fn matching_reason(&self, binary: &str, args: &[String]) -> Option<String> {
+        self.lease.as_ref().and_then(|lease| {
+            lease
+                .matches(binary, &args.join(" "))
+                .map(|shape| shape.last_reason.clone())
+        })
+    }
+}
+
 impl Evaluator {
     pub fn new(config: EvalConfig) -> Result<Self> {
         let policy_engine = if let Some(ref path) = config.policy_path {
@@ -256,6 +273,19 @@ impl Evaluator {
             allow_promotion: config.allow_promotion,
             verb_promotion_stamp,
         })
+    }
+
+    /// Refresh and lease learned-deny authority for a finite process-start
+    /// handoff. A configured store that cannot be refreshed or leased fails
+    /// closed instead of preserving an earlier allow.
+    #[doc(hidden)]
+    pub async fn lease_learned_deny_for_use(&self) -> anyhow::Result<LearnedDenyUseLease> {
+        let Some(store) = self.deny_shapes.as_ref() else {
+            return Ok(LearnedDenyUseLease { lease: None });
+        };
+        refresh_deny_shapes_once(store).await?;
+        let lease = acquire_async_authority_use_lease(store, "learned deny command start").await?;
+        Ok(LearnedDenyUseLease { lease: Some(lease) })
     }
 
     pub fn mode(&self) -> Option<PolicyMode> {

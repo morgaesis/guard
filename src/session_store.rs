@@ -80,6 +80,55 @@ struct RegistryCommitOptions {
     expected_generation: u64,
 }
 
+#[derive(Clone, Copy)]
+enum StaleRegistryWrite {
+    Ignore,
+    Reject(&'static str),
+}
+
+#[cfg(test)]
+pub(crate) type RegistryCommitHook = (
+    std::sync::Arc<tokio::sync::Semaphore>,
+    std::sync::Arc<tokio::sync::Semaphore>,
+);
+
+#[cfg(test)]
+fn registry_commit_hooks(
+) -> &'static std::sync::Mutex<std::collections::BTreeMap<(usize, &'static str), RegistryCommitHook>>
+{
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<(usize, &'static str), RegistryCommitHook>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn registry_commit_hook(gate: usize, task: &'static str) -> RegistryCommitHook {
+    let committed = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    registry_commit_hooks()
+        .lock()
+        .expect("registry commit hook lock")
+        .insert((gate, task), (committed.clone(), release.clone()));
+    (committed, release)
+}
+
+#[cfg(test)]
+async fn pause_registry_write_after_commit(gate: usize, task: &'static str) {
+    let hook = registry_commit_hooks()
+        .lock()
+        .expect("registry commit hook lock")
+        .remove(&(gate, task));
+    if let Some((committed, release)) = hook {
+        committed.add_permits(1);
+        release
+            .acquire()
+            .await
+            .expect("registry commit hook remains open")
+            .forget();
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     path: PathBuf,
@@ -109,6 +158,49 @@ pub struct StateDatabaseLease {
 }
 
 impl SessionStore {
+    #[cfg(test)]
+    pub(crate) fn pause_registry_commit_for_test(&self, task: &'static str) -> RegistryCommitHook {
+        registry_commit_hook(
+            std::sync::Arc::as_ptr(&self.registry_write_gate) as usize,
+            task,
+        )
+    }
+
+    async fn run_registry_write<F>(
+        &self,
+        task: &'static str,
+        revision: u64,
+        stale: StaleRegistryWrite,
+        operation: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(u64) -> Result<u64> + Send + 'static,
+    {
+        let gate = self.registry_write_gate.clone();
+        #[cfg(test)]
+        let gate_identity = std::sync::Arc::as_ptr(&gate) as usize;
+        tokio::spawn(async move {
+            let mut state = gate.lock().await;
+            if revision < state.last_written_revision {
+                return match stale {
+                    StaleRegistryWrite::Ignore => Ok(()),
+                    StaleRegistryWrite::Reject(message) => anyhow::bail!(message),
+                };
+            }
+            let expected_generation = state.database_generation;
+            let generation = tokio::task::spawn_blocking(move || operation(expected_generation))
+                .await
+                .with_context(|| format!("{task} task failed"))??;
+            #[cfg(test)]
+            pause_registry_write_after_commit(gate_identity, task).await;
+            state.database_generation = generation;
+            state.last_written_revision = revision;
+            Ok(())
+        })
+        .await
+        .with_context(|| format!("{task} coordination task failed"))?
+    }
+
     pub(crate) fn is_registry_generation_conflict(error: &anyhow::Error) -> bool {
         error.downcast_ref::<RegistryGenerationConflict>().is_some()
     }
@@ -406,21 +498,15 @@ impl SessionStore {
         let mut snapshot = registry.clone().with_history_retention(retention);
         snapshot.purge_expired();
         let revision = snapshot.revision();
-        let mut write_state = self.registry_write_gate.lock().await;
-        if revision < write_state.last_written_revision {
-            // A newer snapshot already landed; a full-table rewrite from this
-            // one would roll the on-disk state back.
-            return Ok(());
-        }
-        let expected_generation = write_state.database_generation;
-        let generation = tokio::task::spawn_blocking(move || {
-            Self::persist_registry_sync(&path, retention, &snapshot, expected_generation)
-        })
+        self.run_registry_write(
+            "session store persist",
+            revision,
+            StaleRegistryWrite::Ignore,
+            move |expected_generation| {
+                Self::persist_registry_sync(&path, retention, &snapshot, expected_generation)
+            },
+        )
         .await
-        .context("session store persist task failed")??;
-        write_state.database_generation = generation;
-        write_state.last_written_revision = revision;
-        Ok(())
     }
 
     fn open_sync(
@@ -1589,30 +1675,26 @@ impl SessionStore {
         let path = self.path.clone();
         let retention = self.history_retention_secs;
         let revision = registry.revision();
-        let mut write_state = self.registry_write_gate.lock().await;
-        if revision < write_state.last_written_revision {
-            anyhow::bail!("approved session snapshot is stale");
-        }
-        let expected_generation = write_state.database_generation;
-        let generation = tokio::task::spawn_blocking(move || {
-            Self::commit_grant_request_approval_sync(
-                &path,
-                retention,
-                &pending,
-                &approved,
-                &registry,
-                &rebased_pending,
-                RegistryCommitOptions {
-                    fail_before_commit: false,
-                    expected_generation,
-                },
-            )
-        })
+        self.run_registry_write(
+            "grant request approval transaction",
+            revision,
+            StaleRegistryWrite::Reject("approved session snapshot is stale"),
+            move |expected_generation| {
+                Self::commit_grant_request_approval_sync(
+                    &path,
+                    retention,
+                    &pending,
+                    &approved,
+                    &registry,
+                    &rebased_pending,
+                    RegistryCommitOptions {
+                        fail_before_commit: false,
+                        expected_generation,
+                    },
+                )
+            },
+        )
         .await
-        .context("grant request approval transaction task failed")??;
-        write_state.database_generation = generation;
-        write_state.last_written_revision = revision;
-        Ok(())
     }
 
     fn commit_grant_request_approval_sync(
@@ -1764,12 +1846,11 @@ impl SessionStore {
         let path = self.path.clone();
         let retention = self.history_retention_secs;
         let revision = registry.revision();
-        let mut write_state = self.registry_write_gate.lock().await;
-        if revision < write_state.last_written_revision {
-            anyhow::bail!("access revoke session snapshot is stale");
-        }
-        let expected_generation = write_state.database_generation;
-        let generation = tokio::task::spawn_blocking(move || {
+        self.run_registry_write(
+            "access revoke transaction",
+            revision,
+            StaleRegistryWrite::Reject("access revoke session snapshot is stale"),
+            move |expected_generation| {
             let mut conn = Self::open_connection(&path)?;
             Self::init_schema(&conn)?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1829,13 +1910,10 @@ impl SessionStore {
                 )?;
             }
             tx.commit()?;
-            Ok(generation)
-        })
+                Ok(generation)
+            },
+        )
         .await
-        .context("access revoke transaction task failed")??;
-        write_state.database_generation = generation;
-        write_state.last_written_revision = revision;
-        Ok(())
     }
 
     pub async fn load_grant_requests(&self) -> Result<Vec<GrantRequest>> {
@@ -3535,6 +3613,7 @@ mod tests {
                 verb_params: std::collections::BTreeMap::new(),
                 catalog_version: None,
                 verb_digest: None,
+                verb_composition_digest: None,
                 access_verbs: Vec::new(),
                 access_requests: Vec::new(),
                 principal: Some(guard::principal::PrincipalKey::from_uid(1001)),
@@ -4949,6 +5028,170 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn aborted_registry_writers_retain_coordination_until_live_adoption() {
+        async fn assert_waiting(handle: &tokio::task::JoinHandle<Result<()>>) {
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+            assert!(
+                !handle.is_finished(),
+                "a successor overtook a detached committed write"
+            );
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        let persist_path = tmp.path().join("persist.db");
+        let persist_store = SessionStore::open(persist_path.clone(), 3600)
+            .await
+            .unwrap();
+        let mut first_registry = SessionRegistry::new();
+        assert!(first_registry.grant("first".to_string(), exact_rule_grant(Vec::new())));
+        let mut second_registry = first_registry.clone();
+        assert!(second_registry.grant("second".to_string(), exact_rule_grant(Vec::new())));
+        let (committed, release) =
+            persist_store.pause_registry_commit_for_test("session store persist");
+        let detached_store = persist_store.clone();
+        let detached_snapshot = first_registry.clone();
+        let detached =
+            tokio::spawn(async move { detached_store.persist_registry(&detached_snapshot).await });
+        committed.acquire().await.unwrap().forget();
+        detached.abort();
+        let successor_store = persist_store.clone();
+        let successor =
+            tokio::spawn(async move { successor_store.persist_registry(&second_registry).await });
+        assert_waiting(&successor).await;
+        release.add_permits(1);
+        successor.await.unwrap().unwrap();
+        let loaded = SessionStore::open(persist_path, 3600)
+            .await
+            .unwrap()
+            .load_registry()
+            .await
+            .unwrap();
+        assert!(loaded.has("first"));
+        assert!(loaded.has("second"));
+
+        let approval_path = tmp.path().join("approval.db");
+        let approval_store = SessionStore::open(approval_path.clone(), 3600)
+            .await
+            .unwrap();
+        let token = "approval-session".to_string();
+        let mut approval_registry = SessionRegistry::new();
+        assert!(approval_registry.grant(token.clone(), exact_rule_grant(Vec::new())));
+        approval_store
+            .persist_registry(&approval_registry)
+            .await
+            .unwrap();
+        let mut pending = GrantRequest::new(
+            token.clone(),
+            None,
+            crate::grant_profile::GrantRequestDelta {
+                activated_verbs: vec!["inspect".to_string()],
+                ..Default::default()
+            },
+            "inspect".to_string(),
+        )
+        .unwrap();
+        pending.issued_session_revision = approval_registry.effective_revision_key(&token);
+        approval_store
+            .save_grant_request(pending.clone())
+            .await
+            .unwrap();
+        let mut approved = pending.clone();
+        approved.status = crate::grant_profile::GrantRequestStatus::Approved;
+        approved.decided_unix = Some(guard::env::now_unix());
+        let mut approved_registry = approval_registry.clone();
+        approved_registry
+            .apply_delta(&token, &pending.delta)
+            .unwrap();
+        let (committed, release) =
+            approval_store.pause_registry_commit_for_test("grant request approval transaction");
+        let detached_store = approval_store.clone();
+        let detached_pending = pending.clone();
+        let detached_approved = approved.clone();
+        let detached_registry = approved_registry.clone();
+        let detached = tokio::spawn(async move {
+            detached_store
+                .commit_grant_request_approval(
+                    detached_pending,
+                    detached_approved,
+                    detached_registry,
+                    Vec::new(),
+                )
+                .await
+        });
+        committed.acquire().await.unwrap().forget();
+        detached.abort();
+        let successor_store = approval_store.clone();
+        let successor_snapshot = approved_registry.clone();
+        let successor =
+            tokio::spawn(
+                async move { successor_store.persist_registry(&successor_snapshot).await },
+            );
+        assert_waiting(&successor).await;
+        release.add_permits(1);
+        successor.await.unwrap().unwrap();
+        let reopened = SessionStore::open(approval_path, 3600).await.unwrap();
+        assert_eq!(
+            reopened.load_grant_requests().await.unwrap()[0].status,
+            crate::grant_profile::GrantRequestStatus::Approved
+        );
+        assert_eq!(
+            reopened
+                .load_registry()
+                .await
+                .unwrap()
+                .verb_scope_for(&token)
+                .unwrap()
+                .0,
+            vec!["inspect"]
+        );
+
+        let revoke_path = tmp.path().join("revoke.db");
+        let revoke_store = SessionStore::open(revoke_path.clone(), 3600).await.unwrap();
+        let token = "revoked-session".to_string();
+        let mut live_registry = SessionRegistry::new();
+        assert!(live_registry.grant(token.clone(), exact_rule_grant(Vec::new())));
+        revoke_store.persist_registry(&live_registry).await.unwrap();
+        let expected_revision = live_registry.effective_revision_key(&token);
+        let mut revoked_registry = live_registry.clone();
+        assert!(revoked_registry.revoke(&token));
+        let (committed, release) =
+            revoke_store.pause_registry_commit_for_test("access revoke transaction");
+        let detached_store = revoke_store.clone();
+        let detached_token = token.clone();
+        let detached_registry = revoked_registry.clone();
+        let detached = tokio::spawn(async move {
+            detached_store
+                .commit_access_revoke(
+                    detached_token,
+                    expected_revision,
+                    detached_registry,
+                    Vec::new(),
+                )
+                .await
+        });
+        committed.acquire().await.unwrap().forget();
+        detached.abort();
+        let successor_store = revoke_store.clone();
+        let successor_snapshot = revoked_registry.clone();
+        let successor =
+            tokio::spawn(
+                async move { successor_store.persist_registry(&successor_snapshot).await },
+            );
+        assert_waiting(&successor).await;
+        release.add_permits(1);
+        successor.await.unwrap().unwrap();
+        assert!(!SessionStore::open(revoke_path, 3600)
+            .await
+            .unwrap()
+            .load_registry()
+            .await
+            .unwrap()
+            .has(&token));
+    }
+
     /// A stale snapshot (cloned before a later mutation) must never clobber a
     /// newer snapshot that already landed: the registry is persisted as a
     /// full-table rewrite, so out-of-order completion would silently roll the
@@ -5755,6 +5998,7 @@ mod tests {
                 verb_params: std::collections::BTreeMap::new(),
                 catalog_version: None,
                 verb_digest: None,
+                verb_composition_digest: None,
                 access_verbs: Vec::new(),
                 access_requests: Vec::new(),
                 principal: Some(guard::principal::PrincipalKey::from_uid(1001)),

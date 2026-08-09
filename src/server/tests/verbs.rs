@@ -1,5 +1,9 @@
 use crate::server::admin::handle_admin_request_for_test;
 use crate::server::execute::execute_command;
+#[cfg(unix)]
+use crate::server::execute::pause_command_initiation_for_test;
+#[cfg(unix)]
+use crate::server::gate_runtime::resume_approval;
 use crate::server::wire::{
     AdminRequest, AdminResponse, CallerIdentity, ExecuteRequest, GateStatus, VerbInvocation,
 };
@@ -7,6 +11,8 @@ use crate::server::ServerContext;
 use crate::session::SessionGrant;
 use guard::evaluate::{EvalConfig, Evaluator};
 use guard::gating::approval::ApprovalStatus;
+#[cfg(unix)]
+use guard::gating::deny_shape::{DenyLearningConfig, DenyShapeStore};
 use guard::gating::verb::VerbCatalog;
 use guard::gating::GateMode;
 use guard::principal::PrincipalKey;
@@ -101,6 +107,259 @@ verbs:
     assert!(!response.verb_matches[0].selected);
     assert!(response.verb_matches[1].selected);
     assert!(response.verb_guidance.is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn final_composed_match_rejects_nonprimary_amendment_and_new_deny() {
+    const ORIGINAL: &str = r#"
+verbs:
+  - name: first-check
+    binary: true
+    args: ["--check"]
+    consequence: reversible
+    trusted: true
+  - name: second-check
+    binary: true
+    args: ["--check"]
+    consequence: reversible
+    trusted: true
+"#;
+    let replacements = [
+        ORIGINAL.replace(
+            "name: second-check\n    binary: true",
+            "name: second-check\n    binary: true\n    description: amended",
+        ),
+        format!(
+            "{ORIGINAL}\n  - name: late-deny\n    binary: true\n    args: [\"--check\"]\n    consequence: reversible\n    coverage:\n      - name: deny-check\n        action: deny\n"
+        ),
+    ];
+
+    for replacement in replacements {
+        let (mut server, _buffer) = make_test_config();
+        server.config.gate = GateMode::Consequence;
+        server.state.verbs = Arc::new(RwLock::new(VerbCatalog::from_yaml(ORIGINAL).unwrap()));
+        let (reached, release) = pause_command_initiation_for_test(&server);
+        let executing_server = server.clone();
+        let execution = tokio::spawn(async move {
+            execute_command(
+                raw_request("true", &["--check"], None),
+                &executing_server,
+                &CallerIdentity::Unix { uid: 1000 },
+            )
+            .await
+            .into_response()
+        });
+        reached.acquire().await.unwrap().forget();
+        *server.state.verbs.write().await = VerbCatalog::from_yaml(&replacement).unwrap();
+        release.add_permits(1);
+
+        let response = execution.await.unwrap();
+        assert!(!response.allowed, "changed composed authority must deny");
+        assert!(response.exit_code.is_none());
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verb_lease_ends_after_process_start_while_child_is_running() {
+    let directory = tempfile::tempdir().unwrap();
+    let authority_directory = authority_tempdir();
+    let deny_config = DenyLearningConfig::new(authority_directory.path().join("deny.yaml"));
+    let deny_store = DenyShapeStore::load(deny_config.clone()).unwrap();
+    let started = directory.path().join("started");
+    let release_child = directory.path().join("release");
+    let script = format!(
+        "touch {}; while [ ! -e {} ]; do sleep 0.01; done",
+        started.display(),
+        release_child.display()
+    );
+    let yaml = format!(
+        "verbs:\n  - name: finite-start\n    binary: sh\n    args: [\"-c\", {}]\n    consequence: reversible\n    trusted: true\n",
+        serde_json::to_string(&script).unwrap()
+    );
+    let (mut server, _buffer) = make_test_config();
+    server.config.gate = GateMode::Consequence;
+    server.state.evaluator = Arc::new(
+        Evaluator::new(EvalConfig::default().deny_shapes(Arc::new(RwLock::new(deny_store))))
+            .unwrap(),
+    );
+    server.state.verbs = Arc::new(RwLock::new(VerbCatalog::from_yaml(&yaml).unwrap()));
+    let executing_server = server.clone();
+    let executing_script = script.clone();
+    let execution = tokio::spawn(async move {
+        execute_command(
+            raw_request("sh", &["-c", &executing_script], None),
+            &executing_server,
+            &CallerIdentity::Unix { uid: 1000 },
+        )
+        .await
+        .into_response()
+    });
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !started.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "child did not start"
+        );
+        tokio::task::yield_now().await;
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut catalog = server.state.verbs.write().await;
+        *catalog = VerbCatalog::from_yaml("verbs: []").unwrap();
+    })
+    .await
+    .expect("catalog mutation is not held for the child lifetime");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || {
+            let mut independent = DenyShapeStore::load(deny_config).unwrap();
+            independent
+                .promote_shape("fixture", "sh", "^-c$", &["-c".to_string()], "blocked", 1)
+                .unwrap();
+        }),
+    )
+    .await
+    .expect("learned deny mutation is not held for the child lifetime")
+    .unwrap();
+    std::fs::write(&release_child, b"release").unwrap();
+    assert!(execution.await.unwrap().allowed);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn learned_deny_committed_after_initial_allow_prevents_process_start() {
+    let directory = authority_tempdir();
+    let path = directory.path().join("deny.yaml");
+    let deny_config = DenyLearningConfig::new(path.clone());
+    let deny_store = DenyShapeStore::load(deny_config.clone()).unwrap();
+    let evaluator =
+        Evaluator::new(EvalConfig::default().deny_shapes(Arc::new(RwLock::new(deny_store))))
+            .unwrap();
+    let (mut server, _buffer) = make_test_config();
+    server.config.gate = GateMode::Consequence;
+    server.state.evaluator = Arc::new(evaluator);
+    server.state.verbs = Arc::new(RwLock::new(
+        VerbCatalog::from_yaml(
+            "verbs:\n  - name: checked\n    binary: true\n    args: [\"--check\"]\n    consequence: reversible\n    trusted: true\n",
+        )
+        .unwrap(),
+    ));
+    let (reached, release) = pause_command_initiation_for_test(&server);
+    let executing_server = server.clone();
+    let execution = tokio::spawn(async move {
+        execute_command(
+            raw_request("true", &["--check"], None),
+            &executing_server,
+            &CallerIdentity::Unix { uid: 1000 },
+        )
+        .await
+        .into_response()
+    });
+    reached.acquire().await.unwrap().forget();
+    let mut independent = DenyShapeStore::load(deny_config).unwrap();
+    independent
+        .promote_shape(
+            "fixture",
+            "true",
+            "^--check$",
+            &["--check".to_string()],
+            "blocked",
+            1,
+        )
+        .unwrap();
+    release.add_permits(1);
+
+    let response = execution.await.unwrap();
+    assert!(!response.allowed);
+    assert!(response.exit_code.is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn held_replay_revalidates_the_complete_composed_match_before_start() {
+    const ORIGINAL: &str = r#"
+verbs:
+  - name: first-held-check
+    binary: true
+    args: ["--check"]
+    consequence: irreversible
+    trusted: true
+  - name: second-held-check
+    binary: true
+    args: ["--check"]
+    consequence: irreversible
+    trusted: true
+"#;
+    let (mut server, _buffer) = make_test_config();
+    server.config.gate = GateMode::Consequence;
+    server.config.daemon_uid = 777;
+    server.config.daemon_principal = PrincipalKey::from_uid(777);
+    server.state.verbs = Arc::new(RwLock::new(VerbCatalog::from_yaml(ORIGINAL).unwrap()));
+    let mut request = raw_request("true", &["--check"], None);
+    request.require_approval = Some(true);
+    let held = execute_command(request, &server, &CallerIdentity::Unix { uid: 1000 })
+        .await
+        .into_response();
+    assert_eq!(held.status, Some(GateStatus::Held));
+    let handle = held.handle.expect("held command has an approval handle");
+    assert!(server
+        .state
+        .approvals
+        .read()
+        .await
+        .get(&handle)
+        .unwrap()
+        .snapshot
+        .verb_composition_digest
+        .is_some());
+
+    assert!(matches!(
+        handle_admin_request_for_test(
+            &server,
+            &CallerIdentity::UnixAdmin { uid: 777 },
+            AdminRequest::Approve {
+                handle: handle.clone(),
+            },
+        )
+        .await,
+        AdminResponse::GateAction { .. }
+    ));
+    let (reached, release) = pause_command_initiation_for_test(&server);
+    let resuming = server.clone();
+    let resuming_handle = handle.clone();
+    let replay = tokio::spawn(async move {
+        resume_approval(
+            &resuming,
+            &CallerIdentity::Unix { uid: 1000 },
+            &resuming_handle,
+        )
+        .await
+    });
+    reached.acquire().await.unwrap().forget();
+    let amended = ORIGINAL.replace(
+        "name: second-held-check\n    binary: true",
+        "name: second-held-check\n    binary: true\n    description: amended",
+    );
+    *server.state.verbs.write().await = VerbCatalog::from_yaml(&amended).unwrap();
+    release.add_permits(1);
+
+    assert!(!matches!(
+        replay.await.unwrap().exec,
+        crate::server::wire::ExecOutcome::Completed { .. }
+    ));
+    assert_eq!(
+        server
+            .state
+            .approvals
+            .read()
+            .await
+            .get(&handle)
+            .unwrap()
+            .status,
+        ApprovalStatus::ExecFailed
+    );
 }
 
 #[tokio::test]

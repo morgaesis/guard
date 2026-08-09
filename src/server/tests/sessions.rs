@@ -1866,6 +1866,128 @@ async fn access_approval_and_revoke_retry_one_registry_generation_conflict() {
         .has("unrelated-before-revoke"));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn aborted_admin_registry_transitions_finish_live_adoption() {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.daemon_uid = 777;
+    cfg.config.daemon_principal = PrincipalKey::from_uid(777);
+    let state = tempfile::tempdir().unwrap();
+    cfg.state.session_store = Some(
+        SessionStore::open(state.path().join("state.db"), 3600)
+            .await
+            .unwrap(),
+    );
+    let store = cfg.state.session_store.as_ref().unwrap().clone();
+
+    let token = "cancelled-approval".to_string();
+    let approval_snapshot = {
+        let mut sessions = cfg.state.sessions.write().await;
+        assert!(sessions.grant(
+            token.clone(),
+            granted_session_owned(1001, Vec::new(), Vec::new()),
+        ));
+        sessions.clone()
+    };
+    store.persist_registry(&approval_snapshot).await.unwrap();
+    let mut pending = crate::grant_profile::GrantRequest::new(
+        token.clone(),
+        None,
+        crate::grant_profile::GrantRequestDelta {
+            prompt_append: Some("bounded work".to_string()),
+            ..Default::default()
+        },
+        "bounded work".to_string(),
+    )
+    .unwrap();
+    pending.issued_session_revision = approval_snapshot.effective_revision_key(&token);
+    store.save_grant_request(pending.clone()).await.unwrap();
+    cfg.state
+        .grant_requests
+        .write()
+        .await
+        .insert(pending.handle.clone(), pending.clone());
+
+    let (committed, release) =
+        store.pause_registry_commit_for_test("grant request approval transaction");
+    let approving = cfg.clone();
+    let pending_handle = pending.handle.clone();
+    let caller = tokio::spawn(async move {
+        handle_admin_request_for_test(
+            &approving,
+            &CallerIdentity::UnixAdmin { uid: 777 },
+            AdminRequest::GrantRequestApprove {
+                handle: pending_handle,
+            },
+        )
+        .await
+    });
+    committed.acquire().await.unwrap().forget();
+    caller.abort();
+    release.add_permits(1);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if cfg.state.grant_requests.read().await[&pending.handle].status
+                == GrantRequestStatus::Approved
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached approval adopts durable session and request state");
+    assert_eq!(
+        cfg.state
+            .sessions
+            .read()
+            .await
+            .effective_revision_key(&token),
+        store
+            .load_registry()
+            .await
+            .unwrap()
+            .effective_revision_key(&token)
+    );
+
+    let access_token = "cancelled-revoke".to_string();
+    let revoke_snapshot = {
+        let mut sessions = cfg.state.sessions.write().await;
+        let mut grant = granted_session_owned(1001, Vec::new(), Vec::new());
+        grant.scope = IssuedGrantScope {
+            access_managed: true,
+            ..IssuedGrantScope::default()
+        };
+        assert!(sessions.grant(access_token.clone(), grant));
+        sessions.clone()
+    };
+    store.persist_registry(&revoke_snapshot).await.unwrap();
+    let target = session_reference(&access_token);
+    let (committed, release) = store.pause_registry_commit_for_test("access revoke transaction");
+    let revoking = cfg.clone();
+    let caller = tokio::spawn(async move {
+        handle_admin_request_for_test(
+            &revoking,
+            &CallerIdentity::UnixAdmin { uid: 777 },
+            AdminRequest::AccessRevoke { target },
+        )
+        .await
+    });
+    committed.acquire().await.unwrap().forget();
+    caller.abort();
+    release.add_permits(1);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if !cfg.state.sessions.read().await.has(&access_token) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached revoke adopts durable session state");
+    assert!(!store.load_registry().await.unwrap().has(&access_token));
+}
+
 #[tokio::test]
 async fn multi_request_admission_audits_every_consumed_budget() {
     let (mut cfg, _) = make_test_config();

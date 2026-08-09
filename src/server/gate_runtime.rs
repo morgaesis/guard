@@ -8,9 +8,7 @@ use guard::gating::approval::{
     bound_approval_transcript, Approval, ApprovalSnapshot, ApprovalStatus,
 };
 use guard::gating::provisional::{ApiRevertPlan, Provisional, ProvisionalStatus};
-use guard::gating::verb::VerbCatalog;
 use guard::gating::{decide_gate, Coverage, GateOutcome, Reversibility};
-use guard::learned_rules::AuthorityUseLease;
 use guard::principal::{scope_eq, PrincipalKey};
 use guard::redact::{
     command_contains_sensitive_literals, redact_command_line, SENSITIVE_ARGV_REPLAY_GUIDANCE,
@@ -20,7 +18,9 @@ use tokio::io::AsyncWrite;
 
 use super::execute::{
     admit_access_use, audit_command_line, audit_session_fingerprint,
-    exec_after_approval_with_secret_authority, exec_with_read_grant_retry_with_secret_authority,
+    exec_after_approval_with_command_authority, exec_after_approval_with_secret_authority,
+    exec_with_read_grant_retry_with_command_authority, CommandAuthorization,
+    VerbAuthorityExpectation,
 };
 use super::grants::{delete_read_grant_row, finish_read_grant_revert, persist_read_grant};
 use super::runtime::NotifyEvent;
@@ -562,6 +562,7 @@ impl guard::proxy::GateSink for DaemonGateSink {
             verb_params: std::collections::BTreeMap::new(),
             catalog_version: None,
             verb_digest: None,
+            verb_composition_digest: None,
             access_verbs: Vec::new(),
             access_requests: Vec::new(),
             principal,
@@ -1089,30 +1090,7 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
             );
         }
     }
-    let mut verb_authority_lease = if let Some(verb) = inputs.verb.as_ref() {
-        let lease = match server
-            .lease_verb_catalog_for_use("verb execution authorization")
-            .await
-        {
-            Ok(lease) => lease,
-            Err(error) => {
-                return ExecuteResult::denied(format!(
-                    "verb catalog authority changed before execution: {error}"
-                ))
-            }
-        };
-        let current = lease.verb_definition_digest(&verb.name);
-        let unchanged = match verb.verb_digest.as_deref() {
-            Some(expected) => current.as_deref() == Some(expected),
-            None => current.is_some() && lease.version() == verb.catalog_version,
-        };
-        if !unchanged {
-            return ExecuteResult::denied("verb authority was removed or amended before execution");
-        }
-        Some(lease)
-    } else {
-        None
-    };
+    let command_authority = Some(CommandAuthorization::routed(inputs.verb.as_ref()));
     let secret_authority = inputs
         .authority
         .as_ref()
@@ -1123,7 +1101,6 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
         if let Err(reason) =
             admit_access_use(server, &request, &inputs.consume_access_verbs, None).await
         {
-            drop(verb_authority_lease.take());
             return access_admission_denial(
                 server,
                 context.caller,
@@ -1132,11 +1109,12 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
             )
             .await;
         }
-        return exec_with_read_grant_retry_with_secret_authority(
+        return exec_with_read_grant_retry_with_command_authority(
             context,
             request,
             inputs.reason,
             secret_authority,
+            command_authority,
         )
         .await;
     }
@@ -1158,7 +1136,6 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
             if let Err(reason) =
                 admit_access_use(server, &request, &inputs.consume_access_verbs, None).await
             {
-                drop(verb_authority_lease.take());
                 return access_admission_denial(
                     server,
                     context.caller,
@@ -1167,11 +1144,12 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
                 )
                 .await;
             }
-            exec_with_read_grant_retry_with_secret_authority(
+            exec_with_read_grant_retry_with_command_authority(
                 context,
                 request,
                 inputs.reason,
                 secret_authority,
+                command_authority,
             )
             .await
         }
@@ -1214,8 +1192,8 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
                     authority: inputs.authority,
                     consume_access_verbs: inputs.consume_access_verbs,
                     decision_trace,
+                    command_authority,
                 },
-                &mut verb_authority_lease,
             )
             .await
         }
@@ -1245,8 +1223,8 @@ pub(super) async fn arm_containment_with_authority<W: AsyncWrite + Unpin>(
             authority,
             consume_access_verbs: Vec::new(),
             decision_trace: None,
+            command_authority: None,
         },
-        &mut None,
     )
     .await
 }
@@ -1269,8 +1247,8 @@ pub(super) async fn arm_containment_with_access_use_for_test<W: AsyncWrite + Unp
             authority,
             consume_access_verbs,
             decision_trace: None,
+            command_authority: None,
         },
-        &mut None,
     )
     .await
 }
@@ -1280,6 +1258,7 @@ struct ContainmentInputs {
     authority: Option<SessionAuthoritySnapshot>,
     consume_access_verbs: Vec<String>,
     decision_trace: Option<guard::gating::DecisionTrace>,
+    command_authority: Option<CommandAuthorization>,
 }
 
 async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
@@ -1287,13 +1266,13 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
     request: ExecuteRequest,
     caller_principal: Option<PrincipalKey>,
     inputs: ContainmentInputs,
-    verb_authority_lease: &mut Option<AuthorityUseLease<VerbCatalog>>,
 ) -> ExecuteResult {
     let ContainmentInputs {
         reason,
         authority,
         consume_access_verbs,
         decision_trace,
+        command_authority,
     } = inputs;
     let server = context.server;
     let caller = context.caller;
@@ -1504,17 +1483,17 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
                 "failed to retire unstarted provisional {handle} after access admission denial: {cleanup_error}"
             );
         }
-        drop(verb_authority_lease.take());
         return access_admission_denial(server, caller, &consume_access_verbs, admission_reason)
             .await;
     }
 
     let session_fingerprint = audit_session_fingerprint(request.session_token.as_deref());
-    let result = exec_after_approval_with_secret_authority(
+    let result = exec_after_approval_with_command_authority(
         context,
         request,
         reason.clone(),
         Some(provisional.secret_entitlements.clone()),
+        command_authority,
     )
     .await;
     let exposed_secret_refs = result.exposed_secret_refs().to_vec();
@@ -1948,6 +1927,7 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
         verb_params: std::collections::BTreeMap::new(),
         catalog_version: verb.as_ref().map(|v| v.catalog_version),
         verb_digest: verb.as_ref().and_then(|v| v.verb_digest.clone()),
+        verb_composition_digest: verb.as_ref().and_then(|v| v.composition_digest.clone()),
         access_verbs: consume_access_verbs,
         access_requests,
         principal: caller_principal,
@@ -2361,19 +2341,7 @@ pub(super) async fn execute_snapshot(
 ) -> ExecuteResult {
     let access_requests =
         (!snapshot.access_requests.is_empty()).then_some(snapshot.access_requests.as_slice());
-    execute_snapshot_with_access_request_inner(server, snapshot, reason, access_requests, true)
-        .await
-}
-
-pub(super) async fn execute_snapshot_with_prevalidated_verb_catalog(
-    server: &ServerContext,
-    snapshot: &ApprovalSnapshot,
-    reason: &str,
-) -> ExecuteResult {
-    let access_requests =
-        (!snapshot.access_requests.is_empty()).then_some(snapshot.access_requests.as_slice());
-    execute_snapshot_with_access_request_inner(server, snapshot, reason, access_requests, false)
-        .await
+    execute_snapshot_with_access_request_inner(server, snapshot, reason, access_requests).await
 }
 
 #[cfg(all(test, unix))]
@@ -2383,14 +2351,8 @@ pub(super) async fn execute_snapshot_with_access_request(
     reason: &str,
     preferred_access_requests: Option<&[String]>,
 ) -> ExecuteResult {
-    execute_snapshot_with_access_request_inner(
-        server,
-        snapshot,
-        reason,
-        preferred_access_requests,
-        true,
-    )
-    .await
+    execute_snapshot_with_access_request_inner(server, snapshot, reason, preferred_access_requests)
+        .await
 }
 
 async fn execute_snapshot_with_access_request_inner(
@@ -2398,7 +2360,6 @@ async fn execute_snapshot_with_access_request_inner(
     snapshot: &ApprovalSnapshot,
     reason: &str,
     preferred_access_requests: Option<&[String]>,
-    refresh_verb_catalog: bool,
 ) -> ExecuteResult {
     if snapshot.contains_sensitive_literals() {
         return ExecuteResult::exec_failed(
@@ -2406,39 +2367,6 @@ async fn execute_snapshot_with_access_request_inner(
             SENSITIVE_ARGV_REPLAY_GUIDANCE.to_string(),
         );
     }
-    let _verb_authority_lease = if let Some(name) = snapshot.verb_name.as_deref() {
-        let lease = match if refresh_verb_catalog {
-            server
-                .refresh_and_lease_verb_catalog_for_use("approval snapshot execution")
-                .await
-        } else {
-            server
-                .lease_verb_catalog_for_use("approval snapshot execution")
-                .await
-        } {
-            Ok(lease) => lease,
-            Err(error) => {
-                return ExecuteResult::exec_failed(
-                    reason.to_string(),
-                    format!("approval rejected: verb catalog authority is unavailable: {error}"),
-                )
-            }
-        };
-        let current = lease.verb_definition_digest(name);
-        let unchanged = match snapshot.verb_digest.as_deref() {
-            Some(expected) => current.as_deref() == Some(expected),
-            None => current.is_some() && snapshot.catalog_version == Some(lease.version()),
-        };
-        if !unchanged {
-            return ExecuteResult::exec_failed(
-                reason.to_string(),
-                "approval rejected: held verb authority was removed or amended".to_string(),
-            );
-        }
-        Some(lease)
-    } else {
-        None
-    };
     if !binary_allowed(&server.config.allowed_binaries, &snapshot.binary) {
         return ExecuteResult::exec_failed(
             reason.to_string(),
@@ -2729,11 +2657,21 @@ async fn execute_snapshot_request(
         stream_output: false,
         stream_writer: &mut sink,
     };
-    exec_after_approval_with_secret_authority(
+    let verb_authority = snapshot
+        .verb_name
+        .as_ref()
+        .map(|name| VerbAuthorityExpectation {
+            name: name.clone(),
+            catalog_version: snapshot.catalog_version,
+            definition_digest: snapshot.verb_digest.clone(),
+            composition_digest: snapshot.verb_composition_digest.clone(),
+        });
+    exec_after_approval_with_command_authority(
         &mut context,
         request,
         reason.to_string(),
         Some(snapshot.secret_entitlements.clone()),
+        Some(CommandAuthorization::replay(verb_authority)),
     )
     .await
 }
