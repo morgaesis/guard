@@ -139,7 +139,8 @@ exact access approval commands. It does not create a parallel policy path.
 Normal client configuration supplies the execution token for a TCP daemon. MCP does
 not receive or forward the configured admin bearer.
 
-Local-socket MCP exposes seven tools:
+Local-socket stdio MCP exposes the following tools after a successful daemon
+Ping and self-scoped admin probe:
 
 | Tool | Purpose | Key arguments | CLI equivalent |
 | ---- | ------- | ------------- | -------------- |
@@ -150,6 +151,15 @@ Local-socket MCP exposes seven tools:
 | `guard_evaluate_batch` | Dry-evaluate up to 64 command shapes without executing anything | `commands` (array of `{binary, args}`, 1-64 items, required); `session` (string, optional target session) | MCP-only; no CLI equivalent |
 | `guard_access_show` | Show one durable request, hold, or access session | `reference` (string, required) | `guard access show` |
 | `guard_access_status` | Show activity, decisions, holds, and provisionals for one access-managed session | `reference` (string, required) | `guard access status` |
+| `guard_approval_show` | Show a requester-visible hold, including its bounded terminal transcript | `handle` (string, required), `wait` (1-3600 seconds, optional) | `guard approval show` |
+| `guard_approval_resume` | Resume one operator-armed hold as its original requester | `handle` (string, required), `wait` (1-3600 seconds, optional) | `guard approval resume` |
+
+The daemon must advertise `approval-consequences-v1` for the two
+`guard_approval_*` tools. A capability-free daemon retains the seven baseline
+local-socket tools. Failed, malformed, or non-Ping probe responses fail closed
+and expose no tools; a failed Unix admin probe also exposes no tools. Direct
+calls report `endpoint_unavailable` for endpoint or Unix admin-probe failures
+and `feature_unavailable` for capability or transport exclusions.
 
 `guard_run` is the default name for the execution tool; `guard mcp serve
 --tool-name` renames it to a name that is not reserved by another built-in
@@ -160,7 +170,7 @@ bound, and `false` or omission returns the held handle immediately.
 revision cache context and returns per-command verdicts without running,
 holding, or reverting anything.
 
-TCP MCP exposes only `guard_run`. Administrative MCP tools require the
+TCP MCP exposes only `guard_run` after a successful Ping. Administrative MCP tools require the
 kernel-authenticated principal available on a local socket and are not
 advertised over bearer-authenticated TCP.
 
@@ -179,7 +189,10 @@ because it does not provide an SSE listening stream. A successful initialize
 response supplies an `Mcp-Session-Id`; subsequent requests present that ID and
 can reconnect without losing MCP lifecycle state. Unknown, missing, duplicate,
 or terminated sessions fail closed. Every HTTP MCP caller appears to the daemon
-as the MCP process principal. Use stdio when a network transport is unnecessary.
+as the MCP process principal. HTTP exposes the local baseline except
+`guard_access_status`; it never lists or dispatches `guard_approval_show` or
+`guard_approval_resume`, so status reports and approval transcripts remain on
+stdio. Use stdio when a network transport is unnecessary.
 
 ## In-process API clients
 
