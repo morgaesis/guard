@@ -14,11 +14,11 @@ use crate::server::gate_runtime::{
 };
 use crate::server::wire::{
     approval_is_armed, AdminRequest, AdminResponse, CallerIdentity, ExecOutcome, ExecuteRequest,
-    ExecuteResult, RevertSpec, CONSEQUENCE_ARM, CONSEQUENCE_RELEASE,
+    ExecuteResult, RevertSpec, CONSEQUENCE_ARM,
 };
 #[cfg(unix)]
 use crate::server::wire::{
-    ContainmentFailure, ContainmentFailureKind, ContainmentOutcome, GateStatus,
+    ContainmentFailure, ContainmentFailureKind, ContainmentOutcome, GateStatus, CONSEQUENCE_RELEASE,
 };
 use crate::server::{RequestContext, ServerContext, APPROVAL_TTL_SECS};
 use crate::session::SessionGrant;
