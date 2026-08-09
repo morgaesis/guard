@@ -53,9 +53,68 @@ impl LearningWriteOutcome {
     }
 }
 
+#[derive(Debug)]
+struct LearningSnapshotConflict;
+
+impl std::fmt::Display for LearningSnapshotConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("destination generation changed before the atomic rewrite")
+    }
+}
+
+impl std::error::Error for LearningSnapshotConflict {}
+
+pub(crate) fn is_learning_snapshot_conflict(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<LearningSnapshotConflict>().is_some()
+}
+
+fn snapshot_conflict() -> anyhow::Error {
+    anyhow::Error::new(LearningSnapshotConflict)
+}
+
+/// Create one durable authority file only when its destination is absent.
+/// Parent hardening, restrictive file creation, replacement journaling, and
+/// generation comparison use the same path as subsequent learning writes.
+pub fn create_hardened_file_if_absent(path: &Path, content: &str) -> Result<()> {
+    let outcome = write_learning_file_atomically_for_snapshot(path, None, content)?;
+    if let Some(error) = outcome.warning() {
+        let lock = DestinationLock::acquire(path)?;
+        lock.verify_parent_binding()?;
+        let committed = std::fs::read(lock.destination())
+            .with_context(|| format!("failed to verify committed creation {}", path.display()))?;
+        if committed != content.as_bytes() {
+            anyhow::bail!("committed authority-file creation does not match its candidate")
+        }
+        tracing::warn!("authority-file creation committed with a durability warning: {error}");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LearningTransactionMarker {
+    version: u32,
+    transaction_id: String,
+    phase: LearningTransactionPhase,
+    candidate_generation: String,
+    expected_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_security_generation: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LearningTransactionPhase {
+    Preparing,
+    Ready,
+    Replacing,
+    ReplacementDurable,
+    BackupRemoved,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LearningTransactionMarkerV2 {
     version: u32,
     transaction_id: String,
     content_sha256: String,
@@ -63,15 +122,38 @@ struct LearningTransactionMarker {
     had_destination: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LearningTransactionMarkerV1 {
+    version: u32,
+    destination: String,
+    source: String,
+    backup: String,
+    content_sha256: String,
+    original_sha256: Option<String>,
+    had_destination: bool,
+}
+
+enum DecodedLearningTransactionMarker {
+    Current(LearningTransactionMarker),
+    Legacy {
+        transaction_id: String,
+        candidate_generation: String,
+        expected_generation: Option<String>,
+        had_destination: bool,
+    },
+}
+
 #[derive(Debug)]
 struct LearningTransactionPaths {
     marker: PathBuf,
     marker_staging: PathBuf,
     source: PathBuf,
+    backup_staging: PathBuf,
     backup: PathBuf,
 }
 
-const LEARNING_TRANSACTION_VERSION: u32 = 2;
+const LEARNING_TRANSACTION_VERSION: u32 = 3;
 const MAX_TRANSACTION_MARKER_BYTES: u64 = 4 * 1024;
 const MAX_CORRUPT_RECOVERY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CORRUPT_RECOVERY_FILES: usize = 8;
@@ -106,14 +188,34 @@ fn validate_transaction_id(identity: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_generation_digest(digest: &str) -> Result<()> {
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        anyhow::bail!("invalid learning transaction generation digest")
+    }
+    Ok(())
+}
+
 fn transaction_paths(path: &Path, identity: &str) -> Result<LearningTransactionPaths> {
     validate_transaction_id(identity)?;
     let marker = learning_sibling(path, "transaction", None);
     let marker_staging =
         learning_sibling(path, "marker", Some(u128::from_str_radix(identity, 16)?));
     let source = learning_sibling(path, "new", Some(u128::from_str_radix(identity, 16)?));
+    let backup_staging =
+        learning_sibling(path, "old-stage", Some(u128::from_str_radix(identity, 16)?));
     let backup = learning_sibling(path, "old", Some(u128::from_str_radix(identity, 16)?));
-    let paths = [&marker, &marker_staging, &source, &backup, path];
+    let paths = [
+        &marker,
+        &marker_staging,
+        &source,
+        &backup_staging,
+        &backup,
+        path,
+    ];
     for (index, left) in paths.iter().enumerate() {
         if paths[index + 1..].iter().any(|right| left == right) {
             anyhow::bail!("learning transaction paths are not distinct")
@@ -128,6 +230,7 @@ fn transaction_paths(path: &Path, identity: &str) -> Result<LearningTransactionP
         marker,
         marker_staging,
         source,
+        backup_staging,
         backup,
     })
 }
@@ -149,6 +252,7 @@ fn canonical_destination(path: &Path) -> Result<PathBuf> {
     Ok(parent.join(name))
 }
 
+#[cfg(windows)]
 fn destination_lock_path(path: &Path) -> Result<PathBuf> {
     Ok(learning_sibling(
         &canonical_destination(path)?,
@@ -159,20 +263,159 @@ fn destination_lock_path(path: &Path) -> Result<PathBuf> {
 
 struct DestinationLock {
     file: File,
+    parent: File,
+    canonical_parent: PathBuf,
+    destination: PathBuf,
 }
 
 impl DestinationLock {
     fn acquire(path: &Path) -> Result<Self> {
         ensure_destination_parent(path)?;
-        let lock_path = destination_lock_path(path)?;
+        let destination = canonical_destination(path)?;
+        let canonical_parent = destination
+            .parent()
+            .context("learning destination has no canonical parent")?
+            .to_path_buf();
+        let parent = open_parent_directory(&canonical_parent)?;
+        let destination = bind_destination_to_parent(&parent, &destination)?;
+        let lock_path = learning_sibling(&destination, "lock", None);
         let file = open_owner_only_new_or_existing(&lock_path).with_context(|| {
             format!("failed to open learning-file lock {}", lock_path.display())
         })?;
         ensure_regular_file(&lock_path)?;
         lock_file_exclusive(&file)
             .with_context(|| format!("failed to lock learning destination {}", path.display()))?;
-        Ok(Self { file })
+        let lock = Self {
+            file,
+            parent,
+            canonical_parent,
+            destination,
+        };
+        lock.verify_parent_binding()?;
+        Ok(lock)
     }
+
+    fn destination(&self) -> &Path {
+        &self.destination
+    }
+
+    fn verify_parent_binding(&self) -> Result<()> {
+        let current = self.canonical_parent.canonicalize().with_context(|| {
+            format!(
+                "failed to verify destination directory {}",
+                self.canonical_parent.display()
+            )
+        })?;
+        if current != self.canonical_parent {
+            anyhow::bail!("destination directory binding changed during the transaction")
+        }
+        parent_identity_matches(&self.parent, &self.canonical_parent)
+    }
+}
+
+#[cfg(unix)]
+fn open_parent_directory(path: &Path) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .with_context(|| format!("failed to pin destination directory {}", path.display()))
+}
+
+#[cfg(windows)]
+fn open_parent_directory(path: &Path) -> Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+    OpenOptions::new()
+        .read(true)
+        // Excluding FILE_SHARE_DELETE prevents the directory entry from being
+        // renamed or removed while transaction paths are in use. Read and
+        // write sharing keep ordinary non-elevated file access compatible.
+        .share_mode(0x00000001 | 0x00000002)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .with_context(|| format!("failed to pin destination directory {}", path.display()))
+}
+
+#[cfg(target_os = "linux")]
+fn bind_destination_to_parent(parent: &File, destination: &Path) -> Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+    let name = destination
+        .file_name()
+        .context("learning destination has no file name")?;
+    let bound_parent = PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd()));
+    if !bound_parent.is_dir() {
+        anyhow::bail!("held destination directory is not available through its file descriptor")
+    }
+    Ok(bound_parent.join(name))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn bind_destination_to_parent(parent: &File, destination: &Path) -> Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+    let name = destination
+        .file_name()
+        .context("learning destination has no file name")?;
+    let bound_parent = PathBuf::from(format!("/dev/fd/{}", parent.as_raw_fd()));
+    if !bound_parent.is_dir() {
+        anyhow::bail!("held destination directory is not available through its file descriptor")
+    }
+    Ok(bound_parent.join(name))
+}
+
+#[cfg(not(unix))]
+fn bind_destination_to_parent(_parent: &File, destination: &Path) -> Result<PathBuf> {
+    Ok(destination.to_path_buf())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_parent_directory(_path: &Path) -> Result<File> {
+    anyhow::bail!("destination directory pinning is unsupported on this platform")
+}
+
+#[cfg(unix)]
+fn parent_identity_matches(parent: &File, path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let pinned = parent.metadata()?;
+    let current = std::fs::metadata(path)?;
+    if pinned.dev() != current.dev() || pinned.ino() != current.ino() {
+        anyhow::bail!("destination directory identity changed during the transaction")
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn parent_identity_matches(parent: &File, path: &Path) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    fn identity(file: &File) -> Result<(u32, u64)> {
+        let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to inspect a pinned Windows directory");
+        }
+        Ok((
+            information.dwVolumeSerialNumber,
+            (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+        ))
+    }
+
+    let current = open_parent_directory(path)?;
+    if identity(parent)? != identity(&current)? {
+        anyhow::bail!("destination directory identity changed during the transaction")
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn parent_identity_matches(_parent: &File, _path: &Path) -> Result<()> {
+    anyhow::bail!("destination directory identity checks are unsupported on this platform")
 }
 
 #[cfg(unix)]
@@ -190,12 +433,72 @@ fn ensure_destination_parent(path: &Path) -> Result<()> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent).with_context(|| {
-        format!(
-            "failed to create destination directory {}",
-            parent.display()
+    if parent.is_dir() {
+        return Ok(());
+    }
+    let mut missing = Vec::new();
+    let mut cursor = parent;
+    while !cursor.as_os_str().is_empty() && !cursor.is_dir() {
+        missing.push(cursor.to_path_buf());
+        cursor = cursor.parent().unwrap_or_else(|| Path::new("."));
+    }
+    for directory in missing.into_iter().rev() {
+        create_owner_only_directory_windows(&directory).with_context(|| {
+            format!(
+                "failed to create restricted destination directory {}",
+                directory.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn create_owner_only_directory_windows(path: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+
+    let sddl = "D:P(A;OICI;FA;;;OW)\0".encode_utf16().collect::<Vec<_>>();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            std::ptr::null_mut(),
         )
-    })
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to create an owner-only Windows directory descriptor");
+    }
+    let security = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor,
+        bInheritHandle: 0,
+    };
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let created = unsafe { CreateDirectoryW(wide.as_ptr(), &security) };
+    unsafe { LocalFree(descriptor.cast()) };
+    if created == 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(error.into());
+        }
+    }
+    if !path.is_dir() {
+        anyhow::bail!("restricted destination parent is not a directory")
+    }
+    Ok(())
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -369,7 +672,43 @@ fn apply_owner_only_windows_dacl(path: &Path) -> Result<()> {
 
 #[cfg(windows)]
 fn ensure_windows_owner_group_compatible(destination: &[u8], writer: &[u8]) -> Result<()> {
-    if destination != writer {
+    use windows_sys::Win32::Security::{
+        EqualSid, GetSecurityDescriptorGroup, GetSecurityDescriptorOwner, PSID,
+    };
+
+    fn identities(descriptor: &[u8]) -> Result<(PSID, PSID)> {
+        let mut owner = std::ptr::null_mut();
+        let mut group = std::ptr::null_mut();
+        let mut owner_defaulted = 0;
+        let mut group_defaulted = 0;
+        if unsafe {
+            GetSecurityDescriptorOwner(
+                descriptor.as_ptr().cast_mut().cast(),
+                &mut owner,
+                &mut owner_defaulted,
+            )
+        } == 0
+            || unsafe {
+                GetSecurityDescriptorGroup(
+                    descriptor.as_ptr().cast_mut().cast(),
+                    &mut group,
+                    &mut group_defaulted,
+                )
+            } == 0
+            || owner.is_null()
+            || group.is_null()
+        {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to extract Windows owner and group identities");
+        }
+        Ok((owner, group))
+    }
+
+    let (destination_owner, destination_group) = identities(destination)?;
+    let (writer_owner, writer_group) = identities(writer)?;
+    if unsafe { EqualSid(destination_owner, writer_owner) } == 0
+        || unsafe { EqualSid(destination_group, writer_group) } == 0
+    {
         anyhow::bail!(
             "cannot replace a Windows learning file whose owner or group differs from the non-elevated writer"
         );
@@ -377,12 +716,71 @@ fn ensure_windows_owner_group_compatible(destination: &[u8], writer: &[u8]) -> R
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn open_owner_only_new(path: &Path) -> Result<File> {
     let mut options = owner_only_options();
     let file = options.write(true).read(true).create_new(true).open(path)?;
     #[cfg(windows)]
     apply_owner_only_windows_dacl(path)?;
     Ok(file)
+}
+
+#[cfg(windows)]
+fn open_owner_only_new(path: &Path) -> Result<File> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::{
+        LocalFree, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+
+    let sddl = "D:P(A;;FA;;;OW)\0".encode_utf16().collect::<Vec<_>>();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to create an owner-only Windows security descriptor");
+    }
+    let security = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor,
+        bInheritHandle: 0,
+    };
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            0,
+            &security,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    unsafe { LocalFree(descriptor.cast()) };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to create restricted file {}", path.display()));
+    }
+    Ok(unsafe { File::from_raw_handle(handle) })
 }
 
 fn open_owner_only_new_or_existing(path: &Path) -> Result<File> {
@@ -469,7 +867,10 @@ fn write_transaction_marker(
     })
 }
 
-fn read_transaction_marker(path: &Path) -> Result<LearningTransactionMarker> {
+fn read_transaction_marker(
+    path: &Path,
+    destination: &Path,
+) -> Result<DecodedLearningTransactionMarker> {
     ensure_regular_file(path)?;
     let metadata = std::fs::metadata(path)?;
     if metadata.len() == 0 || metadata.len() > MAX_TRANSACTION_MARKER_BYTES {
@@ -482,8 +883,98 @@ fn read_transaction_marker(path: &Path) -> Result<LearningTransactionMarker> {
     if bytes.len() as u64 != metadata.len() || bytes.len() as u64 > MAX_TRANSACTION_MARKER_BYTES {
         anyhow::bail!("transaction marker changed while being read")
     }
-    serde_json::from_slice(&bytes)
-        .with_context(|| format!("invalid transaction marker {}", path.display()))
+    let envelope: serde_json::Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid transaction marker {}", path.display()))?;
+    let version = envelope
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .context("transaction marker has no bounded integer version")?;
+    match version {
+        3 => {
+            let marker: LearningTransactionMarker = serde_json::from_value(envelope)
+                .with_context(|| format!("invalid transaction marker {}", path.display()))?;
+            validate_transaction_id(&marker.transaction_id)?;
+            validate_generation_digest(&marker.candidate_generation)?;
+            if let Some(expected) = &marker.expected_generation {
+                validate_generation_digest(expected)?;
+            }
+            if let Some(expected) = &marker.expected_security_generation {
+                validate_generation_digest(expected)?;
+            }
+            Ok(DecodedLearningTransactionMarker::Current(marker))
+        }
+        2 => {
+            let marker: LearningTransactionMarkerV2 = serde_json::from_value(envelope)
+                .with_context(|| format!("invalid version 2 marker {}", path.display()))?;
+            if marker.version != 2 || marker.had_destination != marker.original_sha256.is_some() {
+                anyhow::bail!("version 2 transaction marker has inconsistent generations")
+            }
+            validate_transaction_id(&marker.transaction_id)?;
+            validate_generation_digest(&marker.content_sha256)?;
+            if let Some(expected) = &marker.original_sha256 {
+                validate_generation_digest(expected)?;
+            }
+            Ok(DecodedLearningTransactionMarker::Legacy {
+                transaction_id: marker.transaction_id,
+                candidate_generation: marker.content_sha256,
+                expected_generation: marker.original_sha256,
+                had_destination: marker.had_destination,
+            })
+        }
+        1 => decode_v1_transaction_marker(envelope, destination),
+        _ => anyhow::bail!("unsupported learning transaction marker version"),
+    }
+}
+
+fn decode_v1_transaction_marker(
+    envelope: serde_json::Value,
+    destination: &Path,
+) -> Result<DecodedLearningTransactionMarker> {
+    let marker: LearningTransactionMarkerV1 =
+        serde_json::from_value(envelope).context("invalid version 1 transaction marker")?;
+    if marker.version != 1 || marker.had_destination != marker.original_sha256.is_some() {
+        anyhow::bail!("version 1 transaction marker has inconsistent generations")
+    }
+    validate_generation_digest(&marker.content_sha256)?;
+    if let Some(expected) = &marker.original_sha256 {
+        validate_generation_digest(expected)?;
+    }
+    let destination_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("learning destination name is not portable")?;
+    if marker.destination != destination_name {
+        anyhow::bail!("version 1 marker targets a different destination")
+    }
+    let source_prefix = format!(".{destination_name}.learning-new-");
+    let backup_prefix = format!(".{destination_name}.learning-old-");
+    let source_id = marker
+        .source
+        .strip_prefix(&source_prefix)
+        .context("version 1 source is not a derived transaction path")?;
+    let backup_id = marker
+        .backup
+        .strip_prefix(&backup_prefix)
+        .context("version 1 backup is not a derived transaction path")?;
+    if source_id != backup_id
+        || Path::new(&marker.source).components().count() != 1
+        || Path::new(&marker.backup).components().count() != 1
+    {
+        anyhow::bail!("version 1 transaction paths are inconsistent")
+    }
+    validate_transaction_id(source_id)?;
+    let paths = transaction_paths(destination, source_id)?;
+    if paths.source.file_name().and_then(|name| name.to_str()) != Some(marker.source.as_str())
+        || paths.backup.file_name().and_then(|name| name.to_str()) != Some(marker.backup.as_str())
+    {
+        anyhow::bail!("version 1 transaction paths are not canonical")
+    }
+    Ok(DecodedLearningTransactionMarker::Legacy {
+        transaction_id: source_id.to_string(),
+        candidate_generation: marker.content_sha256,
+        expected_generation: marker.original_sha256,
+        had_destination: marker.had_destination,
+    })
 }
 
 fn transaction_artifacts(path: &Path) -> Result<Vec<PathBuf>> {
@@ -513,8 +1004,9 @@ fn transaction_artifacts(path: &Path) -> Result<Vec<PathBuf>> {
 /// A malformed or ambiguous state fails closed instead of guessing which copy
 /// is authoritative.
 pub(crate) fn recover_learning_file_transaction(path: &Path) -> Result<()> {
-    let _lock = DestinationLock::acquire(path)?;
-    recover_learning_file_transaction_locked(path)
+    let lock = DestinationLock::acquire(path)?;
+    lock.verify_parent_binding()?;
+    recover_learning_file_transaction_locked(lock.destination())
 }
 
 fn recover_learning_file_transaction_locked(path: &Path) -> Result<()> {
@@ -525,67 +1017,279 @@ fn recover_learning_file_transaction_locked(path: &Path) -> Result<()> {
         }
         return Ok(());
     }
-    let marker = read_transaction_marker(&marker_path)?;
-    if marker.version != LEARNING_TRANSACTION_VERSION {
-        anyhow::bail!("unsupported learning transaction marker version")
-    }
-    let paths = transaction_paths(path, &marker.transaction_id)?;
+    let decoded = read_transaction_marker(&marker_path, path)?;
+    let (transaction_id, candidate_generation, expected_generation) = match &decoded {
+        DecodedLearningTransactionMarker::Current(marker) => (
+            marker.transaction_id.clone(),
+            marker.candidate_generation.clone(),
+            marker.expected_generation.clone(),
+        ),
+        DecodedLearningTransactionMarker::Legacy {
+            transaction_id,
+            candidate_generation,
+            expected_generation,
+            ..
+        } => (
+            transaction_id.clone(),
+            candidate_generation.clone(),
+            expected_generation.clone(),
+        ),
+    };
+    let paths = transaction_paths(path, &transaction_id)?;
     if paths.marker != marker_path {
         anyhow::bail!("transaction marker does not belong to the learning file")
     }
-    let expected = [&paths.source, &paths.backup];
+    let expected = [
+        &paths.marker_staging,
+        &paths.source,
+        &paths.backup_staging,
+        &paths.backup,
+    ];
     for artifact in transaction_artifacts(path)? {
         if !expected.contains(&&artifact) {
             anyhow::bail!("learning transaction has an unexpected sibling artifact")
         }
         ensure_regular_file(&artifact)?;
     }
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let destination_digest = path_present(path)?.then(|| digest_file(path)).transpose()?;
-
-    if destination_digest.as_deref() == Some(marker.content_sha256.as_str()) {
-        remove_verified_artifact(&paths.source, Some(&marker.content_sha256))?;
-        remove_verified_artifact(&paths.backup, marker.original_sha256.as_deref())?;
-        return finish_transaction_cleanup(&paths.marker, parent);
+    match decoded {
+        DecodedLearningTransactionMarker::Legacy {
+            had_destination, ..
+        } => recover_legacy_transaction(
+            path,
+            &paths,
+            destination_digest.as_deref(),
+            &candidate_generation,
+            expected_generation.as_deref(),
+            had_destination,
+        ),
+        DecodedLearningTransactionMarker::Current(mut marker) => {
+            recover_current_transaction(path, &paths, &mut marker, destination_digest.as_deref())
+        }
     }
+}
 
+fn destination_matches_expected(actual: Option<&str>, expected: Option<&str>) -> bool {
+    actual == expected
+}
+
+fn remove_owned_precommit_artifact(path: &Path) -> Result<()> {
     if path_present(path)? {
-        if marker.had_destination {
-            if marker.original_sha256.as_deref() != destination_digest.as_deref() {
-                anyhow::bail!("learning transaction destination does not match its original digest")
-            }
-            if path_present(&paths.backup)?
-                && marker.original_sha256.as_deref() != Some(digest_file(&paths.backup)?.as_str())
-            {
-                anyhow::bail!("learning transaction has conflicting destination and backup data")
-            }
-        } else {
-            anyhow::bail!("new learning-file transaction has an unexpected destination")
-        }
-        remove_verified_artifact(&paths.source, Some(&marker.content_sha256))?;
-        remove_verified_artifact(&paths.backup, marker.original_sha256.as_deref())?;
-        return finish_transaction_cleanup(&paths.marker, parent);
+        ensure_regular_file(path)?;
+        remove_if_present(path)?;
     }
+    Ok(())
+}
 
-    if marker.had_destination {
-        if !path_present(&paths.backup)? {
-            anyhow::bail!("learning transaction lost both destination and recovery backup")
+fn cleanup_precommit_transaction(paths: &LearningTransactionPaths, parent: &Path) -> Result<()> {
+    remove_owned_precommit_artifact(&paths.marker_staging)?;
+    remove_owned_precommit_artifact(&paths.source)?;
+    remove_owned_precommit_artifact(&paths.backup_staging)?;
+    remove_owned_precommit_artifact(&paths.backup)?;
+    sync_learning_parent(parent)?;
+    remove_if_present(&paths.marker)?;
+    sync_learning_parent(parent)
+}
+
+fn recover_legacy_transaction(
+    path: &Path,
+    paths: &LearningTransactionPaths,
+    destination_generation: Option<&str>,
+    candidate_generation: &str,
+    expected_generation: Option<&str>,
+    had_destination: bool,
+) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    if had_destination != expected_generation.is_some() {
+        anyhow::bail!("legacy transaction has inconsistent destination state")
+    }
+    if destination_matches_expected(destination_generation, expected_generation) {
+        return cleanup_precommit_transaction(paths, parent);
+    }
+    if destination_generation == Some(candidate_generation) {
+        sync_replacement(path, parent)?;
+        let identity = paths
+            .source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.rsplit_once('-'))
+            .map(|(_, identity)| identity.to_string())
+            .context("legacy transaction identity is unavailable")?;
+        let mut marker = LearningTransactionMarker {
+            version: LEARNING_TRANSACTION_VERSION,
+            transaction_id: identity,
+            phase: LearningTransactionPhase::ReplacementDurable,
+            candidate_generation: candidate_generation.to_string(),
+            expected_generation: expected_generation.map(str::to_string),
+            expected_security_generation: None,
+        };
+        persist_transaction_phase(paths, &marker)?;
+        return recover_current_transaction(path, paths, &mut marker, Some(candidate_generation));
+    }
+    if destination_generation.is_none() && had_destination {
+        restore_verified_backup(path, paths, expected_generation, None)?;
+        return cleanup_precommit_transaction(paths, parent);
+    }
+    anyhow::bail!("legacy transaction state is ambiguous")
+}
+
+fn recover_current_transaction(
+    path: &Path,
+    paths: &LearningTransactionPaths,
+    marker: &mut LearningTransactionMarker,
+    destination_generation: Option<&str>,
+) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    match marker.phase {
+        LearningTransactionPhase::Preparing | LearningTransactionPhase::Ready => {
+            if !destination_matches_expected(
+                destination_generation,
+                marker.expected_generation.as_deref(),
+            ) {
+                anyhow::bail!("pre-commit transaction destination generation changed")
+            }
+            cleanup_precommit_transaction(paths, parent)
         }
-        if marker.original_sha256.as_deref() != Some(digest_file(&paths.backup)?.as_str()) {
-            anyhow::bail!("learning transaction backup does not match its original digest")
+        LearningTransactionPhase::Replacing => {
+            if destination_generation == Some(marker.candidate_generation.as_str()) {
+                sync_replacement(path, parent)?;
+                marker.phase = LearningTransactionPhase::ReplacementDurable;
+                persist_transaction_phase(paths, marker)?;
+                recover_current_transaction(path, paths, marker, destination_generation)
+            } else if destination_matches_expected(
+                destination_generation,
+                marker.expected_generation.as_deref(),
+            ) {
+                cleanup_precommit_transaction(paths, parent)
+            } else if destination_generation.is_none() && marker.expected_generation.is_some() {
+                restore_verified_backup(
+                    path,
+                    paths,
+                    marker.expected_generation.as_deref(),
+                    marker.expected_security_generation.as_deref(),
+                )?;
+                cleanup_precommit_transaction(paths, parent)
+            } else {
+                anyhow::bail!("replacement transaction destination generation is ambiguous")
+            }
         }
-        rename_write_through(&paths.backup, path).with_context(|| {
-            format!(
-                "failed to restore learning file {} from backup",
-                path.display()
-            )
-        })?;
-        if marker.original_sha256.as_deref() != Some(digest_file(path)?.as_str()) {
-            anyhow::bail!("restored learning file does not match its original digest")
+        LearningTransactionPhase::ReplacementDurable => {
+            if destination_generation != Some(marker.candidate_generation.as_str()) {
+                anyhow::bail!("durable replacement generation is missing or changed")
+            }
+            sync_replacement(path, parent)?;
+            remove_owned_precommit_artifact(&paths.marker_staging)?;
+            remove_verified_artifact(&paths.source, Some(&marker.candidate_generation))?;
+            remove_owned_precommit_artifact(&paths.backup_staging)?;
+            remove_verified_artifact(&paths.backup, marker.expected_generation.as_deref())?;
+            sync_learning_parent(parent)?;
+            marker.phase = LearningTransactionPhase::BackupRemoved;
+            persist_transaction_phase(paths, marker)?;
+            recover_current_transaction(path, paths, marker, destination_generation)
+        }
+        LearningTransactionPhase::BackupRemoved => {
+            if destination_generation != Some(marker.candidate_generation.as_str()) {
+                anyhow::bail!("cleanup transaction lost its durable replacement")
+            }
+            sync_replacement(path, parent)?;
+            if path_present(&paths.backup)? {
+                anyhow::bail!("cleanup phase retained an unexpected rollback backup")
+            }
+            remove_owned_precommit_artifact(&paths.marker_staging)?;
+            remove_owned_precommit_artifact(&paths.backup_staging)?;
+            remove_if_present(&paths.marker)?;
+            sync_learning_parent(parent)
         }
     }
-    remove_verified_artifact(&paths.source, Some(&marker.content_sha256))?;
-    finish_transaction_cleanup(&paths.marker, parent)
+}
+
+fn persist_transaction_phase(
+    paths: &LearningTransactionPaths,
+    marker: &LearningTransactionMarker,
+) -> Result<()> {
+    write_transaction_marker(paths, marker)?;
+    sync_learning_parent(paths.marker.parent().unwrap_or_else(|| Path::new(".")))
+}
+
+fn sync_replacement(path: &Path, parent: &Path) -> Result<()> {
+    File::open(path)?.sync_all()?;
+    sync_learning_parent(parent)
+}
+
+fn restore_verified_backup(
+    destination: &Path,
+    paths: &LearningTransactionPaths,
+    expected_generation: Option<&str>,
+    expected_security_generation: Option<&str>,
+) -> Result<()> {
+    let expected = expected_generation.context("rollback generation is missing")?;
+    if !path_present(&paths.backup)? || digest_file(&paths.backup)? != expected {
+        anyhow::bail!("rollback backup does not match its expected generation")
+    }
+    verify_windows_security_generation(&paths.backup, expected_security_generation)?;
+    rename_write_through(&paths.backup, destination)?;
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    sync_replacement(destination, parent)?;
+    if digest_file(destination)? != expected {
+        anyhow::bail!("restored destination does not match its expected generation")
+    }
+    verify_windows_security_generation(destination, expected_security_generation)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn verify_windows_security_generation(path: &Path, expected: Option<&str>) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    if windows_dacl_digest(path)? != expected {
+        anyhow::bail!("Windows rollback DACL does not match its transaction generation")
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn verify_windows_security_generation(_path: &Path, _expected: Option<&str>) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_dacl_digest(path: &Path) -> Result<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Security::{GetFileSecurityW, DACL_SECURITY_INFORMATION};
+
+    let path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut needed = 0;
+    unsafe {
+        GetFileSecurityW(
+            path.as_ptr(),
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        );
+    }
+    if needed == 0 {
+        return Err(std::io::Error::last_os_error()).context("failed to read the Windows DACL");
+    }
+    let mut descriptor = vec![0u8; needed as usize];
+    if unsafe {
+        GetFileSecurityW(
+            path.as_ptr(),
+            DACL_SECURITY_INFORMATION,
+            descriptor.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error()).context("failed to read the Windows DACL");
+    }
+    Ok(content_digest(&descriptor))
 }
 
 fn remove_verified_artifact(path: &Path, expected_digest: Option<&str>) -> Result<()> {
@@ -599,12 +1303,6 @@ fn remove_verified_artifact(path: &Path, expected_digest: Option<&str>) -> Resul
         anyhow::bail!("transaction artifact digest does not match its marker")
     }
     remove_if_present(path)
-}
-
-fn finish_transaction_cleanup(marker: &Path, parent: &Path) -> Result<()> {
-    sync_learning_parent(parent)?;
-    remove_if_present(marker)?;
-    sync_learning_parent(parent)
 }
 
 fn remove_if_present(path: &Path) -> Result<()> {
@@ -664,7 +1362,8 @@ fn sync_learning_parent(parent: &Path) -> Result<()> {
 #[cfg(windows)]
 fn sync_learning_parent(_parent: &Path) -> Result<()> {
     // Windows has no directory fsync contract. File replacement and recovery
-    // use write-through moves, and destination handles are flushed explicitly.
+    // flush destination handles explicitly; phase and recovery publication use
+    // write-through moves to order the journal around those flushes.
     Ok(())
 }
 
@@ -674,6 +1373,7 @@ fn sync_learning_parent(_parent: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn write_learning_file_atomically(
     path: &Path,
     content: &str,
@@ -689,6 +1389,20 @@ pub(crate) fn write_learning_file_atomically_if_unchanged(
 ) -> Result<LearningWriteOutcome> {
     write_learning_file_atomically_with_sync_and_expected(
         path,
+        Some(Some(expected)),
+        content,
+        sync_parent_directory,
+    )
+}
+
+#[cfg(unix)]
+pub(crate) fn write_learning_file_atomically_for_snapshot(
+    path: &Path,
+    expected: Option<&[u8]>,
+    content: &str,
+) -> Result<LearningWriteOutcome> {
+    write_learning_file_atomically_with_sync_and_expected(
+        path,
         Some(expected),
         content,
         sync_parent_directory,
@@ -696,6 +1410,7 @@ pub(crate) fn write_learning_file_atomically_if_unchanged(
 }
 
 #[cfg(windows)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn write_learning_file_atomically(
     path: &Path,
     content: &str,
@@ -709,10 +1424,20 @@ pub(crate) fn write_learning_file_atomically_if_unchanged(
     expected: &[u8],
     content: &str,
 ) -> Result<LearningWriteOutcome> {
+    write_learning_file_atomically_windows(path, Some(Some(expected)), content)
+}
+
+#[cfg(windows)]
+pub(crate) fn write_learning_file_atomically_for_snapshot(
+    path: &Path,
+    expected: Option<&[u8]>,
+    content: &str,
+) -> Result<LearningWriteOutcome> {
     write_learning_file_atomically_windows(path, Some(expected), content)
 }
 
 #[cfg(not(any(unix, windows)))]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn write_learning_file_atomically(
     _path: &Path,
     _content: &str,
@@ -729,7 +1454,17 @@ pub(crate) fn write_learning_file_atomically_if_unchanged(
     anyhow::bail!("atomic learning-file durability is unsupported on this platform")
 }
 
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn write_learning_file_atomically_for_snapshot(
+    _path: &Path,
+    _expected: Option<&[u8]>,
+    _content: &str,
+) -> Result<LearningWriteOutcome> {
+    anyhow::bail!("atomic learning-file durability is unsupported on this platform")
+}
+
 #[cfg(any(unix, test))]
+#[cfg_attr(not(test), allow(dead_code))]
 fn write_learning_file_atomically_with_sync<F>(
     path: &Path,
     content: &str,
@@ -744,7 +1479,7 @@ where
 #[cfg(any(unix, test))]
 fn write_learning_file_atomically_with_sync_and_expected<F>(
     path: &Path,
-    expected: Option<&[u8]>,
+    expected: Option<Option<&[u8]>>,
     content: &str,
     mut sync_directory: F,
 ) -> Result<LearningWriteOutcome>
@@ -753,17 +1488,26 @@ where
 {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     ensure_durable_directory(parent, &mut sync_directory)?;
-    let _lock = DestinationLock::acquire(path)?;
+    let lock = DestinationLock::acquire(path)?;
+    let path = lock.destination();
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    lock.verify_parent_binding()?;
     recover_learning_file_transaction_locked(path)?;
     if let Some(expected) = expected {
-        let current = std::fs::read(path).with_context(|| {
-            format!(
-                "failed to reread {} under its transaction lock",
-                path.display()
-            )
-        })?;
-        if current != expected {
-            anyhow::bail!("destination changed before the atomic rewrite")
+        match (expected, path_present(path)?) {
+            (None, false) => {}
+            (None, true) | (Some(_), false) => return Err(snapshot_conflict()),
+            (Some(expected), true) => {
+                let current = std::fs::read(path).with_context(|| {
+                    format!(
+                        "failed to reread {} under its transaction lock",
+                        path.display()
+                    )
+                })?;
+                if current != expected {
+                    return Err(snapshot_conflict());
+                }
+            }
         }
     }
     let identity = format!("{:032x}", rand::random::<u128>());
@@ -772,13 +1516,15 @@ where
         .ok()
         .map(|metadata| metadata.permissions());
     let original_sha256 = path.exists().then(|| digest_file(path)).transpose()?;
-    let marker = LearningTransactionMarker {
+    let mut marker = LearningTransactionMarker {
         version: LEARNING_TRANSACTION_VERSION,
         transaction_id: identity,
-        content_sha256: content_digest(content.as_bytes()),
-        original_sha256: original_sha256.clone(),
-        had_destination: path.exists(),
+        phase: LearningTransactionPhase::Preparing,
+        candidate_generation: content_digest(content.as_bytes()),
+        expected_generation: original_sha256.clone(),
+        expected_security_generation: None,
     };
+    lock.verify_parent_binding()?;
     write_transaction_marker(&paths, &marker)?;
     sync_directory(parent)
         .with_context(|| format!("failed to sync parent directory {}", parent.display()))?;
@@ -799,6 +1545,23 @@ where
         sync_directory(parent)
             .with_context(|| format!("failed to sync recovery backup for {}", path.display()))?;
     }
+    marker.phase = LearningTransactionPhase::Ready;
+    write_transaction_marker(&paths, &marker)?;
+    sync_directory(parent).with_context(|| {
+        format!(
+            "failed to sync ready transaction phase in {}",
+            parent.display()
+        )
+    })?;
+    marker.phase = LearningTransactionPhase::Replacing;
+    write_transaction_marker(&paths, &marker)?;
+    sync_directory(parent).with_context(|| {
+        format!(
+            "failed to sync replacing transaction phase in {}",
+            parent.display()
+        )
+    })?;
+    lock.verify_parent_binding()?;
     drop(temporary);
     if let Err(error) = rename_write_through(&paths.source, path) {
         let recovery = recover_learning_file_transaction_locked(path);
@@ -825,6 +1588,16 @@ where
     {
         return Ok(LearningWriteOutcome::CommittedWithWarning(error));
     }
+    if let Err(error) = lock.verify_parent_binding() {
+        return Ok(LearningWriteOutcome::CommittedWithWarning(error));
+    }
+    marker.phase = LearningTransactionPhase::ReplacementDurable;
+    if let Err(error) = write_transaction_marker(&paths, &marker)
+        .and_then(|()| sync_directory(parent))
+        .context("failed to persist durable replacement phase")
+    {
+        return Ok(LearningWriteOutcome::CommittedWithWarning(error));
+    }
     if let Err(error) = remove_verified_artifact(&paths.backup, original_sha256.as_deref())
         .and_then(|()| {
             sync_directory(parent).with_context(|| {
@@ -834,6 +1607,13 @@ where
                 )
             })
         })
+    {
+        return Ok(LearningWriteOutcome::CommittedWithWarning(error));
+    }
+    marker.phase = LearningTransactionPhase::BackupRemoved;
+    if let Err(error) = write_transaction_marker(&paths, &marker)
+        .and_then(|()| sync_directory(parent))
+        .context("failed to persist rollback-cleanup phase")
     {
         return Ok(LearningWriteOutcome::CommittedWithWarning(error));
     }
@@ -916,7 +1696,8 @@ pub(crate) fn preserve_corrupt_learning_file(path: &Path, content: &[u8]) -> Res
             "corrupt learning state exceeds the bounded recovery-copy size; the original remains in place"
         );
     }
-    let _lock = DestinationLock::acquire(path)?;
+    let lock = DestinationLock::acquire(path)?;
+    let path = lock.destination();
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let base = format!(
         ".{}.corrupt-{}",
@@ -926,11 +1707,13 @@ pub(crate) fn preserve_corrupt_learning_file(path: &Path, content: &[u8]) -> Res
         content_digest(content)
     );
     let preserved = parent.join(format!("{base}.recovery"));
+    let stable_preserved = lock.canonical_parent.join(format!("{base}.recovery"));
     if preserved.exists() {
         let verified = std::fs::read(&preserved)?;
         if verified == content {
             preserve_recovery_metadata(path, &preserved)?;
-            return Ok(preserved);
+            lock.verify_parent_binding()?;
+            return Ok(stable_preserved);
         }
         anyhow::bail!("content-addressed corrupt-state copy does not match its digest")
     }
@@ -983,7 +1766,8 @@ pub(crate) fn preserve_corrupt_learning_file(path: &Path, content: &[u8]) -> Res
             preserved.display()
         );
     }
-    Ok(preserved)
+    lock.verify_parent_binding()?;
+    Ok(stable_preserved)
 }
 
 #[cfg(unix)]
@@ -995,7 +1779,7 @@ fn sync_parent_directory(parent: &Path) -> Result<()> {
 #[cfg(windows)]
 fn write_learning_file_atomically_windows(
     path: &Path,
-    expected: Option<&[u8]>,
+    expected: Option<Option<&[u8]>>,
     content: &str,
 ) -> Result<LearningWriteOutcome> {
     use std::os::windows::ffi::OsStrExt;
@@ -1131,20 +1915,26 @@ fn write_learning_file_atomically_windows(
         }
     }
 
+    let lock = DestinationLock::acquire(path)?;
+    let path = lock.destination();
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create {}", parent.display()))?;
-    let _lock = DestinationLock::acquire(path)?;
+    lock.verify_parent_binding()?;
     recover_learning_file_transaction_locked(path)?;
     if let Some(expected) = expected {
-        let current = std::fs::read(path).with_context(|| {
-            format!(
-                "failed to reread {} under its transaction lock",
-                path.display()
-            )
-        })?;
-        if current != expected {
-            anyhow::bail!("destination changed before the atomic rewrite")
+        match (expected, path_present(path)?) {
+            (None, false) => {}
+            (None, true) | (Some(_), false) => return Err(snapshot_conflict()),
+            (Some(expected), true) => {
+                let current = std::fs::read(path).with_context(|| {
+                    format!(
+                        "failed to reread {} under its transaction lock",
+                        path.display()
+                    )
+                })?;
+                if current != expected {
+                    return Err(snapshot_conflict());
+                }
+            }
         }
     }
     let destination_exists = path.exists();
@@ -1166,13 +1956,18 @@ fn write_learning_file_atomically_windows(
     };
     let identity = format!("{:032x}", rand::random::<u128>());
     let paths = transaction_paths(path, &identity)?;
-    let marker = LearningTransactionMarker {
+    let original_generation = destination_exists.then(|| digest_file(path)).transpose()?;
+    let mut marker = LearningTransactionMarker {
         version: LEARNING_TRANSACTION_VERSION,
         transaction_id: identity,
-        content_sha256: content_digest(content.as_bytes()),
-        original_sha256: destination_exists.then(|| digest_file(path)).transpose()?,
-        had_destination: destination_exists,
+        phase: LearningTransactionPhase::Preparing,
+        candidate_generation: content_digest(content.as_bytes()),
+        expected_generation: original_generation.clone(),
+        expected_security_generation: expected_security
+            .as_ref()
+            .map(|(descriptor, _)| content_digest(descriptor)),
     };
+    lock.verify_parent_binding()?;
     write_transaction_marker(&paths, &marker)?;
     let mut temporary = open_owner_only_new(&paths.source)
         .with_context(|| format!("failed to create temporary file in {}", parent.display()))?;
@@ -1198,11 +1993,28 @@ fn write_learning_file_atomically_windows(
         .sync_all()
         .with_context(|| format!("failed to sync temporary file for {}", path.display()))?;
     if destination_exists {
-        copy_file_owner_only(path, &paths.backup)?;
-        if marker.original_sha256.as_deref() != Some(digest_file(&paths.backup)?.as_str()) {
+        copy_file_owner_only(path, &paths.backup_staging)?;
+        if let Some((descriptor, information)) = &expected_security {
+            apply_security_descriptor(&paths.backup_staging, descriptor, *information)
+                .with_context(|| {
+                    format!("failed to preserve backup security for {}", path.display())
+                })?;
+        }
+        if original_generation.as_deref() != Some(digest_file(&paths.backup_staging)?.as_str()) {
             anyhow::bail!("learning transaction backup digest changed during creation")
         }
+        verify_windows_security_generation(
+            &paths.backup_staging,
+            marker.expected_security_generation.as_deref(),
+        )?;
+        move_with_write_through(&paths.backup_staging, &paths.backup, false)
+            .with_context(|| format!("failed to publish recovery backup for {}", path.display()))?;
     }
+    marker.phase = LearningTransactionPhase::Ready;
+    write_transaction_marker(&paths, &marker)?;
+    marker.phase = LearningTransactionPhase::Replacing;
+    write_transaction_marker(&paths, &marker)?;
+    lock.verify_parent_binding()?;
     drop(temporary);
     let replacement = if destination_exists {
         // ReplaceFileW provides the documented metadata-preserving replacement
@@ -1279,14 +2091,31 @@ fn write_learning_file_atomically_windows(
         // disk instead of retaining stale in-memory authority.
         return Ok(LearningWriteOutcome::CommittedWithWarning(finalize_error));
     }
-    if let Err(error) = remove_verified_artifact(&paths.backup, marker.original_sha256.as_deref()) {
+    if let Err(error) = lock.verify_parent_binding() {
         return Ok(LearningWriteOutcome::CommittedWithWarning(error));
+    }
+    marker.phase = LearningTransactionPhase::ReplacementDurable;
+    if let Err(error) = write_transaction_marker(&paths, &marker) {
+        return Ok(LearningWriteOutcome::CommittedWithWarning(
+            error.context("failed to persist durable replacement phase"),
+        ));
+    }
+    if let Err(error) =
+        remove_verified_artifact(&paths.backup, marker.expected_generation.as_deref())
+    {
+        return Ok(LearningWriteOutcome::CommittedWithWarning(error));
+    }
+    marker.phase = LearningTransactionPhase::BackupRemoved;
+    if let Err(error) = write_transaction_marker(&paths, &marker) {
+        return Ok(LearningWriteOutcome::CommittedWithWarning(
+            error.context("failed to persist rollback-cleanup phase"),
+        ));
     }
     if let Err(error) = remove_if_present(&paths.marker) {
         return Ok(LearningWriteOutcome::CommittedWithWarning(error));
     }
     Ok(LearningWriteOutcome::CommittedWithWarning(anyhow::anyhow!(
-        "Windows confirms file replacement with write-through and handle flush, but does not expose directory-entry flush confirmation"
+        "Windows flushes replacement content and publishes transaction phases with write-through moves, but does not expose independent directory-entry flush confirmation"
     )))
 }
 
@@ -1419,18 +2248,27 @@ impl LearnedShim {
 pub struct LearnedRuleStore {
     config: LearningConfig,
     data: LearnedRulesFile,
+    snapshot: Option<Vec<u8>>,
 }
 
 impl LearnedRuleStore {
     pub fn load(config: LearningConfig) -> Result<Self> {
         recover_learning_file_transaction(&config.path)?;
-        let mut data = if config.path.exists() {
-            let content = std::fs::read_to_string(&config.path)
-                .with_context(|| format!("failed to read {}", config.path.display()))?;
+        let snapshot = if config.path.exists() {
+            Some(
+                std::fs::read(&config.path)
+                    .with_context(|| format!("failed to read {}", config.path.display()))?,
+            )
+        } else {
+            None
+        };
+        let mut data = if let Some(content) = snapshot.as_deref() {
+            let content = std::str::from_utf8(content)
+                .with_context(|| format!("{} is not UTF-8", config.path.display()))?;
             if content.trim().is_empty() {
                 LearnedRulesFile::default()
             } else {
-                serde_yaml_ng::from_str(&content)
+                serde_yaml_ng::from_str(content)
                     .with_context(|| format!("failed to parse {}", config.path.display()))?
             }
         } else {
@@ -1446,9 +2284,19 @@ impl LearnedRuleStore {
         let mut changed =
             original_observations != data.observations.len() || original_rules != data.rules.len();
         changed |= sanitize_learned_rules_prose(&mut data);
-        let store = Self { config, data };
+        let mut store = Self {
+            config,
+            data,
+            snapshot,
+        };
         if changed {
-            let outcome = store.save_data(&store.data)?;
+            let content = store.canonical_content(&store.data)?;
+            let outcome = write_learning_file_atomically_for_snapshot(
+                &store.config.path,
+                store.snapshot.as_deref(),
+                &content,
+            )?;
+            store.snapshot = Some(content.into_bytes());
             if let Some(error) = outcome.warning() {
                 tracing::warn!(
                     "learning-file cleanup committed with a durability warning: {}",
@@ -1489,8 +2337,19 @@ impl LearnedRuleStore {
     ) -> Result<Option<LearningOutcome>> {
         let mut candidate = self.clone();
         let outcome = candidate.record_approval_in_memory(binary, args, command, risk, reason)?;
-        self.commit_candidate(candidate.data)?;
-        Ok(outcome)
+        match self.commit_candidate(candidate.data) {
+            Ok(()) => Ok(outcome),
+            Err(error) if is_learning_snapshot_conflict(&error) => {
+                let mut current = Self::load(self.config.clone())?;
+                let mut retry = current.clone();
+                let outcome =
+                    retry.record_approval_in_memory(binary, args, command, risk, reason)?;
+                current.commit_candidate(retry.data)?;
+                *self = current;
+                Ok(outcome)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn record_approval_in_memory(
@@ -1607,6 +2466,7 @@ impl LearnedRuleStore {
         }
         let outcome = self.save_data(&candidate)?;
         self.data = candidate;
+        self.snapshot = Some(self.canonical_content(&self.data)?.into_bytes());
         if let Some(error) = outcome.warning() {
             tracing::warn!(
                 "learning-file replacement committed with a durability warning: {}",
@@ -1617,10 +2477,18 @@ impl LearnedRuleStore {
     }
 
     fn save_data(&self, data: &LearnedRulesFile) -> Result<LearningWriteOutcome> {
+        let content = self.canonical_content(data)?;
+        write_learning_file_atomically_for_snapshot(
+            &self.config.path,
+            self.snapshot.as_deref(),
+            &content,
+        )
+    }
+
+    fn canonical_content(&self, data: &LearnedRulesFile) -> Result<String> {
         let mut data = data.clone();
         sanitize_learned_rules_prose(&mut data);
-        let content = serde_yaml_ng::to_string(&data)?;
-        write_learning_file_atomically(&self.config.path, &content)
+        Ok(serde_yaml_ng::to_string(&data)?)
     }
 }
 
@@ -1943,7 +2811,7 @@ mod tests {
         let mut syncs = 0;
         let outcome = write_learning_file_atomically_with_sync(&path, "new", |_| {
             syncs += 1;
-            if syncs == 3 {
+            if syncs == 5 {
                 anyhow::bail!("simulated directory sync failure")
             }
             Ok(())
@@ -1973,7 +2841,7 @@ mod tests {
         let path = second.join("learned.yaml");
         let mut synced = Vec::new();
         write_learning_file_atomically_with_sync(&path, "safe", |directory| {
-            synced.push(directory.to_path_buf());
+            synced.push(directory.canonicalize().unwrap());
             Ok(())
         })
         .unwrap();
@@ -1988,7 +2856,10 @@ mod tests {
                 first
             ]
         );
-        assert!(synced[4..].iter().all(|directory| directory == &second));
+        let canonical_second = second.canonicalize().unwrap();
+        assert!(synced[4..]
+            .iter()
+            .all(|directory| directory == &canonical_second));
     }
 
     fn test_marker(
@@ -2002,12 +2873,13 @@ mod tests {
         let marker = LearningTransactionMarker {
             version: LEARNING_TRANSACTION_VERSION,
             transaction_id: identity,
-            content_sha256: content_digest(content),
-            original_sha256: had_destination
+            phase: LearningTransactionPhase::Replacing,
+            candidate_generation: content_digest(content),
+            expected_generation: had_destination
                 .then(|| std::fs::read(&paths.backup).ok())
                 .flatten()
                 .map(|bytes| content_digest(&bytes)),
-            had_destination,
+            expected_security_generation: None,
         };
         write_transaction_marker(&paths, &marker).unwrap();
         paths
@@ -2040,6 +2912,292 @@ mod tests {
         );
         assert!(!paths.source.exists());
         assert!(!paths.marker.exists());
+    }
+
+    fn write_current_phase_marker(
+        destination: &Path,
+        identity: &str,
+        phase: LearningTransactionPhase,
+        candidate: &[u8],
+        expected: Option<&[u8]>,
+    ) -> LearningTransactionPaths {
+        let paths = transaction_paths(destination, identity).unwrap();
+        write_transaction_marker(
+            &paths,
+            &LearningTransactionMarker {
+                version: LEARNING_TRANSACTION_VERSION,
+                transaction_id: identity.to_string(),
+                phase,
+                candidate_generation: content_digest(candidate),
+                expected_generation: expected.map(content_digest),
+                expected_security_generation: None,
+            },
+        )
+        .unwrap();
+        paths
+    }
+
+    #[test]
+    fn phase_journal_recovers_every_precommit_and_committed_transition() {
+        let phases = [
+            LearningTransactionPhase::Preparing,
+            LearningTransactionPhase::Ready,
+            LearningTransactionPhase::Replacing,
+        ];
+        for (index, phase) in phases.into_iter().enumerate() {
+            let temp = tempfile::tempdir().unwrap();
+            let destination = temp.path().join("learned.yaml");
+            std::fs::write(&destination, "original").unwrap();
+            let identity = format!("{index:032x}");
+            let paths = transaction_paths(&destination, &identity).unwrap();
+            std::fs::write(&paths.source, "candidate").unwrap();
+            std::fs::write(&paths.backup, "original").unwrap();
+            write_current_phase_marker(
+                &destination,
+                &identity,
+                phase,
+                b"candidate",
+                Some(b"original"),
+            );
+
+            recover_learning_file_transaction(&destination).unwrap();
+            assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+            assert!(transaction_artifacts(&destination).unwrap().is_empty());
+            assert!(!paths.marker.exists());
+        }
+
+        for phase in [
+            LearningTransactionPhase::Replacing,
+            LearningTransactionPhase::ReplacementDurable,
+            LearningTransactionPhase::BackupRemoved,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let destination = temp.path().join("learned.yaml");
+            std::fs::write(&destination, "candidate").unwrap();
+            let identity = format!("{:032x}", phase as u8 + 10);
+            let paths = transaction_paths(&destination, &identity).unwrap();
+            if phase != LearningTransactionPhase::BackupRemoved {
+                std::fs::write(&paths.backup, "original").unwrap();
+            }
+            write_current_phase_marker(
+                &destination,
+                &identity,
+                phase,
+                b"candidate",
+                Some(b"original"),
+            );
+
+            recover_learning_file_transaction(&destination).unwrap();
+            assert_eq!(std::fs::read(&destination).unwrap(), b"candidate");
+            assert!(transaction_artifacts(&destination).unwrap().is_empty());
+            assert!(!paths.marker.exists());
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("learned.yaml");
+        let identity = "00000000000000000000000000000020";
+        let paths = transaction_paths(&destination, identity).unwrap();
+        std::fs::write(&paths.backup, "original").unwrap();
+        write_current_phase_marker(
+            &destination,
+            identity,
+            LearningTransactionPhase::Replacing,
+            b"candidate",
+            Some(b"original"),
+        );
+        recover_learning_file_transaction(&destination).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+        assert!(transaction_artifacts(&destination).unwrap().is_empty());
+    }
+
+    #[test]
+    fn preparing_phase_cleans_only_derived_partial_artifacts() {
+        for partial_role in [
+            "none",
+            "marker_staging",
+            "source",
+            "backup_staging",
+            "backup",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let destination = temp.path().join("learned.yaml");
+            std::fs::write(&destination, "original").unwrap();
+            let identity = "00000000000000000000000000000021";
+            let paths = transaction_paths(&destination, identity).unwrap();
+            write_current_phase_marker(
+                &destination,
+                identity,
+                LearningTransactionPhase::Preparing,
+                b"candidate",
+                Some(b"original"),
+            );
+            match partial_role {
+                "marker_staging" => std::fs::write(&paths.marker_staging, "partial").unwrap(),
+                "source" => std::fs::write(&paths.source, "partial").unwrap(),
+                "backup_staging" => std::fs::write(&paths.backup_staging, "partial").unwrap(),
+                "backup" => std::fs::write(&paths.backup, "partial").unwrap(),
+                _ => {}
+            }
+            recover_learning_file_transaction(&destination).unwrap();
+            assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+            assert!(transaction_artifacts(&destination).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn cleanup_phase_never_discards_unrecorded_rollback_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("learned.yaml");
+        std::fs::write(&destination, "candidate").unwrap();
+        let identity = "00000000000000000000000000000025";
+        let paths = transaction_paths(&destination, identity).unwrap();
+        std::fs::write(&paths.backup, "original").unwrap();
+        write_current_phase_marker(
+            &destination,
+            identity,
+            LearningTransactionPhase::BackupRemoved,
+            b"candidate",
+            Some(b"original"),
+        );
+
+        assert!(recover_learning_file_transaction(&destination).is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"candidate");
+        assert_eq!(std::fs::read(&paths.backup).unwrap(), b"original");
+        assert!(paths.marker.exists());
+    }
+
+    fn write_v1_marker(
+        destination: &Path,
+        identity: &str,
+        candidate: &[u8],
+        expected: Option<&[u8]>,
+    ) -> LearningTransactionPaths {
+        let paths = transaction_paths(destination, identity).unwrap();
+        let marker = serde_json::json!({
+            "version": 1,
+            "destination": destination.file_name().unwrap().to_str().unwrap(),
+            "source": paths.source.file_name().unwrap().to_str().unwrap(),
+            "backup": paths.backup.file_name().unwrap().to_str().unwrap(),
+            "content_sha256": content_digest(candidate),
+            "original_sha256": expected.map(content_digest),
+            "had_destination": expected.is_some(),
+        });
+        write_raw_marker(destination, &serde_json::to_vec(&marker).unwrap());
+        paths
+    }
+
+    #[test]
+    fn version_one_transactions_recover_only_unambiguous_derived_states() {
+        for state in ["precommit", "committed", "restore", "new_precommit"] {
+            let temp = tempfile::tempdir().unwrap();
+            let destination = temp.path().join("learned.yaml");
+            let identity = "00000000000000000000000000000022";
+            let expected = (state != "new_precommit").then_some(b"original".as_slice());
+            let paths = transaction_paths(&destination, identity).unwrap();
+            std::fs::write(&paths.source, "candidate").unwrap();
+            if expected.is_some() {
+                std::fs::write(&paths.backup, "original").unwrap();
+            }
+            match state {
+                "precommit" => std::fs::write(&destination, "original").unwrap(),
+                "committed" => std::fs::write(&destination, "candidate").unwrap(),
+                "restore" | "new_precommit" => {}
+                _ => unreachable!(),
+            }
+            write_v1_marker(&destination, identity, b"candidate", expected);
+
+            recover_learning_file_transaction(&destination).unwrap();
+            let expected_destination = if state == "committed" {
+                Some(b"candidate".as_slice())
+            } else if state == "new_precommit" {
+                None
+            } else {
+                Some(b"original".as_slice())
+            };
+            assert_eq!(
+                destination
+                    .exists()
+                    .then(|| std::fs::read(&destination).unwrap()),
+                expected_destination.map(Vec::from)
+            );
+            assert!(transaction_artifacts(&destination).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn version_two_transaction_recovers_with_constrained_derived_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("learned.yaml");
+        std::fs::write(&destination, "candidate").unwrap();
+        let identity = "00000000000000000000000000000027";
+        let paths = transaction_paths(&destination, identity).unwrap();
+        std::fs::write(&paths.source, "candidate").unwrap();
+        std::fs::write(&paths.backup, "original").unwrap();
+        let marker = serde_json::json!({
+            "version": 2,
+            "transaction_id": identity,
+            "content_sha256": content_digest(b"candidate"),
+            "original_sha256": content_digest(b"original"),
+            "had_destination": true,
+        });
+        write_raw_marker(&destination, &serde_json::to_vec(&marker).unwrap());
+
+        recover_learning_file_transaction(&destination).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"candidate");
+        assert!(transaction_artifacts(&destination).unwrap().is_empty());
+        assert!(!paths.marker.exists());
+    }
+
+    #[test]
+    fn version_one_markers_reject_foreign_paths_and_digest_mismatches() {
+        for (field, foreign) in [
+            ("source", "../operator.yaml"),
+            ("source", "learned.yaml"),
+            ("backup", "sibling.yaml"),
+            ("destination", "sibling.yaml"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let destination = temp.path().join("learned.yaml");
+            std::fs::write(&destination, "original").unwrap();
+            let identity = "00000000000000000000000000000023";
+            let paths = transaction_paths(&destination, identity).unwrap();
+            std::fs::write(&paths.source, "candidate").unwrap();
+            std::fs::write(&paths.backup, "original").unwrap();
+            let mut marker = serde_json::json!({
+                "version": 1,
+                "destination": destination.file_name().unwrap().to_str().unwrap(),
+                "source": paths.source.file_name().unwrap().to_str().unwrap(),
+                "backup": paths.backup.file_name().unwrap().to_str().unwrap(),
+                "content_sha256": content_digest(b"candidate"),
+                "original_sha256": content_digest(b"original"),
+                "had_destination": true,
+            });
+            marker.as_object_mut().unwrap().insert(
+                field.to_string(),
+                serde_json::Value::String(foreign.to_string()),
+            );
+            write_raw_marker(&destination, &serde_json::to_vec(&marker).unwrap());
+            assert!(recover_learning_file_transaction(&destination).is_err());
+            assert!(paths.source.exists());
+            assert!(paths.backup.exists());
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("learned.yaml");
+        std::fs::write(&destination, "original").unwrap();
+        let identity = "00000000000000000000000000000024";
+        let paths = transaction_paths(&destination, identity).unwrap();
+        std::fs::write(&paths.source, "candidate").unwrap();
+        std::fs::write(&paths.backup, "original").unwrap();
+        write_v1_marker(
+            &destination,
+            identity,
+            b"different-candidate",
+            Some(b"different-original"),
+        );
+        assert!(recover_learning_file_transaction(&destination).is_err());
+        assert!(paths.source.exists());
+        assert!(paths.backup.exists());
     }
 
     #[test]
@@ -2107,6 +3265,97 @@ mod tests {
         thread.join().unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn destination_binding_detects_parent_retargeting_before_file_operations() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("authority");
+        let moved = temp.path().join("authority-moved");
+        std::fs::create_dir(&parent).unwrap();
+        let destination = parent.join("learned.yaml");
+        let lock = DestinationLock::acquire(&destination).unwrap();
+
+        std::fs::rename(&parent, &moved).unwrap();
+        std::fs::create_dir(&parent).unwrap();
+        let unrelated = parent.join("unrelated.yaml");
+        std::fs::write(&unrelated, "operator state").unwrap();
+
+        assert!(lock.verify_parent_binding().is_err());
+        assert_eq!(
+            std::fs::read_to_string(unrelated).unwrap(),
+            "operator state"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn atomic_writer_never_redirects_into_a_retargeted_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("authority");
+        let moved = temp.path().join("authority-moved");
+        std::fs::create_dir(&parent).unwrap();
+        let destination = parent.join("learned.yaml");
+        std::fs::write(&destination, "original").unwrap();
+        let replacement_destination = destination.clone();
+        let mut syncs = 0;
+
+        let result =
+            write_learning_file_atomically_with_sync(&destination, "candidate", |bound_parent| {
+                syncs += 1;
+                if syncs == 1 {
+                    std::fs::rename(&parent, &moved)?;
+                    std::fs::create_dir(&parent)?;
+                    std::fs::write(&replacement_destination, "unrelated")?;
+                }
+                sync_parent_directory(bound_parent)
+            });
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&replacement_destination).unwrap(),
+            "unrelated"
+        );
+        let moved_destination = moved.join("learned.yaml");
+        assert_eq!(
+            std::fs::read_to_string(&moved_destination).unwrap(),
+            "original"
+        );
+        recover_learning_file_transaction(&moved_destination).unwrap();
+        assert!(transaction_artifacts(&moved_destination)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hardened_initial_creation_is_restrictive_from_nested_parent_creation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("state");
+        let second = first.join("catalog");
+        let destination = second.join("verbs.yaml");
+        create_hardened_file_if_absent(&destination, "verbs: []\n").unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&first).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&second).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&destination)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read_to_string(destination).unwrap(), "verbs: []\n");
+    }
+
     fn write_raw_marker(destination: &Path, bytes: &[u8]) -> PathBuf {
         let marker = learning_sibling(destination, "transaction", None);
         let mut file = open_owner_only_new(&marker).unwrap();
@@ -2142,9 +3391,9 @@ mod tests {
             let marker = serde_json::json!({
                 "version": LEARNING_TRANSACTION_VERSION,
                 "transaction_id": identity,
-                "content_sha256": content_digest(b"candidate"),
-                "original_sha256": null,
-                "had_destination": false,
+                "phase": "preparing",
+                "candidate_generation": content_digest(b"candidate"),
+                "expected_generation": null,
             });
             write_raw_marker(&destination, &serde_json::to_vec(&marker).unwrap());
             assert!(recover_learning_file_transaction(&destination).is_err());
@@ -2160,9 +3409,9 @@ mod tests {
             let mut marker = serde_json::json!({
                 "version": LEARNING_TRANSACTION_VERSION,
                 "transaction_id": "00000000000000000000000000000005",
-                "content_sha256": content_digest(b"candidate"),
-                "original_sha256": null,
-                "had_destination": false,
+                "phase": "preparing",
+                "candidate_generation": content_digest(b"candidate"),
+                "expected_generation": null,
             });
             marker.as_object_mut().unwrap().insert(
                 field.to_string(),
@@ -2187,9 +3436,10 @@ mod tests {
             &LearningTransactionMarker {
                 version: LEARNING_TRANSACTION_VERSION,
                 transaction_id: "00000000000000000000000000000004".to_string(),
-                content_sha256: content_digest(b"candidate"),
-                original_sha256: Some(content_digest(b"expected original")),
-                had_destination: true,
+                phase: LearningTransactionPhase::ReplacementDurable,
+                candidate_generation: content_digest(b"candidate"),
+                expected_generation: Some(content_digest(b"expected original")),
+                expected_security_generation: None,
             },
         )
         .unwrap();
@@ -2213,9 +3463,10 @@ mod tests {
             &LearningTransactionMarker {
                 version: LEARNING_TRANSACTION_VERSION,
                 transaction_id: "00000000000000000000000000000006".to_string(),
-                content_sha256: content_digest(b"candidate"),
-                original_sha256: None,
-                had_destination: false,
+                phase: LearningTransactionPhase::Preparing,
+                candidate_generation: content_digest(b"candidate"),
+                expected_generation: None,
+                expected_security_generation: None,
             },
         )
         .unwrap();
@@ -2267,7 +3518,7 @@ mod tests {
         let outcome =
             write_learning_file_atomically_with_sync(&destination, "candidate", |parent| {
                 syncs += 1;
-                if syncs == 3 {
+                if syncs == 5 {
                     anyhow::bail!("simulated post-commit sync failure")
                 }
                 sync_learning_parent(parent)
@@ -2311,8 +3562,40 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_owner_group_preflight_accepts_non_elevated_rewrites_and_rejects_mismatch() {
-        assert!(ensure_windows_owner_group_compatible(b"same", b"same").is_ok());
-        assert!(ensure_windows_owner_group_compatible(b"destination", b"writer").is_err());
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+
+        fn descriptor(sddl: &str) -> Vec<u8> {
+            let sddl = sddl
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>();
+            let mut descriptor = std::ptr::null_mut();
+            let mut length = 0;
+            assert_ne!(
+                unsafe {
+                    ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                        sddl.as_ptr(),
+                        SDDL_REVISION_1,
+                        &mut descriptor,
+                        &mut length,
+                    )
+                },
+                0
+            );
+            let bytes = unsafe {
+                std::slice::from_raw_parts(descriptor.cast::<u8>(), length as usize).to_vec()
+            };
+            unsafe { LocalFree(descriptor) };
+            bytes
+        }
+
+        let system = descriptor("O:SYG:SYD:P(A;;FA;;;SY)");
+        let administrators = descriptor("O:BAG:BAD:P(A;;FA;;;BA)");
+        assert!(ensure_windows_owner_group_compatible(&system, &system).is_ok());
+        assert!(ensure_windows_owner_group_compatible(&system, &administrators).is_err());
     }
 
     #[cfg(windows)]
@@ -2407,6 +3690,41 @@ mod tests {
         assert_ne!(
             unsafe { SetFileAttributesW(path_wide.as_ptr(), FILE_ATTRIBUTE_NORMAL) },
             0
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_recovery_restores_only_the_recorded_backup_dacl() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("learned.yaml");
+        let mut original = open_owner_only_new(&destination).unwrap();
+        original.write_all(b"original").unwrap();
+        original.sync_all().unwrap();
+        drop(original);
+        let identity = "00000000000000000000000000000026";
+        let paths = transaction_paths(&destination, identity).unwrap();
+        copy_file_owner_only(&destination, &paths.backup).unwrap();
+        let security_generation = windows_dacl_digest(&destination).unwrap();
+        std::fs::remove_file(&destination).unwrap();
+        write_transaction_marker(
+            &paths,
+            &LearningTransactionMarker {
+                version: LEARNING_TRANSACTION_VERSION,
+                transaction_id: identity.to_string(),
+                phase: LearningTransactionPhase::Replacing,
+                candidate_generation: content_digest(b"candidate"),
+                expected_generation: Some(content_digest(b"original")),
+                expected_security_generation: Some(security_generation.clone()),
+            },
+        )
+        .unwrap();
+
+        recover_learning_file_transaction(&destination).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+        assert_eq!(
+            windows_dacl_digest(&destination).unwrap(),
+            security_generation
         );
     }
 
@@ -2693,5 +4011,35 @@ mod tests {
         assert!(looks_dangerous_for_learned_allow("shutdown /s"));
         assert!(looks_dangerous_for_learned_allow("halt"));
         assert!(looks_dangerous_for_learned_allow("su root"));
+    }
+
+    #[test]
+    fn stale_learning_instances_reapply_observations_without_losing_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = LearningConfig {
+            path: temp.path().join("learned.yaml"),
+            min_approvals: 2,
+            max_risk: 2,
+            auto_shim: AutoShimMode::Suggest,
+        };
+        let mut first = LearnedRuleStore::load(config.clone()).unwrap();
+        let mut second = LearnedRuleStore::load(config.clone()).unwrap();
+        let args = ["status".to_string()];
+
+        first
+            .record_approval("fixturectl", &args, "fixturectl status", Some(1), "safe")
+            .unwrap();
+        let outcome = second
+            .record_approval("fixturectl", &args, "fixturectl status", Some(1), "safe")
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.approvals, 2);
+
+        let loaded = LearnedRuleStore::load(config).unwrap();
+        assert_eq!(loaded.rule_count(), 1);
+        assert_eq!(
+            loaded.data.observations.values().next().unwrap().approvals,
+            2
+        );
     }
 }

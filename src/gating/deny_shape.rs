@@ -26,9 +26,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::env::now_unix;
+#[cfg(test)]
+use crate::learned_rules::write_learning_file_atomically;
 use crate::learned_rules::{
-    infer_service_from_binary, recover_learning_file_transaction, sanitize_learning_text,
-    write_learning_file_atomically, LearningWriteOutcome,
+    infer_service_from_binary, is_learning_snapshot_conflict, recover_learning_file_transaction,
+    sanitize_learning_text, write_learning_file_atomically_for_snapshot, LearningWriteOutcome,
 };
 use crate::redact::{
     command_contains_sensitive_literals, flattened_args_contain_sensitive_literals,
@@ -187,18 +189,27 @@ pub struct DenyLearningOutcome {
 pub struct DenyShapeStore {
     config: DenyLearningConfig,
     data: DenyShapeFile,
+    snapshot: Option<Vec<u8>>,
 }
 
 impl DenyShapeStore {
     pub fn load(config: DenyLearningConfig) -> Result<Self> {
         recover_learning_file_transaction(&config.path)?;
-        let mut data = if config.path.exists() {
-            let content = std::fs::read_to_string(&config.path)
-                .with_context(|| format!("failed to read {}", config.path.display()))?;
+        let snapshot = if config.path.exists() {
+            Some(
+                std::fs::read(&config.path)
+                    .with_context(|| format!("failed to read {}", config.path.display()))?,
+            )
+        } else {
+            None
+        };
+        let mut data = if let Some(content) = snapshot.as_deref() {
+            let content = std::str::from_utf8(content)
+                .with_context(|| format!("{} is not UTF-8", config.path.display()))?;
             if content.trim().is_empty() {
                 DenyShapeFile::default()
             } else {
-                serde_yaml_ng::from_str(&content)
+                serde_yaml_ng::from_str(content)
                     .with_context(|| format!("failed to parse {}", config.path.display()))?
             }
         } else {
@@ -227,9 +238,19 @@ impl DenyShapeStore {
                 changed = true;
             }
         }
-        let store = Self { config, data };
+        let mut store = Self {
+            config,
+            data,
+            snapshot,
+        };
         if changed {
-            let outcome = store.save_data(&store.data)?;
+            let content = store.canonical_content(&store.data)?;
+            let outcome = write_learning_file_atomically_for_snapshot(
+                &store.config.path,
+                store.snapshot.as_deref(),
+                &content,
+            )?;
+            store.snapshot = Some(content.into_bytes());
             if let Some(error) = outcome.warning() {
                 tracing::warn!(
                     "deny-shape cleanup committed with a durability warning: {}",
@@ -289,8 +310,18 @@ impl DenyShapeStore {
     ) -> Result<Option<DenyLearningOutcome>> {
         let mut candidate = self.clone();
         let outcome = candidate.record_denial_in_memory(binary, args, command, reason)?;
-        self.commit_candidate(candidate.data)?;
-        Ok(outcome)
+        match self.commit_candidate(candidate.data) {
+            Ok(()) => Ok(outcome),
+            Err(error) if is_learning_snapshot_conflict(&error) => {
+                let mut current = Self::load(self.config.clone())?;
+                let mut retry = current.clone();
+                let outcome = retry.record_denial_in_memory(binary, args, command, reason)?;
+                current.commit_candidate(retry.data)?;
+                *self = current;
+                Ok(outcome)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn record_denial_in_memory(
@@ -446,6 +477,7 @@ impl DenyShapeStore {
         }
         let outcome = self.save_data(&candidate)?;
         self.data = candidate;
+        self.snapshot = Some(self.canonical_content(&self.data)?.into_bytes());
         if let Some(error) = outcome.warning() {
             tracing::warn!(
                 "deny-shape replacement committed with a durability warning: {}",
@@ -456,6 +488,15 @@ impl DenyShapeStore {
     }
 
     fn save_data(&self, data: &DenyShapeFile) -> Result<LearningWriteOutcome> {
+        let content = self.canonical_content(data)?;
+        write_learning_file_atomically_for_snapshot(
+            &self.config.path,
+            self.snapshot.as_deref(),
+            &content,
+        )
+    }
+
+    fn canonical_content(&self, data: &DenyShapeFile) -> Result<String> {
         let mut data = data.clone();
         for observation in data.observations.values_mut() {
             observation.last_reason = sanitize_learning_text(&observation.last_reason);
@@ -463,8 +504,7 @@ impl DenyShapeStore {
         for shape in &mut data.shapes {
             shape.last_reason = sanitize_learning_text(&shape.last_reason);
         }
-        let content = serde_yaml_ng::to_string(&data)?;
-        write_learning_file_atomically(&self.config.path, &content)
+        Ok(serde_yaml_ng::to_string(&data)?)
     }
 }
 
@@ -973,5 +1013,51 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = DenyShapeStore::load(config(temp.path().join("deny.yaml"), 2)).unwrap();
         assert_eq!(store.shape_count(), 0);
+    }
+
+    #[test]
+    fn stale_deny_instances_merge_observations_but_reject_authority_conflicts() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config(temp.path().join("deny.yaml"), 2);
+        let mut first = DenyShapeStore::load(config.clone()).unwrap();
+        let mut second = DenyShapeStore::load(config.clone()).unwrap();
+        let argv = ["remove".to_string(), "object".to_string()];
+
+        first
+            .record_denial("fixturectl", &argv, "fixturectl remove object", "unsafe")
+            .unwrap();
+        let outcome = second
+            .record_denial("fixturectl", &argv, "fixturectl remove object", "unsafe")
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.denials, 2);
+
+        let mut authority_first = DenyShapeStore::load(config.clone()).unwrap();
+        let mut authority_second = DenyShapeStore::load(config.clone()).unwrap();
+        authority_first
+            .promote_shape(
+                "fixturectl",
+                "fixturectl",
+                r"^remove object$",
+                &["remove object".to_string()],
+                "unsafe",
+                2,
+            )
+            .unwrap();
+        assert!(authority_second
+            .promote_shape(
+                "fixturectl",
+                "fixturectl",
+                r"^remove other$",
+                &["remove other".to_string()],
+                "unsafe",
+                2,
+            )
+            .is_err());
+
+        let loaded = DenyShapeStore::load(config).unwrap();
+        assert_eq!(loaded.shape_count(), 1);
+        assert!(loaded.matches("fixturectl", "remove object").is_some());
+        assert!(loaded.matches("fixturectl", "remove other").is_none());
     }
 }

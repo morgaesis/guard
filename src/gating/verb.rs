@@ -58,6 +58,7 @@ pub enum ParamValueType {
 const SINGLE_ARGV_PATTERN_PREFIX: &str = "\0guard-single-argv:";
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ParamSpecWire {
     pattern: String,
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
@@ -201,6 +202,7 @@ fn default_environment_source() -> EnvironmentBindingSource {
 /// anchored `pattern` supports bounded path-like inputs. Omitting both permits
 /// any value for this exact source and environment variable name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnvironmentConstraint {
     pub name: String,
     #[serde(
@@ -221,6 +223,7 @@ fn is_plain_source(source: &EnvironmentBindingSource) -> bool {
 /// Select one or more argv values either by option spelling or by exact argv
 /// position. Option spellings accept both `--name value` and `--name=value`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ValueConstraint {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<String>,
@@ -241,13 +244,54 @@ pub struct ValueConstraint {
 }
 
 /// A bound on a list-valued target selector such as Ansible `--limit a,b`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FanoutConstraint {
     #[serde(flatten)]
     pub selector: ValueConstraint,
     pub max: usize,
     #[serde(default = "default_fanout_separator")]
     pub separator: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FanoutConstraintWire {
+    #[serde(default)]
+    options: Vec<String>,
+    #[serde(default)]
+    position: Option<usize>,
+    #[serde(default)]
+    values: Vec<String>,
+    #[serde(default)]
+    allow_dash: bool,
+    #[serde(default = "default_true")]
+    required: bool,
+    #[serde(default)]
+    allow_multiple: bool,
+    max: usize,
+    #[serde(default = "default_fanout_separator")]
+    separator: String,
+}
+
+impl<'de> Deserialize<'de> for FanoutConstraint {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = FanoutConstraintWire::deserialize(deserializer)?;
+        Ok(Self {
+            selector: ValueConstraint {
+                options: wire.options,
+                position: wire.position,
+                values: wire.values,
+                allow_dash: wire.allow_dash,
+                required: wire.required,
+                allow_multiple: wire.allow_multiple,
+            },
+            max: wire.max,
+            separator: wire.separator,
+        })
+    }
 }
 
 fn default_fanout_separator() -> String {
@@ -257,6 +301,7 @@ fn default_fanout_separator() -> String {
 /// One typed region of a verb's command space. Constraints are conjunctive.
 /// Required and forbidden argv tokens are exact argv elements, never globs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerbCoverageCell {
     pub name: String,
     pub action: CoverageAction,
@@ -308,6 +353,7 @@ pub struct VerbCoverageCell {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CoverageProvenance {
     pub source: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -321,6 +367,7 @@ pub struct CoverageProvenance {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CoverageProbe {
     pub dimension: String,
     pub args: Vec<String>,
@@ -364,6 +411,7 @@ pub struct ValueDomain {
 
 /// A structured command template (binary + argv templates). No shell.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerbCommand {
     pub binary: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -372,6 +420,7 @@ pub struct VerbCommand {
 
 /// One catalog verb.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Verb {
     pub name: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -595,12 +644,7 @@ impl VerbCatalog {
             }
             if is_synthesized_verb(&verb) {
                 let original = serde_json::to_value(&verb)?;
-                sanitize_synthesized_verb_prose(&mut verb);
-                if generated_authority_contains_sensitive_literal(&verb) {
-                    bail!(
-                        "generated verb contains sensitive authority metadata or literal credential argv"
-                    );
-                }
+                verb = canonicalize_generated_catalog_envelope(verb)?;
                 repaired |= original != serde_json::to_value(&verb)?;
             }
             normalize_operator_boundaries(&mut verb);
@@ -639,8 +683,8 @@ impl VerbCatalog {
                 text.as_bytes(),
                 &canonical,
             )?;
-            if let Some(error) = outcome.warning() {
-                return Err(error).context("catalog repair committed without confirmed durability");
+            if let Some(error) = catalog_repair_warning(path, &canonical, outcome)? {
+                tracing::warn!("catalog repair committed with a durability warning: {error}");
             }
         }
         catalog.path = Some(path.to_path_buf());
@@ -937,16 +981,7 @@ impl VerbCatalog {
     pub fn append_verb(&mut self, verb: &Verb) -> Result<()> {
         let canonical;
         let verb = if is_synthesized_verb(verb) {
-            canonical = {
-                let mut candidate = verb.clone();
-                sanitize_synthesized_verb_prose(&mut candidate);
-                if generated_authority_contains_sensitive_literal(&candidate) {
-                    bail!(
-                        "generated verb contains sensitive authority metadata or literal credential argv"
-                    );
-                }
-                candidate
-            };
+            canonical = canonicalize_generated_catalog_envelope(verb.clone())?;
             &canonical
         } else {
             verb
@@ -959,12 +994,13 @@ impl VerbCatalog {
         let new_content = compose_appended_catalog(&existing, verb)?;
         // Validate the COMBINED catalog in memory BEFORE touching the file, so a
         // bad or duplicate verb can never corrupt the catalog on disk.
-        let validated = Self::from_yaml(&new_content)
+        let (validated, canonical) = Self::from_yaml_with_repair(&new_content)
             .context("appending this verb would make the catalog invalid")?;
+        let durable_content = canonical.as_deref().unwrap_or(&new_content);
         let outcome = crate::learned_rules::write_learning_file_atomically_if_unchanged(
             &path,
             existing.as_bytes(),
-            &new_content,
+            durable_content,
         )?;
         let warning = outcome.warning();
         // Adopt the already-validated content rather than re-reading the file: a
@@ -1036,8 +1072,9 @@ impl VerbCatalog {
         }
 
         let new_content = compose_replaced_catalog(&existing, name, replacement)?;
-        let mut validated = Self::from_yaml(&new_content)
+        let (mut validated, canonical) = Self::from_yaml_with_repair(&new_content)
             .context("amending this verb would make the catalog invalid")?;
+        let durable_content = canonical.as_deref().unwrap_or(&new_content);
 
         let runtime_verbs = self
             .verbs
@@ -1056,7 +1093,7 @@ impl VerbCatalog {
         // Every fallible catalog adoption step completes before the durable
         // rewrite. After this point, success requires only the atomic file
         // replacement and assigning the already validated state.
-        atomic_replace_if_unchanged(&path, existing.as_bytes(), new_content.as_bytes())?;
+        atomic_replace_if_unchanged(&path, existing.as_bytes(), durable_content.as_bytes())?;
         validated.path = Some(path.clone());
         validated.mtime = std::fs::metadata(&path)
             .ok()
@@ -1159,12 +1196,13 @@ impl VerbCatalog {
         })?;
         let existing = std::fs::read_to_string(&path).unwrap_or_default();
         let new_content = compose_removed_catalog(&existing, name)?;
-        let validated = Self::from_yaml(&new_content)
+        let (validated, canonical) = Self::from_yaml_with_repair(&new_content)
             .context("deleting this verb would make the catalog invalid")?;
+        let durable_content = canonical.as_deref().unwrap_or(&new_content);
         let outcome = crate::learned_rules::write_learning_file_atomically_if_unchanged(
             &path,
             existing.as_bytes(),
-            &new_content,
+            durable_content,
         )?;
         let warning = outcome.warning();
         self.verbs = validated.verbs;
@@ -1226,6 +1264,26 @@ impl VerbCatalog {
         self.version = u64::from_be_bytes(version_bytes);
         Ok(())
     }
+}
+
+fn catalog_repair_warning(
+    path: &Path,
+    canonical: &str,
+    outcome: crate::learned_rules::LearningWriteOutcome,
+) -> Result<Option<anyhow::Error>> {
+    let Some(error) = outcome.warning() else {
+        return Ok(None);
+    };
+    let committed = std::fs::read_to_string(path).with_context(|| {
+        format!(
+            "failed to verify committed catalog repair {}",
+            path.display()
+        )
+    })?;
+    if committed != canonical {
+        bail!("committed catalog repair does not match its canonical candidate");
+    }
+    Ok(Some(error))
 }
 
 /// Compose the new catalog text by adding one verb to the top-level `verbs:`
@@ -2378,6 +2436,10 @@ fn generated_authority_contains_sensitive_literal(verb: &Verb) -> bool {
             .credential_plan
             .as_deref()
             .is_some_and(text_contains_sensitive_literals)
+        || verb
+            .promotion_stamp
+            .as_deref()
+            .is_some_and(text_contains_sensitive_literals)
     {
         return true;
     }
@@ -2419,6 +2481,10 @@ fn generated_authority_contains_sensitive_literal(verb: &Verb) -> bool {
                 .cwd
                 .as_ref()
                 .is_some_and(|cwd| text_contains_sensitive_literals(&cwd.to_string_lossy()))
+            || cell
+                .override_marker
+                .as_deref()
+                .is_some_and(text_contains_sensitive_literals)
             || cell.environment.iter().any(|environment| {
                 text_contains_sensitive_literals(&environment.name)
                     || environment.values.iter().any(|value| {
@@ -2474,18 +2540,18 @@ fn sanitize_synthesized_verb_prose(verb: &mut Verb) {
 }
 
 pub fn canonicalize_synthesized_verb_envelope(mut verb: Verb) -> Result<Verb> {
+    verb = canonicalize_generated_catalog_envelope(verb)?;
+    validate_synthesized_safety(&verb)?;
+    Ok(verb)
+}
+
+fn canonicalize_generated_catalog_envelope(mut verb: Verb) -> Result<Verb> {
     sanitize_synthesized_verb_prose(&mut verb);
-    if generated_authority_contains_sensitive_literal(&verb)
-        || verb
-            .promotion_stamp
-            .as_deref()
-            .is_some_and(text_contains_sensitive_literals)
-    {
+    if generated_authority_contains_sensitive_literal(&verb) {
         bail!(
-            "generated verb contains sensitive authority metadata or literal argv and cannot be persisted"
+            "generated verb contains sensitive authority metadata or literal credential argv and cannot be persisted"
         );
     }
-    validate_synthesized_safety(&verb)?;
     Ok(verb)
 }
 
@@ -3693,6 +3759,7 @@ verbs:
         let mut verb = synth_verb("fixturectl", Some("^(status)$"), false, "inspect-fixture");
         verb.source_prose = Some(contaminated.clone());
         verb.evidence = Some(contaminated.clone());
+        verb.promotion_stamp = Some("regime-safe".to_string());
         let yaml = serde_yaml_ng::to_string(&CatalogFile { verbs: vec![verb] }).unwrap();
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("verbs.yaml");
@@ -3704,6 +3771,14 @@ verbs:
         assert!(!serde_json::to_string(&first.list())
             .unwrap()
             .contains(&value));
+        assert_eq!(
+            first
+                .get("inspect-fixture")
+                .unwrap()
+                .promotion_stamp
+                .as_deref(),
+            Some("regime-safe")
+        );
 
         let second = VerbCatalog::load(&path).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), repaired);
@@ -3725,6 +3800,64 @@ verbs:
     }
 
     #[test]
+    fn committed_catalog_repair_warning_adopts_only_verified_canonical_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("verbs.yaml");
+        let canonical = "verbs: []\n";
+        std::fs::write(&path, canonical).unwrap();
+        let warning = catalog_repair_warning(
+            &path,
+            canonical,
+            crate::learned_rules::LearningWriteOutcome::CommittedWithWarning(anyhow::anyhow!(
+                "simulated cleanup warning"
+            )),
+        )
+        .unwrap();
+        assert!(warning.is_some());
+        assert!(VerbCatalog::from_yaml(canonical).is_ok());
+
+        std::fs::write(&path, "verbs:\n  - invalid\n").unwrap();
+        assert!(catalog_repair_warning(
+            &path,
+            canonical,
+            crate::learned_rules::LearningWriteOutcome::CommittedWithWarning(anyhow::anyhow!(
+                "simulated cleanup warning"
+            )),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn stale_catalog_instances_reapply_nonconflicting_appends() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("verbs.yaml");
+        std::fs::write(&path, "verbs: []\n").unwrap();
+        let mut first = VerbCatalog::load(&path).unwrap();
+        let mut second = VerbCatalog::load(&path).unwrap();
+
+        first
+            .append_verb(&synth_verb(
+                "fixturectl",
+                Some("^(one)$"),
+                false,
+                "safe-one",
+            ))
+            .unwrap();
+        second
+            .append_verb(&synth_verb(
+                "fixturectl",
+                Some("^(two)$"),
+                false,
+                "safe-two",
+            ))
+            .unwrap();
+
+        let loaded = VerbCatalog::load(&path).unwrap();
+        assert!(loaded.get("safe-one").is_some());
+        assert!(loaded.get("safe-two").is_some());
+    }
+
+    #[test]
     fn sensitive_synthesized_name_fails_before_preview_or_catalog_load() {
         let value = ["q", "7"].concat();
         let mut verb = synth_verb("fixturectl", Some("^(status)$"), false, "safe");
@@ -3739,6 +3872,23 @@ verbs:
         std::fs::write(&path, &yaml).unwrap();
         assert!(VerbCatalog::load(&path).is_err());
         assert_eq!(std::fs::read_to_string(path).unwrap(), yaml);
+    }
+
+    #[test]
+    fn generated_catalog_envelope_rejects_sensitive_stamps_and_unknown_metadata() {
+        let value = ["q", "7"].concat();
+        let mut verb = synth_verb("fixturectl", Some("^(status)$"), false, "safe");
+        verb.promotion_stamp = Some(format!("password={value}"));
+        assert!(canonicalize_generated_catalog_envelope(verb.clone()).is_err());
+
+        let yaml = serde_yaml_ng::to_string(&CatalogFile { verbs: vec![verb] }).unwrap();
+        assert!(VerbCatalog::from_yaml(&yaml).is_err());
+
+        let unknown_nested = "verbs:\n  - name: safe\n    binary: true\n    consequence: reversible\n    future_metadata: true\n";
+        assert!(VerbCatalog::from_yaml(unknown_nested).is_err());
+        assert!(
+            serde_yaml_ng::from_str::<FanoutConstraint>("max: 2\nfuture_metadata: true\n").is_err()
+        );
     }
 
     #[test]

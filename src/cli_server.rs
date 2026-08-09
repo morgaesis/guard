@@ -10,7 +10,9 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use guard::env::guard_env;
-use guard::learned_rules::{AutoShimMode, LearnedRuleStore, LearningConfig};
+use guard::learned_rules::{
+    create_hardened_file_if_absent, AutoShimMode, LearnedRuleStore, LearningConfig,
+};
 use guard::policy::PolicyMode;
 use std::io::Write;
 use std::path::PathBuf;
@@ -1204,33 +1206,7 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                     let path = default_verbs_path()
                         .ok_or_else(|| anyhow::anyhow!("could not determine default verbs path"))?;
                     if !path.exists() {
-                        if let Some(parent) = path.parent() {
-                            std::fs::create_dir_all(parent).with_context(|| {
-                                format!("failed to create {}", parent.display())
-                            })?;
-                        }
-                        std::fs::write(&path, "verbs: []\n")
-                            .with_context(|| format!("failed to create {}", path.display()))?;
-                        // This file grants real, permanent LLM-bypassing
-                        // trust once auto-promotion populates it -- harden
-                        // its permissions explicitly rather than relying on
-                        // process umask, since this path is created
-                        // automatically rather than only when an operator
-                        // deliberately opted in via --verbs.
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::PermissionsExt;
-                            if let Err(e) = std::fs::set_permissions(
-                                &path,
-                                std::fs::Permissions::from_mode(0o600),
-                            ) {
-                                tracing::warn!(
-                                    "failed to set restrictive permissions on {}: {}",
-                                    path.display(),
-                                    e
-                                );
-                            }
-                        }
+                        create_hardened_file_if_absent(&path, "verbs: []\n")?;
                         tracing::info!(
                             "Created empty verb catalog at {} for auto-verb-promotion",
                             path.display()

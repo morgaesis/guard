@@ -17,8 +17,9 @@ use std::path::{Path, PathBuf};
 use super::{Reversibility, EXECUTE_NOW_MAX_RISK, HOLD_RISK_THRESHOLD};
 use crate::env::now_unix;
 use crate::learned_rules::{
-    preserve_corrupt_learning_file, recover_learning_file_transaction, sanitize_learning_text,
-    write_learning_file_atomically, LearningWriteOutcome,
+    is_learning_snapshot_conflict, preserve_corrupt_learning_file,
+    recover_learning_file_transaction, sanitize_learning_text,
+    write_learning_file_atomically_for_snapshot, LearningWriteOutcome,
 };
 use crate::proxy::ApiRequestSummary;
 use crate::redact::{named_value_contains_sensitive_literals, text_contains_sensitive_literals};
@@ -363,6 +364,7 @@ pub enum ApiPromotionOutcome {
 pub struct ApiPromotionStore {
     config: ApiPromotionConfig,
     data: ApiPromotionFile,
+    snapshot: Option<Vec<u8>>,
     #[cfg(test)]
     fail_writes: bool,
 }
@@ -370,16 +372,22 @@ pub struct ApiPromotionStore {
 impl ApiPromotionStore {
     pub fn load(config: ApiPromotionConfig) -> Result<Self> {
         recover_learning_file_transaction(&config.path)?;
-        let mut data = if config.path.exists() {
-            let content = std::fs::read(&config.path)
-                .with_context(|| format!("failed to read {}", config.path.display()))?;
+        let snapshot = if config.path.exists() {
+            Some(
+                std::fs::read(&config.path)
+                    .with_context(|| format!("failed to read {}", config.path.display()))?,
+            )
+        } else {
+            None
+        };
+        let mut data = if let Some(content) = snapshot.as_deref() {
             if content.iter().all(u8::is_ascii_whitespace) {
                 ApiPromotionFile::default()
             } else {
-                let parsed = std::str::from_utf8(&content)
+                let parsed = std::str::from_utf8(content)
                     .context("API coverage state is not UTF-8")
                     .and_then(|text| serde_yaml_ng::from_str(text).context("parse API coverage"));
-                parsed.map_err(|error| match preserve_corrupt_learning_file(&config.path, &content)
+                parsed.map_err(|error| match preserve_corrupt_learning_file(&config.path, content)
                 {
                     Ok(preserved) => anyhow::anyhow!(
                         "API coverage state is unreadable; the original remains in place and a verified copy was preserved at {}: {}",
@@ -451,14 +459,21 @@ impl ApiPromotionStore {
         data.version = default_version();
         data.buckets = migrated;
         validate_current_api_file(&data)?;
-        let store = Self {
+        let mut store = Self {
             config,
             data,
+            snapshot,
             #[cfg(test)]
             fail_writes: false,
         };
         if changed {
-            let outcome = store.save_data(&store.data)?;
+            let content = store.canonical_content(&store.data)?;
+            let outcome = write_learning_file_atomically_for_snapshot(
+                &store.config.path,
+                store.snapshot.as_deref(),
+                &content,
+            )?;
+            store.snapshot = Some(content.into_bytes());
             if let Some(error) = outcome.warning() {
                 tracing::warn!(
                     "API coverage migration committed with a durability warning: {}",
@@ -609,8 +624,19 @@ impl ApiPromotionStore {
         let mut candidate = self.clone();
         let outcome =
             candidate.record_allow_in_memory(summary, risk, reversibility, reason, stamp)?;
-        self.commit_candidate(candidate.data)?;
-        Ok(outcome)
+        match self.commit_candidate(candidate.data) {
+            Ok(()) => Ok(outcome),
+            Err(error) if is_learning_snapshot_conflict(&error) => {
+                let mut current = Self::load(self.config.clone())?;
+                let mut retry = current.clone();
+                let outcome =
+                    retry.record_allow_in_memory(summary, risk, reversibility, reason, stamp)?;
+                current.commit_candidate(retry.data)?;
+                *self = current;
+                Ok(outcome)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn record_allow_in_memory(
@@ -712,8 +738,18 @@ impl ApiPromotionStore {
     ) -> Result<Option<ApiPromotionOutcome>> {
         let mut candidate = self.clone();
         let outcome = candidate.record_deny_in_memory(summary, reason, stamp)?;
-        self.commit_candidate(candidate.data)?;
-        Ok(outcome)
+        match self.commit_candidate(candidate.data) {
+            Ok(()) => Ok(outcome),
+            Err(error) if is_learning_snapshot_conflict(&error) => {
+                let mut current = Self::load(self.config.clone())?;
+                let mut retry = current.clone();
+                let outcome = retry.record_deny_in_memory(summary, reason, stamp)?;
+                current.commit_candidate(retry.data)?;
+                *self = current;
+                Ok(outcome)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn record_deny_in_memory(
@@ -851,6 +887,7 @@ impl ApiPromotionStore {
         }
         let outcome = self.save_data(&candidate)?;
         self.data = candidate;
+        self.snapshot = Some(self.canonical_content(&self.data)?.into_bytes());
         if let Some(error) = outcome.warning() {
             tracing::warn!(
                 "API coverage replacement committed with a durability warning: {}",
@@ -865,9 +902,17 @@ impl ApiPromotionStore {
         if self.fail_writes {
             anyhow::bail!("simulated API coverage write failure");
         }
+        let content = self.canonical_content(data)?;
+        write_learning_file_atomically_for_snapshot(
+            &self.config.path,
+            self.snapshot.as_deref(),
+            &content,
+        )
+    }
+
+    fn canonical_content(&self, data: &ApiPromotionFile) -> Result<String> {
         validate_current_api_file(data)?;
-        let content = serde_yaml_ng::to_string(data)?;
-        write_learning_file_atomically(&self.config.path, &content)
+        Ok(serde_yaml_ng::to_string(data)?)
     }
 
     #[cfg(test)]
@@ -1679,5 +1724,53 @@ buckets:
             store.learned_allow(&s, "regime").is_none(),
             "one observation must not reactivate expired generated coverage"
         );
+    }
+
+    #[test]
+    fn stale_api_instances_merge_observations_and_preserve_concurrent_denies() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config(temp.path().join("api.yaml"), 2, 1);
+        let mut first = ApiPromotionStore::load(config.clone()).unwrap();
+        let mut second = ApiPromotionStore::load(config.clone()).unwrap();
+        let request = summary("api");
+
+        first
+            .record_allow(
+                &request,
+                Some(1),
+                Some(Reversibility::Reversible),
+                "safe",
+                "regime",
+            )
+            .unwrap();
+        second
+            .record_allow(
+                &request,
+                Some(1),
+                Some(Reversibility::Reversible),
+                "safe",
+                "regime",
+            )
+            .unwrap();
+        assert!(second.learned_allow(&request, "regime").is_some());
+
+        let mut deny_writer = ApiPromotionStore::load(config.clone()).unwrap();
+        let mut stale_allow_writer = ApiPromotionStore::load(config.clone()).unwrap();
+        deny_writer
+            .record_deny(&request, "unsafe", "regime")
+            .unwrap();
+        stale_allow_writer
+            .record_allow(
+                &request,
+                Some(1),
+                Some(Reversibility::Reversible),
+                "safe",
+                "regime",
+            )
+            .unwrap();
+
+        let loaded = ApiPromotionStore::load(config).unwrap();
+        assert!(loaded.learned_allow(&request, "regime").is_none());
+        assert!(loaded.learned_deny(&request, "regime").is_some());
     }
 }
