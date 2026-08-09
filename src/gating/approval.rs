@@ -241,21 +241,62 @@ pub struct ApprovalRegistry {
     leases: Arc<WaiterLeaseState>,
 }
 
-const TRANSCRIPT_BYTES: usize = 262_144;
-const TRANSCRIPT_TRUNCATED_SUFFIX: &str = "\n[guard persisted transcript truncated]\n";
+pub const APPROVAL_TRANSCRIPT_SERIALIZED_BYTES: usize = 262_144;
+pub const APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX: &str = "\n[guard persisted transcript truncated]\n";
 
-fn bound_transcript(value: Option<String>) -> Option<String> {
-    let mut value = value?;
-    if value.len() <= TRANSCRIPT_BYTES {
-        return Some(value);
+fn json_payload_bytes(character: char) -> usize {
+    match character {
+        '"' | '\\' | '\u{0008}' | '\u{0009}' | '\u{000a}' | '\u{000c}' | '\u{000d}' => 2,
+        '\u{0000}'..='\u{001f}' => 6,
+        _ => character.len_utf8(),
     }
-    let mut end = TRANSCRIPT_BYTES.saturating_sub(TRANSCRIPT_TRUNCATED_SUFFIX.len());
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
+}
+
+/// Redact and bound one transcript using the bytes occupied by its serialized
+/// JSON string field, including quotes and escapes. The same projection is
+/// used for persistence, restart loading, and wire responses.
+pub fn bound_approval_transcript(value: Option<String>) -> (Option<String>, bool) {
+    let Some(value) = value else {
+        return (None, false);
+    };
+    let exposed = crate::redact::redact_output_text(&value);
+    let already_truncated = exposed.ends_with(APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX);
+    if serde_json::to_vec(&exposed)
+        .expect("serializing a string cannot fail")
+        .len()
+        <= APPROVAL_TRANSCRIPT_SERIALIZED_BYTES
+    {
+        return (Some(exposed), already_truncated);
     }
-    value.truncate(end);
-    value.push_str(TRANSCRIPT_TRUNCATED_SUFFIX);
-    Some(value)
+
+    let source = exposed
+        .strip_suffix(APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX)
+        .unwrap_or(&exposed);
+    let suffix_payload = APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX
+        .chars()
+        .map(json_payload_bytes)
+        .sum::<usize>();
+    let mut available = APPROVAL_TRANSCRIPT_SERIALIZED_BYTES
+        .saturating_sub(2)
+        .saturating_sub(suffix_payload);
+    let mut boundary = 0;
+    for (offset, character) in source.char_indices() {
+        let bytes = json_payload_bytes(character);
+        if bytes > available {
+            break;
+        }
+        available -= bytes;
+        boundary = offset + character.len_utf8();
+    }
+    let mut bounded = source[..boundary].to_string();
+    bounded.push_str(APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX);
+    debug_assert!(
+        serde_json::to_vec(&bounded)
+            .expect("serializing a string cannot fail")
+            .len()
+            <= APPROVAL_TRANSCRIPT_SERIALIZED_BYTES
+    );
+    (Some(bounded), true)
 }
 
 #[derive(Default)]
@@ -309,8 +350,8 @@ impl ApprovalRegistry {
         let mut items = HashMap::new();
         let mut recovered = Vec::new();
         for mut row in rows {
-            row.result_stdout = bound_transcript(row.result_stdout);
-            row.result_stderr = bound_transcript(row.result_stderr);
+            row.result_stdout = bound_approval_transcript(row.result_stdout).0;
+            row.result_stderr = bound_approval_transcript(row.result_stderr).0;
             if row.status == ApprovalStatus::Approving {
                 row.status = ApprovalStatus::ExecFailed;
                 row.decided_unix = Some(now);
@@ -759,6 +800,55 @@ mod tests {
         let (reg, recovered) = ApprovalRegistry::from_rows(vec![a], 500);
         assert_eq!(recovered, vec!["h1".to_string()]);
         assert_eq!(reg.get("h1").unwrap().status, ApprovalStatus::ExecFailed);
+    }
+
+    #[test]
+    fn restarted_hold_registers_and_releases_a_new_waiter() {
+        let (mut registry, recovered) =
+            ApprovalRegistry::from_rows(vec![held("h1", 100, 3600)], 500);
+        assert!(recovered.is_empty());
+        assert!(registry.notifier("h1").is_none());
+
+        let (notifier, lease) = registry.register_waiter("h1").expect("known hold");
+        assert!(Arc::ptr_eq(
+            &notifier,
+            &registry.notifier("h1").expect("notifier re-registered")
+        ));
+        assert_eq!(registry.active_waiters("h1"), 1);
+        drop(lease);
+        assert_eq!(registry.active_waiters("h1"), 0);
+    }
+
+    #[test]
+    fn transcript_bound_counts_json_escapes_and_utf8_after_redaction() {
+        let pattern = "\"\\\n\u{0001}é界";
+        let input = pattern.repeat(APPROVAL_TRANSCRIPT_SERIALIZED_BYTES / pattern.len() + 1);
+        let (bounded, truncated) = bound_approval_transcript(Some(input));
+        let bounded = bounded.expect("transcript remains present");
+
+        assert!(truncated);
+        assert_eq!(
+            bounded
+                .matches(APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX)
+                .count(),
+            1
+        );
+        assert!(bounded.ends_with(APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX));
+        assert!(
+            serde_json::to_vec(&bounded).unwrap().len() <= APPROVAL_TRANSCRIPT_SERIALIZED_BYTES
+        );
+        assert!(std::str::from_utf8(bounded.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn transcript_bound_is_stable_when_loaded_again() {
+        let input = "\\\"\n".repeat(APPROVAL_TRANSCRIPT_SERIALIZED_BYTES);
+        let (first, first_truncated) = bound_approval_transcript(Some(input));
+        let (second, second_truncated) = bound_approval_transcript(first.clone());
+
+        assert!(first_truncated);
+        assert!(second_truncated);
+        assert_eq!(second, first);
     }
 
     #[test]

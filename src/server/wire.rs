@@ -5,11 +5,10 @@ use crate::session::{
     HistoricalGrant, SessionDecisionSource, SessionExecStatus, SessionGrantSummary, SessionOwner,
     SessionReport,
 };
-use guard::gating::approval::{Approval, WaiterLease};
+use guard::gating::approval::{bound_approval_transcript, Approval, WaiterLease};
 use guard::gating::provisional::Provisional;
 use guard::gating::{Coverage, DecisionTrace, DecisionVerbMatch};
 use guard::principal::PrincipalKey;
-use guard::redact::redact_output_text;
 use serde::{Deserialize, Serialize};
 
 use super::execute::audit_session_fingerprint;
@@ -1092,28 +1091,8 @@ pub struct ApprovalSummary {
 }
 
 pub(super) const APPROVAL_ARMED_REASON: &str = "operator approved; awaiting requester-bound resume";
-pub(super) const APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX: &str =
-    "\n[guard persisted transcript truncated]\n";
-const APPROVAL_TRANSCRIPT_BYTES: usize = 262_144;
-
 fn exposed_transcript(value: Option<&str>) -> (Option<String>, bool) {
-    let Some(value) = value else {
-        return (None, false);
-    };
-    let mut exposed = redact_output_text(value);
-    let mut truncated = exposed.ends_with(APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX);
-    if exposed.len() > APPROVAL_TRANSCRIPT_BYTES {
-        let end =
-            APPROVAL_TRANSCRIPT_BYTES.saturating_sub(APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX.len());
-        let mut boundary = end.min(exposed.len());
-        while boundary > 0 && !exposed.is_char_boundary(boundary) {
-            boundary -= 1;
-        }
-        exposed.truncate(boundary);
-        exposed.push_str(APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX);
-        truncated = true;
-    }
-    (Some(exposed), truncated)
+    bound_approval_transcript(value.map(str::to_string))
 }
 
 pub(super) fn approval_is_armed(approval: &Approval) -> bool {

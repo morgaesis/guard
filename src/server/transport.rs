@@ -85,6 +85,149 @@ async fn write_admin_response<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+#[cfg(test)]
+mod admin_response_lease_tests {
+    use super::*;
+    use guard::gating::approval::{Approval, ApprovalSnapshot};
+    use guard::gating::Reversibility;
+    use std::collections::BTreeMap;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    fn approval() -> Approval {
+        Approval {
+            handle: "lease-test".to_string(),
+            snapshot: ApprovalSnapshot {
+                binary: "true".to_string(),
+                args: Vec::new(),
+                cwd: None,
+                env: BTreeMap::new(),
+                secret_keys: BTreeMap::new(),
+                session_fingerprint: None,
+                session_revision: None,
+                secret_entitlements: None,
+                secret_file_keys: BTreeMap::new(),
+                verb_name: None,
+                verb_params: BTreeMap::new(),
+                catalog_version: None,
+                verb_digest: None,
+                access_verbs: Vec::new(),
+                access_requests: Vec::new(),
+                principal: None,
+                secret_binding: None,
+            },
+            reason: "test".to_string(),
+            risk: Some(8),
+            reversibility: Some(Reversibility::Irreversible),
+            decision_trace: None,
+            created_unix: 1,
+            ttl_secs: 3600,
+            status: ApprovalStatus::Pending,
+            decided_unix: None,
+            decided_reason: None,
+            result_exit: None,
+            result_stdout: None,
+            result_stderr: None,
+            notes: Vec::new(),
+        }
+    }
+
+    fn owned_response(registry: &mut ApprovalRegistry) -> OwnedAdminResponse {
+        registry.enqueue(approval());
+        let (_, lease) = registry
+            .register_waiter("lease-test")
+            .expect("waiter registered");
+        OwnedAdminResponse {
+            response: AdminResponse::Ok,
+            waiter_lease: Some(lease),
+        }
+    }
+
+    struct FailedWriter;
+
+    impl AsyncWrite for FailedWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "connection closed",
+            )))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct PendingWriter;
+
+    impl AsyncWrite for PendingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn response_lease_spans_serialization_and_successful_flush() {
+        let mut registry = ApprovalRegistry::new();
+        let owned = owned_response(&mut registry);
+        assert_eq!(registry.active_waiters("lease-test"), 1);
+        let (mut writer, mut reader) = tokio::io::duplex(128);
+
+        write_admin_response(&mut writer, owned).await.unwrap();
+        assert_eq!(registry.active_waiters("lease-test"), 0);
+        drop(writer);
+        let mut frame = String::new();
+        reader.read_to_string(&mut frame).await.unwrap();
+        assert!(matches!(
+            serde_json::from_str::<AdminResponse>(frame.trim()).unwrap(),
+            AdminResponse::Ok
+        ));
+    }
+
+    #[tokio::test]
+    async fn response_lease_releases_on_write_failure() {
+        let mut registry = ApprovalRegistry::new();
+        let owned = owned_response(&mut registry);
+        assert!(write_admin_response(&mut FailedWriter, owned)
+            .await
+            .is_err());
+        assert_eq!(registry.active_waiters("lease-test"), 0);
+    }
+
+    #[tokio::test]
+    async fn response_lease_releases_when_write_is_cancelled() {
+        let mut registry = ApprovalRegistry::new();
+        let owned = owned_response(&mut registry);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            write_admin_response(&mut PendingWriter, owned),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(registry.active_waiters("lease-test"), 0);
+    }
+}
+
 fn api_session_exec_status(allowed: bool, held: bool) -> SessionExecStatus {
     if held && allowed {
         SessionExecStatus::CompletedAfterApproval
@@ -303,7 +446,6 @@ mod api_session_event_tests {
             confirm_check_args: Vec::new(),
             control_path: Some("local".to_string()),
             session_fingerprint: None,
-            requester_principal: None,
             session_revision: None,
             secret_entitlements: None,
             api_revert: None,

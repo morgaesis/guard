@@ -4,7 +4,9 @@ pub(super) use guard::env::now_unix;
 
 use guard::audit::{AuditEvent, AuditKind};
 
-use guard::gating::approval::{Approval, ApprovalSnapshot, ApprovalStatus};
+use guard::gating::approval::{
+    bound_approval_transcript, Approval, ApprovalSnapshot, ApprovalStatus,
+};
 use guard::gating::provisional::{ApiRevertPlan, Provisional, ProvisionalStatus};
 use guard::gating::{decide_gate, Coverage, GateOutcome, Reversibility};
 use guard::principal::{scope_eq, PrincipalKey};
@@ -20,7 +22,7 @@ use super::runtime::NotifyEvent;
 use super::transport::write_stream_message;
 use super::wire::{
     approval_is_armed, CallerIdentity, ExecOutcome, ExecuteRequest, ExecuteResult,
-    ExecuteStreamMessage, RevertSpec, VerbContext, APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX,
+    ExecuteStreamMessage, RevertSpec, VerbContext,
 };
 use super::{
     RequestContext, ServerContext, DEFAULT_CONFIRM_WITHIN_SECS, GATING_RETENTION_SECS,
@@ -1783,21 +1785,8 @@ async fn wait_for_decision<W: AsyncWrite + Unpin>(
     }
 }
 
-const APPROVAL_TRANSCRIPT_BYTES: usize = 262_144;
-
 pub(super) fn bound_persisted_transcript(value: Option<String>) -> Option<String> {
-    let mut value = value?;
-    if value.len() <= APPROVAL_TRANSCRIPT_BYTES {
-        return Some(value);
-    }
-    let mut end =
-        APPROVAL_TRANSCRIPT_BYTES.saturating_sub(APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX.len());
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    value.truncate(end);
-    value.push_str(APPROVAL_TRANSCRIPT_TRUNCATED_SUFFIX);
-    Some(value)
+    bound_approval_transcript(value).0
 }
 
 async fn reconcile_resumed_approval(server: &ServerContext, handle: &str) {
@@ -3108,7 +3097,6 @@ mod transactional_tests {
                     body: None,
                 },
                 session_fingerprint: None,
-                requester_principal: None,
                 session_revision: None,
                 secret_entitlements: None,
                 upstream_target: "https://fixture.invalid".to_string(),

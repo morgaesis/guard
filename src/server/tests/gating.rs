@@ -1,4 +1,6 @@
-use crate::server::admin::{handle_admin_request, handle_approval_note};
+use crate::server::admin::{
+    handle_admin_request, handle_admin_request_owned, handle_approval_note,
+};
 use crate::server::execute::audit_session_fingerprint;
 #[cfg(unix)]
 use crate::server::gate_runtime::run_provisional_check;
@@ -1972,13 +1974,25 @@ async fn armed_hold_survives_restart_and_persists_bounded_transcript() {
     assert_eq!(row.status, ApprovalStatus::Approved);
     let stdout = row.result_stdout.as_deref().unwrap();
     let stderr = row.result_stderr.as_deref().unwrap();
-    assert!(stdout.len() <= 262_144);
-    assert!(stderr.len() <= 262_144);
+    assert!(serde_json::to_vec(stdout).unwrap().len() <= 262_144);
+    assert!(serde_json::to_vec(stderr).unwrap().len() <= 262_144);
     assert!(stdout.ends_with("[guard persisted transcript truncated]\n"));
     assert!(stderr.ends_with("[guard persisted transcript truncated]\n"));
     let summary = crate::server::wire::ApprovalSummary::from_row(row);
     assert!(summary.stdout_truncated);
     assert!(summary.stderr_truncated);
+    assert!(
+        serde_json::to_vec(summary.stdout.as_deref().unwrap())
+            .unwrap()
+            .len()
+            <= 262_144
+    );
+    assert!(
+        serde_json::to_vec(summary.stderr.as_deref().unwrap())
+            .unwrap()
+            .len()
+            <= 262_144
+    );
 }
 
 #[cfg(unix)]
@@ -4126,6 +4140,44 @@ fn held_verb_approval(
         result_stderr: None,
         notes: Vec::new(),
     }
+}
+
+#[tokio::test]
+async fn one_rpc_approval_wait_returns_owned_armed_outcome() {
+    let (cfg, operator, agent) = gating_config(7007, 1000);
+    let handle = "one-rpc-arm";
+    cfg.state
+        .approvals
+        .write()
+        .await
+        .enqueue(held_verb_approval(handle, None, None, agent.principal()));
+
+    let owned = handle_admin_request_owned(
+        &cfg,
+        &operator,
+        AdminRequest::AccessApprove {
+            handles: vec![handle.to_string()],
+            uses: Some(1),
+            wait_secs: Some(30),
+        },
+    )
+    .await;
+    let AdminResponse::AccessDecisions {
+        items,
+        wait: Some(wait),
+    } = &owned.response
+    else {
+        panic!("expected one access decision with wait outcome");
+    };
+    assert!(items[0].success);
+    assert_eq!(items[0].consequence, CONSEQUENCE_ARM);
+    assert_eq!(wait.outcome, "armed");
+    assert_eq!(wait.item.status, "armed");
+    assert!(owned.waiter_lease.is_some());
+    assert_eq!(cfg.state.approvals.read().await.active_waiters(handle), 1);
+    serde_json::to_vec(&owned.response).expect("owned response serializes");
+    drop(owned);
+    assert_eq!(cfg.state.approvals.read().await.active_waiters(handle), 0);
 }
 
 /// approve of a legacy row (no stored verb digest) after the verb catalog

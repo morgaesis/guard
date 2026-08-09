@@ -1729,11 +1729,7 @@ pub(crate) async fn handle_access(command: AccessCommands) -> Result<()> {
                     "{} kind={} consequence={} requester={} target={} scope={} expiry={} uses={} state={} next={}",
                     item.reference,
                     item.kind,
-                    if item.consequence.is_empty() {
-                        if item.reference.starts_with("gr-") { "grant" } else { "arm" }
-                    } else {
-                        item.consequence.as_str()
-                    },
+                    consequence_text(&item.consequence, &item.reference),
                     item.requester,
                     item.target,
                     if item.effective_scope.is_empty() {
@@ -1796,11 +1792,13 @@ fn access_json_response(response: &server::AdminResponse) -> Result<serde_json::
         server::AdminResponse::Error { message } => return Err(message.clone()),
         other => return Err(format!("unexpected access response: {other:?}")),
     };
-    Ok(serde_json::json!({
+    let mut document = serde_json::json!({
         "schema_version": JSON_SCHEMA_VERSION,
         "type": kind,
         "response": response,
-    }))
+    });
+    normalize_legacy_consequence_json(&mut document);
+    Ok(document)
 }
 
 fn render_access_status(
@@ -1918,15 +1916,7 @@ fn access_item_human(item: &server::AccessItem, raw: bool) -> String {
     lines.push(format!("uses: {}", pending_use_display(item)));
     lines.push(format!(
         "consequence: {}",
-        card_text(if item.consequence.is_empty() {
-            if item.reference.starts_with("gr-") {
-                "grant"
-            } else {
-                "arm"
-            }
-        } else {
-            item.consequence.as_str()
-        })
+        card_text(consequence_text(&item.consequence, &item.reference))
     ));
     if let Some(intent) = &item.intent {
         lines.push(format!("intent: {}", card_text(intent)));
@@ -2211,11 +2201,7 @@ fn print_access_decision_lines(items: &[server::AccessDecisionResult]) {
             item.state,
             item.target.as_deref().unwrap_or("none"),
             use_budget_field(&item.use_policy, item.remaining_uses),
-            if item.consequence.is_empty() {
-                "none"
-            } else {
-                item.consequence.as_str()
-            },
+            consequence_text(&item.consequence, &item.request),
             item.message,
         );
     }
@@ -2294,6 +2280,59 @@ enum ConsequenceClass {
     Release,
 }
 
+const LEGACY_CONSEQUENCE_SOURCE: &str = "legacy_prefix_fallback";
+
+fn legacy_consequence(reference: &str) -> &'static str {
+    if reference.starts_with("gr-") {
+        server::CONSEQUENCE_GRANT
+    } else {
+        server::CONSEQUENCE_ARM
+    }
+}
+
+fn consequence_text<'a>(consequence: &'a str, reference: &str) -> &'a str {
+    if consequence.is_empty() {
+        legacy_consequence(reference)
+    } else {
+        consequence
+    }
+}
+
+fn normalize_legacy_consequence_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                normalize_legacy_consequence_json(value);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            let reference = object
+                .get("reference")
+                .or_else(|| object.get("request"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let needs_fallback = object
+                .get("consequence")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(str::is_empty);
+            if let Some(reference) = reference.filter(|_| needs_fallback) {
+                object.insert(
+                    "consequence".to_string(),
+                    serde_json::Value::String(legacy_consequence(&reference).to_string()),
+                );
+                object.insert(
+                    "consequence_source".to_string(),
+                    serde_json::Value::String(LEGACY_CONSEQUENCE_SOURCE.to_string()),
+                );
+            }
+            for value in object.values_mut() {
+                normalize_legacy_consequence_json(value);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// The class the daemon stated, or the best available derivation when it stated
 /// none. A daemon that predates the field leaves it empty, and the reference
 /// prefix is then the only signal: `gr-` marks a grant request, and everything
@@ -2301,11 +2340,10 @@ enum ConsequenceClass {
 /// API-proxy hold from such a daemon renders as arm-class, which understates
 /// what approving it does.
 fn consequence_class(consequence: &str, reference: &str) -> ConsequenceClass {
-    match consequence {
+    match consequence_text(consequence, reference) {
         server::CONSEQUENCE_GRANT => ConsequenceClass::Grant,
         server::CONSEQUENCE_ARM => ConsequenceClass::Arm,
         server::CONSEQUENCE_RELEASE => ConsequenceClass::Release,
-        _ if reference.starts_with("gr-") => ConsequenceClass::Grant,
         _ => ConsequenceClass::Arm,
     }
 }
@@ -2414,15 +2452,7 @@ fn access_item_card(item: &server::AccessItem, colors: bool) -> Vec<String> {
     lines.push(format!("  uses:      {}", pending_use_display(item)));
     lines.push(format!(
         "  consequence: {}",
-        card_text(if item.consequence.is_empty() {
-            if item.reference.starts_with("gr-") {
-                "grant"
-            } else {
-                "arm"
-            }
-        } else {
-            item.consequence.as_str()
-        })
+        card_text(consequence_text(&item.consequence, &item.reference))
     ));
     lines.push(format!("  expiry:    {expiry}"));
     if let Some(reason) = &item.decided_reason {
@@ -2499,8 +2529,10 @@ async fn handle_access_approve_interactive(
     let (socket_path, tcp_port, source) = resolve_client_endpoint_with_source(socket, &config);
     let client = admin_client(socket_path, tcp_port, &config);
     let colors = color_enabled_for_stderr();
+    if let (Some(_), Some(reference)) = (wait, requests.first()) {
+        ensure_approval_wait_supported(&client, source, reference).await?;
+    }
     let mut any_failed = false;
-    let mut approved: Vec<String> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
     let mut queue = requests.into_iter();
     while let Some(reference) = queue.next() {
@@ -2548,14 +2580,11 @@ async fn handle_access_approve_interactive(
             eprintln!("{line}");
         }
         let decision = match prompt_access_review_choice(&reference, colors)? {
-            AccessReviewChoice::Approve => {
-                approved.push(reference.clone());
-                Some(server::AdminRequest::AccessApprove {
-                    handles: vec![reference.clone()],
-                    uses: effective_uses,
-                    wait_secs: None,
-                })
-            }
+            AccessReviewChoice::Approve => Some(server::AdminRequest::AccessApprove {
+                handles: vec![reference.clone()],
+                uses: effective_uses,
+                wait_secs: wait,
+            }),
             AccessReviewChoice::Deny => Some(server::AdminRequest::AccessDeny {
                 handles: vec![reference.clone()],
                 reason: prompt_access_deny_reason()?,
@@ -2571,12 +2600,22 @@ async fn handle_access_approve_interactive(
             skipped.push(reference);
             continue;
         };
+        let expects_wait = matches!(
+            decision,
+            server::AdminRequest::AccessApprove {
+                wait_secs: Some(_),
+                ..
+            }
+        );
         match client
             .send_admin(decision)
             .await
             .map_err(|error| describe_connect_failure(error, &client, source))?
         {
-            server::AdminResponse::AccessDecisions { items, .. } => {
+            server::AdminResponse::AccessDecisions {
+                items,
+                wait: waited,
+            } => {
                 if any_decision_failed(&items) {
                     any_failed = true;
                     skipped.extend(
@@ -2587,6 +2626,17 @@ async fn handle_access_approve_interactive(
                     );
                 }
                 print_access_decision_lines(&items);
+                if expects_wait {
+                    let Some(waited) = waited else {
+                        anyhow::bail!("guard daemon returned no approval wait result");
+                    };
+                    render_approval(&waited.item, true);
+                    eprintln!("wait outcome: {}", waited.outcome);
+                    let exit = access_wait_exit_code(&waited.outcome);
+                    if exit != 0 {
+                        std::process::exit(exit);
+                    }
+                }
             }
             server::AdminResponse::Error { message } => {
                 any_failed = true;
@@ -2601,12 +2651,6 @@ async fn handle_access_approve_interactive(
     }
     if any_failed {
         std::process::exit(EXIT_GUARD_ACCESS_DECISION_FAILED);
-    }
-    // A batch cannot report one outcome, so `--wait` accepts one reference and
-    // the review loop above ran exactly once.
-    if let (Some(wait_secs), [reference]) = (wait, approved.as_slice()) {
-        let item = wait_for_approval(&client, source, reference, wait_secs).await?;
-        return report_wait_outcome(&item, false);
     }
     Ok(())
 }
@@ -2664,11 +2708,13 @@ async fn handle_access_approve_dry_run(
         }
     }
     if json {
-        print_json(&serde_json::json!({
+        let mut document = serde_json::json!({
             "schema_version": JSON_SCHEMA_VERSION,
             "type": "access_approve_dry_run",
             "items": items,
-        }))?;
+        });
+        normalize_legacy_consequence_json(&mut document);
+        print_json(&document)?;
     } else {
         eprintln!();
         eprintln!("dry run: nothing was decided");
@@ -2715,11 +2761,13 @@ async fn handle_access_approve_wait(
         anyhow::bail!("guard daemon returned no approval wait result");
     };
     if json {
-        print_json(&serde_json::json!({
+        let mut document = serde_json::json!({
             "schema_version": JSON_SCHEMA_VERSION,
             "type": "access_approval_wait",
             "response": decision,
-        }))?;
+        });
+        normalize_legacy_consequence_json(&mut document);
+        print_json(&document)?;
     } else {
         if let server::AdminResponse::AccessDecisions { items, .. } = &decision {
             print_access_decision_lines(items);
@@ -2727,17 +2775,21 @@ async fn handle_access_approve_wait(
         render_approval(&waited.item, true);
         eprintln!("wait outcome: {}", waited.outcome);
     }
-    let exit = match waited.outcome.as_str() {
+    let exit = access_wait_exit_code(&waited.outcome);
+    if exit != 0 {
+        std::process::exit(exit);
+    }
+    Ok(())
+}
+
+fn access_wait_exit_code(outcome: &str) -> i32 {
+    match outcome {
         "approved" => 0,
         "denied" | "expired" => EXIT_GUARD_DENIED,
         "exec_failed" => EXIT_GUARD_ERROR,
         "armed" | "timed_out" => EXIT_GUARD_HELD,
         _ => EXIT_GUARD_ERROR,
-    };
-    if exit != 0 {
-        std::process::exit(exit);
     }
-    Ok(())
 }
 
 /// The client's own statement that a grant cannot be waited on, quoting the
@@ -3699,7 +3751,7 @@ mod tests {
                     message: "approved".to_string(),
                 },
                 server::AccessDecisionResult {
-                    request: "request-failed".to_string(),
+                    request: "hold-failed".to_string(),
                     success: false,
                     state: "failed".to_string(),
                     target: None,
@@ -3717,6 +3769,11 @@ mod tests {
         assert_eq!(
             document["response"]["items"].as_array().map(Vec::len),
             Some(2)
+        );
+        assert_eq!(document["response"]["items"][1]["consequence"], "arm");
+        assert_eq!(
+            document["response"]["items"][1]["consequence_source"],
+            LEGACY_CONSEQUENCE_SOURCE
         );
         assert!(access_decision_failed(&response));
 
@@ -3749,6 +3806,28 @@ mod tests {
             wait: None,
         };
         assert!(!access_decision_failed(&all_succeeded));
+    }
+
+    #[test]
+    fn legacy_consequence_fallback_never_infers_release() {
+        for (reference, expected) in [("gr-legacy", "grant"), ("hold-legacy", "arm")] {
+            let mut value = serde_json::json!({
+                "reference": reference,
+                "consequence": ""
+            });
+            normalize_legacy_consequence_json(&mut value);
+            assert_eq!(value["consequence"], expected);
+            assert_eq!(value["consequence_source"], LEGACY_CONSEQUENCE_SOURCE);
+            assert_ne!(value["consequence"], "release");
+        }
+
+        let mut explicit = serde_json::json!({
+            "reference": "hold-explicit",
+            "consequence": "release"
+        });
+        normalize_legacy_consequence_json(&mut explicit);
+        assert_eq!(explicit["consequence"], "release");
+        assert!(explicit.get("consequence_source").is_none());
     }
 
     #[test]

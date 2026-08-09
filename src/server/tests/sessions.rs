@@ -1,7 +1,7 @@
 use crate::grant_profile::{EvaluationMode, GrantRequestStatus, SavedGrantCatalog};
 use crate::server::admin::{
-    handle_admin_request, prune_grant_requests, validate_durable_access_provenance,
-    MAX_GRANT_REQUESTS,
+    handle_admin_request, handle_admin_request_owned, prune_grant_requests,
+    validate_durable_access_provenance, MAX_GRANT_REQUESTS,
 };
 use crate::server::execute::{
     admit_access_use, evaluation_cache_scope, execute_command, session_source_from_eval,
@@ -142,6 +142,32 @@ async fn approved_synthesized_access_executes_deterministically_without_catalog_
             .proposed_verbs
             .len()
             == 1
+    );
+
+    let grant_reference = item.reference.clone();
+    let grant_target = item.target.clone();
+    let refused = handle_admin_request_owned(
+        &cfg,
+        &daemon,
+        AdminRequest::AccessApprove {
+            handles: vec![grant_reference.clone()],
+            uses: Some(1),
+            wait_secs: Some(30),
+        },
+    )
+    .await;
+    assert!(matches!(
+        refused.response,
+        AdminResponse::Error { ref message }
+            if message == &crate::server::grant_class_wait_refusal(
+                &grant_reference,
+                &grant_target
+            )
+    ));
+    assert!(refused.waiter_lease.is_none());
+    assert_eq!(
+        cfg.state.grant_requests.read().await[&grant_reference].status,
+        GrantRequestStatus::Pending
     );
 
     let AdminResponse::AccessDecisions { items, .. } = handle_admin_request(
