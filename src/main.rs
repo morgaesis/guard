@@ -146,10 +146,11 @@ enum MainArgs {
         #[arg(long = "wait-approval", value_name = "SECONDS|unbounded", num_args = 0..=1, default_missing_value = "unbounded", value_parser = parse_unbounded_secs)]
         wait_approval: Option<u64>,
         /// Skip the daemon's auto-learned deny-shape fast path and force a
-        /// fresh LLM look at this command. Never skips an operator-authored
-        /// policy deny rule -- those stay absolute either way. Use this if
-        /// you believe an auto-learned shape over-blocked something that
-        /// should be allowed.
+        /// fresh LLM look at this command. It applies to a denial reported as
+        /// `source: learned-deny` and to nothing else: an operator-authored
+        /// `source: static-policy` deny is absolute and is never skipped, and
+        /// an evaluator denial is unaffected. Use this if you believe an
+        /// auto-learned shape over-blocked something that should be allowed.
         #[arg(long = "reevaluate", action = ArgAction::SetTrue)]
         reevaluate: bool,
         /// SSH host-key policy for a guarded `ssh` command. `only-existing`
@@ -432,6 +433,9 @@ enum AccessCommands {
     /// Show detailed request or session coverage and evidence.
     Show {
         reference: String,
+        /// Print the raw matcher JSON alongside the readable rendering.
+        #[arg(long, action = ArgAction::SetTrue)]
+        raw: bool,
         #[arg(long)]
         socket: Option<String>,
         #[arg(long, action = ArgAction::SetTrue)]

@@ -565,10 +565,7 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
             && !matched.overridden
             && matched.action == guard::gating::verb::CoverageAction::Deny
     });
-    let static_default_deny = matches!(
-        reason.as_str(),
-        "default-deny: no matching allow rule" | "no policy and LLM disabled: default-deny"
-    );
+    let static_default_deny = guard::policy::is_default_deny_reason(&reason);
     let hard_static_deny = source == SessionDecisionSource::StaticPolicy && !static_default_deny;
     let escalation_allowed = !matches!(
         source,
