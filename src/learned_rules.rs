@@ -71,13 +71,42 @@ where
         .as_file()
         .sync_all()
         .with_context(|| format!("failed to sync temporary file for {}", path.display()))?;
-    temporary
-        .persist(path)
+    let source = temporary
+        .into_temp_path()
+        .keep()
         .map_err(|error| error.error)
-        .with_context(|| format!("failed to replace {}", path.display()))?;
+        .with_context(|| format!("failed to finalize temporary file for {}", path.display()))?;
+    replace_finalized_learning_file(source, path, |source, destination| {
+        std::fs::rename(source, destination)
+    })?;
     sync_parent(parent)
         .with_context(|| format!("failed to sync parent directory {}", parent.display()))?;
     Ok(())
+}
+
+#[cfg(any(unix, windows, test))]
+fn replace_finalized_learning_file<F>(source: PathBuf, destination: &Path, replace: F) -> Result<()>
+where
+    F: FnOnce(&Path, &Path) -> std::io::Result<()>,
+{
+    match replace(&source, destination) {
+        Ok(()) => Ok(()),
+        Err(replace_error) => match std::fs::remove_file(&source) {
+            Ok(()) => Err(replace_error)
+                .with_context(|| format!("failed to replace {}", destination.display())),
+            Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => {
+                Err(replace_error)
+                    .with_context(|| format!("failed to replace {}", destination.display()))
+            }
+            Err(cleanup_error) => anyhow::bail!(
+                "failed to replace {}; temporary file {} remains after cleanup failed: {} (replacement error: {})",
+                destination.display(),
+                source.display(),
+                cleanup_error,
+                replace_error
+            ),
+        },
+    }
 }
 
 #[cfg(unix)]
@@ -90,7 +119,7 @@ fn sync_parent_directory(parent: &Path) -> Result<()> {
 fn write_learning_file_atomically_windows(path: &Path, content: &str) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        MoveFileExW, ReplaceFileW, MOVEFILE_WRITE_THROUGH,
     };
 
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
@@ -98,12 +127,6 @@ fn write_learning_file_atomically_windows(path: &Path, content: &str) -> Result<
         .with_context(|| format!("failed to create {}", parent.display()))?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)
         .with_context(|| format!("failed to create temporary file in {}", parent.display()))?;
-    if let Ok(metadata) = std::fs::metadata(path) {
-        temporary
-            .as_file()
-            .set_permissions(metadata.permissions())
-            .with_context(|| format!("failed to preserve permissions for {}", path.display()))?;
-    }
     temporary
         .write_all(content.as_bytes())
         .with_context(|| format!("failed to write temporary file for {}", path.display()))?;
@@ -112,32 +135,60 @@ fn write_learning_file_atomically_windows(path: &Path, content: &str) -> Result<
         .sync_all()
         .with_context(|| format!("failed to sync temporary file for {}", path.display()))?;
 
-    let temporary = temporary.into_temp_path();
     let source = temporary
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let destination = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    // Windows has no directory-fsync equivalent. MOVEFILE_WRITE_THROUGH is
-    // the strongest documented replacement primitive here: it waits for the
-    // move and guarantees a copy-and-delete move is flushed before returning.
-    let moved = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if moved == 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("failed to durably replace {}", path.display()));
-    }
-    let _ = temporary.keep();
+        .into_temp_path()
+        .keep()
+        .map_err(|error| error.error)
+        .with_context(|| format!("failed to finalize temporary file for {}", path.display()))?;
+    let destination_exists = path.exists();
+    replace_finalized_learning_file(source, path, |source, destination| {
+        let source = source
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let destination = destination
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let replaced = unsafe {
+            if destination_exists {
+                // ReplaceFileW merges the destination's ACLs, security
+                // attributes, streams, encryption, and compression into the
+                // replacement. No ignore flags are used, so a metadata merge
+                // failure aborts instead of widening access.
+                ReplaceFileW(
+                    destination.as_ptr(),
+                    source.as_ptr(),
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            } else {
+                MoveFileExW(
+                    source.as_ptr(),
+                    destination.as_ptr(),
+                    MOVEFILE_WRITE_THROUGH,
+                )
+            }
+        };
+        if replaced == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    })?;
+    // ReplaceFileW's write-through flag is unsupported. Flushing a newly
+    // opened destination handle is the strongest standard file-level flush
+    // available here; Windows does not expose a portable directory fsync.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .with_context(|| format!("failed to reopen replaced file {}", path.display()))?
+        .sync_all()
+        .with_context(|| format!("failed to flush replaced file {}", path.display()))?;
     Ok(())
 }
 
@@ -763,17 +814,117 @@ mod tests {
         assert!(error
             .to_string()
             .contains("failed to sync parent directory"));
-        assert_eq!(std::fs::read_to_string(path).unwrap(), "new");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+    }
+
+    #[test]
+    fn failed_finalized_move_removes_the_temporary_file_and_preserves_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("finalized.tmp");
+        let destination = temp.path().join("learned.yaml");
+        std::fs::write(&source, "new").unwrap();
+        std::fs::write(&destination, "old").unwrap();
+        let error = replace_finalized_learning_file(source.clone(), &destination, |_, _| {
+            Err(std::io::Error::other("simulated replacement failure"))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("failed to replace"));
+        assert!(!source.exists());
+        assert_eq!(std::fs::read_to_string(destination).unwrap(), "old");
     }
 
     #[cfg(windows)]
     #[test]
-    fn windows_atomic_writer_replaces_existing_file_with_write_through() {
+    fn windows_atomic_writer_preserves_restricted_security_and_attributes() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows_sys::Win32::Security::{
+            GetFileSecurityW, SetFileSecurityW, DACL_SECURITY_INFORMATION,
+            GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+            PROTECTED_DACL_SECURITY_INFORMATION,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileAttributesW, SetFileAttributesW, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NORMAL,
+        };
+
+        fn wide(value: &std::ffi::OsStr) -> Vec<u16> {
+            value.encode_wide().chain(std::iter::once(0)).collect()
+        }
+        fn security(path: &Path) -> Vec<u8> {
+            let path = wide(path.as_os_str());
+            let information =
+                OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+            let mut needed = 0;
+            unsafe {
+                GetFileSecurityW(
+                    path.as_ptr(),
+                    information,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut needed,
+                );
+            }
+            let mut descriptor = vec![0u8; needed as usize];
+            let loaded = unsafe {
+                GetFileSecurityW(
+                    path.as_ptr(),
+                    information,
+                    descriptor.as_mut_ptr().cast(),
+                    needed,
+                    &mut needed,
+                )
+            };
+            assert_ne!(loaded, 0);
+            descriptor
+        }
+
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("learned.yaml");
         std::fs::write(&path, "old").unwrap();
+        let path_wide = wide(path.as_os_str());
+        let sddl = wide(std::ffi::OsStr::new("D:P(A;;FA;;;OW)"));
+        let mut descriptor = std::ptr::null_mut();
+        let converted = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(converted, 0);
+        let secured = unsafe {
+            SetFileSecurityW(
+                path_wide.as_ptr(),
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                descriptor,
+            )
+        };
+        unsafe {
+            LocalFree(descriptor);
+        }
+        assert_ne!(secured, 0);
+        assert_ne!(
+            unsafe { SetFileAttributesW(path_wide.as_ptr(), FILE_ATTRIBUTE_HIDDEN) },
+            0
+        );
+        let before_security = security(&path);
+        let before_attributes = unsafe { GetFileAttributesW(path_wide.as_ptr()) };
+
         write_learning_file_atomically(&path, "new").unwrap();
-        assert_eq!(std::fs::read_to_string(path).unwrap(), "new");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        assert_eq!(security(&path), before_security);
+        assert_eq!(
+            unsafe { GetFileAttributesW(path_wide.as_ptr()) },
+            before_attributes
+        );
+        assert_ne!(
+            unsafe { SetFileAttributesW(path_wide.as_ptr(), FILE_ATTRIBUTE_NORMAL) },
+            0
+        );
     }
 
     #[test]

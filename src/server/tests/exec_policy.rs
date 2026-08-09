@@ -1775,6 +1775,36 @@ async fn audit_allowed_then_exec_failed_emits_both_events() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn execution_failure_prose_is_sanitized_before_audit_stream_and_response() {
+    let value = ["q", "7"].concat();
+    let (mut cfg, logs) = make_test_config();
+    let (_audit_dir, audit) = attach_test_audit_log(&mut cfg);
+    let caller = CallerIdentity::Unix { uid: 1000 };
+    let result = ExecuteResult::exec_failed(
+        "ordinary allow",
+        format!("failed to resolve password={value}"),
+    );
+
+    let (_, captured_logs) = capture_async(&logs, async {
+        emit_audit_events(&cfg, &caller, "fixturectl", &[], &result);
+    })
+    .await;
+    assert!(!captured_logs.contains(&value));
+    assert!(!std::fs::read_to_string(audit.path())
+        .unwrap()
+        .contains(&value));
+    if let ExecOutcome::Failed { reason, .. } = &result.exec {
+        assert!(!reason.contains(&value));
+    } else {
+        panic!("expected execution failure");
+    }
+    assert!(!serde_json::to_string(&result.into_response())
+        .unwrap()
+        .contains(&value));
+}
+
 /// Policy allows + exec succeeds: only the POLICY event fires.
 #[tokio::test]
 async fn audit_allowed_and_completed_emits_only_policy_event() {

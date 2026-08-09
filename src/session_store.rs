@@ -41,6 +41,9 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 /// provisional rows. Version 11 removes literal-sensitive session exact
 /// authority instead of redacting it into a different matcher, clears legacy
 /// approval parameter maps, and preserves every terminal provisional status.
+///
+/// Version 12 sanitizes nested decision traces and persisted explanatory prose,
+/// storing malformed non-authoritative traces as `NULL`.
 const SCHEMA_VERSION: i64 = 12;
 const VACUUM_MIN_PAGES: u64 = 512;
 const VACUUM_MIN_FREE_PAGES: u64 = 128;
@@ -2673,7 +2676,7 @@ fn sanitize_persisted_credentials(conn: &Connection) -> Result<()> {
         for (rowid, command, reason, trace_json) in rows {
             let sanitized_command = redact_output_text(&command);
             let sanitized_reason = redact_output_text(&reason);
-            let sanitized_trace = trace_json.as_deref().map(sanitize_decision_trace_json);
+            let sanitized_trace = trace_json.as_deref().and_then(sanitize_decision_trace_json);
             if sanitized_command != command
                 || sanitized_reason != reason
                 || sanitized_trace != trace_json
@@ -2867,14 +2870,15 @@ fn sanitize_persisted_credentials(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Sanitize the string members of one persisted `DecisionTrace`. Unreadable
-/// JSON is left untouched: the load path already tolerates and reports it.
-fn sanitize_decision_trace_json(json: &str) -> String {
+/// Sanitize the string members of one persisted `DecisionTrace`. Malformed
+/// JSON is disposable explanatory detail, so migration clears it instead of
+/// retaining raw text that would make the migrated row unloadable.
+fn sanitize_decision_trace_json(json: &str) -> Option<String> {
     let Ok(mut trace) = serde_json::from_str::<guard::gating::DecisionTrace>(json) else {
-        return json.to_string();
+        return None;
     };
     trace.sanitize_explanatory_text();
-    serde_json::to_string(&trace).unwrap_or_else(|_| json.to_string())
+    serde_json::to_string(&trace).ok()
 }
 
 fn sanitize_string_vec_json(json: &str) -> String {
@@ -3842,6 +3846,7 @@ mod tests {
         request.authority_verbs = vec![verb.name.clone()];
         request.delta.activated_verbs = vec![verb.name.clone()];
         request.proposed_verbs = vec![serde_json::to_value(&verb).unwrap()];
+        request.request_key = request.canonical_access_key().unwrap();
 
         for version in [SCHEMA_VERSION, SCHEMA_VERSION - 1] {
             let tmp = tempfile::tempdir().unwrap();
@@ -3871,6 +3876,182 @@ mod tests {
 
             let error = SessionStore::open(path, 3600).await.unwrap_err();
             assert!(!error.to_string().contains(&value));
+        }
+    }
+
+    #[tokio::test]
+    async fn restarted_generated_parameter_matchers_reject_sensitive_concrete_argv() {
+        use guard::gating::verb::{generated_access_verb_name, ParamSpec, VerbCatalog};
+        use std::collections::BTreeMap;
+
+        fn parameter(pattern: &str, allow_dash: bool) -> ParamSpec {
+            ParamSpec {
+                pattern: pattern.to_string(),
+                required: true,
+                default: None,
+                allow_dash,
+            }
+        }
+        fn generated(binary: &str, args: &[&str], params: BTreeMap<String, ParamSpec>) -> Verb {
+            let mut verb = generated_access_request()
+                .proposed_verbs
+                .into_iter()
+                .next()
+                .and_then(|value| serde_json::from_value::<Verb>(value).ok())
+                .unwrap();
+            verb.binary = binary.to_string();
+            verb.args = args.iter().map(|value| (*value).to_string()).collect();
+            verb.params = params;
+            verb.name = generated_access_verb_name(&verb);
+            verb
+        }
+
+        let verbs = [
+            generated(
+                "fixturectl",
+                &["{option}", "{operand}"],
+                BTreeMap::from([
+                    ("option".to_string(), parameter("^--[a-z]{8}$", true)),
+                    ("operand".to_string(), parameter("^[a-z0-9]{2}$", false)),
+                ]),
+            ),
+            generated(
+                "fixturectl",
+                &["{argument}"],
+                BTreeMap::from([(
+                    "argument".to_string(),
+                    parameter("^--[a-z]{8}=[a-z0-9]{2}$", true),
+                )]),
+            ),
+            generated(
+                "mysql",
+                &["{argument}"],
+                BTreeMap::from([(
+                    "argument".to_string(),
+                    parameter("^-[a-z][a-z0-9]{2}$", true),
+                )]),
+            ),
+        ];
+        let mut request = generated_access_request();
+        request.authority_verbs = verbs.iter().map(|verb| verb.name.clone()).collect();
+        request.delta.activated_verbs = request.authority_verbs.clone();
+        request.proposed_verbs = verbs
+            .iter()
+            .map(|verb| serde_json::to_value(verb).unwrap())
+            .collect();
+        request.request_key = request.canonical_access_key().unwrap();
+
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3_600).await.unwrap();
+        store.save_grant_request(request).await.unwrap();
+        drop(store);
+
+        let restarted = SessionStore::open(path, 3_600).await.unwrap();
+        let request = restarted.load_grant_requests().await.unwrap().remove(0);
+        let mut catalog = VerbCatalog::empty();
+        for proposal in request.proposed_verbs {
+            catalog
+                .upsert_access_verb(
+                    guard::gating::verb::parse_normalized_generated_access_verb(&proposal).unwrap(),
+                )
+                .unwrap();
+        }
+        let value = ["q", "7"].concat();
+        for (index, params, binary, args) in [
+            (
+                0,
+                BTreeMap::from([
+                    ("option".to_string(), "--password".to_string()),
+                    ("operand".to_string(), value.clone()),
+                ]),
+                "fixturectl",
+                vec!["--password".to_string(), value.clone()],
+            ),
+            (
+                1,
+                BTreeMap::from([("argument".to_string(), format!("--password={value}"))]),
+                "fixturectl",
+                vec![format!("--password={value}")],
+            ),
+            (
+                2,
+                BTreeMap::from([("argument".to_string(), format!("-p{value}"))]),
+                "mysql",
+                vec![format!("-p{value}")],
+            ),
+        ] {
+            assert!(catalog.render(&verbs[index].name, &params).is_err());
+            assert!(catalog.match_command(binary, &args).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn sensitive_generated_provenance_fails_write_migration_and_restart_loads() {
+        use guard::gating::verb::{CoverageAction, CoverageProvenance, VerbCoverageCell};
+
+        let value = ["q", "7"].concat();
+        let mut request = generated_access_request();
+        let mut verb: Verb = serde_json::from_value(request.proposed_verbs[0].clone()).unwrap();
+        verb.coverage = vec![VerbCoverageCell {
+            name: "exact".to_string(),
+            action: CoverageAction::Evaluate,
+            required_args: Vec::new(),
+            forbidden_args: Vec::new(),
+            min_args: Some(2),
+            max_args: Some(2),
+            options: Vec::new(),
+            target: None,
+            inventory: None,
+            namespace: None,
+            fanout: None,
+            cwd: None,
+            environment: Vec::new(),
+            override_marker: None,
+            sticky: false,
+            provenance: Some(CoverageProvenance {
+                source: "fixture".to_string(),
+                evidence: Vec::new(),
+                regime_stamp: "safe-regime".to_string(),
+                prompt_stamp: format!("password={value}"),
+                model_stamp: "safe-model".to_string(),
+                generated_unix: 1,
+                probes: Vec::new(),
+            }),
+        }];
+        verb.name = guard::gating::verb::generated_access_verb_name(&verb);
+        request.authority_verbs = vec![verb.name.clone()];
+        request.delta.activated_verbs = vec![verb.name.clone()];
+        request.proposed_verbs = vec![serde_json::to_value(&verb).unwrap()];
+        request.request_key = request.canonical_access_key().unwrap();
+
+        for version in [SCHEMA_VERSION, SCHEMA_VERSION - 1] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("state.db");
+            let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+            let error = store.save_grant_request(request.clone()).await.unwrap_err();
+            assert!(!error.to_string().contains(&value));
+
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO grant_requests (handle, json, status, created_unix)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    request.handle,
+                    serde_json::to_string(&request).unwrap(),
+                    request.status.as_str(),
+                    encode_u64(request.created_unix).unwrap()
+                ],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            drop(conn);
+            drop(store);
+
+            for _ in 0..2 {
+                let error = SessionStore::open(path.clone(), 3600).await.unwrap_err();
+                assert!(!error.to_string().contains(&value));
+            }
         }
     }
 
@@ -6188,7 +6369,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn schema_v11_nested_trace_cleanup_is_transactional_and_idempotent() {
+    async fn schema_v12_nested_trace_cleanup_is_transactional_and_idempotent() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("state.db");
         let store = SessionStore::open(path.clone(), 3600).await.unwrap();
@@ -6222,7 +6403,8 @@ mod tests {
             params![serde_json::to_string(&contaminated_trace(&value)).unwrap()],
         )
         .unwrap();
-        conn.pragma_update(None, "user_version", 11).unwrap();
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
+            .unwrap();
         drop(conn);
         drop(store);
 
@@ -6256,6 +6438,92 @@ mod tests {
                 .unwrap();
             assert_eq!(version, SCHEMA_VERSION);
             assert!(!durable.contains(&value));
+        }
+    }
+
+    #[tokio::test]
+    async fn schema_v12_clears_malformed_trace_without_changing_safe_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let safe_rule = SessionExactRule::new("fixturectl", vec!["status".to_string()]);
+        let mut registry = SessionRegistry::new();
+        registry.grant(
+            "safe".to_string(),
+            exact_rule_grant(vec![safe_rule.clone()]),
+        );
+        registry.record_interaction(
+            "safe",
+            SessionInteraction {
+                at_unix: guard::env::now_unix(),
+                command: "fixturectl status".to_string(),
+                allowed: true,
+                source: SessionDecisionSource::Llm,
+                reason: "safe rationale".to_string(),
+                risk: Some(1),
+                exec_status: SessionExecStatus::Completed,
+                exit_code: Some(0),
+                exposed_secret_refs: Vec::new(),
+                decision_trace: Some(guard::gating::DecisionTrace::source("llm")),
+            },
+        );
+        store.persist_registry(&registry).await.unwrap();
+
+        let value = ["q", "7"].concat();
+        let malformed = format!("{{\"reason\":\"password={value}\"");
+        let conn = Connection::open(&path).unwrap();
+        let safe_allow: String = conn
+            .query_row(
+                "SELECT allow_exact_json FROM session_grants WHERE token = 'safe'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE session_interactions SET decision_trace_json = ?1",
+            params![malformed],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
+            .unwrap();
+        drop(conn);
+        drop(store);
+
+        for _ in 0..2 {
+            let restarted = SessionStore::open(path.clone(), 3600).await.unwrap();
+            let loaded = restarted.load_registry().await.unwrap();
+            assert!(matches!(
+                loaded
+                    .check("safe", "fixturectl", &["status".to_string()], None)
+                    .map(|decision| decision.0),
+                Some(crate::session::SessionDecision::Allow)
+            ));
+            assert!(loaded.show("safe", 10).unwrap().recent[0]
+                .decision_trace
+                .is_none());
+            drop(restarted);
+
+            let conn = Connection::open(&path).unwrap();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            let trace: Option<String> = conn
+                .query_row(
+                    "SELECT decision_trace_json FROM session_interactions",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let durable_allow: String = conn
+                .query_row(
+                    "SELECT allow_exact_json FROM session_grants WHERE token = 'safe'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(version, SCHEMA_VERSION);
+            assert!(trace.is_none());
+            assert_eq!(durable_allow, safe_allow);
         }
     }
 

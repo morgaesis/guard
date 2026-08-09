@@ -49,6 +49,19 @@ impl std::fmt::Display for AttemptError {
 }
 
 impl AttemptError {
+    fn sanitized(self) -> Self {
+        fn clean(value: String) -> String {
+            crate::redact::redact_output_text(&value)
+        }
+        match self {
+            Self::RateLimited { retry_after } => Self::RateLimited { retry_after },
+            Self::ServerError(value) => Self::ServerError(clean(value)),
+            Self::Transport(value) => Self::Transport(clean(value)),
+            Self::ParseError(value) => Self::ParseError(clean(value)),
+            Self::ClientError(value) => Self::ClientError(clean(value)),
+        }
+    }
+
     /// Retriable means "try again within the per-model budget". Client errors
     /// (401/403/404) are NOT retriable because retrying with the same key/model
     /// won't help.
@@ -110,7 +123,11 @@ impl Evaluator {
             Ok(resp) => {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
-                tracing::warn!("LLM API returned {}: {}", status, body);
+                tracing::warn!(
+                    "LLM API returned {}: {}",
+                    status,
+                    crate::redact::redact_output_text(&body)
+                );
                 Ok(())
             }
             Err(e) => {
@@ -188,9 +205,10 @@ impl Evaluator {
                 .await
             {
                 Ok(decision) => {
+                    let reason = crate::redact::redact_output_text(&decision.reason);
                     if decision.decision.eq_ignore_ascii_case("APPROVE") {
                         return EvalResult::Allow {
-                            reason: decision.reason,
+                            reason,
                             source: EvalSource::Llm,
                             risk: Some(decision.risk),
                             // Carry the model's class through only when gating is
@@ -203,13 +221,14 @@ impl Evaluator {
                         };
                     } else {
                         return EvalResult::Deny {
-                            reason: decision.reason,
+                            reason,
                             source: EvalSource::Llm,
                             risk: Some(decision.risk),
                         };
                     }
                 }
                 Err(e) => {
+                    let e = e.sanitized();
                     tracing::warn!(
                         "model {} exhausted retry budget: {} - trying next in chain",
                         model,
@@ -296,6 +315,7 @@ impl Evaluator {
                     return Ok(decision);
                 }
                 Err(e) => {
+                    let e = e.sanitized();
                     let status_tag = e.status_tag();
                     // Log failed attempt usage (zero tokens we know of; still visible in audit).
                     log_usage(model, attempt_num, &TokenUsage::default(), status_tag);
@@ -615,6 +635,50 @@ mod tests {
             }}"#,
             decision
         )
+    }
+
+    fn tool_call_body_with_reason(decision: &str, reason: &str) -> String {
+        serde_json::json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "c1",
+                        "type": "function",
+                        "function": {
+                            "name": "decide",
+                            "arguments": serde_json::json!({
+                                "decision": decision,
+                                "reason": reason,
+                                "risk": 1
+                            }).to_string()
+                        }
+                    }]
+                }
+            }]
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn provider_rationale_is_sanitized_at_the_evaluator_boundary() {
+        let value = ["q", "7"].concat();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock = tokio::spawn(run_mock(
+            listener,
+            vec![(
+                200,
+                tool_call_body_with_reason("APPROVE", &format!("password={value}")),
+                None,
+            )],
+        ));
+        let evaluator = mock_server_evaluator(port, 0, vec![]).await;
+
+        let result = evaluator.evaluate("fixturectl status").await;
+        assert!(result.is_allow());
+        assert!(!result.reason().contains(&value));
+        assert!(result.reason().contains("[REDACTED]"));
+        mock.await.unwrap();
     }
 
     #[tokio::test]

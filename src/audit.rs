@@ -351,7 +351,7 @@ fn redact_secret_exposure(event: &AuditEvent) -> AuditEvent {
             .into_iter()
             .map(|(key, _)| (key, "[redacted]".to_string()))
             .collect();
-    } else if audit_kind_contains_untrusted_prose(event.kind) {
+    } else {
         redacted.cwd = redacted
             .cwd
             .map(|value| crate::redact::redact_output_text(&value));
@@ -368,32 +368,6 @@ fn redact_secret_exposure(event: &AuditEvent) -> AuditEvent {
             .collect();
     }
     redacted
-}
-
-fn audit_kind_contains_untrusted_prose(kind: AuditKind) -> bool {
-    matches!(
-        kind,
-        AuditKind::Allowed
-            | AuditKind::Denied
-            | AuditKind::Held
-            | AuditKind::HoldOrphaned
-            | AuditKind::Provisional
-            | AuditKind::ProvisionalInterrupted
-            | AuditKind::ProvisionalAutoConfirmed
-            | AuditKind::ProvisionalCheckFailed
-            | AuditKind::Confirm
-            | AuditKind::Revert
-            | AuditKind::RevertDeferred
-            | AuditKind::RevertFailed
-            | AuditKind::Approved
-            | AuditKind::ApprovedExecuted
-            | AuditKind::ApproveVoided
-            | AuditKind::ApproveExecFailed
-            | AuditKind::ApprovalExpired
-            | AuditKind::ApprovalNote
-            | AuditKind::DeniedHold
-            | AuditKind::StartupRecovery
-    )
 }
 
 fn push_field(line: &mut String, key: &str, value: &str, quoted: bool) {
@@ -847,6 +821,23 @@ mod tests {
         assert!(verification.intact, "{verification:?}");
         assert_eq!(verification.records, 10);
         assert_eq!(verification.broken_at_seq, None);
+    }
+
+    #[test]
+    fn evaluator_and_execution_failure_prose_is_sanitized_in_both_projections() {
+        let value = ["q", "7"].concat();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let log = AuditLog::open(&path).unwrap();
+        for kind in [AuditKind::Evaluate, AuditKind::ExecFailed] {
+            let event = AuditEvent::new(kind)
+                .cmd(format!("password={value}"))
+                .reason(format!("password={value}"))
+                .field("detail", format!("password={value}"));
+            assert!(!event.render_line().contains(&value));
+            log.append(&event).unwrap();
+        }
+        assert!(!std::fs::read_to_string(path).unwrap().contains(&value));
     }
 
     #[test]

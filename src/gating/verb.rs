@@ -17,7 +17,7 @@ use super::coverage::reversibility_rank;
 use super::Reversibility;
 use crate::redact::{
     command_contains_sensitive_literals, named_value_contains_sensitive_literals,
-    text_contains_sensitive_literals,
+    text_contains_sensitive_literals, SENSITIVE_ARGV_REPLAY_GUIDANCE,
 };
 use anyhow::{bail, Context, Result};
 use regex::Regex;
@@ -707,6 +707,14 @@ impl VerbCatalog {
             }
             None => None,
         };
+        if verb.name.starts_with("access-generated-")
+            && (command_contains_sensitive_literals(&binary, &args)
+                || revert.as_ref().is_some_and(|(revert_binary, revert_args)| {
+                    command_contains_sensitive_literals(revert_binary, revert_args)
+                }))
+        {
+            bail!("{SENSITIVE_ARGV_REPLAY_GUIDANCE}");
+        }
 
         Ok(RenderedVerb {
             name: name.to_string(),
@@ -786,6 +794,11 @@ impl VerbCatalog {
         let mut matches = Vec::new();
         for verb in self.verbs.values() {
             if !binary_names_match(binary, &verb.binary) {
+                continue;
+            }
+            if verb.name.starts_with("access-generated-")
+                && command_contains_sensitive_literals(binary, args)
+            {
                 continue;
             }
 
@@ -2312,6 +2325,9 @@ fn generated_access_authority_contains_sensitive_literal(verb: &Verb) -> bool {
             })
             || cell.provenance.as_ref().is_some_and(|provenance| {
                 text_contains_sensitive_literals(&provenance.source)
+                    || text_contains_sensitive_literals(&provenance.regime_stamp)
+                    || text_contains_sensitive_literals(&provenance.prompt_stamp)
+                    || text_contains_sensitive_literals(&provenance.model_stamp)
                     || provenance
                         .evidence
                         .iter()
@@ -4874,6 +4890,124 @@ verbs:
         let error = catalog.upsert_access_verb(verb).unwrap_err();
         assert!(!error.to_string().contains(&value));
         assert!(catalog.render(&name, &BTreeMap::new()).is_err());
+    }
+
+    #[test]
+    fn generated_access_reclassifies_concrete_parameter_argv_before_use() {
+        fn install(
+            binary: &str,
+            templates: Vec<String>,
+            params: BTreeMap<String, ParamSpec>,
+        ) -> (VerbCatalog, String) {
+            let mut verb = synth_verb(binary, None, false, "access-generated-fixture");
+            verb.baseline = false;
+            verb.args = templates;
+            verb.params = params;
+            verb.name = generated_access_verb_name(&verb);
+            let name = verb.name.clone();
+            let mut catalog = VerbCatalog::empty();
+            catalog.upsert_access_verb(verb).unwrap();
+            (catalog, name)
+        }
+        fn spec(pattern: &str, allow_dash: bool) -> ParamSpec {
+            ParamSpec {
+                pattern: pattern.to_string(),
+                required: true,
+                default: None,
+                allow_dash,
+            }
+        }
+
+        let value = ["q", "7"].concat();
+        let (split_catalog, split_name) = install(
+            "fixturectl",
+            args_vec(&["{option}", "{operand}"]),
+            BTreeMap::from([
+                ("option".to_string(), spec("^--[a-z]{8}$", true)),
+                ("operand".to_string(), spec("^[a-z0-9]{2}$", false)),
+            ]),
+        );
+        let split_params = BTreeMap::from([
+            ("option".to_string(), "--password".to_string()),
+            ("operand".to_string(), value.clone()),
+        ]);
+        assert!(split_catalog.render(&split_name, &split_params).is_err());
+        assert!(split_catalog
+            .match_command("fixturectl", &["--password".to_string(), value.clone()])
+            .is_none());
+        let benign_params = BTreeMap::from([
+            ("option".to_string(), "--endpoint".to_string()),
+            ("operand".to_string(), value.clone()),
+        ]);
+        assert!(split_catalog.render(&split_name, &benign_params).is_ok());
+
+        for (binary, pattern, argument) in [
+            (
+                "fixturectl",
+                "^--[a-z]{8}=[a-z0-9]{2}$",
+                format!("--password={value}"),
+            ),
+            ("mysql", "^-[a-z][a-z0-9]{2}$", format!("-p{value}")),
+        ] {
+            let (catalog, name) = install(
+                binary,
+                args_vec(&["{argument}"]),
+                BTreeMap::from([("argument".to_string(), spec(pattern, true))]),
+            );
+            let params = BTreeMap::from([("argument".to_string(), argument.clone())]);
+            assert!(catalog.render(&name, &params).is_err());
+            assert!(catalog.match_command(binary, &[argument]).is_none());
+        }
+    }
+
+    #[test]
+    fn generated_access_rejects_sensitive_provenance_stamps() {
+        let value = ["q", "7"].concat();
+        for stamp in ["regime", "prompt", "model"] {
+            let mut verb = synth_verb("fixturectl", None, false, "access-generated-fixture");
+            verb.baseline = false;
+            verb.args = args_vec(&["status"]);
+            verb.coverage = vec![VerbCoverageCell {
+                name: "exact".to_string(),
+                action: CoverageAction::Evaluate,
+                required_args: Vec::new(),
+                forbidden_args: Vec::new(),
+                min_args: Some(1),
+                max_args: Some(1),
+                options: Vec::new(),
+                target: None,
+                inventory: None,
+                namespace: None,
+                fanout: None,
+                cwd: None,
+                environment: Vec::new(),
+                override_marker: None,
+                sticky: false,
+                provenance: Some(CoverageProvenance {
+                    source: "fixture".to_string(),
+                    evidence: Vec::new(),
+                    regime_stamp: if stamp == "regime" {
+                        format!("password={value}")
+                    } else {
+                        "safe-regime".to_string()
+                    },
+                    prompt_stamp: if stamp == "prompt" {
+                        format!("password={value}")
+                    } else {
+                        "safe-prompt".to_string()
+                    },
+                    model_stamp: if stamp == "model" {
+                        format!("password={value}")
+                    } else {
+                        "safe-model".to_string()
+                    },
+                    generated_unix: 1,
+                    probes: Vec::new(),
+                }),
+            }];
+            let error = normalize_generated_access_verb(verb).unwrap_err();
+            assert!(!error.to_string().contains(&value));
+        }
     }
 
     #[test]

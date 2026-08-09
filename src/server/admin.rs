@@ -1163,6 +1163,56 @@ mod access_capability_tests {
         verb.name = generated_access_verb_name(&verb);
         assert!(access_capability(&verb).is_none());
     }
+
+    #[test]
+    fn generated_capability_projection_omits_sensitive_provenance_stamps() {
+        let value = ["q", "7"].concat();
+        let mut verb = Verb {
+            name: "access-generated-fixture".to_string(),
+            description: "fixture".to_string(),
+            binary: "fixturectl".to_string(),
+            args: vec!["status".to_string()],
+            baseline: false,
+            coverage: vec![VerbCoverageCell {
+                name: "exact".to_string(),
+                action: CoverageAction::Evaluate,
+                required_args: Vec::new(),
+                forbidden_args: Vec::new(),
+                min_args: Some(1),
+                max_args: Some(1),
+                options: Vec::new(),
+                target: None,
+                inventory: None,
+                namespace: None,
+                fanout: None,
+                cwd: None,
+                environment: Vec::new(),
+                override_marker: None,
+                sticky: false,
+                provenance: Some(CoverageProvenance {
+                    source: "fixture".to_string(),
+                    evidence: Vec::new(),
+                    regime_stamp: format!("password={value}"),
+                    prompt_stamp: "safe-prompt".to_string(),
+                    model_stamp: "safe-model".to_string(),
+                    generated_unix: 1,
+                    probes: Vec::new(),
+                }),
+            }],
+            credential_plan: None,
+            params: std::collections::BTreeMap::new(),
+            consequence: guard::gating::Reversibility::Irreversible,
+            revert: None,
+            trusted: false,
+            prompt_context: None,
+            source_prose: None,
+            evidence: None,
+            auto_promoted: false,
+            promotion_stamp: None,
+        };
+        verb.name = generated_access_verb_name(&verb);
+        assert!(access_capability(&verb).is_none());
+    }
 }
 
 async fn capabilities_for(server: &ServerContext, names: &[String]) -> Vec<AccessCapability> {

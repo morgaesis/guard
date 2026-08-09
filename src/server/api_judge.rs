@@ -447,7 +447,7 @@ impl ApiJudge for DaemonApiJudge {
                 // exactly what a fresh evaluator denial would say. Disclosing
                 // that this shape now skips the evaluator would tell an
                 // adversarial client which requests bypass the model.
-                return ApiJudgeVerdict::Deny { reason: hit.reason };
+                return sanitize_api_judge_verdict(ApiJudgeVerdict::Deny { reason: hit.reason });
             }
 
             if !summary.rarity {
@@ -472,11 +472,11 @@ impl ApiJudge for DaemonApiJudge {
                             .field("risk", hit.risk)
                             .field("reversibility", hit.reversibility),
                     );
-                    return ApiJudgeVerdict::Allow {
+                    return sanitize_api_judge_verdict(ApiJudgeVerdict::Allow {
                         reason: "API evaluator approved request".to_string(),
                         risk: Some(hit.risk),
                         reversibility: Some(hit.reversibility),
-                    };
+                    });
                 }
             }
 
@@ -506,7 +506,9 @@ impl ApiJudge for DaemonApiJudge {
                             .field("shape", hit.shape.audit_label())
                             .field("denials", hit.denials),
                         );
-                        return ApiJudgeVerdict::Deny { reason: hit.reason };
+                        return sanitize_api_judge_verdict(ApiJudgeVerdict::Deny {
+                            reason: hit.reason,
+                        });
                     }
                     let _ = guard::audit::emit_global(
                         &guard::audit::AuditEvent::new(
@@ -526,7 +528,9 @@ impl ApiJudge for DaemonApiJudge {
             .admit(&summary.endpoint, summary.session_fingerprint.as_deref())
         {
             Ok(permit) => permit,
-            Err(reason) => return ApiJudgeVerdict::Error(reason.to_string()),
+            Err(reason) => {
+                return sanitize_api_judge_verdict(ApiJudgeVerdict::Error(reason.to_string()))
+            }
         };
         let result = self.evaluator.evaluate(&summary.stable_text()).await;
         self.spend.complete(
@@ -534,7 +538,7 @@ impl ApiJudge for DaemonApiJudge {
             summary.session_fingerprint.as_deref(),
             matches!(result, EvalResult::Error(_)),
         );
-        match result {
+        sanitize_api_judge_verdict(match result {
             EvalResult::Allow {
                 reason,
                 source,
@@ -542,6 +546,7 @@ impl ApiJudge for DaemonApiJudge {
                 reversibility,
                 ..
             } => {
+                let reason = guard::gating::sanitize_gate_text(&reason);
                 if source == EvalSource::Llm {
                     self.record_allow(summary, risk, reversibility, &reason)
                         .await;
@@ -553,12 +558,33 @@ impl ApiJudge for DaemonApiJudge {
                 }
             }
             EvalResult::Deny { reason, source, .. } => {
+                let reason = guard::gating::sanitize_gate_text(&reason);
                 if source == EvalSource::Llm {
                     self.record_deny(summary, &reason).await;
                 }
                 ApiJudgeVerdict::Deny { reason }
             }
             EvalResult::Error(error) => ApiJudgeVerdict::Error(error),
+        })
+    }
+}
+
+fn sanitize_api_judge_verdict(verdict: ApiJudgeVerdict) -> ApiJudgeVerdict {
+    match verdict {
+        ApiJudgeVerdict::Allow {
+            reason,
+            risk,
+            reversibility,
+        } => ApiJudgeVerdict::Allow {
+            reason: guard::gating::sanitize_gate_text(&reason),
+            risk,
+            reversibility,
+        },
+        ApiJudgeVerdict::Deny { reason } => ApiJudgeVerdict::Deny {
+            reason: guard::gating::sanitize_gate_text(&reason),
+        },
+        ApiJudgeVerdict::Error(error) => {
+            ApiJudgeVerdict::Error(guard::gating::sanitize_gate_text(&error))
         }
     }
 }
@@ -873,6 +899,43 @@ mod tests {
         let user = request["messages"][1]["content"].as_str().unwrap();
         assert!(system.contains("manage dev deployments"));
         assert!(user.contains("revert_constructible: restore_prior_state"));
+    }
+
+    #[tokio::test]
+    async fn ordinary_api_judge_sanitizes_rationale_before_learning_or_return() {
+        let value = ["q", "7"].concat();
+        let reason: &'static str = Box::leak(format!("password={value}").into_boxed_str());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        tokio::spawn(run_llm_capture(
+            listener,
+            bodies,
+            "APPROVE",
+            reason,
+            1,
+            Some("reversible"),
+        ));
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("api.yaml");
+        let store = promotion_store(path.clone(), 5, 3);
+        let judge = DaemonApiJudge::build(
+            llm_config(url),
+            false,
+            16,
+            Duration::from_secs(60),
+            Some("manage dev deployments".to_string()),
+            Some(store),
+            Arc::new(ApiJudgeSpend::new(ApiJudgeSpendConfig::default())),
+        )
+        .expect("judge");
+
+        let verdict = judge.judge(&api_summary("ordinary", false)).await;
+        let ApiJudgeVerdict::Allow { reason, .. } = verdict else {
+            panic!("expected allow verdict");
+        };
+        assert!(!reason.contains(&value));
+        assert!(!std::fs::read_to_string(path).unwrap().contains(&value));
     }
 
     fn promotion_store(

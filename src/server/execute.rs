@@ -1673,7 +1673,6 @@ async fn evaluate_and_route<W: AsyncWrite + Unpin>(
             Some(cache_scope.as_str()),
         )
         .await;
-    let eval_result = sanitize_evaluator_result(eval_result);
     let provider_spend = matches!(
         &eval_result,
         guard::evaluate::EvalResult::Allow {
@@ -1869,34 +1868,6 @@ pub(super) fn session_source_from_eval(
         guard::evaluate::EvalSource::Cache => SessionDecisionSource::Cache,
         guard::evaluate::EvalSource::StaticPolicy => SessionDecisionSource::StaticPolicy,
         guard::evaluate::EvalSource::LearnedDeny => SessionDecisionSource::LearnedDeny,
-    }
-}
-
-fn sanitize_evaluator_result(result: guard::evaluate::EvalResult) -> guard::evaluate::EvalResult {
-    match result {
-        guard::evaluate::EvalResult::Allow {
-            reason,
-            source,
-            risk,
-            reversibility,
-        } => guard::evaluate::EvalResult::Allow {
-            reason: guard::gating::sanitize_gate_text(&reason),
-            source,
-            risk,
-            reversibility,
-        },
-        guard::evaluate::EvalResult::Deny {
-            reason,
-            source,
-            risk,
-        } => guard::evaluate::EvalResult::Deny {
-            reason: guard::gating::sanitize_gate_text(&reason),
-            source,
-            risk,
-        },
-        guard::evaluate::EvalResult::Error(error) => {
-            guard::evaluate::EvalResult::Error(guard::gating::sanitize_gate_text(&error))
-        }
     }
 }
 
@@ -3352,27 +3323,6 @@ mod decision_trace_feature_tests {
         assert!(!serde_json::to_string(&persisted)
             .unwrap()
             .contains(fixture_value));
-    }
-
-    #[test]
-    fn evaluator_rationale_is_sanitized_before_policy_consumers() {
-        let value = ["sk-", &"Ab1".repeat(8)].concat();
-        for result in [
-            guard::evaluate::EvalResult::Allow {
-                reason: format!("allow rationale {value}"),
-                source: guard::evaluate::EvalSource::Llm,
-                risk: Some(1),
-                reversibility: None,
-            },
-            guard::evaluate::EvalResult::Deny {
-                reason: format!("deny rationale {value}"),
-                source: guard::evaluate::EvalSource::Llm,
-                risk: Some(1),
-            },
-        ] {
-            let sanitized = sanitize_evaluator_result(result);
-            assert!(!sanitized.reason().contains(&value));
-        }
     }
 }
 

@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 
 use super::{Reversibility, EXECUTE_NOW_MAX_RISK, HOLD_RISK_THRESHOLD};
 use crate::env::now_unix;
+use crate::learned_rules::sanitize_learning_text;
 use crate::proxy::ApiRequestSummary;
 
 const MAX_EVIDENCE_PER_BUCKET: usize = 8;
@@ -311,8 +312,12 @@ impl ApiPromotionStore {
             ApiPromotionFile::default()
         };
         let now = now_unix();
+        let mut prose_changed = false;
         let mut migrated: BTreeMap<String, ApiShapeBucket> = BTreeMap::new();
         for (_, mut bucket) in std::mem::take(&mut data.buckets) {
+            let sanitized_reason = sanitize_learning_text(&bucket.last_reason);
+            prose_changed |= sanitized_reason != bucket.last_reason;
+            bucket.last_reason = sanitized_reason;
             if bucket.endpoint.is_empty() {
                 bucket.endpoint = "default".to_string();
             }
@@ -350,7 +355,11 @@ impl ApiPromotionStore {
         }
         data.version = default_version();
         data.buckets = migrated;
-        Ok(Self { config, data })
+        let store = Self { config, data };
+        if prose_changed {
+            store.save()?;
+        }
+        Ok(store)
     }
 
     pub fn path(&self) -> &Path {
@@ -506,6 +515,7 @@ impl ApiPromotionStore {
         {
             return Ok(None);
         }
+        let reason = sanitize_learning_text(reason);
         let class = reversibility;
         let risk = risk.unwrap_or(10);
         // An ineligible allow (no class, irreversible, or over the per-class risk
@@ -521,10 +531,10 @@ impl ApiPromotionStore {
         let min_approvals = self.config.min_approvals.max(2);
         let expires_at = now_unix().saturating_add(self.config.generated_ttl_secs);
         let shape = ApiShape::from_summary(summary);
-        let Some(bucket) = self.bucket_mut(&shape, reason, stamp) else {
+        let Some(bucket) = self.bucket_mut(&shape, &reason, stamp) else {
             return Ok(None);
         };
-        bucket.last_reason = reason.to_string();
+        bucket.last_reason = reason;
         bucket.last_seen_unix = now_unix();
         bucket.expires_at_unix = Some(expires_at);
         push_evidence(bucket, summary);
@@ -581,10 +591,11 @@ impl ApiPromotionStore {
         if summary.dry_run {
             return Ok(None);
         }
+        let reason = sanitize_learning_text(reason);
         let min_denials = self.config.min_denials.max(1);
         let expires_at = now_unix().saturating_add(self.config.generated_ttl_secs);
         let shape = ApiShape::from_summary(summary);
-        let Some(bucket) = self.bucket_mut(&shape, reason, stamp) else {
+        let Some(bucket) = self.bucket_mut(&shape, &reason, stamp) else {
             return Ok(None);
         };
         bucket.denials = bucket.denials.saturating_add(1);
@@ -593,7 +604,7 @@ impl ApiPromotionStore {
         // deny reaches its own generation threshold.
         bucket.disqualified = true;
         bucket.promoted_allow = false;
-        bucket.last_reason = reason.to_string();
+        bucket.last_reason = reason;
         bucket.last_seen_unix = now_unix();
         bucket.expires_at_unix = Some(expires_at);
         push_evidence(bucket, summary);
@@ -794,6 +805,28 @@ mod tests {
         let learned = store.learned_allow(&s, "").unwrap();
         assert_eq!(learned.risk, 3);
         assert_eq!(learned.reversibility, Reversibility::Reversible);
+    }
+
+    #[test]
+    fn api_reason_fields_are_sanitized_on_mutation_and_reload() {
+        let value = ["q", "7"].concat();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("api.yaml");
+        let config = config(path.clone(), 2, 1);
+        let mut store = ApiPromotionStore::load(config.clone()).unwrap();
+        let request = summary("api");
+        store
+            .record_deny(&request, &format!("password={value}"), "fixture")
+            .unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains(&value));
+
+        let bucket = store.data.buckets.values_mut().next().unwrap();
+        bucket.last_reason = format!("password={value}");
+        store.save().unwrap();
+        let reloaded = ApiPromotionStore::load(config).unwrap();
+        let hit = reloaded.learned_deny(&request, "fixture").unwrap();
+        assert!(!hit.reason.contains(&value));
+        assert!(!std::fs::read_to_string(path).unwrap().contains(&value));
     }
 
     #[test]

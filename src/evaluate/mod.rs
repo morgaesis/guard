@@ -42,11 +42,27 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum CacheCommandIdentity<'a> {
+    Flat { command: &'a str },
+    Argv { binary: &'a str, args: &'a [String] },
+}
+
+#[derive(serde::Serialize)]
+struct CacheIdentity<'a> {
+    version: u8,
+    command: CacheCommandIdentity<'a>,
+    prompt_context: Option<&'a str>,
+    cache_scope: Option<&'a str>,
+}
+
 /// Build the evaluator decision-cache key.
 ///
 /// The key binds three independent dimensions so a memoized verdict is only
 /// ever served back to an identical request made under identical authority:
-///   - the structured request (`command`, plus daemon-supplied execution
+///   - the request, with structured callers encoded as binary plus exact argv
+///     elements, and daemon-supplied execution
 ///     context such as cwd/env when it is cacheable via `prompt_context`),
 ///   - the caller's authorization scope (`cache_scope`: the authenticated
 ///     principal and the session-grant revision), so a verdict decided for one
@@ -59,17 +75,21 @@ use tokio::sync::RwLock;
 /// not carry a per-principal execution identity.
 fn scoped_cache_key(
     command: &str,
+    structured_command: Option<(&str, &[String])>,
     prompt_context: Option<&str>,
     cache_scope: Option<&str>,
 ) -> String {
-    let request = match prompt_context {
-        Some(context) => format!("{command}\n\n[GUARD EVALUATION CONTEXT]\n{context}"),
-        None => command.to_string(),
+    let command = match structured_command {
+        Some((binary, args)) => CacheCommandIdentity::Argv { binary, args },
+        None => CacheCommandIdentity::Flat { command },
     };
-    match cache_scope {
-        Some(scope) => format!("[GUARD CACHE SCOPE]\n{scope}\n\n{request}"),
-        None => request,
-    }
+    serde_json::to_string(&CacheIdentity {
+        version: 1,
+        command,
+        prompt_context,
+        cache_scope,
+    })
+    .expect("cache identity serializes")
 }
 
 pub struct Evaluator {
@@ -273,7 +293,7 @@ impl Evaluator {
         cache_scope: Option<&str>,
         result: EvalResult,
     ) {
-        let key = scoped_cache_key(command, prompt_context, cache_scope);
+        let key = scoped_cache_key(command, None, prompt_context, cache_scope);
         let cached = match result {
             EvalResult::Allow {
                 reason,
@@ -303,10 +323,53 @@ impl Evaluator {
         prompt_context: Option<&str>,
         cache_scope: Option<&str>,
     ) -> Option<EvalResult> {
-        let key = scoped_cache_key(command, prompt_context, cache_scope);
+        let key = scoped_cache_key(command, None, prompt_context, cache_scope);
         let cache = self.cache.as_ref()?;
         let guard = cache.read().await;
         guard.get(&key)
+    }
+
+    #[cfg(test)]
+    async fn seed_scoped_argv_cache_for_test(
+        &self,
+        binary: &str,
+        args: &[String],
+        prompt_context: Option<&str>,
+        cache_scope: Option<&str>,
+        result: EvalResult,
+    ) {
+        let command = crate::redact::command_line(binary, args);
+        let key = scoped_cache_key(&command, Some((binary, args)), prompt_context, cache_scope);
+        let cached = match result {
+            EvalResult::Allow {
+                reason,
+                risk,
+                reversibility,
+                ..
+            } => CachedResult::Allow {
+                reason,
+                risk,
+                reversibility,
+            },
+            EvalResult::Deny { reason, risk, .. } => CachedResult::Deny { reason, risk },
+            EvalResult::Error(_) => return,
+        };
+        if let Some(cache) = &self.cache {
+            cache.write().await.insert(key, cached);
+        }
+    }
+
+    #[cfg(test)]
+    async fn probe_scoped_argv_cache_for_test(
+        &self,
+        binary: &str,
+        args: &[String],
+        prompt_context: Option<&str>,
+        cache_scope: Option<&str>,
+    ) -> Option<EvalResult> {
+        let command = crate::redact::command_line(binary, args);
+        let key = scoped_cache_key(&command, Some((binary, args)), prompt_context, cache_scope);
+        self.cache.as_ref()?.read().await.get(&key)
     }
 
     pub fn learning_enabled(&self) -> bool {
@@ -414,6 +477,7 @@ impl Evaluator {
     ) -> EvalResult {
         self.evaluate_with_reevaluate_inner(command, None, prompt_append, reevaluate, false, None)
             .await
+            .sanitized()
     }
 
     /// Same as `evaluate_with_reevaluate`, but the decision cache is additionally
@@ -446,11 +510,12 @@ impl Evaluator {
             cache_scope,
         )
         .await
+        .sanitized()
     }
 
-    /// Evaluate a structured command while retaining the original flattened
-    /// form for local policy and cache identity. The provider projection is
-    /// redacted while executable and argv boundaries are still available.
+    /// Evaluate a structured command. Local text policy receives the display
+    /// form, while cache identity and provider redaction retain binary and argv
+    /// boundaries.
     pub async fn evaluate_scoped_argv(
         &self,
         binary: &str,
@@ -470,6 +535,7 @@ impl Evaluator {
             cache_scope,
         )
         .await
+        .sanitized()
     }
 
     async fn evaluate_with_reevaluate_inner(
@@ -485,7 +551,7 @@ impl Evaluator {
         let cache_blocked_by_prompt = session_prompt_active && !cache_prompt_context;
         let prompt_context = (session_prompt_active && cache_prompt_context)
             .then(|| prompt_append.unwrap_or_default());
-        let cache_key = scoped_cache_key(command, prompt_context, cache_scope);
+        let cache_key = scoped_cache_key(command, structured_command, prompt_context, cache_scope);
 
         // Pre-LLM fast-reject: an explicit deny pattern (or deny-decision
         // group rule) rejects without an LLM call. A command that matches
@@ -554,7 +620,8 @@ impl Evaluator {
 
             let result = self
                 .evaluate_llm_with_argv(command, structured_command, prompt_append)
-                .await;
+                .await
+                .sanitized();
 
             // Only insert into cache when the verdict was made under the
             // base prompt. Decisions reached with a session-specific prompt
@@ -629,6 +696,66 @@ mod tests {
     use crate::learned_rules::{AutoShimMode, LearnedRuleStore};
     use std::sync::Arc;
     use tokio::sync::RwLock;
+
+    #[tokio::test]
+    async fn structured_cache_identity_preserves_every_argv_boundary() {
+        let evaluator =
+            Evaluator::new(EvalConfig::default().llm_enabled(false)).expect("build evaluator");
+        let scope = "principal:fixture:revision:1";
+        let joined = vec!["one two".to_string()];
+        let split = vec!["one".to_string(), "two".to_string()];
+
+        evaluator
+            .seed_scoped_argv_cache_for_test(
+                "fixturectl",
+                &joined,
+                None,
+                Some(scope),
+                EvalResult::Allow {
+                    reason: "joined allow".to_string(),
+                    source: EvalSource::Llm,
+                    risk: Some(1),
+                    reversibility: None,
+                },
+            )
+            .await;
+        assert!(matches!(
+            evaluator
+                .probe_scoped_argv_cache_for_test("fixturectl", &joined, None, Some(scope))
+                .await,
+            Some(EvalResult::Allow { .. })
+        ));
+        assert!(evaluator
+            .probe_scoped_argv_cache_for_test("fixturectl", &split, None, Some(scope))
+            .await
+            .is_none());
+
+        evaluator
+            .seed_scoped_argv_cache_for_test(
+                "fixturectl",
+                &split,
+                None,
+                Some(scope),
+                EvalResult::Deny {
+                    reason: "split deny".to_string(),
+                    source: EvalSource::Llm,
+                    risk: Some(7),
+                },
+            )
+            .await;
+        assert!(matches!(
+            evaluator
+                .probe_scoped_argv_cache_for_test("fixturectl", &split, None, Some(scope))
+                .await,
+            Some(EvalResult::Deny { .. })
+        ));
+        assert!(matches!(
+            evaluator
+                .probe_scoped_argv_cache_for_test("fixturectl", &joined, None, Some(scope))
+                .await,
+            Some(EvalResult::Allow { .. })
+        ));
+    }
 
     #[tokio::test]
     async fn evaluate_with_context_session_prompt_does_not_seed_cache() {

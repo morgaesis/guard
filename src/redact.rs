@@ -589,6 +589,7 @@ const MYSQLSH_VALUELESS_PASSWORD_OPTIONS: &[&str] = &[
     "--no-password",
 ];
 const ACCESS_VALUELESS_PASSWORD_OPTIONS: &[&str] = &["-p", "--password"];
+const MYSQL_CONFIG_EDITOR_PASSWORD_OPTIONS: &[&str] = &["-p", "--password"];
 
 /// Official client password grammars. Optional password values use attached
 /// syntax; a bare spelling prompts and never consumes the next operand.
@@ -908,12 +909,38 @@ fn container_subcommand<'a>(binary: &str, args: &'a [String]) -> Option<(usize, 
 fn parsed_subcommand<'a>(binary: &str, args: &'a [String]) -> Option<(usize, &'a str)> {
     match binary_lookup_name(binary).as_str() {
         "docker" | "podman" => container_subcommand(&binary_lookup_name(binary), args),
+        "mysql_config_editor" => mysql_config_editor_subcommand(args),
         _ => args
             .iter()
             .enumerate()
             .find(|(_, argument)| !argument.starts_with('-'))
             .map(|(index, argument)| (index, argument.as_str())),
     }
+}
+
+fn mysql_config_editor_subcommand(args: &[String]) -> Option<(usize, &str)> {
+    const COMMANDS: &[&str] = &["help", "print", "remove", "reset", "set"];
+    let mut short_debug_value = false;
+    for (index, argument) in args.iter().enumerate() {
+        if short_debug_value {
+            short_debug_value = false;
+            continue;
+        }
+        if argument == "-#" {
+            short_debug_value = true;
+            continue;
+        }
+        if argument.starts_with("-#") || argument.starts_with("--debug=") {
+            continue;
+        }
+        if argument.starts_with('-') {
+            continue;
+        }
+        return COMMANDS
+            .contains(&argument.as_str())
+            .then_some((index, argument.as_str()));
+    }
+    None
 }
 
 fn alias_context_matches(
@@ -944,8 +971,18 @@ fn parse_database_client_password_option<'a>(
     binary: &str,
     argument: &'a str,
 ) -> Option<ParsedOption<'a>> {
+    if binary_lookup_name(binary) == "mysql_config_editor" {
+        return parse_attached_password_option(MYSQL_CONFIG_EDITOR_PASSWORD_OPTIONS, argument);
+    }
     let grammar = database_client_password_grammar(binary)?;
-    for option in grammar.attached_options {
+    parse_attached_password_option(grammar.attached_options, argument)
+}
+
+fn parse_attached_password_option<'a>(
+    options: &[&str],
+    argument: &'a str,
+) -> Option<ParsedOption<'a>> {
+    for option in options {
         if argument == *option {
             return Some(ParsedOption {
                 name: argument,
@@ -962,7 +999,7 @@ fn parse_database_client_password_option<'a>(
             .is_some_and(|character| matches!(character, '=' | ':') || character.is_control());
         if !suffix.is_empty() && (short_option || separated_long) {
             return Some(ParsedOption {
-                name: option,
+                name: &argument[..option.len()],
                 value_start: Some(option.len()),
             });
         }
@@ -1034,8 +1071,13 @@ fn is_known_valueless_option(
     option: &ParsedOption<'_>,
 ) -> bool {
     option.value_start.is_none()
-        && (database_client_password_grammar(binary)
-            .is_some_and(|grammar| grammar.valueless_options.contains(&option.name))
+        && ((binary_lookup_name(binary) == "mysql_config_editor"
+            && MYSQL_CONFIG_EDITOR_PASSWORD_OPTIONS.contains(&option.name)
+            && parsed_subcommand(binary, args).is_some_and(|(subcommand_index, subcommand)| {
+                subcommand_index < option_index && matches!(subcommand, "set" | "remove")
+            }))
+            || database_client_password_grammar(binary)
+                .is_some_and(|grammar| grammar.valueless_options.contains(&option.name))
             || BINARY_VALUELESS_OPTIONS.iter().any(|rule| {
                 alias_context_matches(
                     binary,
@@ -1457,6 +1499,50 @@ mod tests {
                         assert!(command_contains_sensitive_literals(&binary, &[form]));
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn mysql_config_editor_password_prompts_are_subcommand_aware_and_valueless() {
+        let value = ["q", "7"].concat();
+        for suffix in ["", ".EXE", ".cmd", ".Bat", ".cOm"] {
+            let binary = format!("C:\\Tools\\MYSQL_CONFIG_EDITOR{suffix}");
+            for args in [
+                vec![
+                    "set".to_string(),
+                    "-p".to_string(),
+                    "--host".to_string(),
+                    "ordinary-host".to_string(),
+                ],
+                vec![
+                    "--verbose".to_string(),
+                    "remove".to_string(),
+                    "--password".to_string(),
+                    "--login-path".to_string(),
+                    "ordinary-path".to_string(),
+                ],
+                vec![
+                    "-#".to_string(),
+                    "ordinary-debug".to_string(),
+                    "set".to_string(),
+                    "--password".to_string(),
+                    "--user".to_string(),
+                    "ordinary-user".to_string(),
+                ],
+            ] {
+                assert!(!command_contains_sensitive_literals(&binary, &args));
+            }
+
+            for argument in [
+                format!("-p{value}"),
+                format!("--password={value}"),
+                format!("--password:{value}"),
+                format!("--password\n{value}"),
+            ] {
+                let args = vec!["set".to_string(), argument];
+                assert!(command_contains_sensitive_literals(&binary, &args));
+                assert!(!redact_command_line(&binary, &args).contains(&value));
             }
         }
     }

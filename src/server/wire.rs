@@ -1589,10 +1589,14 @@ pub(super) struct ExecuteResult {
 }
 
 impl ExecuteResult {
+    fn sanitize_prose(value: impl Into<String>) -> String {
+        guard::gating::sanitize_gate_text(&value.into())
+    }
+
     pub(super) fn denied(reason: impl Into<String>) -> Self {
         Self {
             policy: PolicyOutcome::Denied {
-                reason: reason.into(),
+                reason: Self::sanitize_prose(reason),
             },
             exec: ExecOutcome::NotAttempted,
             request_handle: None,
@@ -1613,7 +1617,7 @@ impl ExecuteResult {
     ) -> Self {
         Self {
             policy: PolicyOutcome::Allowed {
-                reason: reason.into(),
+                reason: Self::sanitize_prose(reason),
             },
             exec: ExecOutcome::Completed {
                 exit_code,
@@ -1637,10 +1641,10 @@ impl ExecuteResult {
     ) -> Self {
         Self {
             policy: PolicyOutcome::Allowed {
-                reason: policy_reason.into(),
+                reason: Self::sanitize_prose(policy_reason),
             },
             exec: ExecOutcome::Failed {
-                reason: exec_reason.into(),
+                reason: Self::sanitize_prose(exec_reason),
                 started: false,
             },
             request_handle: None,
@@ -1661,10 +1665,10 @@ impl ExecuteResult {
     ) -> Self {
         Self {
             policy: PolicyOutcome::Allowed {
-                reason: policy_reason.into(),
+                reason: Self::sanitize_prose(policy_reason),
             },
             exec: ExecOutcome::Failed {
-                reason: exec_reason.into(),
+                reason: Self::sanitize_prose(exec_reason),
                 started: true,
             },
             request_handle: None,
@@ -1679,7 +1683,7 @@ impl ExecuteResult {
     pub(super) fn dry_run(reason: impl Into<String>) -> Self {
         Self {
             policy: PolicyOutcome::Allowed {
-                reason: reason.into(),
+                reason: Self::sanitize_prose(reason),
             },
             exposed_secret_refs: Vec::new(),
             exec: ExecOutcome::DryRun { coverage: None },
@@ -1696,7 +1700,7 @@ impl ExecuteResult {
     pub(super) fn dry_run_gated(reason: impl Into<String>, coverage: Coverage) -> Self {
         Self {
             policy: PolicyOutcome::Allowed {
-                reason: reason.into(),
+                reason: Self::sanitize_prose(reason),
             },
             exec: ExecOutcome::DryRun {
                 coverage: Some(coverage),
@@ -1715,7 +1719,7 @@ impl ExecuteResult {
     pub(super) fn held(reason: impl Into<String>, handle: String, coverage: Coverage) -> Self {
         Self {
             policy: PolicyOutcome::Allowed {
-                reason: reason.into(),
+                reason: Self::sanitize_prose(reason),
             },
             exec: ExecOutcome::Held { handle, coverage },
             request_handle: None,
@@ -1741,7 +1745,7 @@ impl ExecuteResult {
     ) -> Self {
         Self {
             policy: PolicyOutcome::Allowed {
-                reason: reason.into(),
+                reason: Self::sanitize_prose(reason),
             },
             exec: ExecOutcome::Provisional {
                 handle,
@@ -1776,7 +1780,7 @@ impl ExecuteResult {
         stderr: Option<String>,
     ) -> Self {
         self.exec = ExecOutcome::ContainmentFailed {
-            reason: reason.into(),
+            reason: Self::sanitize_prose(reason),
             handle,
             coverage,
             outcome,
