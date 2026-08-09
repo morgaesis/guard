@@ -979,13 +979,12 @@ pub(crate) async fn handle_audit_tail(
         .map_err(|e| describe_connect_failure(e, &client, source))?
     {
         server::AdminResponse::AuditRecords { path, items } => {
+            let items: Vec<serde_json::Value> = items
+                .into_iter()
+                .map(guard::audit::redacted_read_projection)
+                .collect();
             if json {
-                return print_json(&serde_json::json!({
-                    "schema_version": JSON_SCHEMA_VERSION,
-                    "type": "audit_records",
-                    "path": path,
-                    "items": items,
-                }));
+                return print_json(&audit_tail_json_response(&path, &items));
             }
             if items.is_empty() {
                 println!("(no audit records)");
@@ -993,14 +992,20 @@ pub(crate) async fn handle_audit_tail(
             for item in &items {
                 match serde_json::from_value::<guard::audit::AuditRecord>(item.clone()) {
                     Ok(record) => println!(
-                        "seq={} {} [AUDIT] {}",
+                        "seq={} {} [AUDIT] {}{}",
                         record.seq,
                         format_timestamp(record.ts),
-                        record.event.render_line()
+                        record.event.render_line(),
+                        if item.get("read_projection").is_some() {
+                            " [read projection: detail redacted]"
+                        } else {
+                            ""
+                        }
                     ),
-                    // A line that does not parse is shown raw rather than
-                    // hidden, so a tampered tail stays visible in reads too.
-                    Err(_) => println!("(unparseable) {}", item),
+                    // The server returns metadata for an unparseable line and
+                    // omits its raw bytes so a malformed tail cannot disclose
+                    // historical detail.
+                    Err(_) => println!("(unparseable audit record; detail omitted)"),
                 }
             }
             Ok(())
@@ -1014,6 +1019,15 @@ pub(crate) async fn handle_audit_tail(
             std::process::exit(1);
         }
     }
+}
+
+fn audit_tail_json_response(path: &str, items: &[serde_json::Value]) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": JSON_SCHEMA_VERSION,
+        "type": "audit_records",
+        "path": path,
+        "items": items,
+    })
 }
 
 pub(crate) async fn handle_verb(subcommand: VerbCommands) -> Result<()> {
@@ -3168,6 +3182,40 @@ mod tests {
             "malformed client configuration"
         );
         assert_eq!(document.as_object().map(serde_json::Map::len), Some(3));
+    }
+
+    #[test]
+    fn audit_tail_json_keeps_historical_secret_detail_redacted() {
+        let marker = "synthetic-historical-secret-tail-marker";
+        let historical = serde_json::json!({
+            "v": 1,
+            "seq": 23,
+            "ts": 1_700_000_123,
+            "prev_hash": "synthetic-previous-hash",
+            "kind": "SECRET_EXPOSED",
+            "handle": "synthetic-handle",
+            "cmd": marker,
+            "reason": marker,
+            "fields": [["synthetic-secret-key", marker]],
+        });
+
+        let items = vec![historical]
+            .into_iter()
+            .map(guard::audit::redacted_read_projection)
+            .collect::<Vec<_>>();
+        let document = audit_tail_json_response("synthetic-audit-path", &items);
+        let encoded = serde_json::to_string(&document).unwrap();
+
+        assert!(!encoded.contains(marker));
+        assert_eq!(document["items"][0]["seq"], 23);
+        assert_eq!(document["items"][0]["ts"], 1_700_000_123);
+        assert_eq!(document["items"][0]["kind"], "SECRET_EXPOSED");
+        assert_eq!(document["items"][0]["prev_hash"], "synthetic-previous-hash");
+        assert_eq!(document["items"][0]["fields"][0][0], "synthetic-secret-key");
+        assert_eq!(
+            document["items"][0]["read_projection"],
+            "secret_exposure_detail_redacted"
+        );
     }
 
     #[test]
