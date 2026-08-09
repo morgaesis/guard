@@ -27,7 +27,8 @@ use std::path::{Path, PathBuf};
 
 use crate::env::now_unix;
 use crate::learned_rules::{
-    infer_service_from_binary, sanitize_learning_text, write_learning_file_atomically,
+    infer_service_from_binary, recover_learning_file_transaction, sanitize_learning_text,
+    write_learning_file_atomically, LearningWriteOutcome,
 };
 use crate::redact::{
     command_contains_sensitive_literals, flattened_args_contain_sensitive_literals,
@@ -84,7 +85,7 @@ impl DenyLearningConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DenyShapeFile {
     #[serde(default = "default_version")]
     pub version: u32,
@@ -98,7 +99,7 @@ fn default_version() -> u32 {
     1
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DenyObservation {
     pub service: String,
     pub binary: String,
@@ -115,7 +116,7 @@ pub struct DenyObservation {
     pub last_attempt_at_denials: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DenyShape {
     pub service: String,
     pub binary: String,
@@ -190,6 +191,7 @@ pub struct DenyShapeStore {
 
 impl DenyShapeStore {
     pub fn load(config: DenyLearningConfig) -> Result<Self> {
+        recover_learning_file_transaction(&config.path)?;
         let mut data = if config.path.exists() {
             let content = std::fs::read_to_string(&config.path)
                 .with_context(|| format!("failed to read {}", config.path.display()))?;
@@ -227,7 +229,13 @@ impl DenyShapeStore {
         }
         let store = Self { config, data };
         if changed {
-            store.save()?;
+            let outcome = store.save_data(&store.data)?;
+            if let Some(error) = outcome.warning() {
+                tracing::warn!(
+                    "deny-shape cleanup committed with a durability warning: {}",
+                    error
+                );
+            }
         }
         Ok(store)
     }
@@ -273,6 +281,19 @@ impl DenyShapeStore {
     /// just became (re-)eligible for a synthesis attempt. Never grants or
     /// matches anything itself -- see `matches` and `promote_shape`.
     pub fn record_denial(
+        &mut self,
+        binary: &str,
+        args: &[String],
+        command: &str,
+        reason: &str,
+    ) -> Result<Option<DenyLearningOutcome>> {
+        let mut candidate = self.clone();
+        let outcome = candidate.record_denial_in_memory(binary, args, command, reason)?;
+        self.commit_candidate(candidate.data)?;
+        Ok(outcome)
+    }
+
+    fn record_denial_in_memory(
         &mut self,
         binary: &str,
         args: &[String],
@@ -343,7 +364,6 @@ impl DenyShapeStore {
         }
         let evidence_args = observation.evidence_args.clone();
 
-        self.save()?;
         Ok(Some(DenyLearningOutcome {
             service,
             binary: binary.to_string(),
@@ -379,9 +399,9 @@ impl DenyShapeStore {
         }
         validate_deny_shape_safety(args_pattern, evidence)?;
         let reason = sanitize_learning_text(reason);
+        let mut candidate = self.data.clone();
         let now = now_unix();
-        if let Some(existing) = self
-            .data
+        if let Some(existing) = candidate
             .shapes
             .iter_mut()
             .find(|s| s.binary.eq_ignore_ascii_case(binary) && s.args_pattern == args_pattern)
@@ -392,8 +412,7 @@ impl DenyShapeStore {
             existing.evidence_args = evidence.to_vec();
             existing.evidence.clear();
         } else {
-            let per_binary = self
-                .data
+            let per_binary = candidate
                 .shapes
                 .iter()
                 .filter(|s| s.binary.eq_ignore_ascii_case(binary))
@@ -406,7 +425,7 @@ impl DenyShapeStore {
                     binary
                 );
             }
-            self.data.shapes.push(DenyShape {
+            candidate.shapes.push(DenyShape {
                 service: service.to_string(),
                 binary: binary.to_string(),
                 args_pattern: args_pattern.to_string(),
@@ -418,11 +437,26 @@ impl DenyShapeStore {
                 evidence: String::new(),
             });
         }
-        self.save()
+        self.commit_candidate(candidate)
     }
 
-    fn save(&self) -> Result<()> {
-        let mut data = self.data.clone();
+    fn commit_candidate(&mut self, candidate: DenyShapeFile) -> Result<()> {
+        if candidate == self.data {
+            return Ok(());
+        }
+        let outcome = self.save_data(&candidate)?;
+        self.data = candidate;
+        if let Some(error) = outcome.warning() {
+            tracing::warn!(
+                "deny-shape replacement committed with a durability warning: {}",
+                error
+            );
+        }
+        Ok(())
+    }
+
+    fn save_data(&self, data: &DenyShapeFile) -> Result<LearningWriteOutcome> {
+        let mut data = data.clone();
         for observation in data.observations.values_mut() {
             observation.last_reason = sanitize_learning_text(&observation.last_reason);
         }
@@ -554,6 +588,28 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(fourth.ready_to_synthesize);
+    }
+
+    #[test]
+    fn failed_deny_shape_write_keeps_memory_and_durable_state_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("deny.yaml");
+        let mut store = DenyShapeStore::load(config(path.clone(), 2)).unwrap();
+        let command_args = vec!["delete".to_string(), "pod".to_string()];
+        store
+            .record_denial("kubectl", &command_args, "kubectl delete pod", "denied")
+            .unwrap();
+        let before_memory = store.data.clone();
+        let before_file = std::fs::read(&path).unwrap();
+        let blocker = temp.path().join("blocker");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        store.config.path = blocker.join("deny.yaml");
+
+        assert!(store
+            .record_denial("kubectl", &command_args, "kubectl delete pod", "denied")
+            .is_err());
+        assert_eq!(store.data, before_memory);
+        assert_eq!(std::fs::read(path).unwrap(), before_file);
     }
 
     #[test]

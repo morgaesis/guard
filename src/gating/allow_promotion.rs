@@ -79,7 +79,10 @@ use super::verb::{
 use super::{Reversibility, EXECUTE_NOW_MAX_RISK, HOLD_RISK_THRESHOLD};
 use crate::env::now_unix;
 use crate::learned_rules::{infer_service_from_binary, looks_dangerous_for_learned_allow};
-use crate::learned_rules::{sanitize_learning_text, write_learning_file_atomically};
+use crate::learned_rules::{
+    recover_learning_file_transaction, sanitize_learning_text, write_learning_file_atomically,
+    LearningWriteOutcome,
+};
 use crate::redact::{
     command_contains_sensitive_literals, flattened_command_contains_sensitive_literals,
 };
@@ -115,7 +118,7 @@ impl AllowPromotionConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AllowPromotionFile {
     #[serde(default = "default_version")]
     pub version: u32,
@@ -127,7 +130,7 @@ fn default_version() -> u32 {
     1
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AllowObservation {
     pub service: String,
     pub binary: String,
@@ -194,6 +197,7 @@ pub struct AllowPromotionStore {
 
 impl AllowPromotionStore {
     pub fn load(config: AllowPromotionConfig) -> Result<Self> {
+        recover_learning_file_transaction(&config.path)?;
         let mut data = if config.path.exists() {
             let content = std::fs::read_to_string(&config.path)
                 .with_context(|| format!("failed to read {}", config.path.display()))?;
@@ -217,7 +221,13 @@ impl AllowPromotionStore {
         }
         let store = Self { config, data };
         if changed {
-            store.save()?;
+            let outcome = store.save_data(&store.data)?;
+            if let Some(error) = outcome.warning() {
+                tracing::warn!(
+                    "allow-promotion cleanup committed with a durability warning: {}",
+                    error
+                );
+            }
         }
         Ok(store)
     }
@@ -247,6 +257,29 @@ impl AllowPromotionStore {
     /// remains) eligible for a promotion attempt.
     #[allow(clippy::too_many_arguments)]
     pub fn record_approval(
+        &mut self,
+        binary: &str,
+        args: &[String],
+        command: &str,
+        risk: Option<i32>,
+        reversibility: Option<Reversibility>,
+        reason: &str,
+    ) -> Result<Option<AllowPromotionOutcome>> {
+        let mut candidate = self.clone();
+        let outcome = candidate.record_approval_in_memory(
+            binary,
+            args,
+            command,
+            risk,
+            reversibility,
+            reason,
+        )?;
+        self.commit_candidate(candidate.data)?;
+        Ok(outcome)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_approval_in_memory(
         &mut self,
         binary: &str,
         args: &[String],
@@ -362,8 +395,6 @@ impl AllowPromotionStore {
         let max_risk_seen = observation.max_risk_seen;
         let out_class = observation.class_seen;
 
-        self.save()?;
-
         let Some(out_class) = out_class else {
             return Ok(None);
         };
@@ -399,15 +430,31 @@ impl AllowPromotionStore {
         arity: usize,
     ) -> Result<()> {
         let key = format!("{service}|{binary}|{subcommand}|{arity}");
-        if let Some(observation) = self.data.observations.get_mut(&key) {
+        let mut candidate = self.data.clone();
+        if let Some(observation) = candidate.observations.get_mut(&key) {
             observation.resolved = true;
-            self.save()?;
+            self.commit_candidate(candidate)?;
         }
         Ok(())
     }
 
-    fn save(&self) -> Result<()> {
-        let mut data = self.data.clone();
+    fn commit_candidate(&mut self, candidate: AllowPromotionFile) -> Result<()> {
+        if candidate == self.data {
+            return Ok(());
+        }
+        let outcome = self.save_data(&candidate)?;
+        self.data = candidate;
+        if let Some(error) = outcome.warning() {
+            tracing::warn!(
+                "allow-promotion replacement committed with a durability warning: {}",
+                error
+            );
+        }
+        Ok(())
+    }
+
+    fn save_data(&self, data: &AllowPromotionFile) -> Result<LearningWriteOutcome> {
+        let mut data = data.clone();
         for observation in data.observations.values_mut() {
             observation.last_reason = sanitize_learning_text(&observation.last_reason);
         }
@@ -789,6 +836,42 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!third.ready_to_synthesize);
+    }
+
+    #[test]
+    fn failed_allow_promotion_write_keeps_memory_and_durable_state_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("allow.yaml");
+        let mut store = AllowPromotionStore::load(config(path.clone(), 2)).unwrap();
+        let command_args = args(&["get", "pods"]);
+        store
+            .record_approval(
+                "kubectl",
+                &command_args,
+                "kubectl get pods",
+                Some(1),
+                Some(Reversibility::Reversible),
+                "safe",
+            )
+            .unwrap();
+        let before_memory = store.data.clone();
+        let before_file = std::fs::read(&path).unwrap();
+        let blocker = temp.path().join("blocker");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        store.config.path = blocker.join("allow.yaml");
+
+        assert!(store
+            .record_approval(
+                "kubectl",
+                &command_args,
+                "kubectl get pods",
+                Some(1),
+                Some(Reversibility::Reversible),
+                "safe",
+            )
+            .is_err());
+        assert_eq!(store.data, before_memory);
+        assert_eq!(std::fs::read(path).unwrap(), before_file);
     }
 
     #[test]

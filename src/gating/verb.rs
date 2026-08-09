@@ -576,6 +576,15 @@ impl VerbCatalog {
                     verb.name
                 );
             }
+            if verb.source_prose.is_some() || verb.evidence.is_some() {
+                sanitize_synthesized_verb_prose(&mut verb);
+                if generated_authority_contains_sensitive_literal(&verb) {
+                    bail!(
+                        "generated verb '{}' contains sensitive authority metadata or literal argv",
+                        verb.name
+                    );
+                }
+            }
             normalize_operator_boundaries(&mut verb);
             validate_verb(&verb)?;
             if verbs.insert(verb.name.clone(), verb.clone()).is_some() {
@@ -2294,8 +2303,12 @@ fn value_constraint_contains_sensitive_literal(constraint: &ValueConstraint) -> 
         })
 }
 
-fn generated_access_authority_contains_sensitive_literal(verb: &Verb) -> bool {
+fn generated_authority_contains_sensitive_literal(verb: &Verb) -> bool {
     if command_contains_sensitive_literals(&verb.binary, &verb.args)
+        || verb
+            .revert
+            .as_ref()
+            .is_some_and(|revert| command_contains_sensitive_literals(&revert.binary, &revert.args))
         || verb
             .credential_plan
             .as_deref()
@@ -2353,20 +2366,70 @@ fn generated_access_authority_contains_sensitive_literal(verb: &Verb) -> bool {
                     })
             })
             || cell.provenance.as_ref().is_some_and(|provenance| {
-                text_contains_sensitive_literals(&provenance.source)
-                    || text_contains_sensitive_literals(&provenance.regime_stamp)
+                text_contains_sensitive_literals(&provenance.regime_stamp)
                     || text_contains_sensitive_literals(&provenance.prompt_stamp)
                     || text_contains_sensitive_literals(&provenance.model_stamp)
                     || provenance
-                        .evidence
+                        .probes
                         .iter()
-                        .any(|evidence| text_contains_sensitive_literals(evidence))
-                    || provenance.probes.iter().any(|probe| {
-                        text_contains_sensitive_literals(&probe.dimension)
-                            || command_contains_sensitive_literals(&verb.binary, &probe.args)
-                    })
+                        .any(|probe| command_contains_sensitive_literals(&verb.binary, &probe.args))
             })
     })
+}
+
+/// Canonicalize the explanatory envelope of a model-synthesized verb and
+/// reject literal-sensitive authority without changing what the verb can run.
+/// This invariant is applied before preview identity, persistence, reload, and
+/// projection.
+fn sanitize_synthesized_verb_prose(verb: &mut Verb) {
+    verb.description = crate::redact::redact_output_text(&verb.description);
+    verb.prompt_context = verb
+        .prompt_context
+        .take()
+        .map(|value| crate::redact::redact_output_text(&value));
+    verb.source_prose = verb
+        .source_prose
+        .take()
+        .map(|value| crate::redact::redact_output_text(&value));
+    verb.evidence = verb
+        .evidence
+        .take()
+        .map(|value| crate::redact::redact_output_text(&value));
+    for cell in &mut verb.coverage {
+        if let Some(provenance) = &mut cell.provenance {
+            provenance.source = crate::redact::redact_output_text(&provenance.source);
+            for evidence in &mut provenance.evidence {
+                *evidence = crate::redact::redact_output_text(evidence);
+            }
+            for probe in &mut provenance.probes {
+                probe.dimension = crate::redact::redact_output_text(&probe.dimension);
+            }
+        }
+    }
+}
+
+pub fn canonicalize_synthesized_verb_envelope(mut verb: Verb) -> Result<Verb> {
+    sanitize_synthesized_verb_prose(&mut verb);
+    if generated_authority_contains_sensitive_literal(&verb)
+        || verb
+            .promotion_stamp
+            .as_deref()
+            .is_some_and(text_contains_sensitive_literals)
+    {
+        bail!(
+            "generated verb contains sensitive authority metadata or literal argv and cannot be persisted"
+        );
+    }
+    validate_synthesized_safety(&verb)?;
+    Ok(verb)
+}
+
+pub fn validate_canonical_synthesized_verb_envelope(verb: &Verb) -> Result<()> {
+    let canonical = canonicalize_synthesized_verb_envelope(verb.clone())?;
+    if serde_json::to_value(canonical)? != serde_json::to_value(verb)? {
+        bail!("generated verb metadata is not in canonical sanitized form");
+    }
+    Ok(())
 }
 
 /// Normalize and validate a matcher proposed for a principal-bound access
@@ -2384,7 +2447,7 @@ pub fn normalize_generated_access_verb(mut verb: Verb) -> Result<Verb> {
     verb.evidence = None;
     verb.auto_promoted = false;
     verb.promotion_stamp = None;
-    if generated_access_authority_contains_sensitive_literal(&verb) {
+    if generated_authority_contains_sensitive_literal(&verb) {
         bail!(
             "generated access coverage contains sensitive authority metadata or literal argv and cannot be persisted"
         );
@@ -3500,6 +3563,62 @@ verbs:
             auto_promoted: false,
             promotion_stamp: None,
         }
+    }
+
+    #[test]
+    fn successful_synthesis_canonicalizes_all_explanatory_metadata_before_identity() {
+        let value = ["q", "7"].concat();
+        let contaminated = format!("password={value}");
+        let mut verb = synth_verb("fixturectl", Some("^(status)$"), false, "inspect-fixture");
+        verb.description = contaminated.clone();
+        verb.prompt_context = Some(contaminated.clone());
+        verb.source_prose = Some(contaminated.clone());
+        verb.evidence = Some(contaminated.clone());
+        verb.coverage.push(VerbCoverageCell {
+            name: "safe".to_string(),
+            action: CoverageAction::Evaluate,
+            required_args: Vec::new(),
+            forbidden_args: Vec::new(),
+            min_args: None,
+            max_args: None,
+            options: Vec::new(),
+            target: None,
+            inventory: None,
+            namespace: None,
+            fanout: None,
+            cwd: None,
+            environment: Vec::new(),
+            override_marker: None,
+            sticky: false,
+            provenance: Some(CoverageProvenance {
+                source: contaminated.clone(),
+                evidence: vec![contaminated.clone()],
+                regime_stamp: "safe-regime".to_string(),
+                prompt_stamp: "safe-prompt".to_string(),
+                model_stamp: "safe-model".to_string(),
+                generated_unix: 1,
+                probes: vec![CoverageProbe {
+                    dimension: contaminated.clone(),
+                    args: vec!["status".to_string()],
+                    expected_match: true,
+                    observed_match: true,
+                }],
+            }),
+        });
+
+        let canonical = canonicalize_synthesized_verb_envelope(verb).unwrap();
+        validate_canonical_synthesized_verb_envelope(&canonical).unwrap();
+        let serialized = serde_json::to_string(&canonical).unwrap();
+        assert!(!serialized.contains(&value));
+        let digest = canonical.definition_digest();
+        let yaml = serde_yaml_ng::to_string(&CatalogFile {
+            verbs: vec![canonical],
+        })
+        .unwrap();
+        let reloaded = VerbCatalog::from_yaml(&yaml).unwrap();
+        let reloaded = reloaded.get("inspect-fixture").unwrap();
+        assert_eq!(reloaded.definition_digest(), digest);
+        assert!(!serde_json::to_string(reloaded).unwrap().contains(&value));
     }
 
     #[test]

@@ -4496,8 +4496,8 @@ async fn dispatch_admin_request(
                     }
                 }
             };
-            // Record provenance verbatim (tidied to one line); the model's
-            // evidence is metadata only and never affects rendering.
+            // Explanatory provenance is normalized and sanitized before it
+            // contributes to preview identity or durable catalog content.
             verb.source_prose = Some(prose_norm);
             if let Some(ev) = verb.evidence.take() {
                 verb.evidence = Some(normalize_ws(&ev));
@@ -4512,6 +4512,14 @@ async fn dispatch_admin_request(
             // pass the synthesis safety gate (no shell/interpreter binary, no
             // over-broad parameter pattern, kebab-case name).
             verb.trusted = false;
+            verb = match guard::gating::verb::canonicalize_synthesized_verb_envelope(verb) {
+                Ok(verb) => verb,
+                Err(e) => {
+                    return AdminResponse::Error {
+                        message: format!("synthesized verb rejected by the safety gate: {e}"),
+                    }
+                }
+            };
             if let Err(e) = guard::gating::verb::validate_synthesized_safety(&verb) {
                 return AdminResponse::Error {
                     message: format!("synthesized verb rejected by the safety gate: {e}"),
@@ -4577,7 +4585,8 @@ async fn dispatch_admin_request(
             // The gate re-runs at install time: the daemon's rules may have
             // tightened since the preview, and the stored shape must never
             // outrank a live rejection.
-            if let Err(e) = guard::gating::verb::validate_synthesized_safety(&verb) {
+            if let Err(e) = guard::gating::verb::validate_canonical_synthesized_verb_envelope(&verb)
+            {
                 return AdminResponse::Error {
                     message: format!("previewed verb rejected by the safety gate: {e}"),
                 };

@@ -1,23 +1,24 @@
 //! Evidence-based API request shape learning for proxied `evaluate` traffic.
 //!
 //! API promotion is deterministic: the learned shape is the exact observed
-//! `(protocol, verb, group, version, resource, subresource, namespace,
-//! body-shape)` tuple, with the object name deliberately excluded and the body
+//! `ApiShape` identity, with the object name deliberately excluded and the body
 //! reduced to a value-free key skeleton. There is no regex and no model-authored
 //! synthesis in this path, so a promoted shape matches only requests structurally
-//! identical to the ones the evaluator approved. A learned verdict is stamped
-//! with the evaluator regime (model plus intent) that produced it and is
-//! distrusted once that regime changes, mirroring verb-promotion stamping.
+//! identical across every field `ApiShape::key` defines. A learned verdict is
+//! stamped with the evaluator regime that produced it and is distrusted once
+//! that regime changes, mirroring verb-promotion stamping.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use super::{Reversibility, EXECUTE_NOW_MAX_RISK, HOLD_RISK_THRESHOLD};
 use crate::env::now_unix;
 use crate::learned_rules::{
-    preserve_corrupt_learning_file, sanitize_learning_text, write_learning_file_atomically,
+    preserve_corrupt_learning_file, recover_learning_file_transaction, sanitize_learning_text,
+    write_learning_file_atomically, LearningWriteOutcome,
 };
 use crate::proxy::ApiRequestSummary;
 use crate::redact::{named_value_contains_sensitive_literals, text_contains_sensitive_literals};
@@ -47,19 +48,29 @@ impl ApiPromotionConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApiPromotionFile {
-    #[serde(default = "default_version")]
     pub version: u32,
     #[serde(default)]
     pub buckets: BTreeMap<String, ApiShapeBucket>,
 }
 
 fn default_version() -> u32 {
-    3
+    4
+}
+
+impl Default for ApiPromotionFile {
+    fn default() -> Self {
+        Self {
+            version: default_version(),
+            buckets: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApiShapeBucket {
     #[serde(default)]
     pub endpoint: String,
@@ -124,6 +135,7 @@ pub enum ApiCoverageProvenance {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApiCoverageEntry {
     pub key: String,
     pub protocol: String,
@@ -185,35 +197,28 @@ impl ApiShape {
     }
 
     fn key(&self) -> String {
-        // Escape the field delimiter so no component value can collide two
-        // distinct shapes into one bucket.
-        fn esc(s: &str) -> String {
-            s.replace('\\', "\\\\").replace('|', "\\|")
-        }
-        let authority_selectors = self
-            .authority_selectors
+        let identity = serde_json::json!({
+            "endpoint": self.endpoint,
+            "session_fingerprint": self.session_fingerprint,
+            "session_revision": self.session_revision,
+            "protocol": self.protocol,
+            "verb": self.verb,
+            "group": self.group,
+            "version": self.version,
+            "resource": self.resource,
+            "subresource": self.subresource,
+            "namespace": self.namespace,
+            "authority_selectors": self.authority_selectors,
+            "body_shape": self.body_shape,
+        });
+        let digest = sha2::Sha256::digest(
+            serde_json::to_vec(&identity).expect("API shape identity serializes"),
+        );
+        let digest = digest
             .iter()
-            .map(|(key, value)| format!("{key}={value}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        [
-            self.endpoint.as_str(),
-            self.session_fingerprint.as_deref().unwrap_or(""),
-            self.session_revision.as_deref().unwrap_or(""),
-            self.protocol.as_str(),
-            self.verb.as_str(),
-            self.group.as_str(),
-            self.version.as_str(),
-            self.resource.as_str(),
-            self.subresource.as_deref().unwrap_or(""),
-            self.namespace.as_deref().unwrap_or(""),
-            authority_selectors.as_str(),
-            self.body_shape.as_str(),
-        ]
-        .iter()
-        .map(|f| esc(f))
-        .collect::<Vec<_>>()
-        .join("|")
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        format!("api-shape-v1:{digest}")
     }
 
     fn contains_sensitive_literals(&self) -> bool {
@@ -291,6 +296,39 @@ fn stamp_contains_sensitive_literal(stamp: &str) -> bool {
     !canonical_digest && text_contains_sensitive_literals(stamp)
 }
 
+fn shape_from_bucket(bucket: &ApiShapeBucket) -> ApiShape {
+    ApiShape {
+        endpoint: bucket.endpoint.clone(),
+        session_fingerprint: bucket.session_fingerprint.clone(),
+        session_revision: bucket.session_revision.clone(),
+        protocol: bucket.protocol.clone(),
+        verb: bucket.verb.clone(),
+        group: bucket.group.clone(),
+        version: bucket.version.clone(),
+        resource: bucket.resource.clone(),
+        subresource: bucket.subresource.clone(),
+        namespace: bucket.namespace.clone(),
+        authority_selectors: bucket.authority_selectors.clone(),
+        body_shape: bucket.body_shape.clone(),
+    }
+}
+
+fn validate_current_api_file(data: &ApiPromotionFile) -> Result<()> {
+    if data.version != default_version() {
+        anyhow::bail!("API coverage write requires the current schema version");
+    }
+    for (key, bucket) in &data.buckets {
+        let shape = shape_from_bucket(bucket);
+        if shape.contains_sensitive_literals() || stamp_contains_sensitive_literal(&bucket.stamp) {
+            anyhow::bail!("API coverage contains sensitive authority metadata");
+        }
+        if *key != shape.key() {
+            anyhow::bail!("API coverage key does not match its complete shape identity");
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct ApiLearnedAllow {
     pub shape: ApiShape,
@@ -331,6 +369,7 @@ pub struct ApiPromotionStore {
 
 impl ApiPromotionStore {
     pub fn load(config: ApiPromotionConfig) -> Result<Self> {
+        recover_learning_file_transaction(&config.path)?;
         let mut data = if config.path.exists() {
             let content = std::fs::read(&config.path)
                 .with_context(|| format!("failed to read {}", config.path.display()))?;
@@ -357,8 +396,16 @@ impl ApiPromotionStore {
         } else {
             ApiPromotionFile::default()
         };
+        if data.version == 0 || data.version > default_version() {
+            anyhow::bail!(
+                "unsupported API coverage schema version {}; supported versions are 1 through {}",
+                data.version,
+                default_version()
+            );
+        }
+        let source_version = data.version;
         let now = now_unix();
-        let mut changed = data.version != default_version();
+        let mut changed = source_version != default_version();
         let mut migrated: BTreeMap<String, ApiShapeBucket> = BTreeMap::new();
         for (old_key, mut bucket) in std::mem::take(&mut data.buckets) {
             let sanitized_reason = sanitize_learning_text(&bucket.last_reason);
@@ -369,7 +416,7 @@ impl ApiPromotionStore {
                 changed |= sanitized != *evidence;
                 *evidence = sanitized;
             }
-            if bucket.endpoint.is_empty() {
+            if source_version < default_version() && bucket.endpoint.is_empty() {
                 bucket.endpoint = "default".to_string();
                 changed = true;
             }
@@ -384,20 +431,7 @@ impl ApiPromotionStore {
                 );
                 changed = true;
             }
-            let shape = ApiShape {
-                endpoint: bucket.endpoint.clone(),
-                session_fingerprint: bucket.session_fingerprint.clone(),
-                session_revision: bucket.session_revision.clone(),
-                protocol: bucket.protocol.clone(),
-                verb: bucket.verb.clone(),
-                group: bucket.group.clone(),
-                version: bucket.version.clone(),
-                resource: bucket.resource.clone(),
-                subresource: bucket.subresource.clone(),
-                namespace: bucket.namespace.clone(),
-                authority_selectors: bucket.authority_selectors.clone(),
-                body_shape: bucket.body_shape.clone(),
-            };
+            let shape = shape_from_bucket(&bucket);
             if shape.contains_sensitive_literals()
                 || stamp_contains_sensitive_literal(&bucket.stamp)
             {
@@ -406,16 +440,17 @@ impl ApiPromotionStore {
                 );
             }
             let key = shape.key();
+            if source_version == default_version() && key != old_key {
+                anyhow::bail!("API coverage key does not match its complete shape identity");
+            }
             changed |= key != old_key;
-            match migrated.get(&key) {
-                Some(existing) if existing.last_seen_unix >= bucket.last_seen_unix => {}
-                _ => {
-                    migrated.insert(key, bucket);
-                }
+            if migrated.insert(key.clone(), bucket).is_some() {
+                anyhow::bail!("API coverage normalization produced a conflicting canonical key");
             }
         }
         data.version = default_version();
         data.buckets = migrated;
+        validate_current_api_file(&data)?;
         let store = Self {
             config,
             data,
@@ -423,7 +458,13 @@ impl ApiPromotionStore {
             fail_writes: false,
         };
         if changed {
-            store.save_data(&store.data)?;
+            let outcome = store.save_data(&store.data)?;
+            if let Some(error) = outcome.warning() {
+                tracing::warn!(
+                    "API coverage migration committed with a durability warning: {}",
+                    error
+                );
+            }
         }
         Ok(store)
     }
@@ -808,16 +849,23 @@ impl ApiPromotionStore {
         if candidate == self.data {
             return Ok(());
         }
-        self.save_data(&candidate)?;
+        let outcome = self.save_data(&candidate)?;
         self.data = candidate;
+        if let Some(error) = outcome.warning() {
+            tracing::warn!(
+                "API coverage replacement committed with a durability warning: {}",
+                error
+            );
+        }
         Ok(())
     }
 
-    fn save_data(&self, data: &ApiPromotionFile) -> Result<()> {
+    fn save_data(&self, data: &ApiPromotionFile) -> Result<LearningWriteOutcome> {
         #[cfg(test)]
         if self.fail_writes {
             anyhow::bail!("simulated API coverage write failure");
         }
+        validate_current_api_file(data)?;
         let content = serde_yaml_ng::to_string(data)?;
         write_learning_file_atomically(&self.config.path, &content)
     }
@@ -934,7 +982,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_api_coverage_fails_closed_and_preserves_unique_verified_copies() {
+    fn corrupt_api_coverage_fails_closed_and_deduplicates_verified_copies() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("api.yaml");
         let config = config(path.clone(), 3, 1);
@@ -959,10 +1007,70 @@ mod tests {
                     .starts_with(".api.yaml.corrupt-")
             })
             .collect::<Vec<_>>();
-        assert_eq!(copies.len(), 2);
+        assert_eq!(copies.len(), 1);
         assert!(copies
             .iter()
             .all(|entry| std::fs::read(entry.path()).unwrap() == corrupt));
+    }
+
+    #[test]
+    fn current_api_coverage_rejects_newer_schema_unknown_fields_and_key_mismatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("api.yaml");
+        let cfg = config(path.clone(), 2, 1);
+        let request = summary("api");
+        let mut store = ApiPromotionStore::load(cfg.clone()).unwrap();
+        store.record_deny(&request, "no", "regime").unwrap();
+        let original = std::fs::read(&path).unwrap();
+
+        let mut newer = store.data.clone();
+        newer.version = default_version() + 1;
+        std::fs::write(&path, serde_yaml_ng::to_string(&newer).unwrap()).unwrap();
+        assert!(ApiPromotionStore::load(cfg.clone()).is_err());
+
+        let mut unknown = String::from_utf8(original.clone()).unwrap();
+        unknown.push_str("unknown_authority_field: true\n");
+        std::fs::write(&path, unknown).unwrap();
+        assert!(ApiPromotionStore::load(cfg.clone()).is_err());
+
+        let mut missing_version: serde_yaml_ng::Value =
+            serde_yaml_ng::from_slice(&original).unwrap();
+        missing_version
+            .as_mapping_mut()
+            .unwrap()
+            .remove(serde_yaml_ng::Value::String("version".to_string()));
+        std::fs::write(&path, serde_yaml_ng::to_string(&missing_version).unwrap()).unwrap();
+        assert!(ApiPromotionStore::load(cfg.clone()).is_err());
+
+        let mut mismatched = store.data.clone();
+        let (key, bucket) = mismatched.buckets.pop_first().unwrap();
+        mismatched.buckets.insert(format!("{key}-changed"), bucket);
+        std::fs::write(&path, serde_yaml_ng::to_string(&mismatched).unwrap()).unwrap();
+        assert!(ApiPromotionStore::load(cfg).is_err());
+    }
+
+    #[test]
+    fn legacy_api_key_collision_fails_closed_without_rewriting_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("api.yaml");
+        let cfg = config(path.clone(), 2, 1);
+        let request = summary("api");
+        let mut store = ApiPromotionStore::load(cfg.clone()).unwrap();
+        store.record_deny(&request, "no", "regime").unwrap();
+        let bucket = store.data.buckets.values().next().unwrap().clone();
+        let mut legacy = ApiPromotionFile {
+            version: default_version() - 1,
+            buckets: BTreeMap::new(),
+        };
+        legacy
+            .buckets
+            .insert("legacy-one".to_string(), bucket.clone());
+        legacy.buckets.insert("legacy-two".to_string(), bucket);
+        let bytes = serde_yaml_ng::to_string(&legacy).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert!(ApiPromotionStore::load(cfg).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), bytes);
     }
 
     #[test]
@@ -1203,45 +1311,45 @@ mod tests {
         let mut store =
             ApiPromotionStore::load(config(temp.path().join("api.yaml"), 2, 2)).unwrap();
 
+        let mut seeded_keys = Vec::new();
         for i in 0..MAX_BUCKETS {
-            let key = format!("p{i}|get||v1|pods||ns{i}|{{}}");
-            store.data.buckets.insert(
-                key,
-                ApiShapeBucket {
-                    endpoint: String::new(),
-                    session_fingerprint: None,
-                    session_revision: None,
-                    protocol: format!("p{i}"),
-                    verb: "get".to_string(),
-                    group: String::new(),
-                    version: "v1".to_string(),
-                    resource: "pods".to_string(),
-                    subresource: None,
-                    namespace: Some(format!("ns{i}")),
-                    authority_selectors: BTreeMap::new(),
-                    body_shape: "{}".to_string(),
-                    approvals: 1,
-                    denials: 0,
-                    evidence: Vec::new(),
-                    class_seen: Some(Reversibility::Reversible),
-                    mixed_class: false,
-                    disqualified: false,
-                    promoted_allow: false,
-                    learned_deny: false,
-                    stamp: String::new(),
-                    provenance: ApiCoverageProvenance::Evaluator,
-                    expires_at_unix: None,
-                    max_risk_seen: 1,
-                    first_seen_unix: i as u64,
-                    last_seen_unix: i as u64,
-                    last_reason: String::new(),
-                },
-            );
+            let bucket = ApiShapeBucket {
+                endpoint: String::new(),
+                session_fingerprint: None,
+                session_revision: None,
+                protocol: format!("p{i}"),
+                verb: "get".to_string(),
+                group: String::new(),
+                version: "v1".to_string(),
+                resource: "pods".to_string(),
+                subresource: None,
+                namespace: Some(format!("ns{i}")),
+                authority_selectors: BTreeMap::new(),
+                body_shape: "{}".to_string(),
+                approvals: 1,
+                denials: 0,
+                evidence: Vec::new(),
+                class_seen: Some(Reversibility::Reversible),
+                mixed_class: false,
+                disqualified: false,
+                promoted_allow: false,
+                learned_deny: false,
+                stamp: String::new(),
+                provenance: ApiCoverageProvenance::Evaluator,
+                expires_at_unix: None,
+                max_risk_seen: 1,
+                first_seen_unix: i as u64,
+                last_seen_unix: i as u64,
+                last_reason: String::new(),
+            };
+            let key = shape_from_bucket(&bucket).key();
+            seeded_keys.push(key.clone());
+            store.data.buckets.insert(key, bucket);
         }
         store
             .data
             .buckets
-            .get_mut("p0|get||v1|pods||ns0|{}")
+            .get_mut(&seeded_keys[0])
             .unwrap()
             .provenance = ApiCoverageProvenance::Operator;
         assert_eq!(store.bucket_count(), MAX_BUCKETS);
@@ -1251,8 +1359,8 @@ mod tests {
             .expect("record deny");
 
         assert_eq!(store.bucket_count(), MAX_BUCKETS);
-        assert!(store.data.buckets.contains_key("p0|get||v1|pods||ns0|{}"));
-        assert!(!store.data.buckets.contains_key("p1|get||v1|pods||ns1|{}"));
+        assert!(store.data.buckets.contains_key(&seeded_keys[0]));
+        assert!(!store.data.buckets.contains_key(&seeded_keys[1]));
     }
 
     #[test]

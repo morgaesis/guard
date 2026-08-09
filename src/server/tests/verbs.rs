@@ -779,6 +779,21 @@ fn nonfinite_synthesis_arguments(_request: &str) -> serde_json::Value {
     })
 }
 
+fn synthesis_arguments_with_sensitive_prose(_request: &str) -> serde_json::Value {
+    let value = ["q", "7"].concat();
+    serde_json::json!({
+        "name": "check-compiler",
+        "description": format!("password={value}"),
+        "binary": "rustc",
+        "args": ["--version"],
+        "params": {},
+        "consequence": "reversible",
+        "trusted": false,
+        "prompt_context": format!("password={value}"),
+        "evidence": format!("password={value}")
+    })
+}
+
 fn relative_file_synthesis_arguments(_request: &str) -> serde_json::Value {
     serde_json::json!({
         "name": "apply-fixture",
@@ -1047,6 +1062,64 @@ async fn preview_digest_round_trip_installs_the_exact_reviewed_candidate() {
         .await
         .verb_definition_digest(&installed.name);
     assert_eq!(catalog_digest.as_deref(), Some(digest.as_str()));
+}
+
+#[tokio::test]
+async fn successful_synthesis_sanitizes_preview_persistence_and_admin_projection() {
+    let value = ["q", "7"].concat();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(super::run_verb_synthesis_llm_with(
+        listener,
+        synthesis_arguments_with_sensitive_prose,
+    ));
+    let (mut cfg, daemon) = synthesis_test_config(url);
+    let (catalog_dir, catalog) = file_backed_catalog();
+    cfg.state.verbs = Arc::new(RwLock::new(catalog));
+
+    let response = handle_admin_request_for_test(
+        &cfg,
+        &daemon,
+        AdminRequest::VerbCreate {
+            prose: format!("Inspect compiler version with password={value}."),
+            binary_hint: Some("rustc".to_string()),
+            preview: true,
+            gate_feedback: Vec::new(),
+        },
+    )
+    .await;
+    let AdminResponse::VerbCreated {
+        verb,
+        preview_digest: Some(digest),
+        ..
+    } = response
+    else {
+        panic!("expected sanitized preview");
+    };
+    assert!(!serde_json::to_string(&verb).unwrap().contains(&value));
+    assert_eq!(verb.definition_digest(), digest);
+
+    let _policy = install_static_synthesis_policy(&mut cfg, "allow");
+    let installed = handle_admin_request_for_test(
+        &cfg,
+        &daemon,
+        AdminRequest::VerbCreateFromPreview { digest },
+    )
+    .await;
+    assert!(!serde_json::to_string(&installed).unwrap().contains(&value));
+    let shown = handle_admin_request_for_test(
+        &cfg,
+        &daemon,
+        AdminRequest::VerbShow {
+            name: "check-compiler".to_string(),
+        },
+    )
+    .await;
+    assert!(!serde_json::to_string(&shown).unwrap().contains(&value));
+    let catalog_path = catalog_dir.path().join("verbs.yaml");
+    assert!(!std::fs::read_to_string(catalog_path)
+        .unwrap()
+        .contains(&value));
 }
 
 #[tokio::test]

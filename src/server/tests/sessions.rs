@@ -325,11 +325,10 @@ async fn synthesized_access_carries_the_described_grant() {
     );
 }
 
-/// A model that returns no usable description must not leave the operator with
-/// a blank card, and must never block the request: the daemon derives the
-/// description from the matcher instead.
+/// Model-authored description text does not affect the matcher-derived access
+/// description.
 #[tokio::test]
-async fn undescribed_synthesis_falls_back_to_a_matcher_derived_description() {
+async fn undescribed_synthesis_uses_the_matcher_derived_description() {
     let (description, item) =
         synthesized_access_capability_description(undescribed_compiler_check_arguments).await;
     assert_eq!(

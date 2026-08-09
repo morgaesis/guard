@@ -2680,13 +2680,11 @@ pub(crate) fn sanitize_grant_request(mut request: GrantRequest) -> GrantRequest 
 }
 
 fn sanitize_grant_request_for_migration(request: GrantRequest) -> GrantRequest {
-    let mut request = sanitize_grant_request(request);
-    if !request.request_key.is_empty() {
-        if let Ok(request_key) = request.canonical_access_key() {
-            request.request_key = request_key;
-        }
-    }
-    request
+    // The shared sanitizer rewrites a key only when the original pending
+    // envelope already proves that key and a known canonical normalization
+    // changes the proposal. An inconsistent original remains inconsistent so
+    // validation fails transactionally instead of concealing corruption.
+    sanitize_grant_request(request)
 }
 
 /// Migration pass for persisted command-derived text and durable gate state.
@@ -3959,11 +3957,69 @@ mod tests {
             serde_json::to_value(migrated_verb).unwrap(),
             serde_json::to_value(canonical_verb).unwrap()
         );
-        let connection = Connection::open(migration_path).unwrap();
+        let connection = Connection::open(&migration_path).unwrap();
         let raw_json: String = connection
             .query_row("SELECT json FROM grant_requests", [], |row| row.get(0))
             .unwrap();
         assert!(!raw_json.contains(&value));
+        drop(connection);
+        drop(restarted);
+
+        let second_restart = SessionStore::open(migration_path.clone(), 3_600)
+            .await
+            .unwrap();
+        second_restart.load_grant_requests().await.unwrap();
+        drop(second_restart);
+        let connection = Connection::open(migration_path).unwrap();
+        let repeated_json: String = connection
+            .query_row("SELECT json FROM grant_requests", [], |row| row.get(0))
+            .unwrap();
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(repeated_json, raw_json);
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[tokio::test]
+    async fn schema_v13_rejects_an_inconsistent_original_pending_key_transactionally() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3_600).await.unwrap();
+        let mut request = generated_access_request();
+        request.request_key.push_str("-mismatch");
+        let json = serde_json::to_string(&request).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO grant_requests (handle, json, status, created_unix)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    request.handle,
+                    json,
+                    request.status.as_str(),
+                    encode_u64(request.created_unix).unwrap()
+                ],
+            )
+            .unwrap();
+        connection
+            .pragma_update(None, "user_version", SCHEMA_VERSION - 1)
+            .unwrap();
+        drop(connection);
+        drop(store);
+
+        for _ in 0..2 {
+            assert!(SessionStore::open(path.clone(), 3_600).await.is_err());
+            let connection = Connection::open(&path).unwrap();
+            let version: i64 = connection
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            let durable: String = connection
+                .query_row("SELECT json FROM grant_requests", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, SCHEMA_VERSION - 1);
+            assert_eq!(durable, json);
+        }
     }
 
     #[tokio::test]
