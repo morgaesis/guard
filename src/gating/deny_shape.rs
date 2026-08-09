@@ -26,10 +26,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::env::now_unix;
-use crate::learned_rules::{infer_service_from_binary, write_learning_file_atomically};
+use crate::learned_rules::{
+    infer_service_from_binary, sanitize_learning_text, write_learning_file_atomically,
+};
 use crate::redact::{
     command_contains_sensitive_literals, flattened_args_contain_sensitive_literals,
-    flattened_command_contains_sensitive_literals,
+    flattened_command_contains_sensitive_literals, text_contains_sensitive_literals,
 };
 
 /// Canary strings a synthesized args pattern must NOT match. Each canary
@@ -123,6 +125,10 @@ pub struct DenyShape {
     pub synthesized_at_unix: u64,
     pub updated_at_unix: u64,
     pub last_reason: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_args: Vec<String>,
+    /// Delimiter-joined evidence retained only while loading the legacy format.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub evidence: String,
 }
 
@@ -202,10 +208,25 @@ impl DenyShapeStore {
             .retain(|_, observation| !deny_observation_contains_sensitive_literals(observation));
         data.shapes
             .retain(|shape| !deny_shape_contains_sensitive_literals(shape));
+        let mut changed = original_observations != data.observations.len()
+            || original_shapes != data.shapes.len();
+        for observation in data.observations.values_mut() {
+            let sanitized = sanitize_learning_text(&observation.last_reason);
+            changed |= sanitized != observation.last_reason;
+            observation.last_reason = sanitized;
+        }
+        for shape in &mut data.shapes {
+            let sanitized = sanitize_learning_text(&shape.last_reason);
+            changed |= sanitized != shape.last_reason;
+            shape.last_reason = sanitized;
+            if shape.evidence_args.is_empty() && !shape.evidence.is_empty() {
+                shape.evidence_args = shape.evidence.split(" | ").map(str::to_string).collect();
+                shape.evidence.clear();
+                changed = true;
+            }
+        }
         let store = Self { config, data };
-        if original_observations != store.data.observations.len()
-            || original_shapes != store.data.shapes.len()
-        {
+        if changed {
             store.save()?;
         }
         Ok(store)
@@ -265,6 +286,7 @@ impl DenyShapeStore {
             return Ok(None);
         }
         let service = infer_service_from_binary(binary);
+        let reason = sanitize_learning_text(reason);
         let args_joined = args.join(" ");
         let now = now_unix();
         let key = format!("{service}|{binary}");
@@ -293,14 +315,14 @@ impl DenyShapeStore {
                 first_seen_unix: now,
                 last_seen_unix: now,
                 last_command: command.to_string(),
-                last_reason: reason.to_string(),
+                last_reason: reason.clone(),
                 last_attempt_at_denials: 0,
             });
 
         observation.denials = observation.denials.saturating_add(1);
         observation.last_seen_unix = now;
         observation.last_command = command.to_string();
-        observation.last_reason = reason.to_string();
+        observation.last_reason = reason.clone();
         if !observation.evidence_args.contains(&args_joined)
             && observation.evidence_args.len() < MAX_EVIDENCE_PER_OBSERVATION
         {
@@ -329,7 +351,7 @@ impl DenyShapeStore {
             required_denials: min_denials,
             ready_to_synthesize,
             evidence_args,
-            reason: reason.to_string(),
+            reason,
         }))
     }
 
@@ -352,7 +374,11 @@ impl DenyShapeStore {
         {
             bail!("deny shape evidence contains literal credential material");
         }
+        if text_contains_sensitive_literals(args_pattern) {
+            bail!("deny shape args pattern contains literal credential material");
+        }
         validate_deny_shape_safety(args_pattern, evidence)?;
+        let reason = sanitize_learning_text(reason);
         let now = now_unix();
         if let Some(existing) = self
             .data
@@ -362,7 +388,9 @@ impl DenyShapeStore {
         {
             existing.denials = denials;
             existing.updated_at_unix = now;
-            existing.last_reason = reason.to_string();
+            existing.last_reason = reason.clone();
+            existing.evidence_args = evidence.to_vec();
+            existing.evidence.clear();
         } else {
             let per_binary = self
                 .data
@@ -385,15 +413,23 @@ impl DenyShapeStore {
                 denials,
                 synthesized_at_unix: now,
                 updated_at_unix: now,
-                last_reason: reason.to_string(),
-                evidence: evidence.join(" | "),
+                last_reason: reason,
+                evidence_args: evidence.to_vec(),
+                evidence: String::new(),
             });
         }
         self.save()
     }
 
     fn save(&self) -> Result<()> {
-        let content = serde_yaml_ng::to_string(&self.data)?;
+        let mut data = self.data.clone();
+        for observation in data.observations.values_mut() {
+            observation.last_reason = sanitize_learning_text(&observation.last_reason);
+        }
+        for shape in &mut data.shapes {
+            shape.last_reason = sanitize_learning_text(&shape.last_reason);
+        }
+        let content = serde_yaml_ng::to_string(&data)?;
         write_learning_file_atomically(&self.config.path, &content)
     }
 }
@@ -407,10 +443,17 @@ fn deny_observation_contains_sensitive_literals(observation: &DenyObservation) -
 }
 
 fn deny_shape_contains_sensitive_literals(shape: &DenyShape) -> bool {
-    shape
-        .evidence
-        .split(" | ")
-        .any(|args| flattened_args_contain_sensitive_literals(&shape.binary, args))
+    text_contains_sensitive_literals(&shape.args_pattern)
+        || shape
+            .evidence_args
+            .iter()
+            .any(|args| flattened_args_contain_sensitive_literals(&shape.binary, args))
+        || (!shape.evidence.is_empty()
+            && (flattened_args_contain_sensitive_literals(&shape.binary, &shape.evidence)
+                || shape
+                    .evidence
+                    .split(" | ")
+                    .any(|args| flattened_args_contain_sensitive_literals(&shape.binary, args))))
 }
 
 /// Reject a synthesized args pattern that isn't anchored, doesn't compile,
@@ -418,6 +461,9 @@ fn deny_shape_contains_sensitive_literals(shape: &DenyShape) -> bool {
 /// shaped like a chained shell command regardless of the shape it claims to
 /// represent.
 pub fn validate_deny_shape_safety(args_pattern: &str, evidence: &[String]) -> Result<()> {
+    if text_contains_sensitive_literals(args_pattern) {
+        bail!("deny shape args pattern contains literal credential material");
+    }
     if !args_pattern.starts_with('^') || !args_pattern.ends_with('$') {
         bail!(
             "deny shape args pattern {:?} must be fully anchored (^...$)",
@@ -571,6 +617,107 @@ mod tests {
         let loaded = DenyShapeStore::load(config.clone()).unwrap();
         assert_eq!(loaded.data.observations.len(), 1);
         assert_eq!(loaded.data.shapes.len(), 1);
+        let sanitized = std::fs::read(&path).unwrap();
+        assert!(!sanitized
+            .windows(value.len())
+            .any(|window| window == value.as_bytes()));
+        DenyShapeStore::load(config).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), sanitized);
+    }
+
+    #[test]
+    fn deny_shape_regex_and_legacy_delimiter_evidence_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("deny.yaml");
+        let config = config(path.clone(), 1);
+        let mut store = DenyShapeStore::load(config.clone()).unwrap();
+        store
+            .promote_shape(
+                "kubernetes",
+                "kubectl",
+                "^delete pod$",
+                &["delete pod".to_string()],
+                "safe",
+                1,
+            )
+            .unwrap();
+        let value = ["q", "7"].concat();
+        let contaminated_pattern = format!("^(?:password={value})?delete pod$");
+        assert!(store
+            .promote_shape(
+                "kubernetes",
+                "kubectl",
+                &contaminated_pattern,
+                &["delete pod".to_string()],
+                "ignored",
+                1,
+            )
+            .is_err());
+
+        let mut contaminated = store.data.clone();
+        let mut regex_shape = contaminated.shapes[0].clone();
+        regex_shape.args_pattern = contaminated_pattern;
+        contaminated.shapes.push(regex_shape);
+        let mut delimiter_shape = contaminated.shapes[0].clone();
+        delimiter_shape.binary = "docker".to_string();
+        delimiter_shape.evidence_args.clear();
+        delimiter_shape.evidence = "login -p | | ordinary".to_string();
+        contaminated.shapes.push(delimiter_shape);
+        write_learning_file_atomically(&path, &serde_yaml_ng::to_string(&contaminated).unwrap())
+            .unwrap();
+
+        let loaded = DenyShapeStore::load(config.clone()).unwrap();
+        assert_eq!(loaded.shape_count(), 1);
+        let sanitized = std::fs::read(&path).unwrap();
+        assert!(!sanitized
+            .windows(value.len())
+            .any(|window| window == value.as_bytes()));
+        DenyShapeStore::load(config).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), sanitized);
+    }
+
+    #[test]
+    fn deny_learning_prose_is_sanitized_without_changing_shape_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("deny.yaml");
+        let config = config(path.clone(), 1);
+        let value = ["q", "7"].concat();
+        let reason = format!("password={value}");
+        let mut store = DenyShapeStore::load(config.clone()).unwrap();
+        store
+            .record_denial(
+                "kubectl",
+                &["delete".to_string(), "pod".to_string()],
+                "kubectl delete pod",
+                &reason,
+            )
+            .unwrap();
+        store
+            .promote_shape(
+                "kubernetes",
+                "kubectl",
+                "^delete pod$",
+                &["delete pod".to_string()],
+                &reason,
+                1,
+            )
+            .unwrap();
+        let expected_pattern = store.data.shapes[0].args_pattern.clone();
+        assert!(!std::fs::read(&path)
+            .unwrap()
+            .windows(value.len())
+            .any(|window| window == value.as_bytes()));
+
+        let mut contaminated = store.data.clone();
+        contaminated
+            .observations
+            .values_mut()
+            .for_each(|observation| observation.last_reason = reason.clone());
+        contaminated.shapes[0].last_reason = reason;
+        write_learning_file_atomically(&path, &serde_yaml_ng::to_string(&contaminated).unwrap())
+            .unwrap();
+        let loaded = DenyShapeStore::load(config.clone()).unwrap();
+        assert_eq!(loaded.data.shapes[0].args_pattern, expected_pattern);
         let sanitized = std::fs::read(&path).unwrap();
         assert!(!sanitized
             .windows(value.len())

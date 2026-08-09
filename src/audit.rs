@@ -221,42 +221,17 @@ struct AuditEventSerializationView {
 
 impl AuditEvent {
     fn serialization_view(&self) -> AuditEventSerializationView {
-        let redact_detail = self.kind == AuditKind::SecretExposed;
+        let projected = redact_secret_exposure(self);
         AuditEventSerializationView {
-            kind: self.kind,
-            handle: self.handle.clone(),
-            caller: self.caller.clone(),
-            session_fingerprint: self.session_fingerprint.clone(),
-            cwd: self.cwd.clone(),
-            cmd: self.cmd.as_ref().map(|value| {
-                if redact_detail {
-                    "[redacted]".to_string()
-                } else {
-                    value.clone()
-                }
-            }),
-            reason: self.reason.as_ref().map(|value| {
-                if redact_detail {
-                    "[redacted]".to_string()
-                } else {
-                    value.clone()
-                }
-            }),
-            decision_source: self.decision_source.clone(),
-            fields: self
-                .fields
-                .iter()
-                .map(|(key, value)| {
-                    (
-                        key.clone(),
-                        if redact_detail {
-                            "[redacted]".to_string()
-                        } else {
-                            value.clone()
-                        },
-                    )
-                })
-                .collect(),
+            kind: projected.kind,
+            handle: projected.handle,
+            caller: projected.caller,
+            session_fingerprint: projected.session_fingerprint,
+            cwd: projected.cwd,
+            cmd: projected.cmd,
+            reason: projected.reason,
+            decision_source: projected.decision_source,
+            fields: projected.fields,
         }
     }
 }
@@ -367,19 +342,56 @@ impl AuditEvent {
 }
 
 fn redact_secret_exposure(event: &AuditEvent) -> AuditEvent {
-    if event.kind != AuditKind::SecretExposed {
-        return event.clone();
-    }
-
     let mut redacted = event.clone();
-    redacted.cmd = redacted.cmd.map(|_| "[redacted]".to_string());
-    redacted.reason = redacted.reason.map(|_| "[redacted]".to_string());
-    redacted.fields = redacted
-        .fields
-        .into_iter()
-        .map(|(key, _)| (key, "[redacted]".to_string()))
-        .collect();
+    if event.kind == AuditKind::SecretExposed {
+        redacted.cmd = redacted.cmd.map(|_| "[redacted]".to_string());
+        redacted.reason = redacted.reason.map(|_| "[redacted]".to_string());
+        redacted.fields = redacted
+            .fields
+            .into_iter()
+            .map(|(key, _)| (key, "[redacted]".to_string()))
+            .collect();
+    } else if audit_kind_contains_gate_prose(event.kind) {
+        redacted.cwd = redacted
+            .cwd
+            .map(|value| crate::redact::redact_output_text(&value));
+        redacted.cmd = redacted
+            .cmd
+            .map(|value| crate::redact::redact_output_text(&value));
+        redacted.reason = redacted
+            .reason
+            .map(|value| crate::redact::redact_output_text(&value));
+        redacted.fields = redacted
+            .fields
+            .into_iter()
+            .map(|(key, value)| (key, crate::redact::redact_output_text(&value)))
+            .collect();
+    }
     redacted
+}
+
+fn audit_kind_contains_gate_prose(kind: AuditKind) -> bool {
+    matches!(
+        kind,
+        AuditKind::Held
+            | AuditKind::HoldOrphaned
+            | AuditKind::Provisional
+            | AuditKind::ProvisionalInterrupted
+            | AuditKind::ProvisionalAutoConfirmed
+            | AuditKind::ProvisionalCheckFailed
+            | AuditKind::Confirm
+            | AuditKind::Revert
+            | AuditKind::RevertDeferred
+            | AuditKind::RevertFailed
+            | AuditKind::Approved
+            | AuditKind::ApprovedExecuted
+            | AuditKind::ApproveVoided
+            | AuditKind::ApproveExecFailed
+            | AuditKind::ApprovalExpired
+            | AuditKind::ApprovalNote
+            | AuditKind::DeniedHold
+            | AuditKind::StartupRecovery
+    )
 }
 
 fn push_field(line: &mut String, key: &str, value: &str, quoted: bool) {
@@ -1006,6 +1018,21 @@ mod tests {
         assert!(line.contains("cmd=\"[redacted]\""));
         assert!(line.contains("reason=\"[redacted]\""));
         assert!(line.contains("secret=[redacted]"));
+    }
+
+    #[test]
+    fn audit_projections_sanitize_gate_prose_and_trace_fields() {
+        let value = ["q", "7"].concat();
+        let contaminated = format!("password={value}");
+        let event = AuditEvent::new(AuditKind::Approved)
+            .reason(contaminated.clone())
+            .field("trace", contaminated);
+        let line = event.render_line();
+        let json = serde_json::to_vec(&event).unwrap();
+        assert!(!line.contains(&value));
+        assert!(!json
+            .windows(value.len())
+            .any(|window| window == value.as_bytes()));
     }
 
     #[test]

@@ -5918,6 +5918,16 @@ async fn sensitive_armed_approval_is_redacted_and_cannot_resume() {
         let row = rows.iter_mut().find(|row| row.handle == handle).unwrap();
         row.snapshot.binary = "docker.CMD".to_string();
         row.snapshot.args = vec!["login".to_string(), format!("-p:{sensitive}")];
+        row.reason = format!("password={sensitive}");
+        row.notes.push(guard::gating::approval::ApprovalNote {
+            at_unix: now_unix(),
+            author: "operator".to_string(),
+            text: format!("password={sensitive}"),
+        });
+        row.decision_trace = Some(guard::gating::DecisionTrace {
+            guidance: Some(format!("password={sensitive}")),
+            ..guard::gating::DecisionTrace::source("fixture")
+        });
         let (registry, recovered) =
             guard::gating::approval::ApprovalRegistry::from_rows(rows, now_unix());
         assert!(recovered.is_empty());
@@ -5978,8 +5988,11 @@ async fn sensitive_provisional_snapshots_are_redacted_and_cannot_replay() {
         session_revision: None,
         secret_entitlements: None,
         api_revert: None,
-        reason: "fixture provisional".to_string(),
-        decision_trace: None,
+        reason: format!("password={sensitive}"),
+        decision_trace: Some(guard::gating::DecisionTrace {
+            guidance: Some(format!("password={sensitive}")),
+            ..guard::gating::DecisionTrace::source("fixture")
+        }),
         created_unix: now_unix(),
         deadline_unix: now_unix(),
         window_secs: 0,

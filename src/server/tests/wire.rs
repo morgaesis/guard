@@ -126,6 +126,19 @@ fn execute_response_carries_stable_decision_source_and_trace() {
 }
 
 #[test]
+fn execute_response_sanitizes_gate_reason_guidance_and_trace() {
+    let value = ["q", "7"].concat();
+    let contaminated = format!("password={value}");
+    let response = ExecuteResult::denied(contaminated.clone())
+        .with_verb_resolution(Vec::new(), Some(contaminated))
+        .into_response();
+    let encoded = serde_json::to_vec(&response).unwrap();
+    assert!(!encoded
+        .windows(value.len())
+        .any(|window| window == value.as_bytes()));
+}
+
+#[test]
 fn structured_guidance_preserves_access_commands_and_coverage_detail() {
     let response = ExecuteResult::denied("missing authority")
         .with_verb_resolution(

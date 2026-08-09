@@ -9,7 +9,6 @@ use guard::gating::approval::{bound_approval_transcript, Approval, WaiterLease};
 use guard::gating::provisional::{Provisional, ProvisionalStatus};
 use guard::gating::{Coverage, DecisionTrace, DecisionVerbMatch};
 use guard::principal::PrincipalKey;
-use guard::redact::redact_output_text;
 use serde::{Deserialize, Serialize};
 
 use super::execute::audit_session_fingerprint;
@@ -1105,6 +1104,8 @@ pub(super) fn approval_is_armed(approval: &Approval) -> bool {
 
 impl ProvisionalSummary {
     pub(super) fn from_row(p: &Provisional) -> Self {
+        let mut p = p.clone();
+        p.sanitize_explanatory_text();
         // Summaries retain structured argv until the shared classifier has
         // produced each display command.
         Self {
@@ -1124,7 +1125,7 @@ impl ProvisionalSummary {
             confirm_check: p.confirm_check_command_line(),
             control_path: p.control_path.clone(),
             session_fingerprint: p.session_fingerprint.clone(),
-            reason: redact_output_text(&p.reason),
+            reason: p.reason.clone(),
             created_unix: p.created_unix,
             deadline_unix: p.deadline_unix,
             forward_done: p.forward_done,
@@ -1137,7 +1138,7 @@ impl ProvisionalSummary {
                 .collect(),
             principal: p.principal.as_ref().map(|p| p.as_str().to_string()),
             revert_exit: p.revert_exit,
-            revert_detail: p.revert_detail.as_deref().map(redact_output_text),
+            revert_detail: p.revert_detail.clone(),
             decision_trace: p.decision_trace.clone(),
         }
     }
@@ -1145,18 +1146,20 @@ impl ProvisionalSummary {
 
 impl ApprovalSummary {
     pub(super) fn from_row(a: &Approval) -> Self {
+        let mut a = a.clone();
+        a.sanitize_explanatory_text();
         // `ApprovalSnapshot::command_line` applies the structured classifier.
         let (stdout, stdout_truncated) = exposed_transcript(a.result_stdout.as_deref());
         let (stderr, stderr_truncated) = exposed_transcript(a.result_stderr.as_deref());
         Self {
             handle: a.handle.clone(),
-            status: if approval_is_armed(a) {
+            status: if approval_is_armed(&a) {
                 "armed".to_string()
             } else {
                 a.status.as_str().to_string()
             },
             command: a.snapshot.command_line(),
-            reason: redact_output_text(&a.reason),
+            reason: a.reason.clone(),
             risk: a.risk,
             reversibility: a.reversibility.map(|r| r.as_str().to_string()),
             fingerprint: a.snapshot.fingerprint(),
@@ -1172,16 +1175,8 @@ impl ApprovalSummary {
             stderr,
             stdout_truncated,
             stderr_truncated,
-            decided_reason: a.decided_reason.as_deref().map(redact_output_text),
-            notes: a
-                .notes
-                .iter()
-                .map(|note| guard::gating::approval::ApprovalNote {
-                    at_unix: note.at_unix,
-                    author: note.author.clone(),
-                    text: redact_output_text(&note.text),
-                })
-                .collect(),
+            decided_reason: a.decided_reason.clone(),
+            notes: a.notes.clone(),
             decision_trace: a.decision_trace.clone(),
         }
     }
@@ -1394,7 +1389,7 @@ pub(super) fn redacted_verb_match_features(features: &[String]) -> Vec<String> {
     features
         .iter()
         .filter(|feature| !feature.contains(":allowed=") && !feature.contains(":observed="))
-        .cloned()
+        .map(|feature| guard::gating::sanitize_gate_text(feature))
         .collect()
 }
 
@@ -1412,6 +1407,8 @@ pub(super) fn decision_verb_match(matched: &VerbMatchInfo) -> DecisionVerbMatch 
 
 fn redact_verb_matches(matches: &mut [VerbMatchInfo]) {
     for matched in matches {
+        matched.verb = guard::gating::sanitize_gate_text(&matched.verb);
+        matched.cell = guard::gating::sanitize_gate_text(&matched.cell);
         matched.features = redacted_verb_match_features(&matched.features);
     }
 }
@@ -1892,30 +1889,36 @@ impl ExecuteResult {
             .unwrap_or_default();
         let mut verb_matches = self.verb_matches;
         redact_verb_matches(&mut verb_matches);
-        let verb_guidance = self.verb_guidance;
+        let verb_guidance = self
+            .verb_guidance
+            .map(|guidance| guard::gating::sanitize_gate_text(&guidance));
         let decision_source = self.decision_source.as_str().to_string();
-        let decision_trace = Some(DecisionTrace {
-            version: DecisionTrace::VERSION,
-            decision_source: decision_source.clone(),
-            verb_matches: verb_matches.iter().map(decision_verb_match).collect(),
-            failed_dimensions: if allowed {
-                Vec::new()
-            } else {
-                vec![decision_source.clone()]
-            },
-            conflict: verb_guidance
-                .as_ref()
-                .filter(|guidance| guidance.to_ascii_lowercase().contains("conflict"))
-                .cloned(),
-            guidance: verb_guidance.clone(),
-            suggested_grant_delta: verb_guidance
-                .as_ref()
-                .filter(|guidance| guidance.contains("grant"))
-                .cloned(),
-        });
+        let decision_trace = Some(
+            DecisionTrace {
+                version: DecisionTrace::VERSION,
+                decision_source: decision_source.clone(),
+                verb_matches: verb_matches.iter().map(decision_verb_match).collect(),
+                failed_dimensions: if allowed {
+                    Vec::new()
+                } else {
+                    vec![decision_source.clone()]
+                },
+                conflict: verb_guidance
+                    .as_ref()
+                    .filter(|guidance| guidance.to_ascii_lowercase().contains("conflict"))
+                    .cloned(),
+                guidance: verb_guidance.clone(),
+                suggested_grant_delta: verb_guidance
+                    .as_ref()
+                    .filter(|guidance| guidance.contains("grant"))
+                    .cloned(),
+            }
+            .sanitized(),
+        );
         let policy_reason = match self.policy {
             PolicyOutcome::Allowed { reason } | PolicyOutcome::Denied { reason } => reason,
         };
+        let policy_reason = guard::gating::sanitize_gate_text(&policy_reason);
         match self.exec {
             // Legacy arms keep status/handle/coverage = None so a gating-off
             // response is byte-identical to today's wire format.
@@ -1952,7 +1955,10 @@ impl ExecuteResult {
                 // client's perspective nothing ran successfully. The audit
                 // stream still records both POLICY=ALLOWED and EXEC_FAILED.
                 allowed: false,
-                reason: format!("execution error: {}", exec_msg),
+                reason: format!(
+                    "execution error: {}",
+                    guard::gating::sanitize_gate_text(&exec_msg)
+                ),
                 exit_code: None,
                 stdout: None,
                 stderr: None,
@@ -2078,6 +2084,7 @@ impl ExecuteResult {
                 stdout,
                 stderr,
             } => {
+                let containment_reason = guard::gating::sanitize_gate_text(&containment_reason);
                 let command_may_have_run = outcome.command_started();
                 let containment_failure = ContainmentFailure::from(&outcome);
                 let reason = match (command_may_have_run, handle.as_deref()) {

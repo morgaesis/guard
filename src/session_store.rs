@@ -466,6 +466,7 @@ impl SessionStore {
 
         let mut grants = HashMap::new();
         let mut active_exact_updates = Vec::new();
+        let mut retired_active = Vec::new();
         {
             let mut stmt = tx.prepare(
                 "SELECT token, allow_json, deny_json, allow_exact_json, deny_exact_json, activated_verbs_json, override_markers_json, scope_json, expires_at, prompt_append, generated_notes_json, granted_at, static_only, auto_amend, owner_json
@@ -499,9 +500,17 @@ impl SessionStore {
             })?;
             for row in rows {
                 let (token, mut grant) = row?;
-                let changed = purge_sensitive_exact_rules(&mut grant.allow_exact)
-                    | purge_sensitive_exact_rules(&mut grant.deny_exact);
-                if changed {
+                let allow_changed = purge_sensitive_exact_rules(&mut grant.allow_exact);
+                let deny_changed = purge_sensitive_exact_rules(&mut grant.deny_exact);
+                if deny_changed {
+                    retired_active.push(revoked_history_from_grant(
+                        token,
+                        grant,
+                        guard::env::now_unix(),
+                    ));
+                    continue;
+                }
+                if allow_changed {
                     active_exact_updates.push((
                         token.clone(),
                         encode_exact_vec(&grant.allow_exact)?,
@@ -564,6 +573,7 @@ impl SessionStore {
                 history.push(grant);
             }
         }
+        history.extend(retired_active.iter().cloned());
 
         let mut interactions = Vec::new();
         {
@@ -616,13 +626,23 @@ impl SessionStore {
                 params![allow, deny, token],
             )?;
         }
+        for grant in &retired_active {
+            tx.execute(
+                "DELETE FROM session_grants WHERE token = ?1",
+                params![grant.token],
+            )?;
+            insert_historical_grant(&tx, grant)?;
+        }
         for (id, allow, deny) in &history_exact_updates {
             tx.execute(
                 "UPDATE session_history SET allow_exact_json = ?1, deny_exact_json = ?2 WHERE id = ?3",
                 params![allow, deny, id],
             )?;
         }
-        let generation = if active_exact_updates.is_empty() && history_exact_updates.is_empty() {
+        let generation = if active_exact_updates.is_empty()
+            && history_exact_updates.is_empty()
+            && retired_active.is_empty()
+        {
             generation
         } else {
             let next = generation
@@ -780,7 +800,12 @@ impl SessionStore {
             )?;
         }
 
-        for (token, interaction) in snapshot.interactions_snapshot() {
+        for (token, mut interaction) in snapshot.interactions_snapshot() {
+            interaction.command = redact_output_text(&interaction.command);
+            interaction.reason = guard::gating::sanitize_gate_text(&interaction.reason);
+            if let Some(trace) = interaction.decision_trace.as_mut() {
+                trace.sanitize_explanatory_text();
+            }
             tx.execute(
                 "INSERT INTO session_interactions
                  (token, at_unix, command, allowed, source, reason, risk, exec_status, exit_code, secret_refs_json, decision_trace_json)
@@ -1111,10 +1136,10 @@ impl SessionStore {
         // Validate every authority-bearing index before migration sanitization
         // can rewrite redundant columns from JSON and conceal corruption.
         Self::validate_authority_row_indexes(&tx)?;
-        // Databases written before schema v6 may hold credential material that
-        // transited a command line (recorded argv, learned rules, prompts).
-        // Sanitize once as part of the migration; the version bump below makes
-        // this pass run exactly once per database.
+        // Apply the idempotent pre-current-schema cleanup before recording the
+        // current version. The pass sanitizes prose, retires active sessions
+        // whose sensitive exact denies cannot be preserved, removes sensitive
+        // exact authority from history, and repairs durable gate snapshots.
         sanitize_persisted_credentials(&tx)?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
@@ -1900,7 +1925,7 @@ impl SessionStore {
     /// Insert a new provisional or advance an existing row through a legal,
     /// monotonic transition. Creation uses a plain insert. Existing rows are
     /// compared and replaced under one immediate transaction.
-    pub async fn save_provisional(&self, p: Provisional) -> Result<()> {
+    pub async fn save_provisional(&self, mut p: Provisional) -> Result<()> {
         #[cfg(test)]
         if self
             .fail_next_write
@@ -1908,6 +1933,7 @@ impl SessionStore {
         {
             anyhow::bail!("simulated session-store write failure");
         }
+        p.sanitize_explanatory_text();
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || Self::insert_or_advance_provisional_sync(&path, &p))
             .await
@@ -1916,8 +1942,8 @@ impl SessionStore {
 
     pub async fn compare_and_swap_provisional(
         &self,
-        expected: Provisional,
-        next: Provisional,
+        mut expected: Provisional,
+        mut next: Provisional,
     ) -> Result<()> {
         #[cfg(test)]
         if self
@@ -1926,6 +1952,8 @@ impl SessionStore {
         {
             anyhow::bail!("simulated session-store write failure");
         }
+        expected.sanitize_explanatory_text();
+        next.sanitize_explanatory_text();
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
             Self::compare_and_swap_provisional_sync(&path, &expected, &next)
@@ -1967,8 +1995,9 @@ impl SessionStore {
                 }
             }
             Some(durable_json) => {
-                let expected: Provisional =
+                let mut expected: Provisional =
                     serde_json::from_str(&durable_json).context("decode durable provisional")?;
+                expected.sanitize_explanatory_text();
                 Self::compare_and_swap_provisional_transaction(
                     &tx,
                     &expected,
@@ -2058,22 +2087,26 @@ impl SessionStore {
     pub async fn load_provisionals(&self) -> Result<Vec<Provisional>> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = Self::open_connection(&path)?;
+            let mut conn = Self::open_connection(&path)?;
             Self::init_schema(&conn)?;
-            let mut stmt =
-                conn.prepare("SELECT handle, status, created_unix, json FROM gating_provisional")?;
-            let rows = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let rows = {
+                let mut stmt = tx
+                    .prepare("SELECT handle, status, created_unix, json FROM gating_provisional")?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
             let mut out = Vec::new();
             for row in rows {
-                let (handle, status, created_unix, json) = row?;
-                let provisional =
+                let (handle, status, created_unix, json) = row;
+                let mut provisional =
                     serde_json::from_str::<Provisional>(&json).with_context(|| {
                         format!("decode durable provisional {handle} with status {status}")
                     })?;
@@ -2087,8 +2120,16 @@ impl SessionStore {
                 }
                 validate_persisted_provisional(&provisional)
                     .with_context(|| format!("validate durable provisional {handle}"))?;
+                if provisional.sanitize_explanatory_text() {
+                    let sanitized = serde_json::to_string(&provisional)?;
+                    tx.execute(
+                        "UPDATE gating_provisional SET json = ?1 WHERE handle = ?2 AND json = ?3",
+                        params![sanitized, handle, json],
+                    )?;
+                }
                 out.push(provisional);
             }
+            tx.commit()?;
             Ok(out)
         })
         .await
@@ -2099,7 +2140,7 @@ impl SessionStore {
     /// legal, monotonic transition. A stale caller can never replace a decided
     /// row with Pending because the durable row is compared inside the write
     /// transaction.
-    pub async fn save_approval(&self, a: Approval) -> Result<()> {
+    pub async fn save_approval(&self, mut a: Approval) -> Result<()> {
         #[cfg(test)]
         if self
             .fail_next_write
@@ -2107,6 +2148,7 @@ impl SessionStore {
         {
             anyhow::bail!("simulated session-store write failure");
         }
+        a.sanitize_explanatory_text();
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || Self::insert_or_advance_approval_sync(&path, &a))
             .await
@@ -2115,8 +2157,8 @@ impl SessionStore {
 
     pub async fn compare_and_swap_approval(
         &self,
-        expected: Approval,
-        next: Approval,
+        mut expected: Approval,
+        mut next: Approval,
     ) -> Result<()> {
         #[cfg(test)]
         if self
@@ -2125,6 +2167,8 @@ impl SessionStore {
         {
             anyhow::bail!("simulated session-store write failure");
         }
+        expected.sanitize_explanatory_text();
+        next.sanitize_explanatory_text();
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
             Self::compare_and_swap_approval_sync(&path, &expected, &next)
@@ -2166,8 +2210,9 @@ impl SessionStore {
                 }
             }
             Some(durable_json) => {
-                let expected: Approval =
+                let mut expected: Approval =
                     serde_json::from_str(&durable_json).context("decode durable approval")?;
+                expected.sanitize_explanatory_text();
                 Self::compare_and_swap_approval_transaction(&tx, &expected, next, &durable_json)?;
             }
         }
@@ -2254,22 +2299,26 @@ impl SessionStore {
     pub async fn load_approvals(&self) -> Result<Vec<Approval>> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = Self::open_connection(&path)?;
+            let mut conn = Self::open_connection(&path)?;
             Self::init_schema(&conn)?;
-            let mut stmt =
-                conn.prepare("SELECT handle, status, created_unix, json FROM gating_approval")?;
-            let rows = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let rows = {
+                let mut stmt =
+                    tx.prepare("SELECT handle, status, created_unix, json FROM gating_approval")?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
             let mut out = Vec::new();
             for row in rows {
-                let (handle, status, created_unix, json) = row?;
-                let approval = serde_json::from_str::<Approval>(&json).with_context(|| {
+                let (handle, status, created_unix, json) = row;
+                let mut approval = serde_json::from_str::<Approval>(&json).with_context(|| {
                     format!("decode durable approval {handle} with status {status}")
                 })?;
                 if approval.handle != handle
@@ -2282,8 +2331,16 @@ impl SessionStore {
                 }
                 validate_persisted_approval(&approval)
                     .with_context(|| format!("validate durable approval {handle}"))?;
+                if approval.sanitize_explanatory_text() {
+                    let sanitized = serde_json::to_string(&approval)?;
+                    tx.execute(
+                        "UPDATE gating_approval SET json = ?1 WHERE handle = ?2 AND json = ?3",
+                        params![sanitized, handle, json],
+                    )?;
+                }
                 out.push(approval);
             }
+            tx.commit()?;
             Ok(out)
         })
         .await
@@ -2598,7 +2655,7 @@ pub(crate) fn sanitize_grant_request(mut request: GrantRequest) -> GrantRequest 
 /// literal-sensitive structured commands are removed. New writes enforce the
 /// same invariant before storage.
 fn sanitize_persisted_credentials(conn: &Connection) -> Result<()> {
-    let mut exact_authority_changed = false;
+    let exact_authority_changed = repair_sensitive_session_exact_authority(conn)?;
     {
         let mut stmt = conn.prepare(
             "SELECT rowid, command, reason, decision_trace_json FROM session_interactions",
@@ -2632,7 +2689,7 @@ fn sanitize_persisted_credentials(conn: &Connection) -> Result<()> {
     }
     for table in ["session_grants", "session_history"] {
         let mut stmt = conn.prepare(&format!(
-            "SELECT rowid, prompt_append, generated_notes_json, allow_json, deny_json, allow_exact_json, deny_exact_json FROM {table}"
+            "SELECT rowid, prompt_append, generated_notes_json, allow_json, deny_json FROM {table}"
         ))?;
         let rows = stmt
             .query_map([], |row| {
@@ -2642,41 +2699,31 @@ fn sanitize_persisted_credentials(conn: &Connection) -> Result<()> {
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (rowid, prompt, notes, allow, deny, allow_exact, deny_exact) in rows {
+        for (rowid, prompt, notes, allow, deny) in rows {
             let sanitized_prompt = prompt.as_deref().map(redact_output_text);
             let sanitized_notes = sanitize_string_vec_json(&notes);
             let sanitized_allow = sanitize_string_vec_json(&allow);
             let sanitized_deny = sanitize_string_vec_json(&deny);
-            let sanitized_allow_exact = sanitize_exact_rules_json(&allow_exact);
-            let sanitized_deny_exact = sanitize_exact_rules_json(&deny_exact);
-            exact_authority_changed |=
-                sanitized_allow_exact != allow_exact || sanitized_deny_exact != deny_exact;
             if sanitized_prompt != prompt
                 || sanitized_notes != notes
                 || sanitized_allow != allow
                 || sanitized_deny != deny
-                || sanitized_allow_exact != allow_exact
-                || sanitized_deny_exact != deny_exact
             {
                 conn.execute(
                     &format!(
                         "UPDATE {table}
                          SET prompt_append = ?1, generated_notes_json = ?2, allow_json = ?3,
-                             deny_json = ?4, allow_exact_json = ?5, deny_exact_json = ?6
-                         WHERE rowid = ?7"
+                             deny_json = ?4
+                         WHERE rowid = ?5"
                     ),
                     params![
                         sanitized_prompt,
                         sanitized_notes,
                         sanitized_allow,
                         sanitized_deny,
-                        sanitized_allow_exact,
-                        sanitized_deny_exact,
                         rowid
                     ],
                 )?;
@@ -2722,10 +2769,12 @@ fn sanitize_persisted_credentials(conn: &Connection) -> Result<()> {
             let Ok(mut approval) = serde_json::from_str::<Approval>(&json) else {
                 continue;
             };
+            let prose_changed = approval.sanitize_explanatory_text();
             let plain_environment = !approval.snapshot.env.is_empty();
             let sensitive_snapshot = approval.snapshot.contains_sensitive_literals();
             let persisted_verb_params = !approval.snapshot.verb_params.is_empty();
-            if !plain_environment && !sensitive_snapshot && !persisted_verb_params {
+            if !prose_changed && !plain_environment && !sensitive_snapshot && !persisted_verb_params
+            {
                 continue;
             }
             approval.snapshot.env.clear();
@@ -2771,29 +2820,30 @@ fn sanitize_persisted_credentials(conn: &Connection) -> Result<()> {
             let Ok(mut provisional) = serde_json::from_str::<Provisional>(&json) else {
                 continue;
             };
-            if !provisional.contains_sensitive_literals() {
+            let prose_changed = provisional.sanitize_explanatory_text();
+            if !prose_changed && !provisional.contains_sensitive_literals() {
                 continue;
             }
-            provisional.revert_detail = provisional
-                .revert_detail
-                .take()
-                .map(|detail| redact_output_text(&detail));
-            match provisional.status {
-                ProvisionalStatus::Armed | ProvisionalStatus::Reverting => {
-                    provisional.status = ProvisionalStatus::NeedsOperatorDecision;
-                    provisional.revert_detail = Some(SENSITIVE_ARGV_REPLAY_GUIDANCE.to_string());
-                }
-                ProvisionalStatus::NeedsOperatorDecision => {
-                    if provisional.revert_detail.is_none() {
+            if provisional.contains_sensitive_literals() {
+                match provisional.status {
+                    ProvisionalStatus::Armed | ProvisionalStatus::Reverting => {
+                        provisional.status = ProvisionalStatus::NeedsOperatorDecision;
                         provisional.revert_detail =
                             Some(SENSITIVE_ARGV_REPLAY_GUIDANCE.to_string());
                     }
+                    ProvisionalStatus::NeedsOperatorDecision => {
+                        if provisional.revert_detail.is_none() {
+                            provisional.revert_detail =
+                                Some(SENSITIVE_ARGV_REPLAY_GUIDANCE.to_string());
+                        }
+                    }
+                    ProvisionalStatus::Confirmed
+                    | ProvisionalStatus::Reverted
+                    | ProvisionalStatus::RevertFailed => {}
                 }
-                ProvisionalStatus::Confirmed
-                | ProvisionalStatus::Reverted
-                | ProvisionalStatus::RevertFailed => {}
+                provisional.scrub_sensitive_literals();
             }
-            provisional.scrub_sensitive_literals();
+            provisional.sanitize_explanatory_text();
             let sanitized_json = serde_json::to_string(&provisional)?;
             conn.execute(
                 "UPDATE gating_provisional
@@ -2823,15 +2873,7 @@ fn sanitize_decision_trace_json(json: &str) -> String {
     let Ok(mut trace) = serde_json::from_str::<guard::gating::DecisionTrace>(json) else {
         return json.to_string();
     };
-    for field in [
-        &mut trace.conflict,
-        &mut trace.guidance,
-        &mut trace.suggested_grant_delta,
-    ] {
-        if let Some(value) = field.as_mut() {
-            *value = redact_output_text(value);
-        }
-    }
+    trace.sanitize_explanatory_text();
     serde_json::to_string(&trace).unwrap_or_else(|_| json.to_string())
 }
 
@@ -2843,6 +2885,149 @@ fn sanitize_string_vec_json(json: &str) -> String {
         *value = redact_output_text(value);
     }
     serde_json::to_string(&values).unwrap_or_else(|_| json.to_string())
+}
+
+fn revoked_history_from_grant(
+    token: String,
+    grant: SessionGrant,
+    ended_at: u64,
+) -> HistoricalGrant {
+    HistoricalGrant {
+        token,
+        allow: grant.allow,
+        deny: grant.deny,
+        allow_exact: grant.allow_exact,
+        deny_exact: grant.deny_exact,
+        activated_verbs: grant.activated_verbs,
+        override_markers: grant.override_markers,
+        scope: grant.scope,
+        granted_at: grant.granted_at,
+        expires_at: grant.expires_at,
+        ended_at,
+        status: HistoricalStatus::Revoked,
+        prompt_append: grant.prompt_append,
+        generated_notes: grant.generated_notes,
+        static_only: grant.static_only,
+        auto_amend: grant.auto_amend,
+        owner: grant.owner,
+    }
+}
+
+fn insert_historical_grant(conn: &Connection, grant: &HistoricalGrant) -> Result<()> {
+    conn.execute(
+        "INSERT INTO session_history
+         (token, allow_json, deny_json, allow_exact_json, deny_exact_json, activated_verbs_json, override_markers_json, scope_json, granted_at, expires_at, ended_at, status, prompt_append, generated_notes_json, static_only, auto_amend, owner_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+        params![
+            grant.token,
+            encode_vec(&grant.allow)?,
+            encode_vec(&grant.deny)?,
+            encode_exact_vec(&grant.allow_exact)?,
+            encode_exact_vec(&grant.deny_exact)?,
+            encode_vec(&grant.activated_verbs)?,
+            encode_vec(&grant.override_markers)?,
+            encode_scope(&grant.scope)?,
+            encode_u64(grant.granted_at)?,
+            encode_optional_u64(grant.expires_at)?,
+            encode_u64(grant.ended_at)?,
+            encode_historical_status(grant.status),
+            grant.prompt_append,
+            encode_vec(&grant.generated_notes)?,
+            encode_bool(grant.static_only),
+            encode_bool(grant.auto_amend),
+            encode_owner(&grant.owner)?,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Remove literal-sensitive exact authority from pre-current-schema rows.
+/// Sensitive allows can be dropped safely. A sensitive deny on an active
+/// session retires the entire session because preserving broader authority
+/// without that deny would widen access.
+fn repair_sensitive_session_exact_authority(conn: &Connection) -> Result<bool> {
+    let mut changed = false;
+    let mut active = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT token, allow_json, deny_json, allow_exact_json, deny_exact_json, activated_verbs_json, override_markers_json, scope_json, expires_at, prompt_append, generated_notes_json, granted_at, static_only, auto_amend, owner_json
+             FROM session_grants",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                SessionGrant {
+                    allow: decode_vec(&row.get::<_, String>(1)?)?,
+                    deny: decode_vec(&row.get::<_, String>(2)?)?,
+                    allow_exact: decode_exact_vec(&row.get::<_, String>(3)?)?,
+                    deny_exact: decode_exact_vec(&row.get::<_, String>(4)?)?,
+                    activated_verbs: decode_vec(&row.get::<_, String>(5)?)?,
+                    override_markers: decode_vec(&row.get::<_, String>(6)?)?,
+                    scope: decode_scope(&row.get::<_, String>(7)?)?,
+                    expires_at: decode_optional_u64(row.get(8)?)?,
+                    prompt_append: row.get(9)?,
+                    generated_notes: decode_vec(&row.get::<_, String>(10)?)?,
+                    granted_at: decode_u64(row.get(11)?)?,
+                    static_only: decode_bool(row.get(12)?)?,
+                    auto_amend: decode_bool(row.get(13)?)?,
+                    owner: decode_owner(&row.get::<_, String>(14)?)?,
+                },
+            ))
+        })?;
+        for row in rows {
+            active.push(row?);
+        }
+    }
+
+    for (token, mut grant) in active {
+        let allow_changed = purge_sensitive_exact_rules(&mut grant.allow_exact);
+        let deny_changed = purge_sensitive_exact_rules(&mut grant.deny_exact);
+        if deny_changed {
+            conn.execute(
+                "DELETE FROM session_grants WHERE token = ?1",
+                params![token],
+            )?;
+            insert_historical_grant(
+                conn,
+                &revoked_history_from_grant(token, grant, guard::env::now_unix()),
+            )?;
+            changed = true;
+        } else if allow_changed {
+            conn.execute(
+                "UPDATE session_grants SET allow_exact_json = ?1 WHERE token = ?2",
+                params![encode_exact_vec(&grant.allow_exact)?, token],
+            )?;
+            changed = true;
+        }
+    }
+
+    let history_rows = {
+        let mut stmt =
+            conn.prepare("SELECT id, allow_exact_json, deny_exact_json FROM session_history")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (id, allow_json, deny_json) in history_rows {
+        let mut allow = decode_exact_vec(&allow_json)?;
+        let mut deny = decode_exact_vec(&deny_json)?;
+        let row_changed =
+            purge_sensitive_exact_rules(&mut allow) | purge_sensitive_exact_rules(&mut deny);
+        if row_changed {
+            conn.execute(
+                "UPDATE session_history
+                 SET allow_exact_json = ?1, deny_exact_json = ?2 WHERE id = ?3",
+                params![encode_exact_vec(&allow)?, encode_exact_vec(&deny)?, id],
+            )?;
+            changed = true;
+        }
+    }
+    Ok(changed)
 }
 
 fn purge_sensitive_exact_rules(rules: &mut Vec<SessionExactRule>) -> bool {
@@ -2861,14 +3046,6 @@ fn validate_exact_rules_safe(rules: &[SessionExactRule]) -> Result<()> {
         anyhow::bail!("session exact rules cannot persist literal credential argv");
     }
     Ok(())
-}
-
-fn sanitize_exact_rules_json(json: &str) -> String {
-    let Ok(mut rules) = serde_json::from_str::<Vec<SessionExactRule>>(json) else {
-        return json.to_string();
-    };
-    purge_sensitive_exact_rules(&mut rules);
-    serde_json::to_string(&rules).unwrap_or_else(|_| json.to_string())
 }
 
 fn should_vacuum(page_count: u64, free_pages: u64) -> bool {
@@ -3390,6 +3567,26 @@ mod tests {
             static_only: false,
             auto_amend: true,
             owner: SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(1001)),
+        }
+    }
+
+    fn contaminated_trace(value: &str) -> guard::gating::DecisionTrace {
+        guard::gating::DecisionTrace {
+            version: guard::gating::DecisionTrace::VERSION,
+            decision_source: format!("password={value}"),
+            verb_matches: vec![guard::gating::DecisionVerbMatch {
+                verb: format!("password={value}"),
+                cell: format!("password={value}"),
+                scope: format!("password={value}"),
+                action: format!("password={value}"),
+                features: vec![format!("password={value}")],
+                selected: true,
+                overridden: false,
+            }],
+            failed_dimensions: vec![format!("password={value}")],
+            conflict: Some(format!("password={value}")),
+            guidance: Some(format!("password={value}")),
+            suggested_grant_delta: Some(format!("password={value}")),
         }
     }
 
@@ -5277,6 +5474,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gate_prose_is_sanitized_on_write_load_and_durable_repair() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let value = ["q", "7"].concat();
+        let contaminated = format!("password={value}");
+
+        let mut approval = pending_approval("ap-prose");
+        approval.reason = contaminated.clone();
+        approval.decided_reason = Some(contaminated.clone());
+        approval.notes.push(guard::gating::approval::ApprovalNote {
+            at_unix: 1,
+            author: contaminated.clone(),
+            text: contaminated.clone(),
+        });
+        approval.decision_trace = Some(contaminated_trace(&value));
+        store.save_approval(approval).await.unwrap();
+
+        let mut provisional = provisional_row("pv-prose", ProvisionalStatus::Armed);
+        provisional.reason = contaminated.clone();
+        provisional.control_path = Some(contaminated.clone());
+        provisional.revert_detail = Some(contaminated.clone());
+        provisional.decision_trace = Some(contaminated_trace(&value));
+        store.save_provisional(provisional).await.unwrap();
+
+        let conn = Connection::open(&path).unwrap();
+        let approval_json: String = conn
+            .query_row(
+                "SELECT json FROM gating_approval WHERE handle = 'ap-prose'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let provisional_json: String = conn
+            .query_row(
+                "SELECT json FROM gating_provisional WHERE handle = 'pv-prose'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!approval_json.contains(&value));
+        assert!(!provisional_json.contains(&value));
+
+        let mut approval: Approval = serde_json::from_str(&approval_json).unwrap();
+        approval.reason = contaminated.clone();
+        approval.decision_trace = Some(contaminated_trace(&value));
+        let mut provisional: Provisional = serde_json::from_str(&provisional_json).unwrap();
+        provisional.reason = contaminated;
+        provisional.decision_trace = Some(contaminated_trace(&value));
+        conn.execute(
+            "UPDATE gating_approval SET json = ?1 WHERE handle = ?2",
+            params![serde_json::to_string(&approval).unwrap(), approval.handle],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE gating_provisional SET json = ?1 WHERE handle = ?2",
+            params![
+                serde_json::to_string(&provisional).unwrap(),
+                provisional.handle
+            ],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
+            .unwrap();
+        drop(conn);
+
+        let loaded_approvals = store.load_approvals().await.unwrap();
+        let loaded_provisionals = store.load_provisionals().await.unwrap();
+        let approval_bytes = serde_json::to_vec(&loaded_approvals).unwrap();
+        let provisional_bytes = serde_json::to_vec(&loaded_provisionals).unwrap();
+        assert!(!approval_bytes
+            .windows(value.len())
+            .any(|window| window == value.as_bytes()));
+        assert!(!provisional_bytes
+            .windows(value.len())
+            .any(|window| window == value.as_bytes()));
+
+        let conn = Connection::open(&path).unwrap();
+        let json: String = conn
+            .query_row(
+                "SELECT json FROM gating_approval WHERE handle = 'ap-prose'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut approval: Approval = serde_json::from_str(&json).unwrap();
+        approval.reason = format!("password={value}");
+        conn.execute(
+            "UPDATE gating_approval SET json = ?1 WHERE handle = ?2",
+            params![serde_json::to_string(&approval).unwrap(), approval.handle],
+        )
+        .unwrap();
+        drop(conn);
+        let current_schema = store.load_approvals().await.unwrap();
+        let current_bytes = serde_json::to_vec(&current_schema).unwrap();
+        assert!(!current_bytes
+            .windows(value.len())
+            .any(|window| window == value.as_bytes()));
+
+        let conn = Connection::open(path).unwrap();
+        for table in ["gating_approval", "gating_provisional"] {
+            let json: String = conn
+                .query_row(&format!("SELECT json FROM {table}"), [], |row| row.get(0))
+                .unwrap();
+            assert!(!json.contains(&value));
+        }
+    }
+
+    #[tokio::test]
     async fn current_schema_rejects_literal_sensitive_gate_rows() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("state.db");
@@ -5977,5 +6283,91 @@ mod tests {
             SessionStore::read_registry_generation(&conn).unwrap(),
             generation_after_first
         );
+    }
+
+    async fn assert_sensitive_exact_deny_retires_active_session(schema_version: i64) {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.db");
+        let store = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let token = format!("deny-retire-{schema_version}");
+        let mut grant = exact_rule_grant(Vec::new());
+        grant.allow = vec!["docker*".to_string()];
+        let mut registry = SessionRegistry::new();
+        registry.grant(token.clone(), grant);
+        store.persist_registry(&registry).await.unwrap();
+        drop(store);
+
+        let value = ["q", "7"].concat();
+        let deny = vec![SessionExactRule::new(
+            "docker",
+            vec!["login".to_string(), "-p".to_string(), value.clone()],
+        )];
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE session_grants SET deny_exact_json = ?1 WHERE token = ?2",
+            params![serde_json::to_string(&deny).unwrap(), token],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", schema_version)
+            .unwrap();
+        drop(conn);
+
+        let restarted = SessionStore::open(path.clone(), 3600).await.unwrap();
+        let loaded = restarted.load_registry().await.unwrap();
+        assert!(!loaded.has(&token));
+        assert!(loaded
+            .check(
+                &token,
+                "docker",
+                &["run".to_string(), "ordinary-image".to_string()],
+                None,
+            )
+            .is_none());
+        assert!(loaded
+            .check(
+                &token,
+                "docker",
+                &["login".to_string(), "-p".to_string(), value.clone()],
+                None,
+            )
+            .is_none());
+        let retired = loaded
+            .history_snapshot()
+            .into_iter()
+            .find(|row| row.token == token)
+            .unwrap();
+        assert_eq!(retired.status, HistoricalStatus::Revoked);
+        assert!(retired.deny_exact.is_empty());
+
+        let conn = Connection::open(path).unwrap();
+        let active: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_grants WHERE token = ?1",
+                params![retired.token],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, 0);
+        let durable: String = conn
+            .query_row(
+                "SELECT deny_exact_json FROM session_history WHERE token = ?1 ORDER BY id DESC LIMIT 1",
+                params![retired.token],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!durable
+            .as_bytes()
+            .windows(value.len())
+            .any(|window| window == value.as_bytes()));
+    }
+
+    #[tokio::test]
+    async fn current_load_retires_session_when_sensitive_exact_deny_is_stripped() {
+        assert_sensitive_exact_deny_retires_active_session(SCHEMA_VERSION).await;
+    }
+
+    #[tokio::test]
+    async fn pre_current_migration_retires_session_when_sensitive_exact_deny_is_stripped() {
+        assert_sensitive_exact_deny_retires_active_session(SCHEMA_VERSION - 1).await;
     }
 }

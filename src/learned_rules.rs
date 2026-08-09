@@ -26,9 +26,21 @@ use std::path::{Path, PathBuf};
 use crate::env::now_unix;
 use crate::redact::{
     command_contains_sensitive_literals, flattened_command_contains_sensitive_literals,
+    redact_output_text,
 };
 
 pub(crate) fn write_learning_file_atomically(path: &Path, content: &str) -> Result<()> {
+    write_learning_file_atomically_with_sync(path, content, sync_parent_directory)
+}
+
+fn write_learning_file_atomically_with_sync<F>(
+    path: &Path,
+    content: &str,
+    sync_parent: F,
+) -> Result<()>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)
         .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -51,7 +63,24 @@ pub(crate) fn write_learning_file_atomically(path: &Path, content: &str) -> Resu
         .persist(path)
         .map_err(|error| error.error)
         .with_context(|| format!("failed to replace {}", path.display()))?;
+    sync_parent(parent)
+        .with_context(|| format!("failed to sync parent directory {}", parent.display()))?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(parent: &Path) -> Result<()> {
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_parent: &Path) -> Result<()> {
+    Ok(())
+}
+
+pub(crate) fn sanitize_learning_text(value: &str) -> String {
+    redact_output_text(value)
 }
 
 #[derive(Debug, Clone)]
@@ -202,8 +231,9 @@ impl LearnedRuleStore {
             .retain(|_, observation| !learned_observation_contains_sensitive_literals(observation));
         data.rules
             .retain(|rule| !learned_rule_contains_sensitive_literals(rule));
-        let changed =
+        let mut changed =
             original_observations != data.observations.len() || original_rules != data.rules.len();
+        changed |= sanitize_learned_rules_prose(&mut data);
         let store = Self { config, data };
         if changed {
             store.save()?;
@@ -270,6 +300,7 @@ impl LearnedRuleStore {
         }
 
         let candidate = RuleCandidate::from_command(binary, args, command);
+        let reason = sanitize_learning_text(reason);
         let now = now_unix();
         let key = candidate.key();
         let observation = self
@@ -285,7 +316,7 @@ impl LearnedRuleStore {
                 first_seen_unix: now,
                 last_seen_unix: now,
                 last_command: command.to_string(),
-                last_reason: reason.to_string(),
+                last_reason: reason.clone(),
                 shim: candidate.shim.clone(),
             });
 
@@ -293,7 +324,7 @@ impl LearnedRuleStore {
         observation.max_risk_seen = observation.max_risk_seen.max(risk);
         observation.last_seen_unix = now;
         observation.last_command = command.to_string();
-        observation.last_reason = reason.to_string();
+        observation.last_reason = reason.clone();
         observation.shim = candidate.shim.clone();
         observation.equivalent_patterns = candidate.equivalent_patterns.clone();
 
@@ -310,7 +341,7 @@ impl LearnedRuleStore {
                 rule.equivalent_patterns = candidate.equivalent_patterns.clone();
                 rule.max_risk_seen = observation.max_risk_seen;
                 rule.updated_at_unix = now;
-                rule.last_reason = reason.to_string();
+                rule.last_reason = reason.clone();
                 rule.shim = candidate.shim.clone();
             } else {
                 self.data.rules.push(LearnedRule {
@@ -321,7 +352,7 @@ impl LearnedRuleStore {
                     max_risk_seen: observation.max_risk_seen,
                     promoted_at_unix: now,
                     updated_at_unix: now,
-                    last_reason: reason.to_string(),
+                    last_reason: reason.clone(),
                     shim: candidate.shim.clone(),
                 });
             }
@@ -340,9 +371,37 @@ impl LearnedRuleStore {
     }
 
     fn save(&self) -> Result<()> {
-        let content = serde_yaml_ng::to_string(&self.data)?;
+        let mut data = self.data.clone();
+        sanitize_learned_rules_prose(&mut data);
+        let content = serde_yaml_ng::to_string(&data)?;
         write_learning_file_atomically(&self.config.path, &content)
     }
+}
+
+fn sanitize_learned_rules_prose(data: &mut LearnedRulesFile) -> bool {
+    fn sanitize(value: &mut String) -> bool {
+        let sanitized = sanitize_learning_text(value);
+        if sanitized == *value {
+            return false;
+        }
+        *value = sanitized;
+        true
+    }
+
+    let mut changed = false;
+    for observation in data.observations.values_mut() {
+        changed |= sanitize(&mut observation.last_reason);
+        if let Some(shim) = observation.shim.as_mut() {
+            changed |= sanitize(&mut shim.description);
+        }
+    }
+    for rule in &mut data.rules {
+        changed |= sanitize(&mut rule.last_reason);
+        if let Some(shim) = rule.shim.as_mut() {
+            changed |= sanitize(&mut shim.description);
+        }
+    }
+    changed
 }
 
 fn learned_shim_contains_sensitive_literals(shim: &LearnedShim) -> bool {
@@ -399,10 +458,10 @@ impl RuleCandidate {
                         name,
                         target_binary: binary.to_string(),
                         target_args,
-                        description: format!(
+                        description: sanitize_learning_text(&format!(
                             "learned wrapper for {service} via ssh host {}",
                             ssh.host
-                        ),
+                        )),
                     })
                 });
                 let equivalent_patterns = shim
@@ -631,6 +690,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn atomic_writer_propagates_parent_sync_failure_after_replace() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("learned.yaml");
+        std::fs::write(&path, "old").unwrap();
+        let error = write_learning_file_atomically_with_sync(&path, "new", |_| {
+            anyhow::bail!("simulated directory sync failure")
+        })
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("failed to sync parent directory"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "new");
+    }
+
+    #[test]
     fn ssh_parser_keeps_prefix_through_host() {
         let args = vec![
             "-i".to_string(),
@@ -752,6 +826,60 @@ mod tests {
         let loaded = LearnedRuleStore::load(config.clone()).unwrap();
         assert_eq!(loaded.data.observations.len(), 1);
         assert_eq!(loaded.data.rules.len(), 1);
+        let sanitized = std::fs::read(&path).unwrap();
+        assert!(!sanitized
+            .windows(value.len())
+            .any(|window| window == value.as_bytes()));
+        LearnedRuleStore::load(config).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), sanitized);
+    }
+
+    #[test]
+    fn learned_rule_prose_is_sanitized_without_changing_safe_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("learned.yaml");
+        let config = LearningConfig {
+            path: path.clone(),
+            min_approvals: 1,
+            max_risk: 2,
+            auto_shim: AutoShimMode::Suggest,
+        };
+        let value = ["q", "7"].concat();
+        let reason = format!("password={value}");
+        let mut store = LearnedRuleStore::load(config.clone()).unwrap();
+        store
+            .record_approval(
+                "fixturectl",
+                &["status".to_string()],
+                "fixturectl status",
+                Some(1),
+                &reason,
+            )
+            .unwrap();
+        let expected_pattern = store.data.rules[0].pattern.clone();
+        assert!(!std::fs::read(&path)
+            .unwrap()
+            .windows(value.len())
+            .any(|window| window == value.as_bytes()));
+
+        let mut contaminated = store.data.clone();
+        contaminated
+            .observations
+            .values_mut()
+            .for_each(|observation| observation.last_reason = reason.clone());
+        contaminated.rules[0].last_reason = reason.clone();
+        contaminated.rules[0].shim = Some(LearnedShim {
+            name: "fixture-wrapper".to_string(),
+            target_binary: "fixturectl".to_string(),
+            target_args: vec!["status".to_string()],
+            description: reason,
+        });
+        write_learning_file_atomically(&path, &serde_yaml_ng::to_string(&contaminated).unwrap())
+            .unwrap();
+
+        let loaded = LearnedRuleStore::load(config.clone()).unwrap();
+        assert_eq!(loaded.data.rules.len(), 1);
+        assert_eq!(loaded.data.rules[0].pattern, expected_pattern);
         let sanitized = std::fs::read(&path).unwrap();
         assert!(!sanitized
             .windows(value.len())

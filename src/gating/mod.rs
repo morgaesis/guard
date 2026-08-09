@@ -67,6 +67,55 @@ impl DecisionTrace {
             suggested_grant_delta: None,
         }
     }
+
+    /// Redact credential-shaped literals from every explanatory field.
+    /// Decision traces are prose, never execution authority, so sanitizing
+    /// them cannot change what a request is allowed to execute.
+    pub fn sanitize_explanatory_text(&mut self) -> bool {
+        fn sanitize(value: &mut String) -> bool {
+            let sanitized = crate::redact::redact_output_text(value);
+            if sanitized == *value {
+                return false;
+            }
+            *value = sanitized;
+            true
+        }
+
+        let mut changed = sanitize(&mut self.decision_source);
+        for matched in &mut self.verb_matches {
+            changed |= sanitize(&mut matched.verb);
+            changed |= sanitize(&mut matched.cell);
+            changed |= sanitize(&mut matched.scope);
+            changed |= sanitize(&mut matched.action);
+            for feature in &mut matched.features {
+                changed |= sanitize(feature);
+            }
+        }
+        for dimension in &mut self.failed_dimensions {
+            changed |= sanitize(dimension);
+        }
+        for field in [
+            &mut self.conflict,
+            &mut self.guidance,
+            &mut self.suggested_grant_delta,
+        ] {
+            if let Some(value) = field.as_mut() {
+                changed |= sanitize(value);
+            }
+        }
+        changed
+    }
+
+    pub fn sanitized(mut self) -> Self {
+        self.sanitize_explanatory_text();
+        self
+    }
+}
+
+/// Redact credential-shaped literals from gate rationale, notes, lifecycle
+/// detail, and other non-authoritative text.
+pub fn sanitize_gate_text(value: &str) -> String {
+    crate::redact::redact_output_text(value)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

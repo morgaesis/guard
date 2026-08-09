@@ -78,8 +78,8 @@ use super::verb::{
 };
 use super::{Reversibility, EXECUTE_NOW_MAX_RISK, HOLD_RISK_THRESHOLD};
 use crate::env::now_unix;
-use crate::learned_rules::write_learning_file_atomically;
 use crate::learned_rules::{infer_service_from_binary, looks_dangerous_for_learned_allow};
+use crate::learned_rules::{sanitize_learning_text, write_learning_file_atomically};
 use crate::redact::{
     command_contains_sensitive_literals, flattened_command_contains_sensitive_literals,
 };
@@ -209,8 +209,14 @@ impl AllowPromotionStore {
         let original_len = data.observations.len();
         data.observations
             .retain(|_, observation| !allow_observation_contains_sensitive_literals(observation));
+        let mut changed = original_len != data.observations.len();
+        for observation in data.observations.values_mut() {
+            let sanitized = sanitize_learning_text(&observation.last_reason);
+            changed |= sanitized != observation.last_reason;
+            observation.last_reason = sanitized;
+        }
         let store = Self { config, data };
-        if original_len != store.data.observations.len() {
+        if changed {
             store.save()?;
         }
         Ok(store)
@@ -277,6 +283,7 @@ impl AllowPromotionStore {
         }
 
         let service = infer_service_from_binary(binary);
+        let reason = sanitize_learning_text(reason);
         let subcommand = args.first().cloned().unwrap_or_default();
         let arity = args.len();
         let key = format!("{service}|{binary}|{subcommand}|{arity}");
@@ -314,7 +321,7 @@ impl AllowPromotionStore {
                 first_seen_unix: now,
                 last_seen_unix: now,
                 last_command: command.to_string(),
-                last_reason: reason.to_string(),
+                last_reason: reason.clone(),
                 last_attempt_at_approvals: 0,
             });
 
@@ -322,7 +329,7 @@ impl AllowPromotionStore {
         observation.max_risk_seen = observation.max_risk_seen.max(risk_val);
         observation.last_seen_unix = now;
         observation.last_command = command.to_string();
-        observation.last_reason = reason.to_string();
+        observation.last_reason = reason.clone();
         match observation.class_seen {
             None => observation.class_seen = Some(class),
             Some(seen) if seen != class => observation.mixed_class = true,
@@ -371,7 +378,7 @@ impl AllowPromotionStore {
             samples,
             class: out_class,
             max_risk_seen,
-            reason: reason.to_string(),
+            reason,
         }))
     }
 
@@ -400,7 +407,11 @@ impl AllowPromotionStore {
     }
 
     fn save(&self) -> Result<()> {
-        let content = serde_yaml_ng::to_string(&self.data)?;
+        let mut data = self.data.clone();
+        for observation in data.observations.values_mut() {
+            observation.last_reason = sanitize_learning_text(&observation.last_reason);
+        }
+        let content = serde_yaml_ng::to_string(&data)?;
         write_learning_file_atomically(&self.config.path, &content)
     }
 }
@@ -650,6 +661,8 @@ pub(crate) fn build_candidate_verb(
     evidence: String,
     promotion_stamp: String,
 ) -> Verb {
+    let description = sanitize_learning_text(&description);
+    let evidence = sanitize_learning_text(&evidence);
     let fixed_args = args
         .iter()
         .filter(|arg| !(arg.starts_with('{') && arg.ends_with('}')))
@@ -829,6 +842,79 @@ mod tests {
             .any(|window| window == value.as_bytes()));
         AllowPromotionStore::load(config).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), sanitized);
+    }
+
+    #[test]
+    fn allow_promotion_prose_is_sanitized_without_changing_samples() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("allow.yaml");
+        let config = config(path.clone(), 2);
+        let value = ["q", "7"].concat();
+        let reason = format!("password={value}");
+        let safe = args(&["get", "pods"]);
+        let mut store = AllowPromotionStore::load(config.clone()).unwrap();
+        store
+            .record_approval(
+                "kubectl",
+                &safe,
+                "kubectl get pods",
+                Some(1),
+                Some(Reversibility::Reversible),
+                &reason,
+            )
+            .unwrap();
+        let expected_samples = store
+            .data
+            .observations
+            .values()
+            .next()
+            .unwrap()
+            .samples
+            .clone();
+        assert!(!std::fs::read(&path)
+            .unwrap()
+            .windows(value.len())
+            .any(|window| window == value.as_bytes()));
+
+        let mut contaminated = store.data.clone();
+        contaminated
+            .observations
+            .values_mut()
+            .for_each(|observation| observation.last_reason = reason.clone());
+        write_learning_file_atomically(&path, &serde_yaml_ng::to_string(&contaminated).unwrap())
+            .unwrap();
+        let loaded = AllowPromotionStore::load(config.clone()).unwrap();
+        assert_eq!(
+            loaded.data.observations.values().next().unwrap().samples,
+            expected_samples
+        );
+        let sanitized = std::fs::read(&path).unwrap();
+        assert!(!sanitized
+            .windows(value.len())
+            .any(|window| window == value.as_bytes()));
+        AllowPromotionStore::load(config).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), sanitized);
+    }
+
+    #[test]
+    fn promoted_verb_description_and_evidence_are_sanitized() {
+        let value = ["q", "7"].concat();
+        let contaminated = format!("password={value}");
+        let verb = build_candidate_verb(
+            "fixturectl",
+            "fixture-status".to_string(),
+            contaminated.clone(),
+            vec!["status".to_string()],
+            BTreeMap::new(),
+            Reversibility::Reversible,
+            None,
+            contaminated,
+            "fixture-stamp".to_string(),
+        );
+        let encoded = serde_json::to_vec(&verb).unwrap();
+        assert!(!encoded
+            .windows(value.len())
+            .any(|window| window == value.as_bytes()));
     }
 
     #[test]

@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
-use super::{DecisionTrace, GateError};
+use super::{sanitize_gate_text, DecisionTrace, GateError};
 use crate::principal::{scope_eq, PrincipalKey};
 
 /// Lifecycle of a provisional execution.
@@ -173,6 +173,31 @@ impl Provisional {
         crate::redact::redact_command_line(&self.binary, &self.args)
     }
 
+    /// Canonicalize all non-authoritative text before it reaches a registry,
+    /// durable store, audit projection, or wire response.
+    pub fn sanitize_explanatory_text(&mut self) -> bool {
+        fn sanitize(value: &mut String) -> bool {
+            let sanitized = sanitize_gate_text(value);
+            if sanitized == *value {
+                return false;
+            }
+            *value = sanitized;
+            true
+        }
+
+        let mut changed = sanitize(&mut self.reason);
+        if let Some(control_path) = self.control_path.as_mut() {
+            changed |= sanitize(control_path);
+        }
+        if let Some(trace) = self.decision_trace.as_mut() {
+            changed |= trace.sanitize_explanatory_text();
+        }
+        if let Some(detail) = self.revert_detail.as_mut() {
+            changed |= sanitize(detail);
+        }
+        changed
+    }
+
     pub fn revert_command_line(&self) -> String {
         if let Some(api) = &self.api_revert {
             return crate::redact::redact_output_text(&format!(
@@ -313,6 +338,7 @@ impl ProvisionalRegistry {
         let mut items = HashMap::new();
         let mut moved = Vec::new();
         for mut row in rows {
+            row.sanitize_explanatory_text();
             let needs_recovery = row.status == ProvisionalStatus::Reverting
                 || (row.status == ProvisionalStatus::Armed && !row.forward_done);
             if needs_recovery {
@@ -332,7 +358,8 @@ impl ProvisionalRegistry {
         (Self { items }, moved)
     }
 
-    pub fn insert(&mut self, p: Provisional) {
+    pub fn insert(&mut self, mut p: Provisional) {
+        p.sanitize_explanatory_text();
         self.items.insert(p.handle.clone(), p);
     }
 
@@ -347,6 +374,7 @@ impl ProvisionalRegistry {
     ) -> Option<Provisional> {
         let provisional = self.items.get_mut(handle)?;
         provisional.decision_trace = Some(trace);
+        provisional.sanitize_explanatory_text();
         Some(provisional.clone())
     }
 
@@ -430,6 +458,7 @@ impl ProvisionalRegistry {
         p.deadline_unix = 0;
         p.status = ProvisionalStatus::NeedsOperatorDecision;
         p.revert_detail = Some(detail);
+        p.sanitize_explanatory_text();
         Some(p.clone())
     }
 
@@ -600,6 +629,7 @@ impl ProvisionalRegistry {
             p.status = ProvisionalStatus::RevertFailed;
             p.revert_exit = exit;
             p.revert_detail = Some(detail);
+            p.sanitize_explanatory_text();
         }
     }
 
@@ -611,6 +641,7 @@ impl ProvisionalRegistry {
         if let Some(p) = self.items.get_mut(handle) {
             p.status = ProvisionalStatus::NeedsOperatorDecision;
             p.revert_detail = Some(detail);
+            p.sanitize_explanatory_text();
         }
     }
 

@@ -511,6 +511,13 @@ pub fn redact_output_text(text: &str) -> String {
     redacted
 }
 
+/// Whether free-form explanatory text contains a literal the shared output
+/// redactor would replace. This is suitable for rejecting synthesized prose
+/// that becomes authority, such as a learned regular expression.
+pub fn text_contains_sensitive_literals(text: &str) -> bool {
+    redact_output_text(text) != text
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OptionValueKind {
     Credential,
@@ -536,6 +543,49 @@ struct BinaryValuelessOption {
     required_subcommand: Option<&'static str>,
     options: &'static [&'static str],
 }
+
+/// Client programs in the MySQL and MariaDB families that accept the shared
+/// connection password grammar. The optional password arguments are attached
+/// only; bare forms prompt and therefore do not consume the next operand.
+const MYSQL_FAMILY_CLIENTS: &[&str] = &[
+    "mysql",
+    "mysqladmin",
+    "mysqlbinlog",
+    "mysqlcheck",
+    "mysqldump",
+    "mysqlimport",
+    "mysqlpump",
+    "mysqlshow",
+    "mysqlslap",
+    "mariadb",
+    "mariadb-admin",
+    "mariadb-binlog",
+    "mariadb-check",
+    "mariadb-dump",
+    "mariadb-import",
+    "mariadb-show",
+    "mariadb-slap",
+];
+
+const MYSQL_PASSWORD_OPTIONS: &[&str] = &[
+    "-p",
+    "--password",
+    "--password1",
+    "--password2",
+    "--password3",
+];
+
+const MYSQL_VALUELESS_PASSWORD_OPTIONS: &[&str] = &[
+    "-p",
+    "--password",
+    "--password1",
+    "--password2",
+    "--password3",
+    "--skip-password",
+    "--skip-password1",
+    "--skip-password2",
+    "--skip-password3",
+];
 
 /// Opaque credential-taking options whose spelling does not carry enough
 /// meaning for lexical classification. The table stays deliberately bounded:
@@ -565,9 +615,9 @@ const BINARY_OPTION_ALIASES: &[BinaryOptionAlias] = &[
         arity: OptionArity::Required,
     },
     BinaryOptionAlias {
-        binaries: &["mysql", "mariadb", "mysqldump"],
+        binaries: MYSQL_FAMILY_CLIENTS,
         required_subcommand: None,
-        options: &["-p", "--password"],
+        options: MYSQL_PASSWORD_OPTIONS,
         value_kind: OptionValueKind::Credential,
         arity: OptionArity::AttachedOnly,
     },
@@ -609,9 +659,9 @@ const BINARY_VALUELESS_OPTIONS: &[BinaryValuelessOption] = &[
         ],
     },
     BinaryValuelessOption {
-        binaries: &["mysql", "mariadb", "mysqldump"],
+        binaries: MYSQL_FAMILY_CLIENTS,
         required_subcommand: None,
-        options: &["-p", "--password", "--skip-password"],
+        options: MYSQL_VALUELESS_PASSWORD_OPTIONS,
     },
     BinaryValuelessOption {
         binaries: &["docker", "podman"],
@@ -698,6 +748,7 @@ fn container_subcommand<'a>(binary: &str, args: &'a [String]) -> Option<(usize, 
         "--imagestore",
         "--log-level",
         "--module",
+        "--network-cmd-path",
         "--network-config-dir",
         "--out",
         "--root",
@@ -1219,6 +1270,48 @@ mod tests {
     }
 
     #[test]
+    fn mysql_family_password_grammar_preserves_prompt_operands() {
+        let value = ["q", "7"].concat();
+        let clients = [
+            "mysqlcheck",
+            "MYSQLADMIN.EXE",
+            "mariadb-dump.cmd",
+            "MariaDB-Import.COM",
+        ];
+        for binary in clients {
+            for option in [
+                "-p",
+                "--password",
+                "--password1",
+                "--password2",
+                "--password3",
+            ] {
+                assert!(!command_contains_sensitive_literals(
+                    binary,
+                    &[option.to_string(), "ordinary_database".to_string()]
+                ));
+                let attached = if option == "-p" {
+                    format!("{option}{value}")
+                } else {
+                    format!("{option}={value}")
+                };
+                assert!(command_contains_sensitive_literals(binary, &[attached]));
+            }
+            for option in [
+                "--skip-password",
+                "--skip-password1",
+                "--skip-password2",
+                "--skip-password3",
+            ] {
+                assert!(!command_contains_sensitive_literals(
+                    binary,
+                    &[option.to_string(), "ordinary_database".to_string()]
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn container_global_value_options_preserve_login_subcommand() {
         const DOCKER_OPTIONS: &[&str] = &[
             "--config",
@@ -1245,6 +1338,7 @@ mod tests {
             "--imagestore",
             "--log-level",
             "--module",
+            "--network-cmd-path",
             "--network-config-dir",
             "--out",
             "--root",
@@ -1282,6 +1376,42 @@ mod tests {
                     container_subcommand(binary, &attached_args),
                     Some((1, "login"))
                 );
+                if binary == "podman" {
+                    let value = ["q", "7"].concat();
+                    let mut login_args = separate;
+                    login_args.extend(["-p".to_string(), value.clone()]);
+                    assert!(command_contains_sensitive_literals(binary, &login_args));
+                    let mut attached_login_args = attached_args;
+                    attached_login_args.extend(["-p".to_string(), value]);
+                    assert!(command_contains_sensitive_literals(
+                        binary,
+                        &attached_login_args
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn podman_network_global_options_preserve_login_alias_context() {
+        let value = ["q", "7"].concat();
+        for binary in ["podman", "PODMAN.EXE", "C:\\Tools\\podman.CMD"] {
+            for prefix in [
+                vec![
+                    "--network-cmd-path".to_string(),
+                    "ordinary-helper".to_string(),
+                ],
+                vec!["--network-cmd-path=ordinary-helper".to_string()],
+                vec![
+                    "--network-config-dir".to_string(),
+                    "ordinary-config".to_string(),
+                ],
+                vec!["--network-config-dir=ordinary-config".to_string()],
+            ] {
+                let mut args = prefix;
+                args.extend(["login".to_string(), "-p".to_string(), value.clone()]);
+                assert!(command_contains_sensitive_literals(binary, &args));
+                assert!(!redact_command_line(binary, &args).contains(&value));
             }
         }
     }

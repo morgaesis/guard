@@ -233,9 +233,7 @@ fn sanitize_credentials_rules(rules: &mut [SessionExactRule]) {
 
 fn sanitize_credentials_trace(trace: &mut Option<guard::gating::DecisionTrace>) {
     if let Some(trace) = trace.as_mut() {
-        sanitize_credentials_opt(&mut trace.conflict);
-        sanitize_credentials_opt(&mut trace.guidance);
-        sanitize_credentials_opt(&mut trace.suggested_grant_delta);
+        trace.sanitize_explanatory_text();
     }
 }
 
@@ -2460,6 +2458,7 @@ mod tests {
                 ),
             },
         );
+        let trace_value = ["q", "7"].concat();
         let registry = SessionRegistry::from_parts(
             grants,
             Vec::new(),
@@ -2475,7 +2474,20 @@ mod tests {
                     exec_status: SessionExecStatus::Completed,
                     exit_code: Some(0),
                     exposed_secret_refs: Vec::new(),
-                    decision_trace: None,
+                    decision_trace: Some(guard::gating::DecisionTrace {
+                        verb_matches: vec![guard::gating::DecisionVerbMatch {
+                            verb: format!("password={trace_value}"),
+                            cell: format!("password={trace_value}"),
+                            scope: format!("password={trace_value}"),
+                            action: format!("password={trace_value}"),
+                            features: vec![format!("password={trace_value}")],
+                            selected: true,
+                            overridden: false,
+                        }],
+                        failed_dimensions: vec![format!("password={trace_value}")],
+                        guidance: Some(format!("password={trace_value}")),
+                        ..guard::gating::DecisionTrace::source("fixture")
+                    }),
                 },
             )],
             DEFAULT_HISTORY_RETENTION_SECS,
@@ -2488,6 +2500,7 @@ mod tests {
         assert!(!json.contains("SyntheticHunter2Value"), "got: {json}");
         assert!(!json.contains("SyntheticDbPass1"), "got: {json}");
         assert!(json.contains("[REDACTED]"), "got: {json}");
+        assert!(!json.contains(&trace_value));
         let active = report.active.unwrap();
         assert_eq!(active.allow_exact[0].binary, "kubectl");
         assert!(active.allow_exact[0].args[0].contains("[REDACTED]"));
