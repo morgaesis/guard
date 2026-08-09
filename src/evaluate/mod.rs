@@ -33,7 +33,9 @@ use verb_confirm::SYSTEM_PROMPT_CONFIRM_VERB_PROMOTION;
 use crate::gating::allow_promotion::AllowPromotionStore;
 use crate::gating::deny_shape::{split_command_line, DenyShapeStore};
 use crate::gating::GateMode;
-use crate::learned_rules::{AutoShimMode, LearnedRuleStore, LearningOutcome};
+use crate::learned_rules::{
+    run_async_durable_store_operation, AutoShimMode, LearnedRuleStore, LearningOutcome,
+};
 use crate::policy::{PolicyEngine, PolicyMode};
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
@@ -401,8 +403,14 @@ impl Evaluator {
         let Some(store) = &self.learned_rules else {
             return Ok(None);
         };
-        let mut guard = store.write().await;
-        guard.record_approval(binary, args, command, risk, reason)
+        let binary = binary.to_string();
+        let args = args.to_vec();
+        let command = command.to_string();
+        let reason = reason.to_string();
+        run_async_durable_store_operation(store, "learned approval", move |candidate| {
+            candidate.record_approval(&binary, &args, &command, risk, &reason)
+        })
+        .await
     }
 
     /// Hash of the model + prompts backing verb-promotion decisions. See the
@@ -697,13 +705,11 @@ impl Evaluator {
 }
 
 async fn refresh_deny_shapes_once(store: &Arc<RwLock<DenyShapeStore>>) -> anyhow::Result<()> {
-    let refresh_source = store.read().await.clone();
-    let refreshed = tokio::task::spawn_blocking(move || refresh_source.refreshed_copy())
-        .await
-        .map_err(|error| anyhow::anyhow!("learned deny refresh task failed: {error}"))??;
-    let mut current = store.write().await;
-    *current = refreshed;
-    Ok(())
+    run_async_durable_store_operation(store, "learned deny refresh", |candidate| {
+        *candidate = candidate.refreshed_copy()?;
+        Ok(())
+    })
+    .await
 }
 
 #[cfg(test)]

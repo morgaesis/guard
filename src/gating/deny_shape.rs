@@ -31,7 +31,8 @@ use crate::learned_rules::write_learning_file_atomically;
 use crate::learned_rules::{
     infer_service_from_binary, load_learning_file_snapshot, retry_learning_snapshot_conflicts,
     rewrite_learning_file_bounded, sanitize_learning_text,
-    write_learning_file_atomically_for_locked_snapshot, LearningFileSnapshot, LearningWriteOutcome,
+    write_learning_file_atomically_for_locked_snapshot, AsyncDurableStore, LearningFileSnapshot,
+    LearningWriteOutcome,
 };
 use crate::redact::{
     command_contains_sensitive_literals, flattened_args_contain_sensitive_literals,
@@ -582,6 +583,27 @@ pub fn split_command_line(command: &str) -> (&str, &str) {
     }
 }
 
+impl AsyncDurableStore for DenyShapeStore {
+    fn durable_path(&self) -> Option<&Path> {
+        Some(&self.config.path)
+    }
+
+    fn same_in_memory_epoch(&self, other: &Self) -> bool {
+        self.snapshot.same_authority(&other.snapshot) && self.data == other.data
+    }
+
+    fn adopt_async_result(&mut self, baseline: &Self, result: Self) -> Result<()> {
+        if self.same_in_memory_epoch(baseline) {
+            *self = result;
+            return Ok(());
+        }
+        if self.same_in_memory_epoch(&result) {
+            return Ok(());
+        }
+        anyhow::bail!("deny-shape authority changed during asynchronous file I/O")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,6 +614,28 @@ mod tests {
             enabled: true,
             min_denials,
         }
+    }
+
+    #[test]
+    fn delayed_refresh_cannot_replace_a_newer_deny_epoch() {
+        let temp = crate::learned_rules::authority_tempdir();
+        let config = config(temp.path().join("deny.yaml"), 1);
+        let baseline = DenyShapeStore::load(config).unwrap();
+        let delayed_refresh = baseline.clone();
+        let mut current = baseline.clone();
+        current
+            .record_denial(
+                "fixturectl",
+                &["remove".to_string(), "object".to_string()],
+                "fixturectl remove object",
+                "unsafe",
+            )
+            .unwrap();
+
+        assert!(current
+            .adopt_async_result(&baseline, delayed_refresh)
+            .is_err());
+        assert_eq!(current.observation_count(), 1);
     }
 
     #[test]

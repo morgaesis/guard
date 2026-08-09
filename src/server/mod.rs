@@ -23,6 +23,7 @@ use guard::gating::ssh_readonly::{
 };
 use guard::gating::verb::VerbCatalog;
 use guard::gating::GateMode;
+use guard::learned_rules::run_async_durable_store_operation;
 use guard::policy::PolicyMode;
 use guard::principal::PrincipalKey;
 
@@ -371,14 +372,20 @@ struct RequestContext<'a, W> {
 }
 
 impl ServerContext {
+    async fn mutate_verb_catalog<T, F>(&self, task: &'static str, mutation: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut VerbCatalog) -> Result<T> + Send + 'static,
+    {
+        run_async_durable_store_operation(&self.state.verbs, task, mutation).await
+    }
+
     async fn refresh_verb_catalog_for_decision(&self) -> Result<()> {
-        let refresh_source = self.state.verbs.read().await.clone();
-        let refreshed = tokio::task::spawn_blocking(move || refresh_source.refreshed_copy())
-            .await
-            .map_err(|error| anyhow::anyhow!("verb catalog refresh task failed: {error}"))??;
-        let mut current = self.state.verbs.write().await;
-        current.adopt_refreshed_file_authority(refreshed)?;
-        Ok(())
+        run_async_durable_store_operation(&self.state.verbs, "verb catalog refresh", |candidate| {
+            *candidate = candidate.refreshed_copy()?;
+            Ok(())
+        })
+        .await
     }
 
     pub(super) fn emit_event(&self, event: runtime::NotifyEvent) {

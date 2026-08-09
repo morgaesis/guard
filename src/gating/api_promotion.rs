@@ -18,7 +18,7 @@ use super::{Reversibility, EXECUTE_NOW_MAX_RISK, HOLD_RISK_THRESHOLD};
 use crate::env::now_unix;
 use crate::learned_rules::{
     load_learning_file_snapshot, preserve_corrupt_learning_file, retry_learning_snapshot_conflicts,
-    sanitize_learning_text, write_learning_file_atomically_for_locked_snapshot,
+    sanitize_learning_text, write_learning_file_atomically_for_locked_snapshot, AsyncDurableStore,
     LearningFileSnapshot, LearningWriteOutcome,
 };
 use crate::proxy::ApiRequestSummary;
@@ -968,6 +968,27 @@ fn push_evidence(bucket: &mut ApiShapeBucket, summary: &ApiRequestSummary) {
     }
 }
 
+impl AsyncDurableStore for ApiPromotionStore {
+    fn durable_path(&self) -> Option<&Path> {
+        Some(&self.config.path)
+    }
+
+    fn same_in_memory_epoch(&self, other: &Self) -> bool {
+        self.snapshot.same_authority(&other.snapshot) && self.data == other.data
+    }
+
+    fn adopt_async_result(&mut self, baseline: &Self, result: Self) -> Result<()> {
+        if self.same_in_memory_epoch(baseline) {
+            *self = result;
+            return Ok(());
+        }
+        if self.same_in_memory_epoch(&result) {
+            return Ok(());
+        }
+        anyhow::bail!("API coverage authority changed during asynchronous file I/O")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -981,6 +1002,42 @@ mod tests {
             min_denials,
             generated_ttl_secs: DEFAULT_GENERATED_TTL_SECS,
         }
+    }
+
+    #[test]
+    fn delayed_refresh_cannot_restore_coverage_after_a_completed_clear() {
+        let temp = crate::learned_rules::authority_tempdir();
+        let config = config(temp.path().join("api.yaml"), 2, 2);
+        let request = summary("get");
+        let mut baseline = ApiPromotionStore::load(config).unwrap();
+        baseline
+            .record_allow(
+                &request,
+                Some(1),
+                Some(Reversibility::Reversible),
+                "safe",
+                "regime",
+            )
+            .unwrap();
+        baseline
+            .record_allow(
+                &request,
+                Some(1),
+                Some(Reversibility::Reversible),
+                "safe",
+                "regime",
+            )
+            .unwrap();
+        let delayed_refresh = baseline.clone();
+        let refresh_baseline = baseline.clone();
+        assert!(baseline.has_generated_coverage());
+        assert_eq!(baseline.clear_generated().unwrap(), 1);
+
+        assert!(baseline
+            .adopt_async_result(&refresh_baseline, delayed_refresh)
+            .is_err());
+        assert!(!baseline.has_generated_coverage());
+        assert!(baseline.learned_allow(&request, "regime").is_none());
     }
 
     fn summary(name: &str) -> ApiRequestSummary {

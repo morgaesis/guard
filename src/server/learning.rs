@@ -328,7 +328,7 @@ pub(super) async fn maybe_promote_allow_verb(
         return;
     }
     let evaluator = server.state.evaluator.clone();
-    let verbs = server.state.verbs.clone();
+    let server = server.clone();
     let audit_sink = server.state.audit.clone();
     tokio::spawn(async move {
         // `Ok(None)` here means "not confident yet" or a transient LLM
@@ -362,8 +362,13 @@ pub(super) async fn maybe_promote_allow_verb(
                 return;
             }
         };
-        let mut cat = verbs.write().await;
-        match cat.append_verb(&verb) {
+        let candidate = verb.clone();
+        match server
+            .mutate_verb_catalog("auto-promoted verb catalog append", move |catalog| {
+                catalog.append_verb(&candidate)
+            })
+            .await
+        {
             Ok(()) => {
                 let _ = guard::audit::emit(
                     audit_sink.as_deref(),
@@ -382,7 +387,6 @@ pub(super) async fn maybe_promote_allow_verb(
                 );
             }
         }
-        drop(cat);
         if let Err(err) = evaluator.mark_allow_promotion_resolved(&outcome).await {
             tracing::warn!("failed to mark allow-promotion bucket resolved: {}", err);
         }

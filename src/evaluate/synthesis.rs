@@ -5,6 +5,7 @@ use super::redact::redact_for_llm;
 use super::Evaluator;
 use crate::gating::deny_shape::DenyLearningOutcome;
 use crate::gating::verb::Verb;
+use crate::learned_rules::run_async_durable_store_operation;
 use anyhow::{bail, Result};
 use std::time::Duration;
 
@@ -76,8 +77,14 @@ impl Evaluator {
         let Some(store) = &self.deny_shapes else {
             return Ok(None);
         };
-        let mut guard = store.write().await;
-        guard.record_denial(binary, args, command, reason)
+        let binary = binary.to_string();
+        let args = args.to_vec();
+        let command = command.to_string();
+        let reason = reason.to_string();
+        run_async_durable_store_operation(store, "deny-shape observation", move |candidate| {
+            candidate.record_denial(&binary, &args, &command, &reason)
+        })
+        .await
     }
 
     /// Attempt to synthesize and promote a deny shape from an outcome flagged
@@ -100,15 +107,21 @@ impl Evaluator {
         else {
             return Ok(false);
         };
-        let mut guard = store.write().await;
-        guard.promote_shape(
-            &outcome.service,
-            &outcome.binary,
-            &args_pattern,
-            &outcome.evidence_args,
-            &evidence_note,
-            outcome.denials,
-        )?;
+        let service = outcome.service.clone();
+        let binary = outcome.binary.clone();
+        let evidence_args = outcome.evidence_args.clone();
+        let denials = outcome.denials;
+        run_async_durable_store_operation(store, "deny-shape promotion", move |candidate| {
+            candidate.promote_shape(
+                &service,
+                &binary,
+                &args_pattern,
+                &evidence_args,
+                &evidence_note,
+                denials,
+            )
+        })
+        .await?;
         Ok(true)
     }
 

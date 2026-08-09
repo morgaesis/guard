@@ -24,7 +24,9 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::SystemTime;
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 
 use crate::env::now_unix;
 use crate::redact::{
@@ -170,6 +172,71 @@ impl LearningFileSnapshot {
     pub(crate) fn same_authority(&self, other: &Self) -> bool {
         self.generation == other.generation && self.parent_identity == other.parent_identity
     }
+}
+
+/// A file-backed authority store that can be updated on a blocking worker and
+/// conditionally adopted without replacing a newer in-memory epoch.
+pub trait AsyncDurableStore: Clone + Send + Sync + 'static {
+    fn durable_path(&self) -> Option<&Path>;
+    fn same_in_memory_epoch(&self, other: &Self) -> bool;
+    fn adopt_async_result(&mut self, baseline: &Self, result: Self) -> Result<()>;
+}
+
+fn durable_store_coordinator(path: &Path) -> Result<Arc<Semaphore>> {
+    static COORDINATORS: OnceLock<Mutex<BTreeMap<PathBuf, Weak<Semaphore>>>> = OnceLock::new();
+    let key = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut coordinators = COORDINATORS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .map_err(|_| anyhow::anyhow!("durable-store coordinator is unavailable"))?;
+    if let Some(coordinator) = coordinators.get(&key).and_then(Weak::upgrade) {
+        return Ok(coordinator);
+    }
+    let coordinator = Arc::new(Semaphore::new(1));
+    coordinators.insert(key, Arc::downgrade(&coordinator));
+    Ok(coordinator)
+}
+
+async fn acquire_durable_store_permit(path: &Path) -> Result<OwnedSemaphorePermit> {
+    durable_store_coordinator(path)?
+        .acquire_owned()
+        .await
+        .map_err(|_| anyhow::anyhow!("durable-store coordinator closed"))
+}
+
+/// Run one synchronous file transaction on Tokio's blocking pool. The
+/// destination-scoped single-flight permit remains held until the exact
+/// returned snapshot is either adopted or rejected against a newer in-memory
+/// epoch.
+pub async fn run_async_durable_store_operation<S, T, F>(
+    store: &Arc<RwLock<S>>,
+    task: &'static str,
+    operation: F,
+) -> Result<T>
+where
+    S: AsyncDurableStore,
+    T: Send + 'static,
+    F: FnOnce(&mut S) -> Result<T> + Send + 'static,
+{
+    let path = store.read().await.durable_path().map(Path::to_path_buf);
+    let _permit = match path {
+        Some(path) => Some(acquire_durable_store_permit(&path).await?),
+        None => None,
+    };
+    let baseline = store.read().await.clone();
+    let mut worker = baseline.clone();
+    let (result, value) = tokio::task::spawn_blocking(move || {
+        let value = operation(&mut worker)?;
+        Ok::<_, anyhow::Error>((worker, value))
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("{task} task failed: {error}"))??;
+    store.write().await.adopt_async_result(&baseline, result)?;
+    Ok(value)
 }
 
 const MAX_SNAPSHOT_RETRIES: usize = 8;
@@ -616,21 +683,40 @@ fn validate_authority_file(file: &File) -> Result<()> {
 }
 
 #[cfg(windows)]
+fn windows_authority_mutation_mask(directory: bool) -> u32 {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_APPEND_DATA, FILE_DELETE_CHILD,
+        FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA,
+    };
+    let object_specific = if directory {
+        FILE_ADD_FILE
+            | FILE_ADD_SUBDIRECTORY
+            | FILE_DELETE_CHILD
+            | FILE_WRITE_ATTRIBUTES
+            | FILE_WRITE_EA
+    } else {
+        FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA
+    };
+    object_specific
+        | 0x0001_0000 // DELETE
+        | 0x0004_0000 // WRITE_DAC
+        | 0x0008_0000 // WRITE_OWNER
+        | 0x1000_0000 // GENERIC_ALL
+        | 0x4000_0000 // GENERIC_WRITE
+}
+
+#[cfg(windows)]
 fn validate_windows_authority_handle(file: &File, directory: bool) -> Result<()> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
     use windows_sys::Win32::Security::Authorization::{
-        GetExplicitEntriesFromAclW, GetSecurityInfo, GRANT_ACCESS, SET_ACCESS, SE_FILE_OBJECT,
-        TRUSTEE_IS_SID,
+        ConvertStringSidToSidW, GetExplicitEntriesFromAclW, GetSecurityInfo, GRANT_ACCESS,
+        SET_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID,
     };
     use windows_sys::Win32::Security::{
         CreateWellKnownSid, EqualSid, GetTokenInformation, TokenUser, WinBuiltinAdministratorsSid,
         WinLocalSystemSid, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSID,
         SECURITY_MAX_SID_SIZE, TOKEN_QUERY, TOKEN_USER,
-    };
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_APPEND_DATA, FILE_DELETE_CHILD, FILE_WRITE_DATA,
-        FILE_WRITE_EA,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -704,9 +790,35 @@ fn validate_windows_authority_handle(file: &File, directory: bool) -> Result<()>
         Ok(sid)
     }
 
+    fn owner_rights_sid() -> Result<Vec<u8>> {
+        let value = "S-1-3-4\0".encode_utf16().collect::<Vec<_>>();
+        let mut allocated: PSID = std::ptr::null_mut();
+        if unsafe { ConvertStringSidToSidW(value.as_ptr(), &mut allocated) } == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to construct the Windows Owner Rights SID");
+        }
+        let length = unsafe { windows_sys::Win32::Security::GetLengthSid(allocated) };
+        if length == 0 {
+            unsafe { LocalFree(allocated) };
+            return Err(std::io::Error::last_os_error())
+                .context("failed to measure the Windows Owner Rights SID");
+        }
+        let mut sid = vec![0u8; length as usize];
+        let copied = unsafe {
+            windows_sys::Win32::Security::CopySid(length, sid.as_mut_ptr().cast(), allocated)
+        };
+        unsafe { LocalFree(allocated) };
+        if copied == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to copy the Windows Owner Rights SID");
+        }
+        Ok(sid)
+    }
+
     let system = well_known_sid(WinLocalSystemSid)?;
     let administrators = well_known_sid(WinBuiltinAdministratorsSid)?;
     let current_user = current_user_sid()?;
+    let owner_rights = owner_rights_sid()?;
     let mut owner: PSID = std::ptr::null_mut();
     let mut dacl = std::ptr::null_mut();
     let mut descriptor = std::ptr::null_mut();
@@ -744,26 +856,7 @@ fn validate_windows_authority_handle(file: &File, directory: bool) -> Result<()>
         anyhow::bail!("failed to enumerate the Windows authority DACL");
     }
 
-    let dangerous = if directory {
-        FILE_ADD_FILE
-            | FILE_ADD_SUBDIRECTORY
-            | FILE_DELETE_CHILD
-            | FILE_WRITE_EA
-            | 0x0001_0000
-            | 0x0004_0000
-            | 0x0008_0000
-            | 0x1000_0000
-            | 0x4000_0000
-    } else {
-        FILE_WRITE_DATA
-            | FILE_APPEND_DATA
-            | FILE_WRITE_EA
-            | 0x0001_0000
-            | 0x0004_0000
-            | 0x0008_0000
-            | 0x1000_0000
-            | 0x4000_0000
-    };
+    let dangerous = windows_authority_mutation_mask(directory);
     let result = (|| -> Result<()> {
         for entry in unsafe { std::slice::from_raw_parts(entries, count as usize) } {
             if !matches!(entry.grfAccessMode, GRANT_ACCESS | SET_ACCESS)
@@ -777,7 +870,10 @@ fn validate_windows_authority_handle(file: &File, directory: bool) -> Result<()>
             let trustee = entry.Trustee.ptstrName.cast();
             let trusted = unsafe { EqualSid(trustee, owner) } != 0
                 || unsafe { EqualSid(trustee, system.as_ptr().cast_mut().cast()) } != 0
-                || unsafe { EqualSid(trustee, administrators.as_ptr().cast_mut().cast()) } != 0;
+                || unsafe { EqualSid(trustee, administrators.as_ptr().cast_mut().cast()) } != 0
+                // Owner Rights represents the already validated object owner.
+                // Accept it only after the owner check above succeeds.
+                || unsafe { EqualSid(trustee, owner_rights.as_ptr().cast_mut().cast()) } != 0;
             if !trusted {
                 anyhow::bail!("authority DACL grants mutation rights to an untrusted principal");
             }
@@ -3463,6 +3559,27 @@ impl LearnedRuleStore {
     }
 }
 
+impl AsyncDurableStore for LearnedRuleStore {
+    fn durable_path(&self) -> Option<&Path> {
+        Some(&self.config.path)
+    }
+
+    fn same_in_memory_epoch(&self, other: &Self) -> bool {
+        self.snapshot.same_authority(&other.snapshot) && self.data == other.data
+    }
+
+    fn adopt_async_result(&mut self, baseline: &Self, result: Self) -> Result<()> {
+        if self.same_in_memory_epoch(baseline) {
+            *self = result;
+            return Ok(());
+        }
+        if self.same_in_memory_epoch(&result) {
+            return Ok(());
+        }
+        anyhow::bail!("learned-rule authority changed during asynchronous file I/O")
+    }
+}
+
 fn parse_learned_rules_snapshot(
     snapshot: &LearningFileSnapshot,
     path: &Path,
@@ -4229,6 +4346,120 @@ mod tests {
         thread.join().unwrap();
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn asynchronous_mutation_keeps_current_thread_runtime_and_readers_responsive() {
+        let temp = authority_tempdir();
+        let config = LearningConfig {
+            path: temp.path().join("learned.yaml"),
+            min_approvals: 2,
+            max_risk: 2,
+            auto_shim: AutoShimMode::Off,
+        };
+        let store = Arc::new(RwLock::new(LearnedRuleStore::load(config.clone()).unwrap()));
+        let acquired = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let lock_thread = {
+            let path = config.path.clone();
+            let acquired = acquired.clone();
+            let release = release.clone();
+            std::thread::spawn(move || hold_learning_file_lock_for_test(&path, &acquired, &release))
+        };
+        acquired.wait();
+
+        let mutation_store = store.clone();
+        let mutation = tokio::spawn(async move {
+            run_async_durable_store_operation(
+                &mutation_store,
+                "responsive learned-rule mutation",
+                |candidate| {
+                    candidate.record_approval(
+                        "fixturectl",
+                        &["status".to_string()],
+                        "fixturectl status",
+                        Some(1),
+                        "safe",
+                    )
+                },
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            tokio::task::yield_now().await;
+            assert_eq!(store.read().await.rule_count(), 0);
+        })
+        .await
+        .expect("runtime and unrelated store readers remain responsive");
+
+        release.wait();
+        assert!(mutation.await.unwrap().unwrap().is_some());
+        lock_thread.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn destination_coordinator_never_replays_a_committed_observation() {
+        let temp = authority_tempdir();
+        let config = LearningConfig {
+            path: temp.path().join("learned.yaml"),
+            min_approvals: 3,
+            max_risk: 2,
+            auto_shim: AutoShimMode::Off,
+        };
+        let store = Arc::new(RwLock::new(LearnedRuleStore::load(config.clone()).unwrap()));
+        let (committed, release) = pause_post_commit_adoption_for_test("async-race");
+        let first_store = store.clone();
+        let first = tokio::spawn(async move {
+            run_async_durable_store_operation(
+                &first_store,
+                "first coordinated observation",
+                |candidate| {
+                    candidate.record_approval(
+                        "fixturectl",
+                        &["async-race".to_string()],
+                        "fixturectl async-race",
+                        Some(1),
+                        "safe",
+                    )
+                },
+            )
+            .await
+        });
+        tokio::task::spawn_blocking(move || committed.wait())
+            .await
+            .unwrap();
+
+        let second_store = store.clone();
+        let second = tokio::spawn(async move {
+            run_async_durable_store_operation(
+                &second_store,
+                "second coordinated observation",
+                |candidate| {
+                    candidate.record_approval(
+                        "fixturectl",
+                        &["async-race".to_string()],
+                        "fixturectl async-race",
+                        Some(1),
+                        "safe",
+                    )
+                },
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(!second.is_finished());
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .unwrap();
+
+        assert_eq!(first.await.unwrap().unwrap().unwrap().approvals, 1);
+        assert_eq!(second.await.unwrap().unwrap().unwrap().approvals, 2);
+        let loaded = LearnedRuleStore::load(config).unwrap();
+        assert_eq!(
+            loaded.data.observations.values().next().unwrap().approvals,
+            2
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn destination_lock_uses_the_canonical_parent_identity() {
@@ -4549,6 +4780,65 @@ mod tests {
                 0o400
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_mutation_masks_cover_content_metadata_and_replacement_rights() {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_APPEND_DATA, FILE_DELETE_CHILD,
+            FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FILE_WRITE_EA,
+        };
+
+        for right in [
+            FILE_WRITE_ATTRIBUTES,
+            FILE_WRITE_EA,
+            0x0001_0000,
+            0x0004_0000,
+            0x0008_0000,
+            0x1000_0000,
+            0x4000_0000,
+        ] {
+            assert_ne!(windows_authority_mutation_mask(false) & right, 0);
+            assert_ne!(windows_authority_mutation_mask(true) & right, 0);
+        }
+        for right in [FILE_WRITE_DATA, FILE_APPEND_DATA] {
+            assert_ne!(windows_authority_mutation_mask(false) & right, 0);
+        }
+        for right in [FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_DELETE_CHILD] {
+            assert_ne!(windows_authority_mutation_mask(true) & right, 0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_owner_rights_descriptor_supports_fresh_write_recovery_and_reload() {
+        let temp = authority_tempdir();
+        let destination = temp.path().join("state").join("learned.yaml");
+        create_hardened_file_if_absent(&destination, "version: 1\n").unwrap();
+        let first = load_learning_file_snapshot(&destination).unwrap();
+        let outcome = write_learning_file_atomically_for_locked_snapshot(
+            &destination,
+            &first,
+            "version: 1\nrules: []\n",
+        )
+        .unwrap();
+        let (second, warning) = outcome.into_parts();
+        assert!(warning.is_none());
+        write_learning_file_atomically_for_locked_snapshot(
+            &destination,
+            &second,
+            "version: 1\nrules: []\nobservations: {}\n",
+        )
+        .unwrap();
+        recover_learning_file_transaction(&destination).unwrap();
+        let file = owner_only_options()
+            .read(true)
+            .write(true)
+            .open(&destination)
+            .unwrap();
+        validate_authority_file(&file).unwrap();
+        DestinationLock::acquire(&destination).unwrap();
     }
 
     #[cfg(windows)]

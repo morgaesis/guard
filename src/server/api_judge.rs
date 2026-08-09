@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use guard::evaluate::{redact_for_llm, EvalConfig, EvalResult, EvalSource, Evaluator, LlmConfig};
 use guard::gating::api_promotion::{ApiCoverageProvenance, ApiPromotionOutcome, ApiPromotionStore};
 use guard::gating::GateMode;
+use guard::learned_rules::run_async_durable_store_operation;
 use guard::proxy::{ApiCoverageVerdict, ApiJudge, ApiJudgeVerdict, ApiRequestSummary};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -365,13 +366,11 @@ async fn lookup_api_coverage(
 pub(super) async fn refresh_api_coverage_once(
     store: &Arc<RwLock<ApiPromotionStore>>,
 ) -> anyhow::Result<()> {
-    let refresh_source = store.read().await.clone();
-    let refreshed = tokio::task::spawn_blocking(move || refresh_source.refreshed_copy())
-        .await
-        .map_err(|error| anyhow::anyhow!("API coverage refresh task failed: {error}"))??;
-    let mut current = store.write().await;
-    *current = refreshed;
-    Ok(())
+    run_async_durable_store_operation(store, "API coverage refresh", |candidate| {
+        *candidate = candidate.refreshed_copy()?;
+        Ok(())
+    })
+    .await
 }
 
 fn request_stamp(stamp: &str, summary: &ApiRequestSummary) -> String {
@@ -627,31 +626,21 @@ impl DaemonApiJudge {
         let Some(store) = &self.api_promotion else {
             return;
         };
-        let baseline = store.read().await.clone();
-        let mut candidate = baseline.clone();
         let request_stamp = self.request_stamp(summary);
         let summary = summary.clone();
         let reason = reason.to_string();
-        let result = tokio::task::spawn_blocking(move || {
-            let outcome =
-                candidate.record_allow(&summary, risk, reversibility, &reason, &request_stamp)?;
-            Ok::<_, anyhow::Error>((candidate, outcome))
-        })
-        .await;
-        let outcome = match result {
-            Ok(Ok((committed, outcome))) => {
-                let mut current = store.write().await;
-                if current.same_snapshot(&baseline) {
-                    *current = committed;
-                }
-                outcome
-            }
-            Ok(Err(error)) => {
-                tracing::warn!("failed to record API allow-shape observation: {error}");
-                return;
-            }
+        let outcome = match run_async_durable_store_operation(
+            store,
+            "API allow-shape observation",
+            move |candidate| {
+                candidate.record_allow(&summary, risk, reversibility, &reason, &request_stamp)
+            },
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
             Err(error) => {
-                tracing::warn!("API allow-shape observation task failed: {error}");
+                tracing::warn!("failed to record API allow-shape observation: {error}");
                 return;
             }
         };
@@ -681,30 +670,19 @@ impl DaemonApiJudge {
         let Some(store) = &self.api_promotion else {
             return;
         };
-        let baseline = store.read().await.clone();
-        let mut candidate = baseline.clone();
         let request_stamp = self.request_stamp(summary);
         let summary = summary.clone();
         let reason = reason.to_string();
-        let result = tokio::task::spawn_blocking(move || {
-            let outcome = candidate.record_deny(&summary, &reason, &request_stamp)?;
-            Ok::<_, anyhow::Error>((candidate, outcome))
-        })
-        .await;
-        let outcome = match result {
-            Ok(Ok((committed, outcome))) => {
-                let mut current = store.write().await;
-                if current.same_snapshot(&baseline) {
-                    *current = committed;
-                }
-                outcome
-            }
-            Ok(Err(error)) => {
-                tracing::warn!("failed to record API deny-shape observation: {error}");
-                return;
-            }
+        let outcome = match run_async_durable_store_operation(
+            store,
+            "API deny-shape observation",
+            move |candidate| candidate.record_deny(&summary, &reason, &request_stamp),
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
             Err(error) => {
-                tracing::warn!("API deny-shape observation task failed: {error}");
+                tracing::warn!("failed to record API deny-shape observation: {error}");
                 return;
             }
         };

@@ -17,7 +17,7 @@ use super::coverage::reversibility_rank;
 use super::Reversibility;
 use crate::learned_rules::{
     load_learning_file_snapshot, rewrite_learning_file_bounded,
-    write_learning_file_atomically_for_locked_snapshot, LearningFileSnapshot,
+    write_learning_file_atomically_for_locked_snapshot, AsyncDurableStore, LearningFileSnapshot,
 };
 use crate::redact::{
     command_contains_sensitive_literals, named_value_contains_sensitive_literals,
@@ -3345,6 +3345,45 @@ fn match_args_template(
     Some(params)
 }
 
+impl VerbCatalog {
+    fn same_file_generation(&self, other: &Self) -> bool {
+        match (&self.snapshot, &other.snapshot) {
+            (Some(left), Some(right)) => left.same_authority(right),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    fn same_catalog_epoch(&self, other: &Self) -> bool {
+        self.same_file_generation(other)
+            && self.version == other.version
+            && serde_json::to_vec(&self.verbs).ok() == serde_json::to_vec(&other.verbs).ok()
+    }
+}
+
+impl AsyncDurableStore for VerbCatalog {
+    fn durable_path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    fn same_in_memory_epoch(&self, other: &Self) -> bool {
+        self.same_catalog_epoch(other)
+    }
+
+    fn adopt_async_result(&mut self, baseline: &Self, result: Self) -> Result<()> {
+        if self.same_catalog_epoch(&result) {
+            return Ok(());
+        }
+        if self.same_catalog_epoch(baseline) || self.same_file_generation(baseline) {
+            return self.adopt_refreshed_file_authority(result);
+        }
+        if self.same_file_generation(&result) {
+            return Ok(());
+        }
+        anyhow::bail!("verb catalog authority changed during asynchronous file I/O")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5617,5 +5656,34 @@ verbs:
         );
 
         assert_eq!(gate_rejection_guidance("the daemon has no LLM key"), None);
+    }
+}
+#[cfg(test)]
+mod asynchronous_adoption_tests {
+    use super::*;
+
+    #[test]
+    fn delayed_refresh_cannot_restore_a_durably_deleted_verb() {
+        let directory = crate::learned_rules::authority_tempdir();
+        let path = directory.path().join("verbs.yaml");
+        crate::learned_rules::write_authority_file(
+            &path,
+            r#"verbs:
+  - name: inspect-object
+    binary: fixturectl
+    args: ["status"]
+    consequence: reversible
+"#,
+        )
+        .unwrap();
+        let baseline = VerbCatalog::load(&path).unwrap();
+        let delayed_refresh = baseline.clone();
+        let mut current = baseline.clone();
+        current.delete_verb("inspect-object").unwrap();
+
+        assert!(current
+            .adopt_async_result(&baseline, delayed_refresh)
+            .is_err());
+        assert!(current.get("inspect-object").is_none());
     }
 }

@@ -4473,7 +4473,13 @@ async fn dispatch_admin_request(
             }
         }
         AdminRequest::VerbDelete { name } => {
-            match server.state.verbs.write().await.delete_verb(&name) {
+            let delete_name = name.clone();
+            match server
+                .mutate_verb_catalog("verb catalog deletion", move |catalog| {
+                    catalog.delete_verb(&delete_name)
+                })
+                .await
+            {
                 Ok(_) => AdminResponse::Ok,
                 Err(error) => AdminResponse::Error {
                     message: error.to_string(),
@@ -4547,7 +4553,12 @@ async fn dispatch_admin_request(
             let result = if preview {
                 Ok(())
             } else {
-                server.state.verbs.write().await.append_verb(&verb)
+                let candidate = verb.clone();
+                server
+                    .mutate_verb_catalog("verb catalog append", move |catalog| {
+                        catalog.append_verb(&candidate)
+                    })
+                    .await
             };
             match result {
                 Ok(()) => {
@@ -4608,7 +4619,12 @@ async fn dispatch_admin_request(
             if let Err(message) = preflight_synthesized_verb(server, caller, &verb).await {
                 return AdminResponse::Error { message };
             }
-            let result = server.state.verbs.write().await.append_verb(&verb);
+            let candidate = verb.clone();
+            let result = server
+                .mutate_verb_catalog("previewed verb catalog append", move |catalog| {
+                    catalog.append_verb(&candidate)
+                })
+                .await;
             match result {
                 Ok(()) => {
                     server
@@ -4641,11 +4657,14 @@ async fn dispatch_admin_request(
             replacement,
         } => {
             let new_digest = replacement.definition_digest();
-            let result = server.state.verbs.write().await.amend_verb_if_digest(
-                &name,
-                &expected_digest,
-                &replacement,
-            );
+            let amend_name = name.clone();
+            let amend_digest = expected_digest.clone();
+            let amend_replacement = replacement.clone();
+            let result = server
+                .mutate_verb_catalog("verb catalog amendment", move |catalog| {
+                    catalog.amend_verb_if_digest(&amend_name, &amend_digest, &amend_replacement)
+                })
+                .await;
             match result {
                 Ok(previous) => {
                     debug_assert_eq!(previous.definition_digest(), expected_digest);
@@ -4684,37 +4703,22 @@ async fn dispatch_admin_request(
             let Some(store) = &server.state.api_coverage else {
                 return AdminResponse::VerbCoverageCleared { removed: 0 };
             };
-            let baseline = store.read().await.clone();
-            let mut candidate = baseline.clone();
-            let cleared = tokio::task::spawn_blocking(move || {
-                let removed = candidate.clear_generated()?;
-                Ok::<_, anyhow::Error>((candidate, removed))
-            })
-            .await;
-            match cleared {
-                Ok(Ok((committed, removed))) => {
-                    let mut current = store.write().await;
-                    if current.same_snapshot(&baseline) {
-                        *current = committed;
-                    } else if current.has_generated_coverage() {
-                        return AdminResponse::Error {
-                            message:
-                                "API coverage changed while generated coverage was being cleared"
-                                    .to_string(),
-                        };
-                    }
-                    drop(current);
+            match guard::learned_rules::run_async_durable_store_operation(
+                store,
+                "API coverage clear",
+                |candidate| candidate.clear_generated(),
+            )
+            .await
+            {
+                Ok(removed) => {
                     server.emit_audit_ungated(
                         AuditEvent::new(AuditKind::ApiVerbCoverageCleared)
                             .field("removed", removed),
                     );
                     AdminResponse::VerbCoverageCleared { removed }
                 }
-                Ok(Err(error)) => AdminResponse::Error {
-                    message: format!("failed to clear generated API verb coverage: {error}"),
-                },
                 Err(error) => AdminResponse::Error {
-                    message: format!("API coverage clear task failed: {error}"),
+                    message: format!("failed to clear generated API verb coverage: {error}"),
                 },
             }
         }

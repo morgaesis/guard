@@ -83,7 +83,8 @@ use crate::learned_rules::write_learning_file_atomically;
 use crate::learned_rules::{infer_service_from_binary, looks_dangerous_for_learned_allow};
 use crate::learned_rules::{
     retry_learning_snapshot_conflicts, rewrite_learning_file_bounded, sanitize_learning_text,
-    write_learning_file_atomically_for_locked_snapshot, LearningFileSnapshot, LearningWriteOutcome,
+    write_learning_file_atomically_for_locked_snapshot, AsyncDurableStore, LearningFileSnapshot,
+    LearningWriteOutcome,
 };
 use crate::redact::{
     command_contains_sensitive_literals, flattened_command_contains_sensitive_literals,
@@ -798,6 +799,27 @@ pub(crate) fn build_candidate_verb(
         evidence: Some(evidence),
         auto_promoted: true,
         promotion_stamp: Some(promotion_stamp),
+    }
+}
+
+impl AsyncDurableStore for AllowPromotionStore {
+    fn durable_path(&self) -> Option<&Path> {
+        Some(&self.config.path)
+    }
+
+    fn same_in_memory_epoch(&self, other: &Self) -> bool {
+        self.snapshot.same_authority(&other.snapshot) && self.data == other.data
+    }
+
+    fn adopt_async_result(&mut self, baseline: &Self, result: Self) -> Result<()> {
+        if self.same_in_memory_epoch(baseline) {
+            *self = result;
+            return Ok(());
+        }
+        if self.same_in_memory_epoch(&result) {
+            return Ok(());
+        }
+        anyhow::bail!("allow-promotion authority changed during asynchronous file I/O")
     }
 }
 

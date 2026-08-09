@@ -6,6 +6,7 @@ use super::Evaluator;
 use crate::gating::allow_promotion::{self, AllowPromotionOutcome};
 use crate::gating::verb::{validate_auto_promoted_verb_safety, ParamSpec, Verb, VerbCommand};
 use crate::gating::Reversibility;
+use crate::learned_rules::run_async_durable_store_operation;
 use anyhow::{bail, Result};
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -62,8 +63,14 @@ impl Evaluator {
         let Some(store) = &self.allow_promotion else {
             return Ok(None);
         };
-        let mut guard = store.write().await;
-        guard.record_approval(binary, args, command, risk, reversibility, reason)
+        let binary = binary.to_string();
+        let args = args.to_vec();
+        let command = command.to_string();
+        let reason = reason.to_string();
+        run_async_durable_store_operation(store, "allow-promotion observation", move |candidate| {
+            candidate.record_approval(&binary, &args, &command, risk, reversibility, &reason)
+        })
+        .await
     }
 
     /// Permanently exclude `outcome`'s bucket from further promotion
@@ -79,13 +86,14 @@ impl Evaluator {
         let Some(store) = &self.allow_promotion else {
             return Ok(());
         };
-        let mut guard = store.write().await;
-        guard.mark_resolved(
-            &outcome.service,
-            &outcome.binary,
-            &outcome.subcommand,
-            outcome.arity,
-        )
+        let service = outcome.service.clone();
+        let binary = outcome.binary.clone();
+        let subcommand = outcome.subcommand.clone();
+        let arity = outcome.arity;
+        run_async_durable_store_operation(store, "allow-promotion resolution", move |candidate| {
+            candidate.mark_resolved(&service, &binary, &subcommand, arity)
+        })
+        .await
     }
 
     /// Attempt to confirm and build a promotable verb from an outcome flagged
