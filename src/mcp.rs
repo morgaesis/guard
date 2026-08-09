@@ -140,6 +140,10 @@ struct GuardToolResponse {
     status: Option<String>,
     /// Handle for a held/provisional command.
     handle: Option<String>,
+    confirm_deadline_unix: Option<u64>,
+    confirm_window_secs: Option<u64>,
+    auto_revert_durable: Option<bool>,
+    containment_failure: Option<server::ContainmentFailure>,
     approval_options: Vec<String>,
     access_requests: Vec<server::AccessRequestGuidance>,
     /// Honest statement of what the gate checked and did not check.
@@ -174,6 +178,10 @@ impl From<server::ExecuteResponse> for GuardToolResponse {
                 .to_string()
             }),
             handle: response.handle,
+            confirm_deadline_unix: response.confirm_deadline_unix,
+            confirm_window_secs: response.confirm_window_secs,
+            auto_revert_durable: response.auto_revert_durable,
+            containment_failure: response.containment_failure,
             approval_options: response.approval_options,
             access_requests: response.access_requests,
             verb_matches: response.verb_matches,
@@ -1024,6 +1032,16 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
     }
 
     fn list_tools_result(&self) -> Value {
+        let containment_failure_schema = json!({
+            "type": ["object", "null"],
+            "description": "Typed failure detail when containment could not truthfully report an armed timer.",
+            "properties": {
+                "kind": { "type": "string", "enum": ["forward_nonzero_exit", "forward_no_exit_code", "persistence_failure"] },
+                "command_may_have_run": { "type": "boolean" },
+                "forward_exit_code": { "type": ["integer", "null"] }
+            },
+            "required": ["kind", "command_may_have_run"]
+        });
         let mut result = json!({
             "tools": [
                 {
@@ -1116,8 +1134,8 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                             "exit_code": { "type": ["integer", "null"] },
                             "stdout": { "type": ["string", "null"] },
                             "stderr": { "type": ["string", "null"] },
-                            "status": { "type": ["string", "null"], "description": "Consequence-gate outcome: executed, provisional, held, reverted, or dry_run. Null means the legacy gate-off path returned a normal allow/deny result." },
-                            "handle": { "type": ["string", "null"], "description": "Null for an ordinary executed or dry-run result. A denied or held result may carry a durable access-request reference; a provisional result carries its containment handle." },
+                            "status": { "type": ["string", "null"], "description": "Consequence-gate outcome: executed, provisional, held, reverted, or dry_run. Null also covers a typed containment failure." },
+                            "handle": { "type": ["string", "null"], "description": "A denied or held durable request, provisional containment, or resolvable containment-recovery handle when applicable." },
                             "approval_options": {
                                 "type": "array",
                                 "items": { "type": "string" },
@@ -1314,6 +1332,44 @@ impl<E: GuardExecutor, A: GuardAdmin> McpServer<E, A> {
                 }
             ]
         });
+        let output = &mut result["tools"][0]["outputSchema"];
+        let properties = output["properties"]
+            .as_object_mut()
+            .expect("execution output properties");
+        properties.insert(
+            "confirm_deadline_unix".to_string(),
+            json!({
+                "type": ["integer", "null"],
+                "description": "Unix deadline for a durably armed provisional containment window."
+            }),
+        );
+        properties.insert(
+            "confirm_window_secs".to_string(),
+            json!({
+                "type": ["integer", "null"],
+                "description": "Configured duration of a durably armed provisional containment window."
+            }),
+        );
+        properties.insert(
+            "auto_revert_durable".to_string(),
+            json!({
+                "type": ["boolean", "null"],
+                "description": "Whether the daemon durably recorded the armed auto-revert outcome."
+            }),
+        );
+        properties.insert(
+            "containment_failure".to_string(),
+            containment_failure_schema,
+        );
+        output["required"]
+            .as_array_mut()
+            .expect("execution output required fields")
+            .extend([
+                json!("confirm_deadline_unix"),
+                json!("confirm_window_secs"),
+                json!("auto_revert_durable"),
+                json!("containment_failure"),
+            ]);
         if !self.admin_tools {
             result["tools"]
                 .as_array_mut()
@@ -1695,6 +1751,8 @@ fn jsonrpc_error_response(id: Value, code: i64, message: String, data: Option<Va
 }
 
 fn tool_result(result: GuardToolResponse) -> Value {
+    let is_error = result.containment_failure.is_some()
+        || (result.auto_revert_durable == Some(false) && result.containment_failure.is_none());
     let structured = json!({
         "schema_version": TOOL_SCHEMA_VERSION,
         "type": "execution_result",
@@ -1705,6 +1763,10 @@ fn tool_result(result: GuardToolResponse) -> Value {
         "stderr": result.stderr,
         "status": result.status,
         "handle": result.handle,
+        "confirm_deadline_unix": result.confirm_deadline_unix,
+        "confirm_window_secs": result.confirm_window_secs,
+        "auto_revert_durable": result.auto_revert_durable,
+        "containment_failure": result.containment_failure,
         "approval_options": result.approval_options,
         "access_requests": result.access_requests,
         "coverage": result.coverage,
@@ -1721,7 +1783,7 @@ fn tool_result(result: GuardToolResponse) -> Value {
             }
         ],
         "structuredContent": structured,
-        "isError": false
+        "isError": is_error
     })
 }
 
@@ -1736,6 +1798,10 @@ fn tool_error_result(message: String) -> Value {
         "stderr": Value::Null,
         "status": Value::Null,
         "handle": Value::Null,
+        "confirm_deadline_unix": Value::Null,
+        "confirm_window_secs": Value::Null,
+        "auto_revert_durable": Value::Null,
+        "containment_failure": Value::Null,
         "approval_options": [],
         "access_requests": [],
         "coverage": Value::Null,
@@ -1813,6 +1879,41 @@ fn render_tool_text(result: &Value) -> String {
         .unwrap_or_default();
     let decision = decision_text(result);
 
+    let typed_containment_failure = result
+        .get("containment_failure")
+        .is_some_and(|failure| !failure.is_null());
+    let legacy_containment_failure = !typed_containment_failure
+        && result.get("auto_revert_durable").and_then(Value::as_bool) == Some(false);
+    if typed_containment_failure || legacy_containment_failure {
+        let action = if handle.is_empty() {
+            "Operator action required: inspect `guard provisionals`; no recovery handle is available."
+                .to_string()
+        } else {
+            format!(
+                "Operator action required for handle {handle}: inspect `guard provisionals`, then run `guard confirm {handle}` or `guard revert {handle}`."
+            )
+        };
+        let mut out = String::new();
+        if !stdout.is_empty() {
+            out.push_str(stdout);
+            if !stdout.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        if !stderr.is_empty() {
+            out.push_str("stderr:\n");
+            out.push_str(stderr);
+            if !stderr.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        out.push_str(&format!(
+            "CONTAINMENT FAILED: {reason}\nNo auto-revert timer is armed.\n{action}{}",
+            coverage_text(result)
+        ));
+        return out;
+    }
+
     // Consequence-gate outcomes are not denials: surface the handle, the next
     // step, and the honest coverage so the model knows what was NOT verified.
     match status {
@@ -1832,6 +1933,14 @@ fn render_tool_text(result: &Value) -> String {
                 "PROVISIONAL (handle {handle}): applied behind an auto-revert envelope; it reverts unless the operator runs `guard confirm {handle}`.{}",
                 coverage_text(result)
             ));
+            if let (Some(deadline), Some(window)) = (
+                result.get("confirm_deadline_unix").and_then(Value::as_u64),
+                result.get("confirm_window_secs").and_then(Value::as_u64),
+            ) {
+                out.push_str(&format!(
+                    "\nConfirmation window: {window}s; deadline unix {deadline}."
+                ));
+            }
             return out;
         }
         Some("dry_run") => {
@@ -2121,6 +2230,10 @@ mod tests {
                 stderr: None,
                 status: None,
                 handle: None,
+                confirm_deadline_unix: None,
+                confirm_window_secs: None,
+                auto_revert_durable: None,
+                containment_failure: None,
                 approval_options: Vec::new(),
                 access_requests: Vec::new(),
                 coverage: None,
@@ -2337,6 +2450,10 @@ mod tests {
                 stderr: None,
                 status: None,
                 handle: None,
+                confirm_deadline_unix: None,
+                confirm_window_secs: None,
+                auto_revert_durable: None,
+                containment_failure: None,
                 approval_options: Vec::new(),
                 access_requests: Vec::new(),
                 coverage: None,
@@ -2629,6 +2746,10 @@ mod tests {
                 stderr: None,
                 status: None,
                 handle: None,
+                confirm_deadline_unix: None,
+                confirm_window_secs: None,
+                auto_revert_durable: None,
+                containment_failure: None,
                 approval_options: Vec::new(),
                 access_requests: Vec::new(),
                 coverage: None,
@@ -2744,6 +2865,10 @@ mod tests {
             stderr: None,
             status: None,
             handle: None,
+            confirm_deadline_unix: None,
+            confirm_window_secs: None,
+            auto_revert_durable: None,
+            containment_failure: None,
             approval_options: Vec::new(),
             access_requests: Vec::new(),
             coverage: None,
@@ -2776,6 +2901,10 @@ mod tests {
                 stderr: None,
                 status: status.map(str::to_string),
                 handle: handle.map(str::to_string),
+                confirm_deadline_unix: None,
+                confirm_window_secs: None,
+                auto_revert_durable: None,
+                containment_failure: None,
                 approval_options: if status == Some("held") {
                     vec!["guard access approve request-1 --once".to_string()]
                 } else {
@@ -2801,6 +2930,160 @@ mod tests {
         }
     }
 
+    fn execute_response_fixture() -> server::ExecuteResponse {
+        server::ExecuteResponse {
+            allowed: true,
+            reason: "recoverable change".to_string(),
+            exit_code: Some(0),
+            stdout: None,
+            stderr: None,
+            status: Some(server::GateStatus::Provisional),
+            handle: Some("pv-visible".to_string()),
+            approval_options: Vec::new(),
+            access_requests: Vec::new(),
+            coverage: Some(guard::gating::Coverage::contain()),
+            verb_matches: Vec::new(),
+            verb_guidance: None,
+            confirm_deadline_unix: Some(1_700_000_300),
+            confirm_window_secs: Some(300),
+            auto_revert_durable: Some(true),
+            containment_failure: None,
+            decision_source: "static_policy".to_string(),
+            decision_trace: None,
+        }
+    }
+
+    #[test]
+    fn mcp_provisional_result_preserves_and_renders_confirmation_window() {
+        let value = tool_result(execute_response_fixture().into());
+        let structured = &value["structuredContent"];
+        assert_eq!(structured["confirm_deadline_unix"], 1_700_000_300_u64);
+        assert_eq!(structured["confirm_window_secs"], 300);
+        assert_eq!(structured["auto_revert_durable"], true);
+        assert!(structured["containment_failure"].is_null());
+        let text = value["content"][0]["text"].as_str().expect("tool text");
+        assert!(text.contains("pv-visible"));
+        assert!(text.contains("300s"));
+        assert!(text.contains("1700000300"));
+        assert_eq!(value["isError"], false);
+    }
+
+    #[test]
+    fn mcp_started_persistence_failure_is_typed_nonempty_and_actionable() {
+        let mut response = execute_response_fixture();
+        response.allowed = false;
+        response.reason =
+            "containment failed: command may have run; durable outcome unavailable".to_string();
+        response.status = None;
+        response.handle = Some("pv-recovery".to_string());
+        response.confirm_deadline_unix = None;
+        response.confirm_window_secs = None;
+        response.auto_revert_durable = Some(false);
+        response.containment_failure = Some(server::ContainmentFailure {
+            kind: server::ContainmentFailureKind::PersistenceFailure,
+            command_may_have_run: true,
+            forward_exit_code: Some(0),
+        });
+
+        let value = tool_result(response.into());
+        let structured = &value["structuredContent"];
+        assert_eq!(structured["status"], Value::Null);
+        assert_eq!(
+            structured["containment_failure"]["kind"],
+            "persistence_failure"
+        );
+        assert_eq!(
+            structured["containment_failure"]["command_may_have_run"],
+            true
+        );
+        assert_eq!(structured["containment_failure"]["forward_exit_code"], 0);
+        assert!(structured["confirm_deadline_unix"].is_null());
+        assert!(structured["confirm_window_secs"].is_null());
+        assert_eq!(structured["auto_revert_durable"], false);
+        assert_eq!(value["isError"], true);
+        let text = value["content"][0]["text"].as_str().expect("tool text");
+        assert!(!text.is_empty());
+        assert!(text.contains("CONTAINMENT FAILED"));
+        assert!(text.contains("pv-recovery"));
+        assert!(text.contains("guard confirm pv-recovery"));
+        assert!(text.contains("guard revert pv-recovery"));
+        assert!(text.contains("durable outcome unavailable"));
+    }
+
+    fn prior_v1_durability_failure_fixture() -> server::ExecuteResponse {
+        let mut response = execute_response_fixture();
+        response.allowed = true;
+        response.reason =
+            "durable auto-revert state could not be recorded; operator decision required"
+                .to_string();
+        response.status = Some(server::GateStatus::Provisional);
+        response.handle = Some("legacy-recovery".to_string());
+        response.confirm_deadline_unix = None;
+        response.confirm_window_secs = None;
+        response.auto_revert_durable = Some(false);
+        response.containment_failure = None;
+        response
+    }
+
+    fn assert_prior_v1_durability_failure(value: &Value, stdout: &str, stderr: &str) {
+        let structured = &value["structuredContent"];
+        assert_eq!(structured["allowed"], true);
+        assert_eq!(structured["status"], "provisional");
+        assert_eq!(structured["auto_revert_durable"], false);
+        assert!(structured["containment_failure"].is_null());
+        assert_eq!(value["isError"], true);
+        let text = value["content"][0]["text"].as_str().expect("tool text");
+        assert!(text.contains(stdout));
+        assert!(text.contains(stderr));
+        assert!(text.contains("CONTAINMENT FAILED"));
+        assert!(text.contains("No auto-revert timer is armed"));
+        assert!(text.contains("Operator action required"));
+        assert!(text.contains("legacy-recovery"));
+        assert!(text.contains("guard confirm legacy-recovery"));
+        assert!(text.contains("guard revert legacy-recovery"));
+        assert!(!text.contains("applied behind an auto-revert envelope"));
+    }
+
+    #[test]
+    fn mcp_prior_v1_nonstreaming_durability_failure_is_actionable_error() {
+        let mut response = prior_v1_durability_failure_fixture();
+        response.stdout = Some("forward output".to_string());
+        response.stderr = Some("forward warning".to_string());
+        let wire = serde_json::to_string(&response).expect("serialize prior v1 response");
+        let parsed: server::ExecuteResponse =
+            serde_json::from_str(&wire).expect("parse prior v1 response");
+
+        let value = tool_result(parsed.into());
+        assert_prior_v1_durability_failure(&value, "forward output", "forward warning");
+    }
+
+    #[tokio::test]
+    async fn mcp_prior_v1_streaming_durability_failure_is_actionable_error() {
+        let mut response = prior_v1_durability_failure_fixture();
+        response.stdout = None;
+        response.stderr = None;
+        let messages = [
+            serde_json::to_string(&server::ExecuteStreamMessage::Stdout {
+                data: "streamed output".to_string(),
+            })
+            .expect("serialize stdout"),
+            serde_json::to_string(&server::ExecuteStreamMessage::Stderr {
+                data: "streamed warning".to_string(),
+            })
+            .expect("serialize stderr"),
+            serde_json::to_string(&server::ExecuteStreamMessage::Result { response })
+                .expect("serialize result"),
+        ]
+        .join("\n")
+            + "\n";
+        let parsed = crate::daemon_client::read_streaming_response_for_test(&messages)
+            .await
+            .expect("parse streaming prior v1 response");
+
+        let value = tool_result(parsed.into());
+        assert_prior_v1_durability_failure(&value, "streamed output", "streamed warning");
+    }
+
     #[tokio::test]
     async fn request_missing_method_gets_invalid_request_error() {
         let executor = Arc::new(FakeExecutor {
@@ -2812,6 +3095,10 @@ mod tests {
                 stderr: None,
                 status: None,
                 handle: None,
+                confirm_deadline_unix: None,
+                confirm_window_secs: None,
+                auto_revert_durable: None,
+                containment_failure: None,
                 approval_options: Vec::new(),
                 access_requests: Vec::new(),
                 coverage: None,
@@ -2846,6 +3133,10 @@ mod tests {
                 stderr: None,
                 status: None,
                 handle: None,
+                confirm_deadline_unix: None,
+                confirm_window_secs: None,
+                auto_revert_durable: None,
+                containment_failure: None,
                 approval_options: Vec::new(),
                 access_requests: Vec::new(),
                 coverage: None,
@@ -2939,6 +3230,10 @@ mod tests {
                 stderr: None,
                 status: None,
                 handle: None,
+                confirm_deadline_unix: None,
+                confirm_window_secs: None,
+                auto_revert_durable: None,
+                containment_failure: None,
                 approval_options: Vec::new(),
                 access_requests: Vec::new(),
                 coverage: None,
@@ -3004,6 +3299,10 @@ mod tests {
                 stderr: None,
                 status: None,
                 handle: None,
+                confirm_deadline_unix: None,
+                confirm_window_secs: None,
+                auto_revert_durable: None,
+                containment_failure: None,
                 approval_options: Vec::new(),
                 access_requests: Vec::new(),
                 coverage: None,
@@ -3128,6 +3427,10 @@ mod tests {
                 stderr: None,
                 status: None,
                 handle: None,
+                confirm_deadline_unix: None,
+                confirm_window_secs: None,
+                auto_revert_durable: None,
+                containment_failure: None,
                 approval_options: Vec::new(),
                 access_requests: Vec::new(),
                 coverage: None,

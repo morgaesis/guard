@@ -155,6 +155,116 @@ fn print_verb_guidance(response: &server::ExecuteResponse) {
     }
 }
 
+/// The `result:` and `window:` lines of a contained execution banner. The
+/// armed deadline is the operative fact for a provisional; a typed containment
+/// failure never receives deadline wording.
+fn provisional_window_lines(response: &server::ExecuteResponse) -> Vec<String> {
+    if let Some(failure) = response.containment_failure.as_ref() {
+        return match failure.kind {
+            server::ContainmentFailureKind::ForwardNonzeroExit => vec![format!(
+                "result:  forward command failed with exit code {}; auto-revert was not armed; operator decision required",
+                failure.forward_exit_code.unwrap_or_default()
+            )],
+            server::ContainmentFailureKind::ForwardNoExitCode => vec![
+                "result:  forward command ended without an exit code; auto-revert was not armed; operator decision required"
+                    .to_string(),
+            ],
+            server::ContainmentFailureKind::PersistenceFailure
+                if !failure.command_may_have_run => vec![
+                "result:  containment failed before forward execution because durable rollback state was unavailable"
+                    .to_string(),
+            ],
+            server::ContainmentFailureKind::PersistenceFailure => match failure.forward_exit_code {
+                Some(0) => vec![
+                    "result:  executed, but its durable auto-revert state could not be recorded; operator decision required"
+                        .to_string(),
+                ],
+                Some(exit_code) => vec![format!(
+                    "result:  forward command exited with code {exit_code}, but its durable outcome could not be recorded; auto-revert was not armed; operator decision required"
+                )],
+                None => vec![
+                    "result:  forward command ended without an exit code, and its durable outcome could not be recorded; auto-revert was not armed; operator decision required"
+                        .to_string(),
+                ],
+            },
+        };
+    }
+    // Older daemons used this boolean for both forward failures and durability
+    // loss. A new client never turns that ambiguous value into an armed claim.
+    if response.auto_revert_durable == Some(false) {
+        return vec![
+            "result:  containment outcome is not durably armed; operator decision required"
+                .to_string(),
+        ];
+    }
+    if response.auto_revert_durable == Some(true)
+        && (response.confirm_deadline_unix.is_none() || response.confirm_window_secs.is_none())
+    {
+        return vec![
+            "result:  executed; durable auto-revert details unavailable; inspect guard provisionals"
+                .to_string(),
+        ];
+    }
+    let (Some(deadline), Some(window)) =
+        (response.confirm_deadline_unix, response.confirm_window_secs)
+    else {
+        return vec!["result:  executed, auto-reverts unless confirmed".to_string()];
+    };
+    vec![
+        format!(
+            "result:  executed, auto-reverts in {window}s (at {}) unless confirmed",
+            format_timestamp(deadline)
+        ),
+        "window:  set with --confirm-within SECONDS".to_string(),
+    ]
+}
+
+fn print_provisional_window(response: &server::ExecuteResponse) {
+    for line in provisional_window_lines(response) {
+        eprintln!("  {line}");
+    }
+}
+
+fn containment_failure_exit_code(failure: &server::ContainmentFailure) -> i32 {
+    match failure.kind {
+        server::ContainmentFailureKind::ForwardNonzeroExit => {
+            failure.forward_exit_code.unwrap_or(EXIT_GUARD_ERROR)
+        }
+        server::ContainmentFailureKind::ForwardNoExitCode
+        | server::ContainmentFailureKind::PersistenceFailure => EXIT_GUARD_ERROR,
+    }
+}
+
+fn print_containment_failure(response: &server::ExecuteResponse, streamed: bool) -> ! {
+    let color = color_enabled_for_stderr();
+    if !streamed {
+        if let Some(stdout) = &response.stdout {
+            print!("{stdout}");
+        }
+        if let Some(stderr) = &response.stderr {
+            eprint!("{stderr}");
+        }
+    }
+    eprintln!(
+        "{} containment failed: {}",
+        paint("CONTAINMENT FAILED", AnsiColor::Red, color),
+        response.reason
+    );
+    if let Some(handle) = &response.handle {
+        eprintln!("  handle:  {handle}");
+        eprintln!("  confirm: guard confirm {handle}");
+        eprintln!("  revert:  guard revert {handle}");
+        eprintln!("  inspect: guard provisionals");
+    }
+    print_provisional_window(response);
+    print_coverage(&response.coverage);
+    let failure = response
+        .containment_failure
+        .as_ref()
+        .expect("containment failure detail");
+    std::process::exit(containment_failure_exit_code(failure));
+}
+
 fn access_request_guidance_lines(response: &server::ExecuteResponse) -> Vec<String> {
     if !response.access_requests.is_empty() {
         return response
@@ -353,6 +463,9 @@ pub(crate) async fn run_exec(
 
     // Consequence-gate outcomes: a held command did not run; a provisional ran
     // behind an auto-revert timer.
+    if resp.containment_failure.is_some() {
+        print_containment_failure(&resp, streamed_output);
+    }
     match resp.status {
         Some(server::GateStatus::Held) => {
             let color = color_enabled_for_stderr();
@@ -389,7 +502,7 @@ pub(crate) async fn run_exec(
             eprintln!("  handle:  {}", handle);
             eprintln!("  confirm: guard confirm {}", handle);
             eprintln!("  inspect: guard provisionals");
-            eprintln!("  result:  executed, auto-reverts unless confirmed");
+            print_provisional_window(&resp);
             print_coverage(&resp.coverage);
             if let Some(code) = resp.exit_code {
                 std::process::exit(code);
@@ -479,6 +592,9 @@ fn execute_response_envelope(
 fn exit_for_execute_response(response: &server::ExecuteResponse) -> ! {
     if response.status == Some(server::GateStatus::Held) {
         std::process::exit(EXIT_GUARD_HELD);
+    }
+    if let Some(failure) = response.containment_failure.as_ref() {
+        std::process::exit(containment_failure_exit_code(failure));
     }
     if !response.allowed {
         std::process::exit(EXIT_GUARD_DENIED);
@@ -2352,6 +2468,9 @@ fn render_gated_response(
     label: &str,
     explain: bool,
 ) -> Result<()> {
+    if resp.containment_failure.is_some() {
+        print_containment_failure(resp, streamed);
+    }
     match resp.status {
         Some(server::GateStatus::Held) => {
             let color = color_enabled_for_stderr();
@@ -2387,7 +2506,7 @@ fn render_gated_response(
             eprintln!("  handle:  {}", handle);
             eprintln!("  confirm: guard confirm {}", handle);
             eprintln!("  inspect: guard provisionals");
-            eprintln!("  result:  executed, auto-reverts unless confirmed");
+            print_provisional_window(resp);
             print_coverage(&resp.coverage);
             if let Some(code) = resp.exit_code {
                 std::process::exit(code);
@@ -3129,6 +3248,10 @@ mod tests {
             coverage: None,
             verb_matches: Vec::new(),
             verb_guidance: Some("request access".to_string()),
+            confirm_deadline_unix: None,
+            confirm_window_secs: None,
+            auto_revert_durable: None,
+            containment_failure: None,
             decision_source: "access_gate".to_string(),
             decision_trace: None,
         };
@@ -3147,6 +3270,149 @@ mod tests {
         );
     }
 
+    fn provisional_response(
+        confirm_deadline_unix: Option<u64>,
+        confirm_window_secs: Option<u64>,
+    ) -> server::ExecuteResponse {
+        server::ExecuteResponse {
+            allowed: true,
+            reason: "recoverable change".to_string(),
+            exit_code: Some(0),
+            stdout: None,
+            stderr: None,
+            status: Some(server::GateStatus::Provisional),
+            handle: Some("pv-1".to_string()),
+            approval_options: Vec::new(),
+            access_requests: Vec::new(),
+            coverage: None,
+            verb_matches: Vec::new(),
+            verb_guidance: None,
+            confirm_deadline_unix,
+            confirm_window_secs,
+            auto_revert_durable: None,
+            containment_failure: None,
+            decision_source: "llm".to_string(),
+            decision_trace: None,
+        }
+    }
+
+    #[test]
+    fn the_provisional_banner_states_the_armed_deadline_and_how_to_change_it() {
+        let lines = provisional_window_lines(&provisional_response(Some(1_700_000_300), Some(300)));
+        assert_eq!(
+            lines,
+            vec![
+                "result:  executed, auto-reverts in 300s (at 2023-11-14T22:18:20Z (1700000300)) \
+                 unless confirmed"
+                    .to_string(),
+                "window:  set with --confirm-within SECONDS".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_daemon_that_reports_no_deadline_keeps_the_deadline_free_wording() {
+        for response in [
+            provisional_response(None, None),
+            provisional_response(Some(1_700_000_300), None),
+            provisional_response(None, Some(300)),
+        ] {
+            let lines = provisional_window_lines(&response);
+            assert_eq!(
+                lines,
+                vec!["result:  executed, auto-reverts unless confirmed".to_string()]
+            );
+        }
+    }
+
+    #[test]
+    fn an_ambiguous_legacy_durability_flag_never_claims_an_armed_timer() {
+        let mut response = provisional_response(None, None);
+        response.auto_revert_durable = Some(false);
+        assert_eq!(
+            provisional_window_lines(&response),
+            vec![
+                "result:  containment outcome is not durably armed; operator decision required"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_forward_nonzero_exit_has_failure_wording_separate_from_persistence_loss() {
+        let mut response = provisional_response(None, None);
+        response.exit_code = Some(17);
+        response.status = None;
+        response.containment_failure = Some(server::ContainmentFailure {
+            kind: server::ContainmentFailureKind::ForwardNonzeroExit,
+            command_may_have_run: true,
+            forward_exit_code: Some(17),
+        });
+        assert_eq!(
+            provisional_window_lines(&response),
+            vec![
+                "result:  forward command failed with exit code 17; auto-revert was not armed; operator decision required"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_signal_forward_failure_has_no_exit_code_wording() {
+        let mut response = provisional_response(None, None);
+        response.exit_code = None;
+        response.status = None;
+        response.containment_failure = Some(server::ContainmentFailure {
+            kind: server::ContainmentFailureKind::ForwardNoExitCode,
+            command_may_have_run: true,
+            forward_exit_code: None,
+        });
+        assert_eq!(
+            provisional_window_lines(&response),
+            vec![
+                "result:  forward command ended without an exit code; auto-revert was not armed; operator decision required"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_durability_failure_reports_whether_forward_started() {
+        let mut response = provisional_response(None, None);
+        response.status = None;
+        response.containment_failure = Some(server::ContainmentFailure {
+            kind: server::ContainmentFailureKind::PersistenceFailure,
+            command_may_have_run: false,
+            forward_exit_code: None,
+        });
+        assert_eq!(
+            provisional_window_lines(&response),
+            vec![
+                "result:  containment failed before forward execution because durable rollback state was unavailable"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_signal_plus_durability_failure_preserves_both_facts() {
+        let mut response = provisional_response(None, None);
+        response.exit_code = None;
+        response.status = None;
+        response.containment_failure = Some(server::ContainmentFailure {
+            kind: server::ContainmentFailureKind::PersistenceFailure,
+            command_may_have_run: true,
+            forward_exit_code: None,
+        });
+        assert_eq!(
+            provisional_window_lines(&response),
+            vec![
+                "result:  forward command ended without an exit code, and its durable outcome could not be recorded; auto-revert was not armed; operator decision required"
+                    .to_string()
+            ]
+        );
+    }
+
     fn denied_response(decision_source: &str) -> server::ExecuteResponse {
         server::ExecuteResponse {
             allowed: false,
@@ -3161,6 +3427,10 @@ mod tests {
             coverage: None,
             verb_matches: Vec::new(),
             verb_guidance: None,
+            confirm_deadline_unix: None,
+            confirm_window_secs: None,
+            auto_revert_durable: None,
+            containment_failure: None,
             decision_source: decision_source.to_string(),
             decision_trace: None,
         }
@@ -3261,7 +3531,6 @@ mod tests {
         let lines = deny_source_lines(&denied_response("api_proxy"));
         assert_eq!(lines, vec!["source:  api-proxy".to_string()]);
     }
-
     #[test]
     fn access_json_errors_use_one_versioned_shape() {
         for message in [
@@ -3905,6 +4174,10 @@ mod tests {
             coverage: None,
             verb_matches: Vec::new(),
             verb_guidance: None,
+            confirm_deadline_unix: None,
+            confirm_window_secs: None,
+            auto_revert_durable: None,
+            containment_failure: None,
             decision_source: "static_policy".to_string(),
             decision_trace: Some(guard::gating::DecisionTrace::source("static_policy")),
         };

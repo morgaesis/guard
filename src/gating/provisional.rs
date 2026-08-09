@@ -137,10 +137,30 @@ pub struct Provisional {
     pub created_unix: u64,
     /// Auto-revert fires at or after this wall-clock unix-seconds value.
     pub deadline_unix: u64,
+    /// Confirmation window the envelope was armed with, in seconds. Retained
+    /// alongside the deadline so a later message can state the window an
+    /// operator actually got rather than only the instant it expired. Zero on
+    /// rows written before the window was recorded.
+    #[serde(default)]
+    pub window_secs: u64,
+    /// When the deadline sweeper's automatic rollback ran. `None` while the
+    /// envelope is live and after an operator-initiated `guard revert`, so it
+    /// distinguishes "the timer fired" from "somebody reverted this".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_reverted_unix: Option<u64>,
     /// Set once the forward command has actually run. A provisional persisted
     /// before exec with `forward_done=false` that survives a restart is
     /// indeterminate and routes to `NeedsOperatorDecision`.
     pub forward_done: bool,
+    /// Exit status observed from the forward command. `None` means the
+    /// process was interrupted before a normal exit was observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forward_exit: Option<i32>,
+    /// The live forward outcome could not be committed after execution.
+    /// Operator action first converges this row with the durable pre-forward
+    /// record.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub forward_persistence_failed: bool,
     pub status: ProvisionalStatus,
     /// Exit code of the revert, once it has run.
     pub revert_exit: Option<i32>,
@@ -160,16 +180,47 @@ impl Provisional {
         }
     }
 
+    /// Why a lifecycle transition is refused from this row's current state.
+    /// An automatic rollback names when it ran and the window that elapsed: a
+    /// bare "already reverted" reads as a fault, when it is the envelope doing
+    /// exactly what `--confirm-within` armed it to do.
+    pub fn transition_block_detail(&self) -> String {
+        if self.status == ProvisionalStatus::Reverted && !self.forward_done {
+            return "forward command did not execute".to_string();
+        }
+        match self.auto_reverted_unix {
+            Some(at) if self.status == ProvisionalStatus::Reverted => {
+                let at = crate::env::unix_seconds_to_utc(at);
+                if self.window_secs > 0 {
+                    format!(
+                        "auto-reverted at {at} (deadline {}s elapsed)",
+                        self.window_secs
+                    )
+                } else {
+                    format!("auto-reverted at {at}")
+                }
+            }
+            _ => format!("already {}", self.status.as_str()),
+        }
+    }
+
     /// Durable forward-side outcome derived from the lifecycle fields. This is
     /// separate from the rollback status exposed by [`ProvisionalStatus`].
     pub fn forward_outcome(&self) -> &'static str {
-        if !self.forward_done {
+        if self.forward_persistence_failed {
+            "persistence_failed"
+        } else if !self.forward_done {
             if self.status == ProvisionalStatus::Armed {
                 "running"
+            } else if self.status == ProvisionalStatus::Reverted {
+                "not_executed"
             } else {
                 "interrupted"
             }
-        } else if self.status == ProvisionalStatus::NeedsOperatorDecision && self.deadline_unix == 0
+        } else if self.forward_exit.is_some_and(|exit| exit != 0)
+            || (self.forward_exit.is_none()
+                && self.status == ProvisionalStatus::NeedsOperatorDecision
+                && self.deadline_unix == 0)
         {
             "failed"
         } else {
@@ -298,11 +349,15 @@ impl ProvisionalRegistry {
     ) -> Option<Provisional> {
         let p = self.items.get_mut(handle)?;
         p.forward_done = true;
+        p.forward_exit = exit;
+        p.forward_persistence_failed = false;
         if exit == Some(0) {
             p.deadline_unix = finished_unix.saturating_add(window_secs);
+            p.window_secs = window_secs;
             p.revert_detail = None;
         } else {
             p.deadline_unix = 0;
+            p.window_secs = 0;
             p.status = ProvisionalStatus::NeedsOperatorDecision;
             p.revert_detail = Some(format!(
                 "forward command exited with code {exit:?}; confirmation window was not started"
@@ -321,9 +376,50 @@ impl ProvisionalRegistry {
     ) -> Option<Provisional> {
         let p = self.items.get_mut(handle)?;
         p.forward_done = false;
+        p.forward_exit = None;
+        p.forward_persistence_failed = false;
         p.deadline_unix = 0;
         p.status = ProvisionalStatus::NeedsOperatorDecision;
         p.revert_detail = Some(detail);
+        Some(p.clone())
+    }
+
+    /// Mark an interrupted live row whose durable interruption update failed.
+    /// Operator action converges this row with the durable pre-forward record
+    /// before applying the requested decision.
+    pub fn mark_forward_interrupted_persistence_failed(
+        &mut self,
+        handle: &str,
+    ) -> Option<Provisional> {
+        let p = self.items.get_mut(handle)?;
+        if p.status != ProvisionalStatus::NeedsOperatorDecision || p.forward_done {
+            return None;
+        }
+        p.forward_exit = None;
+        p.forward_persistence_failed = true;
+        p.deadline_unix = 0;
+        p.window_secs = 0;
+        Some(p.clone())
+    }
+
+    /// Record that the forward command completed but its durable outcome could
+    /// not be committed. The pre-forward row remains the restart recovery
+    /// authority, while the live registry must not leave a timer eligible for
+    /// automatic rollback.
+    pub fn mark_forward_persistence_failed(
+        &mut self,
+        handle: &str,
+        exit: Option<i32>,
+    ) -> Option<Provisional> {
+        let p = self.items.get_mut(handle)?;
+        p.forward_done = true;
+        p.forward_exit = exit;
+        p.forward_persistence_failed = true;
+        p.deadline_unix = 0;
+        p.window_secs = 0;
+        p.status = ProvisionalStatus::NeedsOperatorDecision;
+        p.revert_detail =
+            Some("forward command completed but its durable outcome was not recorded".to_string());
         Some(p.clone())
     }
 
@@ -334,14 +430,20 @@ impl ProvisionalRegistry {
             .items
             .get_mut(handle)
             .ok_or_else(|| GateError::NotFound(handle.to_string()))?;
+        if p.status == ProvisionalStatus::Armed && !p.forward_done {
+            return Err(GateError::WrongState {
+                handle: handle.to_string(),
+                detail: "forward command is still running".to_string(),
+            });
+        }
         match p.status {
             ProvisionalStatus::Armed | ProvisionalStatus::NeedsOperatorDecision => {
                 p.status = ProvisionalStatus::Confirmed;
                 Ok(p.clone())
             }
-            other => Err(GateError::WrongState {
+            _ => Err(GateError::WrongState {
                 handle: handle.to_string(),
-                detail: format!("already {}", other.as_str()),
+                detail: p.transition_block_detail(),
             }),
         }
     }
@@ -355,7 +457,7 @@ impl ProvisionalRegistry {
         if p.status != ProvisionalStatus::Reverting {
             return Err(GateError::WrongState {
                 handle: handle.to_string(),
-                detail: format!("already {}", p.status.as_str()),
+                detail: p.transition_block_detail(),
             });
         }
         p.status = ProvisionalStatus::Confirmed;
@@ -372,14 +474,20 @@ impl ProvisionalRegistry {
             .items
             .get_mut(handle)
             .ok_or_else(|| GateError::NotFound(handle.to_string()))?;
+        if p.status == ProvisionalStatus::Armed && !p.forward_done {
+            return Err(GateError::WrongState {
+                handle: handle.to_string(),
+                detail: "forward command is still running".to_string(),
+            });
+        }
         match p.status {
             ProvisionalStatus::Armed | ProvisionalStatus::NeedsOperatorDecision => {
                 p.status = ProvisionalStatus::Reverting;
                 Ok(p.clone())
             }
-            other => Err(GateError::WrongState {
+            _ => Err(GateError::WrongState {
                 handle: handle.to_string(),
-                detail: format!("already {}", other.as_str()),
+                detail: p.transition_block_detail(),
             }),
         }
     }
@@ -419,11 +527,20 @@ impl ProvisionalRegistry {
     }
 
     /// Record a successful revert (`Reverting` -> `Reverted`).
-    pub fn set_reverted(&mut self, handle: &str, exit: Option<i32>) {
+    /// `auto_reverted_unix` is `Some(now)` when the deadline sweeper drove the
+    /// rollback and `None` when an operator asked for it, so a later refusal
+    /// can say which happened.
+    pub fn set_reverted(
+        &mut self,
+        handle: &str,
+        exit: Option<i32>,
+        auto_reverted_unix: Option<u64>,
+    ) {
         if let Some(p) = self.items.get_mut(handle) {
             p.status = ProvisionalStatus::Reverted;
             p.revert_exit = exit;
             p.revert_detail = None;
+            p.auto_reverted_unix = auto_reverted_unix;
         }
     }
 
@@ -492,7 +609,11 @@ mod tests {
             decision_trace: None,
             created_unix: 100,
             deadline_unix: deadline,
+            window_secs: 0,
+            auto_reverted_unix: None,
             forward_done: true,
+            forward_exit: Some(0),
+            forward_persistence_failed: false,
             status: ProvisionalStatus::Armed,
             revert_exit: None,
             revert_detail: None,
@@ -507,6 +628,114 @@ mod tests {
         assert_eq!(p.status, ProvisionalStatus::Confirmed);
         // A confirmed provisional is never due.
         assert!(r.take_due(9999).is_empty());
+    }
+
+    #[test]
+    fn running_forward_blocks_decisions_but_recovery_state_remains_actionable() {
+        for action in ["confirm", "revert"] {
+            let mut registry = ProvisionalRegistry::new();
+            let mut running = armed("running", Some(PrincipalKey::from_uid(1001)), 0);
+            running.forward_done = false;
+            running.forward_exit = None;
+            registry.insert(running);
+
+            let error = if action == "confirm" {
+                registry.confirm("running").unwrap_err()
+            } else {
+                registry.begin_revert("running").unwrap_err()
+            };
+            assert_eq!(
+                error.to_string(),
+                "handle 'running' cannot transition: forward command is still running"
+            );
+            assert_eq!(
+                registry.get("running").unwrap().status,
+                ProvisionalStatus::Armed
+            );
+
+            let mut row = registry.remove("running").unwrap();
+            row.status = ProvisionalStatus::NeedsOperatorDecision;
+            registry.insert(row);
+            let recovered = if action == "confirm" {
+                registry.confirm("running")
+            } else {
+                registry.begin_revert("running")
+            };
+            assert!(recovered.is_ok());
+        }
+    }
+
+    #[test]
+    fn confirming_after_the_deadline_names_the_automatic_revert_and_its_window() {
+        let mut r = ProvisionalRegistry::new();
+        let mut p = armed("h1", Some(PrincipalKey::from_uid(1001)), 1_700_000_300);
+        p.window_secs = 300;
+        r.insert(p);
+        r.take_due(1_700_000_301);
+        r.set_reverted("h1", Some(0), Some(1_700_000_301));
+
+        let error = r.confirm("h1").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "handle 'h1' cannot transition: auto-reverted at 2023-11-14T22:18:21Z \
+             (deadline 300s elapsed)"
+        );
+        // `guard revert` on the same spent handle explains itself the same way.
+        assert_eq!(r.begin_revert("h1").unwrap_err(), error);
+    }
+
+    #[test]
+    fn an_operator_revert_is_not_reported_as_an_automatic_one() {
+        let mut r = ProvisionalRegistry::new();
+        let mut p = armed("h1", Some(PrincipalKey::from_uid(1001)), 1_700_000_300);
+        p.window_secs = 300;
+        r.insert(p);
+        r.begin_revert("h1")
+            .expect("operator revert claims the row");
+        r.set_reverted("h1", Some(0), None);
+
+        let error = r.confirm("h1").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "handle 'h1' cannot transition: already reverted"
+        );
+    }
+
+    #[test]
+    fn a_row_without_a_recorded_window_still_names_the_automatic_revert() {
+        let mut r = ProvisionalRegistry::new();
+        r.insert(armed(
+            "h1",
+            Some(PrincipalKey::from_uid(1001)),
+            1_700_000_300,
+        ));
+        r.take_due(1_700_000_301);
+        r.set_reverted("h1", Some(0), Some(1_700_000_301));
+
+        assert_eq!(
+            r.confirm("h1").unwrap_err().to_string(),
+            "handle 'h1' cannot transition: auto-reverted at 2023-11-14T22:18:21Z"
+        );
+    }
+
+    #[test]
+    fn a_successful_forward_command_records_the_window_behind_its_deadline() {
+        let mut r = ProvisionalRegistry::new();
+        let mut armed_row = armed("h1", Some(PrincipalKey::from_uid(1001)), 0);
+        armed_row.forward_done = false;
+        r.insert(armed_row);
+
+        let updated = r.mark_forward_done("h1", Some(0), 1_000, 300).unwrap();
+        assert_eq!(updated.deadline_unix, 1_300);
+        assert_eq!(updated.window_secs, 300);
+
+        // A forward command that failed arms no timer, so it advertises none.
+        let mut failed = armed("h2", Some(PrincipalKey::from_uid(1001)), 0);
+        failed.forward_done = false;
+        r.insert(failed);
+        let updated = r.mark_forward_done("h2", Some(1), 1_000, 300).unwrap();
+        assert_eq!(updated.deadline_unix, 0);
+        assert_eq!(updated.window_secs, 0);
     }
 
     #[test]
@@ -532,7 +761,7 @@ mod tests {
         r.insert(armed("ok", Some(PrincipalKey::from_uid(1001)), 150));
         r.insert(armed("bad", Some(PrincipalKey::from_uid(1001)), 150));
         let _ = r.take_due(200);
-        r.set_reverted("ok", Some(0));
+        r.set_reverted("ok", Some(0), Some(250));
         r.set_revert_failed("bad", Some(1), "boom".into());
         assert_eq!(r.get("ok").unwrap().status, ProvisionalStatus::Reverted);
         assert_eq!(

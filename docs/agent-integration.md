@@ -25,6 +25,15 @@ missing, or unsupported contracts with an upgrade error before evaluation.
 TCP clients declare that caller filesystem context is unavailable instead of
 silently inheriting the daemon's working directory.
 
+Protocol-v1 response `status` values remain a closed compatibility vocabulary.
+A containment failure uses `allowed: false`, an absent `status`, no confirmation
+deadline fields, and an optional typed `containment_failure` object. Its
+`command_may_have_run` and `forward_exit_code` fields are authoritative for new
+clients. Older clients ignore the optional object and still fail closed without
+claiming an armed timer. A recovery `handle` is present only when the daemon can
+resolve its live or durable record; the sanitized `reason` repeats the valid
+operator action for clients that do not understand the typed field.
+
 Add the shim directory ahead of the real tools in the agent's `PATH`. The agent
 cannot bypass Guard if it also lacks remote credentials and direct upstream
 reachability.
