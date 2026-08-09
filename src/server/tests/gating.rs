@@ -14,8 +14,9 @@ use crate::server::gate_runtime::{
     DaemonGateSink,
 };
 use crate::server::wire::{
-    approval_is_armed, AdminRequest, AdminResponse, CallerIdentity, ContainmentOutcome,
-    ExecOutcome, ExecuteRequest, ExecuteResult, GateStatus, RevertSpec,
+    approval_is_armed, AdminRequest, AdminResponse, CallerIdentity, ContainmentFailure,
+    ContainmentFailureKind, ContainmentOutcome, ExecOutcome, ExecuteRequest, ExecuteResult,
+    GateStatus, RevertSpec,
 };
 use crate::server::{RequestContext, ServerContext, APPROVAL_TTL_SECS};
 use crate::session::SessionGrant;
@@ -528,15 +529,14 @@ async fn post_forward_persistence_failure_reports_no_durable_auto_revert_and_rec
         .expect("forward task should not panic");
     let response = result.into_response();
     assert_eq!(response.handle.as_deref(), Some(handle.as_str()));
-    assert_eq!(response.auto_revert_durable, None);
+    assert_eq!(response.auto_revert_durable, Some(false));
     assert!(matches!(
-        response.status,
-        Some(GateStatus::ContainmentFailed(
-            ContainmentOutcome::PersistenceFailure {
-                command_started: true,
-                forward_exit_code: Some(0),
-            }
-        ))
+        response.containment_failure,
+        Some(ContainmentFailure {
+            kind: ContainmentFailureKind::PersistenceFailure,
+            command_may_have_run: true,
+            forward_exit_code: Some(0),
+        })
     ));
     assert!(response.confirm_deadline_unix.is_none());
     assert!(response.confirm_window_secs.is_none());
@@ -647,13 +647,12 @@ async fn signal_and_post_forward_persistence_failure_remain_distinct() {
         .expect("forward task should not panic");
     let response = result.into_response();
     assert!(matches!(
-        response.status,
-        Some(GateStatus::ContainmentFailed(
-            ContainmentOutcome::PersistenceFailure {
-                command_started: true,
-                forward_exit_code: None,
-            }
-        ))
+        response.containment_failure,
+        Some(ContainmentFailure {
+            kind: ContainmentFailureKind::PersistenceFailure,
+            command_may_have_run: true,
+            forward_exit_code: None,
+        })
     ));
     assert!(response.reason.contains("without an exit code"));
     assert!(!response.reason.contains("code 0"));
@@ -724,15 +723,14 @@ async fn post_forward_persistence_failure_fixture() -> (
         .expect("forward task should not panic");
     let response = result.into_response();
     assert_eq!(response.handle.as_deref(), Some(handle.as_str()));
-    assert_eq!(response.auto_revert_durable, None);
+    assert_eq!(response.auto_revert_durable, Some(false));
     assert!(matches!(
-        response.status,
-        Some(GateStatus::ContainmentFailed(
-            ContainmentOutcome::PersistenceFailure {
-                command_started: true,
-                forward_exit_code: Some(0),
-            }
-        ))
+        response.containment_failure,
+        Some(ContainmentFailure {
+            kind: ContainmentFailureKind::PersistenceFailure,
+            command_may_have_run: true,
+            forward_exit_code: Some(0),
+        })
     ));
     assert!(response.confirm_deadline_unix.is_none());
     assert!(response.confirm_window_secs.is_none());
@@ -838,6 +836,137 @@ async fn post_forward_persistence_failure_can_be_reverted_and_converges_durably(
     assert!(durable[0].forward_persistence_failed);
 }
 
+#[cfg(unix)]
+async fn running_containment_fixture() -> (
+    Arc<ServerContext>,
+    CallerIdentity,
+    CallerIdentity,
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    String,
+    tokio::task::JoinHandle<ExecuteResult>,
+) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = SessionStore::open(temp.path().join("state.db"), 3_600)
+        .await
+        .expect("open store");
+    let (mut cfg, operator, agent) = gating_config(7_052, 1_000);
+    cfg.state.session_store = Some(store);
+    let cfg = Arc::new(cfg);
+    let release = temp.path().join("release-forward");
+    let reverted = temp.path().join("reverted");
+    let request = contain_request(
+        "sh",
+        &[
+            "-c",
+            "while [ ! -e \"$1\" ]; do sleep 0.01; done",
+            "guard-test",
+            release.to_str().expect("release path"),
+        ],
+        RevertSpec::new(
+            "touch",
+            vec![reverted.to_str().expect("revert path").to_string()],
+        ),
+    );
+    let task_cfg = Arc::clone(&cfg);
+    let task_agent = agent.clone();
+    let task = tokio::spawn(async move {
+        let mut sink = tokio::io::sink();
+        arm_containment_with_authority(
+            &mut RequestContext {
+                server: &task_cfg,
+                caller: &task_agent,
+                depth: 0,
+                stream_output: false,
+                stream_writer: &mut sink,
+            },
+            request,
+            task_agent.principal(),
+            "recoverable change".to_string(),
+            None,
+        )
+        .await
+    });
+    let handle = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(row) = cfg
+                .state
+                .provisional
+                .read()
+                .await
+                .list()
+                .into_iter()
+                .find(|row| row.status == ProvisionalStatus::Armed && !row.forward_done)
+            {
+                break row.handle;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("forward command should reach running state");
+    (cfg, operator, agent, temp, release, reverted, handle, task)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn confirm_is_blocked_until_the_forward_command_finishes() {
+    let (cfg, operator, _agent, _temp, release, _reverted, handle, task) =
+        running_containment_fixture().await;
+    let blocked = handle_admin_request(
+        &cfg,
+        &operator,
+        AdminRequest::Confirm {
+            handle: handle.clone(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        blocked,
+        AdminResponse::Error { ref message }
+            if message.contains("forward command is still running")
+    ));
+
+    std::fs::write(release, b"release").expect("release forward");
+    let response = task.await.expect("forward task").into_response();
+    assert_eq!(response.status, Some(GateStatus::Provisional));
+    let confirmed = handle_admin_request(&cfg, &operator, AdminRequest::Confirm { handle }).await;
+    assert!(matches!(confirmed, AdminResponse::GateAction { .. }));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn revert_is_blocked_until_the_forward_command_finishes() {
+    let (cfg, operator, _agent, _temp, release, reverted, handle, task) =
+        running_containment_fixture().await;
+    let blocked = handle_admin_request(
+        &cfg,
+        &operator,
+        AdminRequest::Revert {
+            handle: handle.clone(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        blocked,
+        AdminResponse::Error { ref message }
+            if message.contains("forward command is still running")
+    ));
+    assert!(!reverted.exists());
+
+    std::fs::write(release, b"release").expect("release forward");
+    let response = task.await.expect("forward task").into_response();
+    assert_eq!(response.status, Some(GateStatus::Provisional));
+    let reverted_response =
+        handle_admin_request(&cfg, &operator, AdminRequest::Revert { handle }).await;
+    assert!(matches!(
+        reverted_response,
+        AdminResponse::GateAction { .. }
+    ));
+    assert!(reverted.exists());
+}
+
 /// Containment without a state store cannot make a restart-safe rollback
 /// promise, so the forward command is refused before it starts.
 #[cfg(unix)]
@@ -896,17 +1025,16 @@ async fn containment_without_state_store_fails_closed_before_forward() {
     let response = result.into_response();
     assert!(!response.allowed);
     assert!(matches!(
-        response.status,
-        Some(GateStatus::ContainmentFailed(
-            ContainmentOutcome::PersistenceFailure {
-                command_started: false,
-                forward_exit_code: None,
-            }
-        ))
+        response.containment_failure,
+        Some(ContainmentFailure {
+            kind: ContainmentFailureKind::PersistenceFailure,
+            command_may_have_run: false,
+            forward_exit_code: None,
+        })
     ));
     assert_eq!(
         response.reason,
-        "command was not run because durable rollback state is unavailable"
+        "containment failed before forward execution: command was not run because durable rollback state is unavailable"
     );
     assert!(!marker.exists());
     assert!(cfg.state.provisional.read().await.list().is_empty());
@@ -917,6 +1045,106 @@ async fn containment_without_state_store_fails_closed_before_forward() {
         .await
         .access_grant_uses("containment-access", "containment-budget");
     assert_eq!(uses, Some((Some(1), Some(1))));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn admission_denial_with_cleanup_failure_retains_non_actionable_terminal_state() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = SessionStore::open(temp.path().join("state.db"), 3_600)
+        .await
+        .expect("open store");
+    let (mut cfg, operator, agent) = gating_config(7_053, 1_000);
+    cfg.state.session_store = Some(store.clone());
+    cfg.state.sessions.write().await.grant(
+        "exhausted-containment".to_string(),
+        SessionGrant {
+            activated_verbs: vec!["recoverable-fixture".to_string()],
+            scope: IssuedGrantScope {
+                label: Some("bounded authority".to_string()),
+                access_managed: true,
+                access_grants: vec![AccessUseGrant {
+                    request: "bounded-use".to_string(),
+                    verbs: vec!["recoverable-fixture".to_string()],
+                    use_limit: Some(1),
+                    remaining_uses: Some(0),
+                    pending: false,
+                }],
+                ..IssuedGrantScope::default()
+            },
+            expires_at: Some(now_unix().saturating_add(60)),
+            static_only: true,
+            owner: SessionOwner::Principal(PrincipalKey::from_uid(1_000)),
+            ..active_session()
+        },
+    );
+    let marker = temp.path().join("forward-ran");
+    let mut request = contain_request(
+        "touch",
+        &[marker.to_str().expect("marker path")],
+        RevertSpec::new("true", Vec::new()),
+    );
+    request.session_token = Some("exhausted-containment".to_string());
+    let authority = live_authority(&cfg, "exhausted-containment").await;
+    store.fail_next_provisional_delete_for_test();
+    let mut sink = tokio::io::sink();
+    let response = arm_containment_with_access_use_for_test(
+        &mut RequestContext {
+            server: &cfg,
+            caller: &agent,
+            depth: 0,
+            stream_output: false,
+            stream_writer: &mut sink,
+        },
+        request,
+        agent.principal(),
+        "recoverable change".to_string(),
+        authority,
+        vec!["recoverable-fixture".to_string()],
+    )
+    .await
+    .into_response();
+
+    assert!(!response.allowed);
+    assert!(!marker.exists());
+    let rows = cfg.state.provisional.read().await.list();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, ProvisionalStatus::Reverted);
+    assert!(!rows[0].forward_done);
+    assert_eq!(rows[0].forward_outcome(), "not_executed");
+    assert_eq!(cfg.state.provisional.read().await.outstanding(), 0);
+    let handle = rows[0].handle.clone();
+    for request in [
+        AdminRequest::Confirm {
+            handle: handle.clone(),
+        },
+        AdminRequest::Revert {
+            handle: handle.clone(),
+        },
+    ] {
+        assert!(matches!(
+            handle_admin_request(&cfg, &operator, request).await,
+            AdminResponse::Error { ref message }
+                if message.contains("forward command did not execute")
+        ));
+    }
+    let durable = store
+        .load_provisionals()
+        .await
+        .expect("durable terminal row");
+    assert_eq!(durable.len(), 1);
+    assert_eq!(durable[0].status, ProvisionalStatus::Reverted);
+    let (restarted, moved) = guard::gating::provisional::ProvisionalRegistry::from_rows(durable);
+    assert!(moved.is_empty());
+    assert_eq!(restarted.outstanding(), 0);
+    assert_eq!(
+        cfg.state
+            .sessions
+            .read()
+            .await
+            .access_grant_uses("exhausted-containment", "bounded-use"),
+        Some((Some(1), Some(0)))
+    );
 }
 
 #[cfg(unix)]
@@ -1001,10 +1229,12 @@ async fn forward_nonzero_exit_is_durable_failure_without_auto_revert() {
     assert_eq!(response.exit_code, Some(17));
     assert_eq!(response.auto_revert_durable, None);
     assert!(matches!(
-        response.status,
-        Some(GateStatus::ContainmentFailed(
-            ContainmentOutcome::ForwardNonzeroExit { exit_code: 17 }
-        ))
+        response.containment_failure,
+        Some(ContainmentFailure {
+            kind: ContainmentFailureKind::ForwardNonzeroExit,
+            command_may_have_run: true,
+            forward_exit_code: Some(17),
+        })
     ));
     assert!(response.confirm_deadline_unix.is_none());
     assert!(response.reason.contains("forward command exited with code"));
@@ -1060,10 +1290,12 @@ async fn signal_exit_is_a_typed_forward_failure_without_auto_revert() {
     assert_eq!(response.exit_code, None);
     assert_eq!(response.auto_revert_durable, None);
     assert!(matches!(
-        response.status,
-        Some(GateStatus::ContainmentFailed(
-            ContainmentOutcome::ForwardNoExitCode
-        ))
+        response.containment_failure,
+        Some(ContainmentFailure {
+            kind: ContainmentFailureKind::ForwardNoExitCode,
+            command_may_have_run: true,
+            forward_exit_code: None,
+        })
     ));
     assert!(response.reason.contains("without an exit code"));
     assert!(response.confirm_deadline_unix.is_none());
@@ -1123,17 +1355,16 @@ async fn containment_fails_closed_when_initial_provisional_persistence_fails() {
     let response = result.into_response();
     assert!(!response.allowed);
     assert!(matches!(
-        response.status,
-        Some(GateStatus::ContainmentFailed(
-            ContainmentOutcome::PersistenceFailure {
-                command_started: false,
-                forward_exit_code: None,
-            }
-        ))
+        response.containment_failure,
+        Some(ContainmentFailure {
+            kind: ContainmentFailureKind::PersistenceFailure,
+            command_may_have_run: false,
+            forward_exit_code: None,
+        })
     ));
     assert_eq!(
         response.reason,
-        "command was not run because durable rollback state is unavailable"
+        "containment failed before forward execution: command was not run because durable rollback state is unavailable"
     );
     assert!(!marker.exists(), "forward command must not run");
     assert!(cfg.state.provisional.read().await.list().is_empty());

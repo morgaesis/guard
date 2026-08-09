@@ -1254,7 +1254,8 @@ pub struct ExecuteResponse {
     /// Consequence-gate outcome. Absent on a legacy (gating-off) response, which
     /// old clients parse as a normal allow/deny. `Held`/`Provisional` mean the
     /// command was approved but routed to the operator gate / armed containment
-    /// envelope. `ContainmentFailed` means no armed auto-revert outcome exists.
+    /// envelope. Containment failures leave this absent and use the optional
+    /// typed `containment_failure` field so protocol-v1 clients keep parsing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<GateStatus>,
     /// Durable request identifier for a held command, or containment handle for
@@ -1295,6 +1296,10 @@ pub struct ExecuteResponse {
     /// `None` also covers legacy daemons that do not send this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_revert_durable: Option<bool>,
+    /// Typed containment failure detail. This optional field extends the v1
+    /// response without adding a variant to the closed legacy status enum.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub containment_failure: Option<ContainmentFailure>,
     /// Stable source label for the admission decision.
     #[serde(default = "default_decision_source")]
     pub decision_source: String,
@@ -1370,10 +1375,6 @@ pub enum GateStatus {
     Reverted,
     /// Policy evaluated, not executed (dry-run).
     DryRun,
-    /// Containment could not truthfully report an armed auto-revert outcome.
-    /// The payload distinguishes forward exit, interruption, and durability
-    /// failures without relying on the legacy durability boolean.
-    ContainmentFailed(ContainmentOutcome),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1397,6 +1398,49 @@ impl ContainmentOutcome {
             Self::PersistenceFailure {
                 command_started, ..
             } => *command_started,
+        }
+    }
+}
+
+/// Protocol-v1-compatible wire representation of an internal containment
+/// outcome. The explicit execution fields let new clients avoid inference.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContainmentFailure {
+    pub kind: ContainmentFailureKind,
+    pub command_may_have_run: bool,
+    #[serde(default)]
+    pub forward_exit_code: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainmentFailureKind {
+    ForwardNonzeroExit,
+    ForwardNoExitCode,
+    PersistenceFailure,
+}
+
+impl From<&ContainmentOutcome> for ContainmentFailure {
+    fn from(outcome: &ContainmentOutcome) -> Self {
+        match outcome {
+            ContainmentOutcome::ForwardNonzeroExit { exit_code } => Self {
+                kind: ContainmentFailureKind::ForwardNonzeroExit,
+                command_may_have_run: true,
+                forward_exit_code: Some(*exit_code),
+            },
+            ContainmentOutcome::ForwardNoExitCode => Self {
+                kind: ContainmentFailureKind::ForwardNoExitCode,
+                command_may_have_run: true,
+                forward_exit_code: None,
+            },
+            ContainmentOutcome::PersistenceFailure {
+                command_started,
+                forward_exit_code,
+            } => Self {
+                kind: ContainmentFailureKind::PersistenceFailure,
+                command_may_have_run: *command_started,
+                forward_exit_code: *forward_exit_code,
+            },
         }
     }
 }
@@ -1840,6 +1884,7 @@ impl ExecuteResult {
                 confirm_deadline_unix: None,
                 confirm_window_secs: None,
                 auto_revert_durable: None,
+                containment_failure: None,
                 decision_source,
                 decision_trace,
             },
@@ -1866,6 +1911,7 @@ impl ExecuteResult {
                 confirm_deadline_unix: None,
                 confirm_window_secs: None,
                 auto_revert_durable: None,
+                containment_failure: None,
                 decision_source,
                 decision_trace,
             },
@@ -1887,6 +1933,7 @@ impl ExecuteResult {
                 confirm_deadline_unix: None,
                 confirm_window_secs: None,
                 auto_revert_durable: None,
+                containment_failure: None,
                 decision_source,
                 decision_trace,
             },
@@ -1906,6 +1953,7 @@ impl ExecuteResult {
                 confirm_deadline_unix: None,
                 confirm_window_secs: None,
                 auto_revert_durable: None,
+                containment_failure: None,
                 decision_source,
                 decision_trace,
             },
@@ -1932,6 +1980,7 @@ impl ExecuteResult {
                     confirm_deadline_unix: None,
                     confirm_window_secs: None,
                     auto_revert_durable: None,
+                    containment_failure: None,
                     decision_source,
                     decision_trace,
                 }
@@ -1961,6 +2010,7 @@ impl ExecuteResult {
                     .then_some(deadline_unix),
                 confirm_window_secs: (deadline_unix > 0 && window_secs > 0).then_some(window_secs),
                 auto_revert_durable: Some(true),
+                containment_failure: None,
                 decision_source,
                 decision_trace,
             },
@@ -1972,27 +2022,45 @@ impl ExecuteResult {
                 exit_code,
                 stdout,
                 stderr,
-            } => ExecuteResponse {
-                allowed: outcome.command_started(),
-                reason: containment_reason,
-                exit_code,
-                stdout,
-                stderr,
-                status: Some(GateStatus::ContainmentFailed(outcome)),
-                handle,
-                approval_options: Vec::new(),
-                access_requests: Vec::new(),
-                coverage: Some(coverage),
-                verb_matches,
-                verb_guidance,
-                confirm_deadline_unix: None,
-                confirm_window_secs: None,
-                // A failed containment outcome is never represented by the
-                // legacy durability boolean. Its typed status is authoritative.
-                auto_revert_durable: None,
-                decision_source,
-                decision_trace,
-            },
+            } => {
+                let command_may_have_run = outcome.command_started();
+                let containment_failure = ContainmentFailure::from(&outcome);
+                let reason = match (command_may_have_run, handle.as_deref()) {
+                    (true, Some(handle)) => format!(
+                        "containment failed: command may have run; {containment_reason}; recovery handle {handle} requires `guard confirm {handle}` or `guard revert {handle}`"
+                    ),
+                    (true, None) => format!(
+                        "containment failed: command may have run; {containment_reason}; no recovery handle is available"
+                    ),
+                    (false, _) => format!(
+                        "containment failed before forward execution: {containment_reason}"
+                    ),
+                };
+                ExecuteResponse {
+                    allowed: false,
+                    reason,
+                    exit_code,
+                    stdout,
+                    stderr,
+                    status: None,
+                    handle,
+                    approval_options: Vec::new(),
+                    access_requests: Vec::new(),
+                    coverage: Some(coverage),
+                    verb_matches,
+                    verb_guidance,
+                    confirm_deadline_unix: None,
+                    confirm_window_secs: None,
+                    auto_revert_durable: matches!(
+                        containment_failure.kind,
+                        ContainmentFailureKind::PersistenceFailure
+                    )
+                    .then_some(false),
+                    containment_failure: Some(containment_failure),
+                    decision_source,
+                    decision_trace,
+                }
+            }
         }
     }
 

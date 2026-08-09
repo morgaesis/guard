@@ -87,6 +87,8 @@ pub struct SessionStore {
     fail_next_write: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     fail_next_approval: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    fail_next_provisional_delete: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Process-lifetime ownership of one state database. The operating system
@@ -430,6 +432,10 @@ impl SessionStore {
             fail_next_write: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             fail_next_approval: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_next_provisional_delete: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
         };
         Ok(store)
     }
@@ -1779,6 +1785,12 @@ impl SessionStore {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_next_provisional_delete_for_test(&self) {
+        self.fail_next_provisional_delete
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     // --- Consequence-gating runtime state (provisional executions and operator
     // approvals). These are high-churn, handle-keyed rows, so unlike the session
     // registry they persist incrementally (per-row upsert/delete) rather than by
@@ -1920,6 +1932,13 @@ impl SessionStore {
     }
 
     pub async fn delete_provisional(&self, handle: String) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_provisional_delete
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("simulated provisional-delete failure");
+        }
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
             let conn = Self::open_connection(&path)?;

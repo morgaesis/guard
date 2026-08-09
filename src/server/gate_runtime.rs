@@ -739,6 +739,61 @@ async fn delete_provisional_row(server: &ServerContext, handle: &str) {
     }
 }
 
+/// Retire a staging row for a forward command that never ran. The terminal
+/// row is installed in memory first and persisted before deletion, so a failed
+/// delete cannot leave an actionable `Armed` record or consume capacity.
+async fn retire_non_executed_provisional(
+    server: &ServerContext,
+    provisional: &Provisional,
+    detail: String,
+) -> Result<(), String> {
+    let mut terminal = provisional.clone();
+    terminal.status = ProvisionalStatus::Reverted;
+    terminal.revert_detail = Some(detail);
+    server
+        .state
+        .provisional
+        .write()
+        .await
+        .insert(terminal.clone());
+
+    match try_persist_provisional(server, &terminal).await {
+        Ok(()) => match try_delete_provisional_row(server, &terminal.handle).await {
+            Ok(()) => {
+                server
+                    .state
+                    .provisional
+                    .write()
+                    .await
+                    .remove(&terminal.handle);
+                Ok(())
+            }
+            Err(delete_error) => {
+                tracing::warn!(
+                    "{delete_error}; retained terminal non-executed provisional {}",
+                    terminal.handle
+                );
+                Ok(())
+            }
+        },
+        Err(save_error) => match try_delete_provisional_row(server, &terminal.handle).await {
+            Ok(()) => {
+                server
+                    .state
+                    .provisional
+                    .write()
+                    .await
+                    .remove(&terminal.handle);
+                Ok(())
+            }
+            Err(delete_error) => Err(format!(
+                "failed to retire non-executed provisional {}: {save_error}; {delete_error}",
+                terminal.handle
+            )),
+        },
+    }
+}
+
 pub(super) async fn persist_approval(server: &ServerContext, a: &Approval) -> Result<(), String> {
     if let Some(store) = &server.state.session_store {
         if let Err(error) = store.save_approval(a.clone()).await {
@@ -1361,12 +1416,16 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
     if let Err(admission_reason) =
         admit_access_use(server, &request, &consume_access_verbs, None).await
     {
-        if let Err(cleanup_error) = try_delete_provisional_row(server, &handle).await {
+        if let Err(cleanup_error) = retire_non_executed_provisional(
+            server,
+            &provisional,
+            "forward command was not admitted; no rollback is required".to_string(),
+        )
+        .await
+        {
             tracing::error!(
                 "failed to retire unstarted provisional {handle} after access admission denial: {cleanup_error}"
             );
-        } else {
-            server.state.provisional.write().await.remove(&handle);
         }
         return access_admission_denial(server, caller, &consume_access_verbs, admission_reason)
             .await;
@@ -1403,7 +1462,7 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
                 return result
                     .containment_failed(
                         response_reason,
-                        Some(handle),
+                        None,
                         Coverage::contain(),
                         ContainmentOutcome::PersistenceFailure {
                             command_started: true,
@@ -1580,45 +1639,18 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
             // deleting the staging row. If deletion fails, restart recovery
             // sees a non-rollbackable terminal record rather than interpreting
             // an armed, unstarted row as an ambiguous mutation.
-            let terminal = {
-                let mut terminal = provisional.clone();
-                terminal.status = ProvisionalStatus::Reverted;
-                terminal.revert_detail = Some(format!(
-                    "forward command did not start; no rollback is required: {spawn_detail}"
-                ));
-                server
-                    .state
-                    .provisional
-                    .write()
-                    .await
-                    .insert(terminal.clone());
-                terminal
-            };
-            match try_persist_provisional(server, &terminal).await {
-                Ok(()) => match try_delete_provisional_row(server, &handle).await {
-                    Ok(()) => {
-                        server.state.provisional.write().await.remove(&handle);
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            "{error}; retained terminal non-executed provisional {handle}"
-                        );
-                    }
-                },
-                Err(save_error) => match try_delete_provisional_row(server, &handle).await {
-                    Ok(()) => {
-                        server.state.provisional.write().await.remove(&handle);
-                    }
-                    Err(delete_error) => {
-                        tracing::error!(
-                            "failed to retire non-executed provisional {handle}: {save_error}; {delete_error}"
-                        );
-                        return ExecuteResult::exec_failed(
-                            reason,
-                            format!("{spawn_detail}; rollback state could not be retired safely"),
-                        );
-                    }
-                },
+            if let Err(retire_error) = retire_non_executed_provisional(
+                server,
+                &provisional,
+                format!("forward command did not start; no rollback is required: {spawn_detail}"),
+            )
+            .await
+            {
+                tracing::error!("{retire_error}");
+                return ExecuteResult::exec_failed(
+                    reason,
+                    format!("{spawn_detail}; rollback state could not be retired safely"),
+                );
             }
             result
         }

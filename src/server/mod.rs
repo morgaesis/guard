@@ -101,9 +101,9 @@ pub(crate) use transport::winplat;
 pub use transport::Server;
 pub use wire::{
     AccessCapability, AccessDecisionResult, AccessItem, AccessRequestGuidance, AdminRequest,
-    AdminResponse, ApprovalSummary, CommandSpec, ContainmentOutcome, ExecuteRequest,
-    ExecuteResponse, GateStatus, OutputStream, ProvisionalSummary, RevertSpec, SshHostKeyMode,
-    VerbInvocation, VerbMatchInfo, VerbSummary,
+    AdminResponse, ApprovalSummary, CommandSpec, ContainmentFailure, ContainmentFailureKind,
+    ExecuteRequest, ExecuteResponse, GateStatus, OutputStream, ProvisionalSummary, RevertSpec,
+    SshHostKeyMode, VerbInvocation, VerbMatchInfo, VerbSummary,
 };
 pub(crate) use wire::{
     ExecuteStreamMessage, IncomingMessage, EXECUTE_FEATURE_LOCAL_CWD, EXECUTE_FEATURE_TCP_NO_CWD,

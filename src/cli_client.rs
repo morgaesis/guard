@@ -159,26 +159,22 @@ fn print_verb_guidance(response: &server::ExecuteResponse) {
 /// armed deadline is the operative fact for a provisional; a typed containment
 /// failure never receives deadline wording.
 fn provisional_window_lines(response: &server::ExecuteResponse) -> Vec<String> {
-    if let Some(server::GateStatus::ContainmentFailed(outcome)) = response.status.as_ref() {
-        return match outcome {
-            server::ContainmentOutcome::ForwardNonzeroExit { exit_code } => vec![format!(
-                "result:  forward command failed with exit code {exit_code}; auto-revert was not armed; operator decision required"
+    if let Some(failure) = response.containment_failure.as_ref() {
+        return match failure.kind {
+            server::ContainmentFailureKind::ForwardNonzeroExit => vec![format!(
+                "result:  forward command failed with exit code {}; auto-revert was not armed; operator decision required",
+                failure.forward_exit_code.unwrap_or_default()
             )],
-            server::ContainmentOutcome::ForwardNoExitCode => vec![
+            server::ContainmentFailureKind::ForwardNoExitCode => vec![
                 "result:  forward command ended without an exit code; auto-revert was not armed; operator decision required"
                     .to_string(),
             ],
-            server::ContainmentOutcome::PersistenceFailure {
-                command_started: false,
-                ..
-            } => vec![
+            server::ContainmentFailureKind::PersistenceFailure
+                if !failure.command_may_have_run => vec![
                 "result:  containment failed before forward execution because durable rollback state was unavailable"
                     .to_string(),
             ],
-            server::ContainmentOutcome::PersistenceFailure {
-                command_started: true,
-                forward_exit_code,
-            } => match forward_exit_code {
+            server::ContainmentFailureKind::PersistenceFailure => match failure.forward_exit_code {
                 Some(0) => vec![
                     "result:  executed, but its durable auto-revert state could not be recorded; operator decision required"
                         .to_string(),
@@ -229,11 +225,13 @@ fn print_provisional_window(response: &server::ExecuteResponse) {
     }
 }
 
-fn containment_failure_exit_code(outcome: &server::ContainmentOutcome) -> i32 {
-    match outcome {
-        server::ContainmentOutcome::ForwardNonzeroExit { exit_code } => *exit_code,
-        server::ContainmentOutcome::ForwardNoExitCode
-        | server::ContainmentOutcome::PersistenceFailure { .. } => EXIT_GUARD_ERROR,
+fn containment_failure_exit_code(failure: &server::ContainmentFailure) -> i32 {
+    match failure.kind {
+        server::ContainmentFailureKind::ForwardNonzeroExit => {
+            failure.forward_exit_code.unwrap_or(EXIT_GUARD_ERROR)
+        }
+        server::ContainmentFailureKind::ForwardNoExitCode
+        | server::ContainmentFailureKind::PersistenceFailure => EXIT_GUARD_ERROR,
     }
 }
 
@@ -260,14 +258,11 @@ fn print_containment_failure(response: &server::ExecuteResponse, streamed: bool)
     }
     print_provisional_window(response);
     print_coverage(&response.coverage);
-    let server::GateStatus::ContainmentFailed(outcome) = response
-        .status
+    let failure = response
+        .containment_failure
         .as_ref()
-        .expect("containment failure status")
-    else {
-        unreachable!("containment failure renderer requires its status")
-    };
-    std::process::exit(containment_failure_exit_code(outcome));
+        .expect("containment failure detail");
+    std::process::exit(containment_failure_exit_code(failure));
 }
 
 fn access_request_guidance_lines(response: &server::ExecuteResponse) -> Vec<String> {
@@ -468,6 +463,9 @@ pub(crate) async fn run_exec(
 
     // Consequence-gate outcomes: a held command did not run; a provisional ran
     // behind an auto-revert timer.
+    if resp.containment_failure.is_some() {
+        print_containment_failure(&resp, streamed_output);
+    }
     match resp.status {
         Some(server::GateStatus::Held) => {
             let color = color_enabled_for_stderr();
@@ -510,9 +508,6 @@ pub(crate) async fn run_exec(
                 std::process::exit(code);
             }
             return Ok(());
-        }
-        Some(server::GateStatus::ContainmentFailed(_)) => {
-            print_containment_failure(&resp, streamed_output);
         }
         Some(server::GateStatus::DryRun) => {
             let color = color_enabled_for_stdout();
@@ -598,8 +593,8 @@ fn exit_for_execute_response(response: &server::ExecuteResponse) -> ! {
     if response.status == Some(server::GateStatus::Held) {
         std::process::exit(EXIT_GUARD_HELD);
     }
-    if let Some(server::GateStatus::ContainmentFailed(outcome)) = response.status.as_ref() {
-        std::process::exit(containment_failure_exit_code(outcome));
+    if let Some(failure) = response.containment_failure.as_ref() {
+        std::process::exit(containment_failure_exit_code(failure));
     }
     if !response.allowed {
         std::process::exit(EXIT_GUARD_DENIED);
@@ -2473,6 +2468,9 @@ fn render_gated_response(
     label: &str,
     explain: bool,
 ) -> Result<()> {
+    if resp.containment_failure.is_some() {
+        print_containment_failure(resp, streamed);
+    }
     match resp.status {
         Some(server::GateStatus::Held) => {
             let color = color_enabled_for_stderr();
@@ -2514,9 +2512,6 @@ fn render_gated_response(
                 std::process::exit(code);
             }
             Ok(())
-        }
-        Some(server::GateStatus::ContainmentFailed(_)) => {
-            print_containment_failure(resp, streamed);
         }
         Some(server::GateStatus::DryRun) => {
             let color = color_enabled_for_stdout();
@@ -3256,6 +3251,7 @@ mod tests {
             confirm_deadline_unix: None,
             confirm_window_secs: None,
             auto_revert_durable: None,
+            containment_failure: None,
             decision_source: "access_gate".to_string(),
             decision_trace: None,
         };
@@ -3294,6 +3290,7 @@ mod tests {
             confirm_deadline_unix,
             confirm_window_secs,
             auto_revert_durable: None,
+            containment_failure: None,
             decision_source: "llm".to_string(),
             decision_trace: None,
         }
@@ -3345,9 +3342,12 @@ mod tests {
     fn a_forward_nonzero_exit_has_failure_wording_separate_from_persistence_loss() {
         let mut response = provisional_response(None, None);
         response.exit_code = Some(17);
-        response.status = Some(server::GateStatus::ContainmentFailed(
-            server::ContainmentOutcome::ForwardNonzeroExit { exit_code: 17 },
-        ));
+        response.status = None;
+        response.containment_failure = Some(server::ContainmentFailure {
+            kind: server::ContainmentFailureKind::ForwardNonzeroExit,
+            command_may_have_run: true,
+            forward_exit_code: Some(17),
+        });
         assert_eq!(
             provisional_window_lines(&response),
             vec![
@@ -3361,9 +3361,12 @@ mod tests {
     fn a_signal_forward_failure_has_no_exit_code_wording() {
         let mut response = provisional_response(None, None);
         response.exit_code = None;
-        response.status = Some(server::GateStatus::ContainmentFailed(
-            server::ContainmentOutcome::ForwardNoExitCode,
-        ));
+        response.status = None;
+        response.containment_failure = Some(server::ContainmentFailure {
+            kind: server::ContainmentFailureKind::ForwardNoExitCode,
+            command_may_have_run: true,
+            forward_exit_code: None,
+        });
         assert_eq!(
             provisional_window_lines(&response),
             vec![
@@ -3376,12 +3379,12 @@ mod tests {
     #[test]
     fn a_durability_failure_reports_whether_forward_started() {
         let mut response = provisional_response(None, None);
-        response.status = Some(server::GateStatus::ContainmentFailed(
-            server::ContainmentOutcome::PersistenceFailure {
-                command_started: false,
-                forward_exit_code: None,
-            },
-        ));
+        response.status = None;
+        response.containment_failure = Some(server::ContainmentFailure {
+            kind: server::ContainmentFailureKind::PersistenceFailure,
+            command_may_have_run: false,
+            forward_exit_code: None,
+        });
         assert_eq!(
             provisional_window_lines(&response),
             vec![
@@ -3395,12 +3398,12 @@ mod tests {
     fn a_signal_plus_durability_failure_preserves_both_facts() {
         let mut response = provisional_response(None, None);
         response.exit_code = None;
-        response.status = Some(server::GateStatus::ContainmentFailed(
-            server::ContainmentOutcome::PersistenceFailure {
-                command_started: true,
-                forward_exit_code: None,
-            },
-        ));
+        response.status = None;
+        response.containment_failure = Some(server::ContainmentFailure {
+            kind: server::ContainmentFailureKind::PersistenceFailure,
+            command_may_have_run: true,
+            forward_exit_code: None,
+        });
         assert_eq!(
             provisional_window_lines(&response),
             vec![
@@ -3427,6 +3430,7 @@ mod tests {
             confirm_deadline_unix: None,
             confirm_window_secs: None,
             auto_revert_durable: None,
+            containment_failure: None,
             decision_source: decision_source.to_string(),
             decision_trace: None,
         }
@@ -4173,6 +4177,7 @@ mod tests {
             confirm_deadline_unix: None,
             confirm_window_secs: None,
             auto_revert_durable: None,
+            containment_failure: None,
             decision_source: "static_policy".to_string(),
             decision_trace: Some(guard::gating::DecisionTrace::source("static_policy")),
         };

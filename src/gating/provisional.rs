@@ -185,6 +185,9 @@ impl Provisional {
     /// bare "already reverted" reads as a fault, when it is the envelope doing
     /// exactly what `--confirm-within` armed it to do.
     pub fn transition_block_detail(&self) -> String {
+        if self.status == ProvisionalStatus::Reverted && !self.forward_done {
+            return "forward command did not execute".to_string();
+        }
         match self.auto_reverted_unix {
             Some(at) if self.status == ProvisionalStatus::Reverted => {
                 let at = crate::env::unix_seconds_to_utc(at);
@@ -209,6 +212,8 @@ impl Provisional {
         } else if !self.forward_done {
             if self.status == ProvisionalStatus::Armed {
                 "running"
+            } else if self.status == ProvisionalStatus::Reverted {
+                "not_executed"
             } else {
                 "interrupted"
             }
@@ -407,6 +412,12 @@ impl ProvisionalRegistry {
             .items
             .get_mut(handle)
             .ok_or_else(|| GateError::NotFound(handle.to_string()))?;
+        if p.status == ProvisionalStatus::Armed && !p.forward_done {
+            return Err(GateError::WrongState {
+                handle: handle.to_string(),
+                detail: "forward command is still running".to_string(),
+            });
+        }
         match p.status {
             ProvisionalStatus::Armed | ProvisionalStatus::NeedsOperatorDecision => {
                 p.status = ProvisionalStatus::Confirmed;
@@ -445,6 +456,12 @@ impl ProvisionalRegistry {
             .items
             .get_mut(handle)
             .ok_or_else(|| GateError::NotFound(handle.to_string()))?;
+        if p.status == ProvisionalStatus::Armed && !p.forward_done {
+            return Err(GateError::WrongState {
+                handle: handle.to_string(),
+                detail: "forward command is still running".to_string(),
+            });
+        }
         match p.status {
             ProvisionalStatus::Armed | ProvisionalStatus::NeedsOperatorDecision => {
                 p.status = ProvisionalStatus::Reverting;
@@ -593,6 +610,41 @@ mod tests {
         assert_eq!(p.status, ProvisionalStatus::Confirmed);
         // A confirmed provisional is never due.
         assert!(r.take_due(9999).is_empty());
+    }
+
+    #[test]
+    fn running_forward_blocks_decisions_but_recovery_state_remains_actionable() {
+        for action in ["confirm", "revert"] {
+            let mut registry = ProvisionalRegistry::new();
+            let mut running = armed("running", Some(PrincipalKey::from_uid(1001)), 0);
+            running.forward_done = false;
+            running.forward_exit = None;
+            registry.insert(running);
+
+            let error = if action == "confirm" {
+                registry.confirm("running").unwrap_err()
+            } else {
+                registry.begin_revert("running").unwrap_err()
+            };
+            assert_eq!(
+                error.to_string(),
+                "handle 'running' cannot transition: forward command is still running"
+            );
+            assert_eq!(
+                registry.get("running").unwrap().status,
+                ProvisionalStatus::Armed
+            );
+
+            let mut row = registry.remove("running").unwrap();
+            row.status = ProvisionalStatus::NeedsOperatorDecision;
+            registry.insert(row);
+            let recovered = if action == "confirm" {
+                registry.confirm("running")
+            } else {
+                registry.begin_revert("running")
+            };
+            assert!(recovered.is_ok());
+        }
     }
 
     #[test]
