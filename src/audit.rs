@@ -261,6 +261,10 @@ impl AuditEvent {
     /// `caller` field renders unquoted (`caller=uid=1000`) to match the
     /// historical format.
     pub fn render_line(&self) -> String {
+        redact_secret_exposure(self).render_line_unchecked()
+    }
+
+    fn render_line_unchecked(&self) -> String {
         let mut line = self.kind.as_str().to_string();
         if let Some(handle) = &self.handle {
             push_field(&mut line, "handle", handle, false);
@@ -415,6 +419,11 @@ impl AuditLog {
     /// sequence number. Any error means the record is NOT durable; callers
     /// gating auditable actions must fail closed on `Err`.
     pub fn append(&self, event: &AuditEvent) -> std::io::Result<u64> {
+        let event = redact_secret_exposure(event);
+        self.append_unchecked(&event)
+    }
+
+    fn append_unchecked(&self, event: &AuditEvent) -> std::io::Result<u64> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if self.fail_appends.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(std::io::Error::other("audit append failure injected"));
@@ -850,11 +859,48 @@ mod tests {
     }
 
     #[test]
-    fn secret_exposure_audit_output_redacts_sensitive_detail() {
+    fn direct_render_line_redacts_secret_exposure_detail() {
+        let marker = "synthetic-secret-exposure-render-marker";
+        let line = AuditEvent::new(AuditKind::SecretExposed)
+            .cmd(marker)
+            .reason(marker)
+            .field("secret", marker)
+            .render_line();
+
+        assert!(!line.contains(marker));
+        assert!(line.contains("cmd=\"[redacted]\""));
+        assert!(line.contains("reason=\"[redacted]\""));
+        assert!(line.contains("secret=[redacted]"));
+    }
+
+    #[test]
+    fn direct_append_redacts_secret_exposure_detail() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("audit.jsonl");
         let log = AuditLog::open(&path).unwrap();
-        let marker = "synthetic-sensitive-marker";
+        let marker = "synthetic-secret-exposure-append-marker";
+        let event = AuditEvent::new(AuditKind::SecretExposed)
+            .cmd(marker)
+            .reason(marker)
+            .field("secret", marker);
+
+        assert_eq!(log.append(&event).unwrap(), 1);
+        let durable = std::fs::read_to_string(path).unwrap();
+        assert!(!durable.contains(marker));
+        let record: AuditRecord = serde_json::from_str(durable.trim()).unwrap();
+        assert_eq!(record.event.kind, AuditKind::SecretExposed);
+        assert_eq!(record.event.cmd.as_deref(), Some("[redacted]"));
+        assert_eq!(record.event.reason.as_deref(), Some("[redacted]"));
+        assert_eq!(record.event.fields[0].0, "secret");
+        assert_eq!(record.event.fields[0].1, "[redacted]");
+    }
+
+    #[test]
+    fn emit_redacts_secret_exposure_detail() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audit.jsonl");
+        let log = AuditLog::open(&path).unwrap();
+        let marker = "synthetic-secret-exposure-emit-marker";
         let event = AuditEvent::new(AuditKind::SecretExposed)
             .cmd(marker)
             .reason(marker)
@@ -863,8 +909,5 @@ mod tests {
         assert!(emit(Some(&log), &event));
         let durable = std::fs::read_to_string(path).unwrap();
         assert!(!durable.contains(marker));
-        assert!(!redact_secret_exposure(&event)
-            .render_line()
-            .contains(marker));
     }
 }
