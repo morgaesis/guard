@@ -34,7 +34,8 @@ use crate::gating::allow_promotion::AllowPromotionStore;
 use crate::gating::deny_shape::{split_command_line, DenyShapeStore};
 use crate::gating::GateMode;
 use crate::learned_rules::{
-    run_async_durable_store_operation, AutoShimMode, LearnedRuleStore, LearningOutcome,
+    acquire_async_authority_use_lease, run_async_durable_store_operation, AutoShimMode,
+    LearnedRuleStore, LearningOutcome,
 };
 use crate::policy::{PolicyEngine, PolicyMode};
 use anyhow::{bail, Context, Result};
@@ -596,12 +597,20 @@ impl Evaluator {
                         risk: None,
                     };
                 }
-                let hit = {
-                    let guard = store.read().await;
-                    guard
-                        .matches(binary, args_joined)
-                        .map(|shape| shape.last_reason.clone())
-                };
+                let lease =
+                    match acquire_async_authority_use_lease(store, "learned deny decision").await {
+                        Ok(lease) => lease,
+                        Err(_) => {
+                            return EvalResult::Deny {
+                                reason: "learned deny authority is unavailable".to_string(),
+                                source: EvalSource::LearnedDeny,
+                                risk: None,
+                            }
+                        }
+                    };
+                let hit = lease
+                    .matches(binary, args_joined)
+                    .map(|shape| shape.last_reason.clone());
                 if let Some(reason) = hit {
                     tracing::debug!("auto-learned deny shape matched: {}", reason);
                     return EvalResult::Deny {

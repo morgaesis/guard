@@ -12,6 +12,8 @@ use crate::server::gate_runtime::{
     arm_containment_with_access_use_for_test, arm_containment_with_authority,
     finish_due_provisional, finish_revert, resume_approval, run_provisional_check, DaemonGateSink,
 };
+#[cfg(unix)]
+use crate::server::pause_verb_authority_lease_for_test;
 use crate::server::wire::{
     approval_is_armed, AdminRequest, AdminResponse, CallerIdentity, ExecOutcome, ExecuteRequest,
     ExecuteResult, RevertSpec, CONSEQUENCE_ARM,
@@ -5761,6 +5763,154 @@ async fn approve_voided_when_matched_verb_definition_changed() {
             .status,
         ApprovalStatus::ExecFailed
     );
+}
+
+#[cfg(unix)]
+async fn held_approval_catalog_race_is_linearized(replacement: VerbCatalog) {
+    let (cfg, operator, agent) = gating_config(7088, 1000);
+    let held_catalog = VerbCatalog::from_yaml(HELD_VERB_YAML).unwrap();
+    let held_version = held_catalog.version();
+    let held_digest = held_catalog
+        .verb_definition_digest("restart-service")
+        .unwrap();
+    *cfg.state.verbs.write().await = held_catalog;
+    let handle = new_handle();
+    cfg.state
+        .approvals
+        .write()
+        .await
+        .enqueue(held_verb_approval(
+            &handle,
+            Some(held_version),
+            Some(held_digest),
+            agent.principal(),
+        ));
+
+    let (acquired, release) = pause_verb_authority_lease_for_test(&cfg, "held command arming");
+    let approving = cfg.clone();
+    let approving_operator = operator.clone();
+    let approving_handle = handle.clone();
+    let approval = tokio::spawn(async move {
+        handle_admin_request_for_test(
+            &approving,
+            &approving_operator,
+            AdminRequest::Approve {
+                handle: approving_handle,
+            },
+        )
+        .await
+    });
+    acquired.acquire().await.unwrap().forget();
+
+    let changing = cfg.clone();
+    let mutation_started = Arc::new(tokio::sync::Semaphore::new(0));
+    let started = mutation_started.clone();
+    let mutation = tokio::spawn(async move {
+        started.add_permits(1);
+        *changing.state.verbs.write().await = replacement;
+    });
+    mutation_started.acquire().await.unwrap().forget();
+    assert!(!mutation.is_finished());
+    release.add_permits(1);
+
+    assert!(matches!(
+        approval.await.unwrap(),
+        AdminResponse::GateAction { .. }
+    ));
+    mutation.await.unwrap();
+    let resumed = resume_approval(&cfg, &agent, &handle).await;
+    assert!(!matches!(resumed.exec, ExecOutcome::Completed { .. }));
+    assert_eq!(
+        cfg.state
+            .approvals
+            .read()
+            .await
+            .get(&handle)
+            .unwrap()
+            .status,
+        ApprovalStatus::ExecFailed
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn held_approval_lease_linearizes_against_deletion_and_amendment() {
+    held_approval_catalog_race_is_linearized(VerbCatalog::from_yaml("verbs: []").unwrap()).await;
+    let replacement = VerbCatalog::from_yaml(
+        &HELD_VERB_YAML.replace("args: [\"restart\",", "args: [\"reload\","),
+    )
+    .unwrap();
+    held_approval_catalog_race_is_linearized(replacement).await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verb_execution_lease_linearizes_against_concurrent_amendment() {
+    let (cfg, _operator, agent) = gating_config(7089, 1000);
+    let catalog = VerbCatalog::from_yaml(HELD_VERB_YAML).unwrap();
+    let digest = catalog.verb_definition_digest("restart-service").unwrap();
+    let version = catalog.version();
+    *cfg.state.verbs.write().await = catalog;
+    let (acquired, release) =
+        pause_verb_authority_lease_for_test(&cfg, "verb execution authorization");
+
+    let execution = cfg.clone();
+    let execution_agent = agent.clone();
+    let routed = tokio::spawn(async move {
+        let mut sink = tokio::io::sink();
+        route_gated_allow(
+            &mut RequestContext {
+                server: &execution,
+                caller: &execution_agent,
+                depth: 0,
+                stream_output: false,
+                stream_writer: &mut sink,
+            },
+            held_request("true", Vec::new(), None),
+            GateInputs {
+                reason: "operator verb".to_string(),
+                risk: Some(1),
+                reversibility: Some(Reversibility::Reversible),
+                revert_preauthorized: false,
+                verb: Some(VerbContext {
+                    name: "restart-service".to_string(),
+                    class: Reversibility::Reversible,
+                    trusted: true,
+                    params: BTreeMap::new(),
+                    catalog_version: version,
+                    verb_digest: Some(digest),
+                    access_evaluation_override_eligible: false,
+                }),
+                bypass: false,
+                authority: None,
+                consume_access_verbs: Vec::new(),
+            },
+            None,
+        )
+        .await
+    });
+    acquired.acquire().await.unwrap().forget();
+
+    let changing = cfg.clone();
+    let mutation_started = Arc::new(tokio::sync::Semaphore::new(0));
+    let started = mutation_started.clone();
+    let mutation = tokio::spawn(async move {
+        started.add_permits(1);
+        let replacement = VerbCatalog::from_yaml(
+            &HELD_VERB_YAML.replace("args: [\"restart\",", "args: [\"reload\","),
+        )
+        .unwrap();
+        *changing.state.verbs.write().await = replacement;
+    });
+    mutation_started.acquire().await.unwrap().forget();
+    assert!(!mutation.is_finished());
+    release.add_permits(1);
+
+    assert!(matches!(
+        routed.await.unwrap().exec,
+        ExecOutcome::Completed { .. }
+    ));
+    mutation.await.unwrap();
 }
 
 #[tokio::test]

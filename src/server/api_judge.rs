@@ -3,7 +3,9 @@ use async_trait::async_trait;
 use guard::evaluate::{redact_for_llm, EvalConfig, EvalResult, EvalSource, Evaluator, LlmConfig};
 use guard::gating::api_promotion::{ApiCoverageProvenance, ApiPromotionOutcome, ApiPromotionStore};
 use guard::gating::GateMode;
-use guard::learned_rules::run_async_durable_store_operation;
+use guard::learned_rules::{
+    acquire_async_authority_use_lease, run_async_durable_store_operation, AuthorityUseLease,
+};
 use guard::proxy::{ApiCoverageVerdict, ApiJudge, ApiJudgeVerdict, ApiRequestSummary};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -331,15 +333,23 @@ async fn lookup_api_coverage(
             operator: false,
         };
     }
-    let guard = store.read().await;
-    if let Some(hit) = guard.learned_deny(summary, &request_stamp) {
+    let lease = match lease_api_coverage_for_decision(store).await {
+        Ok(lease) => lease,
+        Err(_) => {
+            return ApiCoverageVerdict::Deny {
+                reason: "API coverage authority is unavailable".to_string(),
+                operator: false,
+            }
+        }
+    };
+    if let Some(hit) = lease.learned_deny(summary, &request_stamp) {
         return ApiCoverageVerdict::Deny {
             reason: hit.reason,
             operator: hit.provenance == ApiCoverageProvenance::Operator,
         };
     }
     if !summary.rarity {
-        if let Some(hit) = guard.learned_allow(summary, &request_stamp) {
+        if let Some(hit) = lease.learned_allow(summary, &request_stamp) {
             return ApiCoverageVerdict::Allow {
                 risk: hit.risk,
                 reversibility: hit.reversibility,
@@ -351,7 +361,7 @@ async fn lookup_api_coverage(
         baseline.session_fingerprint = None;
         baseline.session_revision = None;
         baseline.session_intent = None;
-        if let Some(hit) = guard.learned_deny(&baseline, stamp) {
+        if let Some(hit) = lease.learned_deny(&baseline, stamp) {
             if hit.provenance == ApiCoverageProvenance::Operator {
                 return ApiCoverageVerdict::Deny {
                     reason: hit.reason,
@@ -361,6 +371,48 @@ async fn lookup_api_coverage(
         }
     }
     ApiCoverageVerdict::None
+}
+
+pub(super) async fn lease_api_coverage_for_decision(
+    store: &Arc<RwLock<ApiPromotionStore>>,
+) -> anyhow::Result<AuthorityUseLease<ApiPromotionStore>> {
+    let lease = acquire_async_authority_use_lease(store, "API coverage decision").await?;
+    #[cfg(test)]
+    let hook = api_coverage_lease_hooks()
+        .lock()
+        .unwrap()
+        .remove(lease.path());
+    #[cfg(test)]
+    if let Some((acquired, release)) = hook {
+        acquired.add_permits(1);
+        let permit = release.acquire().await.expect("API lease hook is open");
+        permit.forget();
+    }
+    Ok(lease)
+}
+
+#[cfg(test)]
+type ApiCoverageLeaseHook = (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>);
+
+#[cfg(test)]
+fn api_coverage_lease_hooks(
+) -> &'static std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, ApiCoverageLeaseHook>>
+{
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, ApiCoverageLeaseHook>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn pause_api_coverage_lease_for_test(path: std::path::PathBuf) -> ApiCoverageLeaseHook {
+    let acquired = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    api_coverage_lease_hooks()
+        .lock()
+        .unwrap()
+        .insert(path, (acquired.clone(), release.clone()));
+    (acquired, release)
 }
 
 pub(super) async fn refresh_api_coverage_once(
@@ -446,10 +498,15 @@ impl ApiJudge for DaemonApiJudge {
                     reason: "API coverage authority is unavailable".to_string(),
                 });
             }
-            let hit = {
-                let guard = store.read().await;
-                guard.learned_deny(summary, &request_stamp)
+            let lease = match lease_api_coverage_for_decision(store).await {
+                Ok(lease) => lease,
+                Err(_) => {
+                    return sanitize_api_judge_verdict(ApiJudgeVerdict::Deny {
+                        reason: "API coverage authority is unavailable".to_string(),
+                    })
+                }
             };
+            let hit = lease.learned_deny(summary, &request_stamp);
             if let Some(hit) = hit {
                 let _ = guard::audit::emit_global(
                     &guard::audit::AuditEvent::new(guard::audit::AuditKind::ApiVerbCoverageHit)
@@ -473,10 +530,7 @@ impl ApiJudge for DaemonApiJudge {
             }
 
             if !summary.rarity {
-                let hit = {
-                    let guard = store.read().await;
-                    guard.learned_allow(summary, &request_stamp)
-                };
+                let hit = lease.learned_allow(summary, &request_stamp);
                 if let Some(hit) = hit {
                     let _ = guard::audit::emit_global(
                         &guard::audit::AuditEvent::new(guard::audit::AuditKind::ApiVerbCoverageHit)
@@ -512,10 +566,7 @@ impl ApiJudge for DaemonApiJudge {
                 baseline.session_fingerprint = None;
                 baseline.session_revision = None;
                 baseline.session_intent = None;
-                let deny = {
-                    let guard = store.read().await;
-                    guard.learned_deny(&baseline, &self.stamp)
-                };
+                let deny = lease.learned_deny(&baseline, &self.stamp);
                 if let Some(hit) = deny {
                     if hit.provenance == ApiCoverageProvenance::Operator {
                         let _ = guard::audit::emit_global(
@@ -1071,6 +1122,119 @@ mod tests {
             lookup_api_coverage(&store, "", &summary).await,
             ApiCoverageVerdict::Deny { .. }
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn coverage_allow_lease_linearizes_against_external_clear() {
+        let temp = authority_tempdir();
+        let path = temp.path().join("api.yaml");
+        let summary = api_summary("lease-clear", false);
+        let store = promotion_store(path.clone(), 1, 1);
+        for _ in 0..2 {
+            store
+                .write()
+                .await
+                .record_allow(
+                    &summary,
+                    Some(1),
+                    Some(guard::gating::Reversibility::Reversible),
+                    "safe",
+                    "",
+                )
+                .unwrap();
+        }
+
+        let (acquired, release) = pause_api_coverage_lease_for_test(path.clone());
+        let decision_store = store.clone();
+        let decision_summary = summary.clone();
+        let decision = tokio::spawn(async move {
+            lookup_api_coverage(&decision_store, "", &decision_summary).await
+        });
+        acquired.acquire().await.unwrap().forget();
+
+        let writer_started = Arc::new(tokio::sync::Semaphore::new(0));
+        let started = writer_started.clone();
+        let writer = tokio::task::spawn_blocking(move || {
+            started.add_permits(1);
+            let mut config = guard::gating::api_promotion::ApiPromotionConfig::new(path);
+            config.min_approvals = 1;
+            config.min_denials = 1;
+            let mut independent = ApiPromotionStore::load(config).unwrap();
+            independent.clear_generated().unwrap()
+        });
+        writer_started.acquire().await.unwrap().forget();
+        assert!(!writer.is_finished());
+        release.add_permits(1);
+
+        assert!(matches!(
+            decision.await.unwrap(),
+            ApiCoverageVerdict::Allow { .. }
+        ));
+        assert_eq!(writer.await.unwrap(), 1);
+        assert!(matches!(
+            lookup_api_coverage(&store, "", &summary).await,
+            ApiCoverageVerdict::None
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ordinary_judge_allow_lease_linearizes_against_external_clear() {
+        let temp = authority_tempdir();
+        let path = temp.path().join("api.yaml");
+        let summary = api_summary("judge-lease-clear", false);
+        let store = promotion_store(path.clone(), 2, 1);
+        let llm = llm_config("http://127.0.0.1:1".to_string());
+        let intent = "inspect deployments";
+        let stamp = regime_stamp(&llm, Some(intent));
+        for _ in 0..2 {
+            store
+                .write()
+                .await
+                .record_allow(
+                    &summary,
+                    Some(1),
+                    Some(guard::gating::Reversibility::Reversible),
+                    "safe",
+                    &stamp,
+                )
+                .unwrap();
+        }
+        let judge = DaemonApiJudge::build(
+            llm,
+            false,
+            8,
+            Duration::from_secs(60),
+            Some(intent.to_string()),
+            Some(store),
+            Arc::new(ApiJudgeSpend::new(ApiJudgeSpendConfig::default())),
+        )
+        .unwrap();
+
+        let (acquired, release) = pause_api_coverage_lease_for_test(path.clone());
+        let decision_summary = summary.clone();
+        let decision = tokio::spawn(async move { judge.judge(&decision_summary).await });
+        acquired.acquire().await.unwrap().forget();
+        let writer_started = Arc::new(tokio::sync::Semaphore::new(0));
+        let started = writer_started.clone();
+        let writer = tokio::task::spawn_blocking(move || {
+            started.add_permits(1);
+            let mut config = guard::gating::api_promotion::ApiPromotionConfig::new(path);
+            config.min_approvals = 2;
+            config.min_denials = 1;
+            ApiPromotionStore::load(config)
+                .unwrap()
+                .clear_generated()
+                .unwrap()
+        });
+        writer_started.acquire().await.unwrap().forget();
+        assert!(!writer.is_finished());
+        release.add_permits(1);
+
+        assert!(matches!(
+            decision.await.unwrap(),
+            ApiJudgeVerdict::Allow { .. }
+        ));
+        assert_eq!(writer.await.unwrap(), 1);
     }
 
     #[tokio::test]

@@ -29,10 +29,9 @@ use crate::env::now_unix;
 #[cfg(test)]
 use crate::learned_rules::write_learning_file_atomically;
 use crate::learned_rules::{
-    infer_service_from_binary, load_learning_file_snapshot, retry_learning_snapshot_conflicts,
-    rewrite_learning_file_bounded, sanitize_learning_text,
-    write_learning_file_atomically_for_locked_snapshot, AsyncDurableStore, LearningFileSnapshot,
-    LearningWriteOutcome,
+    infer_service_from_binary, retry_learning_snapshot_conflicts, rewrite_learning_file_bounded,
+    sanitize_learning_text, write_learning_file_atomically_for_locked_snapshot, AsyncDurableStore,
+    LearningFileSnapshot, LearningWriteOutcome,
 };
 use crate::redact::{
     command_contains_sensitive_literals, flattened_args_contain_sensitive_literals,
@@ -267,14 +266,6 @@ impl DenyShapeStore {
 
     pub fn observation_count(&self) -> usize {
         self.data.observations.len()
-    }
-
-    pub fn refresh_for_decision(&mut self) -> Result<()> {
-        let current = load_learning_file_snapshot(&self.config.path)?;
-        if !current.same_authority(&self.snapshot) {
-            *self = Self::load(self.config.clone())?;
-        }
-        Ok(())
     }
 
     pub(crate) fn refreshed_copy(&self) -> Result<Self> {
@@ -584,23 +575,20 @@ pub fn split_command_line(command: &str) -> (&str, &str) {
 }
 
 impl AsyncDurableStore for DenyShapeStore {
+    fn authority_name(&self) -> &'static str {
+        "deny-shape"
+    }
+
     fn durable_path(&self) -> Option<&Path> {
         Some(&self.config.path)
     }
 
-    fn same_in_memory_epoch(&self, other: &Self) -> bool {
-        self.snapshot.same_authority(&other.snapshot) && self.data == other.data
+    fn same_durable_snapshot(&self, snapshot: &LearningFileSnapshot) -> bool {
+        self.snapshot.same_authority(snapshot)
     }
 
-    fn adopt_async_result(&mut self, baseline: &Self, result: Self) -> Result<()> {
-        if self.same_in_memory_epoch(baseline) {
-            *self = result;
-            return Ok(());
-        }
-        if self.same_in_memory_epoch(&result) {
-            return Ok(());
-        }
-        anyhow::bail!("deny-shape authority changed during asynchronous file I/O")
+    fn same_in_memory_epoch(&self, other: &Self) -> bool {
+        self.snapshot.same_authority(&other.snapshot) && self.data == other.data
     }
 }
 

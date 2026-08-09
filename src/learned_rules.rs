@@ -25,8 +25,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::SystemTime;
-use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
+use std::time::{Duration, Instant, SystemTime};
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 use crate::env::now_unix;
 use crate::redact::{
@@ -60,21 +60,21 @@ impl LearningWriteOutcome {
     pub(crate) fn into_parts(self) -> (LearningFileSnapshot, Option<anyhow::Error>) {
         #[cfg(test)]
         let hook = {
-            let mut hook = post_commit_adoption_hook()
+            let mut hooks = post_commit_adoption_hooks()
                 .lock()
                 .expect("post-commit hook lock");
-            if hook.as_ref().is_some_and(|(needle, _, _)| {
-                self.snapshot.content().is_some_and(|content| {
-                    std::str::from_utf8(content).is_ok_and(|content| content.contains(needle))
+            let matching = self.snapshot.content().and_then(|content| {
+                std::str::from_utf8(content).ok().and_then(|content| {
+                    hooks
+                        .keys()
+                        .find(|needle| content.contains(needle.as_str()))
+                        .cloned()
                 })
-            }) {
-                hook.take()
-            } else {
-                None
-            }
+            });
+            matching.and_then(|needle| hooks.remove(&needle))
         };
         #[cfg(test)]
-        if let Some((_, committed, release)) = hook {
+        if let Some((committed, release)) = hook {
             committed.wait();
             release.wait();
         }
@@ -95,16 +95,16 @@ impl LearningWriteOutcome {
 
 #[cfg(test)]
 type PostCommitAdoptionHook = (
-    String,
     std::sync::Arc<std::sync::Barrier>,
     std::sync::Arc<std::sync::Barrier>,
 );
 
 #[cfg(test)]
-fn post_commit_adoption_hook() -> &'static std::sync::Mutex<Option<PostCommitAdoptionHook>> {
-    static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<PostCommitAdoptionHook>>> =
+fn post_commit_adoption_hooks(
+) -> &'static std::sync::Mutex<BTreeMap<String, PostCommitAdoptionHook>> {
+    static HOOKS: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, PostCommitAdoptionHook>>> =
         std::sync::OnceLock::new();
-    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+    HOOKS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
 }
 
 #[cfg(test)]
@@ -116,10 +116,10 @@ pub(crate) fn pause_post_commit_adoption_for_test(
 ) {
     let committed = std::sync::Arc::new(std::sync::Barrier::new(2));
     let release = std::sync::Arc::new(std::sync::Barrier::new(2));
-    *post_commit_adoption_hook()
+    post_commit_adoption_hooks()
         .lock()
-        .expect("post-commit hook lock") =
-        Some((needle.to_string(), committed.clone(), release.clone()));
+        .expect("post-commit hook lock")
+        .insert(needle.to_string(), (committed.clone(), release.clone()));
     (committed, release)
 }
 
@@ -153,7 +153,8 @@ enum DirectoryIdentity {
 /// Exact authority bytes and filesystem identity observed while the
 /// destination lock and pinned parent are held.
 #[derive(Debug, Clone)]
-pub(crate) struct LearningFileSnapshot {
+#[doc(hidden)]
+pub struct LearningFileSnapshot {
     content: Option<Vec<u8>>,
     generation: Option<String>,
     parent_identity: DirectoryIdentity,
@@ -176,14 +177,61 @@ impl LearningFileSnapshot {
 
 /// A file-backed authority store that can be updated on a blocking worker and
 /// conditionally adopted without replacing a newer in-memory epoch.
+#[doc(hidden)]
 pub trait AsyncDurableStore: Clone + Send + Sync + 'static {
+    fn authority_name(&self) -> &'static str;
     fn durable_path(&self) -> Option<&Path>;
+    fn same_durable_snapshot(&self, snapshot: &LearningFileSnapshot) -> bool;
     fn same_in_memory_epoch(&self, other: &Self) -> bool;
-    fn adopt_async_result(&mut self, baseline: &Self, result: Self) -> Result<()>;
+    fn adopt_async_result(&mut self, baseline: &Self, result: Self) -> Result<()> {
+        if self.same_in_memory_epoch(baseline) {
+            *self = result;
+            return Ok(());
+        }
+        if self.same_in_memory_epoch(&result) {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "{} authority changed during asynchronous file I/O",
+            self.authority_name()
+        )
+    }
 }
 
-fn durable_store_coordinator(path: &Path) -> Result<Arc<Semaphore>> {
-    static COORDINATORS: OnceLock<Mutex<BTreeMap<PathBuf, Weak<Semaphore>>>> = OnceLock::new();
+#[derive(Debug)]
+struct AuthorityLockTimeout {
+    boundary: &'static str,
+}
+
+impl std::fmt::Display for AuthorityLockTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "timed out acquiring {} authority coordination",
+            self.boundary
+        )
+    }
+}
+
+impl std::error::Error for AuthorityLockTimeout {}
+
+fn authority_lock_timeout(boundary: &'static str) -> anyhow::Error {
+    anyhow::Error::new(AuthorityLockTimeout { boundary })
+}
+
+#[cfg(test)]
+fn is_authority_lock_timeout(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<AuthorityLockTimeout>().is_some()
+}
+
+#[cfg(test)]
+const AUTHORITY_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(not(test))]
+const AUTHORITY_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const AUTHORITY_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+fn durable_store_coordinator(path: &Path) -> Result<Arc<RwLock<()>>> {
+    static COORDINATORS: OnceLock<Mutex<BTreeMap<PathBuf, Weak<RwLock<()>>>>> = OnceLock::new();
     let key = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -196,22 +244,124 @@ fn durable_store_coordinator(path: &Path) -> Result<Arc<Semaphore>> {
     if let Some(coordinator) = coordinators.get(&key).and_then(Weak::upgrade) {
         return Ok(coordinator);
     }
-    let coordinator = Arc::new(Semaphore::new(1));
+    let coordinator = Arc::new(RwLock::new(()));
     coordinators.insert(key, Arc::downgrade(&coordinator));
     Ok(coordinator)
 }
 
-async fn acquire_durable_store_permit(path: &Path) -> Result<OwnedSemaphorePermit> {
-    durable_store_coordinator(path)?
-        .acquire_owned()
-        .await
-        .map_err(|_| anyhow::anyhow!("durable-store coordinator closed"))
+async fn acquire_durable_store_write_permit(path: &Path) -> Result<OwnedRwLockWriteGuard<()>> {
+    let permit = tokio::time::timeout(
+        AUTHORITY_LOCK_TIMEOUT,
+        durable_store_coordinator(path)?.write_owned(),
+    )
+    .await
+    .map_err(|_| authority_lock_timeout("in-process"))?;
+    Ok(permit)
+}
+
+async fn acquire_durable_store_read_permit(path: &Path) -> Result<OwnedRwLockReadGuard<()>> {
+    tokio::time::timeout(
+        AUTHORITY_LOCK_TIMEOUT,
+        durable_store_coordinator(path)?.read_owned(),
+    )
+    .await
+    .map_err(|_| authority_lock_timeout("in-process"))
+}
+
+/// A linearizable read of one durable authority store. The in-process
+/// coordinator, cross-process destination lock, and store read guard remain
+/// held until this value is dropped. Callers retain the lease through the use
+/// boundary so a selected matcher cannot be revoked or amended first.
+#[doc(hidden)]
+pub struct AuthorityUseLease<S> {
+    guard: OwnedRwLockReadGuard<S>,
+    _permit: Option<OwnedRwLockReadGuard<()>>,
+    _destination_lock: Option<DestinationLock>,
+}
+
+impl<S> std::ops::Deref for AuthorityUseLease<S> {
+    type Target = S;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+fn acquire_locked_authority_snapshot(
+    path: PathBuf,
+) -> Result<(DestinationLock, LearningFileSnapshot)> {
+    let mut lock = DestinationLock::acquire_shared(&path)?;
+    lock.verify_parent_binding()?;
+    if !transaction_artifacts(lock.destination())?.is_empty() {
+        drop(lock);
+        let recovery_lock = DestinationLock::acquire(&path)?;
+        recovery_lock.verify_parent_binding()?;
+        recover_learning_file_transaction_locked(recovery_lock.destination())?;
+        recovery_lock.verify_parent_binding()?;
+        drop(recovery_lock);
+        lock = DestinationLock::acquire_shared(&path)?;
+        lock.verify_parent_binding()?;
+    }
+    if !transaction_artifacts(lock.destination())?.is_empty() {
+        anyhow::bail!("authority transaction requires exclusive recovery before use")
+    }
+    let snapshot = read_learning_file_snapshot_locked(&lock)?;
+    Ok((lock, snapshot))
+}
+
+/// Acquire a bounded read lease for a previously refreshed store. A durable
+/// generation change between refresh and lease acquisition is rejected. The
+/// owned task keeps path coordination alive if its async caller is cancelled
+/// while blocking filesystem work is in progress.
+#[doc(hidden)]
+pub async fn acquire_async_authority_use_lease<S>(
+    store: &Arc<RwLock<S>>,
+    task: &'static str,
+) -> Result<AuthorityUseLease<S>>
+where
+    S: AsyncDurableStore,
+{
+    let store = Arc::clone(store);
+    tokio::spawn(async move {
+        let baseline = store.read().await.clone();
+        let path = baseline.durable_path().map(Path::to_path_buf);
+        let permit = match path.as_deref() {
+            Some(path) => Some(acquire_durable_store_read_permit(path).await?),
+            None => None,
+        };
+        let (destination_lock, snapshot) = match path {
+            Some(path) => {
+                let pair =
+                    tokio::task::spawn_blocking(move || acquire_locked_authority_snapshot(path))
+                        .await
+                        .map_err(|error| anyhow::anyhow!("{task} task failed: {error}"))??;
+                (Some(pair.0), Some(pair.1))
+            }
+            None => (None, None),
+        };
+        let guard = Arc::clone(&store).read_owned().await;
+        if !guard.same_in_memory_epoch(&baseline)
+            || snapshot
+                .as_ref()
+                .is_some_and(|snapshot| !guard.same_durable_snapshot(snapshot))
+        {
+            anyhow::bail!("{task} authority changed before its use boundary")
+        }
+        Ok(AuthorityUseLease {
+            guard,
+            _permit: permit,
+            _destination_lock: destination_lock,
+        })
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("{task} coordination task failed: {error}"))?
 }
 
 /// Run one synchronous file transaction on Tokio's blocking pool. The
 /// destination-scoped single-flight permit remains held until the exact
 /// returned snapshot is either adopted or rejected against a newer in-memory
 /// epoch.
+#[doc(hidden)]
 pub async fn run_async_durable_store_operation<S, T, F>(
     store: &Arc<RwLock<S>>,
     task: &'static str,
@@ -222,21 +372,26 @@ where
     T: Send + 'static,
     F: FnOnce(&mut S) -> Result<T> + Send + 'static,
 {
-    let path = store.read().await.durable_path().map(Path::to_path_buf);
-    let _permit = match path {
-        Some(path) => Some(acquire_durable_store_permit(&path).await?),
-        None => None,
-    };
-    let baseline = store.read().await.clone();
-    let mut worker = baseline.clone();
-    let (result, value) = tokio::task::spawn_blocking(move || {
-        let value = operation(&mut worker)?;
-        Ok::<_, anyhow::Error>((worker, value))
+    let store = Arc::clone(store);
+    tokio::spawn(async move {
+        let path = store.read().await.durable_path().map(Path::to_path_buf);
+        let _permit = match path {
+            Some(path) => Some(acquire_durable_store_write_permit(&path).await?),
+            None => None,
+        };
+        let baseline = store.read().await.clone();
+        let mut worker = baseline.clone();
+        let (result, value) = tokio::task::spawn_blocking(move || {
+            let value = operation(&mut worker)?;
+            Ok::<_, anyhow::Error>((worker, value))
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("{task} task failed: {error}"))??;
+        store.write().await.adopt_async_result(&baseline, result)?;
+        Ok(value)
     })
     .await
-    .map_err(|error| anyhow::anyhow!("{task} task failed: {error}"))??;
-    store.write().await.adopt_async_result(&baseline, result)?;
-    Ok(value)
+    .map_err(|error| anyhow::anyhow!("{task} coordination task failed: {error}"))?
 }
 
 const MAX_SNAPSHOT_RETRIES: usize = 8;
@@ -546,6 +701,14 @@ struct DestinationLock {
 
 impl DestinationLock {
     fn acquire(path: &Path) -> Result<Self> {
+        Self::acquire_with_mode(path, true)
+    }
+
+    fn acquire_shared(path: &Path) -> Result<Self> {
+        Self::acquire_with_mode(path, false)
+    }
+
+    fn acquire_with_mode(path: &Path, exclusive: bool) -> Result<Self> {
         ensure_destination_parent(path)?;
         let destination = canonical_destination(path)?;
         let canonical_parent = destination
@@ -569,7 +732,7 @@ impl DestinationLock {
             format!("failed to open learning-file lock {}", lock_path.display())
         })?;
         ensure_regular_file(&lock_path)?;
-        lock_file_exclusive(&file)
+        lock_file(&file, Instant::now() + AUTHORITY_LOCK_TIMEOUT, exclusive)
             .with_context(|| format!("failed to lock learning destination {}", path.display()))?;
         validate_lock_file(&file, &canonical_lock_path)?;
         let lock = Self {
@@ -1144,12 +1307,25 @@ impl Drop for DestinationLock {
 }
 
 #[cfg(unix)]
-fn lock_file_exclusive(file: &File) -> std::io::Result<()> {
+fn lock_file(file: &File, deadline: Instant, exclusive: bool) -> Result<()> {
     use std::os::fd::AsRawFd;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
-        Ok(())
+    let mode = if exclusive {
+        libc::LOCK_EX
     } else {
-        Err(std::io::Error::last_os_error())
+        libc::LOCK_SH
+    };
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), mode | libc::LOCK_NB) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::WouldBlock {
+            return Err(error.into());
+        }
+        if Instant::now() >= deadline {
+            return Err(authority_lock_timeout("cross-process"));
+        }
+        std::thread::sleep(AUTHORITY_LOCK_RETRY_INTERVAL);
     }
 }
 
@@ -1164,24 +1340,31 @@ fn unlock_file(file: &File) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
-fn lock_file_exclusive(file: &File) -> std::io::Result<()> {
+fn lock_file(file: &File, deadline: Instant, exclusive: bool) -> Result<()> {
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK};
-    let mut overlapped = unsafe { std::mem::zeroed() };
-    if unsafe {
-        LockFileEx(
-            file.as_raw_handle(),
-            LOCKFILE_EXCLUSIVE_LOCK,
-            0,
-            1,
-            0,
-            &mut overlapped,
-        )
-    } == 0
-    {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+    };
+    loop {
+        let mut overlapped = unsafe { std::mem::zeroed() };
+        let flags = LOCKFILE_FAIL_IMMEDIATELY
+            | if exclusive {
+                LOCKFILE_EXCLUSIVE_LOCK
+            } else {
+                0
+            };
+        if unsafe { LockFileEx(file.as_raw_handle(), flags, 0, 1, 0, &mut overlapped) } != 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(ERROR_LOCK_VIOLATION as i32) {
+            return Err(error.into());
+        }
+        if Instant::now() >= deadline {
+            return Err(authority_lock_timeout("cross-process"));
+        }
+        std::thread::sleep(AUTHORITY_LOCK_RETRY_INTERVAL);
     }
 }
 
@@ -1198,11 +1381,12 @@ fn unlock_file(file: &File) -> std::io::Result<()> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn lock_file_exclusive(_file: &File) -> std::io::Result<()> {
+fn lock_file(_file: &File, _deadline: Instant, _exclusive: bool) -> Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "file locking is unsupported",
-    ))
+    )
+    .into())
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -3560,23 +3744,20 @@ impl LearnedRuleStore {
 }
 
 impl AsyncDurableStore for LearnedRuleStore {
+    fn authority_name(&self) -> &'static str {
+        "learned-rule"
+    }
+
     fn durable_path(&self) -> Option<&Path> {
         Some(&self.config.path)
     }
 
-    fn same_in_memory_epoch(&self, other: &Self) -> bool {
-        self.snapshot.same_authority(&other.snapshot) && self.data == other.data
+    fn same_durable_snapshot(&self, snapshot: &LearningFileSnapshot) -> bool {
+        self.snapshot.same_authority(snapshot)
     }
 
-    fn adopt_async_result(&mut self, baseline: &Self, result: Self) -> Result<()> {
-        if self.same_in_memory_epoch(baseline) {
-            *self = result;
-            return Ok(());
-        }
-        if self.same_in_memory_epoch(&result) {
-            return Ok(());
-        }
-        anyhow::bail!("learned-rule authority changed during asynchronous file I/O")
+    fn same_in_memory_epoch(&self, other: &Self) -> bool {
+        self.snapshot.same_authority(&other.snapshot) && self.data == other.data
     }
 }
 
@@ -4346,6 +4527,37 @@ mod tests {
         thread.join().unwrap();
     }
 
+    #[test]
+    fn destination_lock_contention_has_a_bounded_failure() {
+        let temp = authority_tempdir();
+        let destination = temp.path().join("learned.yaml");
+        let first = DestinationLock::acquire(&destination).unwrap();
+        let contender = destination.clone();
+        let error = std::thread::spawn(move || DestinationLock::acquire(&contender).err().unwrap())
+            .join()
+            .unwrap();
+        assert!(is_authority_lock_timeout(&error));
+        drop(first);
+        DestinationLock::acquire(&destination).unwrap();
+    }
+
+    #[tokio::test]
+    async fn in_process_authority_coordination_has_a_bounded_failure() {
+        let temp = authority_tempdir();
+        let destination = temp.path().join("learned.yaml");
+        let first = acquire_durable_store_write_permit(&destination)
+            .await
+            .unwrap();
+        let error = acquire_durable_store_write_permit(&destination)
+            .await
+            .unwrap_err();
+        assert!(is_authority_lock_timeout(&error));
+        drop(first);
+        let _permit = acquire_durable_store_write_permit(&destination)
+            .await
+            .unwrap();
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn asynchronous_mutation_keeps_current_thread_runtime_and_readers_responsive() {
         let temp = authority_tempdir();
@@ -4458,6 +4670,130 @@ mod tests {
             loaded.data.observations.values().next().unwrap().approvals,
             2
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_caller_cannot_release_coordination_before_detached_adoption() {
+        let temp = authority_tempdir();
+        let config = LearningConfig {
+            path: temp.path().join("learned.yaml"),
+            min_approvals: 3,
+            max_risk: 2,
+            auto_shim: AutoShimMode::Off,
+        };
+        let store = Arc::new(RwLock::new(LearnedRuleStore::load(config.clone()).unwrap()));
+        let (committed, release) = pause_post_commit_adoption_for_test("cancel-race");
+        let first_store = store.clone();
+        let first = tokio::spawn(async move {
+            run_async_durable_store_operation(
+                &first_store,
+                "cancelled coordinated observation",
+                |candidate| {
+                    candidate.record_approval(
+                        "fixturectl",
+                        &["cancel-race".to_string()],
+                        "fixturectl cancel-race",
+                        Some(1),
+                        "safe",
+                    )
+                },
+            )
+            .await
+        });
+        tokio::task::spawn_blocking(move || committed.wait())
+            .await
+            .unwrap();
+        first.abort();
+
+        let second_store = store.clone();
+        let second_started = Arc::new(tokio::sync::Semaphore::new(0));
+        let started = second_started.clone();
+        let second = tokio::spawn(async move {
+            started.add_permits(1);
+            run_async_durable_store_operation(
+                &second_store,
+                "successor coordinated observation",
+                |candidate| {
+                    candidate.record_approval(
+                        "fixturectl",
+                        &["cancel-race".to_string()],
+                        "fixturectl cancel-race",
+                        Some(1),
+                        "safe",
+                    )
+                },
+            )
+            .await
+        });
+        second_started.acquire().await.unwrap().forget();
+        assert!(!second.is_finished());
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .unwrap();
+
+        assert_eq!(second.await.unwrap().unwrap().unwrap().approvals, 2);
+        let loaded = LearnedRuleStore::load(config).unwrap();
+        assert_eq!(
+            loaded.data.observations.values().next().unwrap().approvals,
+            2
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn authority_use_lease_blocks_an_independent_writer_until_use_finishes() {
+        let temp = authority_tempdir();
+        let config = LearningConfig {
+            path: temp.path().join("learned.yaml"),
+            min_approvals: 2,
+            max_risk: 2,
+            auto_shim: AutoShimMode::Off,
+        };
+        let store = Arc::new(RwLock::new(LearnedRuleStore::load(config.clone()).unwrap()));
+        let lease = acquire_async_authority_use_lease(&store, "learning authority use")
+            .await
+            .unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let mut independent = LearnedRuleStore::load(config).unwrap();
+            independent
+                .record_approval(
+                    "fixturectl",
+                    &["status".to_string()],
+                    "fixturectl status",
+                    Some(1),
+                    "safe",
+                )
+                .unwrap();
+            send.send(()).unwrap();
+        });
+        assert!(receive.recv_timeout(Duration::from_millis(100)).is_err());
+        assert_eq!(lease.rule_count(), 0);
+        drop(lease);
+        receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        writer.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn authority_use_leases_are_shared_between_concurrent_decisions() {
+        let temp = authority_tempdir();
+        let config = LearningConfig {
+            path: temp.path().join("learned.yaml"),
+            min_approvals: 2,
+            max_risk: 2,
+            auto_shim: AutoShimMode::Off,
+        };
+        let store = Arc::new(RwLock::new(LearnedRuleStore::load(config).unwrap()));
+        let first = acquire_async_authority_use_lease(&store, "first authority reader")
+            .await
+            .unwrap();
+        let second = tokio::time::timeout(
+            Duration::from_millis(250),
+            acquire_async_authority_use_lease(&store, "second authority reader"),
+        )
+        .await
+        .expect("concurrent authority readers do not serialize")
+        .unwrap();
+        assert_eq!(first.rule_count(), second.rule_count());
     }
 
     #[cfg(unix)]

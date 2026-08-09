@@ -803,23 +803,20 @@ pub(crate) fn build_candidate_verb(
 }
 
 impl AsyncDurableStore for AllowPromotionStore {
+    fn authority_name(&self) -> &'static str {
+        "allow-promotion"
+    }
+
     fn durable_path(&self) -> Option<&Path> {
         Some(&self.config.path)
     }
 
-    fn same_in_memory_epoch(&self, other: &Self) -> bool {
-        self.snapshot.same_authority(&other.snapshot) && self.data == other.data
+    fn same_durable_snapshot(&self, snapshot: &LearningFileSnapshot) -> bool {
+        self.snapshot.same_authority(snapshot)
     }
 
-    fn adopt_async_result(&mut self, baseline: &Self, result: Self) -> Result<()> {
-        if self.same_in_memory_epoch(baseline) {
-            *self = result;
-            return Ok(());
-        }
-        if self.same_in_memory_epoch(&result) {
-            return Ok(());
-        }
-        anyhow::bail!("allow-promotion authority changed during asynchronous file I/O")
+    fn same_in_memory_epoch(&self, other: &Self) -> bool {
+        self.snapshot.same_authority(&other.snapshot) && self.data == other.data
     }
 }
 

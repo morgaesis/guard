@@ -863,27 +863,6 @@ async fn reduce_access_intent(
     intent: &str,
     observed_argv: Option<(&str, &[String])>,
 ) -> Result<(Vec<Verb>, Vec<Verb>), String> {
-    server
-        .refresh_verb_catalog_for_decision()
-        .await
-        .map_err(|error| format!("verb catalog authority is unavailable: {error}"))?;
-    let existing = {
-        let catalog = server.state.verbs.read().await;
-        catalog
-            .list()
-            .into_iter()
-            .map(|verb| {
-                if !verb.name.starts_with("access-generated-") {
-                    return Ok(verb);
-                }
-                let mut proposal = verb;
-                proposal.trusted = false;
-                guard::gating::verb::normalize_generated_access_verb(proposal).map_err(|error| {
-                    format!("stored generated access coverage was rejected: {error}")
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?
-    };
     if let Some((binary, args)) = observed_argv {
         let candidate = guard::gating::verb::Verb {
             name: "access-generated-pending".to_string(),
@@ -903,9 +882,25 @@ async fn reduce_access_intent(
             auto_promoted: false,
             promotion_stamp: None,
         };
-        return reduce_generated_access_candidate(server, candidate, &existing).await;
+        return reduce_generated_access_candidate(server, candidate).await;
     }
-
+    let catalog = server
+        .refresh_and_lease_verb_catalog_for_use("access proposal selection")
+        .await
+        .map_err(|error| format!("verb catalog authority is unavailable: {error}"))?;
+    let existing = catalog
+        .list()
+        .into_iter()
+        .map(|verb| {
+            if !verb.name.starts_with("access-generated-") {
+                return Ok(verb);
+            }
+            let mut proposal = verb;
+            proposal.trusted = false;
+            guard::gating::verb::normalize_generated_access_verb(proposal)
+                .map_err(|error| format!("stored generated access coverage was rejected: {error}"))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let clauses = access_intent_clauses(intent);
     let named_by_clause = clauses
         .iter()
@@ -971,6 +966,7 @@ async fn reduce_access_intent(
         return access_reduction(vec![best.clone()]);
     }
 
+    drop(catalog);
     let candidate = server
         .state
         .evaluator
@@ -979,30 +975,39 @@ async fn reduce_access_intent(
         .map_err(|error| {
             format!("access intent could not be reduced to typed coverage: {error}")
         })?;
-    reduce_generated_access_candidate(server, candidate, &existing).await
+    reduce_generated_access_candidate(server, candidate).await
 }
 
 async fn reduce_generated_access_candidate(
     server: &ServerContext,
     mut candidate: Verb,
-    existing: &[Verb],
 ) -> Result<(Vec<Verb>, Vec<Verb>), String> {
     candidate.baseline = false;
     candidate.trusted = false;
     candidate = guard::gating::verb::normalize_generated_access_verb(candidate)
         .map_err(|error| format!("synthesized access coverage was rejected: {error}"))?;
 
+    let catalog = server
+        .refresh_and_lease_verb_catalog_for_use("generated access proposal validation")
+        .await
+        .map_err(|error| format!("verb catalog authority is unavailable: {error}"))?;
+    let existing = catalog
+        .list()
+        .into_iter()
+        .map(|verb| {
+            if !verb.name.starts_with("access-generated-") {
+                return Ok(verb);
+            }
+            let mut proposal = verb;
+            proposal.trusted = false;
+            guard::gating::verb::normalize_generated_access_verb(proposal)
+                .map_err(|error| format!("stored generated access coverage was rejected: {error}"))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     if let Some(reused) = existing.iter().find(|verb| {
         generated_access_matcher_shape(verb) == generated_access_matcher_shape(&candidate)
     }) {
         return access_reduction(vec![reused.clone()]);
-    }
-
-    let catalog = server.state.verbs.read().await;
-    if let Some(reused) = catalog.list().into_iter().find(|verb| {
-        generated_access_matcher_shape(verb) == generated_access_matcher_shape(&candidate)
-    }) {
-        return access_reduction(vec![reused]);
     }
     candidate.name = generated_access_verb_name(&candidate);
     catalog
@@ -1221,20 +1226,23 @@ pub(super) async fn install_approved_access_verbs(server: &ServerContext) -> Res
         .into_iter()
         .map(|summary| summary.token)
         .collect::<std::collections::BTreeSet<_>>();
-    let requests = server.state.grant_requests.read().await;
-    let mut catalog = server.state.verbs.read().await.clone();
-    for request in requests.values().filter(|request| {
-        request.status == GrantRequestStatus::Approved
-            && active_tokens.contains(&request.session_token)
-    }) {
-        for verb in proposed_access_verbs(request)? {
-            catalog
-                .upsert_access_verb(verb)
-                .map_err(|error| format!("failed to restore approved access coverage: {error}"))?;
+    let proposals = {
+        let requests = server.state.grant_requests.read().await;
+        let mut proposals = Vec::new();
+        for request in requests.values().filter(|request| {
+            request.status == GrantRequestStatus::Approved
+                && active_tokens.contains(&request.session_token)
+        }) {
+            proposals.extend(proposed_access_verbs(request)?);
         }
+        proposals
+    };
+    let mut catalog = server.state.verbs.write().await;
+    for verb in proposals {
+        catalog
+            .upsert_access_verb(verb)
+            .map_err(|error| format!("failed to restore approved access coverage: {error}"))?;
     }
-    drop(requests);
-    *server.state.verbs.write().await = catalog;
     Ok(())
 }
 
@@ -2134,7 +2142,10 @@ async fn validate_access_verbs(
     names: &[String],
     proposed: &[Verb],
 ) -> Result<(), String> {
-    let catalog = server.state.verbs.read().await;
+    let catalog = server
+        .refresh_and_lease_verb_catalog_for_use("access approval validation")
+        .await
+        .map_err(|error| format!("verb catalog authority is unavailable: {error}"))?;
     for name in names {
         let proposal = proposed.iter().find(|verb| &verb.name == name);
         let verb = proposal
@@ -2149,17 +2160,21 @@ async fn validate_access_verbs(
     Ok(())
 }
 
-async fn stage_proposed_access_verbs(
+async fn validate_proposed_access_verbs(
     server: &ServerContext,
     proposed: &[Verb],
-) -> Result<guard::gating::verb::VerbCatalog, String> {
-    let mut catalog = server.state.verbs.read().await.clone();
+) -> Result<(), String> {
+    let mut catalog = server
+        .refresh_and_lease_verb_catalog_for_use("generated access approval validation")
+        .await
+        .map_err(|error| format!("verb catalog authority is unavailable: {error}"))?
+        .clone();
     for verb in proposed {
         catalog
             .upsert_access_verb(verb.clone())
             .map_err(|error| format!("failed to stage approved access coverage: {error}"))?;
     }
-    Ok(catalog)
+    Ok(())
 }
 
 async fn reload_sessions_after_registry_conflict(
@@ -2410,21 +2425,18 @@ async fn approve_access_request(
             pending.authority_verbs.clone(),
         );
 
-        let staged_verbs = match stage_proposed_access_verbs(server, &proposed_verbs).await {
-            Ok(staged_verbs) => staged_verbs,
-            Err(message) => {
-                return AccessDecisionResult {
-                    request: handle.to_string(),
-                    success: false,
-                    state: "stale".to_string(),
-                    target: pending.target.clone(),
-                    remaining_uses: None,
-                    use_policy: "unavailable".to_string(),
-                    message,
-                    consequence: String::new(),
-                }
-            }
-        };
+        if let Err(message) = validate_proposed_access_verbs(server, &proposed_verbs).await {
+            return AccessDecisionResult {
+                request: handle.to_string(),
+                success: false,
+                state: "stale".to_string(),
+                target: pending.target.clone(),
+                remaining_uses: None,
+                use_policy: "unavailable".to_string(),
+                message,
+                consequence: String::new(),
+            };
+        }
 
         let mut approved = pending.clone();
         approved.session_token = token.clone();
@@ -2530,7 +2542,20 @@ async fn approve_access_request(
         }
         let grant_uses = staged.access_grant_uses(&token, handle);
         let remaining_uses = grant_uses.and_then(|(_, remaining)| remaining);
-        *server.state.verbs.write().await = staged_verbs;
+        let verb_install_error = {
+            let mut catalog = server.state.verbs.write().await;
+            let mut candidate = catalog.clone();
+            let error = proposed_verbs.iter().find_map(|verb| {
+                candidate
+                    .upsert_access_verb(verb.clone())
+                    .err()
+                    .map(|error| format!("failed to install approved access coverage: {error}"))
+            });
+            if error.is_none() {
+                *catalog = candidate;
+            }
+            error
+        };
         *live_sessions = staged;
         drop(live_sessions);
         {
@@ -2539,6 +2564,18 @@ async fn approve_access_request(
                 requests.insert(rebased.handle.clone(), rebased);
             }
             requests.insert(handle.to_string(), approved.clone());
+        }
+        if let Some(message) = verb_install_error {
+            return AccessDecisionResult {
+                request: handle.to_string(),
+                success: false,
+                state: "error".to_string(),
+                target: approved.target,
+                remaining_uses,
+                use_policy: access_use_policy(grant_uses).to_string(),
+                message,
+                consequence: String::new(),
+            };
         }
         emit_grant_request_event(server, &approved, "access_request_approved");
         return AccessDecisionResult {
@@ -2711,22 +2748,6 @@ async fn approve_held_access(
             consequence: String::new(),
         };
     };
-    if let Some(verb_name) = approval.snapshot.verb_name.as_deref() {
-        let catalog = server.state.verbs.read().await;
-        if let Some(staleness) = held_verb_staleness(&approval.snapshot, verb_name, &catalog) {
-            return AccessDecisionResult {
-                request: handle.to_string(),
-                success: false,
-                state: "stale".to_string(),
-                target: Some(format!("agent:{requester}")),
-                remaining_uses: None,
-                use_policy: "unavailable".to_string(),
-                message: format!("{}; re-issue the command", staleness.clause(verb_name)),
-                consequence: String::new(),
-            };
-        }
-    }
-
     let originating_access_token = if approval.snapshot.session_fingerprint.is_none() {
         None
     } else {
@@ -3687,12 +3708,17 @@ async fn dispatch_admin_request(
                 }
             }
             if !activated_verbs.is_empty() || !override_markers.is_empty() {
-                if let Err(error) = server.refresh_verb_catalog_for_decision().await {
-                    return AdminResponse::Error {
-                        message: format!("verb catalog authority is unavailable: {error}"),
-                    };
-                }
-                let catalog = server.state.verbs.read().await;
+                let catalog = match server
+                    .refresh_and_lease_verb_catalog_for_use("session verb activation")
+                    .await
+                {
+                    Ok(catalog) => catalog,
+                    Err(error) => {
+                        return AdminResponse::Error {
+                            message: format!("verb catalog authority is unavailable: {error}"),
+                        }
+                    }
+                };
                 for name in &activated_verbs {
                     let Some(verb) = catalog.get(name) else {
                         return AdminResponse::Error {
@@ -4297,12 +4323,17 @@ async fn dispatch_admin_request(
                 .map(|m| m.as_str().to_string())
                 .unwrap_or_else(|| "readonly".to_string());
             let (verb_catalog_hash, verb_catalog_changed_unix) = {
-                if let Err(error) = server.refresh_verb_catalog_for_decision().await {
-                    return AdminResponse::Error {
-                        message: format!("verb catalog authority is unavailable: {error}"),
-                    };
-                }
-                let catalog = server.state.verbs.read().await;
+                let catalog = match server
+                    .refresh_and_lease_verb_catalog_for_use("status catalog projection")
+                    .await
+                {
+                    Ok(catalog) => catalog,
+                    Err(error) => {
+                        return AdminResponse::Error {
+                            message: format!("verb catalog authority is unavailable: {error}"),
+                        }
+                    }
+                };
                 (catalog.short_hash(), catalog.changed_unix())
             };
 
@@ -4408,12 +4439,17 @@ async fn dispatch_admin_request(
             handle_approval_withdraw(server, caller, &handle).await
         }
         AdminRequest::VerbList => {
-            if let Err(error) = server.refresh_verb_catalog_for_decision().await {
-                return AdminResponse::Error {
-                    message: format!("verb catalog authority is unavailable: {error}"),
-                };
-            }
-            let cat = server.state.verbs.read().await;
+            let cat = match server
+                .refresh_and_lease_verb_catalog_for_use("verb list projection")
+                .await
+            {
+                Ok(catalog) => catalog,
+                Err(error) => {
+                    return AdminResponse::Error {
+                        message: format!("verb catalog authority is unavailable: {error}"),
+                    }
+                }
+            };
             if caller_is_session_admin(server, caller) {
                 let current_stamp = server.state.evaluator.verb_promotion_stamp();
                 let items = cat
@@ -4455,12 +4491,17 @@ async fn dispatch_admin_request(
             }
         }
         AdminRequest::VerbShow { name } => {
-            if let Err(error) = server.refresh_verb_catalog_for_decision().await {
-                return AdminResponse::Error {
-                    message: format!("verb catalog authority is unavailable: {error}"),
-                };
-            }
-            let catalog = server.state.verbs.read().await;
+            let catalog = match server
+                .refresh_and_lease_verb_catalog_for_use("verb detail projection")
+                .await
+            {
+                Ok(catalog) => catalog,
+                Err(error) => {
+                    return AdminResponse::Error {
+                        message: format!("verb catalog authority is unavailable: {error}"),
+                    }
+                }
+            };
             match catalog.get(&name).cloned() {
                 Some(verb) => AdminResponse::VerbCreated {
                     verb,
@@ -4693,7 +4734,14 @@ async fn dispatch_admin_request(
                             message: format!("API coverage authority is unavailable: {error}"),
                         };
                     }
-                    store.read().await.coverage()
+                    match super::api_judge::lease_api_coverage_for_decision(store).await {
+                        Ok(lease) => lease.coverage(),
+                        Err(error) => {
+                            return AdminResponse::Error {
+                                message: format!("API coverage authority is unavailable: {error}"),
+                            }
+                        }
+                    }
                 }
                 None => Vec::new(),
             };
@@ -4946,7 +4994,7 @@ async fn dispatch_admin_request(
                 updated,
                 verb.clone(),
             );
-            let (staged_grants, staged_verbs, updated, added, removed, changed) = match staged {
+            let (_staged_grants, _staged_verbs, updated, added, removed, changed) = match staged {
                 Ok(staged) => staged,
                 Err(message) => return AdminResponse::Error { message },
             };
@@ -4983,8 +5031,39 @@ async fn dispatch_admin_request(
                     };
                 }
             }
-            *server.state.saved_grants.write().await = staged_grants;
-            *server.state.verbs.write().await = staged_verbs;
+            let mut live_grants = server.state.saved_grants.write().await;
+            if live_grants
+                .get(&name)
+                .is_none_or(|current| current.revision != existing.revision)
+            {
+                return AdminResponse::Error {
+                    message: "regeneration proposal is stale: saved grant revision changed"
+                        .to_string(),
+                };
+            }
+            let mut live_verbs = server.state.verbs.write().await;
+            let mut next_grants = live_grants.clone();
+            let mut next_verbs = live_verbs.clone();
+            let updated = match next_grants.replace(updated) {
+                Ok(updated) => updated,
+                Err(error) => {
+                    return AdminResponse::Error {
+                        message: error.to_string(),
+                    }
+                }
+            };
+            if let Err(error) = next_verbs.remove_saved_grant_verbs(&name) {
+                return AdminResponse::Error {
+                    message: error.to_string(),
+                };
+            }
+            if let Err(error) = next_verbs.upsert_saved_grant_verb(verb) {
+                return AdminResponse::Error {
+                    message: error.to_string(),
+                };
+            }
+            *live_grants = next_grants;
+            *live_verbs = next_verbs;
             AdminResponse::SavedGrantRegenerated {
                 grant: updated,
                 added,
@@ -6663,14 +6742,23 @@ async fn arm_held_command(
             Err(message) => AdminResponse::Error { message },
         };
     }
-    if let Some(verb_name) = approval.snapshot.verb_name.as_deref() {
-        let catalog = server.state.verbs.read().await;
-        if let Some(staleness) = held_verb_staleness(&approval.snapshot, verb_name, &catalog) {
+    let _held_verb_lease = if let Some(verb_name) = approval.snapshot.verb_name.as_deref() {
+        let lease = match server
+            .refresh_and_lease_verb_catalog_for_use("held command arming")
+            .await
+        {
+            Ok(lease) => lease,
+            Err(error) => {
+                return AdminResponse::Error {
+                    message: format!("verb catalog authority is unavailable: {error}"),
+                }
+            }
+        };
+        if let Some(staleness) = held_verb_staleness(&approval.snapshot, verb_name, &lease) {
             let message = format!(
                 "{}; held approval voided, re-issue the command",
                 staleness.clause(verb_name)
             );
-            drop(catalog);
             let mut voided = approval.clone();
             voided.status = ApprovalStatus::ExecFailed;
             voided.decided_unix = Some(now);
@@ -6680,7 +6768,10 @@ async fn arm_held_command(
                 Err(message) => AdminResponse::Error { message },
             };
         }
-    }
+        Some(lease)
+    } else {
+        None
+    };
     if approval.snapshot.principal.is_none() {
         return AdminResponse::Error {
             message: "held command has no authenticated requester".to_string(),
@@ -6804,11 +6895,35 @@ async fn handle_approve_claimed(
     // artifact may no longer mean what the operator reviewed. Void the
     // approval rather than execute a stale rendering; unrelated catalog
     // changes leave the hold intact.
-    if let Some(vname) = &snapshot.verb_name {
-        let staleness = {
-            let catalog = server.state.verbs.read().await;
-            held_verb_staleness(&snapshot, vname, &catalog)
+    let _held_verb_lease = if let Some(vname) = &snapshot.verb_name {
+        let lease = match server
+            .refresh_and_lease_verb_catalog_for_use("held command execution")
+            .await
+        {
+            Ok(lease) => lease,
+            Err(error) => {
+                let detail =
+                    format!("verb catalog authority is unavailable; approval voided: {error}");
+                let now = now_unix();
+                let Some(expected) = server.state.approvals.read().await.get(handle).cloned()
+                else {
+                    return AdminResponse::Error {
+                        message: format!(
+                            "approval {handle} disappeared before terminal persistence"
+                        ),
+                    };
+                };
+                let next = match approval_exec_failed_row(expected.clone(), now, detail.clone()) {
+                    Ok(next) => next,
+                    Err(message) => return AdminResponse::Error { message },
+                };
+                if let Err(message) = commit_terminal_approval(server, expected, next).await {
+                    return AdminResponse::Error { message };
+                }
+                return AdminResponse::Error { message: detail };
+            }
         };
+        let staleness = held_verb_staleness(&snapshot, vname, &lease);
         if let Some(staleness) = staleness {
             let now = now_unix();
             let detail = format!(
@@ -6846,7 +6961,10 @@ async fn handle_approve_claimed(
             });
             return AdminResponse::Error { message: detail };
         }
-    }
+        Some(lease)
+    } else {
+        None
+    };
     // The exact Approving claim is already durable before this point. The
     // approval audit must also land before execution; otherwise the hold moves
     // durably to ExecFailed and no process starts.
@@ -6879,7 +6997,11 @@ async fn handle_approve_claimed(
         };
     }
     let reason = format!("operator-approved held command {}", handle);
-    let result = super::gate_runtime::execute_snapshot(server, &snapshot, &reason).await;
+    drop(_held_verb_lease);
+    let result = super::gate_runtime::execute_snapshot_with_prevalidated_verb_catalog(
+        server, &snapshot, &reason,
+    )
+    .await;
     let now = now_unix();
     let Some(expected) = server.state.approvals.read().await.get(handle).cloned() else {
         return AdminResponse::Error {

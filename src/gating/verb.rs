@@ -3362,8 +3362,18 @@ impl VerbCatalog {
 }
 
 impl AsyncDurableStore for VerbCatalog {
+    fn authority_name(&self) -> &'static str {
+        "verb catalog"
+    }
+
     fn durable_path(&self) -> Option<&Path> {
         self.path.as_deref()
+    }
+
+    fn same_durable_snapshot(&self, snapshot: &LearningFileSnapshot) -> bool {
+        self.snapshot
+            .as_ref()
+            .is_some_and(|current| current.same_authority(snapshot))
     }
 
     fn same_in_memory_epoch(&self, other: &Self) -> bool {
@@ -5661,6 +5671,12 @@ verbs:
 #[cfg(test)]
 mod asynchronous_adoption_tests {
     use super::*;
+    use crate::learned_rules::{
+        acquire_async_authority_use_lease, run_async_durable_store_operation,
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::RwLock;
 
     #[test]
     fn delayed_refresh_cannot_restore_a_durably_deleted_verb() {
@@ -5685,5 +5701,94 @@ mod asynchronous_adoption_tests {
             .adopt_async_result(&baseline, delayed_refresh)
             .is_err());
         assert!(current.get("inspect-object").is_none());
+    }
+
+    fn file_backed_catalog() -> (tempfile::TempDir, PathBuf, VerbCatalog) {
+        let directory = crate::learned_rules::authority_tempdir();
+        let path = directory.path().join("verbs.yaml");
+        crate::learned_rules::write_authority_file(
+            &path,
+            r#"verbs:
+  - name: inspect-object
+    description: Inspect an object
+    binary: fixturectl
+    args: ["status"]
+    consequence: reversible
+"#,
+        )
+        .unwrap();
+        let catalog = VerbCatalog::load(&path).unwrap();
+        (directory, path, catalog)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn execution_lease_linearizes_against_external_verb_deletion() {
+        let (_directory, path, catalog) = file_backed_catalog();
+        let store = Arc::new(RwLock::new(catalog));
+        let lease = acquire_async_authority_use_lease(&store, "verb execution test")
+            .await
+            .unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let mut independent = VerbCatalog::load(&path).unwrap();
+            independent.delete_verb("inspect-object").unwrap();
+            send.send(()).unwrap();
+        });
+
+        assert!(receive.recv_timeout(Duration::from_millis(100)).is_err());
+        assert!(lease.render("inspect-object", &BTreeMap::new()).is_ok());
+        drop(lease);
+        receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        writer.join().unwrap();
+
+        assert!(
+            acquire_async_authority_use_lease(&store, "stale verb execution")
+                .await
+                .is_err()
+        );
+        run_async_durable_store_operation(&store, "verb refresh test", |candidate| {
+            *candidate = candidate.refreshed_copy()?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(store.read().await.get("inspect-object").is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn execution_lease_linearizes_against_external_verb_amendment() {
+        let (_directory, path, catalog) = file_backed_catalog();
+        let original_digest = catalog.verb_definition_digest("inspect-object").unwrap();
+        let store = Arc::new(RwLock::new(catalog));
+        let lease = acquire_async_authority_use_lease(&store, "verb execution test")
+            .await
+            .unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let mut independent = VerbCatalog::load(&path).unwrap();
+            let mut replacement = independent.get("inspect-object").unwrap().clone();
+            replacement.description = "Inspect one object safely".to_string();
+            independent
+                .amend_verb_if_digest("inspect-object", &original_digest, &replacement)
+                .unwrap();
+            send.send(()).unwrap();
+        });
+
+        assert!(receive.recv_timeout(Duration::from_millis(100)).is_err());
+        assert_eq!(
+            lease
+                .get("inspect-object")
+                .map(|verb| verb.description.as_str()),
+            Some("Inspect an object")
+        );
+        drop(lease);
+        receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        writer.join().unwrap();
+
+        assert!(
+            acquire_async_authority_use_lease(&store, "stale verb execution")
+                .await
+                .is_err()
+        );
     }
 }

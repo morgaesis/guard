@@ -501,26 +501,9 @@ impl ApiPromotionStore {
         self.data.buckets.len()
     }
 
-    /// Refresh durable API authority before a fast-path decision. Any load or
-    /// recovery failure is returned so callers can deny instead of using a
-    /// stale allow.
-    pub fn refresh_for_decision(&mut self) -> Result<()> {
-        let current = load_learning_file_snapshot(&self.config.path)?;
-        if current.same_authority(&self.snapshot) {
-            return Ok(());
-        }
-        *self = Self::load(self.config.clone())?;
-        Ok(())
-    }
-
     #[doc(hidden)]
     pub fn refreshed_copy(&self) -> Result<Self> {
         Self::load(self.config.clone())
-    }
-
-    #[doc(hidden)]
-    pub fn same_snapshot(&self, other: &Self) -> bool {
-        self.snapshot.same_authority(&other.snapshot)
     }
 
     pub fn coverage(&self) -> Vec<ApiCoverageEntry> {
@@ -562,8 +545,8 @@ impl ApiPromotionStore {
             .collect()
     }
 
-    #[doc(hidden)]
-    pub fn has_generated_coverage(&self) -> bool {
+    #[cfg(test)]
+    fn has_generated_coverage(&self) -> bool {
         self.data
             .buckets
             .values()
@@ -969,23 +952,20 @@ fn push_evidence(bucket: &mut ApiShapeBucket, summary: &ApiRequestSummary) {
 }
 
 impl AsyncDurableStore for ApiPromotionStore {
+    fn authority_name(&self) -> &'static str {
+        "API coverage"
+    }
+
     fn durable_path(&self) -> Option<&Path> {
         Some(&self.config.path)
     }
 
-    fn same_in_memory_epoch(&self, other: &Self) -> bool {
-        self.snapshot.same_authority(&other.snapshot) && self.data == other.data
+    fn same_durable_snapshot(&self, snapshot: &LearningFileSnapshot) -> bool {
+        self.snapshot.same_authority(snapshot)
     }
 
-    fn adopt_async_result(&mut self, baseline: &Self, result: Self) -> Result<()> {
-        if self.same_in_memory_epoch(baseline) {
-            *self = result;
-            return Ok(());
-        }
-        if self.same_in_memory_epoch(&result) {
-            return Ok(());
-        }
-        anyhow::bail!("API coverage authority changed during asynchronous file I/O")
+    fn same_in_memory_epoch(&self, other: &Self) -> bool {
+        self.snapshot.same_authority(&other.snapshot) && self.data == other.data
     }
 }
 
@@ -1898,7 +1878,7 @@ buckets:
         let mut writer = ApiPromotionStore::load(config).unwrap();
         writer.record_deny(&request, "deny", "regime").unwrap();
 
-        stale.refresh_for_decision().unwrap();
+        stale = stale.refreshed_copy().unwrap();
         assert!(stale.learned_allow(&request, "regime").is_none());
         assert!(stale.learned_deny(&request, "regime").is_some());
     }

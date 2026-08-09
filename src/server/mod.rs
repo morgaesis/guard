@@ -23,7 +23,9 @@ use guard::gating::ssh_readonly::{
 };
 use guard::gating::verb::VerbCatalog;
 use guard::gating::GateMode;
-use guard::learned_rules::run_async_durable_store_operation;
+use guard::learned_rules::{
+    acquire_async_authority_use_lease, run_async_durable_store_operation, AuthorityUseLease,
+};
 use guard::policy::PolicyMode;
 use guard::principal::PrincipalKey;
 
@@ -388,6 +390,32 @@ impl ServerContext {
         .await
     }
 
+    async fn lease_verb_catalog_for_use(
+        &self,
+        task: &'static str,
+    ) -> Result<AuthorityUseLease<VerbCatalog>> {
+        let lease = acquire_async_authority_use_lease(&self.state.verbs, task).await?;
+        #[cfg(all(test, unix))]
+        let hook = verb_authority_lease_hooks()
+            .lock()
+            .unwrap()
+            .remove(&(Arc::as_ptr(&self.state.verbs) as usize, task));
+        #[cfg(all(test, unix))]
+        if let Some((acquired, release)) = hook {
+            acquired.add_permits(1);
+            release.acquire().await?.forget();
+        }
+        Ok(lease)
+    }
+
+    async fn refresh_and_lease_verb_catalog_for_use(
+        &self,
+        task: &'static str,
+    ) -> Result<AuthorityUseLease<VerbCatalog>> {
+        self.refresh_verb_catalog_for_decision().await?;
+        self.lease_verb_catalog_for_use(task).await
+    }
+
     pub(super) fn emit_event(&self, event: runtime::NotifyEvent) {
         if let Some(hook) = &self.state.notify_hook {
             hook.emit(event);
@@ -551,6 +579,33 @@ impl ServerContext {
                 .reason(reason),
         );
     }
+}
+
+#[cfg(all(test, unix))]
+type VerbAuthorityLeaseHook = (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>);
+
+#[cfg(all(test, unix))]
+fn verb_authority_lease_hooks() -> &'static std::sync::Mutex<
+    std::collections::BTreeMap<(usize, &'static str), VerbAuthorityLeaseHook>,
+> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<(usize, &'static str), VerbAuthorityLeaseHook>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+#[cfg(all(test, unix))]
+fn pause_verb_authority_lease_for_test(
+    server: &ServerContext,
+    task: &'static str,
+) -> (Arc<tokio::sync::Semaphore>, Arc<tokio::sync::Semaphore>) {
+    let acquired = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    verb_authority_lease_hooks().lock().unwrap().insert(
+        (Arc::as_ptr(&server.state.verbs) as usize, task),
+        (acquired.clone(), release.clone()),
+    );
+    (acquired, release)
 }
 
 /// The daemon's own principal: its uid on Unix, its process SID on Windows.

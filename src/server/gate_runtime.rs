@@ -8,7 +8,9 @@ use guard::gating::approval::{
     bound_approval_transcript, Approval, ApprovalSnapshot, ApprovalStatus,
 };
 use guard::gating::provisional::{ApiRevertPlan, Provisional, ProvisionalStatus};
+use guard::gating::verb::VerbCatalog;
 use guard::gating::{decide_gate, Coverage, GateOutcome, Reversibility};
+use guard::learned_rules::AuthorityUseLease;
 use guard::principal::{scope_eq, PrincipalKey};
 use guard::redact::{
     command_contains_sensitive_literals, redact_command_line, SENSITIVE_ARGV_REPLAY_GUIDANCE,
@@ -1087,6 +1089,30 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
             );
         }
     }
+    let mut verb_authority_lease = if let Some(verb) = inputs.verb.as_ref() {
+        let lease = match server
+            .lease_verb_catalog_for_use("verb execution authorization")
+            .await
+        {
+            Ok(lease) => lease,
+            Err(error) => {
+                return ExecuteResult::denied(format!(
+                    "verb catalog authority changed before execution: {error}"
+                ))
+            }
+        };
+        let current = lease.verb_definition_digest(&verb.name);
+        let unchanged = match verb.verb_digest.as_deref() {
+            Some(expected) => current.as_deref() == Some(expected),
+            None => current.is_some() && lease.version() == verb.catalog_version,
+        };
+        if !unchanged {
+            return ExecuteResult::denied("verb authority was removed or amended before execution");
+        }
+        Some(lease)
+    } else {
+        None
+    };
     let secret_authority = inputs
         .authority
         .as_ref()
@@ -1097,6 +1123,7 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
         if let Err(reason) =
             admit_access_use(server, &request, &inputs.consume_access_verbs, None).await
         {
+            drop(verb_authority_lease.take());
             return access_admission_denial(
                 server,
                 context.caller,
@@ -1131,6 +1158,7 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
             if let Err(reason) =
                 admit_access_use(server, &request, &inputs.consume_access_verbs, None).await
             {
+                drop(verb_authority_lease.take());
                 return access_admission_denial(
                     server,
                     context.caller,
@@ -1181,10 +1209,13 @@ pub(super) async fn route_gated_allow<W: AsyncWrite + Unpin>(
                 context,
                 request,
                 caller_principal,
-                inputs.reason,
-                inputs.authority,
-                inputs.consume_access_verbs,
-                decision_trace,
+                ContainmentInputs {
+                    reason: inputs.reason,
+                    authority: inputs.authority,
+                    consume_access_verbs: inputs.consume_access_verbs,
+                    decision_trace,
+                },
+                &mut verb_authority_lease,
             )
             .await
         }
@@ -1209,10 +1240,13 @@ pub(super) async fn arm_containment_with_authority<W: AsyncWrite + Unpin>(
         context,
         request,
         caller_principal,
-        reason,
-        authority,
-        Vec::new(),
-        None,
+        ContainmentInputs {
+            reason,
+            authority,
+            consume_access_verbs: Vec::new(),
+            decision_trace: None,
+        },
+        &mut None,
     )
     .await
 }
@@ -1230,23 +1264,37 @@ pub(super) async fn arm_containment_with_access_use_for_test<W: AsyncWrite + Unp
         context,
         request,
         caller_principal,
-        reason,
-        authority,
-        consume_access_verbs,
-        None,
+        ContainmentInputs {
+            reason,
+            authority,
+            consume_access_verbs,
+            decision_trace: None,
+        },
+        &mut None,
     )
     .await
+}
+
+struct ContainmentInputs {
+    reason: String,
+    authority: Option<SessionAuthoritySnapshot>,
+    consume_access_verbs: Vec<String>,
+    decision_trace: Option<guard::gating::DecisionTrace>,
 }
 
 async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
     context: &mut RequestContext<'_, W>,
     request: ExecuteRequest,
     caller_principal: Option<PrincipalKey>,
-    reason: String,
-    authority: Option<SessionAuthoritySnapshot>,
-    consume_access_verbs: Vec<String>,
-    decision_trace: Option<guard::gating::DecisionTrace>,
+    inputs: ContainmentInputs,
+    verb_authority_lease: &mut Option<AuthorityUseLease<VerbCatalog>>,
 ) -> ExecuteResult {
+    let ContainmentInputs {
+        reason,
+        authority,
+        consume_access_verbs,
+        decision_trace,
+    } = inputs;
     let server = context.server;
     let caller = context.caller;
     // decide_gate only returns Contain when a revert is present.
@@ -1456,6 +1504,7 @@ async fn arm_containment_with_access_use<W: AsyncWrite + Unpin>(
                 "failed to retire unstarted provisional {handle} after access admission denial: {cleanup_error}"
             );
         }
+        drop(verb_authority_lease.take());
         return access_admission_denial(server, caller, &consume_access_verbs, admission_reason)
             .await;
     }
@@ -2312,14 +2361,44 @@ pub(super) async fn execute_snapshot(
 ) -> ExecuteResult {
     let access_requests =
         (!snapshot.access_requests.is_empty()).then_some(snapshot.access_requests.as_slice());
-    execute_snapshot_with_access_request(server, snapshot, reason, access_requests).await
+    execute_snapshot_with_access_request_inner(server, snapshot, reason, access_requests, true)
+        .await
 }
 
+pub(super) async fn execute_snapshot_with_prevalidated_verb_catalog(
+    server: &ServerContext,
+    snapshot: &ApprovalSnapshot,
+    reason: &str,
+) -> ExecuteResult {
+    let access_requests =
+        (!snapshot.access_requests.is_empty()).then_some(snapshot.access_requests.as_slice());
+    execute_snapshot_with_access_request_inner(server, snapshot, reason, access_requests, false)
+        .await
+}
+
+#[cfg(all(test, unix))]
 pub(super) async fn execute_snapshot_with_access_request(
     server: &ServerContext,
     snapshot: &ApprovalSnapshot,
     reason: &str,
     preferred_access_requests: Option<&[String]>,
+) -> ExecuteResult {
+    execute_snapshot_with_access_request_inner(
+        server,
+        snapshot,
+        reason,
+        preferred_access_requests,
+        true,
+    )
+    .await
+}
+
+async fn execute_snapshot_with_access_request_inner(
+    server: &ServerContext,
+    snapshot: &ApprovalSnapshot,
+    reason: &str,
+    preferred_access_requests: Option<&[String]>,
+    refresh_verb_catalog: bool,
 ) -> ExecuteResult {
     if snapshot.contains_sensitive_literals() {
         return ExecuteResult::exec_failed(
@@ -2327,6 +2406,39 @@ pub(super) async fn execute_snapshot_with_access_request(
             SENSITIVE_ARGV_REPLAY_GUIDANCE.to_string(),
         );
     }
+    let _verb_authority_lease = if let Some(name) = snapshot.verb_name.as_deref() {
+        let lease = match if refresh_verb_catalog {
+            server
+                .refresh_and_lease_verb_catalog_for_use("approval snapshot execution")
+                .await
+        } else {
+            server
+                .lease_verb_catalog_for_use("approval snapshot execution")
+                .await
+        } {
+            Ok(lease) => lease,
+            Err(error) => {
+                return ExecuteResult::exec_failed(
+                    reason.to_string(),
+                    format!("approval rejected: verb catalog authority is unavailable: {error}"),
+                )
+            }
+        };
+        let current = lease.verb_definition_digest(name);
+        let unchanged = match snapshot.verb_digest.as_deref() {
+            Some(expected) => current.as_deref() == Some(expected),
+            None => current.is_some() && snapshot.catalog_version == Some(lease.version()),
+        };
+        if !unchanged {
+            return ExecuteResult::exec_failed(
+                reason.to_string(),
+                "approval rejected: held verb authority was removed or amended".to_string(),
+            );
+        }
+        Some(lease)
+    } else {
+        None
+    };
     if !binary_allowed(&server.config.allowed_binaries, &snapshot.binary) {
         return ExecuteResult::exec_failed(
             reason.to_string(),

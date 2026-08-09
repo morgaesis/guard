@@ -950,9 +950,32 @@ async fn resolve_verb_context<W: AsyncWrite + Unpin>(
             return Err(ExecuteResult::denied(reason));
         }
     }
+    let catalog_lease = if server.config.gate.is_on() {
+        match server
+            .lease_verb_catalog_for_use("verb matcher selection")
+            .await
+        {
+            Ok(lease) => Some(lease),
+            Err(error) => {
+                let reason = format!("verb catalog authority is unavailable: {error}");
+                let _ = write_policy_decision(
+                    phase.stream_output,
+                    &mut *phase.stream_writer,
+                    false,
+                    &reason,
+                )
+                .await;
+                return Err(ExecuteResult::denied(reason));
+            }
+        }
+    } else {
+        None
+    };
     if let Some(invocation) = request.verb.clone() {
         let rendered = {
-            let cat = server.state.verbs.read().await;
+            let cat = catalog_lease
+                .as_ref()
+                .expect("gated verb rendering holds catalog authority");
             cat.render(&invocation.name, &invocation.params)
                 .map(|r| (r, cat.version()))
         };
@@ -995,7 +1018,9 @@ async fn resolve_verb_context<W: AsyncWrite + Unpin>(
     }
 
     let (raw_matches, version, definition_digests) = {
-        let cat = server.state.verbs.read().await;
+        let cat = catalog_lease
+            .as_ref()
+            .expect("gated reverse matching holds catalog authority");
         let plain = request
             .env
             .iter()
