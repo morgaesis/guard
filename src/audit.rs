@@ -15,7 +15,7 @@
 //! genesis constant for the first), so any truncation, edit, or reorder breaks
 //! the chain and `guard audit verify` reports the first broken sequence.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -177,7 +177,7 @@ impl std::fmt::Display for AuditKind {
 /// One typed audit event: the single source of truth both projections render
 /// from. Common fields are named; kind-specific detail goes into `fields`,
 /// which preserves insertion order for the stderr projection.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AuditEvent {
     pub kind: AuditKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -196,6 +196,78 @@ pub struct AuditEvent {
     pub decision_source: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<(String, String)>,
+}
+
+#[derive(Serialize)]
+struct AuditEventSerializationView {
+    kind: AuditKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    handle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    caller: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cmd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decision_source: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    fields: Vec<(String, String)>,
+}
+
+impl AuditEvent {
+    fn serialization_view(&self) -> AuditEventSerializationView {
+        let redact_detail = self.kind == AuditKind::SecretExposed;
+        AuditEventSerializationView {
+            kind: self.kind,
+            handle: self.handle.clone(),
+            caller: self.caller.clone(),
+            session_fingerprint: self.session_fingerprint.clone(),
+            cwd: self.cwd.clone(),
+            cmd: self.cmd.as_ref().map(|value| {
+                if redact_detail {
+                    "[redacted]".to_string()
+                } else {
+                    value.clone()
+                }
+            }),
+            reason: self.reason.as_ref().map(|value| {
+                if redact_detail {
+                    "[redacted]".to_string()
+                } else {
+                    value.clone()
+                }
+            }),
+            decision_source: self.decision_source.clone(),
+            fields: self
+                .fields
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        key.clone(),
+                        if redact_detail {
+                            "[redacted]".to_string()
+                        } else {
+                            value.clone()
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+impl Serialize for AuditEvent {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.serialization_view().serialize(serializer)
+    }
 }
 
 impl AuditEvent {
@@ -261,6 +333,10 @@ impl AuditEvent {
     /// `caller` field renders unquoted (`caller=uid=1000`) to match the
     /// historical format.
     pub fn render_line(&self) -> String {
+        redact_secret_exposure(self).render_line_unchecked()
+    }
+
+    fn render_line_unchecked(&self) -> String {
         let mut line = self.kind.as_str().to_string();
         if let Some(handle) = &self.handle {
             push_field(&mut line, "handle", handle, false);
@@ -290,6 +366,22 @@ impl AuditEvent {
     }
 }
 
+fn redact_secret_exposure(event: &AuditEvent) -> AuditEvent {
+    if event.kind != AuditKind::SecretExposed {
+        return event.clone();
+    }
+
+    let mut redacted = event.clone();
+    redacted.cmd = redacted.cmd.map(|_| "[redacted]".to_string());
+    redacted.reason = redacted.reason.map(|_| "[redacted]".to_string());
+    redacted.fields = redacted
+        .fields
+        .into_iter()
+        .map(|(key, _)| (key, "[redacted]".to_string()))
+        .collect();
+    redacted
+}
+
 fn push_field(line: &mut String, key: &str, value: &str, quoted: bool) {
     use std::fmt::Write;
     let escaped = audit_escape(value);
@@ -305,7 +397,7 @@ fn value_needs_quoting(value: &str) -> bool {
 }
 
 /// One line of the JSONL audit file: the typed event plus the chain header.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AuditRecord {
     /// Schema version of this record.
     pub v: u32,
@@ -318,6 +410,32 @@ pub struct AuditRecord {
     pub prev_hash: String,
     #[serde(flatten)]
     pub event: AuditEvent,
+}
+
+#[derive(Serialize)]
+struct AuditRecordSerializationView {
+    v: u32,
+    seq: u64,
+    ts: u64,
+    prev_hash: String,
+    #[serde(flatten)]
+    event: AuditEventSerializationView,
+}
+
+impl Serialize for AuditRecord {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        AuditRecordSerializationView {
+            v: self.v,
+            seq: self.seq,
+            ts: self.ts,
+            prev_hash: self.prev_hash.clone(),
+            event: self.event.serialization_view(),
+        }
+        .serialize(serializer)
+    }
 }
 
 struct AuditLogState {
@@ -399,6 +517,11 @@ impl AuditLog {
     /// sequence number. Any error means the record is NOT durable; callers
     /// gating auditable actions must fail closed on `Err`.
     pub fn append(&self, event: &AuditEvent) -> std::io::Result<u64> {
+        let event = redact_secret_exposure(event);
+        self.append_unchecked(&event)
+    }
+
+    fn append_unchecked(&self, event: &AuditEvent) -> std::io::Result<u64> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if self.fail_appends.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(std::io::Error::other("audit append failure injected"));
@@ -553,9 +676,10 @@ pub fn verify_chain(path: &Path) -> std::io::Result<ChainVerification> {
     })
 }
 
-/// Read the last `limit` records (in file order). A line that does not parse
-/// is surfaced as `{"seq": null, "raw": "<line>"}` rather than hidden, so a
-/// tampered tail stays visible in reads too.
+/// Read the last `limit` records (in file order) as safe read projections.
+/// Projection values preserve the stored chain metadata, event kind, and
+/// field keys while redacting sensitive detail from historical records. The
+/// projection is not the byte sequence that was hashed into the chain.
 pub fn tail_records(path: &Path, limit: usize) -> std::io::Result<Vec<serde_json::Value>> {
     let file = match File::open(path) {
         Ok(file) => file,
@@ -574,13 +698,45 @@ pub fn tail_records(path: &Path, limit: usize) -> std::io::Result<Vec<serde_json
     }
     Ok(window
         .into_iter()
-        .map(|line| {
-            serde_json::from_str::<serde_json::Value>(&line)
-                .ok()
-                .filter(|value| value.is_object())
-                .unwrap_or_else(|| serde_json::json!({ "seq": null, "raw": line }))
-        })
+        .map(|line| read_projection(&line))
         .collect())
+}
+
+fn read_projection(line: &str) -> serde_json::Value {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return serde_json::json!({
+            "seq": null,
+            "read_projection": "unparseable_record_detail_omitted",
+        });
+    };
+    redacted_read_projection(value)
+}
+
+/// Convert one audit JSON object into a safe read projection. The input may
+/// be a historical record emitted before secret-detail redaction existed.
+pub fn redacted_read_projection(value: serde_json::Value) -> serde_json::Value {
+    let Ok(record) = serde_json::from_value::<AuditRecord>(value) else {
+        return serde_json::json!({
+            "seq": null,
+            "read_projection": "unparseable_record_detail_omitted",
+        });
+    };
+    let is_secret_exposure = record.event.kind == AuditKind::SecretExposed;
+    let mut projection = serde_json::to_value(record).unwrap_or_else(|_| {
+        serde_json::json!({
+            "seq": null,
+            "read_projection": "serialization_failed_detail_omitted",
+        })
+    });
+    if is_secret_exposure {
+        if let Some(object) = projection.as_object_mut() {
+            object.insert(
+                "read_projection".to_string(),
+                serde_json::json!("secret_exposure_detail_redacted"),
+            );
+        }
+    }
+    projection
 }
 
 /// A process-wide observer of every emitted event's kind. The daemon installs
@@ -612,6 +768,7 @@ pub fn install_event_observer(observer: std::sync::Arc<dyn EventObserver>) {
 /// false only when a configured sink failed to append; callers gating
 /// auditable actions must then fail closed.
 pub fn emit(sink: Option<&AuditLog>, event: &AuditEvent) -> bool {
+    let event = redact_secret_exposure(event);
     // Count the event at the same choke point that renders and durably records
     // it. This is a single relaxed atomic increment inside the observer; it
     // never blocks and never sees any free-text field.
@@ -621,7 +778,7 @@ pub fn emit(sink: Option<&AuditLog>, event: &AuditEvent) -> bool {
     tracing::info!(target: "guard::audit", "[AUDIT] {}", event.render_line());
     match sink {
         None => true,
-        Some(log) => match log.append(event) {
+        Some(log) => match log.append(&event) {
             Ok(_) => true,
             Err(error) => {
                 tracing::error!(
@@ -805,7 +962,11 @@ mod tests {
         assert_eq!(records.len(), 3);
         assert_eq!(records[0]["seq"], 4);
         assert_eq!(records[1]["seq"], 5);
-        assert_eq!(records[2]["raw"], "not json");
+        assert_eq!(
+            records[2]["read_projection"],
+            "unparseable_record_detail_omitted"
+        );
+        assert!(records[2].get("raw").is_none());
     }
 
     #[test]
@@ -830,5 +991,142 @@ mod tests {
             .render_line();
         assert!(!line.contains('\n'));
         assert!(line.contains("x\\n[AUDIT] ALLOWED forged"));
+    }
+
+    #[test]
+    fn direct_render_line_redacts_secret_exposure_detail() {
+        let marker = "synthetic-secret-exposure-render-marker";
+        let line = AuditEvent::new(AuditKind::SecretExposed)
+            .cmd(marker)
+            .reason(marker)
+            .field("secret", marker)
+            .render_line();
+
+        assert!(!line.contains(marker));
+        assert!(line.contains("cmd=\"[redacted]\""));
+        assert!(line.contains("reason=\"[redacted]\""));
+        assert!(line.contains("secret=[redacted]"));
+    }
+
+    #[test]
+    fn direct_serde_redacts_secret_exposure_event_detail() {
+        let marker = "synthetic-secret-exposure-serde-event-marker";
+        let event = AuditEvent::new(AuditKind::SecretExposed)
+            .cmd(marker)
+            .reason(marker)
+            .field("synthetic-secret-key", marker);
+
+        let value = serde_json::to_value(&event).unwrap();
+        let encoded = serde_json::to_string(&event).unwrap();
+        assert!(!encoded.contains(marker));
+        assert_eq!(value["kind"], "SECRET_EXPOSED");
+        assert_eq!(value["cmd"], "[redacted]");
+        assert_eq!(value["reason"], "[redacted]");
+        assert_eq!(value["fields"][0][0], "synthetic-secret-key");
+        assert_eq!(value["fields"][0][1], "[redacted]");
+    }
+
+    #[test]
+    fn direct_serde_redacts_flattened_secret_exposure_record_detail() {
+        let marker = "synthetic-secret-exposure-serde-record-marker";
+        let record = AuditRecord {
+            v: AUDIT_SCHEMA_VERSION,
+            seq: 7,
+            ts: 1_700_000_007,
+            prev_hash: "synthetic-previous-hash".to_string(),
+            event: AuditEvent::new(AuditKind::SecretExposed)
+                .handle("synthetic-handle")
+                .cmd(marker)
+                .reason(marker)
+                .field("synthetic-secret-key", marker),
+        };
+
+        let value = serde_json::to_value(&record).unwrap();
+        let encoded = serde_json::to_string(&record).unwrap();
+        assert!(!encoded.contains(marker));
+        assert_eq!(value["seq"], 7);
+        assert_eq!(value["ts"], 1_700_000_007);
+        assert_eq!(value["prev_hash"], "synthetic-previous-hash");
+        assert_eq!(value["kind"], "SECRET_EXPOSED");
+        assert_eq!(value["fields"][0][0], "synthetic-secret-key");
+        assert_eq!(value["fields"][0][1], "[redacted]");
+        let decoded: AuditRecord = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.event.kind, AuditKind::SecretExposed);
+        assert_eq!(decoded.event.cmd.as_deref(), Some("[redacted]"));
+    }
+
+    #[test]
+    fn direct_append_redacts_secret_exposure_detail() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audit.jsonl");
+        let log = AuditLog::open(&path).unwrap();
+        let marker = "synthetic-secret-exposure-append-marker";
+        let event = AuditEvent::new(AuditKind::SecretExposed)
+            .cmd(marker)
+            .reason(marker)
+            .field("secret", marker);
+
+        assert_eq!(log.append(&event).unwrap(), 1);
+        let durable = std::fs::read_to_string(path).unwrap();
+        assert!(!durable.contains(marker));
+        let record: AuditRecord = serde_json::from_str(durable.trim()).unwrap();
+        assert_eq!(record.event.kind, AuditKind::SecretExposed);
+        assert_eq!(record.event.cmd.as_deref(), Some("[redacted]"));
+        assert_eq!(record.event.reason.as_deref(), Some("[redacted]"));
+        assert_eq!(record.event.fields[0].0, "secret");
+        assert_eq!(record.event.fields[0].1, "[redacted]");
+    }
+
+    #[test]
+    fn emit_redacts_secret_exposure_detail() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audit.jsonl");
+        let log = AuditLog::open(&path).unwrap();
+        let marker = "synthetic-secret-exposure-emit-marker";
+        let event = AuditEvent::new(AuditKind::SecretExposed)
+            .cmd(marker)
+            .reason(marker)
+            .field("secret", marker);
+
+        assert!(emit(Some(&log), &event));
+        let durable = std::fs::read_to_string(path).unwrap();
+        assert!(!durable.contains(marker));
+    }
+
+    #[test]
+    fn tail_projects_historical_secret_exposure_without_rewriting_the_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("audit.jsonl");
+        let marker = "synthetic-historical-secret-tail-marker";
+        let historical = serde_json::json!({
+            "v": 1,
+            "seq": 41,
+            "ts": 1_700_000_041,
+            "prev_hash": "synthetic-previous-hash",
+            "kind": "SECRET_EXPOSED",
+            "handle": "synthetic-handle",
+            "cmd": marker,
+            "reason": marker,
+            "fields": [["synthetic-secret-key", marker]],
+        });
+        let historical_line = historical.to_string();
+        std::fs::write(&path, format!("{historical_line}\n")).unwrap();
+
+        let items = tail_records(&path, 1).unwrap();
+        let encoded = serde_json::to_string(&items).unwrap();
+        assert!(!encoded.contains(marker));
+        assert_eq!(items[0]["seq"], 41);
+        assert_eq!(items[0]["ts"], 1_700_000_041);
+        assert_eq!(items[0]["kind"], "SECRET_EXPOSED");
+        assert_eq!(items[0]["prev_hash"], "synthetic-previous-hash");
+        assert_eq!(items[0]["fields"][0][0], "synthetic-secret-key");
+        assert_eq!(
+            items[0]["read_projection"],
+            "secret_exposure_detail_redacted"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim(),
+            historical_line
+        );
     }
 }

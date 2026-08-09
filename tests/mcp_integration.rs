@@ -99,7 +99,7 @@ async fn start_daemon_with_gate(
     let verbs_path = tmp.path().join("verbs.yaml");
     std::fs::write(&policy_path, POLICY_YAML).expect("write policy yaml");
     std::fs::write(&verbs_path, VERBS_YAML).expect("write verbs yaml");
-    let test_secret_env = format!("GUARD_SECRET_U{}_mcp-test-secret", current_uid());
+    let test_secret_env = format!("GUARD_SECRET_U{}_mcp-test-placeholder", current_uid());
 
     let mut command = Command::new(GUARD_BIN);
     command
@@ -118,7 +118,7 @@ async fn start_daemon_with_gate(
         .env("HOME", tmp.path())
         .env("XDG_CONFIG_HOME", tmp.path())
         .env("GUARD_BACKEND", "env")
-        .env(&test_secret_env, "test-value")
+        .env(&test_secret_env, "synthetic-sensitive-marker")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         // Pass the daemon's stderr through: when startup fails, the daemon's
@@ -880,8 +880,8 @@ async fn mcp_end_to_end_initialize_list_call() {
                 "name": "guard_run",
                 "arguments": {
                     "binary": "sh",
-                    "args": ["-lc", "[ -n \"$MCP_TEST_SECRET\" ] && echo set"],
-                    "secrets": ["mcp-test-secret"]
+                    "args": ["-lc", "[ -n \"$MCP_TEST_PLACEHOLDER\" ] && echo set"],
+                    "secrets": ["mcp-test-placeholder"]
                 }
             }),
         )
