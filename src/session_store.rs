@@ -43,8 +43,9 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 /// approval parameter maps, and preserves every terminal provisional status.
 ///
 /// Version 12 sanitizes nested decision traces and persisted explanatory prose,
-/// storing malformed non-authoritative traces as `NULL`.
-const SCHEMA_VERSION: i64 = 12;
+/// storing malformed non-authoritative traces as `NULL`. Version 13
+/// canonicalizes the full generated-access proposal envelope.
+const SCHEMA_VERSION: i64 = 13;
 const VACUUM_MIN_PAGES: u64 = 512;
 const VACUUM_MIN_FREE_PAGES: u64 = 128;
 const REGISTRY_GENERATION_KEY: &str = "registry_generation";
@@ -916,7 +917,7 @@ impl SessionStore {
         }
         if version == SCHEMA_VERSION {
             Self::validate_current_schema_tables(conn)?;
-            Self::validate_authority_row_indexes(conn)?;
+            Self::validate_authority_row_indexes(conn, true)?;
             return Ok(());
         }
 
@@ -1138,18 +1139,22 @@ impl SessionStore {
         )?;
         // Validate every authority-bearing index before migration sanitization
         // can rewrite redundant columns from JSON and conceal corruption.
-        Self::validate_authority_row_indexes(&tx)?;
+        Self::validate_authority_row_indexes(&tx, false)?;
         // Apply the idempotent pre-current-schema cleanup before recording the
         // current version. The pass sanitizes prose, retires active sessions
         // whose sensitive exact denies cannot be preserved, removes sensitive
         // exact authority from history, and repairs durable gate snapshots.
         sanitize_persisted_credentials(&tx)?;
+        Self::validate_authority_row_indexes(&tx, true)?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(())
     }
 
-    fn validate_authority_row_indexes(conn: &Connection) -> Result<()> {
+    fn validate_authority_row_indexes(
+        conn: &Connection,
+        validate_access_authority: bool,
+    ) -> Result<()> {
         {
             let mut stmt =
                 conn.prepare("SELECT name, updated_unix, json FROM saved_grants ORDER BY name")?;
@@ -1188,9 +1193,11 @@ impl SessionStore {
                 let request = serde_json::from_str::<GrantRequest>(&json).with_context(|| {
                     format!("decode durable grant request {handle} with status {status}")
                 })?;
-                validate_persisted_access_request(&request).with_context(|| {
-                    format!("validate durable access coverage for request {handle}")
-                })?;
+                if validate_access_authority {
+                    validate_persisted_access_request(&request).with_context(|| {
+                        format!("validate durable access coverage for request {handle}")
+                    })?;
+                }
                 if request.handle != handle
                     || request.status.as_str() != status
                     || request.created_unix != decode_u64(created_unix)?
@@ -1415,9 +1422,9 @@ impl SessionStore {
         {
             anyhow::bail!("simulated session-store write failure");
         }
-        validate_persisted_access_request(&request)?;
         let path = self.path.clone();
         let request = sanitize_grant_request(request);
+        validate_persisted_access_request(&request)?;
         tokio::task::spawn_blocking(move || {
             let conn = Self::open_connection(&path)?;
             Self::init_schema(&conn)?;
@@ -1446,11 +1453,11 @@ impl SessionStore {
         {
             anyhow::bail!("simulated session-store write failure");
         }
-        validate_persisted_access_request(&pending)?;
-        validate_persisted_access_request(&terminal)?;
         let path = self.path.clone();
         let pending = sanitize_grant_request(pending);
         let terminal = sanitize_grant_request(terminal);
+        validate_persisted_access_request(&pending)?;
+        validate_persisted_access_request(&terminal)?;
         tokio::task::spawn_blocking(move || {
             Self::compare_and_swap_grant_request_sync(&path, &pending, &terminal)
         })
@@ -1562,12 +1569,6 @@ impl SessionStore {
         {
             anyhow::bail!("simulated session-store write failure");
         }
-        validate_persisted_access_request(&pending)?;
-        validate_persisted_access_request(&approved)?;
-        for (previous, next) in &rebased_pending {
-            validate_persisted_access_request(previous)?;
-            validate_persisted_access_request(next)?;
-        }
         let pending = sanitize_grant_request(pending);
         let approved = sanitize_grant_request(approved);
         let rebased_pending = rebased_pending
@@ -1579,6 +1580,12 @@ impl SessionStore {
                 )
             })
             .collect::<Vec<_>>();
+        validate_persisted_access_request(&pending)?;
+        validate_persisted_access_request(&approved)?;
+        for (previous, next) in &rebased_pending {
+            validate_persisted_access_request(previous)?;
+            validate_persisted_access_request(next)?;
+        }
         let path = self.path.clone();
         let retention = self.history_retention_secs;
         let revision = registry.revision();
@@ -1741,10 +1748,6 @@ impl SessionStore {
         {
             anyhow::bail!("simulated session-store write failure");
         }
-        for (previous, next) in &withdrawals {
-            validate_persisted_access_request(previous)?;
-            validate_persisted_access_request(next)?;
-        }
         let withdrawals = withdrawals
             .into_iter()
             .map(|(previous, next)| {
@@ -1754,6 +1757,10 @@ impl SessionStore {
                 )
             })
             .collect::<Vec<_>>();
+        for (previous, next) in &withdrawals {
+            validate_persisted_access_request(previous)?;
+            validate_persisted_access_request(next)?;
+        }
         let path = self.path.clone();
         let retention = self.history_retention_secs;
         let revision = registry.revision();
@@ -2635,6 +2642,10 @@ fn validate_persisted_provisional(provisional: &Provisional) -> Result<()> {
 }
 
 pub(crate) fn sanitize_grant_request(mut request: GrantRequest) -> GrantRequest {
+    let submitted_key_is_consistent = !request.request_key.is_empty()
+        && request
+            .canonical_access_key()
+            .is_ok_and(|expected| expected == request.request_key);
     request.justification = redact_output_text(&request.justification);
     request.delta.prompt_append = request
         .delta
@@ -2645,6 +2656,31 @@ pub(crate) fn sanitize_grant_request(mut request: GrantRequest) -> GrantRequest 
         .decided_reason
         .take()
         .map(|reason| redact_output_text(&reason));
+    let mut proposal_changed = false;
+    for proposal in &mut request.proposed_verbs {
+        let Ok(verb) = serde_json::from_value::<guard::gating::verb::Verb>(proposal.clone()) else {
+            continue;
+        };
+        if !verb.name.starts_with("access-generated-") {
+            continue;
+        }
+        if let Ok(normalized) = guard::gating::verb::normalize_generated_access_verb(verb) {
+            if let Ok(value) = serde_json::to_value(normalized) {
+                proposal_changed |= value != *proposal;
+                *proposal = value;
+            }
+        }
+    }
+    if proposal_changed && submitted_key_is_consistent {
+        if let Ok(request_key) = request.canonical_access_key() {
+            request.request_key = request_key;
+        }
+    }
+    request
+}
+
+fn sanitize_grant_request_for_migration(request: GrantRequest) -> GrantRequest {
+    let mut request = sanitize_grant_request(request);
     if !request.request_key.is_empty() {
         if let Ok(request_key) = request.canonical_access_key() {
             request.request_key = request_key;
@@ -2744,7 +2780,7 @@ fn sanitize_persisted_credentials(conn: &Connection) -> Result<()> {
             let Ok(request) = serde_json::from_str::<GrantRequest>(&json) else {
                 continue;
             };
-            let sanitized = sanitize_grant_request(request);
+            let sanitized = sanitize_grant_request_for_migration(request);
             let sanitized_json = serde_json::to_string(&sanitized)?;
             if sanitized_json != json {
                 conn.execute(
@@ -3613,6 +3649,7 @@ mod tests {
             auto_promoted: false,
             promotion_stamp: None,
         };
+        verb = guard::gating::verb::normalize_generated_access_verb(verb).unwrap();
         verb.name = guard::gating::verb::generated_access_verb_name(&verb);
         let mut request = GrantRequest::new_access(
             guard::principal::PrincipalKey::from_uid(1001),
@@ -3825,6 +3862,108 @@ mod tests {
         .unwrap();
         drop(conn);
         assert!(store.load_grant_requests().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn generated_proposal_envelope_is_canonicalized_on_write_and_migration() {
+        let value = ["q", "7"].concat();
+        let canonical = generated_access_request();
+        let canonical_verb: Verb =
+            serde_json::from_value(canonical.proposed_verbs[0].clone()).unwrap();
+
+        let contaminate = |mut request: GrantRequest| {
+            let mut verb: Verb = serde_json::from_value(request.proposed_verbs[0].clone()).unwrap();
+            verb.description = format!("password={value}");
+            verb.prompt_context = Some(format!("password={value}"));
+            verb.source_prose = Some(format!("password={value}"));
+            verb.evidence = Some(format!("password={value}"));
+            verb.auto_promoted = true;
+            verb.promotion_stamp = Some(format!("password={value}"));
+            verb.baseline = true;
+            verb.trusted = true;
+            verb.revert = Some(guard::gating::verb::VerbCommand {
+                binary: "fixturectl".to_string(),
+                args: vec!["undo".to_string()],
+            });
+            request.proposed_verbs = vec![serde_json::to_value(verb).unwrap()];
+            request.request_key = request.canonical_access_key().unwrap();
+            request
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("write.db");
+        let store = SessionStore::open(path.clone(), 3_600).await.unwrap();
+        store
+            .save_grant_request(contaminate(canonical.clone()))
+            .await
+            .unwrap();
+        let loaded = store.load_grant_requests().await.unwrap().remove(0);
+        let loaded_verb = loaded
+            .validated_generated_access_proposals()
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            guard::gating::verb::generated_access_matcher_shape(&loaded_verb),
+            guard::gating::verb::generated_access_matcher_shape(&canonical_verb)
+        );
+        assert_eq!(loaded_verb.name, canonical_verb.name);
+        assert!(loaded_verb.prompt_context.is_none());
+        assert!(loaded_verb.source_prose.is_none());
+        assert!(loaded_verb.evidence.is_none());
+        assert!(loaded_verb.promotion_stamp.is_none());
+        assert!(!loaded_verb.auto_promoted);
+        assert!(!loaded_verb.baseline);
+        assert!(!loaded_verb.trusted);
+        assert!(loaded_verb.revert.is_none());
+        assert!(!std::fs::read(&path)
+            .unwrap()
+            .windows(value.len())
+            .any(|window| window == value.as_bytes()));
+
+        let migration_path = temp.path().join("migration.db");
+        let migration_store = SessionStore::open(migration_path.clone(), 3_600)
+            .await
+            .unwrap();
+        let contaminated = contaminate(canonical);
+        let connection = Connection::open(&migration_path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO grant_requests (handle, json, status, created_unix)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    contaminated.handle,
+                    serde_json::to_string(&contaminated).unwrap(),
+                    contaminated.status.as_str(),
+                    encode_u64(contaminated.created_unix).unwrap()
+                ],
+            )
+            .unwrap();
+        connection
+            .pragma_update(None, "user_version", SCHEMA_VERSION - 1)
+            .unwrap();
+        let seeded_version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(seeded_version, SCHEMA_VERSION - 1);
+        drop(connection);
+        drop(migration_store);
+        let restarted = SessionStore::open(migration_path.clone(), 3_600)
+            .await
+            .unwrap();
+        let migrated = restarted.load_grant_requests().await.unwrap().remove(0);
+        let migrated_verb = migrated
+            .validated_generated_access_proposals()
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            serde_json::to_value(migrated_verb).unwrap(),
+            serde_json::to_value(canonical_verb).unwrap()
+        );
+        let connection = Connection::open(migration_path).unwrap();
+        let raw_json: String = connection
+            .query_row("SELECT json FROM grant_requests", [], |row| row.get(0))
+            .unwrap();
+        assert!(!raw_json.contains(&value));
     }
 
     #[tokio::test]

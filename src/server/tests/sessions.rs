@@ -308,16 +308,15 @@ async fn synthesized_access_capability_description(
     (description, item)
 }
 
-/// The synthesis call that produces the matcher also describes what it admits,
-/// so an operator reads that sentence rather than reconstructing it from the
-/// matcher.
+/// The displayed description is derived from the canonical matcher envelope,
+/// independent of model-authored proposal prose.
 #[tokio::test]
 async fn synthesized_access_carries_the_described_grant() {
     let (description, item) =
         synthesized_access_capability_description(described_compiler_check_arguments).await;
     assert_eq!(
         description,
-        "Runs rustc --version, which prints the installed compiler version and writes nothing."
+        "Runs rustc with pinned arguments --version and no caller-supplied values."
     );
     assert_ne!(
         Some(description.as_str()),

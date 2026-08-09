@@ -2249,6 +2249,35 @@ pub fn generated_access_verb_name(verb: &Verb) -> String {
     format!("access-generated-{}", &digest[..16])
 }
 
+/// Deterministic operator-facing description derived only from the generated
+/// matcher's authority-bearing shape.
+pub fn generated_access_description(verb: &Verb) -> String {
+    let pinned = verb
+        .args
+        .iter()
+        .filter(|argument| !argument.contains('{'))
+        .cloned()
+        .collect::<Vec<_>>();
+    let parameters = verb.params.keys().cloned().collect::<Vec<_>>();
+    let mut description = format!("Runs {}", verb.binary);
+    if !pinned.is_empty() {
+        description.push_str(&format!(" with pinned arguments {}", pinned.join(" ")));
+    }
+    match parameters.len() {
+        0 => description.push_str(" and no caller-supplied values"),
+        1 => description.push_str(&format!(
+            " and one caller-supplied value ({})",
+            parameters[0]
+        )),
+        count => description.push_str(&format!(
+            " and {count} caller-supplied values ({})",
+            parameters.join(", ")
+        )),
+    }
+    description.push('.');
+    description
+}
+
 fn value_constraint_contains_sensitive_literal(constraint: &ValueConstraint) -> bool {
     constraint
         .options
@@ -2348,11 +2377,19 @@ fn generated_access_authority_contains_sensitive_literal(verb: &Verb) -> bool {
 /// rollback semantics.
 pub fn normalize_generated_access_verb(mut verb: Verb) -> Result<Verb> {
     verb.revert = None;
+    verb.baseline = false;
+    verb.trusted = false;
+    verb.prompt_context = None;
+    verb.source_prose = None;
+    verb.evidence = None;
+    verb.auto_promoted = false;
+    verb.promotion_stamp = None;
     if generated_access_authority_contains_sensitive_literal(&verb) {
         bail!(
             "generated access coverage contains sensitive authority metadata or literal argv and cannot be persisted"
         );
     }
+    verb.description = generated_access_description(&verb);
     validate_synthesized_safety(&verb)?;
     Ok(verb)
 }

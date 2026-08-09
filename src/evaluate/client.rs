@@ -50,15 +50,12 @@ impl std::fmt::Display for AttemptError {
 
 impl AttemptError {
     fn sanitized(self) -> Self {
-        fn clean(value: String) -> String {
-            crate::redact::redact_output_text(&value)
-        }
         match self {
             Self::RateLimited { retry_after } => Self::RateLimited { retry_after },
-            Self::ServerError(value) => Self::ServerError(clean(value)),
-            Self::Transport(value) => Self::Transport(clean(value)),
-            Self::ParseError(value) => Self::ParseError(clean(value)),
-            Self::ClientError(value) => Self::ClientError(clean(value)),
+            Self::ServerError(value) => Self::ServerError(sanitize_provider_error(value)),
+            Self::Transport(value) => Self::Transport(sanitize_provider_error(value)),
+            Self::ParseError(value) => Self::ParseError(sanitize_provider_error(value)),
+            Self::ClientError(value) => Self::ClientError(sanitize_provider_error(value)),
         }
     }
 
@@ -126,13 +123,14 @@ impl Evaluator {
                 tracing::warn!(
                     "LLM API returned {}: {}",
                     status,
-                    crate::redact::redact_output_text(&body)
+                    provider_error_excerpt(&body, 200)
                 );
                 Ok(())
             }
             Err(e) => {
-                tracing::warn!("LLM connectivity check failed: {}", e);
-                Err(e.into())
+                let error = sanitize_provider_error(e);
+                tracing::warn!("LLM connectivity check failed: {}", error);
+                anyhow::bail!(error)
             }
         }
     }
@@ -388,7 +386,7 @@ impl Evaluator {
             return Err(AttemptError::ServerError(format!(
                 "{}: {}",
                 status,
-                truncate(&response_text, 200)
+                provider_error_excerpt(&response_text, 200)
             )));
         }
         if status.is_client_error() {
@@ -400,20 +398,20 @@ impl Evaluator {
             if use_function_calling && response_text.to_ascii_lowercase().contains("tool_choice") {
                 return Err(AttemptError::ParseError(format!(
                     "tool calling unsupported by provider: {}",
-                    truncate(&response_text, 200)
+                    provider_error_excerpt(&response_text, 200)
                 )));
             }
             return Err(AttemptError::ClientError(format!(
                 "{}: {}",
                 status,
-                truncate(&response_text, 200)
+                provider_error_excerpt(&response_text, 200)
             )));
         }
         if !status.is_success() {
             return Err(AttemptError::Transport(format!(
                 "unexpected status {}: {}",
                 status,
-                truncate(&response_text, 200)
+                provider_error_excerpt(&response_text, 200)
             )));
         }
 
@@ -491,6 +489,18 @@ pub(super) fn truncate(s: &str, max: usize) -> String {
         }
         format!("{}...", &s[..end])
     }
+}
+
+/// Sanitize provider-controlled diagnostics before they become errors, logs,
+/// audit detail, or caller-visible text.
+pub(super) fn sanitize_provider_error(value: impl std::fmt::Display) -> String {
+    crate::redact::redact_output_text(&value.to_string())
+}
+
+/// Sanitize a provider response body while it is still identifiable as
+/// untrusted, then apply the requested display bound.
+pub(super) fn provider_error_excerpt(body: &str, max: usize) -> String {
+    truncate(&sanitize_provider_error(body), max)
 }
 
 #[cfg(test)]

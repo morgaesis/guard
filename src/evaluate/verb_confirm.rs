@@ -1,6 +1,6 @@
 //! Verb-promotion confirmation: LLM vetting and naming of mechanically derived verb templates.
 
-use super::client::truncate;
+use super::client::{provider_error_excerpt, sanitize_provider_error};
 use super::redact::redact_for_llm;
 use super::Evaluator;
 use crate::gating::allow_promotion::{self, AllowPromotionOutcome};
@@ -173,7 +173,7 @@ impl Evaluator {
                         break;
                     }
                     Err(e) => {
-                        last_err = e.to_string();
+                        last_err = sanitize_provider_error(e);
                         tracing::warn!(
                             "verb-promotion confirmation attempt {}/{} failed: {}",
                             attempt,
@@ -256,7 +256,11 @@ impl Evaluator {
             .await
             .map_err(|e| anyhow::anyhow!("read error: {e}"))?;
         if !status.is_success() {
-            bail!("LLM call failed ({}): {}", status, truncate(&text, 200));
+            bail!(
+                "LLM call failed ({}): {}",
+                status,
+                provider_error_excerpt(&text, 200)
+            );
         }
         let parsed: serde_json::Value =
             serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("non-JSON response: {e}"))?;
@@ -382,6 +386,37 @@ mod tests {
     use crate::gating::Reversibility;
     use std::sync::Arc;
     use tokio::sync::RwLock;
+
+    #[tokio::test]
+    async fn confirmation_provider_failure_is_sanitized() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let value = ["q", "7"].concat();
+        let body = format!("password={value}");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 16 * 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let evaluator = Evaluator::new(EvalConfig::default()).unwrap();
+        let error = evaluator
+            .confirm_verb_promotion_once(
+                "fixture",
+                &format!("http://{address}"),
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap_err();
+        task.await.unwrap();
+        assert!(!error.to_string().contains(&value));
+    }
 
     #[tokio::test]
     async fn allow_promotion_observation_without_store_is_noop() {

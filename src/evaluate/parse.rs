@@ -1,6 +1,6 @@
 //! Tolerant parsing of provider responses into decisions.
 
-use super::client::truncate;
+use super::client::{provider_error_excerpt, sanitize_provider_error, truncate};
 use super::result::LlmResponse;
 use crate::gating::Reversibility;
 use anyhow::{bail, Context, Result};
@@ -108,7 +108,7 @@ pub fn provider_error_summary(parsed: &serde_json::Value) -> String {
     let message = parsed
         .pointer("/error/message")
         .and_then(|v| v.as_str())
-        .map(|message| truncate(message, 160))
+        .map(|message| provider_error_excerpt(message, 160))
         .unwrap_or_else(|| "provider returned an error object".to_string());
     let code = parsed
         .pointer("/error/code")
@@ -118,7 +118,7 @@ pub fn provider_error_summary(parsed: &serde_json::Value) -> String {
         .pointer("/error/type")
         .and_then(|v| v.as_str())
         .unwrap_or("<none>");
-    format!("{} (code={}, type={})", message, code, error_type)
+    sanitize_provider_error(format!("{} (code={}, type={})", message, code, error_type))
 }
 
 /// Parse a function-calling response: `choices[0].message.tool_calls[0].function.arguments`

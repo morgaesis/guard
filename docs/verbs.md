@@ -178,8 +178,11 @@ recoverable shapes require validated rollback. Promotion records the evaluator
 regime, and a model or prompt change sends stale coverage back to evaluation.
 
 API traffic uses the same verb vocabulary. Generated API cells bind endpoint,
-session fingerprint, operation, namespace, body shape, regime, and expiry.
-Value-bearing mutations remain evaluator-routed. Inspect or reset them with:
+session fingerprint, full session revision, operation, namespace, body shape,
+protocol authority selectors, evaluator regime, and expiry. Authority selector
+identity includes attached option aliases, so changing an attached alias or the
+session revision requires a fresh evaluation. Value-bearing mutations remain
+evaluator-routed. Inspect or reset generated cells with:
 
 ```bash
 guard verb coverage list

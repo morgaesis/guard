@@ -1,6 +1,6 @@
 //! Auxiliary LLM synthesis: verbs from operator prose and learned deny shapes.
 
-use super::client::truncate;
+use super::client::{provider_error_excerpt, sanitize_provider_error};
 use super::redact::redact_for_llm;
 use super::Evaluator;
 use crate::gating::deny_shape::DenyLearningOutcome;
@@ -154,7 +154,7 @@ impl Evaluator {
             match self.synthesize_verb_once(&api_key, &api_url, &body).await {
                 Ok(verb) => return Ok(verb),
                 Err(e) => {
-                    last_err = e.to_string();
+                    last_err = sanitize_provider_error(e);
                     tracing::warn!(
                         "verb synthesis attempt {}/{} failed: {}",
                         attempt,
@@ -193,7 +193,11 @@ impl Evaluator {
             .await
             .map_err(|e| anyhow::anyhow!("read error: {e}"))?;
         if !status.is_success() {
-            bail!("LLM call failed ({}): {}", status, truncate(&text, 200));
+            bail!(
+                "LLM call failed ({}): {}",
+                status,
+                provider_error_excerpt(&text, 200)
+            );
         }
         let parsed: serde_json::Value =
             serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("non-JSON response: {e}"))?;
@@ -239,7 +243,7 @@ impl Evaluator {
             {
                 Ok(result) => return Ok(result),
                 Err(e) => {
-                    last_err = e.to_string();
+                    last_err = sanitize_provider_error(e);
                     tracing::warn!(
                         "deny-shape synthesis attempt {}/{} failed: {}",
                         attempt,
@@ -277,7 +281,11 @@ impl Evaluator {
             .await
             .map_err(|e| anyhow::anyhow!("read error: {e}"))?;
         if !status.is_success() {
-            bail!("LLM call failed ({}): {}", status, truncate(&text, 200));
+            bail!(
+                "LLM call failed ({}): {}",
+                status,
+                provider_error_excerpt(&text, 200)
+            );
         }
         let parsed: serde_json::Value =
             serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("non-JSON response: {e}"))?;
@@ -453,6 +461,45 @@ fn build_create_deny_shape_body(
 #[cfg(test)]
 mod tests {
     use crate::evaluate::{EvalConfig, Evaluator};
+
+    async fn provider_failure(body: String) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 16 * 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        (format!("http://{address}"), task)
+    }
+
+    #[tokio::test]
+    async fn synthesis_provider_failures_are_sanitized_for_each_variant() {
+        let value = ["q", "7"].concat();
+        let evaluator = Evaluator::new(EvalConfig::default()).unwrap();
+        let (url, task) = provider_failure(format!("password={value}")).await;
+        let error = evaluator
+            .synthesize_verb_once("fixture", &url, &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        task.await.unwrap();
+        assert!(!error.to_string().contains(&value));
+
+        let (url, task) = provider_failure(format!("password={value}")).await;
+        let error = evaluator
+            .synthesize_deny_shape_once("fixture", &url, &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        task.await.unwrap();
+        assert!(!error.to_string().contains(&value));
+    }
 
     #[tokio::test]
     async fn deny_shape_observation_without_llm_key_does_not_error() {

@@ -902,7 +902,7 @@ async fn reduce_access_intent(
             auto_promoted: false,
             promotion_stamp: None,
         };
-        return reduce_generated_access_candidate(server, intent, candidate, &existing).await;
+        return reduce_generated_access_candidate(server, candidate, &existing).await;
     }
 
     let clauses = access_intent_clauses(intent);
@@ -978,16 +978,14 @@ async fn reduce_access_intent(
         .map_err(|error| {
             format!("access intent could not be reduced to typed coverage: {error}")
         })?;
-    reduce_generated_access_candidate(server, intent, candidate, &existing).await
+    reduce_generated_access_candidate(server, candidate, &existing).await
 }
 
 async fn reduce_generated_access_candidate(
     server: &ServerContext,
-    intent: &str,
     mut candidate: Verb,
     existing: &[Verb],
 ) -> Result<(Vec<Verb>, Vec<Verb>), String> {
-    candidate.source_prose = Some(intent.to_string());
     candidate.baseline = false;
     candidate.trusted = false;
     candidate = guard::gating::verb::normalize_generated_access_verb(candidate)
@@ -1006,12 +1004,6 @@ async fn reduce_generated_access_candidate(
         return access_reduction(vec![reused]);
     }
     candidate.name = generated_access_verb_name(&candidate);
-    candidate.description = access_grant_description(&candidate);
-    candidate.source_prose = None;
-    candidate.evidence = None;
-    candidate.prompt_context = None;
-    candidate.auto_promoted = false;
-    candidate.promotion_stamp = None;
     catalog
         .validate_candidate(&candidate)
         .map_err(|error| format!("invalid non-baseline access coverage: {error}"))?;
@@ -1041,69 +1033,6 @@ fn access_reduction(matched: Vec<Verb>) -> Result<(Vec<Verb>, Vec<Verb>), String
     Ok((reduced, proposed))
 }
 
-/// Bounds on a grant description the daemon renders. A model can answer with a
-/// single word or with a page, and an approval card has to stay both
-/// informative and readable, so a description outside this range is replaced by
-/// the deterministic template rather than shown or truncated mid-sentence.
-const MIN_ACCESS_DESCRIPTION_CHARS: usize = 12;
-const MAX_ACCESS_DESCRIPTION_CHARS: usize = 400;
-
-/// Plain-language account of the access a synthesized matcher admits, written
-/// for the operator deciding on the request rather than restating the
-/// requester's intent. Prose synthesis can return this description with the
-/// matcher. Structured observed argv and unusable model descriptions use a
-/// deterministic template derived from the matcher itself.
-fn access_grant_description(verb: &Verb) -> String {
-    synthesized_access_description(verb).unwrap_or_else(|| derived_access_description(verb))
-}
-
-fn synthesized_access_description(verb: &Verb) -> Option<String> {
-    let text = verb
-        .description
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let length = text.chars().count();
-    if !(MIN_ACCESS_DESCRIPTION_CHARS..=MAX_ACCESS_DESCRIPTION_CHARS).contains(&length) {
-        return None;
-    }
-    // The description is displayed at the moment of decision. Text that
-    // survives redaction unchanged is safe to render; anything else is not.
-    if redact_output_text(&text) != text {
-        return None;
-    }
-    if text.eq_ignore_ascii_case(&verb.name) || text.eq_ignore_ascii_case(&verb.binary) {
-        return None;
-    }
-    Some(text)
-}
-
-/// Description built only from the matcher: the binary, the arguments the
-/// template pins, and the values the caller still supplies.
-fn derived_access_description(verb: &Verb) -> String {
-    let pinned = verb
-        .args
-        .iter()
-        .filter(|arg| !arg.contains('{'))
-        .cloned()
-        .collect::<Vec<_>>();
-    let params = verb.params.keys().cloned().collect::<Vec<_>>();
-    let mut text = format!("Runs {}", verb.binary);
-    if !pinned.is_empty() {
-        text.push_str(&format!(" with pinned arguments {}", pinned.join(" ")));
-    }
-    match params.len() {
-        0 => text.push_str(" and no caller-supplied values"),
-        1 => text.push_str(&format!(" and one caller-supplied value ({})", params[0])),
-        count => text.push_str(&format!(
-            " and {count} caller-supplied values ({})",
-            params.join(", ")
-        )),
-    }
-    text.push('.');
-    text
-}
-
 fn access_capability(verb: &Verb) -> Option<AccessCapability> {
     if verb.name.starts_with("access-generated-") {
         let mut proposal = verb.clone();
@@ -1130,6 +1059,42 @@ fn access_capability(verb: &Verb) -> Option<AccessCapability> {
 mod access_capability_tests {
     use super::*;
     use guard::gating::verb::ParamSpec;
+
+    #[test]
+    fn generated_capability_uses_only_the_canonical_proposal_envelope() {
+        let value = ["q", "7"].concat();
+        let mut verb = Verb {
+            name: "access-generated-fixture".to_string(),
+            description: format!("password={value}"),
+            binary: "fixturectl".to_string(),
+            args: vec!["status".to_string()],
+            baseline: true,
+            coverage: Vec::new(),
+            credential_plan: None,
+            params: std::collections::BTreeMap::new(),
+            consequence: guard::gating::Reversibility::Irreversible,
+            revert: Some(guard::gating::verb::VerbCommand {
+                binary: "fixturectl".to_string(),
+                args: vec!["undo".to_string()],
+            }),
+            trusted: true,
+            prompt_context: Some(format!("password={value}")),
+            source_prose: Some(format!("password={value}")),
+            evidence: Some(format!("password={value}")),
+            auto_promoted: true,
+            promotion_stamp: Some(format!("password={value}")),
+        };
+        verb = guard::gating::verb::normalize_generated_access_verb(verb).unwrap();
+        verb.name = generated_access_verb_name(&verb);
+        let capability = access_capability(&verb).unwrap();
+        let projection = serde_json::to_string(&capability).unwrap();
+        assert!(!projection.contains(&value));
+        assert_eq!(capability.description, verb.description);
+        assert!(!capability.baseline);
+        assert!(!capability.trusted);
+        assert!(!capability.has_revert);
+        assert!(capability.evidence.is_none());
+    }
 
     #[test]
     fn generated_capability_projection_omits_sensitive_parameter_authority() {
