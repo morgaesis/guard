@@ -2054,6 +2054,99 @@ async fn multi_request_admission_audits_every_consumed_budget() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_bounded_admission_finishes_publication_before_a_successor() {
+    let (mut cfg, _) = make_test_config();
+    let directory = tempfile::tempdir().unwrap();
+    let store = SessionStore::open(directory.path().join("sessions.db"), 3600)
+        .await
+        .unwrap();
+    cfg.state.session_store = Some(store.clone());
+    let token = "cancel-safe-budget";
+    cfg.state.sessions.write().await.grant(
+        token.to_string(),
+        SessionGrant {
+            allow: Vec::new(),
+            deny: Vec::new(),
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            activated_verbs: vec!["bounded-verb".to_string()],
+            override_markers: Vec::new(),
+            scope: IssuedGrantScope {
+                access_managed: true,
+                access_grants: vec![AccessUseGrant {
+                    request: "bounded-request".to_string(),
+                    verbs: vec!["bounded-verb".to_string()],
+                    use_limit: Some(1),
+                    remaining_uses: Some(1),
+                    pending: false,
+                }],
+                ..IssuedGrantScope::default()
+            },
+            expires_at: Some(crate::server::gate_runtime::now_unix().saturating_add(60)),
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            static_only: true,
+            auto_amend: false,
+            granted_at: 0,
+            owner: crate::session::SessionOwner::Principal(PrincipalKey::from_uid(1001)),
+        },
+    );
+    store
+        .persist_registry(&cfg.state.sessions.read().await.clone())
+        .await
+        .unwrap();
+    let request = request_with_session("true", Vec::new(), token.to_string());
+    let (committed, release) = store.pause_registry_commit_for_test("session store persist");
+    let first_server = cfg.clone();
+    let first_request = request.clone();
+    let first = tokio::spawn(async move {
+        admit_access_use(
+            &first_server,
+            &first_request,
+            &["bounded-verb".to_string()],
+            None,
+        )
+        .await
+    });
+    committed.acquire().await.unwrap().forget();
+    first.abort();
+
+    let second_server = cfg.clone();
+    let second = tokio::spawn(async move {
+        admit_access_use(
+            &second_server,
+            &request,
+            &["bounded-verb".to_string()],
+            None,
+        )
+        .await
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !second.is_finished(),
+        "a successor admission overtook detached durable publication"
+    );
+    release.add_permits(1);
+    assert!(second.await.unwrap().is_err());
+    assert_eq!(
+        cfg.state
+            .sessions
+            .read()
+            .await
+            .access_grant_uses(token, "bounded-request"),
+        Some((Some(1), Some(0)))
+    );
+    assert_eq!(
+        store
+            .load_registry()
+            .await
+            .unwrap()
+            .access_grant_uses(token, "bounded-request"),
+        Some((Some(1), Some(0)))
+    );
+}
+
 #[tokio::test]
 async fn access_list_and_show_project_expiry_without_mutating_durable_requests() {
     let (mut cfg, _) = make_test_config();

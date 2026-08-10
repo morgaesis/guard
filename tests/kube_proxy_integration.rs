@@ -24,19 +24,20 @@ use tokio_rustls::rustls::{self, pki_types};
 
 use guard::gating::Reversibility;
 use guard::proxy::{
-    ApiAuthorizationKind, ApiCoverageVerdict, ApiEvaluationMode, ApiForwardAuthorization,
+    ApiAuthorizationKind, ApiCoverageVerdict, ApiEvaluationMode, ApiForwardHandoff,
     ApiForwardRequirement, ApiHoldSnapshot, ApiJudge, ApiJudgeVerdict, ApiListenerMode, ApiPolicy,
-    ApiProxy, ApiRequestSummary, ApiSessionAuthorization, ApiSessionContext, ApiSessionEvent,
-    ApiSessionSink, GateSink, ProxyTls, Upstream,
+    ApiProxy, ApiRequestSummary, ApiSessionContext, ApiSessionEvent, ApiSessionSink, GateSink,
+    ProxyTls, Upstream,
 };
 
 async fn authorize_test_session(
     sink: &(impl ApiSessionSink + ?Sized),
     token: &str,
     expected: &ApiSessionContext,
-) -> Result<ApiSessionAuthorization, String> {
+    handoff: &mut dyn ApiForwardHandoff,
+) -> Result<(), String> {
     if sink.resolve(token).await.as_ref() == Some(expected) {
-        Ok(ApiSessionAuthorization::new(()))
+        handoff.forward().await
     } else {
         Err("session authority changed".to_string())
     }
@@ -61,8 +62,9 @@ impl ApiSessionSink for LiveSessionSink {
         &self,
         token: &str,
         expected: &ApiSessionContext,
-    ) -> Result<ApiSessionAuthorization, String> {
-        authorize_test_session(self, token, expected).await
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        authorize_test_session(self, token, expected, handoff).await
     }
 
     async fn record(&self, _token: &str, _event: ApiSessionEvent) {}
@@ -87,8 +89,9 @@ impl ApiSessionSink for RestrictedCredentialSessionSink {
         &self,
         token: &str,
         expected: &ApiSessionContext,
-    ) -> Result<ApiSessionAuthorization, String> {
-        authorize_test_session(self, token, expected).await
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        authorize_test_session(self, token, expected, handoff).await
     }
 
     async fn record(&self, _token: &str, _event: ApiSessionEvent) {}
@@ -113,8 +116,9 @@ impl ApiSessionSink for H2SessionSink {
         &self,
         token: &str,
         expected: &ApiSessionContext,
-    ) -> Result<ApiSessionAuthorization, String> {
-        authorize_test_session(self, token, expected).await
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        authorize_test_session(self, token, expected, handoff).await
     }
 
     async fn record(&self, _token: &str, _event: ApiSessionEvent) {}
@@ -147,8 +151,9 @@ impl ApiSessionSink for RecordingSessionSink {
         &self,
         token: &str,
         expected: &ApiSessionContext,
-    ) -> Result<ApiSessionAuthorization, String> {
-        authorize_test_session(self, token, expected).await
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        authorize_test_session(self, token, expected, handoff).await
     }
 
     async fn record(&self, _token: &str, event: ApiSessionEvent) {
@@ -202,7 +207,8 @@ impl ApiSessionSink for LinearizedSessionSink {
         &self,
         token: &str,
         expected: &ApiSessionContext,
-    ) -> Result<ApiSessionAuthorization, String> {
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
         if token != "live-session" {
             return Err("unknown session".to_string());
         }
@@ -218,7 +224,9 @@ impl ApiSessionSink for LinearizedSessionSink {
                 .map_err(|_| "session handoff closed".to_string())?
                 .forget();
         }
-        Ok(ApiSessionAuthorization::new(guard))
+        let result = handoff.forward().await;
+        drop(guard);
+        result
     }
 
     async fn record(&self, _token: &str, _event: ApiSessionEvent) {}
@@ -248,8 +256,9 @@ impl ApiSessionSink for PrincipalSessionSink {
         &self,
         token: &str,
         expected: &ApiSessionContext,
-    ) -> Result<ApiSessionAuthorization, String> {
-        authorize_test_session(self, token, expected).await
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        authorize_test_session(self, token, expected, handoff).await
     }
 
     async fn record(&self, _token: &str, _event: ApiSessionEvent) {}
@@ -286,9 +295,10 @@ impl ApiSessionSink for BudgetSessionSink {
         &self,
         token: &str,
         expected: &ApiSessionContext,
-    ) -> Result<ApiSessionAuthorization, String> {
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
         if token == "budget-session" && expected.revision == "budget-session-revision" {
-            Ok(ApiSessionAuthorization::new(()))
+            handoff.forward().await
         } else {
             Err("session authority changed".to_string())
         }
@@ -320,8 +330,9 @@ impl ApiSessionSink for ChangingSessionSink {
         &self,
         token: &str,
         expected: &ApiSessionContext,
-    ) -> Result<ApiSessionAuthorization, String> {
-        authorize_test_session(self, token, expected).await
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        authorize_test_session(self, token, expected, handoff).await
     }
 
     async fn record(&self, _token: &str, _event: ApiSessionEvent) {}
@@ -446,6 +457,33 @@ async fn spawn_stalled_upstream() -> (String, Arc<tokio::sync::Semaphore>) {
         }
     });
     (format!("http://{addr}"), reached)
+}
+
+async fn spawn_success_headers_stalled_body() -> String {
+    type MockBody = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let service = service_fn(|_request: Request<Incoming>| async move {
+                    let frames = futures::stream::pending::<Result<Frame<Bytes>, std::io::Error>>();
+                    Ok::<Response<MockBody>, Infallible>(
+                        Response::builder()
+                            .status(201)
+                            .header("content-type", "application/json")
+                            .body(StreamBody::new(frames).boxed())
+                            .unwrap(),
+                    )
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    format!("http://{addr}")
 }
 
 #[derive(Clone)]
@@ -985,6 +1023,30 @@ async fn start_proxy_with_session_sink_and_timeout(
     session_sink: Arc<dyn ApiSessionSink>,
     handoff_timeout: Duration,
 ) -> (String, reqwest::Client) {
+    start_proxy_with_timeouts(
+        mock_base,
+        policy_yaml,
+        judge,
+        gate,
+        rarity_threshold,
+        session_sink,
+        handoff_timeout,
+        Duration::from_secs(30),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_proxy_with_timeouts(
+    mock_base: String,
+    policy_yaml: &str,
+    judge: Option<Arc<dyn ApiJudge>>,
+    gate: Option<Arc<dyn GateSink>>,
+    rarity_threshold: u64,
+    session_sink: Arc<dyn ApiSessionSink>,
+    handoff_timeout: Duration,
+    body_timeout: Duration,
+) -> (String, reqwest::Client) {
     let kubeconfig = kubeconfig_for(&mock_base);
     let upstream = Upstream::from_kubeconfig_str(&kubeconfig, None).expect("upstream");
     let tls = ProxyTls::generate().expect("tls");
@@ -993,7 +1055,8 @@ async fn start_proxy_with_session_sink_and_timeout(
     let (listener, listen) = reserve_listener().await;
     let mut proxy = ApiProxy::new(listen, tls, upstream, policy, None)
         .with_listener_mode(ApiListenerMode::Policy)
-        .with_upstream_handoff_timeout(handoff_timeout);
+        .with_upstream_handoff_timeout(handoff_timeout)
+        .with_upstream_body_timeout(body_timeout);
     if rarity_threshold > 0 {
         proxy = proxy.with_rarity_escalation(rarity_threshold);
     }
@@ -1036,12 +1099,10 @@ impl ApiJudge for BlockingJudge {
     async fn authorize_forward(
         &self,
         _summary: &ApiRequestSummary,
-        requirement: ApiForwardRequirement,
-    ) -> Result<ApiForwardAuthorization, String> {
-        Ok(match requirement {
-            ApiForwardRequirement::Evaluated => ApiForwardAuthorization::evaluated(()),
-            ApiForwardRequirement::Coverage { .. } => ApiForwardAuthorization::coverage(()),
-        })
+        _requirement: ApiForwardRequirement,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        handoff.forward().await
     }
 
     async fn judge(&self, _summary: &ApiRequestSummary) -> ApiJudgeVerdict {
@@ -1065,12 +1126,10 @@ impl ApiJudge for RecordingJudge {
     async fn authorize_forward(
         &self,
         _summary: &ApiRequestSummary,
-        requirement: ApiForwardRequirement,
-    ) -> Result<ApiForwardAuthorization, String> {
-        Ok(match requirement {
-            ApiForwardRequirement::Evaluated => ApiForwardAuthorization::evaluated(()),
-            ApiForwardRequirement::Coverage { .. } => ApiForwardAuthorization::coverage(()),
-        })
+        _requirement: ApiForwardRequirement,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        handoff.forward().await
     }
 
     async fn judge(&self, summary: &ApiRequestSummary) -> ApiJudgeVerdict {
@@ -1088,10 +1147,10 @@ struct ModeCoverageJudge {
     judge_calls: Arc<AtomicUsize>,
 }
 
-struct MismatchedCoverageJudge;
+struct SkippedHandoffCoverageJudge;
 
 #[async_trait::async_trait]
-impl ApiJudge for MismatchedCoverageJudge {
+impl ApiJudge for SkippedHandoffCoverageJudge {
     async fn coverage(&self, _summary: &ApiRequestSummary) -> ApiCoverageVerdict {
         ApiCoverageVerdict::Allow {
             risk: 1,
@@ -1103,8 +1162,9 @@ impl ApiJudge for MismatchedCoverageJudge {
         &self,
         _summary: &ApiRequestSummary,
         _requirement: ApiForwardRequirement,
-    ) -> Result<ApiForwardAuthorization, String> {
-        Ok(ApiForwardAuthorization::evaluated(()))
+        _handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        Ok(())
     }
 
     async fn judge(&self, _summary: &ApiRequestSummary) -> ApiJudgeVerdict {
@@ -1133,12 +1193,10 @@ impl ApiJudge for ModeCoverageJudge {
     async fn authorize_forward(
         &self,
         _summary: &ApiRequestSummary,
-        requirement: ApiForwardRequirement,
-    ) -> Result<ApiForwardAuthorization, String> {
-        Ok(match requirement {
-            ApiForwardRequirement::Evaluated => ApiForwardAuthorization::evaluated(()),
-            ApiForwardRequirement::Coverage { .. } => ApiForwardAuthorization::coverage(()),
-        })
+        _requirement: ApiForwardRequirement,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        handoff.forward().await
     }
 
     async fn judge(&self, _summary: &ApiRequestSummary) -> ApiJudgeVerdict {
@@ -1193,8 +1251,9 @@ impl ApiJudge for LinearizedJudge {
     async fn authorize_forward(
         &self,
         _summary: &ApiRequestSummary,
-        requirement: ApiForwardRequirement,
-    ) -> Result<ApiForwardAuthorization, String> {
+        _requirement: ApiForwardRequirement,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
         let guard = self.coordination.clone().read_owned().await;
         if !self.active.load(Ordering::SeqCst) {
             return Err("revoked".to_string());
@@ -1205,10 +1264,9 @@ impl ApiJudge for LinearizedJudge {
             .await
             .map_err(|_| "handoff closed".to_string())?
             .forget();
-        Ok(match requirement {
-            ApiForwardRequirement::Evaluated => ApiForwardAuthorization::evaluated(guard),
-            ApiForwardRequirement::Coverage { .. } => ApiForwardAuthorization::coverage(guard),
-        })
+        let result = handoff.forward().await;
+        drop(guard);
+        result
     }
 
     async fn judge(&self, _summary: &ApiRequestSummary) -> ApiJudgeVerdict {
@@ -1280,8 +1338,9 @@ impl ApiSessionSink for ModeSessionSink {
         &self,
         token: &str,
         expected: &ApiSessionContext,
-    ) -> Result<ApiSessionAuthorization, String> {
-        authorize_test_session(self, token, expected).await
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        authorize_test_session(self, token, expected, handoff).await
     }
 
     async fn record(&self, _token: &str, _event: ApiSessionEvent) {}
@@ -1368,7 +1427,7 @@ rules:
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn coverage_capability_must_match_the_coverage_verdict() {
+async fn coverage_allow_cannot_forward_without_invoking_the_authorized_handoff() {
     let policy = r#"
 default: deny
 rules:
@@ -1381,7 +1440,7 @@ rules:
     let (base, client) = start_proxy_with_session_sink(
         upstream,
         policy,
-        Some(Arc::new(MismatchedCoverageJudge)),
+        Some(Arc::new(SkippedHandoffCoverageJudge)),
         None,
         0,
         Arc::new(ModeSessionSink),
@@ -1520,6 +1579,43 @@ async fn stalled_upstream_handoff_times_out_and_releases_authority() {
         .unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn successful_mutation_headers_arm_containment_before_a_stalled_body_times_out() {
+    let sink = RecordingSink::default();
+    let (base, client) = start_proxy_with_timeouts(
+        spawn_success_headers_stalled_body().await,
+        "default: deny\nrules:\n  - verbs: [create]\n    resources: [pods]\n    namespaces: [dev]\n    action: allow\n",
+        None,
+        Some(Arc::new(sink.clone())),
+        0,
+        Arc::new(LiveSessionSink),
+        Duration::from_secs(2),
+        Duration::from_millis(150),
+    )
+    .await;
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        client
+            .post(format!("{base}/api/v1/namespaces/dev/pods"))
+            .bearer_auth("live-session")
+            .body(r#"{"metadata":{"name":"stalled-pod"}}"#)
+            .send(),
+    )
+    .await
+    .expect("proxy applies a bounded body timeout")
+    .unwrap();
+    assert_eq!(response.status(), 504);
+    assert_eq!(sink.calls.lock().unwrap().len(), 1);
+    assert_eq!(sink.activated.lock().unwrap().as_slice(), ["test-handle-0"]);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-guard-provisional")
+            .and_then(|value| value.to_str().ok()),
+        Some("test-handle-0")
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn evaluator_authority_revoked_during_an_approved_hold_prevents_forwarding() {
     let policy = r#"
@@ -1644,7 +1740,7 @@ async fn proxy_gates_redacts_and_forwards() {
     let resp = client
         .post(format!("{base}/api/v1/namespaces/dev/pods"))
         .bearer_auth("live-session")
-        .body("{}")
+        .body(r#"{"metadata":{"name":"web-123"}}"#)
         .send()
         .await
         .unwrap();
@@ -1786,6 +1882,7 @@ async fn http2_multiplexes_session_authentication_failures_independently() {
 #[derive(Clone, Default)]
 struct RecordingSink {
     calls: Arc<std::sync::Mutex<Vec<guard::proxy::ApiMutation>>>,
+    activated: Arc<std::sync::Mutex<Vec<String>>>,
     resolved: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
@@ -1795,6 +1892,11 @@ impl guard::proxy::GateSink for RecordingSink {
         let handle = format!("test-handle-{}", self.calls.lock().unwrap().len());
         self.calls.lock().unwrap().push(mutation);
         Some(handle)
+    }
+
+    async fn mark_revert_forwarded(&self, handle: &str) -> bool {
+        self.activated.lock().unwrap().push(handle.to_string());
+        true
     }
 
     async fn resolve(&self, handle: &str) {
@@ -1881,7 +1983,7 @@ async fn proxy_arms_auto_revert_for_writes() {
     let resp = client
         .post(format!("{base}/api/v1/namespaces/dev/pods"))
         .bearer_auth("live-session")
-        .body("{}")
+        .body(r#"{"metadata":{"name":"web-123"}}"#)
         .send()
         .await
         .unwrap();
@@ -2996,7 +3098,7 @@ async fn proxy_allows_contained_delete_of_created_resource() {
             hyper::Method::POST,
             "/api/v1/namespaces/dev/pods",
             Some("live-session"),
-            Some("{}"),
+            Some(r#"{"metadata":{"name":"check-pod"}}"#),
         )
         .await;
     assert_eq!(status, 201, "create forwarded");
@@ -3058,7 +3160,7 @@ async fn contained_delete_retains_revert_on_transport_4xx_and_5xx_failures() {
                     hyper::Method::POST,
                     "/api/v1/namespaces/dev/pods",
                     Some("live-session"),
-                    Some("{}"),
+                    Some(r#"{"metadata":{"name":"check-pod"}}"#),
                 )
                 .await,
             201
@@ -3117,7 +3219,7 @@ async fn contained_delete_retains_revert_when_session_expires_before_forward() {
                 hyper::Method::POST,
                 "/api/v1/namespaces/dev/pods",
                 Some("budget-session"),
-                Some("{}"),
+                Some(r#"{"metadata":{"name":"check-pod"}}"#),
             )
             .await,
         201
@@ -3163,7 +3265,7 @@ async fn contained_delete_retains_revert_when_a_2xx_body_disconnects() {
                 hyper::Method::POST,
                 "/api/v1/namespaces/dev/pods",
                 Some("live-session"),
-                Some("{}"),
+                Some(r#"{"metadata":{"name":"check-pod"}}"#),
             )
             .await,
         201
@@ -3215,7 +3317,7 @@ async fn created_provenance_never_overrides_an_explicit_policy_deny() {
     let created = client
         .post(format!("{base}/api/v1/namespaces/dev/pods"))
         .bearer_auth("live-session")
-        .body("{}")
+        .body(r#"{"metadata":{"name":"check-pod"}}"#)
         .send()
         .await
         .unwrap();

@@ -363,6 +363,7 @@ impl Drop for ProxyHoldOrphanGuard {
 /// The proxy acts as the daemon principal, so the operator manages
 /// proxy-armed provisionals with the same
 /// `guard confirm` / `guard provisionals` / `guard revert` commands.
+#[derive(Clone)]
 pub(super) struct DaemonGateSink {
     pub(super) server: ServerContext,
     pub(super) endpoint: String,
@@ -469,11 +470,11 @@ impl guard::proxy::GateSink for DaemonGateSink {
             reason: mutation.label,
             decision_trace: Some(guard::gating::DecisionTrace::source("api_proxy")),
             created_unix: now,
-            deadline_unix: now.saturating_add(self.window_secs),
-            window_secs: self.window_secs,
+            deadline_unix: 0,
+            window_secs: 0,
             auto_reverted_unix: None,
-            forward_done: true,
-            forward_exit: Some(0),
+            forward_done: false,
+            forward_exit: None,
             forward_persistence_failed: false,
             status: ProvisionalStatus::Armed,
             revert_exit: None,
@@ -491,17 +492,78 @@ impl guard::proxy::GateSink for DaemonGateSink {
             .write()
             .await
             .insert(provisional.clone());
-        self.server.emit_event(NotifyEvent {
-            event: "provisional_armed",
-            at_unix: now,
-            handle: Some(handle.clone()),
-            session_fingerprint: mutation.session_fingerprint,
-            requester_principal: None,
-            reason: Some(provisional.reason.clone()),
-            status: Some("armed".to_string()),
-            behavior: None,
-        });
         Some(handle)
+    }
+
+    async fn mark_revert_forwarded(&self, handle: &str) -> bool {
+        let server = self.server.clone();
+        let handle = handle.to_string();
+        let window_secs = self.window_secs;
+        let task = tokio::spawn(async move {
+            let mut registry = server.state.provisional.write().await;
+            let Some(expected) = registry.get(&handle).cloned() else {
+                return false;
+            };
+            if expected.forward_done {
+                return expected.forward_exit == Some(0)
+                    && expected.status == ProvisionalStatus::Armed;
+            }
+            let now = now_unix();
+            let mut next = expected.clone();
+            next.forward_done = true;
+            next.forward_exit = Some(0);
+            next.forward_persistence_failed = false;
+            next.deadline_unix = now.saturating_add(window_secs);
+            next.window_secs = window_secs;
+            next.revert_detail = None;
+            let Some(store) = &server.state.session_store else {
+                return false;
+            };
+            if let Err(error) = store
+                .compare_and_swap_provisional(expected, next.clone())
+                .await
+            {
+                tracing::error!("api-proxy auto-revert activation failed: {error}");
+                return false;
+            }
+            registry.insert(next.clone());
+            server.emit_event(NotifyEvent {
+                event: "provisional_armed",
+                at_unix: now,
+                handle: Some(handle),
+                session_fingerprint: next.session_fingerprint,
+                requester_principal: None,
+                reason: Some(next.reason),
+                status: Some("armed".to_string()),
+                behavior: None,
+            });
+            true
+        });
+        task.await.unwrap_or(false)
+    }
+
+    async fn cancel_staged_revert(&self, handle: &str) {
+        let server = self.server.clone();
+        let handle = handle.to_string();
+        let task = tokio::spawn(async move {
+            let mut registry = server.state.provisional.write().await;
+            let Some(staged) = registry.get(&handle).cloned() else {
+                return;
+            };
+            if staged.forward_done {
+                return;
+            }
+            let Some(store) = &server.state.session_store else {
+                return;
+            };
+            if let Err(error) = store.delete_provisional(handle.clone()).await {
+                tracing::warn!("api-proxy staged revert cleanup failed: {error}");
+                return;
+            }
+            registry.remove(&handle);
+            remove_revert_body(&staged);
+        });
+        let _ = task.await;
     }
 
     async fn hold_request(

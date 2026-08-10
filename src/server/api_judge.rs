@@ -7,8 +7,8 @@ use guard::learned_rules::{
     acquire_async_authority_use_lease, run_async_durable_store_operation, AuthorityUseLease,
 };
 use guard::proxy::{
-    ApiAuthorizationKind, ApiCoverageVerdict, ApiForwardAuthorization, ApiForwardRequirement,
-    ApiJudge, ApiJudgeVerdict, ApiRequestSummary,
+    ApiAuthorizationKind, ApiCoverageVerdict, ApiForwardHandoff, ApiForwardRequirement, ApiJudge,
+    ApiJudgeVerdict, ApiRequestSummary,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -381,10 +381,11 @@ async fn authorize_api_forward(
     stamp: &str,
     summary: &ApiRequestSummary,
     requirement: ApiForwardRequirement,
-) -> Result<ApiForwardAuthorization, String> {
+    handoff: &mut dyn ApiForwardHandoff,
+) -> Result<(), String> {
     let Some(store) = store else {
         return match requirement {
-            ApiForwardRequirement::Evaluated => Ok(ApiForwardAuthorization::evaluated(())),
+            ApiForwardRequirement::Evaluated => handoff.forward().await,
             ApiForwardRequirement::Coverage { .. } => {
                 Err("API coverage authority is unavailable".to_string())
             }
@@ -423,10 +424,7 @@ async fn authorize_api_forward(
             return Err("API coverage authority changed before upstream forwarding".to_string());
         }
     }
-    Ok(match requirement {
-        ApiForwardRequirement::Evaluated => ApiForwardAuthorization::evaluated(lease),
-        ApiForwardRequirement::Coverage { .. } => ApiForwardAuthorization::coverage(lease),
-    })
+    handoff.forward().await
 }
 
 pub(super) async fn lease_api_coverage_for_decision(
@@ -513,8 +511,16 @@ impl ApiJudge for DaemonApiCoverageJudge {
         &self,
         summary: &ApiRequestSummary,
         requirement: ApiForwardRequirement,
-    ) -> Result<ApiForwardAuthorization, String> {
-        authorize_api_forward(Some(&self.api_promotion), &self.stamp, summary, requirement).await
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        authorize_api_forward(
+            Some(&self.api_promotion),
+            &self.stamp,
+            summary,
+            requirement,
+            handoff,
+        )
+        .await
     }
 
     async fn judge(&self, _summary: &ApiRequestSummary) -> ApiJudgeVerdict {
@@ -558,12 +564,14 @@ impl ApiJudge for DaemonApiJudge {
         &self,
         summary: &ApiRequestSummary,
         requirement: ApiForwardRequirement,
-    ) -> Result<ApiForwardAuthorization, String> {
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
         authorize_api_forward(
             self.api_promotion.as_ref(),
             &self.stamp,
             summary,
             requirement,
+            handoff,
         )
         .await
     }

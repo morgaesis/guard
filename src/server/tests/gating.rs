@@ -2455,6 +2455,33 @@ async fn api_provisional_binds_session_and_upstream_identity() {
         row.secret_entitlements.as_deref(),
         Some(["cluster-a/token".to_string()].as_slice())
     );
+    assert!(!row.forward_done);
+    assert_eq!(row.deadline_unix, 0);
+    assert!(guard::proxy::GateSink::mark_revert_forwarded(&sink, &handle).await);
+    let live = cfg
+        .state
+        .provisional
+        .read()
+        .await
+        .get(&handle)
+        .cloned()
+        .unwrap();
+    assert!(live.forward_done);
+    assert_eq!(live.forward_exit, Some(0));
+    assert!(live.deadline_unix >= live.created_unix);
+    let durable = cfg
+        .state
+        .session_store
+        .as_ref()
+        .unwrap()
+        .load_provisionals()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.handle == handle)
+        .unwrap();
+    assert_eq!(durable.forward_done, live.forward_done);
+    assert_eq!(durable.deadline_unix, live.deadline_unix);
     let api = row.api_revert.unwrap();
     assert_eq!(api.endpoint, "cluster-a");
     assert_eq!(api.upstream_target, "https://cluster-a.invalid");

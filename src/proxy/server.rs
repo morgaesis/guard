@@ -39,9 +39,10 @@ use tokio::sync::RwLock;
 use tokio_rustls::TlsAcceptor;
 
 use super::gate::{
-    ApiAuthorizationKind, ApiCoverageVerdict, ApiEvaluationMode, ApiForwardRequirement,
-    ApiHoldSnapshot, ApiJudge, ApiJudgeVerdict, ApiMutation, ApiRequestSummary, ApiSessionContext,
-    ApiSessionEvent, ApiSessionSink, GateSink, HoldDecision, RevertConstructible,
+    ApiAuthorizationKind, ApiCoverageVerdict, ApiEvaluationMode, ApiForwardHandoff,
+    ApiForwardRequirement, ApiHoldSnapshot, ApiJudge, ApiJudgeVerdict, ApiMutation,
+    ApiRequestSummary, ApiSessionContext, ApiSessionEvent, ApiSessionSink, GateSink, HoldDecision,
+    RevertConstructible,
 };
 use super::k8s_protocol::KubernetesProtocol;
 use super::k8s_protocol::{bind_mutation_preconditions, object_state, KubernetesObjectState};
@@ -57,6 +58,7 @@ use crate::gating::{decide_gate, GateOutcome};
 const MAX_REQ_BODY: usize = 16 * 1024 * 1024;
 const REQUEST_BODY_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const UPSTREAM_HANDOFF_TIMEOUT: Duration = Duration::from_secs(30);
+const UPSTREAM_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How often the policy file is checked for changes (the operator "slow
 /// clock"). The default for [`ApiProxy::with_policy_reload_interval`].
@@ -215,6 +217,9 @@ pub struct ApiProxy {
     /// Maximum time authority coordination can be retained while waiting for
     /// the upstream to accept a request and return response headers.
     upstream_handoff_timeout: Duration,
+    /// Maximum time spent buffering a response body after the finite header
+    /// handoff and any durable containment transition have completed.
+    upstream_body_timeout: Duration,
     /// How often `policy_path` is checked for changes. Production keeps the
     /// [`POLICY_RELOAD_SECS`] default; tests inject a short interval so they
     /// can observe a reload without a multi-second wait.
@@ -226,6 +231,62 @@ struct PendingApiAuthorization {
     judge: Arc<dyn ApiJudge>,
     summary: ApiRequestSummary,
     requirement: ApiForwardRequirement,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ApprovedApiHold;
+
+enum UpstreamHandoffOutcome {
+    Pending,
+    TimedOut,
+    Finished(Result<reqwest::Response, reqwest::Error>),
+}
+
+struct UpstreamSendHandoff {
+    request: Option<reqwest::RequestBuilder>,
+    timeout: Duration,
+    outcome: UpstreamHandoffOutcome,
+}
+
+#[async_trait::async_trait]
+impl ApiForwardHandoff for UpstreamSendHandoff {
+    async fn forward(&mut self) -> Result<(), String> {
+        let request = self
+            .request
+            .take()
+            .ok_or_else(|| "upstream handoff was already consumed".to_string())?;
+        match tokio::time::timeout(self.timeout, request.send()).await {
+            Ok(result) => {
+                self.outcome = UpstreamHandoffOutcome::Finished(result);
+                Ok(())
+            }
+            Err(_) => {
+                self.outcome = UpstreamHandoffOutcome::TimedOut;
+                Err("upstream request handoff timed out".to_string())
+            }
+        }
+    }
+}
+
+struct SessionBoundHandoff<'a> {
+    sink: Option<&'a Arc<dyn ApiSessionSink>>,
+    auth: Option<&'a SessionAuth>,
+    context: Option<&'a ApiSessionContext>,
+    upstream: &'a mut dyn ApiForwardHandoff,
+}
+
+#[async_trait::async_trait]
+impl ApiForwardHandoff for SessionBoundHandoff<'_> {
+    async fn forward(&mut self) -> Result<(), String> {
+        match (self.sink, self.auth, self.context) {
+            (Some(sink), Some(auth), Some(context)) => {
+                sink.authorize_forward(&auth.token, context, self.upstream)
+                    .await
+            }
+            (_, None, None) => self.upstream.forward().await,
+            _ => Err("session authority context is incomplete".to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -464,6 +525,7 @@ impl ApiProxy {
             listener_mode: ApiListenerMode::default(),
             request_body_timeout: REQUEST_BODY_READ_TIMEOUT,
             upstream_handoff_timeout: UPSTREAM_HANDOFF_TIMEOUT,
+            upstream_body_timeout: UPSTREAM_BODY_TIMEOUT,
             policy_reload_interval: Duration::from_secs(POLICY_RELOAD_SECS),
         }
     }
@@ -495,6 +557,14 @@ impl ApiProxy {
     #[doc(hidden)]
     pub fn with_upstream_handoff_timeout(mut self, timeout: Duration) -> Self {
         self.upstream_handoff_timeout = timeout;
+        self
+    }
+
+    /// Bound response buffering independently from the authority-protected
+    /// response-header handoff.
+    #[doc(hidden)]
+    pub fn with_upstream_body_timeout(mut self, timeout: Duration) -> Self {
+        self.upstream_body_timeout = timeout;
         self
     }
 
@@ -1283,9 +1353,8 @@ impl ApiProxy {
                                 Err(response) => return response,
                             }
                         } else {
-                            // A create's revert is built from the write response
-                            // (delete-the-created-object); it cannot be validated
-                            // before the write, so it is armed best-effort after.
+                            // A named create's delete revert is built from the
+                            // exact buffered request immediately before send.
                             None
                         };
                         let redact = self.protocol.redactable_read(op);
@@ -1531,6 +1600,8 @@ impl ApiProxy {
                         handle,
                         if redact { " (redacting)" } else { "" }
                     );
+                    let mut parts = parts;
+                    parts.extensions.insert(ApprovedApiHold);
                     let response = self
                         .forward_buffered(
                             parts,
@@ -1704,49 +1775,50 @@ impl ApiProxy {
             Ok(context) => context,
             Err(response) => return response,
         };
-        let kubernetes_mutation = op
-            .as_ref()
-            .is_some_and(|operation| self.is_kubernetes_mutation(operation));
-        let _mutation_authority_guard = if kubernetes_mutation {
-            Some(self.mutation_authority_gate.read().await)
+        let provisional_handle = if track_write {
+            let operation = op.as_ref().expect("tracked write has operation");
+            let handle = self
+                .arm_write_revert(
+                    operation,
+                    prepared_snapshot.clone().flatten(),
+                    &body,
+                    conn_id,
+                    session_context.clone(),
+                )
+                .await;
+            if handle.is_none() && parts.extensions.get::<ApprovedApiHold>().is_none() {
+                return Box::pin(self.route_hold_buffered(
+                    parts,
+                    body,
+                    path,
+                    query,
+                    operation,
+                    "the mutation could not be durably contained before forwarding",
+                    conn_id,
+                    authorization,
+                ))
+                .await;
+            }
+            handle
         } else {
             None
         };
-        if let Some(response) = self
-            .recheck_final_authority(&route_authority, op.as_ref())
+        match self
+            .forward_inner(
+                parts,
+                body,
+                path,
+                query,
+                redact,
+                op,
+                session_context,
+                created_cleanup,
+                route_authority,
+                authorization,
+                provisional_handle,
+            )
             .await
         {
-            return response;
-        }
-        let forwarding = self.forward_inner(
-            parts,
-            body,
-            path,
-            query,
-            redact,
-            op,
-            conn_id,
-            prepared_snapshot,
-            session_context,
-            created_cleanup,
-            route_authority,
-            authorization,
-        );
-        let forwarding = if kubernetes_mutation {
-            match tokio::time::timeout(self.upstream_handoff_timeout, forwarding).await {
-                Ok(result) => result,
-                Err(_) => {
-                    return self.status_resp(
-                        StatusCode::GATEWAY_TIMEOUT,
-                        "guard api-proxy: mutation authority handoff timed out",
-                        "Timeout",
-                    );
-                }
-            }
-        } else {
-            forwarding.await
-        };
-        match forwarding {
             Ok(resp) => resp,
             Err(e) => {
                 tracing::warn!(target: "guard::apiproxy", "upstream error for {path}: {e:#}");
@@ -1771,16 +1843,15 @@ impl ApiProxy {
         query: &str,
         redact: bool,
         op: Option<ApiOp>,
-        conn_id: u64,
-        prepared_snapshot: Option<Option<Vec<u8>>>,
         session_context: Option<ApiSessionContext>,
         created_cleanup: Option<CreatedMatch>,
         route_authority: RouteAuthority,
         authorization: Option<PendingApiAuthorization>,
+        provisional_handle: Option<String>,
     ) -> Result<Response<ProxyBody>> {
-        // A recoverable write is wrapped in an auto-revert envelope after the
-        // upstream succeeds. Snapshot acquisition occurs in the caller before
-        // its final authority checks.
+        // A recoverable write is staged durably before its finite upstream
+        // handoff. Snapshot acquisition occurs in the caller before its final
+        // authority checks.
         let track_write = created_cleanup.is_none()
             && op
                 .as_ref()
@@ -1788,7 +1859,6 @@ impl ApiProxy {
         let kubernetes_mutation = op
             .as_ref()
             .is_some_and(|operation| self.is_kubernetes_mutation(operation));
-        let snapshot = prepared_snapshot.flatten();
 
         let url = if query.is_empty() {
             format!("{}{}", self.upstream.base(), path)
@@ -1831,10 +1901,31 @@ impl ApiProxy {
             rb = rb.body(body);
         }
 
+        let policy_authority =
+            match tokio::time::timeout(Duration::from_secs(5), self.mutation_authority_gate.read())
+                .await
+            {
+                Ok(guard) => guard,
+                Err(_) => {
+                    if let (Some(gate), Some(handle)) =
+                        (self.gate.get(), provisional_handle.as_deref())
+                    {
+                        gate.cancel_staged_revert(handle).await;
+                    }
+                    return Ok(self.status_resp(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "guard api-proxy: policy authority lock timed out",
+                        "Timeout",
+                    ));
+                }
+            };
         if let Some(response) = self
             .recheck_final_authority(&route_authority, op.as_ref())
             .await
         {
+            if let (Some(gate), Some(handle)) = (self.gate.get(), provisional_handle.as_deref()) {
+                gate.cancel_staged_revert(handle).await;
+            }
             return Ok(response);
         }
         if let (Some(operation), Some(context)) = (
@@ -1861,76 +1952,51 @@ impl ApiProxy {
         // Revocable durable authority is acquired in one order: evaluator or
         // coverage authority, then session authority. The bundle lives only
         // through the bounded response-header handoff.
-        let forward_authority = if let Some(pending) = authorization {
-            match pending
-                .judge
-                .authorize_forward(&pending.summary, pending.requirement)
-                .await
-            {
-                Ok(authority) if authority.satisfies(pending.requirement) => Some(authority),
-                Ok(_) => {
-                    return Ok(self.status_resp(
-                        StatusCode::FORBIDDEN,
-                        "guard api-proxy authority capability does not match the forwarding decision",
-                        "Forbidden",
-                    ));
-                }
-                Err(reason) => {
-                    return Ok(self.status_resp(
-                        StatusCode::FORBIDDEN,
-                        &format!("guard api-proxy authority changed before forwarding: {reason}"),
-                        "Forbidden",
-                    ));
-                }
-            }
-        } else {
-            None
+        let mut upstream_handoff = UpstreamSendHandoff {
+            request: Some(rb),
+            timeout: self.upstream_handoff_timeout,
+            outcome: UpstreamHandoffOutcome::Pending,
         };
-        let session_authority = match (
-            parts.extensions.get::<SessionAuth>(),
-            session_context.as_ref(),
-        ) {
-            (Some(auth), Some(context)) => {
-                let Some(sink) = self.session_sink.get() else {
-                    return Ok(self.status_resp(
-                        StatusCode::FORBIDDEN,
-                        "guard api-proxy: session attribution is unavailable",
-                        "Forbidden",
-                    ));
-                };
-                match sink.authorize_forward(&auth.token, context).await {
-                    Ok(authority) => Some(authority),
-                    Err(reason) => {
-                        return Ok(self.status_resp(
-                            StatusCode::FORBIDDEN,
-                            &format!(
-                                "guard api-proxy session authority changed before forwarding: {reason}"
-                            ),
-                            "Forbidden",
-                        ));
-                    }
+        let auth = parts.extensions.get::<SessionAuth>();
+        let mut session_handoff = SessionBoundHandoff {
+            sink: self.session_sink.get(),
+            auth,
+            context: session_context.as_ref(),
+            upstream: &mut upstream_handoff,
+        };
+        let authorization_result = if let Some(pending) = authorization {
+            pending
+                .judge
+                .authorize_forward(&pending.summary, pending.requirement, &mut session_handoff)
+                .await
+        } else {
+            session_handoff.forward().await
+        };
+        drop(policy_authority);
+        let upstream_resp = match upstream_handoff.outcome {
+            UpstreamHandoffOutcome::Pending => {
+                if let (Some(gate), Some(handle)) = (self.gate.get(), provisional_handle.as_deref())
+                {
+                    gate.cancel_staged_revert(handle).await;
                 }
-            }
-            (None, None) => None,
-            _ => {
+                let reason = authorization_result.err().unwrap_or_else(|| {
+                    "authority provider did not perform the protected handoff".to_string()
+                });
                 return Ok(self.status_resp(
                     StatusCode::FORBIDDEN,
-                    "guard api-proxy: session authority context is incomplete",
+                    &format!("guard api-proxy authority changed before forwarding: {reason}"),
                     "Forbidden",
                 ));
             }
-        };
-        let upstream_resp = tokio::time::timeout(self.upstream_handoff_timeout, rb.send()).await;
-        drop(session_authority);
-        drop(forward_authority);
-        let upstream_resp = match upstream_resp {
-            Ok(response) => response.context("forward to apiserver")?,
-            Err(_) => {
+            UpstreamHandoffOutcome::TimedOut => {
                 return Ok(self.status_resp(
                     StatusCode::GATEWAY_TIMEOUT,
                     "guard api-proxy: upstream request handoff timed out",
                     "Timeout",
                 ));
+            }
+            UpstreamHandoffOutcome::Finished(response) => {
+                response.context("forward to apiserver")?
             }
         };
         let status = upstream_resp.status();
@@ -2059,21 +2125,56 @@ impl ApiProxy {
                 .expect("build redacted response"));
         }
 
+        // Successful mutation headers are the containment linearization point.
+        // Activate the already durable staged revert before reading any body.
+        let mut provisional_handle = provisional_handle;
+        if status.is_success() {
+            if let Some(handle) = provisional_handle.as_deref() {
+                let activated = match self.gate.get() {
+                    Some(gate) => gate.mark_revert_forwarded(handle).await,
+                    None => false,
+                };
+                if !activated {
+                    builder = builder.header("x-guard-provisional", handle);
+                    return Ok(builder
+                        .body(full_body(Bytes::from_static(
+                            b"guard api-proxy: mutation succeeded but durable containment requires operator action\n",
+                        )))
+                        .expect("build containment failure response"));
+                }
+            }
+        } else if let Some(handle) = provisional_handle.take() {
+            if let Some(gate) = self.gate.get() {
+                gate.cancel_staged_revert(&handle).await;
+            }
+        }
+
         // Kubernetes mutation responses are buffered so the returned object can
-        // become this same session's next observed version. Tracked writes also
-        // use the buffered body to arm their auto-revert.
+        // become this same session's next observed version. The body has a
+        // separate bound because containment is already armed at this point.
         if track_write || kubernetes_mutation {
-            let bytes = upstream_resp.bytes().await.context("read write response")?;
-            let mut provisional_handle = None;
+            let bytes =
+                match tokio::time::timeout(self.upstream_body_timeout, upstream_resp.bytes()).await
+                {
+                    Ok(result) => result.context("read write response")?,
+                    Err(_) => {
+                        let mut response = self.status_resp(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "guard api-proxy: upstream response body timed out after mutation handoff",
+                        "Timeout",
+                    );
+                        if let Some(handle) = provisional_handle.as_deref() {
+                            if let Ok(value) = hyper::header::HeaderValue::from_str(handle) {
+                                response.headers_mut().insert("x-guard-provisional", value);
+                            }
+                        }
+                        return Ok(response);
+                    }
+                };
             if status.is_success() {
                 if let Some(o) = op.as_ref() {
                     if let Some(context) = session_context.as_ref() {
                         self.remember_kubernetes_observation(o, &bytes, context);
-                    }
-                    if track_write {
-                        provisional_handle = self
-                            .arm_write_revert(o, snapshot, &bytes, conn_id, session_context.clone())
-                            .await;
                     }
                 }
             }
@@ -2429,7 +2530,7 @@ impl ApiProxy {
             // The marker is an input the evaluator trusts, so it must not claim a
             // revert the protocol cannot actually build from this snapshot (e.g.
             // an encrypted value the sanitizer drops). Validate by planning the
-            // snapshot-based revert; the response body is unused for these verbs.
+            // snapshot-based revert; the request body is unused for these verbs.
             if self.protocol.plan_revert(op, Some(&snapshot), &[]).is_err() {
                 return Ok(RevertConstructible::None);
             }
@@ -2441,23 +2542,21 @@ impl ApiProxy {
         Ok(RevertConstructible::DeleteCreated)
     }
 
-    /// Arm an auto-revert envelope for a tracked write the proxy just
-    /// forwarded, using the protocol's revert plan.
+    /// Durably stage an auto-revert envelope before a tracked write is sent.
     async fn arm_write_revert(
         &self,
         op: &ApiOp,
         snapshot: Option<Vec<u8>>,
-        response_body: &[u8],
+        request_body: &[u8],
         conn_id: u64,
         session_context: Option<ApiSessionContext>,
     ) -> Option<String> {
         let gate = self.gate.get()?;
         let plan = match self
             .protocol
-            .plan_revert(op, snapshot.as_deref(), response_body)
+            .plan_revert(op, snapshot.as_deref(), request_body)
         {
             Ok(plan) => plan,
-            // The write is already live; a failed plan only means no auto-revert.
             Err(reason) => {
                 tracing::warn!(target: "guard::apiproxy", "{reason}");
                 return None;
@@ -2497,7 +2596,7 @@ impl ApiProxy {
                 if let Some(key) = created_key {
                     self.created.lock().unwrap().remember(key, handle.clone());
                 }
-                tracing::info!(target: "guard::apiproxy", "armed auto-revert {handle} for {label}");
+                tracing::info!(target: "guard::apiproxy", "staged auto-revert {handle} for {label}");
                 Some(handle)
             }
             None => {

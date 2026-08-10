@@ -1057,6 +1057,11 @@ async fn acquire_command_initiation_lease(
         if !guard.has(token) {
             return Err("session was revoked before process start".to_string());
         }
+        if let Some(reason) = guard.suspension_reason(token, &server.config.behavior_limits) {
+            return Err(format!(
+                "session was suspended before process start: {reason}"
+            ));
+        }
         if let Some(expected) = authorization.and_then(|authority| authority.session.as_ref()) {
             let current = guard
                 .authority_snapshot(token)
@@ -2253,57 +2258,69 @@ pub(super) async fn admit_access_use(
     let Some(token) = request.session_token.as_deref() else {
         return Ok(None);
     };
-    let mut sessions = server.state.sessions.write().await;
-    if !sessions.is_access_managed(token) {
-        return Ok(None);
-    }
-    let mut reloaded_after_conflict = false;
-    loop {
-        if !sessions.is_access_managed(token) {
-            return Err(
-                "access session expired or was revoked during durable admission".to_string(),
-            );
+    let server = server.clone();
+    let token = token.to_string();
+    let selected_verbs = selected_verbs.to_vec();
+    let preferred_requests = preferred_requests.map(ToOwned::to_owned);
+    let task = tokio::spawn(async move {
+        let mut sessions = server.state.sessions.write().await;
+        if !sessions.is_access_managed(&token) {
+            return Ok(None);
         }
-        let mut staged = sessions.clone();
-        let admission = staged.consume_access_use(token, selected_verbs, preferred_requests)?;
-        let persist_result =
-            persist_session_snapshot(server.state.session_store.clone(), staged.clone()).await;
-        match persist_result {
-            Ok(()) => {
-                *sessions = staged;
-            }
-            Err(error)
-                if !reloaded_after_conflict
-                    && SessionStore::is_registry_generation_conflict(&error) =>
-            {
-                let Some(store) = &server.state.session_store else {
-                    return Err(format!("failed to persist access admission: {error}"));
-                };
-                *sessions = store.load_registry().await.map_err(|reload_error| {
-                    format!(
-                        "failed to reload sessions after a concurrent access admission: {reload_error}"
-                    )
-                })?;
-                reloaded_after_conflict = true;
-                continue;
-            }
-            Err(error) => {
-                return Err(format!("failed to persist access admission: {error}"));
-            }
-        }
-        for consumption in &admission.consumptions {
-            if let Some(remaining_uses) = consumption.remaining_uses {
-                server.emit_audit_ungated(
-                    guard::audit::AuditEvent::new(guard::audit::AuditKind::SessionGrant)
-                        .session_fingerprint(audit_session_fingerprint(Some(token)))
-                        .field("event", "access_use_consumed")
-                        .field("access_request", &consumption.request)
-                        .field("remaining_uses", format!("{remaining_uses}")),
+        let mut reloaded_after_conflict = false;
+        loop {
+            if !sessions.is_access_managed(&token) {
+                return Err(
+                    "access session expired or was revoked during durable admission".to_string(),
                 );
             }
+            let mut staged = sessions.clone();
+            let admission = staged.consume_access_use(
+                &token,
+                &selected_verbs,
+                preferred_requests.as_deref(),
+            )?;
+            let persist_result =
+                persist_session_snapshot(server.state.session_store.clone(), staged.clone()).await;
+            match persist_result {
+                Ok(()) => {
+                    *sessions = staged;
+                }
+                Err(error)
+                    if !reloaded_after_conflict
+                        && SessionStore::is_registry_generation_conflict(&error) =>
+                {
+                    let Some(store) = &server.state.session_store else {
+                        return Err(format!("failed to persist access admission: {error}"));
+                    };
+                    *sessions = store.load_registry().await.map_err(|reload_error| {
+                        format!(
+                            "failed to reload sessions after a concurrent access admission: {reload_error}"
+                        )
+                    })?;
+                    reloaded_after_conflict = true;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(format!("failed to persist access admission: {error}"));
+                }
+            }
+            for consumption in &admission.consumptions {
+                if let Some(remaining_uses) = consumption.remaining_uses {
+                    server.emit_audit_ungated(
+                        guard::audit::AuditEvent::new(guard::audit::AuditKind::SessionGrant)
+                            .session_fingerprint(audit_session_fingerprint(Some(&token)))
+                            .field("event", "access_use_consumed")
+                            .field("access_request", &consumption.request)
+                            .field("remaining_uses", format!("{remaining_uses}")),
+                    );
+                }
+            }
+            return Ok(Some(admission));
         }
-        return Ok(Some(admission));
-    }
+    });
+    task.await
+        .map_err(|error| format!("access admission task failed: {error}"))?
 }
 
 #[cfg(test)]

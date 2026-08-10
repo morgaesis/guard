@@ -62,20 +62,28 @@ pub enum HoldDecision {
 /// consequence machinery.
 #[async_trait]
 pub trait GateSink: Send + Sync {
-    /// Arm an auto-revert envelope around a mutation the proxy already applied.
-    /// Returns the provisional handle, or `None` if the daemon declined (e.g.
-    /// the outstanding-provisional cap is hit). The proxy proceeds regardless -
-    /// the mutation is already live; `None` only means it will not auto-revert.
+    /// Durably stage an auto-revert before a mutation is sent upstream.
+    /// Returns the provisional handle, or `None` if the daemon cannot provide
+    /// durable containment.
     async fn arm_revert(&self, mutation: ApiMutation) -> Option<String>;
+
+    /// Mark a staged revert as live after successful upstream response headers.
+    /// The confirmation window begins only after this durable transition.
+    async fn mark_revert_forwarded(&self, _handle: &str) -> bool {
+        true
+    }
+
+    /// Remove a staged revert after definitive non-success response headers
+    /// prove that the upstream mutation did not succeed.
+    async fn cancel_staged_revert(&self, _handle: &str) {}
 
     /// Whether the sink could arm a revert right now (capacity available, and a
     /// body-bearing revert can be persisted safely). The proxy consults this on
     /// the evaluate path before forwarding a write it would only forward
     /// *because* a revert was promised, so it can hold rather than forward a
     /// write it cannot contain. Default: assume it can, for sinks that always
-    /// accept a revert. Best-effort: a race between this check and `arm_revert`
-    /// is possible, but this closes the common deterministic gaps (no capacity,
-    /// no safe revert directory).
+    /// accept a staged revert. The staging operation remains authoritative;
+    /// this early check only avoids needless evaluator work.
     async fn can_arm_revert(&self) -> bool {
         true
     }
@@ -276,30 +284,23 @@ pub struct ApiSessionEvent {
 #[async_trait]
 pub trait ApiSessionSink: Send + Sync {
     async fn resolve(&self, token: &str) -> Option<ApiSessionContext>;
-    /// Revalidate an exact session context and retain compatible session
-    /// coordination through one finite upstream request handoff.
+    /// Revalidate an exact session context, retain compatible coordination,
+    /// and invoke the proxy-owned handoff exactly once while it remains held.
     async fn authorize_forward(
         &self,
-        _token: &str,
-        _expected: &ApiSessionContext,
-    ) -> Result<ApiSessionAuthorization, String> {
-        Err("session authority handoff is unavailable".to_string())
-    }
+        token: &str,
+        expected: &ApiSessionContext,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String>;
     async fn record(&self, token: &str, event: ApiSessionEvent);
 }
 
-/// Opaque session authority retained through one upstream request handoff.
-pub struct ApiSessionAuthorization {
-    _authority: Box<dyn Send>,
-}
-
-impl ApiSessionAuthorization {
-    #[doc(hidden)]
-    pub fn new(authority: impl Send + 'static) -> Self {
-        Self {
-            _authority: Box::new(authority),
-        }
-    }
+/// One-shot proxy-owned upstream handoff. Authority providers can invoke this
+/// only while their retained lease is in lexical scope; they cannot construct
+/// or return a stand-in capability.
+#[async_trait]
+pub trait ApiForwardHandoff: Send {
+    async fn forward(&mut self) -> Result<(), String>;
 }
 
 /// API evaluator verdict. An allow is still routed through `decide_gate`; it is
@@ -331,44 +332,6 @@ pub enum ApiForwardRequirement {
         risk: i32,
         reversibility: Reversibility,
     },
-}
-
-/// Opaque authority retained through one upstream request handoff. The proxy
-/// drops it as soon as the request has been sent and response streaming begins.
-pub struct ApiForwardAuthorization {
-    kind: ApiAuthorizationKind,
-    _authority: Box<dyn Send>,
-}
-
-impl ApiForwardAuthorization {
-    #[doc(hidden)]
-    pub fn evaluated(authority: impl Send + 'static) -> Self {
-        Self {
-            kind: ApiAuthorizationKind::Evaluated,
-            _authority: Box::new(authority),
-        }
-    }
-
-    #[doc(hidden)]
-    pub fn coverage(authority: impl Send + 'static) -> Self {
-        Self {
-            kind: ApiAuthorizationKind::Coverage,
-            _authority: Box::new(authority),
-        }
-    }
-
-    pub(crate) fn satisfies(&self, requirement: ApiForwardRequirement) -> bool {
-        matches!(
-            (self.kind, requirement),
-            (
-                ApiAuthorizationKind::Evaluated,
-                ApiForwardRequirement::Evaluated
-            ) | (
-                ApiAuthorizationKind::Coverage,
-                ApiForwardRequirement::Coverage { .. }
-            )
-        )
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -403,7 +366,8 @@ pub trait ApiJudge: Send + Sync {
         &self,
         summary: &ApiRequestSummary,
         requirement: ApiForwardRequirement,
-    ) -> Result<ApiForwardAuthorization, String>;
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String>;
 
     async fn judge(&self, summary: &ApiRequestSummary) -> ApiJudgeVerdict;
 }

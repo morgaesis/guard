@@ -399,13 +399,12 @@ impl ProtocolConfig for KubernetesProtocol {
 
     /// An update/patch with a usable prior state reverts by PUT-restoring it, a
     /// delete reverts by POST-recreating the sanitized prior object, and a
-    /// create reverts by deleting the possibly server-named object from the
-    /// response.
+    /// named create reverts by deleting the object identified in the request.
     fn plan_revert(
         &self,
         op: &ApiOp,
         prior_object: Option<&[u8]>,
-        response: &[u8],
+        create_body: &[u8],
     ) -> Result<PlannedRevert, String> {
         match op.verb {
             Verb::Update | Verb::Patch => {
@@ -446,8 +445,8 @@ impl ProtocolConfig for KubernetesProtocol {
             _ => return Err("operation has no Kubernetes HTTP revert".to_string()),
         }
 
-        let value: Value = serde_json::from_slice(response).map_err(|_| {
-            "allowed write but response was unparsable; no auto-revert armed".to_string()
+        let value: Value = serde_json::from_slice(create_body).map_err(|_| {
+            "allowed create but request was unparsable; no auto-revert armed".to_string()
         })?;
         let Some(name) = value
             .get("metadata")
@@ -455,7 +454,7 @@ impl ProtocolConfig for KubernetesProtocol {
             .and_then(|n| n.as_str())
         else {
             return Err(
-                "allowed create but response carried no object name; no auto-revert armed"
+                "allowed create but request carried no object name; no auto-revert armed"
                     .to_string(),
             );
         };

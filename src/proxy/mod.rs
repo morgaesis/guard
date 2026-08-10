@@ -36,10 +36,10 @@ pub mod upstream;
 pub mod vercel_protocol;
 
 pub use gate::{
-    ApiAuthorizationKind, ApiCoverageVerdict, ApiEvaluationMode, ApiForwardAuthorization,
+    ApiAuthorizationKind, ApiCoverageVerdict, ApiEvaluationMode, ApiForwardHandoff,
     ApiForwardRequirement, ApiHoldSnapshot, ApiJudge, ApiJudgeVerdict, ApiMutation,
-    ApiRequestSummary, ApiSessionAuthorization, ApiSessionContext, ApiSessionEvent, ApiSessionSink,
-    GateSink, HoldDecision, HttpRevert, RevertConstructible,
+    ApiRequestSummary, ApiSessionContext, ApiSessionEvent, ApiSessionSink, GateSink, HoldDecision,
+    HttpRevert, RevertConstructible,
 };
 pub use github_protocol::GithubProtocol;
 pub use k8s_protocol::KubernetesProtocol;

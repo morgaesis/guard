@@ -307,7 +307,8 @@ impl guard::proxy::ApiSessionSink for DaemonApiSessionSink {
         &self,
         token: &str,
         expected: &guard::proxy::ApiSessionContext,
-    ) -> std::result::Result<guard::proxy::ApiSessionAuthorization, String> {
+        handoff: &mut dyn guard::proxy::ApiForwardHandoff,
+    ) -> std::result::Result<(), String> {
         let registry = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             self.server.state.sessions.clone().read_owned(),
@@ -317,7 +318,7 @@ impl guard::proxy::ApiSessionSink for DaemonApiSessionSink {
         if self.context_from_registry(&registry, token).as_ref() != Some(expected) {
             return Err("session expired, was revoked, or changed".to_string());
         }
-        Ok(guard::proxy::ApiSessionAuthorization::new(registry))
+        handoff.forward().await
     }
 
     async fn record(&self, token: &str, event: guard::proxy::ApiSessionEvent) {
