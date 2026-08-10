@@ -31,8 +31,8 @@ use super::execute::{
 };
 use super::gate_runtime::{
     bound_persisted_transcript, finish_revert, forget_proxy_provenance, is_api_proxy_sentinel,
-    now_unix, persist_approval, persist_provisional_transition, remove_revert_body,
-    resume_approval,
+    now_unix, persist_approval, persist_provisional_transition,
+    persist_terminal_provisional_with_body_cleanup, resume_approval,
 };
 #[cfg(test)]
 use super::learning::{
@@ -2647,6 +2647,8 @@ async fn approve_access_request_owned(
             }
             requests.insert(handle.to_string(), approved.clone());
         }
+        #[cfg(test)]
+        server.state.session_publication_events.add_permits(1);
         emit_grant_request_event(server, &approved, "access_request_approved");
         return AccessDecisionResult {
             request: handle.to_string(),
@@ -2777,6 +2779,8 @@ async fn revoke_access_target_owned(
                 }
             }
         }
+        #[cfg(test)]
+        server.state.session_publication_events.add_permits(1);
         for (_, withdrawn) in &withdrawals {
             emit_grant_request_event(server, withdrawn, "grant_request_withdrawn");
         }
@@ -6302,6 +6306,8 @@ async fn apply_and_persist_grant_request_delta_owned(
             requests.insert(approved.handle.clone(), approved.clone());
         }
     }
+    #[cfg(test)]
+    server.state.session_publication_events.add_permits(1);
     Ok(())
 }
 
@@ -6491,7 +6497,7 @@ async fn handle_confirm(
             }
         }
     };
-    match persist_provisional_transition(server, expected, next.clone()).await {
+    match persist_terminal_provisional_with_body_cleanup(server, expected, next.clone()).await {
         Ok(true) => {}
         Ok(false) => {
             return AdminResponse::Error {
@@ -6510,8 +6516,6 @@ async fn handle_confirm(
         }
     }
     forget_proxy_provenance(server, handle).await;
-    // The durable row is terminal, so the rollback body is no longer needed.
-    remove_revert_body(&next);
     server.emit_event(NotifyEvent {
         event: "decision_made",
         at_unix: now_unix(),

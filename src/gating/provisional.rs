@@ -19,6 +19,9 @@ use std::path::PathBuf;
 use super::{sanitize_gate_text, DecisionTrace, GateError};
 use crate::principal::{scope_eq, PrincipalKey};
 
+/// Marks a terminal row whose rollback body still requires durable deletion.
+pub const REVERT_BODY_CLEANUP_PREFIX: &str = "rollback body cleanup pending; ";
+
 /// Lifecycle of a provisional execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -382,7 +385,7 @@ impl ProvisionalRegistry {
         let mut retired = Vec::new();
         for mut row in rows {
             row.sanitize_explanatory_text();
-            if row.status == ProvisionalStatus::Staged {
+            if row.status == ProvisionalStatus::Staged && row.revert_detail.is_none() {
                 retired.push(row.handle);
                 continue;
             }

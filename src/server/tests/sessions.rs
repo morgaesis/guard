@@ -1912,18 +1912,18 @@ async fn aborted_admin_registry_transitions_finish_live_adoption() {
     committed.acquire().await.unwrap().forget();
     caller.abort();
     release.add_permits(1);
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            if cfg.state.grant_requests.read().await[&pending.handle].status
-                == GrantRequestStatus::Approved
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        cfg.state.session_publication_events.acquire(),
+    )
     .await
-    .expect("detached approval adopts durable session and request state");
+    .expect("detached approval adopts durable session and request state")
+    .unwrap()
+    .forget();
+    assert_eq!(
+        cfg.state.grant_requests.read().await[&pending.handle].status,
+        GrantRequestStatus::Approved
+    );
     assert_eq!(
         cfg.state
             .sessions
@@ -1963,16 +1963,15 @@ async fn aborted_admin_registry_transitions_finish_live_adoption() {
     committed.acquire().await.unwrap().forget();
     caller.abort();
     release.add_permits(1);
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            if !cfg.state.sessions.read().await.has(&access_token) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        cfg.state.session_publication_events.acquire(),
+    )
     .await
-    .expect("detached revoke adopts durable session state");
+    .expect("detached revoke adopts durable session state")
+    .unwrap()
+    .forget();
+    assert!(!cfg.state.sessions.read().await.has(&access_token));
     assert!(!store.load_registry().await.unwrap().has(&access_token));
 }
 
@@ -2098,6 +2097,12 @@ async fn cancelled_bounded_admission_finishes_publication_before_a_successor() {
         .await
     });
     committed.acquire().await.unwrap().forget();
+    cfg.state
+        .session_transition_attempt_events
+        .acquire()
+        .await
+        .unwrap()
+        .forget();
     first.abort();
 
     let second_server = cfg.clone();
@@ -2110,11 +2115,12 @@ async fn cancelled_bounded_admission_finishes_publication_before_a_successor() {
         )
         .await
     });
-    tokio::task::yield_now().await;
-    assert!(
-        !second.is_finished(),
-        "a successor admission overtook detached durable publication"
-    );
+    cfg.state
+        .session_transition_attempt_events
+        .acquire()
+        .await
+        .unwrap()
+        .forget();
     release.add_permits(1);
     assert!(second.await.unwrap().is_err());
     assert_eq!(
@@ -3846,6 +3852,12 @@ async fn exact_amendment_publishes_only_after_persistence_and_preserves_concurre
         .await
     });
     committed.acquire().await.unwrap().forget();
+    cfg.state
+        .session_transition_attempt_events
+        .acquire()
+        .await
+        .unwrap()
+        .forget();
     first.abort();
     let second_server = cfg.clone();
     let second = tokio::spawn(async move {
@@ -3859,11 +3871,12 @@ async fn exact_amendment_publishes_only_after_persistence_and_preserves_concurre
         )
         .await
     });
-    tokio::task::yield_now().await;
-    assert!(
-        !second.is_finished(),
-        "a successor amendment overtook detached durable publication"
-    );
+    cfg.state
+        .session_transition_attempt_events
+        .acquire()
+        .await
+        .unwrap()
+        .forget();
     release.add_permits(1);
     assert!(second.await.unwrap().unwrap());
 

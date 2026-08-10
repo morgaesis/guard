@@ -1,6 +1,48 @@
 use regex::Regex;
 use std::borrow::Cow;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
+
+/// Process-wide exact literals supplied by the daemon's trusted configuration.
+///
+/// Registration is monotonic because a daemon may discover credentials before
+/// or during startup, while removing a literal would make older durable and
+/// audit projections unsafe. Callers never receive the registered values.
+fn trusted_exact_secrets() -> &'static RwLock<Vec<String>> {
+    static SECRETS: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
+    SECRETS.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+pub fn register_trusted_exact_secrets(secrets: &[String]) {
+    let mut registered = trusted_exact_secrets()
+        .write()
+        .expect("trusted exact-secret registry is not poisoned");
+    for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
+        if !registered.iter().any(|known| known == secret) {
+            registered.push(secret.clone());
+        }
+    }
+    registered.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
+}
+
+fn with_trusted_exact_secret_refs<T>(operation: impl FnOnce(&[&str]) -> T) -> T {
+    let registered = trusted_exact_secrets()
+        .read()
+        .expect("trusted exact-secret registry is not poisoned");
+    let references = registered.iter().map(String::as_str).collect::<Vec<_>>();
+    operation(&references)
+}
+
+pub fn redact_registered_exact_secrets(text: &str) -> String {
+    redact_exact_and_registered_secrets(text, &[])
+}
+
+pub fn redact_exact_and_registered_secrets(text: &str, secrets: &[&str]) -> String {
+    with_trusted_exact_secret_refs(|registered| {
+        let mut combined = secrets.to_vec();
+        combined.extend_from_slice(registered);
+        redact_exact_secrets(text, &combined)
+    })
+}
 
 /// Render a command as one display line: the binary followed by its arguments,
 /// space-separated. This is the single renderer for operator-facing and audit
@@ -463,7 +505,8 @@ pub fn redact_output(text: &str) -> String {
     let result = redact_flow_name_values(&result);
     let result = redact_named_secrets(&result);
     let result = redact_bare_long_tokens(&result);
-    redact_catchall(&result)
+    let result = redact_catchall(&result);
+    redact_registered_exact_secrets(&result)
 }
 
 #[derive(Debug, Default)]
@@ -497,8 +540,9 @@ pub fn redact_output_with_state(line: &str, state: &mut RedactionState) -> Strin
 
 pub fn redact_output_text(text: &str) -> String {
     let had_trailing_newline = text.ends_with('\n');
+    let exact_redacted = redact_registered_exact_secrets(text);
     let mut state = RedactionState::default();
-    let mut redacted = text
+    let mut redacted = exact_redacted
         .lines()
         .map(|line| redact_output_with_state(line, &mut state))
         .collect::<Vec<_>>()
@@ -1250,6 +1294,80 @@ pub fn redact_command_line(binary: &str, args: &[String]) -> String {
     command_line(&binary, &args)
 }
 
+/// Redact configured exact literals from one structured command in addition
+/// to the shared argv-aware classifier. This explicit form is useful at
+/// boundaries that receive a scoped secret set before daemon registration.
+pub fn redact_command_line_with_exact_secrets(
+    binary: &str,
+    args: &[String],
+    secrets: &[&str],
+) -> String {
+    let binary = redact_exact_and_registered_secrets(binary, secrets);
+    let args = args
+        .iter()
+        .map(|argument| redact_exact_and_registered_secrets(argument, secrets))
+        .collect::<Vec<_>>();
+    redact_command_line(&binary, &args)
+}
+
+pub fn command_contains_exact_secrets(binary: &str, args: &[String], secrets: &[&str]) -> bool {
+    secrets
+        .iter()
+        .copied()
+        .filter(|secret| !secret.is_empty())
+        .any(|secret| {
+            binary.contains(secret) || args.iter().any(|argument| argument.contains(secret))
+        })
+}
+
+pub fn json_contains_exact_secrets(value: &serde_json::Value, secrets: &[&str]) -> bool {
+    match value {
+        serde_json::Value::String(value) => {
+            redact_registered_exact_secrets(value) != *value
+                || secrets
+                    .iter()
+                    .copied()
+                    .filter(|secret| !secret.is_empty())
+                    .any(|secret| value.contains(secret))
+        }
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|value| json_contains_exact_secrets(value, secrets)),
+        serde_json::Value::Object(values) => values.iter().any(|(key, value)| {
+            redact_registered_exact_secrets(key) != *key
+                || secrets
+                    .iter()
+                    .copied()
+                    .filter(|secret| !secret.is_empty())
+                    .any(|secret| key.contains(secret))
+                || json_contains_exact_secrets(value, secrets)
+        }),
+        _ => false,
+    }
+}
+
+pub fn redact_json_exact_secrets(value: &mut serde_json::Value, secrets: &[&str]) {
+    match value {
+        serde_json::Value::String(value) => {
+            *value = redact_exact_and_registered_secrets(value, secrets);
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_json_exact_secrets(value, secrets);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            let original = std::mem::take(values);
+            for (key, mut value) in original {
+                redact_json_exact_secrets(&mut value, secrets);
+                let key = redact_exact_and_registered_secrets(&key, secrets);
+                values.insert(key, value);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Derive command learning metadata without retaining the binary or literal argv.
 ///
 /// Learning stores use the digest only to distinguish observations. It is not
@@ -1301,12 +1419,136 @@ pub fn redact_exact_secrets(text: &str, secrets: &[&str]) -> String {
         .collect::<Vec<_>>();
     literals.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
     literals.dedup();
+    let marker = ["[REDACTED]", "[FILTERED]", "<hidden>", "***", ""]
+        .into_iter()
+        .find(|candidate| !literals.iter().any(|secret| candidate.contains(secret)))
+        .expect("empty exact-redaction marker is always safe");
     for secret in literals {
         if result.contains(secret) {
-            result = result.replace(secret, "[REDACTED]");
+            result = result.replace(secret, marker);
         }
     }
     result
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExactRedactionLimitExceeded;
+
+/// Boundary-safe exact-byte redaction for streamed output. The redactor keeps
+/// only the suffix that can still begin a configured literal, and enforces the
+/// limit on emitted bytes after replacement expansion.
+pub struct ExactSecretStreamRedactor {
+    secrets: Vec<Vec<u8>>,
+    marker: &'static [u8],
+    carry: Vec<u8>,
+    keep: usize,
+    received: usize,
+    emitted: usize,
+    limit: usize,
+}
+
+impl ExactSecretStreamRedactor {
+    pub fn new(secrets: impl IntoIterator<Item = Vec<u8>>, limit: usize) -> Self {
+        let mut secrets = secrets
+            .into_iter()
+            .filter(|secret| !secret.is_empty())
+            .collect::<Vec<_>>();
+        {
+            let registered = trusted_exact_secrets()
+                .read()
+                .expect("trusted exact-secret registry is not poisoned");
+            secrets.extend(
+                registered
+                    .iter()
+                    .filter(|secret| !secret.is_empty())
+                    .map(|secret| secret.as_bytes().to_vec()),
+            );
+        }
+        secrets.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+        secrets.dedup();
+        let marker = [
+            b"[REDACTED]".as_slice(),
+            b"[FILTERED]".as_slice(),
+            b"<hidden>".as_slice(),
+            b"***".as_slice(),
+            b"".as_slice(),
+        ]
+        .into_iter()
+        .find(|candidate| {
+            !secrets.iter().any(|secret| {
+                !secret.is_empty()
+                    && candidate
+                        .windows(secret.len())
+                        .any(|window| window == secret)
+            })
+        })
+        .expect("empty exact-redaction marker is always safe");
+        let keep = secrets
+            .iter()
+            .map(Vec::len)
+            .max()
+            .unwrap_or(1)
+            .saturating_sub(1);
+        Self {
+            secrets,
+            marker,
+            carry: Vec::new(),
+            keep,
+            received: 0,
+            emitted: 0,
+            limit,
+        }
+    }
+
+    pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<u8>, ExactRedactionLimitExceeded> {
+        self.received = self
+            .received
+            .checked_add(chunk.len())
+            .filter(|received| *received <= self.limit)
+            .ok_or(ExactRedactionLimitExceeded)?;
+        self.carry.extend_from_slice(chunk);
+        let safe_end = self.carry.len().saturating_sub(self.keep);
+        self.emit_through(safe_end)
+    }
+
+    pub fn finish(&mut self) -> Result<Vec<u8>, ExactRedactionLimitExceeded> {
+        self.emit_through(self.carry.len())
+    }
+
+    fn emit_through(&mut self, safe_end: usize) -> Result<Vec<u8>, ExactRedactionLimitExceeded> {
+        let mut output = Vec::new();
+        let mut position = 0;
+        while position < safe_end {
+            let (replacement, consumed) = if let Some(secret) = self
+                .secrets
+                .iter()
+                .find(|secret| self.carry[position..].starts_with(secret))
+            {
+                (self.marker, secret.len())
+            } else {
+                (&self.carry[position..position + 1], 1)
+            };
+            if self.emitted.saturating_add(replacement.len()) > self.limit {
+                return Err(ExactRedactionLimitExceeded);
+            }
+            output.extend_from_slice(replacement);
+            self.emitted += replacement.len();
+            position += consumed;
+        }
+        self.carry.drain(..position);
+        Ok(output)
+    }
+
+    pub fn redact_all(
+        secrets: impl IntoIterator<Item = Vec<u8>>,
+        bytes: &[u8],
+        limit: usize,
+    ) -> Result<Vec<u8>, ExactRedactionLimitExceeded> {
+        let mut redactor = Self::new(secrets, limit);
+        let mut output = redactor.push(bytes)?;
+        output.extend_from_slice(&redactor.finish()?);
+        Ok(output)
+    }
 }
 
 #[cfg(test)]
@@ -1328,6 +1570,75 @@ mod tests {
         assert_eq!(escaped, "x\\n[AUDIT] ALLOWED forged");
         assert!(!escaped.contains('\n'));
         assert!(!escaped.contains('\r'));
+    }
+
+    #[test]
+    fn trusted_exact_literals_redact_from_structured_argv_without_shape_heuristics() {
+        let value = ["z", "!"].concat();
+        let args = vec!["inspect".to_string(), value.clone()];
+        assert!(command_contains_exact_secrets(
+            "fixturectl",
+            &args,
+            &[value.as_str()]
+        ));
+        let rendered =
+            redact_command_line_with_exact_secrets("fixturectl", &args, &[value.as_str()]);
+        assert!(!rendered.contains(&value));
+        assert!(rendered.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn registered_exact_literals_redact_across_free_text_line_boundaries() {
+        let value = ["§", "\n", "¶"].concat();
+        register_trusted_exact_secrets(std::slice::from_ref(&value));
+        let rendered = redact_output_text(&format!("prefix {value} suffix"));
+        assert!(!rendered.contains(&value));
+        assert!(rendered.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn exact_stream_redaction_is_boundary_safe_and_bounds_expansion() {
+        let value = [b'z', b'!'];
+        let mut redactor = ExactSecretStreamRedactor::new(vec![value.to_vec()], 64);
+        let mut output = redactor.push(b"prefix z").unwrap();
+        output.extend_from_slice(&redactor.push(b"! suffix").unwrap());
+        output.extend_from_slice(&redactor.finish().unwrap());
+        assert!(!output.windows(value.len()).any(|window| window == value));
+
+        let repeated = value.repeat(4);
+        assert!(
+            ExactSecretStreamRedactor::redact_all(vec![value.to_vec()], &repeated, 8,).is_err()
+        );
+        assert!(ExactSecretStreamRedactor::redact_all(Vec::new(), &[b'x'; 9], 8).is_err());
+    }
+
+    #[test]
+    fn exact_stream_redaction_includes_registered_literals_without_explicit_copying() {
+        let value = ["registered", "-stream-fixture"].concat();
+        register_trusted_exact_secrets(std::slice::from_ref(&value));
+        let split = value.len() / 2;
+        let mut redactor = ExactSecretStreamRedactor::new(Vec::new(), 64);
+        let mut output = redactor.push(&value.as_bytes()[..split]).unwrap();
+        output.extend(redactor.push(&value.as_bytes()[split..]).unwrap());
+        output.extend(redactor.finish().unwrap());
+        assert_eq!(output, b"[REDACTED]");
+        assert!(!output
+            .windows(value.len())
+            .any(|window| window == value.as_bytes()));
+    }
+
+    #[test]
+    fn exact_redaction_marker_never_reintroduces_a_short_trusted_literal() {
+        let value = "A";
+        let text = redact_exact_secrets(value, &[value]);
+        assert!(!text.contains(value));
+        let streamed = ExactSecretStreamRedactor::redact_all(
+            vec![value.as_bytes().to_vec()],
+            value.as_bytes(),
+            64,
+        )
+        .unwrap();
+        assert!(!streamed.contains(&value.as_bytes()[0]));
     }
 
     #[test]

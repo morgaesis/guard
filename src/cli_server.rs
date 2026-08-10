@@ -1039,6 +1039,10 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
             if let Some(ref token) = auth_token {
                 redact_secrets.push(token.clone());
             }
+            if let Some(ref token) = admin_token {
+                redact_secrets.push(token.clone());
+            }
+            guard::redact::register_trusted_exact_secrets(&redact_secrets);
 
             let history_retention_secs =
                 resolve_history_retention(history_retention, guard_env("HISTORY_RETENTION_SECS"))?;
@@ -1517,6 +1521,12 @@ pub(crate) async fn run_server(cmd: ServerCommands) -> Result<()> {
                     .transpose()?
                     .unwrap_or(0);
                 let ca_pem = tls.ca_pem().to_string();
+                let upstream_redaction_values = upstream
+                    .response_secret_values()
+                    .into_iter()
+                    .filter_map(|value| String::from_utf8(value).ok())
+                    .collect::<Vec<_>>();
+                guard::redact::register_trusted_exact_secrets(&upstream_redaction_values);
                 let mut proxy = guard::proxy::ApiProxy::with_protocol(
                     protocol,
                     listen,
@@ -1912,6 +1922,12 @@ fn build_named_api_proxy(
     };
     let policy_contains_evaluate = policy.contains_evaluate();
     let policy_intent = policy.intent.clone();
+    let upstream_redaction_values = upstream
+        .response_secret_values()
+        .into_iter()
+        .filter_map(|value| String::from_utf8(value).ok())
+        .collect::<Vec<_>>();
+    guard::redact::register_trusted_exact_secrets(&upstream_redaction_values);
     let mut proxy = guard::proxy::ApiProxy::with_protocol(
         protocol,
         listen,

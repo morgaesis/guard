@@ -250,6 +250,8 @@ fn durable_store_coordinator(path: &Path) -> Result<Arc<RwLock<()>>> {
 }
 
 async fn acquire_durable_store_write_permit(path: &Path) -> Result<OwnedRwLockWriteGuard<()>> {
+    #[cfg(test)]
+    signal_durable_store_write_attempt(path);
     let permit = tokio::time::timeout(
         AUTHORITY_LOCK_TIMEOUT,
         durable_store_coordinator(path)?.write_owned(),
@@ -257,6 +259,35 @@ async fn acquire_durable_store_write_permit(path: &Path) -> Result<OwnedRwLockWr
     .await
     .map_err(|_| authority_lock_timeout("in-process"))?;
     Ok(permit)
+}
+
+#[cfg(test)]
+fn durable_store_write_attempt_hooks(
+) -> &'static std::sync::Mutex<BTreeMap<PathBuf, Arc<tokio::sync::Semaphore>>> {
+    static HOOKS: OnceLock<std::sync::Mutex<BTreeMap<PathBuf, Arc<tokio::sync::Semaphore>>>> =
+        OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn observe_durable_store_write_attempt(path: &Path) -> Arc<tokio::sync::Semaphore> {
+    let signal = Arc::new(tokio::sync::Semaphore::new(0));
+    durable_store_write_attempt_hooks()
+        .lock()
+        .expect("durable-store attempt hook lock")
+        .insert(path.to_path_buf(), signal.clone());
+    signal
+}
+
+#[cfg(test)]
+fn signal_durable_store_write_attempt(path: &Path) {
+    if let Some(signal) = durable_store_write_attempt_hooks()
+        .lock()
+        .expect("durable-store attempt hook lock")
+        .remove(path)
+    {
+        signal.add_permits(1);
+    }
 }
 
 async fn acquire_durable_store_read_permit(path: &Path) -> Result<OwnedRwLockReadGuard<()>> {
@@ -4607,6 +4638,7 @@ mod tests {
         };
         acquired.wait();
 
+        let attempted = observe_durable_store_write_attempt(&config.path);
         let mutation_store = store.clone();
         let mutation = tokio::spawn(async move {
             run_async_durable_store_operation(
@@ -4625,12 +4657,8 @@ mod tests {
             .await
         });
 
-        tokio::time::timeout(std::time::Duration::from_millis(250), async {
-            tokio::task::yield_now().await;
-            assert_eq!(store.read().await.rule_count(), 0);
-        })
-        .await
-        .expect("runtime and unrelated store readers remain responsive");
+        attempted.acquire().await.unwrap().forget();
+        assert_eq!(store.read().await.rule_count(), 0);
 
         release.wait();
         assert!(mutation.await.unwrap().unwrap().is_some());
@@ -4671,9 +4699,11 @@ mod tests {
             .await
             .unwrap();
 
+        let attempted = observe_durable_store_write_attempt(&config.path);
         let second_store = store.clone();
+        let (second_result_tx, mut second_result_rx) = tokio::sync::oneshot::channel();
         let second = tokio::spawn(async move {
-            run_async_durable_store_operation(
+            let result = run_async_durable_store_operation(
                 &second_store,
                 "second coordinated observation",
                 |candidate| {
@@ -4686,16 +4716,24 @@ mod tests {
                     )
                 },
             )
-            .await
+            .await;
+            let _ = second_result_tx.send(result);
         });
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        assert!(!second.is_finished());
+        attempted.acquire().await.unwrap().forget();
+        assert!(matches!(
+            second_result_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
         tokio::task::spawn_blocking(move || release.wait())
             .await
             .unwrap();
 
         assert_eq!(first.await.unwrap().unwrap().unwrap().approvals, 1);
-        assert_eq!(second.await.unwrap().unwrap().unwrap().approvals, 2);
+        assert_eq!(
+            second_result_rx.await.unwrap().unwrap().unwrap().approvals,
+            2
+        );
+        second.await.unwrap();
         let loaded = LearnedRuleStore::load(config).unwrap();
         assert_eq!(
             loaded.data.observations.values().next().unwrap().approvals,
@@ -4738,12 +4776,11 @@ mod tests {
             .unwrap();
         first.abort();
 
+        let attempted = observe_durable_store_write_attempt(&config.path);
         let second_store = store.clone();
-        let second_started = Arc::new(tokio::sync::Semaphore::new(0));
-        let started = second_started.clone();
+        let (result_tx, mut result_rx) = tokio::sync::oneshot::channel();
         let second = tokio::spawn(async move {
-            started.add_permits(1);
-            run_async_durable_store_operation(
+            let result = run_async_durable_store_operation(
                 &second_store,
                 "successor coordinated observation",
                 |candidate| {
@@ -4756,15 +4793,20 @@ mod tests {
                     )
                 },
             )
-            .await
+            .await;
+            let _ = result_tx.send(result);
         });
-        second_started.acquire().await.unwrap().forget();
-        assert!(!second.is_finished());
+        attempted.acquire().await.unwrap().forget();
+        assert!(matches!(
+            result_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
         tokio::task::spawn_blocking(move || release.wait())
             .await
             .unwrap();
 
-        assert_eq!(second.await.unwrap().unwrap().unwrap().approvals, 2);
+        assert_eq!(result_rx.await.unwrap().unwrap().unwrap().approvals, 2);
+        second.await.unwrap();
         let loaded = LearnedRuleStore::load(config).unwrap();
         assert_eq!(
             loaded.data.observations.values().next().unwrap().approvals,

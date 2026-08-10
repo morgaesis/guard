@@ -2544,7 +2544,12 @@ fn generated_authority_contains_sensitive_literal(verb: &Verb) -> bool {
                     })
             })
             || cell.provenance.as_ref().is_some_and(|provenance| {
-                text_contains_sensitive_literals(&provenance.regime_stamp)
+                text_contains_sensitive_literals(&provenance.source)
+                    || provenance
+                        .evidence
+                        .iter()
+                        .any(|evidence| text_contains_sensitive_literals(evidence))
+                    || text_contains_sensitive_literals(&provenance.regime_stamp)
                     || text_contains_sensitive_literals(&provenance.prompt_stamp)
                     || text_contains_sensitive_literals(&provenance.model_stamp)
                     || provenance
@@ -2628,6 +2633,12 @@ pub fn normalize_generated_access_verb(mut verb: Verb) -> Result<Verb> {
     if generated_authority_contains_sensitive_literal(&verb) {
         bail!(
             "generated access coverage contains sensitive authority metadata or literal argv and cannot be persisted"
+        );
+    }
+    sanitize_synthesized_verb_prose(&mut verb);
+    if generated_authority_contains_sensitive_literal(&verb) {
+        bail!(
+            "generated access coverage is not in canonical secret-free form and cannot be persisted"
         );
     }
     verb.description = generated_access_description(&verb);
@@ -5526,7 +5537,7 @@ verbs:
     #[test]
     fn generated_access_rejects_sensitive_provenance_stamps() {
         let value = ["q", "7"].concat();
-        for stamp in ["regime", "prompt", "model"] {
+        for stamp in ["source", "evidence", "regime", "prompt", "model"] {
             let mut verb = synth_verb("fixturectl", None, false, "access-generated-fixture");
             verb.baseline = false;
             verb.args = args_vec(&["status"]);
@@ -5547,8 +5558,15 @@ verbs:
                 override_marker: None,
                 sticky: false,
                 provenance: Some(CoverageProvenance {
-                    source: "fixture".to_string(),
-                    evidence: Vec::new(),
+                    source: if stamp == "source" {
+                        format!("password={value}")
+                    } else {
+                        "fixture".to_string()
+                    },
+                    evidence: (stamp == "evidence")
+                        .then(|| format!("password={value}"))
+                        .into_iter()
+                        .collect(),
                     regime_stamp: if stamp == "regime" {
                         format!("password={value}")
                     } else {

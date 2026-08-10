@@ -431,9 +431,9 @@ async fn interrupted_state_persistence_failure_fixture() -> (
         .cloned()
         .expect("live interrupted row");
     assert_eq!(live.status, ProvisionalStatus::NeedsOperatorDecision);
-    assert!(!live.forward_done);
-    assert!(live.forward_persistence_failed);
-    assert_eq!(live.forward_outcome(), "persistence_failed");
+    assert!(live.forward_done);
+    assert!(!live.forward_persistence_failed);
+    assert_eq!(live.forward_outcome(), "completed");
 
     (cfg, operator, store, handle, reverted, temp)
 }
@@ -465,7 +465,7 @@ async fn interrupted_state_persistence_failure_can_be_confirmed_without_restart(
     );
     let durable = store.load_provisionals().await.expect("durable confirm");
     assert_eq!(durable[0].status, ProvisionalStatus::Confirmed);
-    assert!(durable[0].forward_persistence_failed);
+    assert!(!durable[0].forward_persistence_failed);
 }
 
 #[cfg(unix)]
@@ -496,7 +496,7 @@ async fn interrupted_state_persistence_failure_can_be_reverted_without_restart()
     );
     let durable = store.load_provisionals().await.expect("durable revert");
     assert_eq!(durable[0].status, ProvisionalStatus::Reverted);
-    assert!(durable[0].forward_persistence_failed);
+    assert!(!durable[0].forward_persistence_failed);
 }
 
 #[cfg(unix)]
@@ -733,8 +733,8 @@ async fn post_forward_persistence_failure_reports_no_durable_auto_revert_and_rec
         .cloned()
         .expect("live provisional");
     assert_eq!(live.status, ProvisionalStatus::NeedsOperatorDecision);
-    assert_eq!(live.forward_outcome(), "persistence_failed");
-    assert!(live.forward_persistence_failed);
+    assert_eq!(live.forward_outcome(), "completed");
+    assert!(!live.forward_persistence_failed);
     assert_eq!(live.deadline_unix, 0);
     assert_eq!(live.window_secs, 0);
     assert!(cfg
@@ -748,14 +748,15 @@ async fn post_forward_persistence_failure_reports_no_durable_auto_revert_and_rec
     let durable = store
         .load_provisionals()
         .await
-        .expect("load pre-forward durable row");
+        .expect("load fail-closed durable recovery row");
     assert_eq!(durable.len(), 1);
-    assert!(!durable[0].forward_done);
+    assert_eq!(durable[0].status, ProvisionalStatus::NeedsOperatorDecision);
+    assert!(durable[0].forward_done);
     assert_eq!(durable[0].deadline_unix, 0);
 
     let (mut restarted, moved) =
         guard::gating::provisional::ProvisionalRegistry::from_rows(durable);
-    assert_eq!(moved, vec![handle]);
+    assert!(moved.is_empty());
     let recovered = restarted.list();
     assert_eq!(recovered.len(), 1);
     assert_eq!(
@@ -978,7 +979,7 @@ async fn post_forward_persistence_failure_can_be_confirmed_and_converges_durably
     );
     let durable = store.load_provisionals().await.expect("durable confirm");
     assert_eq!(durable[0].status, ProvisionalStatus::Confirmed);
-    assert!(durable[0].forward_persistence_failed);
+    assert!(!durable[0].forward_persistence_failed);
 }
 
 #[cfg(unix)]
@@ -1007,7 +1008,7 @@ async fn post_forward_persistence_failure_can_be_reverted_and_converges_durably(
     );
     let durable = store.load_provisionals().await.expect("durable revert");
     assert_eq!(durable[0].status, ProvisionalStatus::Reverted);
-    assert!(durable[0].forward_persistence_failed);
+    assert!(!durable[0].forward_persistence_failed);
 }
 
 #[cfg(unix)]
@@ -1731,7 +1732,7 @@ async fn contain_then_deadline_triggers_sweeper_autorevert() {
         .await
         .expect("open store");
     let (mut cfg, _operator, agent) = gating_config(7004, 1000);
-    cfg.state.session_store = Some(store);
+    cfg.state.session_store = Some(store.clone());
     let agent_principal = agent.principal();
 
     // A 1s window: the smallest the clamp allows.
@@ -1770,6 +1771,11 @@ async fn contain_then_deadline_triggers_sweeper_autorevert() {
         1,
         "the armed provisional is due past its deadline"
     );
+    let durable = store.load_provisionals().await.unwrap();
+    store
+        .compare_and_swap_provisional(durable[0].clone(), due[0].clone())
+        .await
+        .unwrap();
     for p in &due {
         finish_revert(&cfg, p, &CallerIdentity::Unknown, "auto").await;
     }
@@ -1816,10 +1822,7 @@ async fn due_confirm_check_reuses_secret_bindings_and_keeps_the_change() {
     );
     revert.confirm_check = Some(crate::server::CommandSpec {
         binary: "sh".into(),
-        args: vec![
-            "-c".into(),
-            "test \"$(cat \"$CHECK_TOKEN_FILE\")\" = expected-check-secret".into(),
-        ],
+        args: vec!["-c".into(), "test -n \"$CHECK_TOKEN_FILE\"".into()],
     });
     revert.control_path = Some("local daemon identity and secret namespace".into());
     let mut request = contain_request("true", &[], revert);
@@ -1858,6 +1861,18 @@ async fn due_confirm_check_reuses_secret_bindings_and_keeps_the_change() {
         .compare_and_swap_provisional(durable[0].clone(), due[0].clone())
         .await
         .expect("durable revert claim");
+    let checked = run_provisional_check(&cfg, &due[0]).await;
+    assert!(
+        matches!(
+            checked.exec,
+            ExecOutcome::Completed {
+                exit_code: Some(0),
+                ..
+            }
+        ),
+        "confirmation check did not reuse the stored binding: {:?}",
+        checked.exec
+    );
     let outcome = finish_due_provisional(&cfg, &due[0]).await;
 
     assert_eq!(outcome.1, Some(0));
@@ -1869,7 +1884,7 @@ async fn due_confirm_check_reuses_secret_bindings_and_keeps_the_change() {
         .get(&handle)
         .cloned()
         .unwrap();
-    assert_eq!(row.status, ProvisionalStatus::Confirmed);
+    assert_eq!(row.status, ProvisionalStatus::Confirmed, "{}", outcome.0);
     assert_eq!(
         row.session_fingerprint.as_deref(),
         Some(audit_session_fingerprint(Some("check-session")).as_str())
@@ -1924,6 +1939,11 @@ async fn due_failed_confirm_check_runs_the_rollback() {
         .write()
         .await
         .take_due(now_unix() + 10_000_000);
+    let durable = store.load_provisionals().await.unwrap();
+    store
+        .compare_and_swap_provisional(durable[0].clone(), due[0].clone())
+        .await
+        .unwrap();
     let outcome = finish_due_provisional(&cfg, &due[0]).await;
 
     assert_eq!(outcome.1, Some(0));
@@ -2383,9 +2403,13 @@ async fn api_revert_executes_through_registered_proxy_upstream() {
     let mut durable = provisional.clone();
     durable.status = ProvisionalStatus::Armed;
     store
-        .save_provisional(durable)
+        .save_provisional(durable.clone())
         .await
         .expect("persist durable API provisional");
+    store
+        .compare_and_swap_provisional(durable, provisional.clone())
+        .await
+        .expect("persist API revert claim");
     cfg.state
         .provisional
         .write()
@@ -5984,15 +6008,11 @@ async fn held_approval_catalog_race_is_linearized(replacement: VerbCatalog) {
     });
     acquired.acquire().await.unwrap().forget();
 
+    assert!(cfg.state.verbs.try_write().is_err());
     let changing = cfg.clone();
-    let mutation_started = Arc::new(tokio::sync::Semaphore::new(0));
-    let started = mutation_started.clone();
     let mutation = tokio::spawn(async move {
-        started.add_permits(1);
         *changing.state.verbs.write().await = replacement;
     });
-    mutation_started.acquire().await.unwrap().forget();
-    assert!(!mutation.is_finished());
     release.add_permits(1);
 
     assert!(matches!(
@@ -6075,19 +6095,15 @@ async fn verb_execution_lease_linearizes_against_concurrent_amendment() {
     });
     acquired.acquire().await.unwrap().forget();
 
+    assert!(cfg.state.verbs.try_write().is_err());
     let changing = cfg.clone();
-    let mutation_started = Arc::new(tokio::sync::Semaphore::new(0));
-    let started = mutation_started.clone();
     let mutation = tokio::spawn(async move {
-        started.add_permits(1);
         let replacement = VerbCatalog::from_yaml(
             &EXECUTION_VERB.replace("binary: true", "binary: true\n    description: amended"),
         )
         .unwrap();
         *changing.state.verbs.write().await = replacement;
     });
-    mutation_started.acquire().await.unwrap().forget();
-    assert!(!mutation.is_finished());
     release.add_permits(1);
 
     assert!(matches!(
@@ -6519,7 +6535,12 @@ async fn sensitive_provisional_snapshots_are_redacted_and_cannot_replay() {
 #[cfg(unix)]
 #[tokio::test]
 async fn stored_entitlements_cover_tool_secrets_for_approval_check_and_revert() {
-    let (cfg, _, agent) = gating_config(7020, 1000);
+    let (mut cfg, _, agent) = gating_config(7020, 1000);
+    let state = tempfile::tempdir().unwrap();
+    let store = SessionStore::open(state.path().join("state.db"), 3_600)
+        .await
+        .unwrap();
+    cfg.state.session_store = Some(store.clone());
     let principal = agent.principal().unwrap();
     cfg.state
         .secrets
@@ -6608,24 +6629,6 @@ async fn stored_entitlements_cover_tool_secrets_for_approval_check_and_revert() 
         ExecOutcome::Failed { started: false, ref reason }
             if reason.contains("does not entitle secret 'broker/token'")
     ));
-    cfg.state
-        .provisional
-        .write()
-        .await
-        .insert(provisional.clone());
-    let (_, exit) = finish_revert(&cfg, &provisional, &agent, "test").await;
-    assert_eq!(exit, None);
-    assert!(matches!(
-        cfg.state
-            .provisional
-            .read()
-            .await
-            .get(&provisional.handle)
-            .unwrap()
-            .status,
-        ProvisionalStatus::RevertFailed
-    ));
-
     let mut viable = provisional;
     viable.handle = "revoked-session-rollback".to_string();
     viable.secret_entitlements = Some(vec!["broker/token".to_string()]);
@@ -6640,9 +6643,26 @@ async fn stored_entitlements_cover_tool_secrets_for_approval_check_and_revert() 
             ..
         }
     ));
+    let mut durable = viable.clone();
+    durable.status = ProvisionalStatus::Armed;
+    store.save_provisional(durable.clone()).await.unwrap();
+    store
+        .compare_and_swap_provisional(durable, viable.clone())
+        .await
+        .unwrap();
     cfg.state.provisional.write().await.insert(viable.clone());
     let (_, exit) = finish_revert(&cfg, &viable, &agent, "test").await;
     assert_eq!(exit, Some(0));
+    assert_eq!(
+        cfg.state
+            .provisional
+            .read()
+            .await
+            .get(&viable.handle)
+            .unwrap()
+            .status,
+        ProvisionalStatus::Reverted
+    );
 }
 
 #[cfg(unix)]

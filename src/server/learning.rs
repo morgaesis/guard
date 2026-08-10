@@ -139,11 +139,15 @@ pub(super) async fn amend_session_exact_rule(
 ) -> Result<bool> {
     let sessions = server.state.sessions.clone();
     let session_store = server.state.session_store.clone();
+    #[cfg(test)]
+    let transition_attempt_events = server.state.session_transition_attempt_events.clone();
     let token = token.to_string();
     tokio::spawn(async move {
         // The detached task owns live coordination through staging, durable
         // commit, and publication. Cancellation cannot expose an uncommitted
         // rule or let a successor overtake a committed amendment.
+        #[cfg(test)]
+        transition_attempt_events.add_permits(1);
         let mut live = sessions.write_owned().await;
         let mut staged = live.clone();
         let amended = staged

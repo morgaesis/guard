@@ -246,6 +246,26 @@ impl Serialize for AuditEvent {
 }
 
 impl AuditEvent {
+    pub fn redact_exact_secrets(mut self, secrets: &[&str]) -> Self {
+        fn redact(value: &mut Option<String>, secrets: &[&str]) {
+            if let Some(value) = value {
+                *value = crate::redact::redact_exact_and_registered_secrets(value, secrets);
+            }
+        }
+        redact(&mut self.handle, secrets);
+        redact(&mut self.caller, secrets);
+        redact(&mut self.session_fingerprint, secrets);
+        redact(&mut self.cwd, secrets);
+        redact(&mut self.cmd, secrets);
+        redact(&mut self.reason, secrets);
+        redact(&mut self.decision_source, secrets);
+        for (key, value) in &mut self.fields {
+            *key = crate::redact::redact_exact_and_registered_secrets(key, secrets);
+            *value = crate::redact::redact_exact_and_registered_secrets(value, secrets);
+        }
+        self
+    }
+
     pub fn new(kind: AuditKind) -> Self {
         Self {
             kind,
@@ -367,7 +387,7 @@ fn redact_secret_exposure(event: &AuditEvent) -> AuditEvent {
             .map(|(key, value)| (key, crate::redact::redact_output_text(&value)))
             .collect();
     }
-    redacted
+    redacted.redact_exact_secrets(&[])
 }
 
 fn push_field(line: &mut String, key: &str, value: &str, quoted: bool) {
@@ -807,6 +827,20 @@ mod tests {
             .session_fingerprint("none")
             .cmd(format!("echo {n}"))
             .reason("test allow")
+    }
+
+    #[test]
+    fn central_audit_projection_redacts_registered_exact_literals_in_all_fields() {
+        let value = ["audit", "-exact-fixture"].concat();
+        crate::redact::register_trusted_exact_secrets(std::slice::from_ref(&value));
+        let event = AuditEvent::new(AuditKind::Denied)
+            .handle(format!("handle-{value}"))
+            .caller(format!("caller-{value}"))
+            .field(format!("key-{value}"), format!("value-{value}"));
+        let redacted = redact_secret_exposure(&event);
+        let serialized = serde_json::to_string(&redacted).unwrap();
+        assert!(!serialized.contains(&value));
+        assert!(!redacted.render_line().contains(&value));
     }
 
     #[test]

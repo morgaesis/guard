@@ -52,6 +52,7 @@ use super::protocol::ProtocolConfig;
 use super::tls::ProxyTls;
 use super::upstream::Upstream;
 use crate::gating::{decide_gate, GateOutcome};
+use crate::redact::ExactSecretStreamRedactor as ExactSecretRedactor;
 
 /// Cap on a forwarded request body. Manifests are small; this bounds memory by
 /// rejecting an oversized request body.
@@ -64,8 +65,6 @@ const UPSTREAM_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 /// How often the policy file is checked for changes (the operator "slow
 /// clock"). The default for [`ApiProxy::with_policy_reload_interval`].
 const POLICY_RELOAD_SECS: u64 = 5;
-
-const RESPONSE_REDACTION_MARKER: &[u8] = b"[REDACTED]";
 
 type ProxyBody = BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
 type ReqwestByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + Sync>>;
@@ -101,69 +100,6 @@ struct SessionAuth {
     context: ApiSessionContext,
 }
 
-struct ExactSecretRedactor {
-    secrets: Vec<Vec<u8>>,
-    carry: Vec<u8>,
-    keep: usize,
-}
-
-impl ExactSecretRedactor {
-    fn new(mut secrets: Vec<Vec<u8>>) -> Self {
-        secrets.retain(|secret| !secret.is_empty());
-        secrets.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
-        secrets.dedup();
-        let keep = secrets
-            .iter()
-            .map(Vec::len)
-            .max()
-            .unwrap_or(1)
-            .saturating_sub(1);
-        Self {
-            secrets,
-            carry: Vec::new(),
-            keep,
-        }
-    }
-
-    fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
-        self.carry.extend_from_slice(chunk);
-        let safe_end = self.carry.len().saturating_sub(self.keep);
-        self.emit_through(safe_end)
-    }
-
-    fn finish(&mut self) -> Vec<u8> {
-        let end = self.carry.len();
-        self.emit_through(end)
-    }
-
-    fn emit_through(&mut self, safe_end: usize) -> Vec<u8> {
-        let mut output = Vec::new();
-        let mut position = 0;
-        while position < safe_end {
-            if let Some(secret) = self
-                .secrets
-                .iter()
-                .find(|secret| self.carry[position..].starts_with(secret))
-            {
-                output.extend_from_slice(RESPONSE_REDACTION_MARKER);
-                position += secret.len();
-            } else {
-                output.push(self.carry[position]);
-                position += 1;
-            }
-        }
-        self.carry.drain(..position);
-        output
-    }
-
-    fn redact_all(secrets: Vec<Vec<u8>>, bytes: &[u8]) -> Bytes {
-        let mut redactor = Self::new(secrets);
-        let mut output = redactor.push(bytes);
-        output.extend_from_slice(&redactor.finish());
-        Bytes::from(output)
-    }
-}
-
 /// A configured API proxy: TLS identity, upstream connection, the attached
 /// protocol plug-in, and the hot-reloaded operator policy. Hosted by the daemon
 /// alongside the gate socket.
@@ -181,14 +117,6 @@ pub struct ApiProxy {
     /// swaps mark the generation odd for their short transition, then publish
     /// the next even value. Routes bind an even generation plus policy digest.
     authority_revision: AtomicU64,
-    /// Mutations hold the shared side through their finite upstream header
-    /// handoff. Reload first acquires the exclusive side, then uses only
-    /// nonblocking acquisition for the read gate and policy snapshot.
-    mutation_authority_gate: RwLock<()>,
-    /// Read-only requests retain policy authority through response headers on
-    /// a separate lock, so they do not queue behind a reload waiting for a
-    /// stalled mutation.
-    read_authority_gate: RwLock<()>,
     /// Bridge to the daemon's consequence machinery, attached before serving.
     /// When present, recoverable writes are wrapped in an auto-revert envelope.
     gate: OnceLock<Arc<dyn GateSink>>,
@@ -204,9 +132,6 @@ pub struct ApiProxy {
     /// contained rather than an untracked delete. Entries are scoped to the
     /// creating connection and removed when their revert resolves.
     created: Mutex<CreatedRegistry>,
-    /// Revocable cleanup provenance. Readers cover only the final validation
-    /// and upstream header handoff; resolution takes the writer side first.
-    created_authority: RwLock<()>,
     observations: Mutex<ObservationRegistry>,
     /// Monotonic per-connection id, assigned in the accept loop, so a created
     /// resource's provenance is scoped to the connection that created it.
@@ -280,7 +205,10 @@ enum UpstreamBodyError {
     TooLarge,
 }
 
-struct UpstreamSendHandoff {
+struct UpstreamSendHandoff<'a> {
+    proxy: &'a ApiProxy,
+    route_authority: RouteAuthority,
+    operation: Option<ApiOp>,
     request: Option<reqwest::RequestBuilder>,
     timeout: Duration,
     outcome: UpstreamHandoffOutcome,
@@ -498,7 +426,7 @@ impl Drop for ContainmentLifecycle {
 }
 
 #[async_trait::async_trait]
-impl ApiForwardHandoff for UpstreamSendHandoff {
+impl ApiForwardHandoff for UpstreamSendHandoff<'_> {
     async fn forward(&mut self) -> Result<(), String> {
         if self
             .authorized_body_sha256
@@ -507,6 +435,18 @@ impl ApiForwardHandoff for UpstreamSendHandoff {
         {
             return Err("final request bytes changed after authorization".to_string());
         }
+        if self
+            .proxy
+            .recheck_final_authority(&self.route_authority, self.operation.as_ref())
+            .await
+            .is_some()
+        {
+            return Err("policy authority changed before upstream handoff".to_string());
+        }
+        // This exact generation comparison is the finite authorization
+        // linearization point. No registry guard crosses the bounded network
+        // handoff; response-derived authority is revalidated again before it
+        // is published locally.
         let request = self
             .request
             .take()
@@ -582,10 +522,6 @@ struct CreatedRegistryHandoff<'a> {
 impl ApiForwardHandoff for CreatedRegistryHandoff<'_> {
     async fn forward(&mut self) -> Result<(), String> {
         let created = self.created;
-        let lease =
-            tokio::time::timeout(Duration::from_secs(5), self.proxy.created_authority.read())
-                .await
-                .map_err(|_| "created-resource cleanup authority lock timed out".to_string())?;
         let current = self
             .proxy
             .created
@@ -606,9 +542,21 @@ impl ApiForwardHandoff for CreatedRegistryHandoff<'_> {
                 &current.create_provenance,
             )
             .await?;
-        let result = self.upstream.forward().await;
-        drop(lease);
-        result
+        let still_current = self
+            .proxy
+            .created
+            .lock()
+            .unwrap()
+            .find_record(&created.key)
+            .is_some_and(|record| {
+                record.handle == created.handle
+                    && record.resource_uid == created.resource_uid
+                    && record.create_provenance == created.create_provenance
+            });
+        if !still_current {
+            return Err("created-resource cleanup authority was revoked".to_string());
+        }
+        self.upstream.forward().await
     }
 }
 
@@ -838,6 +786,16 @@ impl CreatedRegistry {
 }
 
 impl ApiProxy {
+    fn redact_upstream_bytes(
+        &self,
+        secrets: Vec<Vec<u8>>,
+        bytes: &[u8],
+    ) -> Result<Bytes, UpstreamBodyError> {
+        ExactSecretRedactor::redact_all(secrets, bytes, self.upstream_body_limit)
+            .map(Bytes::from)
+            .map_err(|_| UpstreamBodyError::TooLarge)
+    }
+
     async fn read_upstream_body(
         &self,
         mut response: reqwest::Response,
@@ -922,13 +880,10 @@ impl ApiProxy {
             policy: Arc::new(RwLock::new(policy)),
             policy_path,
             authority_revision: AtomicU64::new(0),
-            mutation_authority_gate: RwLock::new(()),
-            read_authority_gate: RwLock::new(()),
             gate: OnceLock::new(),
             judge: StdRwLock::new(None),
             judge_builder: OnceLock::new(),
             created: Mutex::new(CreatedRegistry::default()),
-            created_authority: RwLock::new(()),
             observations: Mutex::new(ObservationRegistry::default()),
             next_conn: AtomicU64::new(1),
             rarity: RarityTracker::new(0),
@@ -1041,13 +996,7 @@ impl ApiProxy {
     /// proxy-armed create-revert is confirmed or reverted, so a create record
     /// cannot outlive the revert window it was tied to.
     pub async fn forget_created_by_handle(&self, handle: &str) -> bool {
-        let Ok(lease) =
-            tokio::time::timeout(Duration::from_secs(5), self.created_authority.write()).await
-        else {
-            return false;
-        };
         self.created.lock().unwrap().forget_by_handle(handle);
-        drop(lease);
         true
     }
 
@@ -2540,34 +2489,10 @@ impl ApiProxy {
             rb = rb.body(body);
         }
 
-        let mutating = op
-            .as_ref()
-            .is_some_and(|operation| !operation.is_read() && !operation.dry_run);
-        let policy_authority = if mutating {
-            tokio::time::timeout(Duration::from_secs(5), self.mutation_authority_gate.read()).await
-        } else {
-            tokio::time::timeout(Duration::from_secs(5), self.read_authority_gate.read()).await
-        };
-        let policy_authority = match policy_authority {
-            Ok(guard) => guard,
-            Err(_) => {
-                if let Some(staged) = containment.take() {
-                    if !staged.cancel_inert().await {
-                        return Ok(self.staged_cleanup_failure_response());
-                    }
-                }
-                return Ok(self.status_resp(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "guard api-proxy: policy authority lock timed out",
-                    "Timeout",
-                ));
-            }
-        };
         if let Some(response) = self
             .recheck_final_authority(&route_authority, op.as_ref())
             .await
         {
-            drop(policy_authority);
             if let Some(staged) = containment.take() {
                 if !staged.cancel_inert().await {
                     return Ok(self.staged_cleanup_failure_response());
@@ -2600,6 +2525,9 @@ impl ApiProxy {
         // coverage authority, then session authority. The bundle lives only
         // through the bounded response-header handoff.
         let mut upstream_handoff = UpstreamSendHandoff {
+            proxy: self,
+            route_authority: route_authority.clone(),
+            operation: op.clone(),
             request: Some(rb),
             timeout: self.upstream_handoff_timeout,
             outcome: UpstreamHandoffOutcome::Pending,
@@ -2633,7 +2561,6 @@ impl ApiProxy {
             &mut upstream_handoff.outcome,
             UpstreamHandoffOutcome::Pending,
         );
-        drop(policy_authority);
         let (upstream_resp, mut containment) = match upstream_outcome {
             UpstreamHandoffOutcome::Pending => {
                 if let Some(containment) = containment {
@@ -2789,13 +2716,18 @@ impl ApiProxy {
                                 .as_ref()
                                 .expect("created containment has a verified UID")
                                 .clone();
-                            self.created.lock().unwrap().remember(
-                                key,
-                                handle.clone(),
-                                uid,
-                                create_provenance
-                                    .expect("created containment has canonical provenance"),
-                            );
+                            if self
+                                .publication_authority_is_current(&route_authority, op.as_ref())
+                                .await
+                            {
+                                self.created.lock().unwrap().remember(
+                                    key,
+                                    handle.clone(),
+                                    uid,
+                                    create_provenance
+                                        .expect("created containment has canonical provenance"),
+                                );
+                            }
                         }
                         provisional_handle = Some(handle);
                         containment_active = true;
@@ -2919,7 +2851,13 @@ impl ApiProxy {
                 }
                 let _ = self.forget_created_by_handle(&created.handle).await;
             }
-            let bytes = ExactSecretRedactor::redact_all(response_secrets, &bytes);
+            let bytes = self
+                .redact_upstream_bytes(response_secrets, &bytes)
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "contained cleanup response exceeded the byte limit after redaction"
+                    )
+                })?;
             return Ok(builder
                 .body(full_body(bytes))
                 .expect("build contained cleanup response"));
@@ -2937,7 +2875,13 @@ impl ApiProxy {
                     .map_err(|_| {
                         anyhow::anyhow!("read Secret error response failed or timed out")
                     })?;
-                let bytes = ExactSecretRedactor::redact_all(response_secrets, &bytes);
+                let bytes = self
+                    .redact_upstream_bytes(response_secrets, &bytes)
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "Secret error response exceeded the byte limit after redaction"
+                        )
+                    })?;
                 return Ok(builder
                     .body(full_body(bytes))
                     .expect("build Secret error response"));
@@ -2970,7 +2914,11 @@ impl ApiProxy {
             let n = self.protocol.redact_response(&mut value);
             tracing::info!(target: "guard::apiproxy", "redacted {n} Secret object(s) on {path}");
             let out = serde_json::to_vec(&value).context("re-serialize redacted Secret")?;
-            let out = ExactSecretRedactor::redact_all(response_secrets, &out);
+            let out = self
+                .redact_upstream_bytes(response_secrets, &out)
+                .map_err(|_| {
+                    anyhow::anyhow!("Secret response exceeded the byte limit after redaction")
+                })?;
             return Ok(builder
                 .body(full_body(out))
                 .expect("build redacted response"));
@@ -3018,7 +2966,12 @@ impl ApiProxy {
             if status.is_success() {
                 if let Some(o) = op.as_ref() {
                     if let Some(context) = session_context.as_ref() {
-                        self.remember_kubernetes_observation(o, &bytes, context);
+                        if self
+                            .publication_authority_is_current(&route_authority, Some(o))
+                            .await
+                        {
+                            self.remember_kubernetes_observation(o, &bytes, context);
+                        }
                     }
                 }
             }
@@ -3036,7 +2989,11 @@ impl ApiProxy {
                     .header("x-guard-provisional", &handle)
                     .header(hyper::header::WARNING, warning);
             }
-            let bytes = ExactSecretRedactor::redact_all(response_secrets, &bytes);
+            let bytes = self
+                .redact_upstream_bytes(response_secrets, &bytes)
+                .map_err(|_| {
+                    anyhow::anyhow!("mutation response exceeded the byte limit after redaction")
+                })?;
             return Ok(builder
                 .body(full_body(bytes))
                 .expect("build write response"));
@@ -3060,9 +3017,18 @@ impl ApiProxy {
                     anyhow::anyhow!("read Kubernetes object response failed or timed out")
                 })?;
             if let (Some(operation), Some(context)) = (op.as_ref(), session_context.as_ref()) {
-                self.remember_kubernetes_observation(operation, &bytes, context);
+                if self
+                    .publication_authority_is_current(&route_authority, Some(operation))
+                    .await
+                {
+                    self.remember_kubernetes_observation(operation, &bytes, context);
+                }
             }
-            let bytes = ExactSecretRedactor::redact_all(response_secrets, &bytes);
+            let bytes = self
+                .redact_upstream_bytes(response_secrets, &bytes)
+                .map_err(|_| {
+                    anyhow::anyhow!("object response exceeded the byte limit after redaction")
+                })?;
             return Ok(builder
                 .body(full_body(bytes))
                 .expect("build observed object response"));
@@ -3074,19 +3040,27 @@ impl ApiProxy {
             .take()
             .ok_or_else(|| anyhow::anyhow!("upstream response body was already consumed"))?;
         let source: ReqwestByteStream = Box::pin(upstream_resp.bytes_stream());
-        let redactor = ExactSecretRedactor::new(response_secrets);
+        let redactor = ExactSecretRedactor::new(response_secrets, self.upstream_body_limit);
         let stream = futures::stream::try_unfold(
             (source, redactor, false),
             |(mut source, mut redactor, finished)| async move {
                 if finished {
-                    return Ok::<Option<(Frame<Bytes>, RedactingStreamState)>, reqwest::Error>(
-                        None,
-                    );
+                    return Ok::<
+                        Option<(Frame<Bytes>, RedactingStreamState)>,
+                        Box<dyn std::error::Error + Send + Sync>,
+                    >(None);
                 }
                 loop {
-                    match source.as_mut().try_next().await? {
+                    match source.as_mut().try_next().await.map_err(|error| {
+                        Box::new(error) as Box<dyn std::error::Error + Send + Sync>
+                    })? {
                         Some(chunk) => {
-                            let output = redactor.push(&chunk);
+                            let output = redactor.push(&chunk).map_err(|_| {
+                                Box::new(std::io::Error::other(
+                                    "upstream response exceeded the byte limit after redaction",
+                                ))
+                                    as Box<dyn std::error::Error + Send + Sync>
+                            })?;
                             if output.is_empty() {
                                 continue;
                             }
@@ -3096,7 +3070,12 @@ impl ApiProxy {
                             )));
                         }
                         None => {
-                            let output = redactor.finish();
+                            let output = redactor.finish().map_err(|_| {
+                                Box::new(std::io::Error::other(
+                                    "upstream response exceeded the byte limit after redaction",
+                                ))
+                                    as Box<dyn std::error::Error + Send + Sync>
+                            })?;
                             if output.is_empty() {
                                 return Ok(None);
                             }
@@ -3108,8 +3087,7 @@ impl ApiProxy {
                     }
                 }
             },
-        )
-        .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>);
+        );
         let body = StreamBody::new(stream).boxed();
         Ok(builder.body(body).expect("build streamed response"))
     }
@@ -3137,6 +3115,21 @@ impl ApiProxy {
             ));
         }
         Ok(current)
+    }
+
+    async fn publication_authority_is_current(
+        &self,
+        route_authority: &RouteAuthority,
+        operation: Option<&ApiOp>,
+    ) -> bool {
+        // Session authority is linearized while `SessionBoundHandoff` retains
+        // its exact lease through response headers. A later session revocation
+        // does not erase the upstream operation that already happened. Policy
+        // generation is rechecked here because observations are local policy
+        // inputs and must not publish into a different route generation.
+        self.recheck_final_authority(route_authority, operation)
+            .await
+            .is_none()
     }
 
     fn is_kubernetes_mutation(&self, op: &ApiOp) -> bool {
@@ -4192,11 +4185,6 @@ async fn policy_reloader(path: PathBuf, proxy: Arc<ApiProxy>) {
                 }
                 proxy.policy_reload_attempt.fetch_add(1, Ordering::AcqRel);
                 proxy.policy_reload_notify.notify_waiters();
-                let _mutation_authority_guard = proxy.mutation_authority_gate.write().await;
-                let Ok(_read_authority_guard) = proxy.read_authority_gate.try_write() else {
-                    tracing::debug!(target: "guard::apiproxy", "policy publication deferred while a read handoff is active");
-                    continue;
-                };
                 let Ok(mut policy) = proxy.policy.try_write() else {
                     tracing::debug!(target: "guard::apiproxy", "policy publication deferred while a policy snapshot is active");
                     continue;
@@ -4261,13 +4249,36 @@ mod tests {
 
     #[test]
     fn exact_response_redaction_spans_chunk_boundaries() {
-        let mut redactor = ExactSecretRedactor::new(vec![b"operator-secret-token".to_vec()]);
-        let mut output = redactor.push(b"prefix operator-secr");
-        output.extend_from_slice(&redactor.push(b"et-token suffix"));
-        output.extend_from_slice(&redactor.finish());
+        let mut redactor = ExactSecretRedactor::new(vec![b"operator-secret-token".to_vec()], 1024);
+        let mut output = redactor.push(b"prefix operator-secr").unwrap();
+        output.extend_from_slice(&redactor.push(b"et-token suffix").unwrap());
+        output.extend_from_slice(&redactor.finish().unwrap());
         let output = String::from_utf8(output).unwrap();
         assert_eq!(output, "prefix [REDACTED] suffix");
         assert!(!output.contains("operator-secret-token"));
+    }
+
+    #[test]
+    fn exact_response_redaction_enforces_raw_and_expanded_byte_limits() {
+        let proxy = test_proxy().with_upstream_body_limit(8);
+        let value = [b'x', b'!'];
+        assert!(proxy
+            .redact_upstream_bytes(vec![value.to_vec()], &value.repeat(4))
+            .is_err());
+        assert!(proxy.redact_upstream_bytes(Vec::new(), &[b'x'; 9]).is_err());
+    }
+
+    #[tokio::test]
+    async fn response_derived_authority_rejects_a_stale_route_generation() {
+        let proxy = test_proxy();
+        let (_, expected) = proxy.capture_route_authority().await;
+        proxy.begin_authority_update();
+        proxy.finish_authority_update();
+        assert!(
+            !proxy
+                .publication_authority_is_current(&expected, None)
+                .await
+        );
     }
 
     #[test]

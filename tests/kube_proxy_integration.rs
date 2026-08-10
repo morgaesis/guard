@@ -1674,7 +1674,7 @@ async fn policy_reload_during_arbitration_prevents_mutable_forwarding() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn read_handoff_linearizes_before_a_queued_policy_deny() {
+async fn read_handoff_allows_concurrent_policy_reload_after_linearization() {
     let (upstream_base, read_reached, release_read) =
         spawn_policy_barrier_upstream(hyper::Method::GET).await;
     let upstream =
@@ -1721,15 +1721,9 @@ async fn read_handoff_linearizes_before_a_queued_policy_deny() {
     )
     .await
     .expect("policy reloader reaches authority coordination");
-    assert_eq!(
-        proxy.policy_fingerprint().await,
-        ApiPolicy::from_yaml(allow_policy)
-            .unwrap()
-            .authority_fingerprint()
-    );
+    wait_for_policy_reload(&proxy, deny_policy).await;
     release_read.add_permits(1);
     assert_eq!(request.await.unwrap().status(), 200);
-    wait_for_policy_reload(&proxy, deny_policy).await;
     assert_eq!(
         client
             .get(url)
@@ -1743,7 +1737,7 @@ async fn read_handoff_linearizes_before_a_queued_policy_deny() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn evaluated_read_handoff_linearizes_before_a_queued_policy_deny() {
+async fn evaluated_read_handoff_allows_concurrent_policy_reload_after_linearization() {
     let (upstream_base, read_reached, release_read) =
         spawn_policy_barrier_upstream(hyper::Method::GET).await;
     let upstream =
@@ -1794,15 +1788,9 @@ async fn evaluated_read_handoff_linearizes_before_a_queued_policy_deny() {
     )
     .await
     .expect("policy reloader reaches authority coordination");
-    assert_eq!(
-        proxy.policy_fingerprint().await,
-        ApiPolicy::from_yaml(evaluate_policy)
-            .unwrap()
-            .authority_fingerprint()
-    );
+    wait_for_policy_reload(&proxy, deny_policy).await;
     release_read.add_permits(1);
     assert_eq!(request.await.unwrap().status(), 200);
-    wait_for_policy_reload(&proxy, deny_policy).await;
     assert_eq!(
         client
             .get(url)
@@ -1874,7 +1862,7 @@ async fn read_does_not_queue_behind_reload_waiting_for_a_stalled_mutation() {
     .await
     .expect("read authority does not queue behind mutation reload")
     .unwrap();
-    assert_eq!(read.status(), 200);
+    assert_eq!(read.status(), 403);
     release_mutation.add_permits(1);
     assert_eq!(mutation.await.unwrap().status(), 201);
     wait_for_policy_reload(&proxy, deny_policy).await;
@@ -2473,16 +2461,12 @@ rules:
             .unwrap()
     });
     judge.reached_handoff.acquire().await.unwrap().forget();
-    let mutation_started = Arc::new(tokio::sync::Semaphore::new(0));
-    let started = mutation_started.clone();
+    assert!(judge.coordination.try_write().is_err());
     let mutation_judge = judge.clone();
     let revoke = tokio::spawn(async move {
-        started.add_permits(1);
         let _guard = mutation_judge.coordination.write().await;
         mutation_judge.active.store(false, Ordering::SeqCst);
     });
-    mutation_started.acquire().await.unwrap().forget();
-    assert!(!revoke.is_finished());
     judge.release_handoff.add_permits(1);
 
     assert_eq!(request.await.unwrap().status(), 200);

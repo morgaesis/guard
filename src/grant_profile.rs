@@ -13,6 +13,7 @@ use guard::gating::verb::{
 };
 use guard::gating::Reversibility;
 use guard::principal::PrincipalKey;
+use guard::redact::{command_contains_sensitive_literals, command_metadata};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -655,17 +656,26 @@ fn migrate_legacy_pattern(
         || pattern.contains('*') && !pattern.ends_with(" *")
     {
         bail!(
-            "legacy grant pattern {:?} cannot migrate safely: use a typed verb coverage cell or an exact trailing ' *' argv suffix",
-            pattern
+            "legacy grant pattern cannot migrate safely: use a typed verb coverage cell or an exact trailing ' *' argv suffix"
         );
     }
     let prefix = pattern.strip_suffix(" *").unwrap_or(pattern).trim();
     let trailing_wildcard = pattern.ends_with(" *");
     let tokens = prefix.split_whitespace().collect::<Vec<_>>();
     if tokens.is_empty() {
-        bail!("legacy grant pattern {:?} has no binary", pattern);
+        bail!("legacy grant pattern has no binary");
     }
     let binary = tokens[0].to_string();
+    let evidence_args = tokens
+        .iter()
+        .skip(1)
+        .map(|token| (*token).to_string())
+        .collect::<Vec<_>>();
+    if command_contains_sensitive_literals(&binary, &evidence_args) {
+        bail!(
+            "legacy grant pattern cannot migrate safely because it contains credential-bearing command authority"
+        );
+    }
     let options = tokens
         .iter()
         .skip(1)
@@ -679,11 +689,8 @@ fn migrate_legacy_pattern(
             allow_multiple: false,
         })
         .collect::<Vec<_>>();
-    let evidence_args = tokens
-        .iter()
-        .skip(1)
-        .map(|token| (*token).to_string())
-        .collect::<Vec<_>>();
+    let evidence_metadata = command_metadata(&binary, &evidence_args);
+    let evidence_arg_count = evidence_args.len();
     let mut boundary_args = evidence_args.clone();
     boundary_args.push("__outside_legacy_prefix__".to_string());
     let digest = Sha256::digest(pattern.as_bytes());
@@ -714,7 +721,7 @@ fn migrate_legacy_pattern(
         sticky: true,
         provenance: Some(CoverageProvenance {
             source: "legacy_profile_migration".to_string(),
-            evidence: vec![pattern.to_string()],
+            evidence: vec![evidence_metadata.clone()],
             regime_stamp: "legacy-profile-v1".to_string(),
             prompt_stamp: "not-applicable".to_string(),
             model_stamp: "not-applicable".to_string(),
@@ -737,7 +744,10 @@ fn migrate_legacy_pattern(
     };
     Ok(Verb {
         name: verb_name,
-        description: format!("Migrated saved-grant coverage for {pattern}"),
+        description: format!(
+            "Runs {binary} with {} pinned argument(s) from saved-grant coverage.",
+            evidence_arg_count
+        ),
         binary,
         args: Vec::new(),
         baseline: false,
@@ -749,7 +759,7 @@ fn migrate_legacy_pattern(
         trusted: action == CoverageAction::Preauthorized,
         prompt_context: None,
         source_prose: None,
-        evidence: Some(pattern.to_string()),
+        evidence: Some(evidence_metadata),
         auto_promoted: false,
         promotion_stamp: None,
     })
@@ -881,6 +891,20 @@ mod tests {
         );
         assert!(grant.generated_verbs[0].trusted);
         assert!(grant.generated_verbs[0].coverage[0].sticky);
+        assert!(grant.generated_verbs.iter().all(|verb| {
+            verb.evidence
+                .as_deref()
+                .is_some_and(|evidence| evidence.starts_with("[argv-sha256:"))
+                && verb.coverage[0]
+                    .provenance
+                    .as_ref()
+                    .is_some_and(|provenance| {
+                        provenance
+                            .evidence
+                            .iter()
+                            .all(|evidence| evidence.starts_with("[argv-sha256:"))
+                    })
+        }));
         assert_eq!(
             grant.generated_verbs[2].coverage[0].action,
             CoverageAction::Deny
@@ -946,6 +970,17 @@ mod tests {
         )
         .expect_err("ambiguous glob");
         assert!(error.to_string().contains("cannot migrate safely"));
+    }
+
+    #[test]
+    fn rejects_credential_bearing_legacy_authority_without_retaining_source_metadata() {
+        let value = ["legacy", "-fixture-value"].concat();
+        let yaml = format!(
+            "profiles:\n  - name: legacy\n    allow: [\"fixturectl --api-token={value} inspect\"]\n"
+        );
+        let error = SavedGrantCatalog::from_yaml(&yaml).expect_err("credential authority");
+        assert!(error.to_string().contains("credential-bearing"));
+        assert!(!error.to_string().contains(&value));
     }
 
     #[test]

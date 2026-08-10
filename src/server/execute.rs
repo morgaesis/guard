@@ -15,8 +15,8 @@ use guard::gating::coverage::{
 use guard::gating::verb::{CoverageAction, VerbCatalog};
 use guard::gating::{Coverage, DecisionTrace};
 use guard::redact::{
-    command_line, redact_command_line, redact_exact_secrets, redact_output_text,
-    redact_output_with_state, RedactionState,
+    command_contains_exact_secrets, command_line, redact_command_line, redact_exact_secrets,
+    redact_output_text, redact_output_with_state, ExactSecretStreamRedactor, RedactionState,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -28,8 +28,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 #[cfg(unix)]
@@ -85,7 +86,7 @@ pub(super) fn log_audit_policy_for_request(
                 .caller(caller)
                 .session_fingerprint(audit_session_fingerprint(request.session_token.as_deref()))
                 .cwd(cwd.display().to_string())
-                .cmd(audit_command_line(&request.binary, &request.args))
+                .cmd(server.redact_command_line(&request.binary, &request.args))
                 .reason(reason),
         )
     } else {
@@ -545,7 +546,18 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
     mut reason: String,
 ) -> ExecuteResult {
     let mut access_request_handle = None;
-    let durable_command = redact_command_line(&request.binary, &request.args);
+    let trusted_secrets = phase
+        .server
+        .config
+        .redact_secrets
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let durable_command = guard::redact::redact_command_line_with_exact_secrets(
+        &request.binary,
+        &request.args,
+        &trusted_secrets,
+    );
     let hard_verb_deny = phase.verb_matches.iter().any(|matched| {
         matched.selected
             && !matched.overridden
@@ -828,7 +840,18 @@ async fn route_allow_and_record<W: AsyncWrite + Unpin>(
     let reason = inputs.reason.clone();
     let risk = inputs.risk;
     let trace = decision_trace_for_phase(phase, source, true);
-    let interaction_command = redact_command_line(&request.binary, &request.args);
+    let trusted_secrets = phase
+        .server
+        .config
+        .redact_secrets
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let interaction_command = guard::redact::redact_command_line_with_exact_secrets(
+        &request.binary,
+        &request.args,
+        &trusted_secrets,
+    );
     let mut context = RequestContext {
         server: phase.server,
         caller: phase.caller,
@@ -1467,6 +1490,24 @@ async fn validate_exec_request<W: AsyncWrite + Unpin>(
             SessionDecisionSource::Validation,
             None,
             reason,
+        )
+        .await);
+    }
+    let trusted_secrets = phase
+        .server
+        .config
+        .redact_secrets
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if command_contains_exact_secrets(&request.binary, &request.args, &trusted_secrets) {
+        return Err(deny_and_record(
+            phase,
+            request,
+            SessionDecisionSource::Validation,
+            None,
+            "command contains a daemon-managed credential literal; use a managed secret binding"
+                .to_string(),
         )
         .await);
     }
@@ -2324,6 +2365,11 @@ pub(super) async fn admit_access_use(
     let selected_verbs = selected_verbs.to_vec();
     let preferred_requests = preferred_requests.map(ToOwned::to_owned);
     let task = tokio::spawn(async move {
+        #[cfg(test)]
+        server
+            .state
+            .session_transition_attempt_events
+            .add_permits(1);
         let _transition = server.state.grant_request_transition_gate.lock().await;
         let mut reloaded_after_conflict = false;
         loop {
@@ -2974,6 +3020,11 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
             return ExecuteResult::exec_failed(allow_reason, format!("tool config error: {}", e));
         }
     };
+    let mut exact_output_secrets = tool_env
+        .secret_sources
+        .keys()
+        .filter_map(|key| tool_env.env.get(key).cloned())
+        .collect::<Vec<_>>();
     let trusted_tool_env = tool_env.env;
     let mut exposed_secret_refs = tool_env.secret_refs;
     exposed_secret_refs.extend(request.secrets.values().cloned());
@@ -3112,6 +3163,7 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
                     );
                 }
             };
+            exact_output_secrets.push(value.clone());
             request_env.insert(env_var.clone(), value);
         }
     }
@@ -3151,9 +3203,11 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
                     );
                 }
             };
+            exact_output_secrets.push(value.clone());
             secret_file_values.push((env_var.clone(), value));
         }
     }
+    guard::redact::register_trusted_exact_secrets(&exact_output_secrets);
 
     let daemon_child_env: HashMap<String, String> = server
         .config
@@ -3340,7 +3394,10 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
             cmd,
             allow_reason,
             server,
-            &redaction_env,
+            OutputRedactionContext {
+                environment: &redaction_env,
+                exact_secrets: &exact_output_secrets,
+            },
             SpawnAuditContext {
                 caller,
                 request: &request,
@@ -3389,17 +3446,27 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
     let stdout = if output.stdout.is_empty() {
         None
     } else {
-        let raw = &output.stdout[..output.stdout.len().min(MAX_OUTPUT_BYTES)];
-        let s = String::from_utf8_lossy(raw).to_string();
-        Some(redact_command_text(server, &redaction_env, s))
+        let mut redacted = redact_command_text(
+            server,
+            &redaction_env,
+            &exact_output_secrets,
+            String::from_utf8_lossy(&output.stdout).to_string(),
+        );
+        truncate_utf8_bytes(&mut redacted, MAX_OUTPUT_BYTES);
+        Some(redacted)
     };
 
     let mut stderr = if output.stderr.is_empty() {
         None
     } else {
-        let raw = &output.stderr[..output.stderr.len().min(MAX_OUTPUT_BYTES)];
-        let s = String::from_utf8_lossy(raw).to_string();
-        Some(redact_command_text(server, &redaction_env, s))
+        let mut redacted = redact_command_text(
+            server,
+            &redaction_env,
+            &exact_output_secrets,
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        );
+        truncate_utf8_bytes(&mut redacted, MAX_OUTPUT_BYTES);
+        Some(redacted)
     };
 
     let mut exit_code = output.status.code();
@@ -3419,17 +3486,33 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
         .with_exposed_secret_refs(exposed_secret_refs)
 }
 
+fn truncate_utf8_bytes(value: &mut String, limit: usize) {
+    if value.len() <= limit {
+        return;
+    }
+    let mut end = limit;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+}
+
 #[derive(Debug)]
-struct StreamChunk {
-    stream: OutputStream,
-    data: String,
+enum StreamChunk {
+    Data { stream: OutputStream, data: Vec<u8> },
+    LimitExceeded,
+}
+
+struct OutputRedactionContext<'a> {
+    environment: &'a HashMap<String, String>,
+    exact_secrets: &'a [String],
 }
 
 async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
     mut cmd: Command,
     allow_reason: String,
     server: &ServerContext,
-    tool_env: &HashMap<String, String>,
+    redaction: OutputRedactionContext<'_>,
     audit: SpawnAuditContext<'_>,
     writer: &mut W,
     initiation_lease: CommandInitiationLease,
@@ -3461,18 +3544,21 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
 
     let (tx, mut rx) = mpsc::channel::<StreamChunk>(32);
     let mut stream_tasks = Vec::new();
+    let raw_total = Arc::new(AtomicUsize::new(0));
 
     if let Some(stdout) = child.stdout.take() {
         let tx = tx.clone();
+        let raw_total = raw_total.clone();
         stream_tasks.push(tokio::spawn(async move {
-            forward_stream_lines(stdout, OutputStream::Stdout, tx).await;
+            forward_stream_chunks(stdout, OutputStream::Stdout, tx, raw_total).await;
         }));
     }
 
     if let Some(stderr) = child.stderr.take() {
         let tx = tx.clone();
+        let raw_total = raw_total.clone();
         stream_tasks.push(tokio::spawn(async move {
-            forward_stream_lines(stderr, OutputStream::Stderr, tx).await;
+            forward_stream_chunks(stderr, OutputStream::Stderr, tx, raw_total).await;
         }));
     }
 
@@ -3480,6 +3566,16 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
 
     let mut stdout_redaction = RedactionState::default();
     let mut stderr_redaction = RedactionState::default();
+    let exact_secrets = server
+        .config
+        .redact_secrets
+        .iter()
+        .chain(redaction.exact_secrets)
+        .map(|secret| secret.as_bytes().to_vec())
+        .collect::<Vec<_>>();
+    let mut stdout_exact = ExactSecretStreamRedactor::new(exact_secrets.clone(), MAX_OUTPUT_BYTES);
+    let mut stderr_exact = ExactSecretStreamRedactor::new(exact_secrets, MAX_OUTPUT_BYTES);
+    let mut emitted_total = 0usize;
     let mut ansible_diagnostics =
         AnsibleInventoryDiagnostics::for_command(&audit.request.binary, &audit.request.args);
     let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -3487,16 +3583,52 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
         tokio::select! {
             maybe_chunk = rx.recv() => {
                 match maybe_chunk {
-                    Some(chunk) => {
+                    Some(StreamChunk::Data { stream, data }) => {
                     if let Some(diagnostics) = &mut ansible_diagnostics {
-                        diagnostics.observe(&chunk.data);
+                        diagnostics.observe(&String::from_utf8_lossy(&data));
                     }
-                    let redaction_state = match chunk.stream {
-                        OutputStream::Stdout => &mut stdout_redaction,
-                        OutputStream::Stderr => &mut stderr_redaction,
+                    let (redaction_state, exact_redactor) = match stream {
+                        OutputStream::Stdout => (&mut stdout_redaction, &mut stdout_exact),
+                        OutputStream::Stderr => (&mut stderr_redaction, &mut stderr_exact),
                     };
-                    let data = redact_command_text_with_state(server, tool_env, chunk.data, redaction_state);
-                    let message = match chunk.stream {
+                    let Ok(data) = exact_redactor.push(&data) else {
+                        if let Some(guard) = process_guard.take() {
+                            guard.terminate();
+                        } else {
+                            let _ = child.kill().await;
+                        }
+                        let _ = child.wait().await;
+                        return ExecuteResult::exec_failed_after_start(
+                            allow_reason,
+                            "command output exceeded the redacted byte limit".to_string(),
+                        )
+                        .with_exposed_secret_refs(audit.exposed_secret_refs);
+                    };
+                    if data.is_empty() {
+                        continue;
+                    }
+                    let data = redact_command_text_with_state(
+                        server,
+                        redaction.environment,
+                        redaction.exact_secrets,
+                        String::from_utf8_lossy(&data).to_string(),
+                        redaction_state,
+                    );
+                    if emitted_total.saturating_add(data.len()) > MAX_OUTPUT_BYTES {
+                        if let Some(guard) = process_guard.take() {
+                            guard.terminate();
+                        } else {
+                            let _ = child.kill().await;
+                        }
+                        let _ = child.wait().await;
+                        return ExecuteResult::exec_failed_after_start(
+                            allow_reason,
+                            "command output exceeded the redacted byte limit".to_string(),
+                        )
+                        .with_exposed_secret_refs(audit.exposed_secret_refs);
+                    }
+                    emitted_total += data.len();
+                    let message = match stream {
                         OutputStream::Stdout => ExecuteStreamMessage::Stdout { data },
                         OutputStream::Stderr => ExecuteStreamMessage::Stderr { data },
                     };
@@ -3515,7 +3647,89 @@ async fn execute_spawn_streaming<W: AsyncWrite + Unpin>(
                         .with_exposed_secret_refs(audit.exposed_secret_refs);
                     }
                     }
-                    None => break,
+                    Some(StreamChunk::LimitExceeded) => {
+                        if let Some(guard) = process_guard.take() {
+                            guard.terminate();
+                        } else {
+                            let _ = child.kill().await;
+                        }
+                        let _ = child.wait().await;
+                        return ExecuteResult::exec_failed_after_start(
+                            allow_reason,
+                            "command output exceeded the byte limit".to_string(),
+                        )
+                        .with_exposed_secret_refs(audit.exposed_secret_refs);
+                    }
+                    None => {
+                        for (stream, exact_redactor, redaction_state) in [
+                            (
+                                OutputStream::Stdout,
+                                &mut stdout_exact,
+                                &mut stdout_redaction,
+                            ),
+                            (
+                                OutputStream::Stderr,
+                                &mut stderr_exact,
+                                &mut stderr_redaction,
+                            ),
+                        ] {
+                            let Ok(data) = exact_redactor.finish() else {
+                                if let Some(guard) = process_guard.take() {
+                                    guard.terminate();
+                                } else {
+                                    let _ = child.kill().await;
+                                }
+                                let _ = child.wait().await;
+                                return ExecuteResult::exec_failed_after_start(
+                                    allow_reason,
+                                    "command output exceeded the redacted byte limit".to_string(),
+                                )
+                                .with_exposed_secret_refs(audit.exposed_secret_refs);
+                            };
+                            if data.is_empty() {
+                                continue;
+                            }
+                            let data = redact_command_text_with_state(
+                                server,
+                                redaction.environment,
+                                redaction.exact_secrets,
+                                String::from_utf8_lossy(&data).to_string(),
+                                redaction_state,
+                            );
+                            if emitted_total.saturating_add(data.len()) > MAX_OUTPUT_BYTES {
+                                if let Some(guard) = process_guard.take() {
+                                    guard.terminate();
+                                } else {
+                                    let _ = child.kill().await;
+                                }
+                                let _ = child.wait().await;
+                                return ExecuteResult::exec_failed_after_start(
+                                    allow_reason,
+                                    "command output exceeded the redacted byte limit".to_string(),
+                                )
+                                .with_exposed_secret_refs(audit.exposed_secret_refs);
+                            }
+                            emitted_total += data.len();
+                            let message = match stream {
+                                OutputStream::Stdout => ExecuteStreamMessage::Stdout { data },
+                                OutputStream::Stderr => ExecuteStreamMessage::Stderr { data },
+                            };
+                            if let Err(error) = write_stream_message(writer, &message).await {
+                                if let Some(guard) = process_guard.take() {
+                                    guard.terminate();
+                                } else {
+                                    let _ = child.kill().await;
+                                }
+                                let _ = child.wait().await;
+                                return ExecuteResult::exec_failed_after_start(
+                                    allow_reason,
+                                    format!("client stream error: {error}"),
+                                )
+                                .with_exposed_secret_refs(audit.exposed_secret_refs);
+                            }
+                        }
+                        break;
+                    },
                 }
             }
             _ = keepalive.tick() => {
@@ -3595,32 +3809,53 @@ fn audit_secret_exposure(
             guard::audit::AuditEvent::new(guard::audit::AuditKind::SecretExposed)
                 .caller(caller)
                 .session_fingerprint(audit_session_fingerprint(request.session_token.as_deref()))
-                .cmd(audit_command_line(&request.binary, &request.args))
+                .cmd(server.redact_command_line(&request.binary, &request.args))
                 .field("secret", secret_name),
         );
     }
 }
 
-async fn forward_stream_lines<R>(reader: R, stream: OutputStream, tx: mpsc::Sender<StreamChunk>)
-where
+async fn forward_stream_chunks<R>(
+    mut reader: R,
+    stream: OutputStream,
+    tx: mpsc::Sender<StreamChunk>,
+    total: Arc<AtomicUsize>,
+) where
     R: AsyncRead + Unpin,
 {
-    let mut reader = BufReader::new(reader);
-
+    const CHUNK_BYTES: usize = 8 * 1024;
+    let mut stream_bytes = 0usize;
+    let mut buffer = vec![0_u8; CHUNK_BYTES];
     loop {
-        let mut data = String::new();
-        match reader.read_line(&mut data).await {
+        match reader.read(&mut buffer).await {
             Ok(0) => break,
-            Ok(_) => {
-                if tx.send(StreamChunk { stream, data }).await.is_err() {
+            Ok(read) => {
+                stream_bytes = stream_bytes.saturating_add(read);
+                let reserved = total.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    current
+                        .checked_add(read)
+                        .filter(|next| *next <= MAX_OUTPUT_BYTES)
+                });
+                if stream_bytes > MAX_OUTPUT_BYTES || reserved.is_err() {
+                    let _ = tx.send(StreamChunk::LimitExceeded).await;
+                    break;
+                }
+                if tx
+                    .send(StreamChunk::Data {
+                        stream,
+                        data: buffer[..read].to_vec(),
+                    })
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
             Err(e) => {
                 let _ = tx
-                    .send(StreamChunk {
+                    .send(StreamChunk::Data {
                         stream: OutputStream::Stderr,
-                        data: format!("guard stream read error: {}\n", e),
+                        data: format!("guard stream read error: {}\n", e).into_bytes(),
                     })
                     .await;
                 break;
@@ -3632,40 +3867,44 @@ where
 fn redact_command_text(
     server: &ServerContext,
     tool_env: &HashMap<String, String>,
+    exact_output_secrets: &[String],
     text: String,
 ) -> String {
-    redact_command_text_inner(server, tool_env, text, None)
+    redact_command_text_inner(server, tool_env, exact_output_secrets, text, None)
 }
 
 fn redact_command_text_with_state(
     server: &ServerContext,
     tool_env: &HashMap<String, String>,
+    exact_output_secrets: &[String],
     text: String,
     state: &mut RedactionState,
 ) -> String {
-    redact_command_text_inner(server, tool_env, text, Some(state))
+    redact_command_text_inner(server, tool_env, exact_output_secrets, text, Some(state))
 }
 
 fn redact_command_text_inner(
     server: &ServerContext,
     tool_env: &HashMap<String, String>,
+    exact_output_secrets: &[String],
     text: String,
     state: Option<&mut RedactionState>,
 ) -> String {
-    if !server.config.redact {
-        return text;
-    }
-
-    let secret_refs: Vec<&str> = server
+    let trusted_secret_refs: Vec<&str> = server
         .config
         .redact_secrets
         .iter()
         .map(|s| s.as_str())
-        .chain(tool_env.values().map(|s| s.as_str()))
+        .chain(exact_output_secrets.iter().map(String::as_str))
         .collect();
 
     // First: exact-match redaction catches bare secret values in output.
-    let text = redact_exact_secrets(&text, &secret_refs);
+    let text = redact_exact_secrets(&text, &trusted_secret_refs);
+    if !server.config.redact {
+        return text;
+    }
+    let heuristic_exact_refs = tool_env.values().map(String::as_str).collect::<Vec<_>>();
+    let text = redact_exact_secrets(&text, &heuristic_exact_refs);
     // Then: regex and context-based redaction catches KEY=value, YAML env
     // pairs, PEM blocks, etc.
     if let Some(state) = state {
@@ -3732,6 +3971,44 @@ pub(super) fn merge_envelope_context(
 mod decision_trace_feature_tests {
     use super::*;
     use guard::gating::verb::CoverageAction;
+
+    #[test]
+    fn buffered_output_truncation_preserves_utf8_and_the_byte_cap() {
+        let mut output = "x".repeat(MAX_OUTPUT_BYTES - 1);
+        output.push('µ');
+        truncate_utf8_bytes(&mut output, MAX_OUTPUT_BYTES);
+        assert!(output.len() <= MAX_OUTPUT_BYTES);
+        assert!(output.is_char_boundary(output.len()));
+        assert!(!output.ends_with('µ'));
+    }
+
+    #[tokio::test]
+    async fn unterminated_stream_is_chunked_and_stopped_at_the_total_byte_limit() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let total = Arc::new(AtomicUsize::new(0));
+        let reader =
+            tokio::io::AsyncReadExt::take(tokio::io::repeat(b'x'), (MAX_OUTPUT_BYTES + 1) as u64);
+        let task = tokio::spawn(forward_stream_chunks(
+            reader,
+            OutputStream::Stdout,
+            tx,
+            total,
+        ));
+        let mut retained = 0usize;
+        let mut limited = false;
+        while let Some(chunk) = rx.recv().await {
+            match chunk {
+                StreamChunk::Data { data, .. } => {
+                    assert!(data.len() <= 8 * 1024);
+                    retained += data.len();
+                }
+                StreamChunk::LimitExceeded => limited = true,
+            }
+        }
+        task.await.unwrap();
+        assert!(limited);
+        assert!(retained <= MAX_OUTPUT_BYTES);
+    }
 
     #[test]
     fn persisted_trace_drops_legacy_observed_argument_values() {

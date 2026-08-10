@@ -1810,6 +1810,42 @@ async fn execution_failure_prose_is_sanitized_before_audit_stream_and_response()
         .contains(&value));
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn configured_exact_literal_is_rejected_and_absent_from_all_command_projections() {
+    let value = ["x", "!"].concat();
+    let (mut cfg, logs) = make_test_config();
+    cfg.config.redact_secrets.push(value.clone());
+    let (_audit_dir, audit) = attach_test_audit_log(&mut cfg);
+    let token = "exact-literal-session".to_string();
+    cfg.state
+        .sessions
+        .write()
+        .await
+        .grant(token.clone(), unrestricted_session());
+    let mut request = basic_request("echo", vec![value.clone()]);
+    request.session_token = Some(token);
+
+    let (result, captured_logs) = capture_async(
+        &logs,
+        execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 }),
+    )
+    .await;
+
+    assert!(!result.policy_allowed());
+    assert!(!serde_json::to_string(&result.into_response())
+        .unwrap()
+        .contains(&value));
+    assert!(!captured_logs.contains(&value));
+    assert!(!std::fs::read_to_string(audit.path())
+        .unwrap()
+        .contains(&value));
+    let interactions = cfg.state.sessions.read().await.interactions_snapshot();
+    assert!(!serde_json::to_string(&interactions)
+        .unwrap()
+        .contains(&value));
+}
+
 /// Policy allows + exec succeeds: only the POLICY event fires.
 #[tokio::test]
 async fn audit_allowed_and_completed_emits_only_policy_event() {
@@ -2521,6 +2557,58 @@ async fn redaction_covers_effective_tool_child_and_request_env_values() {
         }
         other => panic!("expected redacted env output, got {:?}", other),
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn trusted_exact_tool_values_redact_when_heuristic_redaction_is_disabled() {
+    let (mut cfg, _) = make_test_config();
+    cfg.config.redact = false;
+    let exact = ['¤', '9'].iter().collect::<String>();
+    cfg.state
+        .secrets
+        .set(&PrincipalKey::from_uid(1000), "tool/exact", &exact)
+        .await
+        .unwrap();
+    let tools = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        tools.path(),
+        "tools:\n  sh:\n    secrets:\n      TOOL_EXACT: tool/exact\n",
+    )
+    .unwrap();
+    *cfg.state.tool_registry.write().await =
+        crate::tool_config::ToolRegistry::load(tools.path()).unwrap();
+
+    let token = "exact-output-redaction";
+    cfg.state.sessions.write().await.grant(
+        token.to_string(),
+        SessionGrant {
+            allow: vec!["sh *".into()],
+            deny: Vec::new(),
+            allow_exact: Vec::new(),
+            deny_exact: Vec::new(),
+            activated_verbs: Vec::new(),
+            override_markers: Vec::new(),
+            scope: Default::default(),
+            expires_at: None,
+            prompt_append: None,
+            generated_notes: Vec::new(),
+            static_only: true,
+            auto_amend: false,
+            granted_at: 0,
+            owner: crate::session::SessionOwner::Principal(PrincipalKey::from_uid(1000)),
+        },
+    );
+    let mut request = basic_request(
+        "sh",
+        vec!["-c".to_string(), "printf '%s' \"$TOOL_EXACT\"".to_string()],
+    );
+    request.session_token = Some(token.to_string());
+    let result = execute_command(request, &cfg, &CallerIdentity::Unix { uid: 1000 }).await;
+    let ExecOutcome::Completed { stdout, .. } = result.exec else {
+        panic!("expected completed command");
+    };
+    assert!(!stdout.unwrap_or_default().contains(&exact));
 }
 
 #[cfg(unix)]

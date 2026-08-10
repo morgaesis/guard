@@ -14,6 +14,7 @@ use guard::gating::provisional::{Provisional, ProvisionalRegistry, ProvisionalSt
 use guard::gating::read_grant::{GrantReadRegistry, ReadGrantStatus};
 use guard::gating::verb::VerbCatalog;
 use guard::gating::GateMode;
+use std::collections::HashSet;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -47,6 +48,78 @@ use super::{
     SESSION_MAINTENANCE_INTERVAL_SECS,
 };
 use crate::session::{SessionDecisionSource, SessionExecStatus, SessionInteraction};
+
+fn is_revert_body_name(name: &str) -> bool {
+    let Some(handle) = name
+        .strip_prefix("api-revert-")
+        .and_then(|name| name.strip_suffix(".body"))
+    else {
+        return false;
+    };
+    handle.len() == 32
+        && handle
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+}
+
+/// Reconcile only transaction-owned revert bodies in the daemon-private
+/// directory. Unrelated names are untouched; an ambiguous or unsafe owned name
+/// fails startup instead of risking deletion of another file.
+fn reconcile_revert_body_files(snapshot_dir: &Path, rows: &[Provisional]) -> Result<()> {
+    if !snapshot_dir.try_exists()? {
+        return Ok(());
+    }
+    if !super::secure_fs::private_path_is_safe(snapshot_dir, true) {
+        anyhow::bail!("API-revert body directory is not daemon-only");
+    }
+
+    let mut referenced = HashSet::new();
+    for row in rows {
+        let Some(body_file) = row
+            .api_revert
+            .as_ref()
+            .and_then(|revert| revert.body_file.as_ref())
+        else {
+            continue;
+        };
+        let expected = snapshot_dir.join(format!("api-revert-{}.body", row.handle));
+        if body_file != &expected
+            || !is_revert_body_name(&format!("api-revert-{}.body", row.handle))
+        {
+            anyhow::bail!("persisted API-revert body path is outside its owned namespace");
+        }
+        referenced.insert(expected);
+    }
+
+    #[cfg(unix)]
+    let mut removed = false;
+    for entry in std::fs::read_dir(snapshot_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !is_revert_body_name(&name) || referenced.contains(&entry.path()) {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(entry.path())?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || !super::secure_fs::private_path_is_safe(&entry.path(), false)
+        {
+            anyhow::bail!("orphan API-revert body is not a daemon-only regular file");
+        }
+        std::fs::remove_file(entry.path())?;
+        #[cfg(unix)]
+        {
+            removed = true;
+        }
+    }
+    #[cfg(unix)]
+    if removed {
+        std::fs::File::open(snapshot_dir)?.sync_all()?;
+    }
+    Ok(())
+}
 
 #[derive(Clone)]
 struct DaemonApiSessionSink {
@@ -117,16 +190,33 @@ impl Drop for ReplyWaiterGuard {
 async fn write_admin_response<W: AsyncWrite + Unpin>(
     writer: &mut W,
     owned: OwnedAdminResponse,
+    exact_secrets: &[String],
 ) -> Result<()> {
     let OwnedAdminResponse {
         response,
         waiter_lease,
     } = owned;
     let _reply_guard = ReplyWaiterGuard::new(waiter_lease);
+    let mut response = serde_json::to_value(response)?;
+    let exact_secrets = exact_secrets.iter().map(String::as_str).collect::<Vec<_>>();
+    guard::redact::redact_json_exact_secrets(&mut response, &exact_secrets);
     let bytes = serde_json::to_vec(&response)?;
     writer.write_all(&bytes).await?;
     writer.write_all(b"\n").await?;
     writer.flush().await?;
+    Ok(())
+}
+
+async fn write_redacted_json_line<W: AsyncWrite + Unpin, T: serde::Serialize>(
+    writer: &mut W,
+    response: &T,
+    exact_secrets: &[String],
+) -> Result<()> {
+    let mut value = serde_json::to_value(response)?;
+    let exact_secrets = exact_secrets.iter().map(String::as_str).collect::<Vec<_>>();
+    guard::redact::redact_json_exact_secrets(&mut value, &exact_secrets);
+    writer.write_all(&serde_json::to_vec(&value)?).await?;
+    writer.write_all(b"\n").await?;
     Ok(())
 }
 
@@ -239,7 +329,7 @@ mod admin_response_lease_tests {
         assert_eq!(registry.active_waiters("lease-test"), 1);
         let (mut writer, mut reader) = tokio::io::duplex(128);
 
-        write_admin_response(&mut writer, owned).await.unwrap();
+        write_admin_response(&mut writer, owned, &[]).await.unwrap();
         assert_eq!(registry.active_waiters("lease-test"), 0);
         drop(writer);
         let mut frame = String::new();
@@ -251,10 +341,42 @@ mod admin_response_lease_tests {
     }
 
     #[tokio::test]
+    async fn rpc_projection_redacts_exact_literals_in_values_and_map_keys() {
+        let value = ["r", "!"].concat();
+        let mut output = Vec::new();
+        write_admin_response(
+            &mut output,
+            OwnedAdminResponse {
+                response: AdminResponse::Error {
+                    message: format!("failure {value}"),
+                },
+                waiter_lease: None,
+            },
+            std::slice::from_ref(&value),
+        )
+        .await
+        .unwrap();
+        let mut keyed = Vec::new();
+        write_redacted_json_line(
+            &mut keyed,
+            &serde_json::json!({ value.clone(): value.clone() }),
+            std::slice::from_ref(&value),
+        )
+        .await
+        .unwrap();
+        assert!(!output
+            .windows(value.len())
+            .any(|bytes| bytes == value.as_bytes()));
+        assert!(!keyed
+            .windows(value.len())
+            .any(|bytes| bytes == value.as_bytes()));
+    }
+
+    #[tokio::test]
     async fn response_lease_releases_on_write_failure() {
         let mut registry = ApprovalRegistry::new();
         let owned = owned_response(&mut registry);
-        assert!(write_admin_response(&mut FailedWriter, owned)
+        assert!(write_admin_response(&mut FailedWriter, owned, &[])
             .await
             .is_err());
         assert_eq!(registry.active_waiters("lease-test"), 0);
@@ -266,7 +388,7 @@ mod admin_response_lease_tests {
         let owned = owned_response(&mut registry);
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(10),
-            write_admin_response(&mut PendingWriter, owned),
+            write_admin_response(&mut PendingWriter, owned, &[]),
         )
         .await;
         assert!(result.is_err());
@@ -588,6 +710,7 @@ impl Server {
         sessions: SessionRegistry,
         session_store: Option<SessionStore>,
     ) -> Result<Self> {
+        guard::redact::register_trusted_exact_secrets(&config.redact_secrets);
         let mut state =
             ServerState::new(evaluator, secrets, tool_registry, sessions, session_store);
         // Count every audited event at the single audit emission choke point by
@@ -768,6 +891,17 @@ impl Server {
         match store.load_provisionals().await {
             Ok(rows) => {
                 let mut rows = rows;
+                if let Some(snapshot_dir) = self
+                    .context
+                    .config
+                    .state_db_path
+                    .as_ref()
+                    .and_then(|path| path.parent())
+                    .map(|parent| parent.join("api-proxy-reverts"))
+                {
+                    reconcile_revert_body_files(&snapshot_dir, &rows)
+                        .context("reconcile durable API-revert bodies")?;
+                }
                 #[cfg(windows)]
                 if let Some(state_parent) = self
                     .context
@@ -823,15 +957,17 @@ impl Server {
                 let durable_rows = rows.clone();
                 let (mut reg, moved, retired) = ProvisionalRegistry::recover_rows(rows);
                 for handle in retired {
+                    if let Some(row) = durable_rows.iter().find(|row| row.handle == handle) {
+                        super::gate_runtime::remove_revert_body(row).with_context(|| {
+                            format!("remove inert pre-handoff revert body for {handle}")
+                        })?;
+                    }
                     store
                         .delete_provisional(handle.clone())
                         .await
                         .with_context(|| {
                             format!("retire inert pre-handoff provisional {handle}")
                         })?;
-                    if let Some(row) = durable_rows.iter().find(|row| row.handle == handle) {
-                        super::gate_runtime::remove_revert_body(row);
-                    }
                 }
                 let mut escalated = invalid;
                 for handle in moved {
@@ -1837,10 +1973,7 @@ where
                     "request exceeds {} bytes",
                     MAX_REQUEST_BYTES
                 ));
-                writer
-                    .write_all(serde_json::to_string(&resp)?.as_bytes())
-                    .await?;
-                writer.write_all(b"\n").await?;
+                write_redacted_json_line(&mut writer, &resp, &server.config.redact_secrets).await?;
                 break;
             }
         };
@@ -1851,10 +1984,7 @@ where
                 let reason = classify_execute_protocol_parse_error(&line)
                     .unwrap_or_else(|| format!("invalid request: {e}"));
                 let resp = validation_error_response(reason);
-                writer
-                    .write_all(serde_json::to_string(&resp)?.as_bytes())
-                    .await?;
-                writer.write_all(b"\n").await?;
+                write_redacted_json_line(&mut writer, &resp, &server.config.redact_secrets).await?;
                 continue;
             }
         };
@@ -1885,10 +2015,12 @@ where
                             let resp = AdminResponse::Error {
                                 message: format!("admin RPC refused: {}", e),
                             };
-                            writer
-                                .write_all(serde_json::to_string(&resp)?.as_bytes())
-                                .await?;
-                            writer.write_all(b"\n").await?;
+                            write_redacted_json_line(
+                                &mut writer,
+                                &resp,
+                                &server.config.redact_secrets,
+                            )
+                            .await?;
                             continue;
                         } else {
                             caller_with_valid_admin_bearer(&caller, admin_token.as_deref())
@@ -1902,10 +2034,12 @@ where
                             let resp = AdminResponse::Error {
                                 message: format!("admin RPC refused: {}", e),
                             };
-                            writer
-                                .write_all(serde_json::to_string(&resp)?.as_bytes())
-                                .await?;
-                            writer.write_all(b"\n").await?;
+                            write_redacted_json_line(
+                                &mut writer,
+                                &resp,
+                                &server.config.redact_secrets,
+                            )
+                            .await?;
                             continue;
                         }
                         caller_with_valid_admin_bearer(&caller, admin_token.as_deref())
@@ -1913,8 +2047,35 @@ where
                         caller.clone()
                     }
                 };
+                let trusted = server
+                    .config
+                    .redact_secrets
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                if serde_json::to_value(admin.as_ref())
+                    .ok()
+                    .is_some_and(|value| {
+                        guard::redact::json_contains_exact_secrets(&value, &trusted)
+                    })
+                {
+                    let response = AdminResponse::Error {
+                        message: "admin request contains a daemon-managed credential literal"
+                            .to_string(),
+                    };
+                    write_admin_response(
+                        &mut writer,
+                        OwnedAdminResponse {
+                            response,
+                            waiter_lease: None,
+                        },
+                        &server.config.redact_secrets,
+                    )
+                    .await?;
+                    continue;
+                }
                 let owned = handle_admin_request_owned(server, &caller, *admin).await;
-                write_admin_response(&mut writer, owned).await?;
+                write_admin_response(&mut writer, owned, &server.config.redact_secrets).await?;
                 continue;
             }
             IncomingMessage::Execute {
@@ -1926,10 +2087,8 @@ where
                     validate_execute_protocol(protocol_version, &features, &execute, &caller)
                 {
                     let resp = validation_error_response(reason);
-                    writer
-                        .write_all(serde_json::to_string(&resp)?.as_bytes())
+                    write_redacted_json_line(&mut writer, &resp, &server.config.redact_secrets)
                         .await?;
-                    writer.write_all(b"\n").await?;
                     continue;
                 }
                 *execute
@@ -1945,10 +2104,7 @@ where
                 "invalid auth token",
             );
             let resp = validation_error_response("invalid auth token".to_string());
-            writer
-                .write_all(serde_json::to_string(&resp)?.as_bytes())
-                .await?;
-            writer.write_all(b"\n").await?;
+            write_redacted_json_line(&mut writer, &resp, &server.config.redact_secrets).await?;
             continue;
         }
 
@@ -1968,16 +2124,14 @@ where
 
         let resp = result.into_response();
         if request.stream {
-            write_stream_message(
+            write_redacted_json_line(
                 &mut writer,
                 &ExecuteStreamMessage::Result { response: resp },
+                &server.config.redact_secrets,
             )
             .await?;
         } else {
-            writer
-                .write_all(serde_json::to_string(&resp)?.as_bytes())
-                .await?;
-            writer.write_all(b"\n").await?;
+            write_redacted_json_line(&mut writer, &resp, &server.config.redact_secrets).await?;
         }
     }
 
@@ -2228,10 +2382,7 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, server: &ServerContext
                     "request exceeds {} bytes",
                     MAX_REQUEST_BYTES
                 ));
-                writer
-                    .write_all(serde_json::to_string(&resp)?.as_bytes())
-                    .await?;
-                writer.write_all(b"\n").await?;
+                write_redacted_json_line(&mut writer, &resp, &server.config.redact_secrets).await?;
                 break;
             }
         };
@@ -2241,10 +2392,7 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, server: &ServerContext
                 let reason = classify_execute_protocol_parse_error(&line)
                     .unwrap_or_else(|| format!("invalid request: {e}"));
                 let resp = validation_error_response(reason);
-                writer
-                    .write_all(serde_json::to_string(&resp)?.as_bytes())
-                    .await?;
-                writer.write_all(b"\n").await?;
+                write_redacted_json_line(&mut writer, &resp, &server.config.redact_secrets).await?;
                 continue;
             }
         };
@@ -2259,18 +2407,43 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, server: &ServerContext
                     let resp = AdminResponse::Error {
                         message: format!("admin RPC refused: {}", e),
                     };
-                    writer
-                        .write_all(serde_json::to_string(&resp)?.as_bytes())
+                    write_redacted_json_line(&mut writer, &resp, &server.config.redact_secrets)
                         .await?;
-                    writer.write_all(b"\n").await?;
                     continue;
                 } else {
                     CallerIdentity::TcpAdmin {
                         token: admin_token.unwrap_or_else(|| "<missing>".to_string()),
                     }
                 };
+                let trusted = server
+                    .config
+                    .redact_secrets
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                if serde_json::to_value(admin.as_ref())
+                    .ok()
+                    .is_some_and(|value| {
+                        guard::redact::json_contains_exact_secrets(&value, &trusted)
+                    })
+                {
+                    let response = AdminResponse::Error {
+                        message: "admin request contains a daemon-managed credential literal"
+                            .to_string(),
+                    };
+                    write_admin_response(
+                        &mut writer,
+                        OwnedAdminResponse {
+                            response,
+                            waiter_lease: None,
+                        },
+                        &server.config.redact_secrets,
+                    )
+                    .await?;
+                    continue;
+                }
                 let owned = handle_admin_request_owned(server, &caller, *admin).await;
-                write_admin_response(&mut writer, owned).await?;
+                write_admin_response(&mut writer, owned, &server.config.redact_secrets).await?;
                 continue;
             }
             IncomingMessage::Execute {
@@ -2285,10 +2458,8 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, server: &ServerContext
                     validate_execute_protocol(protocol_version, &features, &execute, &tcp_caller)
                 {
                     let resp = validation_error_response(reason);
-                    writer
-                        .write_all(serde_json::to_string(&resp)?.as_bytes())
+                    write_redacted_json_line(&mut writer, &resp, &server.config.redact_secrets)
                         .await?;
-                    writer.write_all(b"\n").await?;
                     continue;
                 }
                 *execute
@@ -2305,10 +2476,7 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, server: &ServerContext
                 "invalid auth token",
             );
             let resp = validation_error_response("invalid auth token".to_string());
-            writer
-                .write_all(serde_json::to_string(&resp)?.as_bytes())
-                .await?;
-            writer.write_all(b"\n").await?;
+            write_redacted_json_line(&mut writer, &resp, &server.config.redact_secrets).await?;
             continue;
         }
 
@@ -2334,16 +2502,14 @@ async fn handle_client_tcp(stream: tokio::net::TcpStream, server: &ServerContext
 
         let resp = result.into_response();
         if request.stream {
-            write_stream_message(
+            write_redacted_json_line(
                 &mut writer,
                 &ExecuteStreamMessage::Result { response: resp },
+                &server.config.redact_secrets,
             )
             .await?;
         } else {
-            writer
-                .write_all(serde_json::to_string(&resp)?.as_bytes())
-                .await?;
-            writer.write_all(b"\n").await?;
+            write_redacted_json_line(&mut writer, &resp, &server.config.redact_secrets).await?;
         }
     }
 
@@ -2354,9 +2520,9 @@ pub(super) async fn write_stream_message<W: AsyncWrite + Unpin>(
     writer: &mut W,
     message: &ExecuteStreamMessage,
 ) -> Result<()> {
-    writer
-        .write_all(serde_json::to_string(message)?.as_bytes())
-        .await?;
+    let mut message = serde_json::to_value(message)?;
+    guard::redact::redact_json_exact_secrets(&mut message, &[]);
+    writer.write_all(&serde_json::to_vec(&message)?).await?;
     writer.write_all(b"\n").await?;
     writer.flush().await?;
     Ok(())
@@ -2385,6 +2551,23 @@ mod line_limit_tests {
     use std::time::Duration;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn startup_reconciles_only_owned_orphan_revert_bodies() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("api-proxy-reverts");
+        super::super::secure_fs::create_private_dir(&directory).unwrap();
+        let orphan = directory.join(format!("api-revert-{}.body", "a".repeat(32)));
+        super::super::secure_fs::write_new_private(&orphan, b"fixture").unwrap();
+        let unrelated = directory.join("operator-note");
+        super::super::secure_fs::write_new_private(&unrelated, b"fixture").unwrap();
+
+        reconcile_revert_body_files(&directory, &[]).unwrap();
+
+        assert!(!orphan.exists());
+        assert!(unrelated.exists());
+        reconcile_revert_body_files(&directory, &[]).unwrap();
+    }
 
     #[tokio::test]
     async fn policy_stream_sanitizes_reason_before_serialization() {

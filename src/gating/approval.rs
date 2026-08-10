@@ -948,15 +948,15 @@ mod tests {
     async fn waiter_is_woken_on_decision() {
         let mut r = ApprovalRegistry::new();
         let notify = r.enqueue(held("h1", 100, 3600));
-        // Spawn a waiter; then decide and ensure it wakes.
+        let (registered_tx, registered_rx) = tokio::sync::oneshot::channel();
         let waiter = tokio::spawn(async move {
-            notify.notified().await;
+            let mut notified = Box::pin(notify.notified());
+            notified.as_mut().enable();
+            let _ = registered_tx.send(());
+            notified.await;
         });
-        // Ensure the waiter has parked on notified() before we wake it;
-        // notify_waiters() only wakes tasks already awaiting.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        registered_rx.await.unwrap();
         r.deny("h1", 150, "no".into()).unwrap();
-        // notify_waiters wakes those currently awaiting; the spawned task should finish.
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
             .await
             .expect("waiter should have been woken");
