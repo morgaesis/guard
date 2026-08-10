@@ -14,7 +14,7 @@ use crate::session::{SessionDecisionSource, SessionExecStatus, SessionInteractio
 use guard::evaluate::{EvalConfig, Evaluator};
 use guard::gating::approval::ApprovalStatus;
 #[cfg(unix)]
-use guard::gating::deny_shape::{DenyLearningConfig, DenyShapeStore};
+use guard::gating::deny_shape::{canonical_argv, DenyLearningConfig, DenyShapeStore};
 use guard::gating::verb::VerbCatalog;
 use guard::gating::GateMode;
 use guard::principal::PrincipalKey;
@@ -240,8 +240,16 @@ async fn verb_lease_ends_after_process_start_while_child_is_running() {
         std::time::Duration::from_secs(2),
         tokio::task::spawn_blocking(move || {
             let mut independent = DenyShapeStore::load(deny_config).unwrap();
+            let evidence = canonical_argv(&["-c".to_string()]);
             independent
-                .promote_shape("fixture", "sh", "^-c$", &["-c".to_string()], "blocked", 1)
+                .promote_shape(
+                    "fixture",
+                    "sh",
+                    &format!("^{}$", regex::escape(&evidence)),
+                    &[evidence],
+                    "blocked",
+                    1,
+                )
                 .unwrap();
         }),
     )
@@ -284,12 +292,13 @@ async fn learned_deny_committed_after_initial_allow_prevents_process_start() {
     });
     reached.acquire().await.unwrap().forget();
     let mut independent = DenyShapeStore::load(deny_config).unwrap();
+    let evidence = canonical_argv(&["--check".to_string()]);
     independent
         .promote_shape(
             "fixture",
             "true",
-            "^--check$",
-            &["--check".to_string()],
+            &format!("^{}$", regex::escape(&evidence)),
+            &[evidence],
             "blocked",
             1,
         )

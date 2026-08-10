@@ -963,8 +963,8 @@ impl Server {
                     .filter(|approval| approval.status == ApprovalStatus::Pending)
                     .map(|approval| approval.handle)
                     .collect::<std::collections::BTreeSet<_>>();
-                let mut sessions = self.context.state.sessions.write().await;
-                let mut reconciled = sessions.clone();
+                let baseline_sessions = self.context.state.sessions.read().await.clone();
+                let mut reconciled = baseline_sessions.clone();
                 let removed = reconciled.retain_pending_access_grants(&pending);
                 if removed > 0 {
                     match super::execute::persist_session_snapshot(
@@ -974,6 +974,12 @@ impl Server {
                     .await
                     {
                         Ok(()) => {
+                            let mut sessions = self.context.state.sessions.write().await;
+                            if sessions.revision() != baseline_sessions.revision() {
+                                return Err(anyhow::anyhow!(
+                                    "session authority changed during startup approval reconciliation"
+                                ));
+                            }
                             *sessions = reconciled;
                             self.context.emit_audit_ungated(
                                 AuditEvent::new(AuditKind::StartupRecovery)
@@ -986,7 +992,6 @@ impl Server {
                         ),
                     }
                 }
-                drop(sessions);
                 *self.context.state.approvals.write().await = reg;
             }
             Err(e) => return Err(e).context("load durable approval state"),

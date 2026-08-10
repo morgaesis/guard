@@ -273,6 +273,9 @@ struct ServerState {
     session_maintenance_started: Arc<AtomicBool>,
     /// Containment-envelope state (recoverable provisionals).
     provisional: Arc<RwLock<ProvisionalRegistry>>,
+    /// Serializes durable provisional transitions without retaining the live
+    /// registry guard across storage I/O.
+    provisional_transition_gate: Arc<Mutex<()>>,
     /// Operator-approval state (held irreversible commands).
     approvals: Arc<RwLock<ApprovalRegistry>>,
     /// Operator-authored verb catalog (the typed, least-expressive interface).
@@ -333,6 +336,7 @@ impl ServerState {
             session_store,
             session_maintenance_started: Arc::new(AtomicBool::new(false)),
             provisional: Arc::new(RwLock::new(ProvisionalRegistry::new())),
+            provisional_transition_gate: Arc::new(Mutex::new(())),
             approvals: Arc::new(RwLock::new(ApprovalRegistry::new())),
             verbs: Arc::new(RwLock::new(VerbCatalog::empty())),
             verb_previews: Arc::new(RwLock::new(admin::VerbPreviewCache::default())),

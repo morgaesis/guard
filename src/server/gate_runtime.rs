@@ -19,8 +19,8 @@ use tokio::io::AsyncWrite;
 use super::execute::{
     admit_access_use, audit_command_line, audit_session_fingerprint,
     exec_after_approval_with_command_authority, exec_after_approval_with_secret_authority,
-    exec_with_read_grant_retry_with_command_authority, CommandAuthorization,
-    VerbAuthorityExpectation,
+    exec_with_read_grant_retry_with_command_authority, resolve_current_tool_env,
+    CommandAuthorization, VerbAuthorityExpectation,
 };
 use super::grants::{delete_read_grant_row, finish_read_grant_revert, persist_read_grant};
 use super::runtime::NotifyEvent;
@@ -177,6 +177,7 @@ async fn try_persist_provisional(server: &ServerContext, p: &Provisional) -> Res
 /// Complete the safe transition from the live post-forward persistence-loss
 /// row to durable state before an operator decision is applied. The detailed
 /// store error is kept in local diagnostics only.
+#[cfg(test)]
 pub(super) async fn converge_forward_persistence_failure(
     server: &ServerContext,
     provisional: &Provisional,
@@ -202,6 +203,51 @@ pub(super) async fn converge_forward_persistence_failure(
             false
         }
     }
+}
+
+/// Commit one exact provisional transition before conditionally publishing it
+/// to the live registry. The independently owned task retains coordination
+/// through durable completion even if its caller is cancelled.
+pub(super) async fn persist_provisional_transition(
+    server: &ServerContext,
+    expected: Provisional,
+    next: Provisional,
+) -> Result<bool, String> {
+    let server = server.clone();
+    tokio::spawn(async move {
+        let _transition = server.state.provisional_transition_gate.lock().await;
+        if server.state.provisional.read().await.get(&expected.handle) != Some(&expected) {
+            return Ok(false);
+        }
+        let Some(store) = &server.state.session_store else {
+            return Err("durable provisional state is unavailable".to_string());
+        };
+        if expected.forward_persistence_failed {
+            store
+                .save_provisional(expected.clone())
+                .await
+                .map_err(|error| format!("failed to converge provisional state: {error}"))?;
+        }
+        #[cfg(test)]
+        if let Some(api) = expected.api_revert.as_ref() {
+            pause_api_containment(&api.endpoint, "provisional_transition_before_persist").await;
+        }
+        store
+            .compare_and_swap_provisional(expected.clone(), next.clone())
+            .await
+            .map_err(|error| format!("failed to persist provisional transition: {error}"))?;
+        let mut registry = server.state.provisional.write().await;
+        if registry.get(&expected.handle) == Some(&expected) {
+            registry.insert(next);
+            Ok(true)
+        } else {
+            // A live mutation that did not participate in this coordinator is
+            // never overwritten by a stale post-I/O result.
+            Ok(false)
+        }
+    })
+    .await
+    .map_err(|error| format!("provisional transition task failed: {error}"))?
 }
 
 /// Drop any API-proxy delete-provenance tied to a now-resolved auto-revert
@@ -2184,25 +2230,20 @@ pub(super) async fn hold_for_approval_with_trace<W: AsyncWrite + Unpin>(
     let handle = new_handle();
     let now = now_unix();
 
-    let tool_secret_sources = {
-        let mut registry = server.state.tool_registry.write().await;
-        let _ = registry.reload_if_stale();
-        match registry
-            .resolve_env(
-                &request.binary,
-                &server.state.secrets,
-                caller_principal.as_ref(),
-                caller.user_key().as_deref(),
+    let tool_secret_sources = match resolve_current_tool_env(
+        server,
+        &request.binary,
+        caller_principal.as_ref(),
+        caller.user_key().as_deref(),
+    )
+    .await
+    {
+        Ok(resolved) => resolved.secret_sources,
+        Err(error) => {
+            return ExecuteResult::exec_failed(
+                reason,
+                format!("approval hold rejected: tool secret resolution failed: {error}"),
             )
-            .await
-        {
-            Ok(resolved) => resolved.secret_sources,
-            Err(error) => {
-                return ExecuteResult::exec_failed(
-                    reason,
-                    format!("approval hold rejected: tool secret resolution failed: {error}"),
-                )
-            }
         }
     };
 
@@ -2805,25 +2846,20 @@ async fn execute_snapshot_with_access_request_inner(
 
     let caller = reconstruct_caller(snapshot.principal.clone(), &CallerIdentity::Unknown);
 
-    let current_tool_sources = {
-        let mut registry = server.state.tool_registry.write().await;
-        let _ = registry.reload_if_stale();
-        match registry
-            .resolve_env(
-                &snapshot.binary,
-                &server.state.secrets,
-                snapshot.principal.as_ref(),
-                caller.user_key().as_deref(),
+    let current_tool_sources = match resolve_current_tool_env(
+        server,
+        &snapshot.binary,
+        snapshot.principal.as_ref(),
+        caller.user_key().as_deref(),
+    )
+    .await
+    {
+        Ok(resolved) => resolved.secret_sources,
+        Err(error) => {
+            return ExecuteResult::exec_failed(
+                reason.to_string(),
+                format!("approval rejected: failed to re-resolve tool secrets: {error}"),
             )
-            .await
-        {
-            Ok(resolved) => resolved.secret_sources,
-            Err(error) => {
-                return ExecuteResult::exec_failed(
-                    reason.to_string(),
-                    format!("approval rejected: failed to re-resolve tool secrets: {error}"),
-                )
-            }
         }
     };
 
@@ -3125,32 +3161,22 @@ pub(super) async fn gating_sweeper(server: ServerContext) {
         // out the next tick's fail-closed expiry sweep.
         let due = { server.state.provisional.read().await.due_handles(now) };
         for handle in due {
-            let claimed = {
-                let mut registry = server.state.provisional.write().await;
-                let Some(expected) = registry.get(&handle).cloned() else {
-                    continue;
-                };
-                let mut staged = guard::gating::provisional::ProvisionalRegistry::new();
-                staged.insert(expected.clone());
-                let Ok(next) = staged.begin_revert(&handle) else {
-                    continue;
-                };
-                if let Some(store) = &server.state.session_store {
-                    if let Err(error) = store
-                        .compare_and_swap_provisional(expected, next.clone())
-                        .await
-                    {
-                        tracing::warn!(
-                            "failed to persist due rollback claim {}: {}",
-                            handle,
-                            error
-                        );
-                        continue;
-                    }
-                }
-                registry.insert(next.clone());
-                next
+            let Some(expected) = server.state.provisional.read().await.get(&handle).cloned() else {
+                continue;
             };
+            let mut staged = guard::gating::provisional::ProvisionalRegistry::new();
+            staged.insert(expected.clone());
+            let Ok(claimed) = staged.begin_revert(&handle) else {
+                continue;
+            };
+            match persist_provisional_transition(&server, expected, claimed.clone()).await {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    tracing::warn!("failed to persist due rollback claim {}: {}", handle, error);
+                    continue;
+                }
+            }
             server.emit_event(NotifyEvent {
                 event: "provisional_due",
                 at_unix: now,
@@ -3378,8 +3404,13 @@ pub(super) async fn finish_due_provisional(
         _ => None,
     });
     if check_exit == Some(0) {
-        let mut registry = server.state.provisional.write().await;
-        let expected = registry.get(&p.handle).cloned();
+        let expected = server
+            .state
+            .provisional
+            .read()
+            .await
+            .get(&p.handle)
+            .cloned();
         let confirmed = expected.as_ref().and_then(|expected| {
             let mut staged = guard::gating::provisional::ProvisionalRegistry::new();
             staged.insert(expected.clone());
@@ -3387,20 +3418,8 @@ pub(super) async fn finish_due_provisional(
         });
         match (expected, confirmed) {
             (Some(expected), Some(row)) => {
-                if let Some(store) = &server.state.session_store {
-                    if let Err(error) = store
-                        .compare_and_swap_provisional(expected, row.clone())
-                        .await
-                    {
-                        drop(registry);
-                        tracing::warn!(
-                            "confirmation check succeeded but provisional {} could not become durable: {}",
-                            p.handle,
-                            error
-                        );
-                    } else {
-                        registry.insert(row.clone());
-                        drop(registry);
+                match persist_provisional_transition(server, expected, row.clone()).await {
+                    Ok(true) => {
                         forget_proxy_provenance(server, &p.handle).await;
                         remove_revert_body(p);
                         server.emit_audit_ungated(
@@ -3430,31 +3449,18 @@ pub(super) async fn finish_due_provisional(
                             Some(0),
                         );
                     }
-                } else {
-                    registry.insert(row.clone());
-                    drop(registry);
-                    forget_proxy_provenance(server, &p.handle).await;
-                    remove_revert_body(p);
-                    server.emit_audit_ungated(
-                        AuditEvent::new(AuditKind::ProvisionalAutoConfirmed)
-                            .handle(&p.handle)
-                            .field(
-                                "check",
-                                audit_command_line(
-                                    p.confirm_check_binary.as_deref().unwrap_or_default(),
-                                    &p.confirm_check_args,
-                                ),
-                            )
-                            .field("control_path", format!("{:?}", p.control_path)),
-                    );
-                    return (
-                        format!("provisional {} confirmed by independent check", p.handle),
-                        Some(0),
-                    );
+                    Ok(false) => tracing::warn!(
+                        "confirmation check succeeded but provisional {} changed before publication",
+                        p.handle
+                    ),
+                    Err(error) => tracing::warn!(
+                        "confirmation check succeeded but provisional {} could not become durable: {}",
+                        p.handle,
+                        error
+                    ),
                 }
             }
             _ => {
-                drop(registry);
                 tracing::warn!(
                     "confirmation check succeeded but provisional {} was no longer reverting",
                     p.handle
@@ -4104,6 +4110,67 @@ mod transactional_tests {
                 .await
                 .expect("cleanup resolution completes after persistence resumes")
                 .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn provisional_transition_releases_live_registry_and_rejects_stale_publication() {
+        let mut server = crate::server::tests::config_for_proposal_test();
+        let state = tempfile::tempdir().unwrap();
+        let store = crate::session_store::SessionStore::open(state.path().join("state.db"), 3600)
+            .await
+            .unwrap();
+        server.state.session_store = Some(store);
+        let endpoint = "fixture-transition";
+        let sink = DaemonGateSink {
+            server: server.clone(),
+            endpoint: endpoint.to_string(),
+            protocol: "fixture-protocol".to_string(),
+            snapshot_dir: state.path().to_path_buf(),
+            snapshot_dir_safe: true,
+            window_secs: 60,
+        };
+        let handle = guard::proxy::GateSink::arm_revert(&sink, fixture_api_mutation(false))
+            .await
+            .unwrap();
+        assert!(guard::proxy::GateSink::mark_revert_dispatching(&sink, &handle).await);
+        assert!(guard::proxy::GateSink::mark_revert_forwarded(&sink, &handle, None).await);
+        let expected = server
+            .state
+            .provisional
+            .read()
+            .await
+            .get(&handle)
+            .cloned()
+            .unwrap();
+        let mut staged = ProvisionalRegistry::new();
+        staged.insert(expected.clone());
+        let next = staged.confirm(&handle).unwrap();
+        let (reached, release) =
+            install_api_containment_hook(endpoint, "provisional_transition_before_persist");
+        let transition = tokio::spawn({
+            let server = server.clone();
+            let expected = expected.clone();
+            async move { persist_provisional_transition(&server, expected, next).await }
+        });
+        reached.acquire().await.unwrap().forget();
+
+        let mut live = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server.state.provisional.write(),
+        )
+        .await
+        .expect("durable transition must not retain the live registry writer");
+        let mut newer = expected.clone();
+        newer.revert_detail = Some("newer live classification".to_string());
+        live.insert(newer.clone());
+        drop(live);
+
+        release.add_permits(1);
+        assert!(!transition.await.unwrap().unwrap());
+        assert_eq!(
+            server.state.provisional.read().await.get(&handle).cloned(),
+            Some(newer)
         );
     }
 

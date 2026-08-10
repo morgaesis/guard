@@ -210,7 +210,7 @@ fn message_content_to_text(value: &serde_json::Value) -> Result<String> {
 
 /// Build an LlmResponse from a parsed JSON value, accepting decision values
 /// case-insensitively (APPROVE/approve/Approve → APPROVE) and coercing a
-/// missing/invalid risk to 5.
+/// missing/invalid risk to the maximum score.
 fn decision_from_value(value: &serde_json::Value) -> Result<LlmResponse> {
     let decision_raw = value
         .get("decision")
@@ -228,7 +228,15 @@ fn decision_from_value(value: &serde_json::Value) -> Result<LlmResponse> {
         .unwrap_or("")
         .to_string();
 
-    let risk = value.get("risk").and_then(|v| v.as_i64()).unwrap_or(5) as i32;
+    // Provider-controlled authorization input must be range-checked before
+    // narrowing. Missing, non-integral, negative, and oversized scores all
+    // become maximally risky so malformed output cannot reach execute-now or
+    // low-risk learning through integer wraparound.
+    let risk = value
+        .get("risk")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|risk| (0..=10).contains(risk))
+        .map_or(10, |risk| risk as i32);
 
     // Reversibility is optional: present only when gating asked for it, and a
     // garbled value is tolerated as `None` so a small model's bad label fails
@@ -558,7 +566,52 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(r#"{"decision":"APPROVE","reason":"ok"}"#).unwrap();
         let d = decision_from_value(&v).unwrap();
-        assert_eq!(d.risk, 5);
+        assert_eq!(d.risk, 10);
+    }
+
+    #[test]
+    fn malformed_risk_is_always_maximal() {
+        let malformed = [
+            serde_json::Value::Null,
+            serde_json::json!(-1),
+            serde_json::json!(11),
+            serde_json::json!(i64::MIN),
+            serde_json::json!(i64::MAX),
+            serde_json::json!(u64::MAX),
+            serde_json::json!(1.5),
+            serde_json::json!("1"),
+        ];
+        for risk in malformed {
+            let value = serde_json::json!({
+                "decision": "APPROVE",
+                "reason": "fixture",
+                "risk": risk,
+                "reversibility": "reversible"
+            });
+            let decision = decision_from_value(&value).unwrap();
+            assert_eq!(decision.risk, 10);
+            assert_eq!(
+                crate::gating::decide_gate(
+                    decision.reversibility,
+                    Some(decision.risk),
+                    false,
+                    false,
+                ),
+                crate::gating::GateOutcome::Hold
+            );
+        }
+    }
+
+    #[test]
+    fn risk_boundaries_remain_exact() {
+        for risk in [0_i64, 10] {
+            let value = serde_json::json!({
+                "decision": "APPROVE",
+                "reason": "fixture",
+                "risk": risk
+            });
+            assert_eq!(decision_from_value(&value).unwrap().risk, risk as i32);
+        }
     }
 
     #[test]

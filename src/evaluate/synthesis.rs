@@ -419,12 +419,12 @@ fn build_create_verb_body(
 /// model is instructed to prefer declining (`confident: false`) over
 /// guessing.
 const SYSTEM_PROMPT_CREATE_DENY_SHAPE: &str = "You infer the minimal common shape from several \
-argument strings that were all denied for the same binary. Each example below is quoted exactly \
-as the regex must match it: no binary name, no leading or trailing space, no added punctuation. \
+canonical JSON argv arrays that were all denied for the same binary. Each example below is quoted \
+exactly as the regex must match it, including JSON brackets, commas, quotes, and escapes. \
 Produce a single fully-anchored regular expression (must start with ^ and end with $) that matches \
 each quoted example verbatim and materially similar variants -- and nothing broader. Do not prepend \
 `^\\s` or any other whitespace to the pattern; the match starts at the first character of the \
-argument string itself. Only set confident=true if the examples clearly share one narrow shape. If \
+JSON array itself. Only set confident=true if the examples clearly share one narrow shape. If \
 they look unrelated, or generalizing would require matching a wide range of unrelated arguments, \
 set confident=false and leave args_pattern empty. This pattern will become an automatic deny fast \
 path with no human review, so err toward declining rather than guessing.";
@@ -441,7 +441,7 @@ fn build_create_deny_shape_body(
         .collect::<Vec<_>>()
         .join("\n");
     let user = format!(
-        "Binary: {binary}\nMost recent denial reason: {last_reason}\n\nDenied argument strings \
+        "Binary: {binary}\nMost recent denial reason: {last_reason}\n\nDenied canonical argv arrays \
          (quoted exactly; match them without the surrounding quotes):\n{examples}"
     );
     let user = redact_for_llm(&user);
@@ -459,7 +459,7 @@ fn build_create_deny_shape_body(
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "args_pattern": {"type": "string", "description": "FULLY ANCHORED regex ^...$ over the space-joined argument string"},
+                        "args_pattern": {"type": "string", "description": "FULLY ANCHORED regex ^...$ over the canonical JSON argv array"},
                         "confident": {"type": "boolean", "description": "true only if the examples clearly share one narrow shape"},
                         "evidence": {"type": "string", "description": "one sentence justifying this shape"}
                     },

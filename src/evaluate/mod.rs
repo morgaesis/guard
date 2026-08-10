@@ -31,7 +31,7 @@ use prompt::{
 use verb_confirm::SYSTEM_PROMPT_CONFIRM_VERB_PROMOTION;
 
 use crate::gating::allow_promotion::AllowPromotionStore;
-use crate::gating::deny_shape::{split_command_line, DenyShapeStore};
+use crate::gating::deny_shape::DenyShapeStore;
 use crate::gating::GateMode;
 use crate::learned_rules::{
     acquire_async_authority_use_lease, run_async_durable_store_operation, AutoShimMode,
@@ -126,7 +126,7 @@ impl LearnedDenyUseLease {
     pub fn matching_reason(&self, binary: &str, args: &[String]) -> Option<String> {
         self.lease.as_ref().and_then(|lease| {
             lease
-                .matches(binary, &args.join(" "))
+                .matches(binary, args)
                 .map(|shape| shape.last_reason.clone())
         })
     }
@@ -618,8 +618,9 @@ impl Evaluator {
         // its only effect is forcing a fresh LLM call, never a grant, since
         // this store can only ever hold shapes the LLM already denied.
         if !reevaluate {
-            if let Some(ref store) = self.deny_shapes {
-                let (binary, args_joined) = split_command_line(command);
+            if let (Some(store), Some((binary, args))) =
+                (self.deny_shapes.as_ref(), structured_command)
+            {
                 if refresh_deny_shapes_once(store).await.is_err() {
                     return EvalResult::Deny {
                         reason: "learned deny authority is unavailable".to_string(),
@@ -639,7 +640,7 @@ impl Evaluator {
                         }
                     };
                 let hit = lease
-                    .matches(binary, args_joined)
+                    .matches(binary, args)
                     .map(|shape| shape.last_reason.clone());
                 if let Some(reason) = hit {
                     tracing::debug!("auto-learned deny shape matched: {}", reason);
@@ -754,7 +755,7 @@ async fn refresh_deny_shapes_once(store: &Arc<RwLock<DenyShapeStore>>) -> anyhow
 #[cfg(test)]
 mod tests {
     use super::{EvalConfig, EvalResult, EvalSource, Evaluator};
-    use crate::gating::deny_shape::DenyShapeStore;
+    use crate::gating::deny_shape::{canonical_argv, DenyShapeStore};
     use crate::learned_rules::{AutoShimMode, LearnedRuleStore};
     use std::sync::Arc;
     use tokio::sync::RwLock;
@@ -1040,12 +1041,18 @@ mod tests {
             temp.path().join("deny.yaml"),
         ))
         .unwrap();
+        let denied_args = vec![
+            "delete".to_string(),
+            "namespace".to_string(),
+            "production".to_string(),
+        ];
+        let denied_evidence = canonical_argv(&denied_args);
         store
             .promote_shape(
                 "kubectl",
                 "kubectl",
-                r"^delete namespace \S+$",
-                &["delete namespace prod".to_string()],
+                &format!("^{}$", regex::escape(&denied_evidence)),
+                &[denied_evidence],
                 "namespace deletion is destructive",
                 3,
             )
@@ -1055,7 +1062,10 @@ mod tests {
             Evaluator::new(EvalConfig::default().deny_shapes(Arc::new(RwLock::new(store))))
                 .unwrap();
 
-        match evaluator.evaluate("kubectl delete namespace prod").await {
+        match evaluator
+            .evaluate_scoped_argv("kubectl", &denied_args, None, false, false, None)
+            .await
+        {
             EvalResult::Deny { source, reason, .. } => {
                 assert_eq!(source, EvalSource::LearnedDeny);
                 assert!(reason.contains("namespace deletion is destructive"));
@@ -1070,7 +1080,17 @@ mod tests {
         }
 
         // A non-matching command for the same binary must not be affected.
-        match evaluator.evaluate("kubectl get pods").await {
+        match evaluator
+            .evaluate_scoped_argv(
+                "kubectl",
+                &["get".to_string(), "pods".to_string()],
+                None,
+                false,
+                false,
+                None,
+            )
+            .await
+        {
             EvalResult::Error(msg) => assert!(msg.contains("API key")),
             other => {
                 panic!("expected fallthrough to the LLM for a non-matching shape, got {other:?}")
@@ -1085,12 +1105,18 @@ mod tests {
             temp.path().join("deny.yaml"),
         ))
         .unwrap();
+        let denied_args = vec![
+            "delete".to_string(),
+            "namespace".to_string(),
+            "production".to_string(),
+        ];
+        let denied_evidence = canonical_argv(&denied_args);
         store
             .promote_shape(
                 "kubectl",
                 "kubectl",
-                r"^delete namespace \S+$",
-                &["delete namespace prod".to_string()],
+                &format!("^{}$", regex::escape(&denied_evidence)),
+                &[denied_evidence],
                 "namespace deletion is destructive",
                 3,
             )
@@ -1104,7 +1130,7 @@ mod tests {
         .unwrap();
 
         match evaluator
-            .evaluate_with_reevaluate("kubectl delete namespace prod", None, false)
+            .evaluate_scoped_argv("kubectl", &denied_args, None, false, false, None)
             .await
         {
             EvalResult::Deny { source, .. } => assert_eq!(source, EvalSource::LearnedDeny),
@@ -1115,7 +1141,7 @@ mod tests {
         // disabled and no policy engine, the fallback is a bare default-deny
         // (StaticPolicy), proving the learned-deny check was bypassed.
         match evaluator
-            .evaluate_with_reevaluate("kubectl delete namespace prod", None, true)
+            .evaluate_scoped_argv("kubectl", &denied_args, None, true, false, None)
             .await
         {
             EvalResult::Deny { source, reason, .. } => {

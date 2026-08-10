@@ -4,6 +4,7 @@ use crate::session::{
     SessionInteraction, SessionOwner, SessionRegistry,
 };
 use crate::session_store::SessionStore;
+use crate::tool_config::ResolvedToolEnv;
 #[cfg(unix)]
 use anyhow::Context;
 use anyhow::{bail, Result};
@@ -635,69 +636,78 @@ async fn deny_and_record<W: AsyncWrite + Unpin>(
                     request
                 }))
             });
-            let (request, created) = {
-                let mut requests = phase.server.state.grant_requests.write().await;
-                let queue_full = requests.len() >= super::admin::MAX_GRANT_REQUESTS
-                    || requests
-                        .values()
-                        .filter(|request| {
-                            request.session_token == token
-                                && request.status
-                                    == crate::grant_profile::GrantRequestStatus::Pending
-                        })
-                        .count()
-                        >= super::admin::MAX_PENDING_GRANT_REQUESTS_PER_SESSION;
-                if let Some(existing) = requests
+            let _transition = phase
+                .server
+                .state
+                .grant_request_transition_gate
+                .lock()
+                .await;
+            let baseline_requests = phase.server.state.grant_requests.read().await.clone();
+            let queue_full = baseline_requests.len() >= super::admin::MAX_GRANT_REQUESTS
+                || baseline_requests
                     .values()
-                    .find(|request| {
+                    .filter(|request| {
                         request.session_token == token
                             && request.status == crate::grant_profile::GrantRequestStatus::Pending
-                            && request.expires_unix > now
-                            && request.issued_session_revision
-                                == candidate
-                                    .as_ref()
-                                    .and_then(|candidate| candidate.issued_session_revision.clone())
-                            && request.request_key
-                                == candidate
-                                    .as_ref()
-                                    .map(|candidate| candidate.request_key.as_str())
-                                    .unwrap_or_default()
                     })
-                    .cloned()
+                    .count()
+                    >= super::admin::MAX_PENDING_GRANT_REQUESTS_PER_SESSION;
+            let existing = baseline_requests
+                .values()
+                .find(|request| {
+                    request.session_token == token
+                        && request.status == crate::grant_profile::GrantRequestStatus::Pending
+                        && request.expires_unix > now
+                        && request.issued_session_revision
+                            == candidate
+                                .as_ref()
+                                .and_then(|candidate| candidate.issued_session_revision.clone())
+                        && request.request_key
+                            == candidate
+                                .as_ref()
+                                .map(|candidate| candidate.request_key.as_str())
+                                .unwrap_or_default()
+                })
+                .cloned();
+            let (request, created) = if let Some(existing) = existing {
+                (Some(existing), false)
+            } else if queue_full {
+                (None, false)
+            } else if let Some(candidate) = candidate {
+                if super::admin::grant_request_payload_bytes(&candidate)
+                    > super::admin::MAX_GRANT_REQUEST_PAYLOAD_BYTES
                 {
-                    (Some(existing), false)
-                } else if queue_full {
                     (None, false)
-                } else if let Some(candidate) = candidate {
-                    if super::admin::grant_request_payload_bytes(&candidate)
-                        > super::admin::MAX_GRANT_REQUEST_PAYLOAD_BYTES
-                    {
-                        (None, false)
-                    } else {
-                        let persisted = if let Some(store) = &phase.server.state.session_store {
-                            match store.save_grant_request(candidate.clone()).await {
-                                Ok(()) => true,
-                                Err(error) => {
-                                    tracing::warn!(
-                                        "failed to persist denial escalation: {}",
-                                        error
-                                    );
-                                    false
-                                }
+                } else {
+                    let persisted = if let Some(store) = &phase.server.state.session_store {
+                        match store.save_grant_request(candidate.clone()).await {
+                            Ok(()) => true,
+                            Err(error) => {
+                                tracing::warn!("failed to persist denial escalation: {}", error);
+                                false
                             }
-                        } else {
-                            true
-                        };
-                        if persisted {
+                        }
+                    } else {
+                        true
+                    };
+                    if persisted {
+                        let mut requests = phase.server.state.grant_requests.write().await;
+                        if *requests == baseline_requests {
                             requests.insert(candidate.handle.clone(), candidate.clone());
                             (Some(candidate), true)
                         } else {
-                            (None, false)
+                            let converged = requests
+                                .values()
+                                .find(|request| request.request_key == candidate.request_key)
+                                .cloned();
+                            (converged, false)
                         }
+                    } else {
+                        (None, false)
                     }
-                } else {
-                    (None, false)
                 }
+            } else {
+                (None, false)
             };
             if let Some(request) = request {
                 if request.requester.is_some() {
@@ -2232,6 +2242,34 @@ pub(super) async fn persist_session_snapshot(
     Ok(())
 }
 
+/// Resolve one tool mapping without retaining the global registry lock across
+/// secret-backend I/O. A mapping change during resolution invalidates the
+/// result, so callers never use secret values selected by stale authority.
+pub(super) async fn resolve_current_tool_env(
+    server: &ServerContext,
+    binary: &str,
+    principal: Option<&guard::principal::PrincipalKey>,
+    user_key: Option<&str>,
+) -> Result<ResolvedToolEnv> {
+    let snapshot = {
+        let mut registry = server.state.tool_registry.write().await;
+        registry.reload_if_stale()?;
+        registry.clone()
+    };
+    let resolved = snapshot
+        .resolve_env(binary, &server.state.secrets, principal, user_key)
+        .await?;
+    let current = {
+        let mut registry = server.state.tool_registry.write().await;
+        registry.reload_if_stale()?;
+        registry.same_authority(&snapshot)
+    };
+    if !current {
+        bail!("tool environment authority changed during secret resolution");
+    }
+    Ok(resolved)
+}
+
 /// Validate access authority at the execution-admission boundary and consume
 /// bounded uses. The durable registry snapshot is written before spawn, so a
 /// later spawn failure burns the admitted use, unlimited grants observe remote
@@ -2253,18 +2291,21 @@ pub(super) async fn admit_access_use(
     let selected_verbs = selected_verbs.to_vec();
     let preferred_requests = preferred_requests.map(ToOwned::to_owned);
     let task = tokio::spawn(async move {
-        let mut sessions = server.state.sessions.write().await;
-        if !sessions.is_access_managed(&token) {
-            return Ok(None);
-        }
+        let _transition = server.state.grant_request_transition_gate.lock().await;
         let mut reloaded_after_conflict = false;
         loop {
-            if !sessions.is_access_managed(&token) {
-                return Err(
-                    "access session expired or was revoked during durable admission".to_string(),
-                );
+            let baseline = server.state.sessions.read().await.clone();
+            if !baseline.is_access_managed(&token) {
+                return if reloaded_after_conflict {
+                    Err(
+                        "access session expired or was revoked during durable admission"
+                            .to_string(),
+                    )
+                } else {
+                    Ok(None)
+                };
             }
-            let mut staged = sessions.clone();
+            let mut staged = baseline.clone();
             let admission = staged.consume_access_use(
                 &token,
                 &selected_verbs,
@@ -2274,6 +2315,13 @@ pub(super) async fn admit_access_use(
                 persist_session_snapshot(server.state.session_store.clone(), staged.clone()).await;
             match persist_result {
                 Ok(()) => {
+                    let mut sessions = server.state.sessions.write().await;
+                    if sessions.revision() != baseline.revision() {
+                        return Err(
+                            "access authority changed while durable admission was committing"
+                                .to_string(),
+                        );
+                    }
                     *sessions = staged;
                 }
                 Err(error)
@@ -2283,11 +2331,15 @@ pub(super) async fn admit_access_use(
                     let Some(store) = &server.state.session_store else {
                         return Err(format!("failed to persist access admission: {error}"));
                     };
-                    *sessions = store.load_registry().await.map_err(|reload_error| {
+                    let durable = store.load_registry().await.map_err(|reload_error| {
                         format!(
                             "failed to reload sessions after a concurrent access admission: {reload_error}"
                         )
                     })?;
+                    let mut sessions = server.state.sessions.write().await;
+                    if sessions.revision() == baseline.revision() {
+                        *sessions = durable;
+                    }
                     reloaded_after_conflict = true;
                     continue;
                 }
@@ -2876,17 +2928,13 @@ pub(super) async fn exec_after_approval_with_command_authority<W: AsyncWrite + U
 
     let user_key = caller.user_key();
     let caller_principal = caller.principal();
-    let tool_env = {
-        let mut reg = server.state.tool_registry.write().await;
-        let _ = reg.reload_if_stale();
-        reg.resolve_env(
-            &request.binary,
-            &server.state.secrets,
-            caller_principal.as_ref(),
-            user_key.as_deref(),
-        )
-        .await
-    };
+    let tool_env = resolve_current_tool_env(
+        server,
+        &request.binary,
+        caller_principal.as_ref(),
+        user_key.as_deref(),
+    )
+    .await;
     let tool_env = match tool_env {
         Ok(env) => env,
         Err(e) => {
@@ -3677,6 +3725,109 @@ mod decision_trace_feature_tests {
 mod transactional_access_tests {
     use super::*;
 
+    #[derive(Clone)]
+    struct PausingSecretBackend {
+        reached: std::sync::Arc<tokio::sync::Semaphore>,
+        release: std::sync::Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::secrets::SecretBackend for PausingSecretBackend {
+        fn name(&self) -> &str {
+            "pausing-test-backend"
+        }
+
+        async fn get(
+            &self,
+            _principal: &guard::principal::PrincipalKey,
+            _key: &str,
+        ) -> Result<Option<String>> {
+            self.reached.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            Ok(Some("resolved-value".to_string()))
+        }
+
+        async fn list(&self, _principal: &guard::principal::PrincipalKey) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_all(&self) -> Result<Vec<(guard::principal::PrincipalKey, String)>> {
+            Ok(Vec::new())
+        }
+
+        async fn set(
+            &self,
+            _principal: &guard::principal::PrincipalKey,
+            _key: &str,
+            _value: &str,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn delete(
+            &self,
+            _principal: &guard::principal::PrincipalKey,
+            _key: &str,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn secret_resolution_releases_tool_registry_and_rejects_stale_mapping() {
+        let mut server = crate::server::tests::config_for_proposal_test();
+        let state = tempfile::tempdir().unwrap();
+        let path = state.path().join("tools.yaml");
+        let mut registry = crate::tool_config::ToolRegistry::load(path).unwrap();
+        registry
+            .set(
+                "fixture-tool",
+                crate::tool_config::ToolConfig {
+                    secrets: HashMap::from([(
+                        "FIXTURE_VARIABLE".to_string(),
+                        "fixture-reference".to_string(),
+                    )]),
+                    ..crate::tool_config::ToolConfig::default()
+                },
+            )
+            .unwrap();
+        *server.state.tool_registry.write().await = registry;
+        let reached = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        server.state.secrets = std::sync::Arc::new(crate::secrets::SecretManager::with_backend(
+            PausingSecretBackend {
+                reached: reached.clone(),
+                release: release.clone(),
+            },
+        ));
+        let principal = guard::principal::PrincipalKey::from_uid(1001);
+        let resolving = tokio::spawn({
+            let server = server.clone();
+            let principal = principal.clone();
+            async move {
+                resolve_current_tool_env(&server, "fixture-tool", Some(&principal), Some("1001"))
+                    .await
+            }
+        });
+        reached.acquire().await.unwrap().forget();
+
+        let mut live = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server.state.tool_registry.write(),
+        )
+        .await
+        .expect("secret lookup must not retain the tool-registry writer");
+        live.set("fixture-tool", crate::tool_config::ToolConfig::default())
+            .unwrap();
+        drop(live);
+
+        release.add_permits(1);
+        let error = resolving.await.unwrap().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("authority changed during secret resolution"));
+    }
+
     #[tokio::test]
     async fn bounded_admission_reloads_once_after_unrelated_daemon_write() {
         let mut server = crate::server::tests::config_for_proposal_test();
@@ -3835,5 +3986,102 @@ mod transactional_access_tests {
 
         assert!(error.contains("expired or was revoked"));
         assert!(!server.state.sessions.read().await.has(&token));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stalled_access_admission_releases_sessions_and_cannot_publish_over_newer_state() {
+        let mut server = crate::server::tests::config_for_proposal_test();
+        let state = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(state.path().join("state.db"), 3600)
+            .await
+            .unwrap();
+        let token = "stalled-admission".to_string();
+        let mut registry = SessionRegistry::new();
+        registry.grant(
+            token.clone(),
+            crate::session::SessionGrant {
+                allow: Vec::new(),
+                deny: Vec::new(),
+                allow_exact: Vec::new(),
+                deny_exact: Vec::new(),
+                activated_verbs: vec!["host-inspect".to_string()],
+                override_markers: Vec::new(),
+                scope: crate::session::IssuedGrantScope {
+                    access_managed: true,
+                    ..crate::session::IssuedGrantScope::default()
+                },
+                expires_at: None,
+                prompt_append: None,
+                generated_notes: Vec::new(),
+                granted_at: 1,
+                static_only: true,
+                auto_amend: false,
+                owner: SessionOwner::Principal(guard::principal::PrincipalKey::from_uid(1001)),
+            },
+        );
+        registry.install_access_grant(
+            &token,
+            Some(1),
+            "access-use".to_string(),
+            vec!["host-inspect".to_string()],
+        );
+        store.persist_registry(&registry).await.unwrap();
+        *server.state.sessions.write().await = registry;
+        server.state.session_store = Some(store.clone());
+        let request = ExecuteRequest {
+            binary: "host-inspect".to_string(),
+            args: Vec::new(),
+            auth_token: None,
+            env: HashMap::new(),
+            secrets: HashMap::new(),
+            secret_files: HashMap::new(),
+            stream: false,
+            session_token: Some(token.clone()),
+            revert: None,
+            confirm_within_secs: None,
+            reevaluate: false,
+            ssh_hostkey: None,
+            cwd: None,
+            require_approval: None,
+            wait_approval_secs: None,
+            verb: None,
+        };
+        let (committed, release) = store.pause_registry_commit_for_test("session store persist");
+        let admission = tokio::spawn({
+            let server = server.clone();
+            async move { admit_access_use(&server, &request, &["host-inspect".to_string()], None).await }
+        });
+        committed.acquire().await.unwrap().forget();
+
+        let mut sessions = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server.state.sessions.write(),
+        )
+        .await
+        .expect("durable admission must not retain the live sessions writer");
+        sessions.record_interaction(
+            &token,
+            SessionInteraction {
+                at_unix: guard::env::now_unix(),
+                command: "newer interaction".to_string(),
+                allowed: false,
+                source: SessionDecisionSource::StaticPolicy,
+                reason: "newer authority state".to_string(),
+                risk: Some(10),
+                exec_status: SessionExecStatus::NotAttempted,
+                exit_code: None,
+                exposed_secret_refs: Vec::new(),
+                decision_trace: None,
+            },
+        );
+        let newer_revision = sessions.revision();
+        drop(sessions);
+
+        release.add_permits(1);
+        let error = admission.await.unwrap().unwrap_err();
+        assert!(error.contains("authority changed"));
+        let sessions = server.state.sessions.read().await;
+        assert_eq!(sessions.revision(), newer_revision);
+        assert_eq!(sessions.show(&token, 10).unwrap().stats.denied, 1);
     }
 }

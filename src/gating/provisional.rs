@@ -84,7 +84,7 @@ impl ProvisionalStatus {
 }
 
 /// One provisional execution and its revert.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Provisional {
     pub handle: String,
     /// Principal of the caller that created this, used to reconstruct the exec

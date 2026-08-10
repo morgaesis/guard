@@ -181,12 +181,13 @@ pub struct ApiProxy {
     /// swaps mark the generation odd for their short transition, then publish
     /// the next even value. Routes bind an even generation plus policy digest.
     authority_revision: AtomicU64,
-    /// A policy reload takes the write side after excluding mutations; an
-    /// admitted mutation holds the read side through upstream dispatch.
+    /// Mutations hold the shared side through their finite upstream header
+    /// handoff. Reload first acquires the exclusive side, then uses only
+    /// nonblocking acquisition for the read gate and policy snapshot.
     mutation_authority_gate: RwLock<()>,
     /// Read-only requests retain policy authority through response headers on
-    /// a separate lock. Reloaders acquire the mutation lock first, so reads do
-    /// not queue behind a reload waiting for a stalled mutation.
+    /// a separate lock, so they do not queue behind a reload waiting for a
+    /// stalled mutation.
     read_authority_gate: RwLock<()>,
     /// Bridge to the daemon's consequence machinery, attached before serving.
     /// When present, recoverable writes are wrapped in an auto-revert envelope.
@@ -252,8 +253,10 @@ struct StagedRevert {
 
 const CREATE_PROVENANCE_ANNOTATION: &str = "guard.morgaesis.dev/provisional";
 
-#[derive(Debug, Clone, Copy)]
-struct ApprovedApiHold;
+#[derive(Debug, Clone)]
+struct ApprovedApiHold {
+    body_sha256: String,
+}
 
 #[derive(Debug, Clone)]
 struct PreparedCreateProvenance(String);
@@ -1968,9 +1971,9 @@ impl ApiProxy {
         op: &ApiOp,
         reason: &str,
         conn_id: u64,
-        authorization: Option<PendingApiAuthorization>,
+        mut authorization: Option<PendingApiAuthorization>,
     ) -> Response<ProxyBody> {
-        let body = match prepare_create_provenance(
+        let mut body = match prepare_create_provenance(
             &mut parts,
             body,
             op,
@@ -1996,6 +1999,31 @@ impl ApiProxy {
                 "Forbidden",
             );
         };
+        let route_authority = match self.route_authority_from_parts(&parts) {
+            Some(authority) => authority,
+            None => return self.missing_route_authority_response(),
+        };
+        let mut prepared_snapshot = None;
+        let mut preparation_error = None;
+        if self.is_kubernetes_mutation(op) {
+            match self
+                .arbitrate_kubernetes_mutation(&parts, &body, path, op, &route_authority, None)
+                .await
+            {
+                Ok((guarded_body, snapshot)) => {
+                    body = guarded_body;
+                    prepared_snapshot = Some(snapshot);
+                }
+                // A request that is denied by the hold never reaches the
+                // upstream, so an unavailable concurrency snapshot must not
+                // bypass the operator's denial. If the operator approves, the
+                // preparation failure is returned and no bytes are sent.
+                Err(response) => preparation_error = Some(response),
+            }
+        }
+        if let Some(pending) = authorization.as_mut() {
+            pending.summary.redacted_body_shape = redacted_body_shape(&body);
+        }
         tracing::info!(target: "guard::apiproxy", "HOLD {} ({})", label, reason);
         let snapshot = api_hold_snapshot(label.clone(), query, op, &body);
         let session_context = parts
@@ -2005,30 +2033,36 @@ impl ApiProxy {
         let (mut response, outcome) =
             match gate.hold_request(&snapshot, reason, session_context).await {
                 HoldDecision::Approved { handle } => {
-                    let redact = self.protocol.redactable_read(op);
-                    tracing::info!(
-                        target: "guard::apiproxy",
-                        "ALLOW {} (operator approved hold {}){}",
-                        label,
-                        handle,
-                        if redact { " (redacting)" } else { "" }
-                    );
-                    let mut parts = parts;
-                    parts.extensions.insert(ApprovedApiHold);
-                    let response = self
-                        .forward_buffered(
-                            parts,
-                            body,
-                            path,
-                            query,
-                            redact,
-                            Some(op.clone()),
-                            conn_id,
-                            None,
-                            authorization,
-                        )
-                        .await;
-                    (response, GuardHoldOutcome::Approved)
+                    if let Some(response) = preparation_error.take() {
+                        (response, GuardHoldOutcome::Denied)
+                    } else {
+                        let redact = self.protocol.redactable_read(op);
+                        tracing::info!(
+                            target: "guard::apiproxy",
+                            "ALLOW {} (operator approved hold {}){}",
+                            label,
+                            handle,
+                            if redact { " (redacting)" } else { "" }
+                        );
+                        let mut parts = parts;
+                        parts.extensions.insert(ApprovedApiHold {
+                            body_sha256: snapshot.body_sha256.clone(),
+                        });
+                        let response = self
+                            .forward_buffered(
+                                parts,
+                                body,
+                                path,
+                                query,
+                                redact,
+                                Some(op.clone()),
+                                conn_id,
+                                prepared_snapshot,
+                                authorization,
+                            )
+                            .await;
+                        (response, GuardHoldOutcome::Approved)
+                    }
                 }
                 HoldDecision::Denied { reason } => {
                     tracing::info!(target: "guard::apiproxy", "DENY {} (held: {})", label, reason);
@@ -2176,6 +2210,15 @@ impl ApiProxy {
                     arbitration_snapshot = snapshot;
                 }
                 Err(response) => return response,
+            }
+        }
+        if let Some(approved) = parts.extensions.get::<ApprovedApiHold>() {
+            if approved.body_sha256 != body_sha256(&body) {
+                return self.status_resp(
+                    StatusCode::FORBIDDEN,
+                    "guard api-proxy: final request bytes changed after approval; submit a fresh approval",
+                    "Forbidden",
+                );
             }
         }
         // Snapshot reads can block on the upstream. Acquire any snapshot before
@@ -3627,15 +3670,21 @@ async fn collect_request_body(
 }
 
 fn api_hold_snapshot(label: String, query: &str, op: &ApiOp, body: &[u8]) -> ApiHoldSnapshot {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(body);
     ApiHoldSnapshot {
         label,
-        body_sha256: digest.iter().map(|byte| format!("{byte:02x}")).collect(),
+        body_sha256: body_sha256(body),
         redacted_body_shape: redacted_body_shape(body),
         redacted_query: crate::evaluate::redact_for_llm(query),
         authority_selectors: op.authority_selectors.clone(),
     }
+}
+
+fn body_sha256(body: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(body)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn full_body(bytes: Bytes) -> ProxyBody {
@@ -3905,24 +3954,32 @@ async fn policy_reloader(path: PathBuf, proxy: Arc<ApiProxy>) {
         if modified == last {
             continue;
         }
-        last = modified;
         match ApiPolicy::load_file(&path) {
             Ok(p) => {
                 proxy.policy_reload_attempt.fetch_add(1, Ordering::AcqRel);
                 proxy.policy_reload_notify.notify_waiters();
                 let _mutation_authority_guard = proxy.mutation_authority_gate.write().await;
-                let _read_authority_guard = proxy.read_authority_gate.write().await;
-                let old_intent = proxy.policy.read().await.intent.clone();
+                let Ok(_read_authority_guard) = proxy.read_authority_gate.try_write() else {
+                    tracing::debug!(target: "guard::apiproxy", "policy publication deferred while a read handoff is active");
+                    continue;
+                };
+                let Ok(mut policy) = proxy.policy.try_write() else {
+                    tracing::debug!(target: "guard::apiproxy", "policy publication deferred while a policy snapshot is active");
+                    continue;
+                };
+                let old_intent = policy.intent.clone();
                 let new_intent = p.intent.clone();
                 proxy.begin_authority_update();
                 if old_intent != new_intent {
                     proxy.rebuild_judge_for_intent_during_update(new_intent);
                 }
-                *proxy.policy.write().await = p;
+                *policy = p;
                 proxy.finish_authority_update();
+                last = modified;
                 tracing::info!(target: "guard::apiproxy", "reloaded api-policy from {}", path.display());
             }
             Err(e) => {
+                last = modified;
                 tracing::error!(
                     target: "guard::apiproxy",
                     "api-policy reload failed ({}); keeping previous policy: {e}",

@@ -936,6 +936,7 @@ struct ArbitrationMock {
     object: Arc<std::sync::Mutex<Value>>,
     forwarded_mutations: Arc<AtomicUsize>,
     mutation_bodies: Arc<std::sync::Mutex<Vec<(hyper::Method, Value)>>>,
+    mutation_digests: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl ArbitrationMock {
@@ -956,6 +957,7 @@ impl ArbitrationMock {
             }))),
             forwarded_mutations: Arc::new(AtomicUsize::new(0)),
             mutation_bodies: Arc::new(std::sync::Mutex::new(Vec::new())),
+            mutation_digests: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -999,6 +1001,13 @@ async fn arbitration_mock_handler(
     mock.forwarded_mutations.fetch_add(1, Ordering::SeqCst);
     let method = req.method().clone();
     let bytes = req.into_body().collect().await.unwrap().to_bytes();
+    mock.mutation_digests.lock().unwrap().push({
+        use sha2::Digest;
+        sha2::Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    });
     let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     mock.mutation_bodies
         .lock()
@@ -1275,6 +1284,131 @@ async fn observations_are_principal_bound_and_arbitrate_interleaved_writes() {
     assert_eq!(delete.0, hyper::Method::DELETE);
     assert_eq!(delete.1["preconditions"]["uid"], "deployment-uid");
     assert_eq!(delete.1["preconditions"]["resourceVersion"], "5");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_kubernetes_mutations_approve_the_exact_guarded_bytes() {
+    let cases = [
+        (
+            reqwest::Method::PUT,
+            Some("application/json"),
+            Some(r#"{"metadata":{"name":"api","namespace":"dev"},"spec":{"replicas":3}}"#),
+        ),
+        (
+            reqwest::Method::PATCH,
+            Some("application/merge-patch+json"),
+            Some(r#"{"spec":{"replicas":3}}"#),
+        ),
+        (reqwest::Method::DELETE, None, None),
+    ];
+    for (method, content_type, body) in cases {
+        let (upstream, mock) = spawn_arbitration_mock().await;
+        let upstream =
+            Upstream::from_kubeconfig_str(&kubeconfig_for(&upstream), None).expect("upstream");
+        let tls = ProxyTls::generate().expect("tls");
+        let ca_pem = tls.ca_pem().to_string();
+        let policy = ApiPolicy::from_yaml(
+            "default: deny\nrules:\n  - verbs: [get]\n    resources: [deployments]\n    namespaces: [dev]\n    action: allow\n  - verbs: [update, patch, delete]\n    resources: [deployments]\n    namespaces: [dev]\n    action: hold\n",
+        )
+        .unwrap();
+        let (listener, listen) = reserve_listener().await;
+        let proxy = Arc::new(
+            ApiProxy::new(listen, tls, upstream, policy, None)
+                .with_listener_mode(ApiListenerMode::Policy),
+        );
+        let sink = SnapshotSink::default();
+        proxy.attach_gate(Arc::new(sink.clone()));
+        proxy.attach_session_sink(Arc::new(PrincipalSessionSink));
+        tokio::spawn(proxy.serve_on(listener));
+        let client = reqwest::Client::builder()
+            .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+            .build()
+            .unwrap();
+        let url = format!("https://{listen}/apis/apps/v1/namespaces/dev/deployments/api");
+        assert_eq!(
+            client
+                .get(&url)
+                .bearer_auth("principal-a")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        let mut request = client.request(method, &url).bearer_auth("principal-a");
+        if let Some(content_type) = content_type {
+            request = request.header("content-type", content_type);
+        }
+        if let Some(body) = body {
+            request = request.body(body);
+        }
+        assert!(request.send().await.unwrap().status().is_success());
+        let snapshots = sink.snapshots.lock().unwrap();
+        let digests = mock.mutation_digests.lock().unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(digests.len(), 1);
+        assert_eq!(snapshots[0].body_sha256, digests[0]);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn object_change_after_hold_cannot_rewrite_approved_mutation_bytes() {
+    let (upstream, mock) = spawn_arbitration_mock().await;
+    let upstream =
+        Upstream::from_kubeconfig_str(&kubeconfig_for(&upstream), None).expect("upstream");
+    let tls = ProxyTls::generate().expect("tls");
+    let ca_pem = tls.ca_pem().to_string();
+    let policy = ApiPolicy::from_yaml(
+        "default: deny\nrules:\n  - verbs: [get]\n    resources: [deployments]\n    namespaces: [dev]\n    action: allow\n  - verbs: [patch]\n    resources: [deployments]\n    namespaces: [dev]\n    action: hold\n",
+    )
+    .unwrap();
+    let (listener, listen) = reserve_listener().await;
+    let proxy = Arc::new(
+        ApiProxy::new(listen, tls, upstream, policy, None)
+            .with_listener_mode(ApiListenerMode::Policy),
+    );
+    let sink = BlockingSnapshotSink::default();
+    proxy.attach_gate(Arc::new(sink.clone()));
+    proxy.attach_session_sink(Arc::new(PrincipalSessionSink));
+    tokio::spawn(proxy.serve_on(listener));
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap();
+    let url = format!("https://{listen}/apis/apps/v1/namespaces/dev/deployments/api");
+    assert_eq!(
+        client
+            .get(&url)
+            .bearer_auth("principal-a")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    let pending = tokio::spawn({
+        let client = client.clone();
+        let url = url.clone();
+        async move {
+            client
+                .patch(url)
+                .bearer_auth("principal-a")
+                .header("content-type", "application/merge-patch+json")
+                .body(r#"{"spec":{"replicas":3}}"#)
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    sink.reached.acquire().await.unwrap().forget();
+    mock.advance_spec();
+    sink.release.add_permits(1);
+    assert_eq!(pending.await.unwrap().status(), 409);
+    let snapshots = sink.state.snapshots.lock().unwrap();
+    let digests = mock.mutation_digests.lock().unwrap();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(digests.len(), 1);
+    assert_eq!(snapshots[0].body_sha256, digests[0]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5943,6 +6077,83 @@ struct SnapshotSink {
     snapshots: Arc<std::sync::Mutex<Vec<ApiHoldSnapshot>>>,
 }
 
+#[derive(Clone)]
+struct BlockingSnapshotSink {
+    state: SnapshotSink,
+    reached: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for BlockingSnapshotSink {
+    fn default() -> Self {
+        Self {
+            state: SnapshotSink::default(),
+            reached: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl GateSink for BlockingSnapshotSink {
+    async fn arm_revert(&self, mutation: guard::proxy::ApiMutation) -> Option<String> {
+        self.state.arm_revert(mutation).await
+    }
+
+    async fn mark_revert_dispatching(&self, handle: &str) -> bool {
+        self.state.mark_revert_dispatching(handle).await
+    }
+
+    async fn resolve(&self, handle: &str) -> bool {
+        self.state.resolve(handle).await
+    }
+
+    async fn authorize_cleanup(
+        &self,
+        handle: &str,
+        resource_uid: &str,
+        create_provenance: &str,
+        handoff: &mut dyn ApiForwardHandoff,
+    ) -> Result<(), String> {
+        self.state
+            .authorize_cleanup(handle, resource_uid, create_provenance, handoff)
+            .await
+    }
+
+    async fn mark_revert_forwarded(&self, handle: &str, resource_uid: Option<&str>) -> bool {
+        self.state.mark_revert_forwarded(handle, resource_uid).await
+    }
+
+    async fn mark_revert_indeterminate(
+        &self,
+        handle: &str,
+        reason: &str,
+        resource_uid: Option<&str>,
+    ) -> bool {
+        self.state
+            .mark_revert_indeterminate(handle, reason, resource_uid)
+            .await
+    }
+
+    async fn cancel_staged_revert(&self, handle: &str) -> bool {
+        self.state.cancel_staged_revert(handle).await
+    }
+
+    async fn hold_request(
+        &self,
+        snapshot: &ApiHoldSnapshot,
+        _reason: &str,
+        _session_context: Option<&ApiSessionContext>,
+    ) -> guard::proxy::HoldDecision {
+        self.state.snapshots.lock().unwrap().push(snapshot.clone());
+        self.reached.add_permits(1);
+        self.release.acquire().await.unwrap().forget();
+        guard::proxy::HoldDecision::Approved {
+            handle: "snapshot-approved".to_string(),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl GateSink for SnapshotSink {
     async fn arm_revert(&self, _mutation: guard::proxy::ApiMutation) -> Option<String> {
@@ -6628,9 +6839,9 @@ rules:
         0,
         "no revert arming should be attempted for a held write"
     );
-    // Only the pre-judge constructibility GET ran; no forward-time fetch and no
-    // write, since the request was held before forwarding.
-    assert_eq!(gets.load(std::sync::atomic::Ordering::SeqCst), 1);
+    // The pre-judge constructibility GET and the pre-approval guard
+    // materialization GET ran. No post-approval fetch or write occurs.
+    assert_eq!(gets.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
 async fn spawn_flaky_snapshot_mock(

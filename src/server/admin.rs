@@ -30,8 +30,8 @@ use super::execute::{
     session_source_from_eval,
 };
 use super::gate_runtime::{
-    bound_persisted_transcript, converge_forward_persistence_failure, finish_revert,
-    forget_proxy_provenance, is_api_proxy_sentinel, now_unix, persist_approval, remove_revert_body,
+    bound_persisted_transcript, finish_revert, forget_proxy_provenance, is_api_proxy_sentinel,
+    now_unix, persist_approval, persist_provisional_transition, remove_revert_body,
     resume_approval,
 };
 #[cfg(test)]
@@ -2184,6 +2184,7 @@ async fn reload_sessions_after_registry_conflict(
     error: &anyhow::Error,
     already_retried: bool,
     operation: &str,
+    baseline_revision: u64,
 ) -> Result<bool, String> {
     if already_retried
         || !crate::session_store::SessionStore::is_registry_generation_conflict(error)
@@ -2196,7 +2197,10 @@ async fn reload_sessions_after_registry_conflict(
     let durable = store.load_registry().await.map_err(|reload_error| {
         format!("failed to reload sessions after concurrent {operation}: {reload_error}")
     })?;
-    *server.state.sessions.write().await = durable;
+    let mut sessions = server.state.sessions.write().await;
+    if sessions.revision() == baseline_revision {
+        *sessions = durable;
+    }
     Ok(true)
 }
 
@@ -2355,8 +2359,8 @@ async fn approve_access_request_owned(
                 consequence: String::new(),
             };
         }
-        let mut live_verbs = server.state.verbs.write().await;
-        let mut staged_verbs = live_verbs.clone();
+        let baseline_verbs = server.state.verbs.read().await.clone();
+        let mut staged_verbs = baseline_verbs.clone();
         if let Some(error) = proposed_verbs.iter().find_map(|verb| {
             staged_verbs
                 .upsert_access_verb(verb.clone())
@@ -2394,8 +2398,8 @@ async fn approve_access_request_owned(
                 consequence: String::new(),
             };
         }
-        let mut live_sessions = server.state.sessions.write().await;
-        let mut staged = live_sessions.clone();
+        let baseline_sessions = server.state.sessions.read().await.clone();
+        let mut staged = baseline_sessions.clone();
         staged.purge_expired();
         let token = if pending.session_token.is_empty() {
             access_token_for_principal_ci(&staged, &requester)
@@ -2556,13 +2560,12 @@ async fn approve_access_request_owned(
                 )
                 .await
             {
-                drop(live_sessions);
-                drop(live_verbs);
                 match reload_sessions_after_registry_conflict(
                     server,
                     &error,
                     generation_retry,
                     "access approval",
+                    baseline_sessions.revision(),
                 )
                 .await
                 {
@@ -2599,10 +2602,44 @@ async fn approve_access_request_owned(
         }
         let grant_uses = staged.access_grant_uses(&token, handle);
         let remaining_uses = grant_uses.and_then(|(_, remaining)| remaining);
-        *live_verbs = staged_verbs;
-        *live_sessions = staged;
-        drop(live_verbs);
-        drop(live_sessions);
+        {
+            let mut live_verbs = server.state.verbs.write().await;
+            if live_verbs.version() == baseline_verbs.version() {
+                *live_verbs = staged_verbs;
+            } else if proposed_verbs
+                .iter()
+                .any(|verb| live_verbs.upsert_access_verb(verb.clone()).is_err())
+            {
+                return AccessDecisionResult {
+                    request: handle.to_string(),
+                    success: false,
+                    state: "stale".to_string(),
+                    target: approved.target.clone(),
+                    remaining_uses,
+                    use_policy: "unavailable".to_string(),
+                    message: "verb catalog changed while access approval was committing"
+                        .to_string(),
+                    consequence: String::new(),
+                };
+            }
+        }
+        {
+            let mut live_sessions = server.state.sessions.write().await;
+            if live_sessions.revision() != baseline_sessions.revision() {
+                return AccessDecisionResult {
+                    request: handle.to_string(),
+                    success: false,
+                    state: "stale".to_string(),
+                    target: approved.target.clone(),
+                    remaining_uses,
+                    use_policy: "unavailable".to_string(),
+                    message: "session authority changed while access approval was committing"
+                        .to_string(),
+                    consequence: String::new(),
+                };
+            }
+            *live_sessions = staged;
+        }
         {
             let mut requests = server.state.grant_requests.write().await;
             for (_, rebased) in rebased_pending {
@@ -2651,9 +2688,9 @@ async fn revoke_access_target_owned(
     let _transition = server.state.grant_request_transition_gate.lock().await;
     let mut generation_retry = false;
     loop {
-        let mut live_sessions = server.state.sessions.write().await;
-        let token = match live_sessions.token_for_access_target(target) {
-            Ok(Some(token)) if live_sessions.is_access_managed(&token) => token,
+        let baseline_sessions = server.state.sessions.read().await.clone();
+        let token = match baseline_sessions.token_for_access_target(target) {
+            Ok(Some(token)) if baseline_sessions.is_access_managed(&token) => token,
             Ok(Some(_)) => {
                 return AdminResponse::Error {
                     message: "access revoke only accepts access-managed sessions".to_string(),
@@ -2667,15 +2704,15 @@ async fn revoke_access_target_owned(
             Err(message) => return AdminResponse::Error { message },
         };
         let reference = session_reference(&token);
-        let expected_revision = live_sessions.effective_revision_key(&token);
-        let mut staged = live_sessions.clone();
+        let expected_revision = baseline_sessions.effective_revision_key(&token);
+        let mut staged = baseline_sessions.clone();
         if !staged.revoke(&token) {
             return AdminResponse::Error {
                 message: format!("unknown active access target: '{target}'"),
             };
         }
-        let mut live_requests = server.state.grant_requests.write().await;
-        let withdrawals = live_requests
+        let baseline_requests = server.state.grant_requests.read().await.clone();
+        let withdrawals = baseline_requests
             .values()
             .filter(|request| {
                 request.status == GrantRequestStatus::Pending && request.session_token == token
@@ -2700,13 +2737,12 @@ async fn revoke_access_target_owned(
                 )
                 .await
             {
-                drop(live_requests);
-                drop(live_sessions);
                 match reload_sessions_after_registry_conflict(
                     server,
                     &error,
                     generation_retry,
                     "access revoke",
+                    baseline_sessions.revision(),
                 )
                 .await
                 {
@@ -2722,12 +2758,25 @@ async fn revoke_access_target_owned(
                 };
             }
         }
-        *live_sessions = staged;
-        for (_, withdrawn) in &withdrawals {
-            live_requests.insert(withdrawn.handle.clone(), withdrawn.clone());
+        {
+            let mut live_sessions = server.state.sessions.write().await;
+            if live_sessions.revision() != baseline_sessions.revision() {
+                return AdminResponse::Error {
+                    message:
+                        "session authority changed while access revocation was committing; durable revocation remains authoritative"
+                            .to_string(),
+                };
+            }
+            *live_sessions = staged;
         }
-        drop(live_requests);
-        drop(live_sessions);
+        {
+            let mut live_requests = server.state.grant_requests.write().await;
+            for (pending, withdrawn) in &withdrawals {
+                if live_requests.get(&pending.handle) == Some(pending) {
+                    live_requests.insert(withdrawn.handle.clone(), withdrawn.clone());
+                }
+            }
+        }
         for (_, withdrawn) in &withdrawals {
             emit_grant_request_event(server, withdrawn, "grant_request_withdrawn");
         }
@@ -3957,8 +4006,9 @@ async fn dispatch_admin_request(
                 granted_at: 0, // SessionRegistry::grant fills the current time
                 owner: session_owner,
             };
-            let mut live = server.state.sessions.write().await;
-            let mut staged = live.clone();
+            let _transition = server.state.grant_request_transition_gate.lock().await;
+            let baseline = server.state.sessions.read().await.clone();
+            let mut staged = baseline.clone();
             staged.purge_expired();
             if !staged.grant(token.clone(), grant) {
                 return AdminResponse::Error {
@@ -3970,6 +4020,13 @@ async fn dispatch_admin_request(
             {
                 return AdminResponse::Error {
                     message: format!("failed to persist session grant: {err}"),
+                };
+            }
+            let mut live = server.state.sessions.write().await;
+            if live.revision() != baseline.revision() {
+                return AdminResponse::Error {
+                    message: "session authority changed while the durable grant was committing"
+                        .to_string(),
                 };
             }
             *live = staged;
@@ -3994,14 +4051,23 @@ async fn dispatch_admin_request(
         } => handle_session_appeal(server, caller, token, binary, args).await,
         #[cfg(test)]
         AdminRequest::SessionRevoke { token } => {
-            let mut live = server.state.sessions.write().await;
-            let mut staged = live.clone();
+            let _transition = server.state.grant_request_transition_gate.lock().await;
+            let baseline = server.state.sessions.read().await.clone();
+            let mut staged = baseline.clone();
             let removed = staged.revoke(&token);
             if let Err(err) =
                 persist_session_snapshot(server.state.session_store.clone(), staged.clone()).await
             {
                 return AdminResponse::Error {
                     message: format!("failed to persist session revoke: {err}"),
+                };
+            }
+            let mut live = server.state.sessions.write().await;
+            if live.revision() != baseline.revision() {
+                return AdminResponse::Error {
+                    message:
+                        "session authority changed while the durable revocation was committing"
+                            .to_string(),
                 };
             }
             *live = staged;
@@ -6184,14 +6250,14 @@ async fn apply_and_persist_grant_request_delta_owned(
     pending: &GrantRequest,
     approved: &GrantRequest,
 ) -> Result<(), String> {
-    let mut sessions = server.state.sessions.write().await;
-    if sessions.effective_revision_key(&pending.session_token) != pending.issued_session_revision {
+    let baseline = server.state.sessions.read().await.clone();
+    if baseline.effective_revision_key(&pending.session_token) != pending.issued_session_revision {
         return Err(format!(
             "grant request '{}' no longer matches the issued session revision; submit a new request",
             pending.handle
         ));
     }
-    let issued = sessions.saved_grant_for(&pending.session_token);
+    let issued = baseline.saved_grant_for(&pending.session_token);
     let issued_matches = match (&pending.saved_grant, pending.issued_saved_revision, issued) {
         (Some(expected_name), Some(expected_revision), Some((name, revision))) => {
             expected_name == &name && expected_revision == revision
@@ -6205,7 +6271,7 @@ async fn apply_and_persist_grant_request_delta_owned(
             pending.handle
         ));
     }
-    let mut staged = sessions.clone();
+    let mut staged = baseline.clone();
     staged
         .apply_delta(&pending.session_token, &pending.delta)
         .ok_or_else(|| format!("unknown active session: '{}'", pending.session_token))?;
@@ -6220,13 +6286,22 @@ async fn apply_and_persist_grant_request_delta_owned(
             .await
             .map_err(|error| format!("failed to persist approved grant request: {error}"))?;
     }
-    *sessions = staged;
-    server
-        .state
-        .grant_requests
-        .write()
-        .await
-        .insert(approved.handle.clone(), approved.clone());
+    {
+        let mut sessions = server.state.sessions.write().await;
+        if sessions.revision() != baseline.revision() {
+            return Err(
+                "session authority changed while grant approval was committing; durable state remains authoritative"
+                    .to_string(),
+            );
+        }
+        *sessions = staged;
+    }
+    {
+        let mut requests = server.state.grant_requests.write().await;
+        if requests.get(&pending.handle) == Some(pending) {
+            requests.insert(approved.handle.clone(), approved.clone());
+        }
+    }
     Ok(())
 }
 
@@ -6401,9 +6476,7 @@ async fn handle_confirm(
             message: super::AUDIT_UNAVAILABLE_REASON.to_string(),
         };
     }
-    let _transition = server.state.grant_request_transition_gate.lock().await;
-    let mut registry = server.state.provisional.write().await;
-    let Some(expected) = registry.get(handle).cloned() else {
+    let Some(expected) = server.state.provisional.read().await.get(handle).cloned() else {
         return AdminResponse::Error {
             message: format!("no provisional with handle '{}'", handle),
         };
@@ -6418,16 +6491,14 @@ async fn handle_confirm(
             }
         }
     };
-    if !converge_forward_persistence_failure(server, &expected).await {
-        return AdminResponse::Error {
-            message: "cannot confirm provisional because its durable state is unavailable; no decision was applied; retry the command".to_string(),
-        };
-    }
-    if let Some(store) = &server.state.session_store {
-        if let Err(error) = store
-            .compare_and_swap_provisional(expected, next.clone())
-            .await
-        {
+    match persist_provisional_transition(server, expected, next.clone()).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return AdminResponse::Error {
+                message: "provisional changed before confirmation; no decision was applied; retry the command".to_string(),
+            }
+        }
+        Err(error) => {
             tracing::warn!(
                 "failed to persist provisional confirmation for {}: {}",
                 handle,
@@ -6438,8 +6509,6 @@ async fn handle_confirm(
             };
         }
     }
-    registry.insert(next.clone());
-    drop(registry);
     forget_proxy_provenance(server, handle).await;
     // The durable row is terminal, so the rollback body is no longer needed.
     remove_revert_body(&next);
@@ -6595,9 +6664,7 @@ async fn handle_manual_revert(
     caller: &CallerIdentity,
     handle: &str,
 ) -> AdminResponse {
-    let _transition = server.state.grant_request_transition_gate.lock().await;
-    let mut registry = server.state.provisional.write().await;
-    let Some(expected) = registry.get(handle).cloned() else {
+    let Some(expected) = server.state.provisional.read().await.get(handle).cloned() else {
         return AdminResponse::Error {
             message: format!("no provisional with handle '{}'", handle),
         };
@@ -6612,25 +6679,20 @@ async fn handle_manual_revert(
             }
         }
     };
-    if !converge_forward_persistence_failure(server, &expected).await {
-        return AdminResponse::Error {
-            message: "cannot revert provisional because its durable state is unavailable; no rollback was started; retry the command".to_string(),
-        };
-    }
-    if let Some(store) = &server.state.session_store {
-        if let Err(error) = store
-            .compare_and_swap_provisional(expected, claimed.clone())
-            .await
-        {
+    match persist_provisional_transition(server, expected, claimed.clone()).await {
+        Ok(true) => {}
+        Ok(false) => return AdminResponse::Error {
+            message:
+                "provisional changed before rollback; no rollback was started; retry the command"
+                    .to_string(),
+        },
+        Err(error) => {
             tracing::warn!("failed to persist rollback claim for {}: {}", handle, error);
             return AdminResponse::Error {
                 message: "cannot revert provisional because its durable state is unavailable; no rollback was started; retry the command".to_string(),
             };
         }
     }
-    registry.insert(claimed.clone());
-    drop(registry);
-    drop(_transition);
     let outcome = finish_revert(server, &claimed, caller, "manual").await;
     AdminResponse::GateAction {
         message: outcome.0,
